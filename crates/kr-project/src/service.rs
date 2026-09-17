@@ -207,7 +207,9 @@ impl ProjectService {
         self.store
             .lock()
             .map_err(|_| ProjectError::StoreUnavailable {
-                detail: "the project journal was left poisoned by an earlier failure".to_owned(),
+                detail: "the project journal was left poisoned by an earlier failure"
+                    .to_owned()
+                    .into(),
             })
     }
 
@@ -226,8 +228,8 @@ impl ProjectService {
             Ok(())
         } else {
             Err(ProjectError::WrongEnvironment {
-                named: named.to_string(),
-                owned: self.environment_id.to_string(),
+                named: named.to_string().into(),
+                owned: self.environment_id.to_string().into(),
             })
         }
     }
@@ -743,7 +745,8 @@ impl ProjectService {
                         // rest of the explanation legible, and replacing the whole reason at the
                         // journal's write would take away the part that says what to do next.
                         crate::git::redact(&destination.path().display().to_string())
-                    ),
+                    )
+                    .into(),
                 },
                 OperationState::Failed,
             )?;
@@ -820,7 +823,8 @@ impl ProjectService {
                              that was staged, so this host cannot say whether the publication \
                              landed",
                             crate::git::redact(&destination.path().display().to_string())
-                        ),
+                        )
+                        .into(),
                     },
                     OperationState::Unknown,
                 )?;
@@ -844,7 +848,8 @@ impl ProjectService {
                     "{} holds {} and the staged repository was {identity}",
                     crate::git::redact(&path.display().to_string()),
                     opened.identity().work_tree
-                ),
+                )
+                .into(),
             });
         }
         let project = ProjectRow {
@@ -939,7 +944,7 @@ impl ProjectService {
             .locked()?
             .retained_action(&row.actor_id, row.action_id.get())?
             .ok_or_else(|| ProjectError::StoreUnavailable {
-                detail: format!("operation {} has no action record", row.action_id),
+                detail: format!("operation {} has no action record", row.action_id).into(),
             })?;
         Ok(record.payload_digest)
     }
@@ -1005,7 +1010,7 @@ impl ProjectService {
         let row = store
             .project(params.project_repository_id)?
             .ok_or_else(|| ProjectError::UnknownProject {
-                project: params.project_repository_id.to_string(),
+                project: params.project_repository_id.to_string().into(),
             })?;
         let workspace_rows =
             store.workspaces(self.environment_id, Some(row.project_repository_id))?;
@@ -1058,7 +1063,7 @@ impl ProjectService {
         let store = self.locked()?;
         let row = store.workspace(params.workspace_id)?.ok_or_else(|| {
             ProjectError::UnknownWorkspace {
-                workspace: params.workspace_id.to_string(),
+                workspace: params.workspace_id.to_string().into(),
             }
         })?;
         Ok(WorkspaceReadResult {
@@ -1235,7 +1240,8 @@ impl ProjectService {
                                      operation keeps its create token, its action is not answered \
                                      yet, and the host resolves it against the object it staged \
                                      rather than starting again"
-                                ),
+                                )
+                                .into(),
                             });
                         }
                     }
@@ -1324,7 +1330,8 @@ impl ProjectService {
                     "{} holds {} and the staged repository was {identity}",
                     crate::git::redact(&path.display().to_string()),
                     opened.identity().work_tree
-                ),
+                )
+                .into(),
             });
         }
         let project = ProjectRow {
@@ -1397,7 +1404,7 @@ impl ProjectService {
             .locked()?
             .operation(params.operation_action_id)?
             .ok_or_else(|| ProjectError::UnknownOperation {
-                operation: params.operation_action_id.to_string(),
+                operation: params.operation_action_id.to_string().into(),
             })?;
         // Section 23 puts this method under the resource owner's authority, and the resource is
         // the operation. An operation another actor started is not this caller's to stop.
@@ -1407,7 +1414,8 @@ impl ProjectService {
                     "operation {} belongs to another actor, and a cancellation reaches only \
                      authorised owned work",
                     row.action_id
-                ),
+                )
+                .into(),
             });
         }
         let flag = self
@@ -1481,7 +1489,7 @@ impl ProjectService {
             .locked()?
             .project(params.project_repository_id)?
             .ok_or_else(|| ProjectError::UnknownProject {
-                project: params.project_repository_id.to_string(),
+                project: params.project_repository_id.to_string().into(),
             })?;
         let repository = OpenedRepository::open_recorded(
             &self.profile,
@@ -1490,23 +1498,27 @@ impl ProjectService {
             project.identity,
         )?;
         let (head_revision, head_reference) = repository.head(&self.profile)?;
-        let base_revision = match params.base_revision.0.as_deref() {
-            Some(revision) => {
-                check_revision(revision)?;
-                self.resolve_revision(&repository, revision)?
-            }
-            None => head_revision.clone().ok_or_else(|| ProjectError::WrongState {
+        let base_revision =
+            match params.base_revision.0.as_deref() {
+                Some(revision) => {
+                    check_revision(revision)?;
+                    self.resolve_revision(&repository, revision)?
+                }
+                None => head_revision.clone().ok_or_else(|| {
+                    ProjectError::WrongState {
                 detail: format!(
                     "{} has no commit yet, so a workspace of it names the revision it starts from",
                     project.display_path
-                ),
-            })?,
-        };
+                ).into(),
+            }
+                })?,
+            };
         if params.base_change_set_id.0.is_some() && params.base_revision.0.is_none() {
             return Err(ProjectError::InvalidArgument(
                 "a change-set version is resolved to a revision by the change-set service, so a \
                  workspace that materialises one names that revision as well"
-                    .to_owned(),
+                    .to_owned()
+                    .into(),
             ));
         }
         let surveyed = survey(
@@ -1544,7 +1556,9 @@ impl ProjectService {
             WorkspaceKind::Isolated => {
                 let request = params.destination.0.as_ref().ok_or_else(|| {
                     ProjectError::InvalidArgument(
-                        "an isolated workspace names where its working tree goes".to_owned(),
+                        "an isolated workspace names where its working tree goes"
+                            .to_owned()
+                            .into(),
                     )
                 })?;
                 let destination = Destination::resolve(request, self.environment_id)?;
@@ -1554,7 +1568,8 @@ impl ProjectService {
                             "{} exists, and an isolated workspace is created rather than merged \
                              into something",
                             crate::git::redact(&destination.path().display().to_string())
-                        ),
+                        )
+                        .into(),
                     });
                 }
                 (destination.path().display().to_string(), params.isolation.0)
@@ -1617,7 +1632,7 @@ impl ProjectService {
         let row = store
             .workspace(workspace_id)?
             .ok_or_else(|| ProjectError::UnknownWorkspace {
-                workspace: workspace_id.to_string(),
+                workspace: workspace_id.to_string().into(),
             })?;
         let workspace = self.summarise_workspace(&store, &row)?;
         let result = WorkspaceCreateResult {
@@ -1652,7 +1667,9 @@ impl ProjectService {
             WorkspaceKind::Isolated => {
                 let request = params.destination.0.as_ref().ok_or_else(|| {
                     ProjectError::InvalidArgument(
-                        "an isolated workspace names where its working tree goes".to_owned(),
+                        "an isolated workspace names where its working tree goes"
+                            .to_owned()
+                            .into(),
                     )
                 })?;
                 let destination = Destination::resolve(request, self.environment_id)?;
@@ -2126,7 +2143,7 @@ impl ProjectService {
         let row = store
             .workspace(workspace_id)?
             .ok_or_else(|| ProjectError::UnknownWorkspace {
-                workspace: workspace_id.to_string(),
+                workspace: workspace_id.to_string().into(),
             })?;
         let result = WorkspaceRemoveResult {
             workspace: self.summarise_workspace(&store, &row)?,
@@ -2154,9 +2171,10 @@ impl ProjectService {
                         kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
                             .map_err(ProjectError::store)
                     }
-                    RetainedOutcome::Error { code, detail } => {
-                        Err(ProjectError::Retained { code, detail })
-                    }
+                    RetainedOutcome::Error { code, detail } => Err(ProjectError::Retained {
+                        code,
+                        detail: detail.into(),
+                    }),
                 };
             }
         }
@@ -2170,7 +2188,8 @@ impl ProjectService {
                 detail: format!(
                     "{} has no parent directory",
                     crate::git::redact(&path.display().to_string())
-                ),
+                )
+                .into(),
             });
         };
         let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
@@ -2178,7 +2197,8 @@ impl ProjectService {
                 detail: format!(
                     "{} has no final name",
                     crate::git::redact(&path.display().to_string())
-                ),
+                )
+                .into(),
             });
         };
         let Some(expected) = row.identity else {
@@ -2190,7 +2210,8 @@ impl ProjectService {
                     "this host recorded no filesystem identity for the workspace at {}, so it \
                      will not remove what is there; the directory is left for a person to look at",
                     crate::git::redact(&path.display().to_string())
-                ),
+                )
+                .into(),
             });
         };
         let parent = kr_transfer::AuthorisedDirectory::open_root(self.environment_id, parent)?;
@@ -2210,7 +2231,8 @@ impl ProjectService {
                      removed",
                     crate::git::redact(&path.display().to_string()),
                     here.identity()
-                ),
+                )
+                .into(),
             });
         }
         // What is inside goes through the tree's *own* open handle, so every one of those
@@ -2228,7 +2250,8 @@ impl ProjectService {
                     detail: format!(
                         "{} could not be removed: {error}",
                         crate::git::redact(&path.display().to_string())
-                    ),
+                    )
+                    .into(),
                 });
             }
         }
@@ -2335,8 +2358,8 @@ impl ProjectService {
         };
         if record.method != method || record.payload_digest != payload_digest {
             return Err(ProjectError::IdConflict {
-                action: action_id.to_string(),
-                method: record.method,
+                action: action_id.to_string().into(),
+                method: record.method.into(),
             });
         }
         // A claim with no outcome is not an answer: the request reaches the service, which finishes
@@ -2380,7 +2403,7 @@ impl ProjectService {
         let row = store
             .operation(action_id)?
             .ok_or_else(|| ProjectError::UnknownOperation {
-                operation: action_id.to_string(),
+                operation: action_id.to_string().into(),
             })?;
         let paths = store.staging_paths(action_id)?;
         drop(store);
@@ -2408,8 +2431,8 @@ impl ProjectService {
         };
         if record.method != action.method || record.payload_digest != action.payload_digest {
             return Err(ProjectError::IdConflict {
-                action: action.action_id.to_string(),
-                method: record.method,
+                action: action.action_id.to_string().into(),
+                method: record.method.into(),
             });
         }
         match (record.result, record.error_code) {
@@ -2421,9 +2444,12 @@ impl ProjectService {
                 code: code
                     .parse()
                     .unwrap_or(kr_protocol::error::ErrorCode::OutcomeUnknown),
-                detail: record.error_detail.unwrap_or_else(|| {
-                    format!("action {} was recorded as {code}", action.action_id)
-                }),
+                detail: record
+                    .error_detail
+                    .unwrap_or_else(|| {
+                        format!("action {} was recorded as {code}", action.action_id)
+                    })
+                    .into(),
             }),
             // Claimed and not settled: another copy of this action is performing the effect.
             (None, None) => Err(ProjectError::OutcomeUnknown {
@@ -2431,7 +2457,8 @@ impl ProjectService {
                     "action {} claimed its effect and its result is not recorded yet; read the \
                      operation or cancel it rather than submitting it again",
                     action.action_id
-                ),
+                )
+                .into(),
             }),
         }
     }
@@ -2453,12 +2480,15 @@ impl ProjectService {
         // taken for the identifier it names.
         output.require_complete()?;
         if !output.success {
-            return Err(ProjectError::InvalidArgument(format!(
-                "{} is not a revision this repository holds",
-                // The revision is the caller's own text, and it goes into a message a journal
-                // keeps and another actor can read, so it goes through the same rule.
-                crate::git::redact(revision)
-            )));
+            return Err(ProjectError::InvalidArgument(
+                format!(
+                    "{} is not a revision this repository holds",
+                    // The revision is the caller's own text, and it goes into a message a journal
+                    // keeps and another actor can read, so it goes through the same rule.
+                    crate::git::redact(revision)
+                )
+                .into(),
+            ));
         }
         Ok(output.text().trim().to_owned())
     }
@@ -2618,14 +2648,16 @@ fn check_destination(
                     detail: format!(
                         "{} holds no checkout to adopt",
                         crate::git::redact(&destination.path().display().to_string())
-                    ),
+                    )
+                    .into(),
                 })
             }
             DestinationState::Occupied => Err(ProjectError::Destination {
                 detail: format!(
                     "{} is not a directory, so there is no checkout to adopt",
                     crate::git::redact(&destination.path().display().to_string())
-                ),
+                )
+                .into(),
             }),
         },
         CreatePlan::Initialise { .. } | CreatePlan::Clone { .. } => match state {
@@ -2638,7 +2670,8 @@ fn check_destination(
                      adopt the checkout that is there by choosing the existing-checkout flow, or \
                      name a destination that does not exist",
                     crate::git::redact(&destination.path().display().to_string())
-                ),
+                )
+                .into(),
             }),
         },
     }
@@ -2646,13 +2679,13 @@ fn check_destination(
 
 fn check_label(label: &str) -> Result<()> {
     if label.is_empty() || label.chars().count() > MAX_LABEL_LEN {
-        return Err(ProjectError::InvalidArgument(format!(
-            "a label is between one and {MAX_LABEL_LEN} characters"
-        )));
+        return Err(ProjectError::InvalidArgument(
+            format!("a label is between one and {MAX_LABEL_LEN} characters").into(),
+        ));
     }
     if label.chars().any(char::is_control) {
         return Err(ProjectError::InvalidArgument(
-            "a label carries no control character".to_owned(),
+            "a label carries no control character".to_owned().into(),
         ));
     }
     Ok(())
@@ -2667,10 +2700,9 @@ fn check_branch(branch: &str) -> Result<()> {
                 || matches!(character, ' ' | '~' | '^' | ':' | '?' | '*' | '[' | '\\')
         })
     {
-        return Err(ProjectError::InvalidArgument(format!(
-            "{} is not a branch name",
-            crate::git::redact(branch)
-        )));
+        return Err(ProjectError::InvalidArgument(
+            format!("{} is not a branch name", crate::git::redact(branch)).into(),
+        ));
     }
     Ok(())
 }
@@ -2682,10 +2714,9 @@ fn check_revision(revision: &str) -> Result<()> {
             .chars()
             .any(|character| character.is_control() || character == ' ')
     {
-        return Err(ProjectError::InvalidArgument(format!(
-            "{} is not a revision",
-            crate::git::redact(revision)
-        )));
+        return Err(ProjectError::InvalidArgument(
+            format!("{} is not a revision", crate::git::redact(revision)).into(),
+        ));
     }
     Ok(())
 }

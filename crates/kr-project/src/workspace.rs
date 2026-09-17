@@ -213,7 +213,8 @@ pub fn submodule_paths(
     let reported = std::str::from_utf8(&output.stdout).map_err(|_| ProjectError::GitFailed {
         detail: "this repository's index holds a path this host cannot read as text, so it \
                  cannot say what that path holds"
-            .to_owned(),
+            .to_owned()
+            .into(),
     })?;
     let mut paths = Vec::new();
     for record in reported.split('\0') {
@@ -242,7 +243,8 @@ fn malformed(record: &str) -> ProjectError {
                 let judged = crate::git::redact(record);
                 judged.chars().take(120).collect::<String>()
             }
-        ),
+        )
+        .into(),
     }
 }
 
@@ -715,14 +717,16 @@ pub fn check_choice(
                 return Err(ProjectError::InvalidArgument(
                     "a shared workspace is the repository's own working tree, so it names no \
                      isolation mechanism"
-                        .to_owned(),
+                        .to_owned()
+                        .into(),
                 ));
             }
             if has_destination {
                 return Err(ProjectError::InvalidArgument(
                     "a shared workspace is the repository's own working tree, so it names no \
                      destination"
-                        .to_owned(),
+                        .to_owned()
+                        .into(),
                 ));
             }
             if InclusionClass::EVERY
@@ -732,7 +736,8 @@ pub fn check_choice(
                 return Err(ProjectError::InvalidArgument(
                     "a shared workspace keeps the user's dirty and untracked state in place, so \
                      every class is included; an exclusion needs an isolated workspace"
-                        .to_owned(),
+                        .to_owned()
+                        .into(),
                 ));
             }
             Ok(())
@@ -742,12 +747,14 @@ pub fn check_choice(
                 return Err(ProjectError::InvalidArgument(
                     "an isolated workspace names how it is separated: a Git worktree, which is not \
                      a security sandbox, or an independent clone"
-                        .to_owned(),
+                        .to_owned().into(),
                 ));
             }
             if !has_destination {
                 return Err(ProjectError::InvalidArgument(
-                    "an isolated workspace names where its working tree goes".to_owned(),
+                    "an isolated workspace names where its working tree goes"
+                        .to_owned()
+                        .into(),
                 ));
             }
             Ok(())
@@ -918,14 +925,15 @@ fn copy_one(
             detail: format!(
                 "this inclusion would copy more than {MAX_WORKSPACE_COPY_BYTES} bytes into the \
                  new workspace; narrow the policy or start from the base alone"
-            ),
+            )
+            .into(),
         });
     }
     let components = name.components();
     let (leaf, parents) = components
         .split_last()
         .ok_or_else(|| ProjectError::Destination {
-            detail: format!("{name} names nothing to copy"),
+            detail: format!("{name} names nothing to copy").into(),
         })?;
     // Each level is created against the handle of the level above it, so a creation never depends
     // on a prefix resolved after it was checked.
@@ -976,7 +984,7 @@ fn copy_one(
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => {
                     return Err(ProjectError::Destination {
-                        detail: format!("{leaf} could not be read: {error}"),
+                        detail: format!("{leaf} could not be read: {error}").into(),
                     });
                 }
             };
@@ -984,7 +992,7 @@ fn copy_one(
                 .handle_mut()
                 .write_all(&buffer[..read])
                 .map_err(|error| ProjectError::Destination {
-                    detail: format!("{leaf} could not be written: {error}"),
+                    detail: format!("{leaf} could not be written: {error}").into(),
                 })?;
         }
         // An executable script that arrives without its executable bit is not the file the user
@@ -997,7 +1005,7 @@ fn copy_one(
             .handle_mut()
             .sync_all()
             .map_err(|error| ProjectError::Destination {
-                detail: format!("{leaf} could not be flushed: {error}"),
+                detail: format!("{leaf} could not be flushed: {error}").into(),
             })?;
         Ok(())
     })();
@@ -1042,7 +1050,7 @@ fn source_mode(file: &kr_transfer::AuthorisedFile) -> Result<Option<u32>> {
         .handle()
         .metadata()
         .map_err(|error| ProjectError::Destination {
-            detail: format!("a file's own permissions could not be read: {error}"),
+            detail: format!("a file's own permissions could not be read: {error}").into(),
         })?;
     Ok(Some(metadata.mode()))
 }
@@ -1070,7 +1078,7 @@ fn apply_mode(file: &kr_transfer::AuthorisedFile, mode: Option<u32>) -> Result<(
         file.handle()
             .set_permissions(cap_std::fs::Permissions::from_mode(mode))
             .map_err(|error| ProjectError::Destination {
-                detail: format!("a copy's permissions could not be set: {error}"),
+                detail: format!("a copy's permissions could not be set: {error}").into(),
             })?;
     }
     Ok(())

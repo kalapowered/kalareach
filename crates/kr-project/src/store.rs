@@ -527,7 +527,8 @@ impl Store {
                     detail: format!(
                         "this project store is at schema version {version}; this build reads \
                          {SCHEMA_VERSION}"
-                    ),
+                    )
+                    .into(),
                 });
             }
         }
@@ -1020,14 +1021,15 @@ impl Store {
             .optional()
             .map_err(ProjectError::store)?
             .ok_or_else(|| ProjectError::UnknownWorkspace {
-                workspace: workspace_id.to_string(),
+                workspace: workspace_id.to_string().into(),
             })?;
         if matches!(row.state, WorkspaceState::Materialising) {
             return Err(ProjectError::WrongState {
                 detail: format!(
                     "workspace {workspace_id} is still being materialised, so what is in its \
                      directory is not yet something this host can account for"
-                ),
+                )
+                .into(),
             });
         }
         // One removal at a time. `removal_pending` is a state a workspace *rests* in — it holds
@@ -1052,7 +1054,8 @@ impl Store {
                 detail: format!(
                     "a removal of workspace {workspace_id} is already in progress; read the \
                      workspace for what it holds rather than removing it twice"
-                ),
+                )
+                .into(),
             });
         }
         let sessions: i64 = transaction
@@ -1074,7 +1077,8 @@ impl Store {
                 detail: format!(
                     "{sessions} sessions and {runs} automation runs bound to this workspace are \
                      still live, and cleanup happens after every bound session and run has finished"
-                ),
+                )
+                .into(),
             });
         }
         transaction
@@ -1472,7 +1476,8 @@ impl Store {
                 detail: format!(
                     "workspace {workspace_id} is {}, so nothing new may hold it",
                     state.map_or("not a workspace this environment has", workspace_state_text)
-                ),
+                )
+                .into(),
             });
         }
         transaction
@@ -1586,7 +1591,8 @@ impl Store {
                 detail: format!(
                     "workspace {workspace_id} is {}, so nothing new is recorded against it",
                     state.map_or("not a workspace this environment has", workspace_state_text)
-                ),
+                )
+                .into(),
             });
         }
         transaction
@@ -1823,13 +1829,15 @@ impl Store {
         }
         let existing = self.retained_action(actor_id, action_id)?.ok_or_else(|| {
             ProjectError::StoreUnavailable {
-                detail: "an action row that conflicted could not be read back".to_owned(),
+                detail: "an action row that conflicted could not be read back"
+                    .to_owned()
+                    .into(),
             }
         })?;
         if existing.method != method || existing.payload_digest != payload_digest {
             return Err(ProjectError::IdConflict {
-                action: action_id.to_string(),
-                method: existing.method,
+                action: action_id.to_string().into(),
+                method: existing.method.into(),
             });
         }
         Ok(Some(outcome_of(&existing)))
@@ -1986,8 +1994,8 @@ pub fn claim_action(
         .map_err(ProjectError::store)?;
     if existing.0 != action.method || digest_of(&existing.1) != action.payload_digest {
         return Err(ProjectError::IdConflict {
-            action: action.action_id.to_string(),
-            method: existing.0,
+            action: action.action_id.to_string().into(),
+            method: existing.0.into(),
         });
     }
     // Another copy of this action claimed first. The caller reads the claim's record and answers
@@ -1996,7 +2004,8 @@ pub fn claim_action(
         detail: format!(
             "action {} is already claimed by another copy of this request",
             action.action_id
-        ),
+        )
+        .into(),
     })
 }
 

@@ -47,7 +47,8 @@ pub fn protect_stored_result(method: &str, encoded: &[u8]) -> Result<Vec<u8>> {
             detail: format!(
                 "a recorded answer to {} is not one this build can read back",
                 crate::git::redact(method)
-            ),
+            )
+            .into(),
         }),
     }
 }

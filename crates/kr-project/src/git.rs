@@ -254,16 +254,19 @@ const FORBIDDEN_LONG: &[&str] = &[
 pub fn check_arguments(arguments: &[&OsStr]) -> Result<()> {
     let Some(subcommand) = arguments.first() else {
         return Err(ProjectError::InvalidArgument(
-            "an invocation names a subcommand".to_owned(),
+            "an invocation names a subcommand".to_owned().into(),
         ));
     };
     let subcommand = subcommand.to_string_lossy();
     if !PERMITTED_SUBCOMMANDS.contains(&subcommand.as_ref()) {
-        return Err(ProjectError::InvalidArgument(format!(
-            "git {} is not a subcommand this service runs; it runs {}",
-            redact(&subcommand),
-            PERMITTED_SUBCOMMANDS.join(", ")
-        )));
+        return Err(ProjectError::InvalidArgument(
+            format!(
+                "git {} is not a subcommand this service runs; it runs {}",
+                redact(&subcommand),
+                PERMITTED_SUBCOMMANDS.join(", ")
+            )
+            .into(),
+        ));
     }
     for argument in arguments {
         let text = argument.to_string_lossy();
@@ -285,7 +288,7 @@ pub fn check_arguments(arguments: &[&OsStr]) -> Result<()> {
                  the way, and the configuration, the programs and the directories are the \
                  profile's rather than the caller's",
                 redact(&text)
-            )));
+            ).into()));
         }
         // A combined short option hides its members: `-qf` is `-q` and `-f`, and the second is
         // the one this service never passes.
@@ -298,20 +301,26 @@ pub fn check_arguments(arguments: &[&OsStr]) -> Result<()> {
                     .any(|short| short.ends_with(character))
             })
         {
-            return Err(ProjectError::InvalidArgument(format!(
-                "{} combines a short option this service never passes",
-                redact(&text)
-            )));
+            return Err(ProjectError::InvalidArgument(
+                format!(
+                    "{} combines a short option this service never passes",
+                    redact(&text)
+                )
+                .into(),
+            ));
         }
         // The one template directory an invocation may name is the empty one the profile already
         // points at, so an explicit `--template=` carries nothing. An abbreviation of it is the
         // same option, so only the exact empty form is allowed through.
         if "--template".starts_with(head) && head.len() > 2 && text != "--template=" {
-            return Err(ProjectError::InvalidArgument(format!(
-                "{} names a template directory whose hooks would be copied into the new \
+            return Err(ProjectError::InvalidArgument(
+                format!(
+                    "{} names a template directory whose hooks would be copied into the new \
                  repository",
-                redact(&text)
-            )));
+                    redact(&text)
+                )
+                .into(),
+            ));
         }
     }
     Ok(())
@@ -372,7 +381,7 @@ impl GitProgram {
     /// an absolute path, or is older than [`MINIMUM_GIT_VERSION`].
     pub fn discover() -> Result<Self> {
         let program = search_path(GIT_FILE_NAME).ok_or_else(|| ProjectError::GitUnavailable {
-            detail: "installed Git was not found on this host".to_owned(),
+            detail: "installed Git was not found on this host".to_owned().into(),
         })?;
         Self::at(&program)
     }
@@ -390,14 +399,16 @@ impl GitProgram {
                 detail: format!(
                     "{} could not be resolved: {error}",
                     redact(&path.display().to_string())
-                ),
+                )
+                .into(),
             })?;
         if !program.is_absolute() {
             return Err(ProjectError::GitUnavailable {
                 detail: format!(
                     "{} is not an absolute path",
                     redact(&program.display().to_string())
-                ),
+                )
+                .into(),
             });
         }
         // Asked of the resolved binary with an environment of nothing, so the answer is the
@@ -409,12 +420,13 @@ impl GitProgram {
                     "{} reports a relative helper directory {}",
                     redact(&program.display().to_string()),
                     redact(&exec_path.display().to_string())
-                ),
+                )
+                .into(),
             });
         }
         let version = ask(&program, &["--version"])?.trim_end().to_owned();
         let parsed = parse_version(&version).ok_or_else(|| ProjectError::GitUnavailable {
-            detail: format!("{version} does not report a version this host can read"),
+            detail: format!("{version} does not report a version this host can read").into(),
         })?;
         if parsed < MINIMUM_GIT_VERSION {
             return Err(ProjectError::GitUnavailable {
@@ -422,7 +434,8 @@ impl GitProgram {
                     "this host needs Git {}.{} or later for the restricted execution profile, and \
                      {version} is installed",
                     MINIMUM_GIT_VERSION.0, MINIMUM_GIT_VERSION.1
-                ),
+                )
+                .into(),
             });
         }
         Ok(Self {
@@ -500,7 +513,8 @@ impl RestrictedProfile {
                         "{} must be empty for the restricted profile and it holds {}",
                         redact(&directory.display().to_string()),
                         redact(&entry.file_name().to_string_lossy())
-                    ),
+                    )
+                    .into(),
                 });
             }
         }
@@ -521,7 +535,8 @@ impl RestrictedProfile {
                             "{} must be empty for the restricted profile and it holds {length} \
                              bytes",
                             redact(&empty_config.display().to_string())
-                        ),
+                        )
+                        .into(),
                     });
                 }
             }
@@ -588,7 +603,7 @@ impl RestrictedProfile {
         // those holding the connection this cancellation was meant to drop.
         own_process_group(&mut command);
         let mut child = command.spawn().map_err(|error| ProjectError::GitFailed {
-            detail: format!("{} could not start: {error}", request.describe()),
+            detail: format!("{} could not start: {error}", request.describe()).into(),
         })?;
         let out = child.stdout.take().map(read_bounded);
         let err = child.stderr.take().map(read_bounded);
@@ -599,7 +614,8 @@ impl RestrictedProfile {
                 Ok(None) => {}
                 Err(error) => {
                     return Err(ProjectError::GitFailed {
-                        detail: format!("{} could not be waited on: {error}", request.describe()),
+                        detail: format!("{} could not be waited on: {error}", request.describe())
+                            .into(),
                     });
                 }
             }
@@ -621,7 +637,8 @@ impl RestrictedProfile {
                         } else {
                             ", and this host could not confirm that every process it started ended"
                         }
-                    ),
+                    )
+                    .into(),
                 });
             }
             if Instant::now() >= deadline {
@@ -641,7 +658,8 @@ impl RestrictedProfile {
                         } else {
                             ", and this host could not confirm that every process it started ended"
                         }
-                    ),
+                    )
+                    .into(),
                 });
             }
             std::thread::sleep(Duration::from_millis(5));
@@ -1162,7 +1180,8 @@ impl GitOutput {
                     self.status
                         .map_or_else(|| "on a signal".to_owned(), |code| code.to_string()),
                     self.stderr.trim()
-                ),
+                )
+                .into(),
             });
         }
         if self.stdout_truncated {
@@ -1170,7 +1189,8 @@ impl GitOutput {
                 detail: format!(
                     "{} produced more than {MAX_GIT_OUTPUT_BYTES} bytes",
                     self.command
-                ),
+                )
+                .into(),
             });
         }
         Ok(())
@@ -1192,7 +1212,8 @@ impl GitOutput {
                     "{} produced more output than this host could read, so what it said is not \
                      what this host holds",
                     self.command
-                ),
+                )
+                .into(),
             });
         }
         Ok(())
@@ -1370,7 +1391,8 @@ impl ConfigurationAudit {
         Err(ProjectError::IdentityChanged {
             detail: "this repository's configuration changed while the host was reading it, so \
                      what it read was produced under a configuration the host did not audit"
-                .to_owned(),
+                .to_owned()
+                .into(),
         })
     }
 
@@ -1429,7 +1451,8 @@ impl ConfigurationAudit {
                 "this repository's configuration names {}, which no override removes, so the \
                  operation is refused rather than run under it",
                 names(&self.refused)
-            ),
+            )
+            .into(),
         })
     }
 
@@ -1452,7 +1475,8 @@ impl ConfigurationAudit {
                  override, so it does not read the repository at all rather than reading it beside \
                  something it cannot neutralise",
                 names(&self.unexpressible)
-            ),
+            )
+            .into(),
         })
     }
 }
@@ -1680,7 +1704,8 @@ fn join(reader: Option<Reader>, request: &GitRequest<'_>) -> Result<Bounded> {
             detail: format!(
                 "{} produced output this host could not read",
                 request.describe()
-            ),
+            )
+            .into(),
         })?;
         return Ok(Bounded {
             bytes: held.bytes.clone(),
@@ -1691,13 +1716,15 @@ fn join(reader: Option<Reader>, request: &GitRequest<'_>) -> Result<Bounded> {
         detail: format!(
             "{} produced output this host could not read",
             request.describe()
-        ),
+        )
+        .into(),
     })?;
     let held = reader.read.lock().map_err(|_| ProjectError::GitFailed {
         detail: format!(
             "{} produced output this host could not read",
             request.describe()
-        ),
+        )
+        .into(),
     })?;
     outcome?;
     Ok(Bounded {
@@ -1725,7 +1752,9 @@ fn read_bounded<R: std::io::Read + Send + 'static>(pipe: R) -> Reader {
                     // The shared buffer is what a caller whose wait runs out reads, so each chunk
                     // goes into it as it arrives rather than at the end.
                     let mut kept = held.lock().map_err(|_| ProjectError::GitFailed {
-                        detail: "a pipe reader could not reach its own buffer".to_owned(),
+                        detail: "a pipe reader could not reach its own buffer"
+                            .to_owned()
+                            .into(),
                     })?;
                     let room = ceiling.saturating_sub(kept.bytes.len());
                     if read > room {
@@ -1764,7 +1793,8 @@ fn ask(program: &Path, arguments: &[&str]) -> Result<String> {
                 "{} {} could not run: {error}",
                 redact(&program.display().to_string()),
                 redact(&arguments.join(" "))
-            ),
+            )
+            .into(),
         })?;
     if !output.status.success() {
         return Err(ProjectError::GitUnavailable {
@@ -1776,7 +1806,8 @@ fn ask(program: &Path, arguments: &[&str]) -> Result<String> {
                     .status
                     .code()
                     .map_or_else(|| "on a signal".to_owned(), |code| code.to_string())
-            ),
+            )
+            .into(),
         });
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())

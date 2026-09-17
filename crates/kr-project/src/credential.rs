@@ -177,7 +177,8 @@ impl BrokerRegistry {
                     } else {
                         self.names().join(", ")
                     }
-                ),
+                )
+                .into(),
             })
     }
 
@@ -192,7 +193,8 @@ impl BrokerRegistry {
                 detail: format!(
                     "a remote URL is at most {MAX_REMOTE_URL_LEN} bytes and this one is {}",
                     requested.url.len()
-                ),
+                )
+                .into(),
             });
         }
         if requested.remote_name.is_empty()
@@ -205,7 +207,8 @@ impl BrokerRegistry {
                     "{} is not a remote name; a remote name is letters, digits, hyphens and \
                      underscores",
                     crate::git::redact(&requested.remote_name)
-                ),
+                )
+                .into(),
             });
         }
         let parsed = parse_remote(&requested.url)?;
@@ -214,48 +217,51 @@ impl BrokerRegistry {
                 detail: format!(
                     "the caller named the {:?} transport and this remote is the {:?} transport",
                     requested.transport, parsed.transport
-                ),
+                )
+                .into(),
             });
         }
-        let broker = match parsed.transport {
-            // A local path reaches no network and needs no credential, so it names no broker.
-            RemoteTransport::LocalPath => {
-                if !requested.credential_broker.is_empty() {
-                    return Err(ProjectError::RemoteRejected {
-                        detail:
-                            "a local-path remote reaches no network, so it names no credential \
-                                 broker"
-                                .to_owned(),
-                    });
-                }
-                None
-            }
-            RemoteTransport::Https | RemoteTransport::Ssh => {
-                let broker = self.approved(&requested.credential_broker)?;
-                match parsed.transport {
-                    RemoteTransport::Https if broker.helper.is_none() => {
+        let broker =
+            match parsed.transport {
+                // A local path reaches no network and needs no credential, so it names no broker.
+                RemoteTransport::LocalPath => {
+                    if !requested.credential_broker.is_empty() {
                         return Err(ProjectError::RemoteRejected {
+                            detail:
+                                "a local-path remote reaches no network, so it names no credential \
+                                 broker"
+                                    .to_owned()
+                                    .into(),
+                        });
+                    }
+                    None
+                }
+                RemoteTransport::Https | RemoteTransport::Ssh => {
+                    let broker = self.approved(&requested.credential_broker)?;
+                    match parsed.transport {
+                        RemoteTransport::Https if broker.helper.is_none() => {
+                            return Err(ProjectError::RemoteRejected {
                             detail: format!(
                                 "the broker {} has no credential helper on this host, so an https \
                                  remote cannot be authenticated",
                                 broker.name
-                            ),
+                            ).into(),
                         });
-                    }
-                    RemoteTransport::Ssh if broker.ssh_command.is_none() => {
-                        return Err(ProjectError::RemoteRejected {
+                        }
+                        RemoteTransport::Ssh if broker.ssh_command.is_none() => {
+                            return Err(ProjectError::RemoteRejected {
                             detail: format!(
                                 "the broker {} has no ssh program on this host, so an ssh remote \
                                  cannot be reached",
                                 broker.name
-                            ),
+                            ).into(),
                         });
+                        }
+                        _ => {}
                     }
-                    _ => {}
+                    Some(broker.clone())
                 }
-                Some(broker.clone())
-            }
-        };
+            };
         Ok(ValidatedRemote {
             specification: RemoteSpecification {
                 remote_name: requested.remote_name.clone(),
@@ -322,7 +328,9 @@ pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
     let trimmed = url.trim();
     if trimmed != url || trimmed.is_empty() {
         return Err(ProjectError::RemoteRejected {
-            detail: "a remote URL has no surrounding space and is not empty".to_owned(),
+            detail: "a remote URL has no surrounding space and is not empty"
+                .to_owned()
+                .into(),
         });
     }
     if trimmed
@@ -330,7 +338,9 @@ pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
         .any(|character| character.is_control() || character == '\0')
     {
         return Err(ProjectError::RemoteRejected {
-            detail: "a remote URL carries no control character".to_owned(),
+            detail: "a remote URL carries no control character"
+                .to_owned()
+                .into(),
         });
     }
     // A query or a fragment is how a token reaches a URL without going through the authority:
@@ -340,7 +350,8 @@ pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
         return Err(ProjectError::RemoteRejected {
             detail: "a remote URL carries no query and no fragment; a repository URL needs \
                      neither, and a credential travels in one"
-                .to_owned(),
+                .to_owned()
+                .into(),
         });
     }
     // `<transport>::<address>` is how Git names a remote helper program, so it is refused before
@@ -357,7 +368,8 @@ pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
             detail: format!(
                 "this remote names the helper program git-remote-{}, which this host does not run",
                 &trimmed[..colon]
-            ),
+            )
+            .into(),
         });
     }
     // A local path next, because it is the one form that is not a URL at all.
@@ -389,7 +401,8 @@ pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
             return Err(ProjectError::RemoteRejected {
                 detail: "a remote URL carries no credential; the approved credential broker \
                          supplies it"
-                    .to_owned(),
+                    .to_owned()
+                    .into(),
             });
         }
         check_host(host)?;
@@ -402,7 +415,7 @@ pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
     // The refusal below names what is wrong and not the URL: a URL this host could not parse is
     // one it cannot redact either, and a malformed authority is exactly where a credential sits.
     let parsed = url::Url::parse(trimmed).map_err(|error| ProjectError::RemoteRejected {
-        detail: format!("this remote is not a URL this host can read: {error}"),
+        detail: format!("this remote is not a URL this host can read: {error}").into(),
     })?;
     let transport = match parsed.scheme() {
         "https" => RemoteTransport::Https,
@@ -413,7 +426,8 @@ pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
                     "{other} is not a transport this host uses; it uses https, ssh and a local \
                      path on this host, and refuses every other transport rather than handing it \
                      to a remote helper"
-                ),
+                )
+                .into(),
             });
         }
     };
@@ -421,7 +435,8 @@ pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
         return Err(ProjectError::RemoteRejected {
             detail: "a remote URL carries no credential; the approved credential broker supplies \
                      it"
-            .to_owned(),
+            .to_owned()
+            .into(),
         });
     }
     if matches!(transport, RemoteTransport::Https) && !parsed.username().is_empty() {
@@ -430,13 +445,14 @@ pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
         return Err(ProjectError::RemoteRejected {
             detail: "an https remote carries no user name in its URL; the approved credential \
                      broker supplies both halves"
-                .to_owned(),
+                .to_owned()
+                .into(),
         });
     }
     let host = parsed
         .host_str()
         .ok_or_else(|| ProjectError::RemoteRejected {
-            detail: "this remote names no host".to_owned(),
+            detail: "this remote names no host".to_owned().into(),
         })?;
     check_host(host)?;
     Ok(ProjectRemote {
@@ -450,12 +466,12 @@ pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
 fn check_host(host: &str) -> Result<()> {
     if host.is_empty() {
         return Err(ProjectError::RemoteRejected {
-            detail: "a remote URL names a host".to_owned(),
+            detail: "a remote URL names a host".to_owned().into(),
         });
     }
     if host.starts_with('-') || host.contains("..") || host.contains('/') {
         return Err(ProjectError::RemoteRejected {
-            detail: format!("{} is not a host name", crate::git::redact(host)),
+            detail: format!("{} is not a host name", crate::git::redact(host)).into(),
         });
     }
     Ok(())
@@ -477,7 +493,8 @@ pub fn require_no_credential(remote_name: &str, stored: &str) -> Result<()> {
             detail: format!(
                 "the remote {remote_name} was stored as a URL this host would not have used: \
                  {error}"
-            ),
+            )
+            .into(),
         })
 }
 

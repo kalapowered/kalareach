@@ -106,7 +106,8 @@ impl OpenedRepository {
                 detail: format!(
                     "{} is not inside a Git working tree, so it is not a project repository",
                     crate::git::redact(&path.display().to_string())
-                ),
+                )
+                .into(),
             });
         }
         if git_dir_path.as_os_str().is_empty() || top_level.as_os_str().is_empty() {
@@ -114,7 +115,8 @@ impl OpenedRepository {
                 detail: format!(
                     "{} did not report its own repository and working tree",
                     crate::git::redact(&path.display().to_string())
-                ),
+                )
+                .into(),
             });
         }
         // The Git directory is opened as an object of its own, because for a linked worktree it
@@ -176,7 +178,8 @@ impl OpenedRepository {
                     expected.git_dir,
                     crate::git::redact(&self.top_level.display().to_string()),
                     self.identity.git_dir
-                ),
+                )
+                .into(),
             });
         }
         if self.identity.work_tree != expected.work_tree {
@@ -187,7 +190,8 @@ impl OpenedRepository {
                     expected.work_tree,
                     crate::git::redact(&self.top_level.display().to_string()),
                     self.identity.work_tree
-                ),
+                )
+                .into(),
             });
         }
         Ok(())
@@ -265,7 +269,8 @@ impl OpenedRepository {
                     crate::git::redact(&self.top_level.display().to_string()),
                     crate::git::redact(&git_dir_path.display().to_string()),
                     crate::git::redact(&top_level.display().to_string())
-                ),
+                )
+                .into(),
             });
         }
         let tree = AuthorisedDirectory::open_root(self.work_tree.environment_id(), &top_level)?;

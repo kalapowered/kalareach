@@ -4,6 +4,55 @@ use std::fmt;
 
 use kr_protocol::error::{ErrorCode, ProtocolError};
 
+/// Free text inside a failure, as this host will repeat it.
+///
+/// The only way to make one applies the rule, so a field on a failure cannot hold what a caller or
+/// a repository chose even when the sentence around it is never formatted. A consumer that reads
+/// the field and a consumer that prints the failure are told the same thing.
+///
+/// The rule leaves its own output alone, so a fragment that was already replaced where the message
+/// was composed comes through here unchanged, and this host's own words stay legible.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Diagnostic(String);
+
+impl Diagnostic {
+    /// Puts one piece of text through the rule and keeps what it may repeat.
+    #[must_use]
+    pub fn new(text: impl AsRef<str>) -> Self {
+        Self(crate::git::redact(text.as_ref()))
+    }
+
+    /// Returns the protected text.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Diagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl fmt::Debug for Diagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.0, formatter)
+    }
+}
+
+impl From<String> for Diagnostic {
+    fn from(text: String) -> Self {
+        Self::new(text)
+    }
+}
+
+impl From<&str> for Diagnostic {
+    fn from(text: &str) -> Self {
+        Self::new(text)
+    }
+}
+
 /// A project-service failure.
 ///
 /// Every variant carries the sentence this host composed for it, and each place that composes one
@@ -18,39 +67,39 @@ pub enum ProjectError {
     /// The project store could not be read or written.
     StoreUnavailable {
         /// What went wrong.
-        detail: String,
+        detail: Diagnostic,
     },
     /// The service's own directories could not be prepared or used.
     StagingUnavailable {
         /// What went wrong.
-        detail: String,
+        detail: Diagnostic,
     },
     /// The request names another environment.
     WrongEnvironment {
         /// The environment the request named.
-        named: String,
+        named: Diagnostic,
         /// The environment this service owns.
-        owned: String,
+        owned: Diagnostic,
     },
     /// The named repository does not exist here.
     UnknownProject {
         /// The identifier that was named.
-        project: String,
+        project: Diagnostic,
     },
     /// The named workspace does not exist here.
     UnknownWorkspace {
         /// The identifier that was named.
-        workspace: String,
+        workspace: Diagnostic,
     },
     /// The named operation does not exist here.
     UnknownOperation {
         /// The identifier that was named.
-        operation: String,
+        operation: Diagnostic,
     },
     /// The destination is not usable for this operation.
     Destination {
         /// What is wrong with it.
-        detail: String,
+        detail: Diagnostic,
     },
     /// The destination exists and the caller chose no adoption flow.
     ///
@@ -58,7 +107,7 @@ pub enum ProjectError {
     /// independently supported adoption flow, and never merges a clone into one.
     AdoptionRequired {
         /// What is at the destination, and what the caller would have to choose.
-        detail: String,
+        detail: Diagnostic,
     },
     /// The repository's stored identity no longer matches the object at its path.
     ///
@@ -66,61 +115,61 @@ pub enum ProjectError {
     /// and nothing is served from it until the identity matches again.
     IdentityChanged {
         /// What was recorded and what is there now.
-        detail: String,
+        detail: Diagnostic,
     },
     /// A remote, a transport or a credential broker is not one this host will use.
     RemoteRejected {
         /// Which rule the remote breaks.
-        detail: String,
+        detail: Diagnostic,
     },
     /// The repository's own configuration names something this host will not execute.
     ConfigurationRejected {
         /// Which key, and why.
-        detail: String,
+        detail: Diagnostic,
     },
     /// Installed Git could not be used.
     GitUnavailable {
         /// What went wrong.
-        detail: String,
+        detail: Diagnostic,
     },
     /// A Git invocation failed, ran too long, or produced more output than the host accepts.
     GitFailed {
         /// The command, its status and its scrubbed output.
-        detail: String,
+        detail: Diagnostic,
     },
     /// The object or the workspace is not in a state that admits this call.
     WrongState {
         /// What state it is in, and what cannot be done in it.
-        detail: String,
+        detail: Diagnostic,
     },
     /// A workspace still has live bound sessions or runs.
     StillBound {
         /// Which sessions, and how many.
-        detail: String,
+        detail: Diagnostic,
     },
     /// The caller's authority does not reach this operation.
     PermissionDenied {
         /// What was refused.
-        detail: String,
+        detail: Diagnostic,
     },
     /// The same action identifier was reused for a different request.
     IdConflict {
         /// The identifier.
-        action: String,
+        action: Diagnostic,
         /// The method it was first used for.
-        method: String,
+        method: Diagnostic,
     },
     /// This host cannot say whether an interrupted publication landed.
     OutcomeUnknown {
         /// What is known, and what is not.
-        detail: String,
+        detail: Diagnostic,
     },
     /// A retained failure, replayed under the code it was first produced with.
     Retained {
         /// The code the first attempt produced.
         code: ErrorCode,
         /// What it said.
-        detail: String,
+        detail: Diagnostic,
     },
     /// The operation's owner stopped it.
     ///
@@ -129,15 +178,15 @@ pub enum ProjectError {
     /// would have created does not exist, and asking again is a new operation rather than a retry.
     Cancelled {
         /// What was stopped.
-        detail: String,
+        detail: Diagnostic,
     },
     /// A configured resource limit is reached.
     QuotaExceeded {
         /// Which limit, and what it is.
-        detail: String,
+        detail: Diagnostic,
     },
     /// A request field is malformed.
-    InvalidArgument(String),
+    InvalidArgument(Diagnostic),
 }
 
 impl fmt::Debug for ProjectError {
@@ -233,21 +282,21 @@ impl ProjectError {
             | Self::Retained { detail, .. }
             | Self::Cancelled { detail }
             | Self::QuotaExceeded { detail }
-            | Self::InvalidArgument(detail) => detail.clone(),
+            | Self::InvalidArgument(detail) => detail.as_str().to_owned(),
         }
     }
 
     /// Wraps a store failure.
     pub fn store(error: impl std::fmt::Display) -> Self {
         Self::StoreUnavailable {
-            detail: error.to_string(),
+            detail: error.to_string().into(),
         }
     }
 
     /// Wraps a directory failure.
     pub fn staging(error: impl std::fmt::Display) -> Self {
         Self::StagingUnavailable {
-            detail: error.to_string(),
+            detail: error.to_string().into(),
         }
     }
 
@@ -300,7 +349,7 @@ impl From<kr_transfer::Escape> for ProjectError {
             // The refusal names the component it refused, which is text the caller supplied, so it
             // goes through the same rule as anything else this host did not choose. An ordinary
             // path comes back as it is; anything a credential is made of does not.
-            detail: crate::git::redact(&error.to_string()),
+            detail: crate::git::redact(&error.to_string()).into(),
         }
     }
 }
@@ -308,7 +357,7 @@ impl From<kr_transfer::Escape> for ProjectError {
 impl From<kr_transfer::TransferError> for ProjectError {
     fn from(error: kr_transfer::TransferError) -> Self {
         Self::StagingUnavailable {
-            detail: error.to_string(),
+            detail: error.to_string().into(),
         }
     }
 }
@@ -331,66 +380,66 @@ mod tests {
             ProjectError::store(HOSTILE),
             ProjectError::staging(HOSTILE),
             ProjectError::WrongEnvironment {
-                named: HOSTILE.to_owned(),
-                owned: HOSTILE.to_owned(),
+                named: HOSTILE.to_owned().into(),
+                owned: HOSTILE.to_owned().into(),
             },
             ProjectError::UnknownProject {
-                project: HOSTILE.to_owned(),
+                project: HOSTILE.to_owned().into(),
             },
             ProjectError::UnknownWorkspace {
-                workspace: HOSTILE.to_owned(),
+                workspace: HOSTILE.to_owned().into(),
             },
             ProjectError::UnknownOperation {
-                operation: HOSTILE.to_owned(),
+                operation: HOSTILE.to_owned().into(),
             },
             ProjectError::Destination {
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::AdoptionRequired {
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::IdentityChanged {
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::RemoteRejected {
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::ConfigurationRejected {
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::GitUnavailable {
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::GitFailed {
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::WrongState {
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::StillBound {
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::PermissionDenied {
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::IdConflict {
-                action: HOSTILE.to_owned(),
-                method: HOSTILE.to_owned(),
+                action: HOSTILE.to_owned().into(),
+                method: HOSTILE.to_owned().into(),
             },
             ProjectError::OutcomeUnknown {
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::Retained {
                 code: ErrorCode::RepositoryUntrusted,
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::Cancelled {
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
             ProjectError::QuotaExceeded {
-                detail: HOSTILE.to_owned(),
+                detail: HOSTILE.to_owned().into(),
             },
-            ProjectError::InvalidArgument(HOSTILE.to_owned()),
+            ProjectError::InvalidArgument(HOSTILE.to_owned().into()),
         ];
         for failure in every {
             let code = failure.code();
@@ -420,6 +469,33 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_this_library_produces_carries_no_raw_text_in_its_own_fields() {
+        // A consumer inside this host can read a failure's field rather than print the failure, and
+        // the field is what the library it wrapped said. SQLite puts the file name it was asked for
+        // into its own message, and that name is a path somebody chose. So the field holds what
+        // this host will repeat and nothing else: the type of the field is the guarantee, rather
+        // than every producer remembering.
+        let refusal = crate::store::Store::open(
+            std::path::Path::new("/dev/null/access_token=FIELDSECRET/projects.sqlite"),
+            kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([1; 16])),
+        )
+        .expect_err("a database beneath something that is not a directory cannot be opened");
+        assert_eq!(refusal.code(), ErrorCode::StorageUnavailable);
+        assert!(!refusal.to_string().contains("FIELDSECRET"));
+        let ProjectError::StoreUnavailable { detail } = &refusal else {
+            panic!("the store reports its own failure: {refusal:?}");
+        };
+        assert!(
+            !detail.as_str().contains("FIELDSECRET"),
+            "the field a consumer reads holds no more than the sentence does: {detail:?}"
+        );
+        assert!(
+            detail.as_str().contains("does-not-repeat"),
+            "and it says that something was replaced: {detail:?}"
+        );
+    }
+
+    #[test]
     fn a_refused_subcommand_is_named_through_the_rule_in_every_rendering() {
         // The one producer the boundary above cannot answer for on its own: a refusal composed out
         // of the caller's own word. The fragment goes through the rule where the sentence is built,
@@ -446,7 +522,9 @@ mod tests {
         // A repeat of an action is owed what happened, not a fresh refusal in another category.
         let retained = ProjectError::Retained {
             code: ErrorCode::RepositoryUntrusted,
-            detail: "the remote's transport is not one this host will use".to_owned(),
+            detail: "the remote's transport is not one this host will use"
+                .to_owned()
+                .into(),
         };
         assert_eq!(retained.code(), ErrorCode::RepositoryUntrusted);
         let protocol: ProtocolError = retained.into();
@@ -459,35 +537,35 @@ mod tests {
         // category, so each of these has to be distinct where the caller's next step differs.
         assert_eq!(
             ProjectError::AdoptionRequired {
-                detail: "the destination holds a checkout".to_owned()
+                detail: "the destination holds a checkout".to_owned().into()
             }
             .code(),
             ErrorCode::InvalidArgument
         );
         assert_eq!(
             ProjectError::IdentityChanged {
-                detail: "the repository was replaced".to_owned()
+                detail: "the repository was replaced".to_owned().into()
             }
             .code(),
             ErrorCode::SourceChanged
         );
         assert_eq!(
             ProjectError::ConfigurationRejected {
-                detail: "core.fsmonitor names a program".to_owned()
+                detail: "core.fsmonitor names a program".to_owned().into()
             }
             .code(),
             ErrorCode::RepositoryUntrusted
         );
         assert_eq!(
             ProjectError::StillBound {
-                detail: "one session is live".to_owned()
+                detail: "one session is live".to_owned().into()
             }
             .code(),
             ErrorCode::ResourceUnavailable
         );
         assert_eq!(
             ProjectError::OutcomeUnknown {
-                detail: "the publication cannot be resolved".to_owned()
+                detail: "the publication cannot be resolved".to_owned().into()
             }
             .code(),
             ErrorCode::OutcomeUnknown

@@ -70,8 +70,8 @@ impl Destination {
     pub fn resolve(request: &DestinationRequest, environment_id: EnvironmentId) -> Result<Self> {
         if request.environment_id != environment_id {
             return Err(ProjectError::WrongEnvironment {
-                named: request.environment_id.to_string(),
-                owned: environment_id.to_string(),
+                named: request.environment_id.to_string().into(),
+                owned: environment_id.to_string().into(),
             });
         }
         if request.name.len() > MAX_NAME_LEN {
@@ -79,7 +79,8 @@ impl Destination {
                 detail: format!(
                     "a destination name is at most {MAX_NAME_LEN} bytes and this one is {}",
                     request.name.len()
-                ),
+                )
+                .into(),
             });
         }
         let parent_path = PathBuf::from(&request.parent_path);
@@ -89,7 +90,8 @@ impl Destination {
                     "{} is not an absolute path; a destination's parent is named absolutely and \
                      resolved once",
                     crate::git::redact(&parent_path.display().to_string())
-                ),
+                )
+                .into(),
             });
         }
         let name = RelativeName::parse(&request.name)?;
@@ -99,7 +101,8 @@ impl Destination {
                     "{} is more than one name; a repository is created as one entry in the \
                      directory whose handle this host holds",
                     crate::git::redact(&request.name)
-                ),
+                )
+                .into(),
             });
         }
         let parent = AuthorisedDirectory::open_root(environment_id, &parent_path)?;
@@ -157,11 +160,13 @@ impl Destination {
                          something",
                         crate::git::redact(&self.path().display().to_string())
                     )
+                    .into()
                 } else {
                     format!(
                         "{} could not be created: {error}",
                         crate::git::redact(&self.path().display().to_string())
                     )
+                    .into()
                 },
             })?;
         self.parent.sync()?;
@@ -182,7 +187,7 @@ impl Destination {
                         .handle()
                         .entries()
                         .map_err(|error| ProjectError::Destination {
-                            detail: format!("{} could not be listed: {error}", self.name),
+                            detail: format!("{} could not be listed: {error}", self.name).into(),
                         })?;
                 Ok(if entries.next().is_some() {
                     DestinationState::NonEmptyDirectory
@@ -245,7 +250,7 @@ impl StagingSibling {
     pub fn open(destination: &Destination, name: &str) -> Result<Self> {
         if !name.starts_with(STAGING_PREFIX) {
             return Err(ProjectError::Destination {
-                detail: format!("{name} is not a staging directory this host created"),
+                detail: format!("{name} is not a staging directory this host created").into(),
             });
         }
         let name = RelativeName::parse(name)?;
@@ -390,7 +395,8 @@ impl StagingSibling {
                      is removed",
                     crate::git::redact(&self.path.display().to_string()),
                     self.directory.identity()
-                ),
+                )
+                .into(),
             });
         }
         // What is inside goes through this sibling's *own* open handle, so every one of those
@@ -409,7 +415,8 @@ impl StagingSibling {
                     detail: format!(
                         "{} could not be removed: {error}",
                         crate::git::redact(&self.path.display().to_string())
-                    ),
+                    )
+                    .into(),
                 });
             }
         }
@@ -443,7 +450,8 @@ pub fn clear_through(directory: &AuthorisedDirectory, path: &Path) -> Result<()>
                     detail: format!(
                         "{} could not be read: {error}",
                         crate::git::redact(&path.display().to_string())
-                    ),
+                    )
+                    .into(),
                 });
             }
         };
@@ -452,7 +460,8 @@ pub fn clear_through(directory: &AuthorisedDirectory, path: &Path) -> Result<()>
                 detail: format!(
                     "{} could not be read: {error}",
                     crate::git::redact(&path.display().to_string())
-                ),
+                )
+                .into(),
             })?;
             let name = entry.file_name();
             let below = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
@@ -469,7 +478,8 @@ pub fn clear_through(directory: &AuthorisedDirectory, path: &Path) -> Result<()>
                         detail: format!(
                             "{} could not be emptied: {error}",
                             crate::git::redact(&path.display().to_string())
-                        ),
+                        )
+                        .into(),
                     });
                 }
             }
@@ -530,7 +540,8 @@ pub fn publish(
                 expected.identity,
                 crate::git::redact(&staging.tree_path().display().to_string()),
                 found.identity
-            ),
+            )
+            .into(),
         });
     }
     let staged = found.identity;
@@ -552,7 +563,8 @@ pub fn publish(
                  which publication landed",
                 crate::git::redact(&destination.path().display().to_string()),
                 published.identity()
-            ),
+            )
+            .into(),
         });
     }
     Ok(staged)
@@ -592,13 +604,15 @@ fn rename_no_replace(
                 "{} was taken between this operation's check and its publication, so nothing was \
                  replaced",
                 crate::git::redact(to_name.as_str())
-            ),
+            )
+            .into(),
         },
         other => ProjectError::Destination {
             detail: format!(
                 "{} could not be published: {other}",
                 crate::git::redact(to_name.as_str())
-            ),
+            )
+            .into(),
         },
     })
 }
@@ -759,7 +773,8 @@ pub fn stage_clone(
                 "the remote {} was stored as a different URL from the one this host passed, so \
                  the clone is not published",
                 remote.specification.remote_name
-            ),
+            )
+            .into(),
         });
     }
     Ok(())
