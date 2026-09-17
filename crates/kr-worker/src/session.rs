@@ -1511,6 +1511,16 @@ impl Session {
         }
     }
 
+    /// Returns whether one subscriber has been told to resynchronise and has not come back.
+    ///
+    /// The queue for a client that stopped reading fills, and the answer is this: the session keeps
+    /// reading the terminal and the client is told to ask for a fresh screen. A test watches it to
+    /// know when that moment has actually arrived, rather than waiting a while and assuming.
+    #[must_use]
+    pub fn is_resynchronising(&self, attachment_id: AttachmentId) -> bool {
+        self.hub.is_resynchronising(attachment_id)
+    }
+
     /// Returns whether one attachment is being held out of live byte forwarding.
     #[must_use]
     pub fn forwarding_held(&self, attachment_id: AttachmentId) -> bool {

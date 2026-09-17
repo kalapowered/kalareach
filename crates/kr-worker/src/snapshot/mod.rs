@@ -260,6 +260,7 @@ pub fn install(
     let generation = snapshot.projection_generation;
     let cursor = snapshot.output_cursor;
     let oldest = wire::row_id(snapshot.oldest_retained_row)?;
+    let inactive_oldest = wire::row_id(snapshot.inactive_oldest_retained_row)?;
     let mut events = vec![
         outgoing(ProjectionEvent::Reset(ProjectionReset {
             projection_generation: U64::new(generation),
@@ -354,14 +355,15 @@ pub fn install(
     }
     let mut pages = Vec::new();
     for (buffer, rows) in converted {
-        // Retention belongs to the buffer that has a scrollback. The alternate buffer keeps no
-        // history, so its own oldest row is the first row it holds and nothing below it was ever
-        // evicted; labelling its pages with the primary's cutoff would tell a client to give up
-        // rows that are the whole of that screen.
-        let (page_oldest, page_evicted) = if buffer == ProjectedBuffer::Primary {
+        // Retention belongs to a buffer, so each buffer's pages carry its own. The engine reports
+        // both: the cutoff of the buffer that is showing and the cutoff of the one that is not.
+        // Labelling one buffer's pages with the other's would tell a client to give up rows that
+        // are the whole of that screen, or to keep rows that are gone, and which of those it is
+        // changes with every buffer switch.
+        let (page_oldest, page_evicted) = if buffer == wire::buffer(snapshot.active_buffer) {
             (oldest, snapshot.evicted)
         } else {
-            (rows.first().map_or(U64::ZERO, |row| row.row), false)
+            (inactive_oldest, snapshot.inactive_evicted)
         };
         for page in paginate(rows) {
             pages.push(ProjectionRowPage {

@@ -730,6 +730,64 @@ mod projection_tests {
         TerminalEngine::new(dimensions(80, 24)).expect("a canonical grid")
     }
 
+    /// KR-REQ-08.83: each buffer's pages carry that buffer's own retention.
+    ///
+    /// The primary buffer keeps a scrollback and gives its oldest rows up; the alternate buffer
+    /// keeps none and numbers its rows from its own beginning. A client told the showing buffer's
+    /// cutoff for the other one would give up rows that are the whole of that screen.
+    #[test]
+    fn each_buffers_pages_carry_that_buffers_own_retention() {
+        let mut engine = engine();
+        // Past the scrollback bound, so the primary buffer has given rows up.
+        let mut stream = Vec::new();
+        for line in 0..3_600 {
+            stream.extend_from_slice(format!("line {line}\r\n").as_bytes());
+        }
+        // Then into the alternate buffer, which starts its own numbering and keeps no history.
+        stream.extend_from_slice(b"\x1b[?1049h");
+        stream.extend_from_slice(b"an application's screen\r\n");
+        engine.feed(0, &stream, LaneGate::default(), 0);
+        let (update, _) = engine
+            .projection_install(
+                dimensions(80, 24),
+                ProjectionResetReason::Attached,
+                LaneGate::default(),
+                0,
+                crate::output::DEFAULT_SEND_QUEUE_BYTES,
+            )
+            .expect("a snapshot");
+        let pages: Vec<&kr_protocol::projection::ProjectionRowPage> = update
+            .events
+            .iter()
+            .filter_map(|outgoing| match &outgoing.event {
+                kr_protocol::projection::ProjectionEvent::Rows(page) => Some(page),
+                _ => None,
+            })
+            .collect();
+        let primary = pages
+            .iter()
+            .find(|page| page.buffer == kr_protocol::projection::ProjectedBuffer::Primary)
+            .expect("the primary buffer's rows");
+        let alternate = pages
+            .iter()
+            .find(|page| page.buffer == kr_protocol::projection::ProjectedBuffer::Alternate)
+            .expect("the alternate buffer's rows");
+        assert!(
+            primary.oldest_retained_row.get() > 0 && primary.evicted,
+            "the primary buffer gave rows up and says so: {:?}",
+            primary.oldest_retained_row
+        );
+        assert!(
+            !alternate.evicted,
+            "the alternate buffer keeps no history, so nothing of it was evicted"
+        );
+        assert_eq!(
+            alternate.oldest_retained_row.get(),
+            0,
+            "and its own numbering starts where it started"
+        );
+    }
+
     /// KR-REQ-08.79 and KR-REQ-08.80: a screen larger than a subscriber's queue is cut to it,
     /// explicitly, rather than refused for ever.
     ///
