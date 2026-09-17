@@ -142,6 +142,16 @@ fn retained(session: &Session) -> Vec<u8> {
     seen
 }
 
+/// How long a wait for something to appear is given.
+///
+/// A liveness wait is not a measurement: it is there to fail when something never happens. The ten
+/// and thirty second windows these waits had were inside the range the slowest reference hosts
+/// reach when several suites share them, which turned each of them into a coin toss; two minutes is
+/// outside it. The poll intervals are unchanged, so a wait that succeeds costs what it always did.
+/// What is deliberately *not* raised is a window that asserts something never arrives, or one that
+/// samples what arrives inside it: those are not waiting for anything.
+const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
+
 async fn retained_within(runtime: &SessionRuntime, marker: &[u8], within: Duration) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + within;
     loop {
@@ -343,7 +353,7 @@ async fn only_the_owners_resize_moves_the_pseudo_terminal() {
         )
         .expect("starts"),
     );
-    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     // The watcher reports the size it is looking at. It is a report, not an insistence.
     {
@@ -385,7 +395,7 @@ async fn only_the_owners_resize_moves_the_pseudo_terminal() {
         assert_eq!(changed.dimensions, Dimensions::new(100, 30));
         assert_eq!(changed.epoch.get(), epoch + 1);
     }
-    let seen = retained_within(&runtime, b"kr-size:30 100", Duration::from_secs(10)).await;
+    let seen = retained_within(&runtime, b"kr-size:30 100", LIVENESS_DEADLINE).await;
     assert!(
         contains(&seen, b"kr-size:30 100"),
         "the kernel moved with the bookkeeping: {}",
@@ -564,7 +574,7 @@ async fn the_oldest_remaining_claim_succeeds_and_the_application_is_resized_to_i
         )
         .expect("starts"),
     );
-    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     {
         let mut session = runtime.session();
@@ -576,7 +586,7 @@ async fn the_oldest_remaining_claim_succeeds_and_the_application_is_resized_to_i
         );
         assert_eq!(succeeded.dimensions, Dimensions::new(100, 30));
     }
-    let seen = retained_within(&runtime, b"kr-size:30 100", Duration::from_secs(10)).await;
+    let seen = retained_within(&runtime, b"kr-size:30 100", LIVENESS_DEADLINE).await;
     assert!(
         contains(&seen, b"kr-size:30 100"),
         "and the application was resized to the successor's size: {}",
@@ -618,7 +628,7 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
     let phone_attachment = attach_over(&mut phone, &wired, Dimensions::new(48, 16), true).await;
     subscribe_over(&mut desk, &wired, desk_attachment).await;
     subscribe_over(&mut phone, &wired, phone_attachment).await;
-    retained_within(&wired.runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     let epoch = wired.runtime.session().geometry().epoch;
     // A stale epoch is refused. The size is not moved by a caller working from a view that has
@@ -666,14 +676,14 @@ async fn a_transfer_quotes_the_expected_epoch_and_notifies_every_attachment_at_o
     // Both attachments learn, and they learn the same thing: the size changed under all of them,
     // so each is told its view is no longer continuous.
     assert!(
-        resynchronised(&mut desk, Duration::from_secs(10)).await,
+        resynchronised(&mut desk, LIVENESS_DEADLINE).await,
         "the desk's view of a session at another size is not continuous with what it had"
     );
     assert!(
-        resynchronised(&mut phone, Duration::from_secs(10)).await,
+        resynchronised(&mut phone, LIVENESS_DEADLINE).await,
         "and neither is the phone's"
     );
-    let seen = retained_within(&wired.runtime, b"kr-size:16 48", Duration::from_secs(10)).await;
+    let seen = retained_within(&wired.runtime, b"kr-size:16 48", LIVENESS_DEADLINE).await;
     assert!(
         contains(&seen, b"kr-size:16 48"),
         "and the shell was resized rather than replaced: {}",
@@ -768,7 +778,7 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
     let mut narrow = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
-    retained_within(&wired.runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     // Everybody joins before anything is drawn, so what each one receives is live output rather
     // than the screen it was restored with.
@@ -821,7 +831,7 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
             .expect("lets the application proceed");
     }
     wired.runtime.flush_input();
-    retained_within(&wired.runtime, b"kr-drawn.", Duration::from_secs(10)).await;
+    retained_within(&wired.runtime, b"kr-drawn.", LIVENESS_DEADLINE).await;
 
     let direct = collect(&mut same, Duration::from_secs(3)).await;
     let also_direct = collect(&mut also_same, Duration::from_secs(3)).await;
@@ -931,11 +941,11 @@ async fn a_transfer_that_moves_no_dimension_still_notifies_every_attachment() {
     // Both are told their view is no longer continuous, in the same locked step that moved the
     // ownership. The snapshot each then asks for carries the committed owner and epoch.
     assert!(
-        resynchronised(&mut desk, Duration::from_secs(10)).await,
+        resynchronised(&mut desk, LIVENESS_DEADLINE).await,
         "the desk is told it no longer owns the size"
     );
     assert!(
-        resynchronised(&mut watching, Duration::from_secs(10)).await,
+        resynchronised(&mut watching, LIVENESS_DEADLINE).await,
         "and so is a window that owns nothing and asked for nothing"
     );
     let snapshot: kr_protocol::recovery::EventsSnapshotResult = desk
@@ -1069,7 +1079,7 @@ async fn a_window_that_changed_presentation_is_told_while_the_application_is_idl
         .expect("connects");
     let attachment = attach_over(&mut client, &wired, CANONICAL, false).await;
     subscribe_over(&mut client, &wired, attachment).await;
-    retained_within(&wired.runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
     collect(&mut client, Duration::from_millis(500)).await;
     assert_eq!(
         presentation_of(&wired, attachment),
@@ -1099,7 +1109,7 @@ async fn a_window_that_changed_presentation_is_told_while_the_application_is_idl
         "and the canonical geometry did not move"
     );
     assert!(
-        resynchronised(&mut client, Duration::from_secs(10)).await,
+        resynchronised(&mut client, LIVENESS_DEADLINE).await,
         "it is told at once that what it holds is no longer continuous"
     );
 
@@ -1121,7 +1131,7 @@ async fn a_window_that_changed_presentation_is_told_while_the_application_is_idl
         .expect("decodes");
     assert_eq!(reported.presentation, TerminalPresentationMode::Direct);
     assert!(
-        resynchronised(&mut client, Duration::from_secs(10)).await,
+        resynchronised(&mut client, LIVENESS_DEADLINE).await,
         "and told again on the way back"
     );
 

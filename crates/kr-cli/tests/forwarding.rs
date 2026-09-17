@@ -250,7 +250,7 @@ impl Keyboard {
         let output = output.clone();
         let keyboard = self.clone();
         std::thread::spawn(move || {
-            if !output.wait_for(b"\x1b[?u", Duration::from_secs(20)) {
+            if !output.wait_for(b"\x1b[?u", LIVENESS_DEADLINE) {
                 return;
             }
             keyboard.types(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
@@ -275,6 +275,16 @@ fn retained(runtime: &SessionRuntime) -> Vec<u8> {
     }
     seen
 }
+
+/// How long a wait for something to appear is given.
+///
+/// A liveness wait is not a measurement: it is there to fail when something never happens. The ten,
+/// twenty and thirty second windows these waits had were inside the range the slowest reference
+/// hosts reach when several suites share them, which turned each of them into a coin toss; two
+/// minutes is outside it. The poll intervals are unchanged, so a wait that succeeds costs what it
+/// always did. The short windows that assert something *never* appears are deliberately left as
+/// they are: they are not waiting for anything.
+const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
 fn retained_within(runtime: &SessionRuntime, marker: &[u8], within: Duration) -> Vec<u8> {
     let deadline = Instant::now() + within;
@@ -383,7 +393,7 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
     let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
     keyboard.answers_the_probe(&output);
     assert!(
-        output.wait_for(b"kr-ready.", Duration::from_secs(30)),
+        output.wait_for(b"kr-ready.", LIVENESS_DEADLINE),
         "the session's screen reached the terminal: {}",
         output.text().escape_debug()
     );
@@ -393,7 +403,7 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
         // One sequence at a time, so an assertion that fails names the sequence that failed rather
         // than a batch, and so the order they arrived in is the order they were typed in.
         let before = retained(&hosted.runtime).len();
-        let seen = retained_within(&hosted.runtime, sequence.bytes, Duration::from_secs(10));
+        let seen = retained_within(&hosted.runtime, sequence.bytes, LIVENESS_DEADLINE);
         assert!(
             contains(&seen, sequence.bytes),
             "{} reached the application unchanged: {:?}",
@@ -479,7 +489,7 @@ async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
     let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
     keyboard.answers_the_probe(&output);
     assert!(
-        output.wait_for(b"kr-ready.", Duration::from_secs(30)),
+        output.wait_for(b"kr-ready.", LIVENESS_DEADLINE),
         "the session's screen reached the terminal: {}",
         output.text().escape_debug()
     );
@@ -488,7 +498,7 @@ async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
     let settled = output.snapshot();
 
     assert!(
-        output.wait_for(b"kr-batch-3.", Duration::from_secs(30)),
+        output.wait_for(b"kr-batch-3.", LIVENESS_DEADLINE),
         "three separate output batches reached the terminal: {}",
         output.text().escape_debug()
     );
@@ -561,7 +571,7 @@ async fn mouse_reports_pass_through_and_a_wheel_event_is_never_an_arrow_key() {
     let keyboard = Keyboard::new(pty.master.take_writer().expect("a writer"));
     keyboard.answers_the_probe(&output);
     assert!(
-        output.wait_for(b"kr-ready.", Duration::from_secs(30)),
+        output.wait_for(b"kr-ready.", LIVENESS_DEADLINE),
         "the session's screen reached the terminal: {}",
         output.text().escape_debug()
     );
@@ -582,7 +592,7 @@ async fn mouse_reports_pass_through_and_a_wheel_event_is_never_an_arrow_key() {
     ];
     for (what, bytes) in reports {
         keyboard.types(bytes);
-        let seen = retained_within(&hosted.runtime, bytes, Duration::from_secs(10));
+        let seen = retained_within(&hosted.runtime, bytes, LIVENESS_DEADLINE);
         assert!(
             contains(&seen, bytes),
             "{what} reached the application as the report it is"
@@ -644,7 +654,7 @@ async fn a_view_without_the_lease_cannot_change_the_applications_focus_state() {
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     assert!(
-        output.wait_for(b"kr-ready.", Duration::from_secs(30)),
+        output.wait_for(b"kr-ready.", LIVENESS_DEADLINE),
         "it watches the session it may not type into: {}",
         output.text().escape_debug()
     );

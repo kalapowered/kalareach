@@ -154,11 +154,14 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     assert!(before > 0, "the client that kept reading received output");
     // Waited for rather than sampled over a fixed window: what this asserts is that more arrives,
     // not how quickly a loaded machine delivers it.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let started = Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
     while received.load(std::sync::atomic::Ordering::Relaxed) <= before {
         assert!(
             Instant::now() < deadline,
-            "the client that kept reading is still receiving while the other is not reading"
+            "waited {:?} for more output to reach the client that kept reading while the other \
+             was not reading",
+            started.elapsed()
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -171,7 +174,8 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     // not a hole it was never told about.
     let mut slow = slow;
     let mut resynchronised = false;
-    let deadline = Instant::now() + Duration::from_secs(60);
+    let started = Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
     while Instant::now() < deadline {
         // A timeout here is not an answer. The loop keeps looking until its own deadline rather
         // than concluding from one quiet moment that nothing is coming.
@@ -188,10 +192,20 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     }
     assert!(
         resynchronised,
-        "the client that stopped reading was told to resynchronise"
+        "waited {:?} for the client that stopped reading to be told to resynchronise",
+        started.elapsed()
     );
     draining.abort();
 }
+
+/// How long a wait for something to arrive is given.
+///
+/// A liveness wait is not a measurement: it is there to fail when something never arrives. Thirty
+/// seconds was inside the range the slowest reference hosts reach when several suites share them,
+/// which turned these waits into coin tosses; two minutes is outside it. The poll intervals are
+/// unchanged, so a wait that succeeds costs what it always did, and each failure says how long it
+/// actually waited. What the assertions themselves say is untouched.
+const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")

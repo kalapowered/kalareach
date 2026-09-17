@@ -160,13 +160,23 @@ fn shell_running(hosted: &Hosted, command_line: &str) -> CommandBuilder {
     builder
 }
 
+/// How long a wait for something to appear is given.
+///
+/// A liveness wait is not a measurement: it is there to fail when something never happens. The ten,
+/// twenty and thirty second windows these waits had were inside the range the slowest reference
+/// hosts reach when several suites share them, which turned each of them into a coin toss; two
+/// minutes is outside it. The poll intervals are unchanged, so a wait that succeeds costs what it
+/// always did. The short windows that assert something *never* appears are deliberately left as
+/// they are: they are not waiting for anything.
+const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
+
 /// Returns the identifier of the `kr` process the shell started.
 ///
 /// The shell has more than one child while an attachment is running: the command, and the guard
 /// the command armed. They are told apart by the executable they are running, because killing the
 /// wrong one would prove nothing.
 fn attach_process(shell: u32) -> Option<u32> {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
     while Instant::now() < deadline {
         let listing = std::process::Command::new("pgrep")
             .args(["-P", &shell.to_string()])
@@ -310,7 +320,7 @@ impl TerminalOutput {
 fn answer_keyboard_queries(output: &TerminalOutput, mut writer: Box<dyn std::io::Write + Send>) {
     let output = output.clone();
     std::thread::spawn(move || {
-        if !output.wait_for(b"\x1b[?u", Duration::from_secs(20)) {
+        if !output.wait_for(b"\x1b[?u", LIVENESS_DEADLINE) {
             return;
         }
         let _ = writer.write_all(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
@@ -330,7 +340,7 @@ fn answer_and_type(
 ) {
     let output = output.clone();
     std::thread::spawn(move || {
-        if !output.wait_for(b"\x1b[?u", Duration::from_secs(20)) {
+        if !output.wait_for(b"\x1b[?u", LIVENESS_DEADLINE) {
             return;
         }
         let mut answer = Vec::from(b"\x1b[?5u".as_slice());
@@ -410,7 +420,7 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
     assert!(
-        output.wait_for(b"ready", Duration::from_secs(30)),
+        output.wait_for(b"ready", LIVENESS_DEADLINE),
         "the session's output reached the terminal: {}",
         output.text()
     );
@@ -442,7 +452,7 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
         .expect("sends the signal");
     assert!(killed.success(), "the attach process was killed");
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
     let mut after = during.clone();
     while Instant::now() < deadline {
         after = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");
@@ -467,7 +477,7 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
     // And the keyboard protocols this terminal had negotiated for itself, which termios does not
     // describe and clearing alone would have taken away.
     assert!(
-        output.wait_for(KEYBOARD_RESTORED, Duration::from_secs(10)),
+        output.wait_for(KEYBOARD_RESTORED, LIVENESS_DEADLINE),
         "the guard put the terminal's own keyboard protocol back: {}",
         output.text().escape_debug()
     );
@@ -520,7 +530,7 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
     assert!(
-        output.wait_for(b"ready", Duration::from_secs(30)),
+        output.wait_for(b"ready", LIVENESS_DEADLINE),
         "the session's output reached the terminal: {}",
         output.text()
     );
@@ -554,7 +564,7 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
     // The attached command ends by itself, its exit status says the detach was not a failure, and
     // its terminal comes back with it.
     assert!(
-        output.wait_for(b"attach-finished-0", Duration::from_secs(30)),
+        output.wait_for(b"attach-finished-0", LIVENESS_DEADLINE),
         "the attachment ended, and an ordinary detach is not a failure: {}",
         output.text()
     );
@@ -565,7 +575,7 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
         "the terminal came back when the attachment ended"
     );
     assert!(
-        output.wait_for(KEYBOARD_RESTORED, Duration::from_secs(10)),
+        output.wait_for(KEYBOARD_RESTORED, LIVENESS_DEADLINE),
         "and so did the keyboard protocol it had negotiated for itself: {}",
         output.text().escape_debug()
     );
@@ -618,7 +628,7 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
     assert!(
-        output.wait_for(b"ready", Duration::from_secs(30)),
+        output.wait_for(b"ready", LIVENESS_DEADLINE),
         "the session's output reached the terminal: {}",
         output.text()
     );
@@ -647,12 +657,12 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
         String::from_utf8_lossy(&detach.stderr)
     );
     assert!(
-        output.wait_for(b"attach-finished-0", Duration::from_secs(30)),
+        output.wait_for(b"attach-finished-0", LIVENESS_DEADLINE),
         "the attachment ended: {}",
         output.text()
     );
     assert!(
-        output.wait_for(KEYBOARD_RESTORED, Duration::from_secs(10)),
+        output.wait_for(KEYBOARD_RESTORED, LIVENESS_DEADLINE),
         "the terminal's own keyboard protocol was put back: {}",
         output.text().escape_debug()
     );
@@ -717,7 +727,7 @@ async fn a_terminal_that_does_not_finish_the_handshake_fails_the_attach_and_keep
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     // Nothing answers. The handshake's own deadline ends it.
     assert!(
-        output.wait_for(b"attach-finished-6", Duration::from_secs(30)),
+        output.wait_for(b"attach-finished-6", LIVENESS_DEADLINE),
         "the attach failed with the terminal's own exit code rather than forwarding input: {}",
         output.text().escape_debug()
     );
@@ -768,7 +778,7 @@ async fn what_was_typed_during_the_handshake_reaches_the_application() {
         b"kr-typed-early\n",
     );
     assert!(
-        output.wait_for(b"kr-typed-early", Duration::from_secs(30)),
+        output.wait_for(b"kr-typed-early", LIVENESS_DEADLINE),
         "the bytes typed during the handshake reached the application: {}",
         output.text().escape_debug()
     );
@@ -821,7 +831,7 @@ async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_a
     answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
 
     assert!(
-        output.wait_for(b"attach-finished-", Duration::from_secs(30)),
+        output.wait_for(b"attach-finished-", LIVENESS_DEADLINE),
         "the attach ended: {}",
         output.text().escape_debug()
     );
@@ -884,7 +894,7 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     assert!(
-        output.wait_for(b"ready", Duration::from_secs(30)),
+        output.wait_for(b"ready", LIVENESS_DEADLINE),
         "the session's output reached the terminal: {}",
         output.text().escape_debug()
     );
@@ -892,7 +902,7 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
     // and a terminal nobody was allowed to ask about cannot be shown to. The attachment is not
     // refused - it watches - and the person is told which of the two they have.
     assert!(
-        output.wait_for(b"will not let it type", Duration::from_secs(10)),
+        output.wait_for(b"will not let it type", LIVENESS_DEADLINE),
         "the person is told that this attachment watches rather than types: {}",
         output.text().escape_debug()
     );
@@ -920,7 +930,7 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
     assert!(killed.success(), "the attach process was killed");
 
     // The guard puts the modes back, which is how this test knows the cleanup ran at all.
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + LIVENESS_DEADLINE;
     while Instant::now() < deadline {
         let after =
             rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the terminal's modes");

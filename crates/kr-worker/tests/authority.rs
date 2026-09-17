@@ -573,7 +573,7 @@ async fn a_subscription_on_a_fenced_connection_stops_delivering() {
         .expect("the call reaches the worker")
         .expect("the subscription succeeds");
     assert!(
-        output_within(&mut first, std::time::Duration::from_secs(4)).await,
+        output_within(&mut first, LIVENESS_DEADLINE).await,
         "the subscription is delivering before anything is fenced"
     );
 
@@ -598,6 +598,15 @@ async fn a_subscription_on_a_fenced_connection_stops_delivering() {
         "and its next request says why"
     );
 }
+
+/// How long a wait for something to appear is given.
+///
+/// A liveness wait is not a measurement: it is there to fail when something never happens. The
+/// windows these waits had were inside the range the slowest reference hosts reach when several
+/// suites share them; two minutes is outside it, and the poll intervals are unchanged, so a wait
+/// that succeeds costs what it always did. The short windows that assert output *never* arrives are
+/// deliberately left as they are: they are not waiting for anything.
+const LIVENESS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Returns whether any session output reaches this client inside `window`.
 async fn output_within(client: &mut LocalClient, window: std::time::Duration) -> bool {
@@ -710,7 +719,7 @@ async fn withdrawal_completes_while_the_peer_has_stopped_reading() {
         .expect("the call reaches the worker")
         .expect("the subscription succeeds");
     assert!(
-        output_within(&mut first, std::time::Duration::from_secs(4)).await,
+        output_within(&mut first, LIVENESS_DEADLINE).await,
         "the subscription is delivering before anything is withdrawn"
     );
     assert_eq!(
@@ -734,14 +743,17 @@ async fn withdrawal_completes_while_the_peer_has_stopped_reading() {
         .expect("the replacement connection is served");
 
     // The attachment goes with the withdrawal, not with the socket.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
     loop {
         if host.service.runtime().session().attachments().is_empty() {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "withdrawal took the connection's attachments back without waiting for its peer"
+            "waited {:?} for withdrawal to take the connection's attachments back without \
+             waiting for its peer",
+            started.elapsed()
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }

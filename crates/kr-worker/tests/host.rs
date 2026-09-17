@@ -159,6 +159,17 @@ impl RunningDaemon {
     }
 }
 
+/// How long a wait for something to appear is given.
+///
+/// A liveness wait is not a measurement. What it is for is to fail when something never happens,
+/// and every second above that is patience rather than looseness: these suites run beside each
+/// other and beside other work, and a host that needs half a minute to publish a closure record is
+/// slow rather than broken. Thirty seconds was inside the range the slowest reference hosts reach,
+/// which turned each of these waits into a coin toss; two minutes is outside it. The poll intervals
+/// are unchanged, so a wait that succeeds costs what it always did, and each failure says how long
+/// it actually waited.
+const LIVENESS_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
@@ -508,7 +519,8 @@ async fn a_closed_session_answers_with_the_record_its_worker_wrote() {
     // A close is accepted before anything is signalled, so the tombstone appears once the daemon
     // has seen the worker end. The list is asked until it does, rather than once and immediately:
     // asking once would be a test of how busy the machine is.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
     let summary = loop {
         let listed: SessionListResult = client
             .request(
@@ -533,7 +545,8 @@ async fn a_closed_session_answers_with_the_record_its_worker_wrote() {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the closed session is listed"
+            "waited {:?} for the closed session to be listed",
+            started.elapsed()
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     };
@@ -569,7 +582,8 @@ async fn close(client: &mut LocalClient, host: &Host, session_id: SessionId) -> 
         .unwrap_or_else(|error| panic!("the close failed: {error}"));
     // The acceptance says `closing`; the closure finishes afterwards. Waiting for the record is
     // what makes the next assertion about the record rather than about the acceptance.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
     while tokio::time::Instant::now() < deadline {
         let listed: SessionListResult = client
             .request(
@@ -591,5 +605,8 @@ async fn close(client: &mut LocalClient, host: &Host, session_id: SessionId) -> 
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    panic!("the session did not finish closing");
+    panic!(
+        "waited {:?} for the session to finish closing",
+        started.elapsed()
+    );
 }

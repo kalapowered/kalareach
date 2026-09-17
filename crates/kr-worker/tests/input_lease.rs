@@ -134,6 +134,16 @@ fn retained(session: &Session) -> Vec<u8> {
 }
 
 /// Waits for `marker` in the runtime's retained output, or gives up after `within`.
+/// How long a wait for something to appear is given.
+///
+/// A liveness wait is not a measurement: it is there to fail when something never happens. The five
+/// and ten second windows these waits had were inside the range the slowest reference hosts reach
+/// when several suites share them, which turned each of them into a coin toss; two minutes is
+/// outside it. The poll intervals are unchanged, so a wait that succeeds costs what it always did.
+/// What is deliberately *not* raised is a window that asserts something never arrives, or one that
+/// samples what arrives inside it: those are not waiting for anything.
+const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
+
 async fn retained_within(runtime: &SessionRuntime, marker: &[u8], within: Duration) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + within;
     loop {
@@ -485,7 +495,7 @@ async fn a_takeover_ends_the_other_lease_and_the_approval_executes_once() {
     let first_lease = acquire_over(&mut first, &wired, held_by_first)
         .await
         .expect("the first holder");
-    retained_within(&wired.runtime, b"kr-approve?", Duration::from_secs(10)).await;
+    retained_within(&wired.runtime, b"kr-approve?", LIVENESS_DEADLINE).await;
 
     // The second controller takes the keys while the prompt is waiting for an answer.
     let second_lease = acquire_over(&mut second, &wired, held_by_second)
@@ -520,7 +530,7 @@ async fn a_takeover_ends_the_other_lease_and_the_approval_executes_once() {
     .await
     .expect("the holder's answer reaches the application");
 
-    let seen = retained_within(&wired.runtime, b"kr-granted:1:", Duration::from_secs(10)).await;
+    let seen = retained_within(&wired.runtime, b"kr-granted:1:", LIVENESS_DEADLINE).await;
     // Given a moment in which a second execution could have been reported, it was not.
     tokio::time::sleep(Duration::from_millis(500)).await;
     let seen = if contains(&seen, b"kr-granted:1:") {
@@ -562,7 +572,7 @@ async fn a_takeover_ends_the_other_lease_and_the_approval_executes_once() {
     )
     .await
     .expect("the next prompt's answer");
-    let seen = retained_within(&wired.runtime, b"kr-granted:2:", Duration::from_secs(10)).await;
+    let seen = retained_within(&wired.runtime, b"kr-granted:2:", LIVENESS_DEADLINE).await;
     assert!(
         contains(&seen, b"kr-granted:2:y."),
         "a second approval is reportable, and reports the answer it was given: {}",
@@ -760,7 +770,7 @@ async fn a_forwarded_caller_claiming_a_network_ingress_is_refused_the_lease() {
 async fn an_incompatible_controller_is_refused_the_lease_over_the_wire() {
     // The application asks for all keys as escape codes before anybody attaches.
     let wired = wired("stty raw -echo; printf '\\033[=8;1ukr-ready.'; exec cat").await;
-    retained_within(&wired.runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
     let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
@@ -833,7 +843,7 @@ async fn a_lease_the_host_ends_reports_its_interrupted_input_to_the_next_holder(
         )
         .expect("starts"),
     );
-    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     {
         let mut session = runtime.session();
@@ -918,7 +928,7 @@ async fn a_plain_escape_reaches_the_application_with_no_paste_prefix_hold() {
         )
         .expect("starts"),
     );
-    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     let accepted = {
         let mut session = runtime.session();
@@ -932,7 +942,7 @@ async fn a_plain_escape_reaches_the_application_with_no_paste_prefix_hold() {
     );
     assert_eq!(accepted.forwarded_bytes, 1);
     runtime.flush_input();
-    let seen = retained_within(&runtime, b"kr-ready.\x1b", Duration::from_secs(5)).await;
+    let seen = retained_within(&runtime, b"kr-ready.\x1b", LIVENESS_DEADLINE).await;
     assert!(
         contains(&seen, b"kr-ready.\x1b"),
         "and it arrived at once: {seen:?}"
@@ -964,7 +974,7 @@ async fn a_delimiter_split_across_frames_reaches_the_application_once_with_its_p
         )
         .expect("starts"),
     );
-    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     // Four bytes of the start delimiter, then the rest with its payload behind it.
     {
@@ -987,7 +997,7 @@ async fn a_delimiter_split_across_frames_reaches_the_application_once_with_its_p
         assert_eq!(second.held_prefix_bytes, 0);
     }
     runtime.flush_input();
-    let seen = retained_within(&runtime, PASTE_END, Duration::from_secs(10)).await;
+    let seen = retained_within(&runtime, PASTE_END, LIVENESS_DEADLINE).await;
     assert_eq!(
         count(&seen, PASTE_START),
         1,
@@ -1029,7 +1039,7 @@ async fn a_paste_open_when_the_mode_was_turned_off_is_still_closed_before_the_ne
         )
         .expect("starts"),
     );
-    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     {
         let mut session = runtime.session();
@@ -1052,7 +1062,7 @@ async fn a_paste_open_when_the_mode_was_turned_off_is_still_closed_before_the_ne
         );
     }
     runtime.flush_input();
-    retained_within(&runtime, b"half", Duration::from_secs(10)).await;
+    retained_within(&runtime, b"half", LIVENESS_DEADLINE).await;
 
     let taken = {
         let mut session = runtime.session();
@@ -1080,7 +1090,7 @@ async fn a_paste_open_when_the_mode_was_turned_off_is_still_closed_before_the_ne
     }
     runtime.flush_input();
 
-    let seen = retained_within(&runtime, b"kr-after.", Duration::from_secs(10)).await;
+    let seen = retained_within(&runtime, b"kr-after.", LIVENESS_DEADLINE).await;
     let terminator = seen
         .windows(PASTE_END.len())
         .position(|window| window == PASTE_END)
@@ -1130,7 +1140,7 @@ async fn an_incomplete_delimiter_is_discarded_on_source_loss_and_counted() {
         )
         .expect("starts"),
     );
-    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     {
         let mut session = runtime.session();
@@ -1159,7 +1169,7 @@ async fn an_incomplete_delimiter_is_discarded_on_source_loss_and_counted() {
         assert_eq!(accepted.held_prefix_bytes, 4);
     }
     runtime.flush_input();
-    retained_within(&runtime, b"kr-typed.", Duration::from_secs(10)).await;
+    retained_within(&runtime, b"kr-typed.", LIVENESS_DEADLINE).await;
 
     // The source goes.
     {
@@ -1234,7 +1244,7 @@ async fn focus_scrollback_replies_and_an_idle_window_never_seize_the_lease() {
         )
         .expect("starts"),
     );
-    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     // An idle window opens. It observes and it takes nothing.
     let idle = {
@@ -1323,7 +1333,7 @@ async fn nothing_journals_a_keystroke_and_reaching_the_terminal_is_not_an_effect
         .expect("acquires")
         .to_typed()
         .expect("decodes");
-    retained_within(&wired.runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
 
     let secret = b"kr-secret-keystrokes";
     let accepted: InputWriteResult = client
@@ -1584,7 +1594,7 @@ async fn the_input_methods_check_the_encoder_the_lease_epoch_and_the_sequence() 
     // Waited for, because until the root program has put the terminal into raw mode with the echo
     // off the line discipline echoes input as well, and a byte that came back twice would be read
     // as the host having written it twice.
-    retained_within(&wired.runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    retained_within(&wired.runtime, b"kr-ready.", LIVENESS_DEADLINE).await;
     let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
@@ -1763,7 +1773,7 @@ async fn the_input_methods_check_the_encoder_the_lease_epoch_and_the_sequence() 
     assert!(released.lease.epoch.get() > epoch.get());
 
     // What was accepted did reach the application, which is what the ordered stream is for.
-    let seen = retained_within(&wired.runtime, b"kr-one.", Duration::from_secs(10)).await;
+    let seen = retained_within(&wired.runtime, b"kr-one.", LIVENESS_DEADLINE).await;
     assert_eq!(count(&seen, b"kr-one."), 1);
     assert!(
         !contains(&seen, b"kr-again."),
@@ -1915,7 +1925,8 @@ async fn an_idle_connection_that_never_acquires_leaves_the_lease_where_it_was() 
     .expect("subscribes");
     // It receives output, which is what watching is.
     let mut received = false;
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
     while tokio::time::Instant::now() < deadline {
         let Ok(Ok(frame)) = tokio::time::timeout(Duration::from_secs(2), idle.recv()).await else {
             break;
@@ -1927,7 +1938,11 @@ async fn an_idle_connection_that_never_acquires_leaves_the_lease_where_it_was() 
             break;
         }
     }
-    assert!(received, "the idle window is being shown the session");
+    assert!(
+        received,
+        "waited {:?} for the idle window to be shown the session",
+        started.elapsed()
+    );
     assert_eq!(
         wired.runtime.session().lease().epoch.get(),
         lease.lease.epoch.get(),
