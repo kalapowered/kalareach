@@ -589,6 +589,14 @@ impl TerminalOutput {
             .is_ok_and(|seen| seen.windows(marker.len()).any(|window| window == marker))
     }
 
+    /// Every byte the terminal has been sent, as it was sent.
+    fn bytes(&self) -> Vec<u8> {
+        self.seen
+            .lock()
+            .map(|seen| seen.clone())
+            .unwrap_or_default()
+    }
+
     /// How many times a sequence appears in what the terminal has been sent.
     fn count(&self, marker: &[u8]) -> usize {
         self.seen.lock().map_or(0, |seen| {
@@ -618,7 +626,11 @@ fn answer_keyboard_queries(
 ) -> std::thread::JoinHandle<()> {
     let output = output.clone();
     std::thread::spawn(move || {
-        output.expect_within(b"\x1b[?u", LIVENESS_DEADLINE, QUERY_EXPECTED);
+        // The device-attributes request is the one question every profile asks, so it is what this
+        // waits for. The two keyboard answers are volunteered: this terminal implements both
+        // protocols and says so, and a reply a terminal gives unbidden is still the truth about
+        // itself, which is what the restoration puts back.
+        output.expect_within(b"\x1b[c", LIVENESS_DEADLINE, QUERY_EXPECTED);
         writer
             .write_all(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c")
             .expect("answers the queries");
@@ -626,8 +638,8 @@ fn answer_keyboard_queries(
     })
 }
 
-/// What a terminal is waiting for when it answers the keyboard queries.
-const QUERY_EXPECTED: &str = "the command asked this terminal what keyboard protocol it had";
+/// What a terminal is waiting for when it answers the queries this command asks.
+const QUERY_EXPECTED: &str = "the command asked this terminal what it is";
 
 /// Waits for the thread that answers this terminal's queries, and gives the test what it found.
 ///
@@ -657,7 +669,7 @@ fn answer_and_type(
 ) -> std::thread::JoinHandle<()> {
     let output = output.clone();
     std::thread::spawn(move || {
-        output.expect_within(b"\x1b[?u", LIVENESS_DEADLINE, QUERY_EXPECTED);
+        output.expect_within(b"\x1b[c", LIVENESS_DEADLINE, QUERY_EXPECTED);
         let mut answer = Vec::from(b"\x1b[?5u".as_slice());
         answer.extend_from_slice(typed);
         answer.extend_from_slice(b"\x1b[>4;2m\x1b[?62;22c");
@@ -677,6 +689,107 @@ const KEYBOARD_RESTORED: &[u8] = b"\x1b[=5;1u";
 /// it is given in whatever reads it likes, so this is waited for in its own right rather than
 /// checked once the sequence before it has arrived.
 const MODIFY_OTHER_KEYS_RESTORED: &[u8] = b"\x1b[>4;2m";
+
+/// The mode state a stream of bytes leaves a terminal in: the last value each mode was given.
+///
+/// Keyed by the parameter as it was written, so a DEC private mode keeps its `?`. Only the
+/// single-parameter forms are read, which is the only form anything here writes.
+fn final_modes(stream: &[u8]) -> std::collections::BTreeMap<String, bool> {
+    let mut modes = std::collections::BTreeMap::new();
+    let mut index = 0;
+    while index + 2 < stream.len() {
+        if &stream[index..index + 2] != b"\x1b[" {
+            index += 1;
+            continue;
+        }
+        let mut at = index + 2;
+        let mut key = String::new();
+        if stream.get(at) == Some(&b'?') {
+            key.push('?');
+            at += 1;
+        }
+        while let Some(byte) = stream.get(at).copied() {
+            if byte.is_ascii_digit() {
+                key.push(char::from(byte));
+                at += 1;
+            } else {
+                break;
+            }
+        }
+        match stream.get(at) {
+            Some(b'h') if !key.is_empty() && key != "?" => {
+                modes.insert(key, true);
+            }
+            Some(b'l') if !key.is_empty() && key != "?" => {
+                modes.insert(key, false);
+            }
+            _ => {}
+        }
+        index += 2;
+    }
+    modes
+}
+
+/// The last position a sequence appears at in a stream.
+fn last_index(stream: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || stream.len() < needle.len() {
+        return None;
+    }
+    (0..=stream.len() - needle.len()).rev().find(|start| {
+        stream
+            .get(*start..*start + needle.len())
+            .is_some_and(|window| window == needle)
+    })
+}
+
+/// Asserts a terminal was left in its own state rather than in the session's.
+///
+/// Termios describes the driver. It says nothing about the alternate screen, mouse reporting,
+/// bracketed paste, the coordinate system or the cursor, and a person left in any of those has a
+/// terminal that behaves like somebody else's: a mouse that prints escape sequences when they
+/// select text, or a screen that types over itself. This reads the modes out of what the terminal
+/// actually received, checks the state they add up to, and checks the order: the alternate screen
+/// is left first, so everything after it lands in the buffer the person is left looking at, and the
+/// keyboard protocols the terminal reported are put back last of all.
+fn assert_the_terminal_was_left_its_own(stream: &[u8]) {
+    let modes = final_modes(stream);
+    for (mode, expected, what) in [
+        ("?1049", false, "the alternate screen"),
+        ("?1000", false, "mouse reporting"),
+        ("?1002", false, "button-event mouse reporting"),
+        ("?1003", false, "any-event mouse reporting"),
+        ("?1004", false, "focus reporting"),
+        ("?1006", false, "SGR mouse encoding"),
+        ("?1007", false, "alternate scroll"),
+        ("?2004", false, "bracketed paste"),
+        ("?2026", false, "synchronised output"),
+        ("?69", false, "left and right margins"),
+        ("?6", false, "origin mode"),
+        ("4", false, "insert mode"),
+        ("?1", false, "application cursor keys"),
+        ("?7", true, "autowrap"),
+        ("?25", true, "the cursor"),
+    ] {
+        assert_eq!(
+            modes.get(mode).copied(),
+            Some(expected),
+            "{what} was left as the terminal's own, not the session's: {:?}",
+            modes
+        );
+    }
+    let reset = last_index(stream, kr_cli::terminal::RESET_SEQUENCES)
+        .unwrap_or_else(|| panic!("the restoration wrote the whole reset block"));
+    assert!(
+        kr_cli::terminal::RESET_SEQUENCES.starts_with(b"\x1b[?1049l"),
+        "and it begins by leaving the alternate screen"
+    );
+    if let Some(keyboard) = last_index(stream, KEYBOARD_RESTORED) {
+        assert!(
+            keyboard > reset,
+            "the keyboard state the terminal reported is put back after the modes are cleared"
+        );
+    }
+}
 
 /// Counts the Kitty keyboard stack operations in what reached a terminal.
 ///
@@ -799,6 +912,8 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
         LIVENESS_DEADLINE,
         "and its modifyOtherKeys level",
     );
+    // And everything else the emulator holds and termios does not describe.
+    assert_the_terminal_was_left_its_own(&output.bytes());
     // The control characters too. A terminal whose modes look right and whose interrupt key does
     // nothing has not been restored.
     for index in [
@@ -907,6 +1022,8 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
         "nothing was pushed or popped: {}",
         output.text().escape_debug()
     );
+    // And everything else the emulator holds and termios does not describe.
+    assert_the_terminal_was_left_its_own(&output.bytes());
     let _ = shell.kill();
     let _ = shell.wait();
 }
@@ -1177,8 +1294,8 @@ async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_a
     );
     answered(queries);
     assert!(
-        output.contains(b"\x1b[?u"),
-        "the handshake did happen, so this terminal's state was read: {}",
+        output.contains(b"\x1b[c"),
+        "the handshake did happen, so this terminal was asked what it was: {}",
         output.text().escape_debug()
     );
     assert_eq!(
@@ -1311,8 +1428,13 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
     // The outer session runs a shell that stays as the session leader; the inner one echoes what
     // it reads, so what the person typed is visible from outside the process.
     let outer = hosted("stty raw -echo; printf 'kr-outer.'; exec /bin/sh").await;
-    let (inner_display, inner) =
-        second_session(&outer, "stty raw -echo; printf 'kr-inner.'; exec cat").await;
+    // The inner application turns bracketed paste on, so a paste through both sessions is a real
+    // paste rather than a person typing marker bytes.
+    let (inner_display, inner) = second_session(
+        &outer,
+        "stty raw -echo; printf 'kr-inner.'; printf '\\033[?2004h'; exec cat",
+    )
+    .await;
 
     let pty = native_pty_system()
         .openpty(PtySize {
@@ -1343,7 +1465,7 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
         let output = output.clone();
         let keyboard = Arc::clone(&keyboard);
         std::thread::spawn(move || {
-            if !output.wait_for(b"\x1b[?u", Duration::from_secs(20)) {
+            if !output.wait_for(b"\x1b[c", Duration::from_secs(20)) {
                 return;
             }
             if let Ok(mut writer) = keyboard.lock() {
@@ -1362,11 +1484,20 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
         "the outer session's screen reached the terminal: {}",
         output.text().escape_debug()
     );
+    // The outer attachment owns this terminal's driver state. Whatever the inner one does, this is
+    // what has to still be true afterwards.
+    let outer_raw = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the modes");
+    assert!(
+        !outer_raw
+            .local_modes
+            .contains(rustix::termios::LocalModes::ICANON),
+        "the outer attachment put the real terminal into raw mode"
+    );
 
     // The inner attach, typed into the outer session's shell. Its own probe asks the outer KR
     // terminal, which answers as the sole responder for that session.
     let inner_command = format!(
-        "{} attach {}\n",
+        "{} attach {}; printf 'inner-finished-%s\\n' \"$?\"\n",
         env!("CARGO_BIN_EXE_kr"),
         inner_display.get()
     );
@@ -1418,6 +1549,113 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
     assert!(
         !output.contains(b"outer-finished-"),
         "the outer attachment is still running, so nothing outer took the end-of-file byte: {}",
+        output.text().escape_debug()
+    );
+    // Nothing the inner command asked the outer terminal reached the inner application. The
+    // replies to its handshake arrive on the same stream as the person's typing and are separated
+    // from it: an application that was sent a device report would echo one here, because it echoes
+    // everything it reads.
+    for reply in [&b"\x1b[?62;22c"[..], &b"\x1b[?5u"[..]] {
+        assert!(
+            !saw(&seen, reply),
+            "no reply to the handshake was forwarded as input: {:?} in {}",
+            String::from_utf8_lossy(reply),
+            String::from_utf8_lossy(&seen).escape_debug()
+        );
+    }
+
+    // A paste, through both sessions. The inner application enabled bracketed paste, so each
+    // session in the chain has it on and the paste has to arrive framed, whole and once: a marker
+    // delivered twice is a paste the application reads as two, and a marker stripped on the way is
+    // a paste it cannot tell from typing.
+    types(b"\x1b[200~kr-pasted\x1b[201~");
+    let framed = &b"\x1b[200~kr-pasted\x1b[201~"[..];
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut pasted = Vec::new();
+    while Instant::now() < deadline {
+        pasted = application_saw(&inner);
+        if saw(&pasted, framed) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        saw(&pasted, framed),
+        "the paste reached the inner session's application, framed: {}",
+        String::from_utf8_lossy(&pasted).escape_debug()
+    );
+    let opened = pasted
+        .windows(6)
+        .filter(|window| *window == b"\x1b[200~")
+        .count();
+    assert_eq!(
+        opened,
+        1,
+        "once, however many sessions it passed through: {}",
+        String::from_utf8_lossy(&pasted).escape_debug()
+    );
+
+    // How the inner attachment is being served, said rather than assumed. It claimed the geometry
+    // of the terminal it was handed, which is the outer session's own terminal, so the two agree
+    // about size and it is forwarded the stream. A projection is what an attachment of another
+    // size is served, and that is the same rule inside a nesting as outside it.
+    let presentation = inner
+        .session()
+        .attachments()
+        .into_iter()
+        .find_map(|summary| summary.presentation.as_ref().copied());
+    assert_eq!(
+        presentation,
+        Some(kr_protocol::attachment::TerminalPresentationMode::Direct),
+        "the inner attachment is forwarded the stream, because it claimed the geometry"
+    );
+
+    // An orderly inner detach, from outside. The inner command ends, its status says a detach is
+    // not a failure, and the outer attachment is untouched by the cleanup of an attachment that
+    // was never holding this terminal.
+    let detach = std::process::Command::new(env!("CARGO_BIN_EXE_kr"))
+        .args(["detach", &inner_display.get().to_string()])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env(
+            "KR_RUNTIME_DIR",
+            outer.temp.paths().runtime_root().display().to_string(),
+        )
+        .env(
+            "KR_STATE_DIR",
+            outer.temp.paths().state_root().display().to_string(),
+        )
+        .output()
+        .expect("runs the detach");
+    assert!(
+        detach.status.success(),
+        "the detach succeeded: {}",
+        String::from_utf8_lossy(&detach.stderr)
+    );
+    assert!(
+        output.wait_for(b"inner-finished-0", Duration::from_secs(30)),
+        "the inner command ended, and an ordinary detach is not a failure: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        !output.contains(b"outer-finished-"),
+        "while the outer attachment carried on: {}",
+        output.text().escape_debug()
+    );
+    let after_inner = rustix::termios::tcgetattr(terminal_fd(&pty)).expect("reads the modes");
+    assert_eq!(
+        after_inner.local_modes.bits(),
+        outer_raw.local_modes.bits(),
+        "and the real terminal is still in the state its own attachment put it in: the inner \
+         cleanup restored the terminal it was given, which is the outer session's"
+    );
+
+    // And the keys go back to the outer session's shell, which is what was in the foreground
+    // before the inner command took it.
+    types(b"printf 'kr-back.'\n");
+    assert!(
+        output.wait_for(b"kr-back.", Duration::from_secs(30)),
+        "the outer session's shell is reading again: {}",
         output.text().escape_debug()
     );
     let _ = shell.kill();

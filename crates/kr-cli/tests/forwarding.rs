@@ -348,10 +348,15 @@ impl Keyboard {
         let output = output.clone();
         let keyboard = self.clone();
         std::thread::spawn(move || {
+            // The device-attributes request is the question every profile asks, and the last of
+            // them, so it is what this waits for: a terminal calling itself `xterm-256color` is
+            // asked no keyboard question at all. The keyboard answers are volunteered, and a reply
+            // a terminal gives unbidden is still the truth about itself, which is what a cleanup
+            // puts back.
             output.expect_within(
-                b"\x1b[?u",
+                b"\x1b[c",
                 LIVENESS_DEADLINE,
-                "the command asked this terminal what keyboard protocol it had",
+                "the command asked this terminal what it is",
             );
             keyboard.types(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
         })
@@ -661,6 +666,17 @@ async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
     assert!(
         cleared <= 1,
         "the screen was cleared {cleared} times while two batches flowed: {}",
+        String::from_utf8_lossy(during).escape_debug()
+    );
+    // And counted directly, because a repaint need not clear the screen: a projected frame can
+    // draw row by row with a cursor address and an erase to the end of the line, and its text
+    // would satisfy every assertion below. Every such frame opens by establishing the coordinate
+    // system it addresses in, which is a sequence nothing else writes, so counting that counts the
+    // frames. At most one, which is the transition into forwarding.
+    let frames = count(during, b"\x1b[?69l\x1b[r\x1b[4l\x1b[?7l");
+    assert!(
+        frames <= 1,
+        "{frames} projected frames were drawn while two batches flowed: {}",
         String::from_utf8_lossy(during).escape_debug()
     );
     assert!(
