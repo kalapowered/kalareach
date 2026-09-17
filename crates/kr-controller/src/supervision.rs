@@ -508,6 +508,24 @@ impl SystemdSupervisor {
         for (name, value) in desktop {
             arguments.push(format!("--setenv={name}={value}"));
         }
+        // Every other handle a login session publishes is removed from what the unit inherits.
+        // Setting the collected ones is not enough on its own: the user manager holds one
+        // environment for the whole user, so a handle this host did not collect would reach the
+        // worker from whichever login imported it, and a worker watching one desktop while its
+        // tools reach another is what an execution context has to rule out. The two lists are
+        // disjoint, which is what lets this stand although the manager applies it last.
+        let cleared: Vec<&str> = crate::desktop::agent::session_variables()
+            .into_iter()
+            .filter(|name| {
+                !launch
+                    .desktop_environment
+                    .iter()
+                    .any(|(set, _)| set == name)
+            })
+            .collect();
+        if !cleared.is_empty() {
+            arguments.push(format!("--property=UnsetEnvironment={}", cleared.join(" ")));
+        }
         arguments.push(launch.program.display().to_string());
         arguments.extend(launch.arguments.clone());
         let borrowed: Vec<&str> = arguments.iter().map(String::as_str).collect();

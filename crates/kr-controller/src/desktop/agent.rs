@@ -1,9 +1,10 @@
 //! Putting a worker in the selected desktop's session.
 //!
-//! Two of the three platforms do this for us. A macOS job bootstrapped into the user's graphical
-//! domain is in the Aqua login session by construction, and a Windows worker started by the
-//! per-user host agent is in the interactive logon session that agent runs in. Neither needs
-//! anything carried across.
+//! A macOS job bootstrapped into the user's graphical domain is in the Aqua login session by
+//! construction, so nothing has to be carried across. Windows runs every one of a user's processes
+//! in that user's own interactive session, so a worker this daemon starts is in the session this
+//! daemon is in; selecting a different logon session would need a per-user agent running in it,
+//! which this build does not install.
 //!
 //! Linux does need it. A user service manager started at boot — which is what a lingering user
 //! has — has no display, no compositor socket and no session message bus, because those belong to
@@ -13,8 +14,13 @@
 //! So the graphical session's own environment is collected here and passed to the worker's unit.
 //! The session's leader is asked first, because its environment is that session's by definition:
 //! the user manager holds one environment for the whole user, which on a host with two concurrent
-//! logins can describe either of them or neither. The manager is the fallback, and what it offers
-//! is used only when it names the session this host selected or names no session at all.
+//! logins can describe either of them. The manager is the fallback, and what it offers is used
+//! only when it says which session it describes and says the selected one; a listing attributed
+//! to no session is not evidence about this one.
+//!
+//! What is passed to the unit is the whole of what it gets. Every other login-session handle is
+//! removed from the environment the user manager would otherwise pass on, because a display this
+//! host did not collect would still reach the worker from whichever login imported it.
 //!
 //! The selected session's own identifier travels with the rest, so the worker reads the session
 //! this host chose rather than looking one up again.
@@ -29,15 +35,37 @@ use kr_protocol::identity::WorkerProfile;
 
 /// The variables a graphical login session publishes that a desktop tool needs.
 ///
-/// Each one is a handle to something that belongs to the login session: the display, the
-/// compositor socket, the display authority, the session message bus, the session's runtime
-/// directory and the session's own identity. A worker that is missing one of them is in the login
-/// session and unable to reach part of it.
+/// Each one is a handle to something the login session publishes: the display, the compositor
+/// socket, the display authority, the session message bus, the user's runtime directory and the
+/// session's own identity. A worker that is missing one of them is in the login session and unable
+/// to reach part of it.
 ///
 /// It is the worker's own list rather than a second one. What is collected here is exactly what a
 /// session's environment takes from its execution context, and two lists that drifted apart would
 /// mean a variable collected and then discarded, or discarded and then missed.
 pub const DESKTOP_VARIABLES: &[&str] = kr_worker::environment::DESKTOP_VARIABLES;
+
+/// The desktop variable that belongs to the user rather than to one of the user's login sessions.
+///
+/// The runtime directory is the same directory for every login of one user, so it says nothing
+/// about which desktop a value came from, and it carries the host's own socket paths as well as
+/// the desktop's.
+const USER_RUNTIME_DIRECTORY: &str = "XDG_RUNTIME_DIR";
+
+/// Returns the desktop variables that belong to one login session.
+///
+/// These are the handles a worker must not inherit from a login this host did not select: each one
+/// names that login's own display, authority, message bus or session. Removing them and then
+/// putting the selected session's back is what makes the worker's context the selected desktop's
+/// rather than the union of every login the user has.
+#[must_use]
+pub fn session_variables() -> Vec<&'static str> {
+    DESKTOP_VARIABLES
+        .iter()
+        .copied()
+        .filter(|name| *name != USER_RUNTIME_DIRECTORY)
+        .collect()
+}
 
 /// Returns the desktop environment a worker of this profile is started with.
 ///
@@ -97,10 +125,16 @@ fn environ_pairs(block: &str) -> Vec<(String, String)> {
 mod platform {
     /// Reads the graphical session's environment, from its leader and then the user manager.
     ///
-    /// The leader's own environment is that session's, so it is read first. The user manager holds
-    /// one environment for the user rather than one per session, so what it offers is accepted
-    /// only when it names the selected session or names none at all: on a host where the same user
-    /// is logged in twice, the manager can be describing the other login.
+    /// The leader's own environment is that session's by definition, so it is read first. The user
+    /// manager holds one environment for the whole user rather than one per session, so what it
+    /// offers is used only when it says which session it describes and says the selected one. A
+    /// listing that attributes itself to nothing is not evidence about this session: on a host
+    /// where the same user is logged in twice it is as likely to be the other login's display, and
+    /// a worker given that would watch one desktop while its tools reached another.
+    ///
+    /// A session whose environment cannot be attributed is a worker started with no desktop
+    /// handles, which its capability records then say. That is the honest answer, and it is a
+    /// better one than a display belonging to a login this host did not select.
     pub(super) fn desktop_environment(session: &str) -> Vec<(String, String)> {
         let mut collected = Vec::new();
         if let Some(leader) = session_leader(session)
@@ -116,10 +150,10 @@ mod platform {
         }
         if let Some(printed) = output("systemctl", &["--user", "show-environment"]) {
             let offered = super::key_values(&printed);
-            let names_another = offered.iter().any(|(name, value)| {
-                name == "XDG_SESSION_ID" && !value.is_empty() && value != session
-            });
-            if !names_another {
+            let names_this_session = offered
+                .iter()
+                .any(|(name, value)| name == "XDG_SESSION_ID" && value == session);
+            if names_this_session {
                 collected.extend(offered);
             }
         }
