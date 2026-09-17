@@ -1395,6 +1395,73 @@ fn a_mark_added_to_a_settled_cell_reaches_a_delta() {
     );
 }
 
+/// A link is never admitted past the hyperlink envelope, whatever the account was holding.
+///
+/// Every link is charged what it will cost where it arrives, and a row that is dropped gives
+/// nothing back until the objects on it are measured again, so the charged figure drifts above the
+/// truth while a session prints. The engine reads the truth before it refuses a link on the drifted
+/// figure. That reading replaces the account with what the grid is holding, and the object being
+/// admitted is not on a row yet, so it has to happen before anything is charged for that link: a
+/// reading between the object's charge and the table entry's would erase the first of them, and the
+/// session would then hold more than the envelope allows while reporting that it does not.
+///
+/// This fills the envelope with links whose cells all stay on the screen, so nothing is given back,
+/// and then offers a shorter one that fits the room left for an object but not the room left for an
+/// object and a table entry together. That is the one the erasure would lose.
+#[test]
+fn a_link_is_never_admitted_past_the_envelope() {
+    /// Links offered before the short one, enough to bring what the session holds to within one
+    /// table entry of the envelope while the table of distinct targets still has room.
+    const LINKS: u32 = 4_005;
+    /// The longest target that fits the bound one link may hold, at this scheme and path.
+    const LONG_TARGET: usize = 2_034;
+    /// A target short enough that its object fits the room left and its table entry does not.
+    const SHORT_TARGET: usize = 490;
+
+    // Wide enough that every link's cell stays on the screen, so no object is given up.
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(647, 96),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let envelope = engine.budget().reserved().links;
+    let long = "a".repeat(LONG_TARGET);
+    for index in 0..LINKS {
+        let input = format!("\u{1b}]8;;https://{index:04}/{long}\u{1b}\\x\u{1b}]8;;\u{1b}\\");
+        engine.feed(input.as_bytes(), 0);
+        assert!(
+            engine.budget().usage().links <= envelope,
+            "the hyperlink state reached {} bytes against a {envelope}-byte envelope at link \
+             {index}",
+            engine.budget().usage().links
+        );
+    }
+    let short = "b".repeat(SHORT_TARGET);
+    let input = format!("\u{1b}]8;;https://y/{short}\u{1b}\\x\u{1b}]8;;\u{1b}\\");
+    engine.feed(input.as_bytes(), 0);
+    engine.quiesce(0);
+
+    let holding = engine.budget().usage().links;
+    assert!(
+        holding > envelope - envelope / 512,
+        "the run has to bring the session to the envelope for this to say anything: {holding} \
+         bytes of {envelope}"
+    );
+    assert!(
+        holding <= envelope,
+        "the session holds {holding} bytes of hyperlink state against a {envelope}-byte envelope"
+    );
+    assert_eq!(
+        engine.budget().excess(),
+        0,
+        "the session holds more than the admitted geometry reserved for it"
+    );
+    assert!(
+        !engine.budget().session_over_budget(),
+        "the session is over its budget after admitting links inside the envelope"
+    );
+}
+
 /// A mark joins the cell it belongs to when the run before it was cut at every cell.
 ///
 /// A run that is not plain ASCII is drawn a cell at a time, because the profile's width model and
