@@ -252,6 +252,8 @@ async fn session_retained(hosted: &Hosted, marker: &[u8], within: Duration) -> V
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
 /// The environment a session's own shell runs in.
 ///
 /// It carries the host's directories, because a command run inside a session has to reach the same

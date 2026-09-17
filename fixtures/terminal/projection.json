@@ -10,7 +10,8 @@
     "A cluster the window's edge falls inside is replaced by one space for each cell of it that is inside, never half drawn.",
     "A run whose text does not measure the cell span the session gave it is replaced by spaces for that span and counted.",
     "No frame contains a line feed, an index, a scroll or a line insertion, so nothing the renderer writes can scroll the destination.",
-    "Each expected line is one entry per destination cell: the cluster drawn there, or an empty string for the second cell of a wide cluster."
+    "Each expected line is one entry per destination cell: the cluster drawn there, or an empty string for the second cell of a wide cluster.",
+    "A frame clears each line it draws before it draws on it, so a row with no run at column zero and a row shorter than the one before it both leave nothing of what was there."
   ],
   "cases": [
     {
@@ -457,6 +458,95 @@
         "soft_wraps": 0,
         "pending_wrap": false,
         "cursor_outside": true
+      }
+    },
+    {
+      "id": "a_row_clears_what_was_on_the_line",
+      "why": "A row's runs cover only the cells that hold something. A row whose first cell is blank has no run at column zero, and a row shorter than the one before it has no run at its end; a frame that cleared only after its runs would leave both of those showing the previous screen. The destination starts with something on it, and what remains is the canonical row and nothing else.",
+      "preload": [
+        "stale-content-he",
+        "and-more-of-it--"
+      ],
+      "window": {
+        "top_row": 0,
+        "left_column": 0,
+        "rows": 2,
+        "columns": 16
+      },
+      "rows": [
+        {
+          "row": 0,
+          "soft_wrapped": false,
+          "runs": [
+            {
+              "column": 2,
+              "cells": 4,
+              "text": "date"
+            }
+          ]
+        },
+        {
+          "row": 1,
+          "soft_wrapped": false,
+          "runs": []
+        }
+      ],
+      "cursor": {
+        "column": 6,
+        "row": 0,
+        "visible": true,
+        "style": 1,
+        "pending_wrap": false
+      },
+      "lines": [
+        [
+          " ",
+          " ",
+          "d",
+          "a",
+          "t",
+          "e",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " "
+        ],
+        [
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " ",
+          " "
+        ]
+      ],
+      "cursor_cell": [
+        0,
+        6
+      ],
+      "expect": {
+        "runs_replaced": 0,
+        "clusters_replaced": 0,
+        "cells_clipped": 0,
+        "soft_wraps": 0,
+        "pending_wrap": false,
+        "cursor_outside": false
       }
     }
   ]

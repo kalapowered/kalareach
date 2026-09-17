@@ -302,6 +302,10 @@ async fn drive(
     // What this terminal is showing, for as long as it is being projected. A direct attachment
     // never installs one: it is sent the application's own bytes and draws nothing of its own.
     let mut display = crate::render::ProjectedDisplay::new();
+    // Said once, the first time the projection could not carry everything the session holds. A
+    // person told that something is outside their window can make it wider; one who is not told is
+    // looking at an approximation and does not know it.
+    let mut reported_degradation = false;
 
     // What the person typed while the host was asking the terminal what it was. It was buffered
     // rather than discarded, and it is the first thing the application receives, in the order it
@@ -385,6 +389,15 @@ async fn drive(
                                     return AttachOutcome::Disconnected;
                                 }
                                 outstanding.insert(request_id, Outstanding::Resubscribe);
+                            }
+                            if !reported_degradation
+                                && let Some(detail) = display.degradation()
+                            {
+                                reported_degradation = true;
+                                eprintln!(
+                                    "kr: this terminal is showing a projection of the session, and \
+                                     it does not carry all of it: {detail}"
+                                );
                             }
                         }
                         // A resynchronisation marker means this terminal's view of the session is

@@ -175,33 +175,34 @@ impl ProjectedDisplay {
         }
         let mut parts = Vec::new();
         if self.losses.cells_clipped > 0 {
+            let cells = usize::try_from(self.losses.cells_clipped).unwrap_or(usize::MAX);
             parts.push(format!(
-                "{} cells outside this window",
-                self.losses.cells_clipped
+                "{} outside this window",
+                plural(cells, "cell", "cells")
             ));
         }
         if self.losses.clusters_replaced > 0 {
             parts.push(format!(
-                "{} characters the window's edge fell inside",
-                self.losses.clusters_replaced
+                "{} the window's edge fell inside",
+                plural(self.losses.clusters_replaced, "character", "characters")
             ));
         }
         if self.losses.runs_replaced > 0 {
             parts.push(format!(
-                "{} runs this terminal cannot place",
-                self.losses.runs_replaced
+                "{} this terminal cannot place",
+                plural(self.losses.runs_replaced, "run", "runs")
             ));
         }
         if self.losses.soft_wraps > 0 {
             parts.push(format!(
-                "{} wrapped lines drawn as separate rows",
-                self.losses.soft_wraps
+                "{} drawn as separate rows",
+                plural(self.losses.soft_wraps, "wrapped line", "wrapped lines")
             ));
         }
         if self.losses.truncated_rows > 0 {
             parts.push(format!(
-                "{} rows the session had already shortened",
-                self.losses.truncated_rows
+                "{} the session had already shortened",
+                plural(self.losses.truncated_rows, "row", "rows")
             ));
         }
         if self.losses.pending_wrap {
@@ -211,6 +212,15 @@ impl ProjectedDisplay {
             parts.push("the cursor outside this window".to_owned());
         }
         Some(parts.join(", "))
+    }
+}
+
+/// Renders a count with the right form of its noun.
+fn plural(count: usize, one: &str, many: &str) -> String {
+    if count == 1 {
+        format!("{count} {one}")
+    } else {
+        format!("{count} {many}")
     }
 }
 

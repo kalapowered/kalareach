@@ -280,11 +280,18 @@ impl<'a> Writer<'a> {
     }
 
     fn row(&mut self, row: u64, line: u32) {
+        // The whole line is cleared before anything is drawn on it. A row's runs cover only the
+        // cells that hold something, so a row whose first cell is blank has no run at column zero
+        // and a row shorter than the one before it has none at its end: clearing only after the
+        // runs would leave both of those showing whatever was there before. The pen goes back to
+        // the default first, because an erase paints the background colour in force.
+        self.rendition(CellRendition::PLAIN);
         self.place(line, 0);
+        self.csi(b"K");
         let Some(content) = self.screen.rows.get(&(self.screen.active_buffer, row)) else {
-            // A row the window shows and the session does not hold is blank, not stale. Erasing it
-            // is what makes a destination taller than the grid leave its unused area empty.
-            self.csi(b"K");
+            // A row the window shows and the session does not hold is blank, not stale, and the
+            // line has just been cleared. That is what makes a destination taller than the grid
+            // leave its unused area empty.
             return;
         };
         if content.soft_wrapped {
@@ -303,9 +310,6 @@ impl<'a> Writer<'a> {
         if clipped {
             self.comparison.rows_clipped += 1;
         }
-        // Whatever the runs did not cover is cleared, so a shorter row does not leave the tail of
-        // a longer one behind it.
-        self.csi(b"K");
     }
 
     /// Draws one run, returning whether any of it lay outside the window.
@@ -968,6 +972,20 @@ mod fixtures {
                 usize::try_from(window.rows).expect("rows"),
                 usize::try_from(window.columns).expect("columns"),
             );
+            // Some cases start with something already on the destination, because a frame has to
+            // clear what it is drawing over and a blank destination cannot show that.
+            if let Some(preload) = case.get("preload").and_then(serde_json::Value::as_array) {
+                for (index, line) in preload.iter().enumerate() {
+                    destination.line = index;
+                    destination.column = 0;
+                    destination.print(line.as_str().expect("a preloaded line"));
+                }
+                destination.line = 0;
+                destination.column = 0;
+                // Whatever the preload did is not what this frame is being judged on.
+                destination.overflowed = false;
+                destination.scrolled = false;
+            }
             destination.feed(&painted.bytes);
 
             assert!(
