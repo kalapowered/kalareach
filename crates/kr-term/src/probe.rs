@@ -282,6 +282,16 @@ impl ProbeSession {
         &self.typed
     }
 
+    /// How many bytes of the person's typing this exchange is holding.
+    ///
+    /// For a caller that has to report what a failed exchange cost rather than deliver it: an
+    /// attach that fails delivers nothing anywhere, and the person is owed the number if not the
+    /// keys.
+    #[must_use]
+    pub fn typing_len(&self) -> usize {
+        self.typed.len().saturating_add(self.lexer.held_len())
+    }
+
     /// Takes the person's typing from an exchange that did not finish.
     ///
     /// A failed exchange does not make somebody's keystrokes nobody's, and the lexer may still be

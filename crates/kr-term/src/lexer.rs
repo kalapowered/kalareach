@@ -257,6 +257,12 @@ impl Lexer {
         self.pending_len
     }
 
+    /// How many bytes the lexer is holding, text tail and incomplete sequence together.
+    #[must_use]
+    pub fn held_len(&self) -> usize {
+        self.text.len().saturating_add(self.pending.len())
+    }
+
     /// Takes everything the lexer is still holding, leaving it on ground.
     ///
     /// Two things can be held at once, and both come back in the order they arrived: the tail of a
