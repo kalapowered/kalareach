@@ -1254,76 +1254,129 @@ fn a_restart_mid_publish_resolves_by_identifier_without_losing_the_completed_fil
 /// published, and one whose payload is gone is invalidated.
 #[test]
 fn a_replaced_or_missing_payload_is_never_published() {
-    let host = kr_ipc::testing::TempHost::create();
+    let harness = Harness::create();
     let bytes = pattern(64);
-    let actor = kr_protocol::ids::ActorId::new("local:transfer-test").expect("a valid principal");
-    let expected = digest(&bytes);
-    let clock = Arc::new(ManualClock::new(support::START_MS));
-    let service = TransferService::with_clock(&host.environment(), clock as Arc<_>)
-        .expect("a transfer service");
-    let begun = service
-        .upload_begin(
-            &actor,
-            &UploadBeginParams {
-                environment_id: host.environment_id(),
-                session_id: Nullable::null(),
-                device_id: Nullable::null(),
-                declared_byte_len: U64::new(bytes.len() as u64),
-                declared_digest: expected,
-                declared_media_type: "application/octet-stream".to_owned(),
-                original_file_name: "notes.bin".to_owned(),
-            },
-            None,
-        )
-        .expect("reserves the upload");
-    let (chunk, payload) = chunk_of(&bytes, 0);
-    service
-        .upload_chunk(
-            &actor,
-            &UploadChunkParams {
-                transfer_id: begun.transfer_id,
-                chunk,
-                bytes: payload,
-            },
-            None,
-        )
-        .expect("accepts the chunk");
-    let staged = std::fs::read_dir(service.staging().incomplete().display_path())
-        .expect("reads the incomplete area")
-        .next()
-        .expect("one staged payload")
-        .expect("a directory entry")
-        .path();
-    let verified = identity_of(&staged);
-    interrupt_publish(&host, begun.transfer_id, expected, verified);
+    let (transfer_id, staged) = interrupted_publication(&harness, &bytes, "notes.bin");
 
-    // Another writer replaces the payload with a file of the same length. Recovery finds an object
-    // that is not the one that was verified, so nothing is published.
+    // Another writer replaces the payload with a file of the same length. Whether the replacement
+    // is an object the filesystem gives a new identifier or one it gives the identifier the
+    // removal has just freed is the filesystem's to decide, and the outcome is the same either
+    // way: these are not the bytes that were verified, so no handle is published over them.
     std::fs::remove_file(&staged).expect("removes the payload");
     std::fs::write(&staged, vec![0_u8; bytes.len()]).expect("writes a replacement");
-    assert_ne!(identity_of(&staged), verified);
-    let recovery = service.recover().expect("recovers");
-    assert_eq!(recovery.completed_publications, 0);
-    assert_eq!(recovery.unresolved_publications, 1);
-    let status = service
-        .upload_status(
-            &actor,
-            &UploadStatusParams {
-                transfer_id: begun.transfer_id,
-            },
-        )
-        .expect("reads the status");
-    assert_eq!(status.state, UploadState::Invalidated);
-    assert!(status.handle.as_ref().is_none());
+
+    let recovery = harness.service.recover().expect("recovers");
+    assert_publication_invalidated(&harness, transfer_id, recovery);
+}
+
+/// KR-REQ-24.09: a verified publication whose payload was rewritten where it lies is invalidated
+/// rather than published.
+///
+/// This is the same case as the replacement above on a filesystem that reuses a freed file
+/// identifier, and here it happens on every filesystem: the payload is opened and overwritten in
+/// place, so the device and the file number are exactly the ones the publication recorded and only
+/// the bytes differ. Identity is the cheap first gate; the digest is what decides.
+#[test]
+fn a_payload_rewritten_in_place_is_invalidated_rather_than_published() {
+    use std::io::Write as _;
+
+    let harness = Harness::create();
+    let bytes = pattern(64);
+    let (transfer_id, staged) = interrupted_publication(&harness, &bytes, "notes.bin");
+    let verified = identity_of(&staged);
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&staged)
+        .expect("opens the staged payload where it lies");
+    file.write_all(&vec![0xA5_u8; bytes.len()])
+        .expect("overwrites every byte of it");
+    file.sync_all().expect("flushes the overwrite");
+    drop(file);
     assert_eq!(
-        std::fs::read_dir(service.staging().complete().display_path())
-            .expect("reads the completed area")
-            .count(),
-        0,
-        "nothing reached the completed area"
+        identity_of(&staged),
+        verified,
+        "an overwrite in place leaves the object's identity exactly as it was"
     );
-    // The invalidated upload's payload is removed and its bytes released.
-    assert_eq!(service.staged_byte_len().expect("reads the total"), 0);
+
+    let recovery = harness.service.recover().expect("recovers");
+    let reason = harness
+        .service
+        .upload_status(&harness.actor, &UploadStatusParams { transfer_id })
+        .expect("reads the status")
+        .invalid_reason;
+    assert!(
+        reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("different digest")),
+        "the digest is what decided it, and the row said {:?}",
+        reason.as_ref()
+    );
+    assert_publication_invalidated(&harness, transfer_id, recovery);
+}
+
+/// KR-REQ-24.09: an interrupted publication that cannot be resolved does not stop the recovery
+/// pass, so the rows behind it are resolved rather than waiting for a start that never gets past
+/// this one.
+#[test]
+fn a_publication_behind_an_invalidated_one_is_still_resolved() {
+    use std::io::Write as _;
+
+    let harness = Harness::create();
+    let rewritten_bytes = pattern(64);
+    let intact_bytes = pattern(128);
+    let (rewritten, rewritten_path) =
+        interrupted_publication(&harness, &rewritten_bytes, "rewritten.bin");
+    let (intact, _) = interrupted_publication(&harness, &intact_bytes, "intact.bin");
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&rewritten_path)
+        .expect("opens the first payload where it lies");
+    file.write_all(&vec![0xA5_u8; rewritten_bytes.len()])
+        .expect("overwrites every byte of it");
+    file.sync_all().expect("flushes the overwrite");
+    drop(file);
+
+    let recovery = harness.service.recover().expect("recovers");
+    assert_eq!(
+        recovery.completed_publications, 1,
+        "the intact publication completed in the same pass"
+    );
+    assert_eq!(recovery.unresolved_publications, 1);
+    assert_eq!(
+        harness
+            .service
+            .attachment_handle(&harness.actor, intact)
+            .expect("the intact publication has a handle")
+            .content_digest,
+        digest(&intact_bytes)
+    );
+    assert!(
+        harness
+            .service
+            .upload_status(
+                &harness.actor,
+                &UploadStatusParams {
+                    transfer_id: rewritten
+                },
+            )
+            .expect("reads the invalidated row's status")
+            .handle
+            .as_ref()
+            .is_none(),
+        "and the one that could not be resolved has no handle"
+    );
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        intact_bytes.len() as u64,
+        "only the published attachment's bytes stay charged"
+    );
+    // The second pass has nothing to resolve: one row is published and the other is terminal.
+    assert_eq!(
+        harness.service.recover().expect("recovers again"),
+        kr_transfer::Recovery::default()
+    );
 }
 
 /// KR-REQ-24.09: a payload a closed upload left behind is removed by the next recovery pass, and
@@ -1386,6 +1439,98 @@ fn a_payload_a_closed_upload_left_behind_is_removed_by_recovery() {
             .expect("recovers again")
             .removed_payloads,
         0
+    );
+}
+
+/// Stages one chunk and records the publication's intent, which is what an interrupted publish
+/// leaves behind: a durable verification carrying the identity of the object it was made against,
+/// and the payload still under its incomplete name.
+///
+/// Returns the transfer and the path of its payload.
+fn interrupted_publication(
+    harness: &Harness,
+    bytes: &[u8],
+    original_file_name: &str,
+) -> (TransferId, std::path::PathBuf) {
+    let begun = harness
+        .begin(bytes, "application/octet-stream", original_file_name)
+        .expect("reserves the upload");
+    harness
+        .send(begun.transfer_id, bytes, 0)
+        .expect("sends the chunk");
+    // Named rather than listed, so a test with more than one staged payload still knows which is
+    // which.
+    let staged = harness.service.staging().incomplete().display_path().join(
+        kr_transfer::StorageName::derive(begun.transfer_id, original_file_name)
+            .incomplete()
+            .expect("the payload's staged name")
+            .as_str(),
+    );
+    interrupt_publish(
+        &harness.host,
+        begun.transfer_id,
+        digest(bytes),
+        identity_of(&staged),
+    );
+    (begun.transfer_id, staged)
+}
+
+/// Asserts everything an invalidated publication leaves behind, whichever way it was invalidated.
+///
+/// The outcomes are the same on every filesystem: the pass resolved this row and published nothing,
+/// the row is invalidated with its reason recorded, no handle names it, neither staging area holds
+/// a payload, its bytes are released, and a second pass finds nothing left to do.
+fn assert_publication_invalidated(
+    harness: &Harness,
+    transfer_id: TransferId,
+    recovery: kr_transfer::Recovery,
+) {
+    assert_eq!(recovery.completed_publications, 0, "nothing was published");
+    assert_eq!(recovery.unresolved_publications, 1);
+    assert_eq!(
+        (
+            recovery.removed_payloads,
+            recovery.unremovable_payloads,
+            recovery.orphans_removed
+        ),
+        (0, 0, 0),
+        "the invalidation discarded the payload itself, leaving nothing for the cleanup retry"
+    );
+    let status = harness
+        .service
+        .upload_status(&harness.actor, &UploadStatusParams { transfer_id })
+        .expect("reads the status");
+    assert_eq!(status.state, UploadState::Invalidated);
+    assert!(status.handle.as_ref().is_none(), "no handle names it");
+    assert!(
+        status
+            .invalid_reason
+            .as_ref()
+            .is_some_and(|reason| reason.contains("verified")),
+        "the row says the payload is not what was verified, and it said {:?}",
+        status.invalid_reason.as_ref()
+    );
+    for area in [
+        harness.service.staging().incomplete().display_path(),
+        harness.service.staging().complete().display_path(),
+    ] {
+        assert_eq!(
+            std::fs::read_dir(area)
+                .expect("reads a staging area")
+                .count(),
+            0,
+            "neither name holds a payload afterwards"
+        );
+    }
+    assert_eq!(
+        harness.service.staged_byte_len().expect("reads the total"),
+        0,
+        "and its bytes are released"
+    );
+    assert_eq!(
+        harness.service.recover().expect("recovers again"),
+        kr_transfer::Recovery::default(),
+        "a second pass changes nothing"
     );
 }
 

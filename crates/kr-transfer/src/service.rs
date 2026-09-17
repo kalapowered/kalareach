@@ -98,7 +98,8 @@ pub struct Sweep {
 pub struct Recovery {
     /// Publications that were interrupted after verification and have now completed.
     pub completed_publications: usize,
-    /// Publications whose payload could not be found and are now invalidated.
+    /// Publications whose payload is gone, or is no longer the bytes that were verified, and are
+    /// now invalidated.
     pub unresolved_publications: usize,
     /// Action claims whose effect finished without their result being recorded.
     pub resolved_claims: usize,
@@ -237,6 +238,42 @@ enum Recorded<T> {
     Claimed,
     /// This actor has no record of the action.
     Absent,
+}
+
+/// What a re-read says about the bytes behind a payload whose identity was checked.
+enum PayloadIntegrity {
+    /// The bytes are the ones the publication recorded.
+    Verified,
+    /// The identity is the recorded one and the bytes are not. The detail says what was found.
+    Altered(String),
+}
+
+impl PayloadIntegrity {
+    /// Reads a payload back through the handle whose identity was already checked.
+    ///
+    /// Identity is the cheap first gate, and it answers one question: was this object replaced by
+    /// one the filesystem gave a different identifier? It does not say the object was not rewritten
+    /// in place, and on a filesystem that hands a new file the identifier a removal has just freed
+    /// it does not say the object was not replaced either. The digest is what decides, and this is
+    /// where it is compared.
+    ///
+    /// The handle is the one the identity was read from, so the bytes hashed here belong to the
+    /// object that passed that gate rather than to whatever the name resolves to now.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StagingUnavailable`] when the read fails. A read that fails says
+    /// nothing about the bytes, which is why it is not an answer about them.
+    fn of(file: &mut AuthorisedFile, byte_len: u64, digest: Digest256) -> Result<Self> {
+        let (found, length) = digest_of(file)?;
+        if length != byte_len || found != digest {
+            return Ok(Self::Altered(format!(
+                "the payload is {length} bytes with a different digest, and the verification \
+                 recorded {byte_len}: these are not the bytes that were verified"
+            )));
+        }
+        Ok(Self::Verified)
+    }
 }
 
 /// What a mutation names in its parameters.
@@ -806,13 +843,7 @@ impl TransferService {
                             self.complete_claim(action, &result)?;
                             Ok(result)
                         }
-                        state => Err(TransferError::WrongState {
-                            transfer: row.transfer_id.to_string(),
-                            state: state.as_str(),
-                            detail: "the verified payload could not be found, so no handle names \
-                                     it"
-                            .to_owned(),
-                        }),
+                        _ => Err(publication_refusal(&row)),
                     };
                 }
                 _ => {}
@@ -990,12 +1021,7 @@ impl TransferService {
         let row = upload_of(&store, params.transfer_id, actor)?;
         drop(store);
         if row.state != UploadState::Published {
-            return Err(TransferError::WrongState {
-                transfer: row.transfer_id.to_string(),
-                state: row.state.as_str(),
-                detail: "the verified payload could not be moved into the completed area"
-                    .to_owned(),
-            });
+            return Err(publication_refusal(&row));
         }
         let result = UploadFinishResult {
             handle: handle_of(&row)?,
@@ -1013,13 +1039,20 @@ impl TransferService {
     ///
     /// Called by `upload.finish` for the publication it just recorded, by a retried finish, and by
     /// recovery at startup. All three answer the same question: which name holds the object whose
-    /// identity the row recorded?
+    /// identity the row recorded, and are its bytes the ones that were verified?
     ///
-    /// * The published name holding that object means the move landed and only the row was behind.
-    /// * The incomplete name holding it means the move did not land, and the verified bytes are
+    /// * The published name holding those bytes means the move landed and only the row was behind.
+    /// * The incomplete name holding them means the move did not land, and the verified bytes are
     ///   still there to move.
-    /// * Neither means no handle can name it, so the upload is invalidated. A storage failure is
-    ///   reported instead, because it is not evidence that the file is gone.
+    /// * A name that holds the recorded identity over different bytes is a payload rewritten in
+    ///   place, or a replacement on a filesystem that hands a new file the identifier a removal
+    ///   has just freed. The digest decides, so the upload is invalidated: nothing publishes a
+    ///   handle over bytes this service never verified.
+    /// * Neither name holding it means no handle can name it either, so the upload is invalidated.
+    ///
+    /// Only storage and journal failures are reported. Every other answer leaves the row terminal
+    /// and its payloads discarded, so recovery resolves the rows behind this one instead of
+    /// stopping on it and finding the same payload again at the next start.
     fn resolve_publication(&self, row: &UploadRow, now: TimestampMs) -> Result<()> {
         let identity = row.payload_identity.ok_or_else(|| {
             TransferError::store("a publication was recorded without the identity it verified")
@@ -1036,8 +1069,12 @@ impl TransferService {
         let verified = row.content_digest.ok_or_else(|| {
             TransferError::store("a publication was recorded without the digest it verified")
         })?;
-        if self.holds(self.staging.complete(), &published, identity)? {
-            self.verify_published(&published, row.declared_byte_len, verified)?;
+        if let Some(mut file) = self.holds(self.staging.complete(), &published, identity)? {
+            if let PayloadIntegrity::Altered(detail) =
+                PayloadIntegrity::of(&mut file, row.declared_byte_len, verified)?
+            {
+                return self.abandon_publication(row, &detail, now);
+            }
             // Flushed here too. A first attempt can have renamed and then failed before its own
             // flush, and this is the path that answers for it.
             self.staging.complete().sync()?;
@@ -1046,8 +1083,14 @@ impl TransferService {
                 .complete_publish(row.transfer_id, now, expires_at_ms)?;
             return Ok(());
         }
-        if self.holds(self.staging.incomplete(), &incomplete, identity)? {
-            self.verify_published(&incomplete, row.declared_byte_len, verified)?;
+        if let Some(mut file) = self.holds(self.staging.incomplete(), &incomplete, identity)? {
+            let integrity = PayloadIntegrity::of(&mut file, row.declared_byte_len, verified)?;
+            // Closed before the move. This handle was opened to read bytes, not to move them, and
+            // Windows refuses to rename a file whose open handle did not ask for delete sharing.
+            drop(file);
+            if let PayloadIntegrity::Altered(detail) = integrity {
+                return self.abandon_publication(row, &detail, now);
+            }
             self.staging.incomplete().rename_into(
                 &incomplete,
                 self.staging.complete(),
@@ -1057,10 +1100,17 @@ impl TransferService {
             // could say `published` while the rename was still only in the page cache.
             self.staging.complete().sync()?;
             self.staging.incomplete().sync()?;
-            if !self.holds(self.staging.complete(), &published, identity)? {
-                return Err(TransferError::integrity(
+            if self
+                .holds(self.staging.complete(), &published, identity)?
+                .is_none()
+            {
+                // Something took the published name between the move and this read, so a handle
+                // over that name would not name the bytes that were verified.
+                return self.abandon_publication(
+                    row,
                     "the published name does not hold the object that was verified",
-                ));
+                    now,
+                );
             }
             self.locked()?
                 .complete_publish(row.transfer_id, now, expires_at_ms)?;
@@ -1069,63 +1119,50 @@ impl TransferService {
         // Only a row that is still publishing. A cancellation that closed this transfer and
         // removed its payload is the other explanation for finding neither name, and it is not an
         // integrity failure to be overwritten with one.
+        self.abandon_publication(
+            row,
+            "the verified payload is not in the staging area, so no handle can name it",
+            now,
+        )
+    }
+
+    /// Invalidates a publication no handle can name, and discards whatever its names still hold.
+    ///
+    /// One exit for every publication that cannot be completed, so all of them leave the same
+    /// state behind: a terminal row carrying the reason, neither name holding a payload, the bytes
+    /// released, and nothing for the next recovery pass to find.
+    fn abandon_publication(&self, row: &UploadRow, detail: &str, now: TimestampMs) -> Result<()> {
         self.locked()?.close_upload_from(
             row.transfer_id,
             UploadState::Publishing,
             UploadState::Invalidated,
-            Some("the verified payload is not in the staging area, so no handle can name it"),
+            Some(detail),
             now,
         )?;
-        self.discard_payloads(row)?;
-        Ok(())
+        self.discard_payloads(row)
     }
 
-    /// Reads a payload back and checks its size and digest against what was verified.
+    /// Returns the open object when `name` in `directory` is the one whose identity was recorded.
     ///
-    /// Identity alone says the object was not replaced. It does not say the object was not
-    /// rewritten in place, which a recovery pass long after the verification has to establish for
-    /// itself before it publishes a handle over it.
-    fn verify_published(
-        &self,
-        name: &RelativeName,
-        byte_len: u64,
-        digest: Digest256,
-    ) -> Result<()> {
-        let directory = if self.staging.complete().probe(name).is_ok() {
-            self.staging.complete()
-        } else {
-            self.staging.incomplete()
-        };
-        let mut file = directory.open_read(name, ObjectPolicy::HostOwnedFile)?;
-        let (found, length) = digest_of(&mut file)?;
-        if length != byte_len || found != digest {
-            return Err(TransferError::integrity(format!(
-                "{name} is {length} bytes with a different digest, and the verification recorded \
-                 {byte_len}"
-            )));
-        }
-        Ok(())
-    }
-
-    /// Returns true when `name` in `directory` is the object whose identity was recorded.
-    ///
-    /// Opened without following a link and checked through the handle, so a replacement of the
-    /// same length reads as absent rather than as the verified file. A name that is not there is
-    /// `false`; a storage failure is reported, because it says nothing about what is there.
+    /// Opened without following a link and checked through the handle, so a replacement the
+    /// filesystem gave a different identifier reads as absent rather than as the verified file. The
+    /// handle comes back with the answer, because the bytes behind it are what decides the
+    /// publication and reopening the name would be a second resolution to race. A name that is not
+    /// there is `None`; a storage failure is reported, because it says nothing about what is there.
     fn holds(
         &self,
         directory: &AuthorisedDirectory,
         name: &RelativeName,
         identity: crate::authority::ObjectIdentity,
-    ) -> Result<bool> {
+    ) -> Result<Option<AuthorisedFile>> {
         match directory.open_read(name, ObjectPolicy::HostOwnedFile) {
-            Ok(file) => Ok(file.identity() == identity),
-            Err(crate::authority::Escape::NotFound { .. }) => Ok(false),
+            Ok(file) => Ok((file.identity() == identity).then_some(file)),
+            Err(crate::authority::Escape::NotFound { .. }) => Ok(None),
             // A link or the wrong kind of object has taken the name. It is not the verified file,
             // and saying so is what lets the caller look at the other name.
             Err(
                 crate::authority::Escape::Link { .. } | crate::authority::Escape::WrongKind { .. },
-            ) => Ok(false),
+            ) => Ok(None),
             Err(error) => Err(TransferError::from(error)),
         }
     }
@@ -1785,8 +1822,11 @@ impl TransferService {
     /// Two jobs, both idempotent.
     ///
     /// A publication interrupted between its two commits is resolved from the identity the row
-    /// recorded: whichever name holds that exact object says what happened, and a row whose object
-    /// is in neither place is invalidated because no handle can name it.
+    /// recorded and the digest it verified: whichever name holds that object says what happened,
+    /// and the digest says whether its bytes are still the ones that were verified. A row whose
+    /// object is in neither place, or whose bytes are no longer those, is invalidated, because no
+    /// handle can name it. One row that cannot be resolved never stops the pass: it ends
+    /// invalidated and the rows behind it are resolved in the same pass.
     ///
     /// A payload whose upload is closed but whose bytes are still on disk is removed, and only then
     /// is its reservation released. That is the other half of the cleanup contract: a removal that
@@ -2522,6 +2562,25 @@ fn check_declaration(row: &UploadRow, params: &UploadFinishParams) -> Result<()>
         ));
     }
     Ok(())
+}
+
+/// The refusal a caller is owed when the publication it asked for did not complete.
+///
+/// An invalidated publication is an integrity refusal carrying the reason the row recorded, which
+/// is the same answer a repeat of the same action is given from the record. Any other terminal
+/// state is that state: a cancellation that closed this transfer first is not an integrity
+/// failure, and saying so would spend the wrong code on it.
+fn publication_refusal(row: &UploadRow) -> TransferError {
+    if row.state == UploadState::Invalidated {
+        return TransferError::integrity(row.invalid_reason.clone().unwrap_or_else(|| {
+            "the verified payload could not be published, so no handle names it".to_owned()
+        }));
+    }
+    TransferError::WrongState {
+        transfer: row.transfer_id.to_string(),
+        state: row.state.as_str(),
+        detail: "this upload was closed before its publication could be resolved".to_owned(),
+    }
 }
 
 /// Builds the opaque handle of a published upload.

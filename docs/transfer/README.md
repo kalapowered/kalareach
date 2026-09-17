@@ -192,10 +192,22 @@ renamed, then the row moves to `published`.
 
 A daemon that dies in the middle finds the `publishing` row and resolves it by asking which name
 holds *that exact object*: the published name means the rename landed and only the row was behind,
-and the incomplete name means it did not and the verified bytes are still there to move. A file of
-the same length that took either name in between is not that object, so it is not published. A row
-whose object is in neither place is invalidated, because a handle whose file is gone is not a
-handle, and a storage failure is reported instead of being read as an absence.
+and the incomplete name means it did not and the verified bytes are still there to move.
+
+Identity is the first question and not the last one. It is cheap, and it settles which of the two
+names to look at, but it says only that the filesystem did not give this object a new identifier.
+A payload rewritten where it lies keeps its identity, and a filesystem that hands a new file the
+identifier a removal has just freed gives a replacement the same one. So the object is read back
+and its digest compared with the one the verification recorded, and *that* is what decides. Bytes
+that are not the verified bytes invalidate the upload: `invalidated`, the reason recorded on the
+row, both payload names removed and the reservation released. The identifier is spent and a new
+upload is required.
+
+A row whose object is in neither place is invalidated the same way, because a handle whose file is
+gone is not a handle. Only a storage or journal failure is reported, because neither says what the
+staging area holds. Everything else leaves the row terminal, so one payload nothing can vouch for
+does not stop the pass: the publications behind it are resolved in the same pass rather than
+waiting for a start that would find the same payload again.
 
 The directory that names a payload is flushed before the record that depends on it commits: after a
 `create`, after the rename that publishes, and after each directory of the staging tree is created.
