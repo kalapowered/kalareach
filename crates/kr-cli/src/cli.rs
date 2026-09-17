@@ -57,6 +57,8 @@ pub enum Command {
     Doctor(DoctorArguments),
     /// Inspect or change this host's own settings.
     Host(HostArguments),
+    /// Set up the managed shell integration, or report what it is.
+    Shell(ShellArguments),
 }
 
 /// `kr host`.
@@ -94,6 +96,60 @@ pub struct Execution {
     /// of a desktop's handles.
     #[arg(long)]
     pub headless: bool,
+}
+
+/// `kr shell`.
+#[derive(Debug, Args)]
+pub struct ShellArguments {
+    /// What to do.
+    #[command(subcommand)]
+    pub command: ShellCommand,
+}
+
+/// One `kr shell` operation.
+#[derive(Debug, Subcommand)]
+pub enum ShellCommand {
+    /// Report the resolved executable, flags, version and integration mode.
+    Status(ShellStatusArguments),
+    /// Add the marked, guarded entry to this user's own startup configuration.
+    Install(ShellInstallArguments),
+    /// Delete the marked entry, and nothing else.
+    Remove(ShellRemoveArguments),
+}
+
+/// `kr shell status`.
+#[derive(Debug, Args)]
+pub struct ShellStatusArguments {
+    /// Report one shell rather than every installed package.
+    #[arg(long)]
+    pub shell: Option<String>,
+}
+
+/// `kr shell install`.
+#[derive(Debug, Args)]
+pub struct ShellInstallArguments {
+    /// Install the entry for one shell rather than every installed package.
+    #[arg(long)]
+    pub shell: Option<String>,
+    /// Offer the documented session-local bypass for a known auto-wrapper.
+    ///
+    /// It sets `NSH_NO_WRAP=1` inside KalaReach-created shells only, and changes no other setting.
+    #[arg(long)]
+    pub nsh_bypass: bool,
+    /// Report what would change without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+/// `kr shell remove`.
+#[derive(Debug, Args)]
+pub struct ShellRemoveArguments {
+    /// Remove the entry for one shell rather than every installed package.
+    #[arg(long)]
+    pub shell: Option<String>,
+    /// Report what would change without writing anything.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 /// `kr question`.

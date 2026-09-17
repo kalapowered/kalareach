@@ -188,6 +188,8 @@ pub struct Session {
     fence: Option<crate::fence::FenceDriver>,
     /// What the registered root integration is, recorded whole for diagnostics.
     root_integration: Option<kr_shell_integration::host::handshake::Registration>,
+    /// The last takeover receipt the machine completed.
+    takeover_receipt: Option<crate::fence::TakeoverReceipt>,
     /// What the renderings this session has produced could not carry.
     restoration_losses: crate::render::Carried,
     /// How much of the screen each attachment's caller may be shown.
@@ -401,6 +403,7 @@ impl Session {
             engine,
             fence: None,
             root_integration: None,
+            takeover_receipt: None,
             restoration_losses: crate::render::Carried::default(),
             forwarding_held: std::collections::BTreeMap::new(),
             projections: crate::snapshot::Bases::new(),
@@ -487,6 +490,16 @@ impl Session {
         self.root_integration = Some(registration);
     }
 
+    /// Returns the last completed takeover receipt.
+    ///
+    /// A receipt is completed when the reader reports what its cancellation discarded, or when the
+    /// hold ends without one. It says `unknown` in the second case rather than a zero nobody
+    /// measured.
+    #[must_use]
+    pub const fn last_takeover_receipt(&self) -> Option<crate::fence::TakeoverReceipt> {
+        self.takeover_receipt
+    }
+
     /// Returns the registered root integration, for diagnostics and session status.
     #[must_use]
     pub const fn root_integration(
@@ -524,6 +537,9 @@ impl Session {
         }
         if effects.interrupt.is_some() {
             let _ = self.interrupt_foreground();
+        }
+        if let Some(receipt) = effects.receipts.last() {
+            self.takeover_receipt = Some(*receipt);
         }
         self.pump_replies();
         FenceOutcome {

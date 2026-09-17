@@ -255,6 +255,8 @@ pub struct Controller {
     worker_program: PathBuf,
     build_id: BuildId,
     release: String,
+    /// Where this host's qualified shell packages are, when it keeps them somewhere of its own.
+    shell_packages: Option<PathBuf>,
     started_at_ms: TimestampMs,
     /// The desktop this host has, as last read, and the capability revision that reading is
     /// evidence for.
@@ -403,6 +405,7 @@ impl Controller {
             build_id: setup.build_id,
             release: setup.release,
             started_at_ms,
+            shell_packages: setup.shell_packages,
             desktop: Mutex::new(DesktopReading {
                 context: crate::desktop::current(boot.clone()),
                 revision: recorded_revision.unwrap_or_else(|| CapabilityRevision::new(0)),
@@ -1661,6 +1664,13 @@ impl Controller {
                             .to_owned(),
                     ));
                 }
+                // A managed session needs a KalaReach-qualified shell package. Refusing here means
+                // refusing before a reservation is recorded and before anything is spawned, so an
+                // unsupported shell costs the caller a named error rather than a session that
+                // closes itself a moment later.
+                if params.shell_mode == kr_protocol::session::ShellMode::Managed {
+                    self.check_qualified_package(params.shell.0.as_deref())?;
+                }
             }
             // A skill installation is the host's, not a session's, so its target names the
             // environment and nothing else. A request that named a session here would be asking
@@ -2875,6 +2885,26 @@ impl Controller {
         }
     }
 
+    /// Refuses a managed create whose shell no installed package qualifies.
+    ///
+    /// Section 7: an unqualified system shell may be a child application or an explicitly selected
+    /// `native_compat` top-level shell; it cannot claim the managed contract. The refusal names the
+    /// shell rather than substituting another, and it happens before a reservation is recorded, so
+    /// an unsupported request costs the caller an error rather than a session that closes itself.
+    fn check_qualified_package(&self, requested: Option<&str>) -> Result<()> {
+        use kr_shell_integration::host::package::{PackageSet, default_package_root};
+
+        let installed = match self.shell_packages.as_ref() {
+            Some(root) => PackageSet::discover(root),
+            None => PackageSet::installed(&default_package_root()),
+        }
+        .map_err(|fault| ControllerError::ShellIntegrationUnsupported(fault.to_string()))?;
+        installed
+            .select(requested)
+            .map(|_| ())
+            .map_err(|fault| ControllerError::ShellIntegrationUnsupported(fault.to_string()))
+    }
+
     /// Reserves a session and starts its worker.
     ///
     /// `connection_id` is the connection that asked, on whichever ingress. A create is the one
@@ -3896,6 +3926,13 @@ pub struct ControllerSetup {
     pub build_id: BuildId,
     /// The release string sessions report as their terminal program version.
     pub release: String,
+    /// Where the qualified shell packages are installed.
+    ///
+    /// `None` is the installation's own directory, or whatever
+    /// [`PACKAGE_ROOT_VARIABLE`](kr_shell_integration::host::package::PACKAGE_ROOT_VARIABLE)
+    /// names. A host that keeps its packages somewhere else is told, rather than being expected to
+    /// arrange a variable for every process that needs to know.
+    pub shell_packages: Option<PathBuf>,
 }
 
 fn closed_summary(

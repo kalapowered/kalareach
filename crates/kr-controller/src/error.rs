@@ -52,6 +52,9 @@ pub enum ControllerError {
         /// The identifier that was named.
         session: String,
     },
+    /// The managed shell integration this request asked for is not available.
+    #[error("{0}")]
+    ShellIntegrationUnsupported(String),
     /// The freshness window this first admission is bound to is expired or unknown.
     #[error("{detail}")]
     WindowExpired {
@@ -182,6 +185,7 @@ impl ControllerError {
             Self::Uncertain { .. } => ErrorCode::OutcomeUnknown,
             Self::ClockUntrusted { .. } => ErrorCode::ClockUntrusted,
             Self::Refused { code, .. } => *code,
+            Self::ShellIntegrationUnsupported(_) => ErrorCode::ShellIntegrationUnsupported,
             Self::Ipc(error) => error.code(),
             Self::NotConfigured(_) => ErrorCode::HostNotConfigured,
         }

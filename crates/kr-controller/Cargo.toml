@@ -21,6 +21,7 @@ kr-ipc.workspace = true
 kr-pairing.workspace = true
 kr-protocol.workspace = true
 kr-project.workspace = true
+kr-shell-integration.workspace = true
 kr-transfer.workspace = true
 kr-transport.workspace = true
 kr-worker.workspace = true

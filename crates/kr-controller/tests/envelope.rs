@@ -69,6 +69,7 @@ async fn host() -> Host {
         worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
         build_id: build(),
         release: "0".to_owned(),
+        shell_packages: None,
     })
     .await
     .expect("the daemon starts");

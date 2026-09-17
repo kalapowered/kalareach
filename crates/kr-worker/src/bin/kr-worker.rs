@@ -30,7 +30,9 @@ use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::ids::{BuildId, EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::local::{LocalClientKind, LocalHello};
 use kr_protocol::scalars::Uuid;
-use kr_protocol::session::{DisplayNumber, Presentation, SessionCreateParams, ShellMode};
+use kr_protocol::session::{
+    ClosureReason, DisplayNumber, Presentation, SessionCreateParams, ShellMode,
+};
 use kr_protocol::worker::{ReservationId, WorkerLaunchSpec, WorkerReady};
 use kr_shell_integration::host::HostError;
 use kr_shell_integration::host::endpoint::HostEndpoint;
@@ -259,6 +261,20 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         tokio::spawn(server.serve())
     });
 
+    // Section 7 paragraph 4: a managed create succeeds only after full post-profile qualification.
+    // The shell is running and its startup files are executing; until the integration reports its
+    // hooks live, this session is authenticated rather than qualified, and it reports nothing
+    // ready. A failure here closes the session that was being created and records why.
+    if bridge_server.is_some()
+        && let Err(error) = await_qualification(&runtime, QUALIFICATION_DEADLINE).await
+    {
+        writer
+            .write_message(&ControlFrame::WorkerFailed(error.clone()))
+            .await?;
+        runtime.close(ClosureReason::RootLaunchFailed).1.release();
+        return Err(error.message.into());
+    }
+
     let ready = {
         let session = runtime.session();
         WorkerReady {
@@ -317,6 +333,58 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// How long a managed session waits for the user's startup files to finish.
+///
+/// It is a bound rather than a latency: the integration reports its hooks live the moment the
+/// startup files are done, and this is only what stops a profile that blocks forever from leaving
+/// a create request unanswered.
+const QUALIFICATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Waits until the root integration has qualified, or says why it did not.
+///
+/// Waiting is on the phase rather than on a timer: the session is asked what it is, and a session
+/// that has closed in the meantime answers immediately rather than holding this for the bound.
+async fn await_qualification(
+    runtime: &Arc<kr_worker::runtime::SessionRuntime>,
+    within: std::time::Duration,
+) -> std::result::Result<(), ProtocolError> {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        {
+            let session = runtime.session();
+            if let Some(driver) = session.fence() {
+                if driver.phase().reports_ready() {
+                    return Ok(());
+                }
+                if !driver.phase().consumes_eligible_eof() {
+                    return Err(ProtocolError::new(
+                        ErrorCode::ShellIntegrationUnsupported,
+                        "the root shell was replaced by something this build cannot qualify, so \
+                         this session claims none of the managed contract",
+                    ));
+                }
+            }
+            if session.state() != kr_protocol::session::SessionState::Live {
+                return Err(ProtocolError::new(
+                    ErrorCode::ShellIntegrationUnsupported,
+                    "the session ended before its root integration qualified",
+                ));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ProtocolError::new(
+                ErrorCode::ShellIntegrationUnsupported,
+                format!(
+                    "the root integration did not qualify within {} seconds; the session is closed \
+                     and an explicit compatibility retry is a new create request",
+                    within.as_secs()
+                ),
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// Resolves the qualified package a managed session launches.
 ///
 /// A `native_compat` session resolves none: it runs the selected stock shell, which cannot claim
@@ -337,11 +405,13 @@ fn bridge_endpoint(
     environment: &kr_ipc::paths::EnvironmentPaths,
     session_id: SessionId,
 ) -> Result<HostEndpoint, HostError> {
-    // Inside the session's own runtime directory, which is already owner-only and on the internal
-    // disk: the socket lives beside the descriptors rather than anywhere a shell chose.
-    let directory = environment.descriptors_dir().join(session_id.to_string());
-    kr_ipc::paths::create_private_tree(environment.runtime_root(), &directory)?;
-    HostEndpoint::open(session_id, &directory)
+    // Inside the session's own directory in the environment's runtime tree, which is owner-only
+    // and on the internal disk: the socket lives there rather than anywhere a shell chose.
+    HostEndpoint::open_for_session(
+        environment.runtime_root(),
+        environment.runtime_dir(),
+        session_id,
+    )
 }
 
 fn session_config(

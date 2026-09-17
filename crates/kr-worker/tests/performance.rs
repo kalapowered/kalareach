@@ -80,6 +80,7 @@ async fn host() -> Host {
         worker_program: worker.clone(),
         build_id: build(),
         release: "0".to_owned(),
+        shell_packages: None,
     })
     .await
     .expect("the daemon starts");

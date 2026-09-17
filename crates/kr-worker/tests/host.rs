@@ -82,6 +82,7 @@ impl Host {
                 worker_program: self.worker.clone(),
                 build_id: build(),
                 release: "0".to_owned(),
+                shell_packages: None,
             })
             .await;
             match outcome {

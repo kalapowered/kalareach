@@ -145,6 +145,8 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             worker_program,
             build_id,
             release: RELEASE.to_owned(),
+            // The installation's own package directory, or whatever KR_SHELL_PACKAGES names.
+            shell_packages: None,
         })
         .await?;
 

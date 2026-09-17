@@ -71,6 +71,27 @@ impl HostEndpoint {
         })
     }
 
+    /// Creates the endpoint in a directory of its own inside the session's runtime directory.
+    ///
+    /// The directory's name is short on purpose. A Unix socket address is copied into a fixed
+    /// array of 104 bytes on the tightest platform, and a runtime root inside a temporary directory
+    /// already spends most of it; a session identifier written out in full would leave a path that
+    /// binds on one machine and not on another.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`HostError::Ipc`] when the directory cannot be created owner-only, and whatever
+    /// [`Self::open`] returns.
+    pub fn open_for_session(
+        runtime_root: &Path,
+        runtime_dir: &Path,
+        session_id: SessionId,
+    ) -> Result<Self> {
+        let directory = session_directory(runtime_dir, session_id);
+        kr_ipc::paths::create_private_tree(runtime_root, &directory)?;
+        Self::open(session_id, &directory)
+    }
+
     #[cfg(unix)]
     fn address_in(_session_id: SessionId, directory: &Path) -> Result<(BridgeEndpoint, Endpoint)> {
         let path = directory.join(ENDPOINT_BASENAME);
@@ -143,6 +164,22 @@ impl HostEndpoint {
             secret: Bytes::new(self.secret.expose().to_vec()),
         }
     }
+}
+
+/// Returns the directory one session's bridge endpoint lives in.
+///
+/// Eight characters of the session identifier, which is what the rest of the runtime tree uses for
+/// the same reason: the whole identity is recorded in the descriptor, and the directory name only
+/// has to tell one live session from another.
+#[must_use]
+pub fn session_directory(runtime_dir: &Path, session_id: SessionId) -> std::path::PathBuf {
+    let text = session_id.to_string();
+    let short: String = text
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(8)
+        .collect();
+    runtime_dir.join(format!("b{short}"))
 }
 
 /// Returns the kind of endpoint this platform listens on.

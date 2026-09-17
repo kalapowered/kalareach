@@ -3,7 +3,7 @@
 use std::process::ExitCode;
 
 use clap::Parser as _;
-use kr_cli::cli::{Cli, Command, HostCommand};
+use kr_cli::cli::{Cli, Command, HostCommand, ShellArguments, ShellCommand};
 use kr_cli::error::{CliError, Result};
 use kr_cli::resolve::{SessionSelector, find, open_controller, open_worker};
 use kr_cli::session::AttachOptions;
@@ -21,6 +21,7 @@ use kr_protocol::session::{
     SessionCreateResult, SessionListParams, SessionListResult, SessionReadParams,
     SessionReadResult, ShellMode,
 };
+use kr_shell_integration::host::startup::HomeLayout;
 
 fn main() -> ExitCode {
     // Whether the caller asked for machine-readable output has to be known before the arguments
@@ -583,6 +584,49 @@ async fn run(cli: Cli) -> Result<Completion> {
                 Ok(Completion::Done)
             }
         },
+        Command::Shell(arguments) => {
+            // Nothing here reaches the host: setup configures this user's own shell, and the
+            // diagnostics read the installed packages and the files those shells actually read.
+            let layout = HomeLayout::from_environment();
+            let packages = kr_cli::shell::packages()?;
+            let selected = kr_cli::shell::selected(&packages, shell_selector(&arguments))?;
+            let reports = match &arguments.command {
+                ShellCommand::Status(_) => selected
+                    .iter()
+                    .map(|package| kr_cli::shell::report(package, &layout))
+                    .collect::<Vec<_>>(),
+                ShellCommand::Install(install) => selected
+                    .iter()
+                    .map(|package| {
+                        kr_cli::shell::install(
+                            package,
+                            &layout,
+                            install.nsh_bypass,
+                            install.dry_run,
+                        )
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                ShellCommand::Remove(remove) => selected
+                    .iter()
+                    .map(|package| kr_cli::shell::remove(package, &layout, remove.dry_run))
+                    .collect::<Result<Vec<_>>>()?,
+            };
+            if cli.json {
+                print_json(&kr_cli::shell::to_json(&reports));
+            } else {
+                kr_cli::shell::print(&reports);
+            }
+            Ok(Completion::Done)
+        }
+    }
+}
+
+/// Returns the shell one `kr shell` invocation names, when it names one.
+fn shell_selector(arguments: &ShellArguments) -> Option<&str> {
+    match &arguments.command {
+        ShellCommand::Status(status) => status.shell.as_deref(),
+        ShellCommand::Install(install) => install.shell.as_deref(),
+        ShellCommand::Remove(remove) => remove.shell.as_deref(),
     }
 }
 
