@@ -630,7 +630,8 @@ fn rename_no_replace(
             detail: format!(
                 "{} is taken, so nothing was replaced",
                 crate::git::redact(to_name.as_str())
-            ),
+            )
+            .into(),
         });
     }
     from.rename_into(from_name, to, to_name)?;
