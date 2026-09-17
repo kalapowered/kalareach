@@ -37,10 +37,14 @@ working tree.
 * A linked worktree is a new object with a new identity, so adding one creates a record rather than
   widening a grant that covers an existing one.
 
-Everything after the first open goes through an open directory descriptor rather than a path, which
-is the same authority model the transfer service uses for a staging area and for a client's chosen
-destination. A destination is a parent directory resolved once and one single-component name inside
-it: no separator, no traversal segment, no reserved device name.
+Everything this host does to the filesystem itself goes through an open directory descriptor rather
+than a path: the same authority model the transfer service uses for a staging area and for a
+client's chosen destination. A destination is a parent directory resolved once and one
+single-component name inside it: no separator, no traversal segment, no reserved device name.
+
+A Git invocation is the exception, and it is stated rather than glossed over. Git resolves the
+directory `-C` names for itself and reads the configuration for itself, so neither is under a handle
+this host holds. What the host does about that is in the limits section below.
 
 ## Creating a repository
 
@@ -81,7 +85,8 @@ and the rename is refused rather than published under the same action.
 
 **A crash is reconciled against the create token.** The operation row's key is the action identifier
 the caller submitted, and the staged repository's *witness* is recorded before the rename: its
-filesystem identity, and the instant the filesystem says it was created. So a replacement daemon
+filesystem identity, and the instant the filesystem says it was created — or, where the platform
+does not report a creation instant, its modification instant. So a replacement daemon
 never asks "does the name exist"; it asks which name holds *that object*. The creation instant is
 the second half of the witness because a filesystem reuses a device and inode pair once the object
 that held them is gone, and reuse with the same creation instant is not something a filesystem
@@ -92,12 +97,14 @@ host says so rather than claiming more.
 | --- | --- |
 | The destination holds the staged object | Finishes the operation: writes the repository row and settles the claim |
 | The staging directory still holds it | Finishes the same publication, which is not another clone |
-| Neither holds it | Records the operation as unknown and keeps the staging path, named in the result |
+| Neither holds it | Records the operation as unknown and keeps the staging path, named in the result. The cleanup deliberately leaves an `unknown` operation's staging path alone, because ownership of what is there is exactly what is uncertain |
 | No witness was recorded | Nothing was published: removes the staged content and closes the operation |
 
-A staging sibling exists for a moment before the row that names it is updated, so recovery also
-removes any sibling no operation row accounts for, in the parents this host has used. Recovery runs
-before anything is served, so no operation is in flight when it does.
+A staging sibling's *name* goes on to the row before the directory exists, and the sibling's own
+filesystem identity goes on to it as soon as it does. So the cleanup removes a name this host
+recorded **and** checks that the object at that name is still the one it recorded: a repository a
+user happened to call `.kr-project-something` is not this host's to delete, and neither is a
+replacement at a name this host used once.
 
 A failure *after* the rename landed is not a failure of the operation: the repository exists. The
 row is in `publishing` with the witness, so the same reconciliation runs immediately rather than
@@ -163,8 +170,10 @@ workspace is for.
 ### The inclusion preview
 
 The create interface previews what will be included, and the preview is `workspace.create` with
-`preview_only` set: the same parameters, so a user cannot be shown a preview of one policy and given
-a workspace built under another. It creates nothing.
+`preview_only` set. The parameters are the same type, so a client shows and creates from one object
+rather than two that could drift apart in its own code. It is not a promise that the tree has not
+changed between the two calls: the preview says so among its limitations, and a creation takes its
+own reading.
 
 Five classes, five decisions:
 
@@ -191,9 +200,11 @@ path from the new workspace, because the checkout put the base's copy there.
 
 The counts cover every path the status reported, including the ones the bounded list leaves out; the
 list says how many those are. `counts_complete` says whether the counts are the whole of their
-classes: a wholly ignored directory is one entry in Git's own status output, so this host walks it to
-count and copy what an inclusion covers, and a directory deeper or larger than the walk's bound
-makes every count a lower bound with the reason among the limitations.
+classes. It is false when any bound was reached: a wholly ignored directory is one entry in Git's own
+status output, so this host walks it to count and copy what an inclusion covers, and a directory
+deeper or larger than the walk's bound, an entry the host could not read, a link or a device it did
+not count, or a path it did not classify as text or binary all make every count a lower bound with
+the reason among the limitations.
 
 A submodule is counted from the index and never entered, so what a submodule holds is neither
 measured nor copied. Including one records the decision and names the path among the creation's
@@ -210,11 +221,18 @@ An exclusion means the new workspace starts without that file, or with the base'
 where the base has one. It never means the original is touched. The service reads the source tree
 and writes only into the new one.
 
-An inclusion replaces the destination rather than writing over it: the name is removed and created
-again, so a file the user has shortened does not keep the base's tail. What the host could not
-carry it names rather than hides: a symbolic link, a device, a submodule's own working tree and a
-path whose destination could not be replaced all appear in the creation's `unapplied` list, and the
-workspace is still returned because it is usable and what it does not hold is stated.
+An inclusion replaces the destination rather than writing over it: the copy is written to a name of
+this host's own, flushed to disk, given the source's permission bits, and then renamed over the
+destination. A rename replaces a file in one step, so the destination is either the base's file or
+the user's and never half of each, and a failure anywhere before the rename leaves the destination
+as it was. What the host could not carry it names rather than hides: a symbolic link, a device, a
+submodule's own working tree and a path whose destination could not be replaced all appear in the
+creation's `unapplied` list, and the workspace is still returned because it is usable and what it
+does not hold is stated.
+
+An **exclusion** of a dirty tracked file means the workspace holds the *base's* version of it, not
+that the path is absent: the checkout put the base's content there and an exclusion is the host not
+replacing it. A path the base does not have — an untracked file, an ignored one — is absent.
 
 That rule is enforced from underneath as well as stated: the restricted profile's subcommand
 allowlist does not contain `clean`, `stash`, `reset`, `restore`, `commit`, `push`, `revert`,
@@ -286,10 +304,11 @@ nothing can prompt and nothing can page.
 **What configuration applies.** `GIT_CONFIG_NOSYSTEM=1`, and the global and system files both point
 at a zero-byte file this host owns, so the only configuration left is the repository's own. On top of
 it go the host's overrides, carried as `GIT_CONFIG_COUNT` with a `GIT_CONFIG_KEY_<n>` and
-`GIT_CONFIG_VALUE_<n>` pair for each one. That form has the same precedence as `git -c`, beats every
-configuration file and reaches every subprocess Git starts. It is used in place of `-c` because `-c`
-splits its argument at the first `=`, so a configuration key whose subsection contains one could not
-be overridden at all.
+`GIT_CONFIG_VALUE_<n>` pair for each one. That form beats every configuration file and reaches every
+subprocess Git starts. It is used in place of `-c` because `-c` splits its argument at the first
+`=`, so a configuration key whose subsection contains one could not be overridden at all. A
+command-line `-c` would take precedence over this form, and nothing here passes one: the argument
+checker refuses `-c` in any spelling, so the environment form is the only source of overrides.
 
 Hooks are looked for in an empty directory this host owns; the filesystem monitor, the pager, the
 editor, the credential prompt, the proxy, the alternate-reference command, the external diff, the
@@ -310,11 +329,11 @@ repository chose, so a fixed list of overrides cannot cover it. The effective co
 therefore read first, and every driver it defines is blanked by name.
 
 A driver's subsection keeps the bytes the repository chose, because a configuration subsection is
-case-sensitive: an override spelled `filter.mixed.clean` does not reach `filter.Mixed.clean`. A name
-holding a control character cannot be carried in an environment value at all, so a driver named that
-way is refused rather than left alone.
+case-sensitive: an override spelled `filter.mixed.clean` does not reach `filter.Mixed.clean`. The
+listing is classified from its bytes rather than as text, because Git accepts a subsection that is
+not valid text and reading it lossily would hand the host a name with a replacement character in it.
 
-The keys that remain are dealt with in one of two ways, and never ignored:
+The keys that remain are dealt with in one of three ways, and never ignored:
 
 * **Blanked.** An override sets the key to nothing. The limitation is reported with the result,
   because section 14 asks the host to expose a limitation rather than execute an ungranted helper.
@@ -324,6 +343,14 @@ The keys that remain are dealt with in one of two ways, and never ignored:
   program, so an override adds to them rather than replacing them. A *read* of such a repository is
   allowed and states the limitation; adopting it into this host's registry is refused, because a
   record is a promise to serve the repository and its remotes.
+* **Inexpressible.** A key that is not valid text, or a driver whose subsection holds a control
+  character, cannot be carried in an environment value at all. Whether it would run cannot be
+  decided either way, so **every** operation on the repository is refused, a read included: a read
+  that ran beside one of these could be a read that went through it.
+
+A configuration key can itself carry a credential — `[url "https://token@host/"]` puts one in the
+subsection — so every key on its way into a limitation or a refusal goes through the same redaction
+a URL does.
 
 Nothing here rewrites the user's Git configuration. The overrides live on one child process's
 command line and in its environment. A terminal command under broad shell access keeps normal Git
@@ -361,9 +388,11 @@ tree it created and what it carried into it.
 
 **A cancellation contains a process group on Unix and a single process elsewhere.** Every Git child
 this service starts leads its own process group, so a cancellation ends the helper, the ssh process
-and the credential helper along with Git. Windows containment is a Job Object, which is a call
-outside safe Rust and therefore not in this crate; a cancellation there ends the Git process and the
-result says that the host could not confirm the rest.
+and the credential helper along with Git, and the result says so only when the kill and the reap
+both succeeded. Windows containment is a Job Object, which is a call outside safe Rust and therefore
+not in this crate; a cancellation there ends the Git process and **always** says that the host could
+not confirm the rest. A reader thread that still holds a pipe after Git has gone is waited on for
+five seconds and then left to its own end, so a descendant cannot hold the call open.
 
 ## Storage layout
 
@@ -398,6 +427,11 @@ change commits with the outbox row that announces it.
 | `actions` | One row per claimed action: the claim, and its result when there is one |
 | `events`, `cursors` | The outbox and its consumers |
 
+Every transition of an owned object commits with the outbox row that announces it, in one
+transaction. The `actions` table is the exception and deliberately so: it is the de-duplication
+record rather than an object whose transitions a consumer replays, and what a consumer replays is
+the state each claim was opened beside.
+
 The journal's lock is never held across a subprocess. A clone can take minutes; each transaction
 takes the lock and releases it, and every Git invocation runs with none held. A guard is always
 bound to a local first, never taken in the head of a condition or a loop: a temporary guard there
@@ -415,7 +449,7 @@ happened here and never happened anywhere downstream.
 | An operation in `staging` or `publishing` | Reconciles it against the create token, as the table above says |
 | A staging sibling a row names, whose operation has ended | Removes it. Nothing is removed because of its name alone: a repository a user called `.kr-project-something` is not this host's |
 | A workspace in `materialising` | Removes the staged sibling it recorded, leaves every file in the directory alone, and moves the row to `removal_pending` with the reason. The files may be the user's, and this host does not know which of them it wrote; what it does know is that the workspace is not what its creation asked for, so nothing new may hold it and no read calls it ready |
-| An action claim with no result | Settles it. A claim is opened with the state it changes and filled in when the effect settles, so a daemon that died between the two leaves one open — and an open claim is not an answer: a repeat would be told the outcome is unknown for ever. Where the durable state answers the action, that is the answer; where it does not, the claim settles as an unknown outcome naming the object it acted on |
+| An action claim with no result | Consults the object the claim names. A completed operation's own rows reconstruct the result the caller never received, and that is what the claim settles with. An operation still in `staging` or `publishing` is one this host may yet decide, so its claim stays open on purpose for the next recovery. Anything else settles as an unknown outcome naming the object and the state it is in. An open claim is not an answer, and neither is a permanent unknown where the state says otherwise |
 
 ## Errors
 

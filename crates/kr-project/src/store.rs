@@ -20,7 +20,9 @@
 //!   evidence each get one, and a removal that finds any of them leaves the workspace in
 //!   `removal_pending` until the user approves.
 //! * An **action** row claims a mutation in the same transaction as its effect, so two copies of
-//!   one action agree about what happened.
+//!   one action agree about what happened. It is the de-duplication record rather than an object
+//!   whose transitions a consumer replays, so it carries no outbox row of its own: what a consumer
+//!   replays is the state the claim was opened beside.
 
 use std::path::Path;
 
@@ -74,6 +76,24 @@ pub struct ProjectRow {
     pub remote: Option<RemoteSpecification>,
     /// When the record was written.
     pub created_at_ms: TimestampMs,
+}
+
+/// What one operation state change records beside the state.
+///
+/// Every field is optional and an absent one leaves what the row holds alone, so one call carries
+/// whichever of them the caller has learned.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OperationUpdate<'a> {
+    /// Why it is in the state it is in.
+    pub detail: Option<&'a str>,
+    /// When it ended.
+    pub ended_at_ms: Option<TimestampMs>,
+    /// What this host recorded about the object it staged, before the publication.
+    pub staged_identity: Option<StagedWitness>,
+    /// The private sibling the content is staged in.
+    pub staging_name: Option<&'a str>,
+    /// That sibling's own filesystem identity.
+    pub staging_identity: Option<ObjectIdentity>,
 }
 
 /// What one workspace state change records beside the state.
@@ -160,6 +180,11 @@ pub struct OperationRow {
     pub destination_name: String,
     /// The private sibling the content was staged in, when one was made.
     pub staging_name: Option<String>,
+    /// That sibling's own filesystem identity, recorded when it was created.
+    ///
+    /// A recorded name is not authority to remove whatever now holds it. The identity is what
+    /// makes the cleanup a removal of this host's own directory rather than of a replacement.
+    pub staging_identity: Option<ObjectIdentity>,
     /// What this host recorded about the object it staged, before the publication.
     ///
     /// This is what makes an interrupted publication resolvable: the question is not whether a
@@ -378,6 +403,8 @@ impl Store {
                      parent_path           TEXT NOT NULL,
                      destination_name      TEXT NOT NULL,
                      staging_name          TEXT,
+                     staging_device        INTEGER,
+                     staging_file_id       INTEGER,
                      staged_device         INTEGER,
                      staged_file_id        INTEGER,
                      staged_created_at_ms  INTEGER,
@@ -495,11 +522,15 @@ impl Store {
         &mut self,
         action_id: ActionId,
         state: OperationState,
-        detail: Option<&str>,
-        ended_at_ms: Option<TimestampMs>,
-        staged_identity: Option<StagedWitness>,
-        staging_name: Option<&str>,
+        update: &OperationUpdate<'_>,
     ) -> Result<()> {
+        let OperationUpdate {
+            detail,
+            ended_at_ms,
+            staged_identity,
+            staging_name,
+            staging_identity,
+        } = *update;
         let now = kr_ipc::now_ms();
         let transaction = self.transaction()?;
         transaction
@@ -511,7 +542,9 @@ impl Store {
                         staged_device = COALESCE(?5, staged_device),
                         staged_file_id = COALESCE(?6, staged_file_id),
                         staged_created_at_ms = COALESCE(?7, staged_created_at_ms),
-                        staging_name = COALESCE(?8, staging_name)
+                        staging_name = COALESCE(?8, staging_name),
+                        staging_device = COALESCE(?9, staging_device),
+                        staging_file_id = COALESCE(?10, staging_file_id)
                   WHERE action_id = ?1",
                 params![
                     action_id.get().as_bytes().to_vec(),
@@ -524,6 +557,8 @@ impl Store {
                         .and_then(|staged| staged.created_at_ms)
                         .map(i64_of),
                     staging_name,
+                    staging_identity.map(|identity| i64_of(identity.device)),
+                    staging_identity.map(|identity| i64_of(identity.file_id)),
                 ],
             )
             .map_err(ProjectError::store)?;
@@ -583,19 +618,31 @@ impl Store {
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
     pub fn record_staging_path(
-        &self,
+        &mut self,
         action_id: ActionId,
         path: &str,
         removed: bool,
     ) -> Result<()> {
-        self.connection
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        transaction
             .execute(
                 "INSERT INTO operation_paths (action_id, path, removed) VALUES (?1, ?2, ?3)
                  ON CONFLICT (action_id, path) DO UPDATE SET removed = ?3",
                 params![action_id.get().as_bytes().to_vec(), path, removed],
             )
             .map_err(ProjectError::store)?;
-        Ok(())
+        announce(
+            &transaction,
+            if removed {
+                "project.operation.staging_removed"
+            } else {
+                "project.operation.staging_retained"
+            },
+            &action_id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
     }
 
     /// Returns the staging paths one operation accounts for.
@@ -854,7 +901,7 @@ impl Store {
         workspace_id: WorkspaceId,
         retention: RetentionPolicy,
         action: Option<&Action>,
-    ) -> Result<(WorkspaceRow, Vec<RetainedRow>)> {
+    ) -> Result<WorkspaceRow> {
         let now = kr_ipc::now_ms();
         let transaction = self.transaction()?;
         if let Some(action) = action {
@@ -901,6 +948,52 @@ impl Store {
                 ),
             });
         }
+        transaction
+            .execute(
+                "UPDATE workspaces SET state = ?2, retention = ?3 WHERE workspace_id = ?1",
+                params![
+                    workspace_id.get().as_bytes().to_vec(),
+                    workspace_state_text(WorkspaceState::RemovalPending),
+                    retention_text(retention),
+                ],
+            )
+            .map_err(ProjectError::store)?;
+        announce(
+            &transaction,
+            "workspace.removal_pending",
+            &workspace_id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)?;
+        Ok(row)
+    }
+
+    /// Finishes a removal in one transaction: re-reads what is held, releases it where the policy
+    /// approves, and sets the terminal state.
+    ///
+    /// The re-read is the point. The decision to delete was taken from a list read earlier, and a
+    /// pin added since then is a pin the decision never saw: the state it lands in has to be
+    /// decided from what is held *now*.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn finish_removal(
+        &mut self,
+        workspace_id: WorkspaceId,
+        retention: RetentionPolicy,
+        removed_at_ms: TimestampMs,
+    ) -> Result<Vec<RetainedRow>> {
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        if matches!(retention, RetentionPolicy::RemoveRetained) {
+            transaction
+                .execute(
+                    "DELETE FROM workspace_retained WHERE workspace_id = ?1",
+                    params![workspace_id.get().as_bytes().to_vec()],
+                )
+                .map_err(ProjectError::store)?;
+        }
         let mut statement = transaction
             .prepare(
                 "SELECT kind, detail, change_set_id FROM workspace_retained
@@ -921,29 +1014,36 @@ impl Store {
                 })
             })
             .map_err(ProjectError::store)?;
-        let mut retained = Vec::new();
+        let mut held = Vec::new();
         for item in mapped {
-            retained.push(item.map_err(ProjectError::store)?);
+            held.push(item.map_err(ProjectError::store)?);
         }
         drop(statement);
+        let state = if held.is_empty() {
+            WorkspaceState::Removed
+        } else {
+            WorkspaceState::RemovalPending
+        };
         transaction
             .execute(
-                "UPDATE workspaces SET state = ?2, retention = ?3 WHERE workspace_id = ?1",
+                "UPDATE workspaces SET state = ?2, retention = ?3, removed_at_ms = ?4
+                  WHERE workspace_id = ?1",
                 params![
                     workspace_id.get().as_bytes().to_vec(),
-                    workspace_state_text(WorkspaceState::RemovalPending),
+                    workspace_state_text(state),
                     retention_text(retention),
+                    i64_of(removed_at_ms.get()),
                 ],
             )
             .map_err(ProjectError::store)?;
         announce(
             &transaction,
-            "workspace.removal_pending",
+            &format!("workspace.{}", workspace_state_text(state)),
             &workspace_id.to_string(),
             now,
         )?;
         transaction.commit().map_err(ProjectError::store)?;
-        Ok((row, retained))
+        Ok(held)
     }
 
     /// Forgets a workspace's staging name, once the sibling it named is gone.
@@ -951,14 +1051,22 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
-    pub fn clear_workspace_staging(&self, id: WorkspaceId) -> Result<()> {
-        self.connection
+    pub fn clear_workspace_staging(&mut self, id: WorkspaceId) -> Result<()> {
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        transaction
             .execute(
                 "UPDATE workspaces SET staging_name = NULL WHERE workspace_id = ?1",
                 params![id.get().as_bytes().to_vec()],
             )
             .map_err(ProjectError::store)?;
-        Ok(())
+        announce(
+            &transaction,
+            "workspace.staging_removed",
+            &id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
     }
 
     /// Returns one workspace.
@@ -1181,6 +1289,30 @@ impl Store {
     pub fn retain(&mut self, workspace_id: WorkspaceId, item: &RetainedRow) -> Result<()> {
         let now = kr_ipc::now_ms();
         let transaction = self.transaction()?;
+        // A workspace whose removal has begun takes nothing new, for the same reason it takes no
+        // new holder: a pin added between the removal's decision and its deletion would be a pin
+        // the removal never saw. The host's own measurement uses `replace_retained`, which is part
+        // of the removal rather than a caller of it.
+        let state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM workspaces WHERE workspace_id = ?1",
+                params![workspace_id.get().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ProjectError::store)?;
+        let state = state.as_deref().map(workspace_state_of);
+        if !matches!(
+            state,
+            Some(WorkspaceState::Ready | WorkspaceState::Materialising)
+        ) {
+            return Err(ProjectError::WrongState {
+                detail: format!(
+                    "workspace {workspace_id} is {}, so nothing new is recorded against it",
+                    state.map_or("not a workspace this environment has", workspace_state_text)
+                ),
+            });
+        }
         transaction
             .execute(
                 "INSERT INTO workspace_retained (workspace_id, kind, detail, change_set_id)
@@ -1636,8 +1768,9 @@ fn announce(
 /// The columns an operation row is read from.
 const OPERATION_COLUMNS: &str = "action_id, actor_id, environment_id, project_repository_id, \
      method, state, remote_name, remote_transport, remote_url, remote_provider, remote_broker, \
-     flow, destination_state, parent_path, destination_name, staging_name, staged_device, \
-     staged_file_id, staged_created_at_ms, detail, started_at_ms, ended_at_ms";
+     flow, destination_state, parent_path, destination_name, staging_name, staging_device, \
+     staging_file_id, staged_device, staged_file_id, staged_created_at_ms, detail, \
+     started_at_ms, ended_at_ms";
 
 /// The columns a repository row is read from.
 const PROJECT_COLUMNS: &str = "project_repository_id, environment_id, label, origin, state, \
@@ -1657,11 +1790,11 @@ fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result
             "INSERT INTO operations (action_id, actor_id, environment_id, project_repository_id,
                                      method, state, remote_name, remote_transport, remote_url,
                                      remote_provider, remote_broker, flow, destination_state,
-                                     parent_path, destination_name, staging_name, staged_device,
-                                     staged_file_id, staged_created_at_ms, detail, started_at_ms,
-                                     ended_at_ms)
+                                     parent_path, destination_name, staging_name, staging_device,
+                                     staging_file_id, staged_device, staged_file_id,
+                                     staged_created_at_ms, detail, started_at_ms, ended_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20, ?21, ?22)",
+                     ?18, ?19, ?20, ?21, ?22, ?23, ?24)",
             params![
                 row.action_id.get().as_bytes().to_vec(),
                 row.actor_id.as_str(),
@@ -1679,6 +1812,9 @@ fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result
                 row.parent_path,
                 row.destination_name,
                 row.staging_name,
+                row.staging_identity.map(|identity| i64_of(identity.device)),
+                row.staging_identity
+                    .map(|identity| i64_of(identity.file_id)),
                 row.staged_identity
                     .map(|staged| i64_of(staged.identity.device)),
                 row.staged_identity
@@ -1703,9 +1839,11 @@ fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
     let transport: Option<String> = row.get(7)?;
     let flow: Option<String> = row.get(11)?;
     let destination_state: String = row.get(12)?;
-    let device: Option<i64> = row.get(16)?;
-    let file_id: Option<i64> = row.get(17)?;
-    let created_at_ms: Option<i64> = row.get(18)?;
+    let staging_device: Option<i64> = row.get(16)?;
+    let staging_file_id: Option<i64> = row.get(17)?;
+    let device: Option<i64> = row.get(18)?;
+    let file_id: Option<i64> = row.get(19)?;
+    let created_at_ms: Option<i64> = row.get(20)?;
     let remote = match (row.get::<_, Option<String>>(6)?, transport) {
         (Some(name), Some(transport)) => Some(RemoteSpecification {
             remote_name: name,
@@ -1733,6 +1871,13 @@ fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
         parent_path: row.get(13)?,
         destination_name: row.get(14)?,
         staging_name: row.get(15)?,
+        staging_identity: match (staging_device, staging_file_id) {
+            (Some(device), Some(file_id)) => Some(ObjectIdentity {
+                device: u64_of(device),
+                file_id: u64_of(file_id),
+            }),
+            _ => None,
+        },
         staged_identity: match (device, file_id) {
             (Some(device), Some(file_id)) => Some(StagedWitness {
                 identity: ObjectIdentity {
@@ -1743,10 +1888,10 @@ fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
             }),
             _ => None,
         },
-        detail: row.get(19)?,
-        started_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(20)?)),
+        detail: row.get(21)?,
+        started_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(22)?)),
         ended_at_ms: row
-            .get::<_, Option<i64>>(21)?
+            .get::<_, Option<i64>>(23)?
             .map(|stamp| TimestampMs::new(u64_of(stamp))),
     })
 }
@@ -2133,6 +2278,7 @@ mod tests {
             parent_path: "/tmp/parent".to_owned(),
             destination_name: "x".to_owned(),
             staging_name: Some(".kr-project-0123".to_owned()),
+            staging_identity: None,
             staged_identity: None,
             detail: None,
             started_at_ms: TimestampMs::new(1_000),
@@ -2175,10 +2321,10 @@ mod tests {
             .set_operation_state(
                 row.action_id,
                 OperationState::Publishing,
-                None,
-                None,
-                Some(staged),
-                None,
+                &OperationUpdate {
+                    staged_identity: Some(staged),
+                    ..OperationUpdate::default()
+                },
             )
             .expect("the state moves");
         let read = store
@@ -2411,10 +2557,9 @@ mod tests {
             .set_operation_state(
                 row.action_id,
                 OperationState::Publishing,
-                None,
-                None,
-                None,
-                None,
+                &OperationUpdate {
+                    ..OperationUpdate::default()
+                },
             )
             .expect("the state moves");
         announced(&store, "moving an operation");

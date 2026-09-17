@@ -145,19 +145,22 @@ pub fn parse_status(text: &str) -> Result<Vec<StatusEntry>> {
                 if path.is_empty() {
                     return Err(malformed(record));
                 }
-                // The two state characters are the index's and the working tree's. A `D` in the
-                // working-tree position is a path the tree no longer holds, and carrying that
-                // inclusion means removing the path rather than copying it.
-                let worktree = states.chars().nth(1).unwrap_or('.');
+                // The two state characters are the index's and the working tree's. A `D` in
+                // either position is a path the working tree no longer holds: `.D` is deleted and
+                // not staged, `D.` is deleted and staged, and either way there is nothing there to
+                // copy. Carrying that inclusion means removing the path from the new workspace.
+                let mut states = states.chars();
+                let index = states.next().unwrap_or('.');
+                let worktree = states.next().unwrap_or('.');
                 entries.push(StatusEntry {
                     class: if submodule.starts_with('S') {
                         InclusionClass::Submodule
                     } else {
                         InclusionClass::DirtyFile
                     },
-                    change: match (marker, worktree) {
-                        ("u", _) => ChangeKind::Unmerged,
-                        (_, 'D') => ChangeKind::Deleted,
+                    change: match (marker, index, worktree) {
+                        ("u", _, _) => ChangeKind::Unmerged,
+                        (_, 'D', '.') | (_, _, 'D') => ChangeKind::Deleted,
                         _ => ChangeKind::Present,
                     },
                     path: path.to_owned(),
@@ -412,7 +415,9 @@ pub fn survey(
             entries: sample,
             omitted_entries: U64::new(omitted),
             unknown_content: U64::new(unknown),
-            counts_complete: truncated == 0,
+            // The binary count covers the paths this host read, so a path it did not read makes
+            // that count a lower bound as surely as an unwalked directory does.
+            counts_complete: truncated == 0 && unknown == 0,
             limitations,
             taken_at_ms: request.at_ms,
         },
@@ -460,8 +465,14 @@ fn expand(
         *truncated += 1;
         return;
     };
-    for entry in entries.flatten() {
+    for entry in entries {
+        let Ok(entry) = entry else {
+            // A directory entry this host could not read is one it did not count.
+            *truncated += 1;
+            continue;
+        };
         let Ok(file_name) = entry.file_name().into_string() else {
+            *truncated += 1;
             continue;
         };
         let child = format!("{prefix}/{file_name}");
@@ -481,8 +492,9 @@ fn expand(
                     change: ChangeKind::Present,
                 });
             }
-            // A link, a socket or a device is not content this host copies.
-            _ => {}
+            // A link, a socket or a device is not content this host copies, and one it did not
+            // count is one its counts do not cover.
+            _ => *truncated += 1,
         }
     }
 }
@@ -543,12 +555,22 @@ fn measure(
     let mut head = vec![0_u8; wanted];
     let mut read = 0_usize;
     let handle = file.handle_mut();
-    while read < head.len() {
+    loop {
+        if read >= head.len() {
+            break;
+        }
         match handle.read(&mut head[read..]) {
             Ok(0) => break,
             Ok(count) => read += count,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-            Err(_) => break,
+            Err(_) => {
+                // A read that failed part way says nothing about the rest of the file. Reporting
+                // the prefix as text would be reporting a classification this host does not have.
+                return Measured {
+                    byte_len: Some(byte_len),
+                    content: ContentClass::Unknown,
+                };
+            }
         }
     }
     Measured {
@@ -785,41 +807,108 @@ fn copy_one(
     }
     let target = here.as_ref().unwrap_or(destination);
     let leaf = RelativeName::parse(leaf)?;
+    let mode = source_mode(&file);
     let mut handle = file.into_handle();
-    // The checkout may already have put the base's content at this name. Writing over it would
-    // leave the base's tail behind whenever the user's file is shorter, so the name is removed and
-    // created again: what the workspace holds is the user's file and nothing of the base's.
-    let existing = target.remove(&leaf).is_ok();
-    let mut written = match target.create_new(&leaf) {
+    // The checkout may already have put the base's content at this name, and writing over it would
+    // leave the base's tail behind whenever the user's file is shorter. So the copy is written to
+    // a name of this host's own, flushed, and then renamed over the destination: a rename replaces
+    // a file in one step, so the destination is either the base's file or the user's and never
+    // half of each. A failure anywhere before the rename leaves the destination as it was.
+    let temporary = RelativeName::parse(&format!(".kr-copy-{}", random_name()))?;
+    let _ = target.remove(&temporary);
+    let mut written = match target.create_new(&temporary) {
         Ok(created) => created,
-        // Something this host could not replace is still there: a directory where the source has
-        // a file, or a name the platform would not remove. It is named rather than written over.
-        Err(_) => {
-            let _ = existing;
-            return Ok(false);
-        }
+        Err(_) => return Ok(false),
     };
     let mut buffer = vec![0_u8; 256 * 1024];
-    loop {
-        let read = match handle.read(&mut buffer) {
-            Ok(0) => break,
-            Ok(count) => count,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => {
-                return Err(ProjectError::Destination {
-                    detail: format!("{leaf} could not be read: {error}"),
-                });
-            }
-        };
+    let outcome = (|| -> Result<()> {
+        loop {
+            let read = match handle.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(count) => count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(ProjectError::Destination {
+                        detail: format!("{leaf} could not be read: {error}"),
+                    });
+                }
+            };
+            written
+                .handle_mut()
+                .write_all(&buffer[..read])
+                .map_err(|error| ProjectError::Destination {
+                    detail: format!("{leaf} could not be written: {error}"),
+                })?;
+        }
+        // The bytes are durable before the name changes, so a power loss cannot leave the
+        // destination naming a file whose content never reached the disk.
         written
             .handle_mut()
-            .write_all(&buffer[..read])
+            .sync_all()
             .map_err(|error| ProjectError::Destination {
-                detail: format!("{leaf} could not be written: {error}"),
+                detail: format!("{leaf} could not be flushed: {error}"),
             })?;
+        // An executable script that arrives without its executable bit is not the file the user
+        // has, so the source's mode is carried across where the platform has one.
+        apply_mode(&written, mode);
+        Ok(())
+    })();
+    drop(written);
+    if let Err(error) = outcome {
+        let _ = target.remove(&temporary);
+        return Err(error);
+    }
+    if target.rename_into(&temporary, target, &leaf).is_err() {
+        // Something this host could not replace is at the name: a directory where the source has a
+        // file. The destination keeps whatever it had and the path is named rather than written
+        // over.
+        let _ = target.remove(&temporary);
+        return Ok(false);
     }
     target.sync()?;
     Ok(true)
+}
+
+/// Returns the source file's permission bits, where the platform has them.
+#[cfg(unix)]
+fn source_mode(file: &kr_transfer::AuthorisedFile) -> Option<u32> {
+    use cap_std::fs::MetadataExt as _;
+
+    file.handle()
+        .metadata()
+        .ok()
+        .map(|metadata| metadata.mode())
+}
+
+/// Returns the source file's permission bits, where the platform has them.
+#[cfg(not(unix))]
+fn source_mode(_file: &kr_transfer::AuthorisedFile) -> Option<u32> {
+    None
+}
+
+/// Puts the source's permission bits on the copy, where the platform has them.
+#[cfg(unix)]
+fn apply_mode(file: &kr_transfer::AuthorisedFile, mode: Option<u32>) {
+    use cap_std::fs::PermissionsExt as _;
+
+    if let Some(mode) = mode {
+        let _ = file
+            .handle()
+            .set_permissions(cap_std::fs::Permissions::from_mode(mode));
+    }
+}
+
+/// Puts the source's permission bits on the copy, where the platform has them.
+#[cfg(not(unix))]
+fn apply_mode(_file: &kr_transfer::AuthorisedFile, _mode: Option<u32>) {}
+
+/// Returns a name for a copy in progress that nothing else will collide with.
+fn random_name() -> String {
+    let mut text = String::with_capacity(32);
+    for byte in uuid::Uuid::new_v4().as_bytes() {
+        text.push_str(&format!("{byte:02x}"));
+    }
+    text
 }
 
 #[cfg(test)]

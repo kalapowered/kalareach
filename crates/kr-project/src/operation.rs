@@ -324,6 +324,16 @@ impl StagingSibling {
         })
     }
 
+    /// Returns the sibling's own filesystem identity, read through its handle.
+    ///
+    /// The cleanup removes a name this host recorded *and* checks that the object at that name is
+    /// still this one, so a replacement at an old name is never removed as though it were the
+    /// staging directory.
+    #[must_use]
+    pub fn identity(&self) -> ObjectIdentity {
+        self.directory.identity()
+    }
+
     /// Removes the sibling and everything inside it.
     ///
     /// # Errors
@@ -331,6 +341,36 @@ impl StagingSibling {
     /// Returns [`ProjectError::Destination`] when the removal fails for a reason other than the
     /// directory already being gone.
     pub fn remove(self, destination: &Destination) -> Result<()> {
+        self.remove_if(destination, None)
+    }
+
+    /// Removes the sibling only when it is still the object whose identity was recorded.
+    ///
+    /// A recorded name is not authority to remove whatever now holds it. Where an identity was
+    /// recorded, the object at the name has to be that one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::IdentityChanged`] when the name holds a different object, or
+    /// [`ProjectError::Destination`] when the removal fails for a reason other than the directory
+    /// already being gone.
+    pub fn remove_if(
+        self,
+        destination: &Destination,
+        expected: Option<ObjectIdentity>,
+    ) -> Result<()> {
+        if let Some(expected) = expected
+            && self.directory.identity() != expected
+        {
+            return Err(ProjectError::IdentityChanged {
+                detail: format!(
+                    "this operation staged its content in {expected} and {} now holds {}; nothing \
+                     is removed",
+                    self.path.display(),
+                    self.directory.identity()
+                ),
+            });
+        }
         match destination
             .parent
             .handle()

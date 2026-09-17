@@ -595,3 +595,73 @@ fn a_driver_named_in_a_spelling_an_override_could_miss_still_never_runs() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn a_configuration_key_this_host_cannot_express_stops_it_reading_the_repository_at_all() {
+    // A driver whose name this host cannot carry in an environment value is one whose override
+    // would be for a different key. Reading the repository beside it could be reading it *through*
+    // it, so nothing is read.
+    use std::io::Write as _;
+
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "unreadable-config");
+    // Git accepts a subsection that is not valid text, and `git config` would refuse to write it,
+    // so the fixture writes the configuration file itself.
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path.join(".git/config"))
+        .expect("the repository's own configuration opens");
+    file.write_all(b"[filter \"bad\xffname\"]\n\tclean = /bin/echo\n")
+        .expect("a subsection that is not valid text");
+    drop(file);
+    let refusal =
+        OpenedRepository::open(fixture.service().profile(), fixture.environment_id(), &path)
+            .expect_err("this host does not read a repository beside a name it cannot override");
+    assert_eq!(
+        refusal.code(),
+        kr_protocol::error::ErrorCode::RepositoryUntrusted
+    );
+    assert!(
+        refusal.to_string().contains("cannot express"),
+        "the refusal says why: {refusal}"
+    );
+}
+
+#[test]
+fn a_configuration_key_that_carries_a_credential_is_not_repeated_in_a_diagnostic() {
+    // A configuration key can hold a URL: `[url "https://token@host/"] insteadOf = ...` puts one
+    // in the subsection, and that key travels into the limitation and the refusal.
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "credential-in-a-key");
+    support::git_raw(
+        &path,
+        [
+            "config",
+            "--local",
+            "--",
+            "url.https://tokenuser:SECRET@example.invalid/.insteadOf",
+            "kr:",
+        ],
+    );
+    let repository =
+        OpenedRepository::open(fixture.service().profile(), fixture.environment_id(), &path)
+            .expect("a read is allowed and states the limitation");
+    let limitations = repository.audit().limitations().join("\n");
+    assert!(
+        limitations.contains("insteadof"),
+        "the limitation names the key: {limitations}"
+    );
+    assert!(
+        !limitations.contains("SECRET"),
+        "and does not repeat what it carried: {limitations}"
+    );
+    let refusal = repository
+        .audit()
+        .require_neutralised()
+        .expect_err("taking it into the registry is refused");
+    assert!(
+        !refusal.to_string().contains("SECRET"),
+        "the refusal does not repeat it either: {refusal}"
+    );
+}

@@ -1364,3 +1364,257 @@ fn a_removal_this_host_cannot_prove_it_owns_is_refused() {
     );
     assert!(fixture.work().join("unproven-tree/README.md").is_file());
 }
+
+#[cfg(unix)]
+#[test]
+fn an_included_executable_arrives_executable_and_a_failed_copy_leaves_the_base_in_place() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "executable");
+    write(&path, "run.sh", "#!/bin/sh\necho base\n");
+    write(&path, "blocked", "the base's content\n");
+    std::fs::set_permissions(path.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+        .expect("the script is executable");
+    support::git_raw(&path, ["add", "-A"]);
+    support::git_raw(&path, ["commit", "-m", "the base"]);
+    // The user's own versions.
+    write(&path, "run.sh", "#!/bin/sh\necho mine\n");
+    std::fs::set_permissions(path.join("run.sh"), std::fs::Permissions::from_mode(0o755))
+        .expect("the user's script is executable too");
+    write(&path, "blocked", "the user's content\n");
+    let project = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "executable"),
+                label: "executable".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 50)),
+        )
+        .expect("it is adopted")
+        .project
+        .project_repository_id;
+    // A worktree the host reserves, so a directory can be put where a file is expected before the
+    // inclusion runs. That is the case a copy must not write over.
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "modes".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "modes",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 51)),
+        )
+        .expect("the workspace is created");
+    assert!(created.workspace.0.is_some());
+    let tree = fixture.work().join("modes");
+    assert_eq!(
+        std::fs::read_to_string(tree.join("run.sh")).expect("it is there"),
+        "#!/bin/sh\necho mine\n"
+    );
+    let mode = std::fs::metadata(tree.join("run.sh"))
+        .expect("its metadata")
+        .permissions()
+        .mode();
+    assert_eq!(
+        mode & 0o111,
+        0o111,
+        "an included executable keeps its executable bit"
+    );
+}
+
+#[test]
+fn a_workspace_this_host_cannot_inspect_is_kept_rather_than_removed() {
+    // An incomplete inspection keeps work. A tree this host could not read is not a tree it found
+    // empty, so `keep_everything` keeps it and says why.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "uninspectable");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "uninspectable".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "uninspectable-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 52)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    let tree = fixture.work().join("uninspectable-tree");
+    // The gitfile a linked worktree uses, replaced by something Git cannot read: the directory is
+    // still there and its identity still matches, but its status cannot be taken.
+    std::fs::write(tree.join(".git"), "not a gitfile\n").expect("the gitfile is broken");
+    let answer = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::KeepEverything,
+            },
+            Some(&action("workspace.remove", 53)),
+        )
+        .expect("the removal is answered");
+    assert!(!answer.working_files_removed);
+    assert_eq!(answer.workspace.state, WorkspaceState::RemovalPending);
+    assert!(
+        answer.retained.iter().any(|item| item
+            .detail
+            .contains("could not read what this workspace holds")),
+        "the host says it could not inspect the tree: {:?}",
+        answer.retained
+    );
+    assert!(tree.join("README.md").is_file(), "nothing was removed");
+}
+
+#[test]
+fn nothing_new_is_recorded_against_a_workspace_once_its_removal_has_begun() {
+    // A pin added between the removal's decision and its deletion would be a pin the removal never
+    // saw, so a workspace whose removal has begun takes nothing new either.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "sealed");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "sealed".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "sealed-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 54)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    // A pin before the removal keeps it, and is visible to the decision.
+    fixture
+        .service()
+        .retain(
+            workspace_id,
+            &RetainedRow {
+                kind: RetainedKind::PinnedChangeSet,
+                detail: "version 9 is pinned".to_owned(),
+                change_set_id: Some(ChangeSetId::new(Uuid::from_bytes([55; 16]))),
+            },
+        )
+        .expect("the pin is recorded");
+    let answer = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::KeepEverything,
+            },
+            Some(&action("workspace.remove", 56)),
+        )
+        .expect("the removal is answered");
+    assert_eq!(answer.workspace.state, WorkspaceState::RemovalPending);
+    // And a pin that arrives afterwards is refused rather than recorded against a workspace whose
+    // removal has begun.
+    let refusal = fixture
+        .service()
+        .retain(
+            workspace_id,
+            &RetainedRow {
+                kind: RetainedKind::ReviewEvidence,
+                detail: "a review that arrived too late".to_owned(),
+                change_set_id: None,
+            },
+        )
+        .expect_err("nothing new is recorded against it");
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+}
+
+#[test]
+fn a_staged_deletion_is_carried_like_an_unstaged_one() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "staged-delete");
+    // `git rm` stages the deletion, so the status reports `D.` rather than `.D`.
+    support::git_raw(&path, ["rm", "--quiet", "README.md"]);
+    let project = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "staged-delete"),
+                label: "staged".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 57)),
+        )
+        .expect("it is adopted")
+        .project
+        .project_repository_id;
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "staged".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "staged-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 58)),
+        )
+        .expect("the workspace is created");
+    assert!(
+        created
+            .preview
+            .entries
+            .iter()
+            .any(|entry| entry.path == "README.md"
+                && entry.change == kr_protocol::project::ChangeKind::Deleted),
+        "a staged deletion is a deletion: {:?}",
+        created.preview.entries
+    );
+    assert!(
+        !fixture.work().join("staged-tree/README.md").exists(),
+        "the workspace holds the deletion rather than the base's copy"
+    );
+}

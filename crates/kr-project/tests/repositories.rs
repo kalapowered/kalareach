@@ -966,15 +966,22 @@ fn recovery_removes_the_staging_directories_it_recorded_and_nothing_else() {
             .join(kr_project::store::STORE_FILE_NAME),
     )
     .expect("the journal opens");
+    // The service records the sibling's own identity with its name, because a recorded name is
+    // not authority to remove whatever now holds it. The row a dying daemon would have left holds
+    // both, so the fixture writes both.
+    let recorded_identity = std::fs::metadata(&recorded).expect("the directory's metadata");
     journal
         .execute(
-            "UPDATE operations SET staging_name = ?2 WHERE action_id = ?1",
+            "UPDATE operations SET staging_name = ?2, staging_device = ?3, staging_file_id = ?4
+              WHERE action_id = ?1",
             rusqlite::params![
                 cloned.operation.action_id.get().as_bytes().to_vec(),
                 format!("{STAGING_PREFIX}recorded"),
+                std::os::unix::fs::MetadataExt::dev(&recorded_identity) as i64,
+                std::os::unix::fs::MetadataExt::ino(&recorded_identity) as i64,
             ],
         )
-        .expect("the name is recorded");
+        .expect("the name and the identity are recorded");
     drop(journal);
 
     let replacement = fixture.reopen();
@@ -988,6 +995,61 @@ fn recovery_removes_the_staging_directories_it_recorded_and_nothing_else() {
     );
     assert!(decoy.join("README.md").is_file());
     assert!(fixture.work().join("swept/.git").is_dir());
+}
+
+#[test]
+fn a_recorded_staging_name_whose_object_was_replaced_is_left_alone() {
+    // A recorded name is not authority to remove whatever now holds it. The row carries the
+    // sibling's own identity, and a different directory at that name is not the one to remove.
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "source");
+    let cloned = fixture
+        .service()
+        .project_clone(
+            &actor(),
+            &ProjectCloneParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "replaced"),
+                label: "replaced".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: String::new(),
+                    credential_broker: String::new(),
+                },
+            },
+            Some(&action("project.clone", 23)),
+        )
+        .expect("the clone completes");
+    let name = format!("{STAGING_PREFIX}substituted");
+    let substituted = fixture.work().join(&name);
+    std::fs::create_dir_all(substituted.join("somebody-elses-work"))
+        .expect("a directory at the name");
+    // The row names that name and an identity that is not what is there.
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE operations SET staging_name = ?2, staging_device = ?3, staging_file_id = ?4
+              WHERE action_id = ?1",
+            rusqlite::params![
+                cloned.operation.action_id.get().as_bytes().to_vec(),
+                name,
+                1_i64,
+                1_i64,
+            ],
+        )
+        .expect("the name and a different identity are recorded");
+    drop(journal);
+    let replacement = fixture.reopen();
+    replacement.recover().expect("recovery runs");
+    assert!(
+        substituted.join("somebody-elses-work").is_dir(),
+        "a different object at a recorded name is not the one to remove"
+    );
 }
 
 #[test]
@@ -1026,9 +1088,9 @@ fn recovery_settles_a_claim_an_earlier_daemon_left_open() {
     let replacement = fixture.reopen();
     let recovery = replacement.recover().expect("recovery runs");
     assert_eq!(recovery.claims_settled, 1);
-    // A repeat now gets a definite answer that names what the action acted on, rather than being
-    // told for ever that the outcome is unknown.
-    let refusal = replacement
+    // The claim named a completed operation, so the durable state answers it: the repeat gets the
+    // repository that was created rather than being told the outcome is unknown for ever.
+    let repeated = replacement
         .project_init(
             &actor(),
             &ProjectInitParams {
@@ -1038,14 +1100,12 @@ fn recovery_settles_a_claim_an_earlier_daemon_left_open() {
             },
             Some(&submitted),
         )
-        .expect_err("the repeat is answered from the settled record");
-    assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
-    assert!(
-        refusal
-            .to_string()
-            .contains(&created.operation.action_id.to_string()),
-        "the answer names what the action acted on: {refusal}"
+        .expect("the repeat is answered from the settled record");
+    assert_eq!(
+        repeated.project.project_repository_id,
+        created.project.project_repository_id
     );
+    assert_eq!(repeated.operation.state, OperationState::Completed);
     // And a second recovery has nothing left to settle.
     assert_eq!(
         replacement
@@ -1054,4 +1114,82 @@ fn recovery_settles_a_claim_an_earlier_daemon_left_open() {
             .claims_settled,
         0
     );
+}
+
+#[test]
+fn a_claim_whose_publication_is_still_undecided_is_left_open_for_the_next_recovery() {
+    // A claim is closed only when this host can say what happened. An operation still in
+    // `publishing` is one it may yet decide, and settling it now would replace a result it could
+    // establish with a permanent unknown.
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "source");
+    let submitted = action("project.clone", 24);
+    let cloned = fixture
+        .service()
+        .project_clone(
+            &actor(),
+            &ProjectCloneParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "undecided"),
+                label: "undecided".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: String::new(),
+                    credential_broker: String::new(),
+                },
+            },
+            Some(&submitted),
+        )
+        .expect("the clone completes");
+    // The state a daemon that died in the middle of a publication leaves: the row is `publishing`
+    // with a witness of an object neither name holds, and the claim is open.
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE operations SET state = 'publishing', ended_at_ms = NULL,
+                    staged_device = 1, staged_file_id = 1, staged_created_at_ms = 1,
+                    staging_name = NULL WHERE action_id = ?1",
+            rusqlite::params![cloned.operation.action_id.get().as_bytes().to_vec()],
+        )
+        .expect("the row moves back to publishing");
+    journal
+        .execute(
+            "UPDATE actions SET result = NULL, error_code = NULL, error_detail = NULL
+              WHERE action_id = ?1",
+            rusqlite::params![submitted.action_id.as_bytes().to_vec()],
+        )
+        .expect("the claim is open again");
+    drop(journal);
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover().expect("recovery runs");
+    // Neither name holds the object, so the operation is recorded as unknown and its claim is
+    // settled from that state rather than left open.
+    assert_eq!(recovery.unresolved, 1);
+    let operation = replacement
+        .read_operation(cloned.operation.action_id)
+        .expect("the operation reads");
+    assert_eq!(operation.state, OperationState::Unknown);
+    let refusal = replacement
+        .project_clone(
+            &actor(),
+            &ProjectCloneParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "undecided"),
+                label: "undecided".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: String::new(),
+                    credential_broker: String::new(),
+                },
+            },
+            Some(&submitted),
+        )
+        .expect_err("the repeat is answered with what this host could establish");
+    assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
 }

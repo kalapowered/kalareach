@@ -285,9 +285,25 @@ pub fn check_arguments(arguments: &[&OsStr]) -> Result<()> {
                  profile's rather than the caller's"
             )));
         }
+        // A combined short option hides its members: `-qf` is `-q` and `-f`, and the second is
+        // the one this service never passes.
+        if text.starts_with('-')
+            && !text.starts_with("--")
+            && text.len() > 2
+            && text.chars().skip(1).any(|character| {
+                FORBIDDEN_SHORT
+                    .iter()
+                    .any(|short| short.ends_with(character))
+            })
+        {
+            return Err(ProjectError::InvalidArgument(format!(
+                "{text} combines a short option this service never passes"
+            )));
+        }
         // The one template directory an invocation may name is the empty one the profile already
-        // points at, so an explicit `--template=` carries nothing.
-        if head == "--template" && text != "--template=" {
+        // points at, so an explicit `--template=` carries nothing. An abbreviation of it is the
+        // same option, so only the exact empty form is allowed through.
+        if "--template".starts_with(head) && head.len() > 3 && text != "--template=" {
             return Err(ProjectError::InvalidArgument(format!(
                 "{text} names a template directory whose hooks would be copied into the new \
                  repository"
@@ -908,9 +924,16 @@ fn end_group(child: &mut std::process::Child) -> bool {
 }
 
 /// Ends a child and everything it started, and says whether it could confirm that.
+///
+/// It could not: containment here is a Job Object, which is a call outside safe Rust and therefore
+/// not in this crate. Ending the Git process leaves a remote helper, an ssh process or a credential
+/// helper that Git started still running, so this returns false and the caller says the host could
+/// not confirm that everything it started ended.
 #[cfg(not(unix))]
 fn end_group(child: &mut std::process::Child) -> bool {
-    child.kill().is_ok() && child.wait().is_ok()
+    let _ = child.kill();
+    let _ = child.wait();
+    false
 }
 
 /// The separator between two entries of `PATH` on this platform.
@@ -1137,9 +1160,18 @@ pub struct ConfigurationAudit {
     pub blanked: Vec<String>,
     /// The execution-capable keys no override removes.
     ///
-    /// An operation that would depend on one of these is refused rather than run, which is what
-    /// section 14 means by exposing the limitation instead of executing it.
+    /// These are multi-valued or name the other side's program, so an override adds to them rather
+    /// than replacing them. A *read* of such a repository is allowed and states the limitation; a
+    /// record in this host's registry is not, because that is a promise to serve the repository
+    /// including its remotes.
     pub refused: Vec<String>,
+    /// The driver names this host cannot express as an override at all.
+    ///
+    /// A key that is not valid text, or whose subsection holds a control character, cannot be
+    /// carried in an environment value. Whether it would run cannot be decided either way, so
+    /// **every** operation on the repository is refused: a read that ran beside one of these could
+    /// be a read that executed it.
+    pub unexpressible: Vec<String>,
     /// The digest of the listing this audit was taken from.
     ///
     /// A caller compares it against a second reading to find out whether the configuration
@@ -1165,7 +1197,11 @@ impl ConfigurationAudit {
         let request = GitRequest::read(directory, &arguments);
         let output = profile.run(&request)?;
         output.require_success()?;
-        Ok(Self::classify(&output.text()))
+        // The listing is classified from its bytes. Git accepts a configuration subsection that is
+        // not valid text, and reading the listing lossily would hand this host a name with a
+        // replacement character in it: the override would then be for a different key and the
+        // driver would run.
+        Ok(Self::classify_bytes(&output.stdout))
     }
 
     /// Classifies a `git config --list --null` listing.
@@ -1174,15 +1210,37 @@ impl ConfigurationAudit {
     /// platform rather than only against whatever this machine's Git happens to hold.
     #[must_use]
     pub fn classify(listing: &str) -> Self {
+        Self::classify_bytes(listing.as_bytes())
+    }
+
+    /// Classifies a `git config --list --null` listing from its bytes.
+    ///
+    /// Git accepts a configuration subsection that is not valid text, so the listing is split and
+    /// matched as bytes. A key this host cannot carry exactly — one that is not valid text, or
+    /// whose subsection holds a control character — is refused rather than overridden wrongly.
+    #[must_use]
+    pub fn classify_bytes(listing: &[u8]) -> Self {
         let mut drivers: BTreeMap<(String, String), ()> = BTreeMap::new();
         let mut blanked = Vec::new();
         let mut refused = Vec::new();
-        for record in listing.split('\0') {
+        let mut unexpressible = Vec::new();
+        for record in listing.split(|byte| *byte == 0) {
             if record.is_empty() {
                 continue;
             }
             // Each record is `key` or `key\nvalue`. A key with no value is a boolean true.
-            let key = record.split('\n').next().unwrap_or(record);
+            let key_bytes = record.split(|byte| *byte == b'\n').next().unwrap_or(record);
+            let Ok(key) = std::str::from_utf8(key_bytes) else {
+                // A key this host cannot read as text is one it cannot write as an override
+                // either. Whether it names a driver cannot be decided, so the whole operation is
+                // refused rather than run beside it.
+                unexpressible.push(
+                    "a configuration key this host cannot read as text, so it cannot be \
+                     overridden either"
+                        .to_owned(),
+                );
+                continue;
+            };
             let lower = key.to_ascii_lowercase();
             // A driver's section and leaf are case-insensitive and Git writes them lowercase; its
             // subsection is case-sensitive and Git writes it verbatim. So the section and the leaf
@@ -1200,7 +1258,7 @@ impl ConfigurationAudit {
                     // A subsection with a control character in it is not a name this host can put
                     // in an environment value, so the driver cannot be neutralised and the
                     // operation is refused instead of run beside it.
-                    refused.push(format!(
+                    unexpressible.push(format!(
                         "{section}.<a name holding a control character>.{leaf}"
                     ));
                 } else {
@@ -1220,11 +1278,14 @@ impl ConfigurationAudit {
         blanked.dedup();
         refused.sort_unstable();
         refused.dedup();
+        unexpressible.sort_unstable();
+        unexpressible.dedup();
         Self {
             drivers: drivers.into_keys().collect(),
             blanked,
             refused,
-            digest: kr_cbor::sha256(listing.as_bytes()),
+            unexpressible,
+            digest: kr_cbor::sha256(listing),
         }
     }
 
@@ -1256,7 +1317,8 @@ impl ConfigurationAudit {
         let mut lines = Vec::new();
         for key in &self.blanked {
             lines.push(format!(
-                "{key} names {}, which this host does not execute for a repository operation",
+                "{} names {}, which this host does not execute for a repository operation",
+                redact(key),
                 names_of(key)
             ));
         }
@@ -1268,9 +1330,17 @@ impl ConfigurationAudit {
         }
         for key in &self.refused {
             lines.push(format!(
-                "{key} names {}, which no override removes, so an operation that would depend on \
-                 it is refused",
+                "{} names {}, which no override removes, so an operation that would depend on it \
+                 is refused",
+                redact(key),
                 names_of(key)
+            ));
+        }
+        for key in &self.unexpressible {
+            lines.push(format!(
+                "{} is a name this host cannot express as an override, so it does not read this \
+                 repository at all",
+                redact(key)
             ));
         }
         lines
@@ -1278,21 +1348,60 @@ impl ConfigurationAudit {
 
     /// Refuses when this repository's configuration names something no override removes.
     ///
+    /// This is the bar for taking a repository into the host's registry, which is a promise to
+    /// serve it including its remotes. A read is allowed under the same configuration and states
+    /// the limitation.
+    ///
     /// # Errors
     ///
     /// Returns [`ProjectError::ConfigurationRejected`] naming every such key.
     pub fn require_neutralised(&self) -> Result<()> {
+        self.require_expressible()?;
         if self.refused.is_empty() {
             return Ok(());
         }
         Err(ProjectError::ConfigurationRejected {
             detail: format!(
-                "this repository's configuration names {}, which no command-line override \
-                 removes, so the operation is refused rather than run under it",
-                self.refused.join(", ")
+                "this repository's configuration names {}, which no override removes, so the \
+                 operation is refused rather than run under it",
+                names(&self.refused)
             ),
         })
     }
+
+    /// Refuses when this repository's configuration names a driver this host cannot override.
+    ///
+    /// This is the bar for *every* operation, a read included: a driver whose name cannot be
+    /// carried in an environment value is one whose override would be for a different key, so a
+    /// status run beside it could be a status that executed it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::ConfigurationRejected`] naming every such key.
+    pub fn require_expressible(&self) -> Result<()> {
+        if self.unexpressible.is_empty() {
+            return Ok(());
+        }
+        Err(ProjectError::ConfigurationRejected {
+            detail: format!(
+                "this repository's configuration names {}, which this host cannot express as an \
+                 override, so it does not read the repository at all rather than reading it beside \
+                 something it cannot neutralise",
+                names(&self.unexpressible)
+            ),
+        })
+    }
+}
+
+/// Returns a list of keys for a diagnostic, with any credential a key carries removed.
+///
+/// A configuration key can hold a URL: `[url "https://token@host/"] insteadOf = ...` puts one in
+/// the subsection. So a key on its way into a message goes through the same redaction a URL does.
+fn names(keys: &[String]) -> String {
+    keys.iter()
+        .map(|key| redact(key))
+        .collect::<Vec<String>>()
+        .join(", ")
 }
 
 /// Returns what one execution-capable key names, for a diagnostic.
@@ -1350,20 +1459,39 @@ struct Bounded {
     truncated: bool,
 }
 
-/// Waits for one bounded reader and reports a thread that did not finish.
+/// How long a reader thread may go on holding a pipe after the Git process has ended.
+///
+/// A descendant Git started can keep a pipe open after Git itself is gone, and a reader waiting on
+/// one would hold this call for as long as that descendant lives. So the wait is bounded and what
+/// was read so far is what the caller gets, with the shortfall reported.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
+
+/// Waits for one bounded reader, for no longer than [`PIPE_DRAIN_GRACE`].
 fn join(
     handle: Option<std::thread::JoinHandle<Result<Bounded>>>,
     request: &GitRequest<'_>,
 ) -> Result<Bounded> {
-    match handle {
-        None => Ok(Bounded::default()),
-        Some(handle) => handle.join().map_err(|_| ProjectError::GitFailed {
-            detail: format!(
-                "{} produced output this host could not read",
-                request.describe()
-            ),
-        })?,
+    let Some(handle) = handle else {
+        return Ok(Bounded::default());
+    };
+    let deadline = Instant::now() + PIPE_DRAIN_GRACE;
+    while !handle.is_finished() {
+        if Instant::now() >= deadline {
+            // Something Git started still holds the pipe. The thread owns its own end and goes
+            // when the pipe closes; this call does not wait for it.
+            return Ok(Bounded {
+                bytes: Vec::new(),
+                truncated: true,
+            });
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
+    handle.join().map_err(|_| ProjectError::GitFailed {
+        detail: format!(
+            "{} produced output this host could not read",
+            request.describe()
+        ),
+    })?
 }
 
 /// Reads one pipe to its end, keeping at most [`MAX_GIT_OUTPUT_BYTES`].

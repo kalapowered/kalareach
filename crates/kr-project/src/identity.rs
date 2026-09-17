@@ -126,6 +126,11 @@ impl OpenedRepository {
             work_tree: tree.identity(),
         };
         let audit = ConfigurationAudit::take(profile, &top_level)?;
+        // A driver whose name this host cannot express as an override is one whose override would
+        // be for a different key. Reading the repository beside it could be reading it *through*
+        // it, so nothing is read at all: this is the bar for every operation rather than only for
+        // taking the repository into the registry.
+        audit.require_expressible()?;
         Ok(Self {
             work_tree,
             identity,
@@ -235,15 +240,39 @@ impl OpenedRepository {
     ///
     /// Returns [`ProjectError::IdentityChanged`] when either identity or the configuration differs.
     pub fn confirm(&self, profile: &RestrictedProfile) -> Result<()> {
-        let tree =
-            AuthorisedDirectory::open_root(self.work_tree.environment_id(), &self.top_level)?;
+        // The repository is asked where its common directory and its top level are, rather than
+        // reopened at the paths recorded earlier. A `.git` file rewritten to point elsewhere would
+        // otherwise pass a check made against the old path's object.
+        let arguments: [&OsStr; 4] = [
+            OsStr::new("rev-parse"),
+            OsStr::new("--path-format=absolute"),
+            OsStr::new("--git-common-dir"),
+            OsStr::new("--show-toplevel"),
+        ];
+        let reported = profile.run_checked(&GitRequest::read(&self.top_level, &arguments))?;
+        let mut lines = reported.lines();
+        let git_dir_path = PathBuf::from(lines.next().unwrap_or_default());
+        let top_level = PathBuf::from(lines.next().unwrap_or_default());
+        if git_dir_path != self.git_dir_path || top_level != self.top_level {
+            return Err(ProjectError::IdentityChanged {
+                detail: format!(
+                    "this repository reported {} and {} and now reports {} and {}; what the host \
+                     read was read somewhere else",
+                    self.git_dir_path.display(),
+                    self.top_level.display(),
+                    git_dir_path.display(),
+                    top_level.display()
+                ),
+            });
+        }
+        let tree = AuthorisedDirectory::open_root(self.work_tree.environment_id(), &top_level)?;
         let git_dir =
-            AuthorisedDirectory::open_root(self.work_tree.environment_id(), &self.git_dir_path)?;
+            AuthorisedDirectory::open_root(self.work_tree.environment_id(), &git_dir_path)?;
         self.require_identity(RepositoryIdentity {
             git_dir: git_dir.identity(),
             work_tree: tree.identity(),
         })?;
-        let later = ConfigurationAudit::take(profile, &self.top_level)?;
+        let later = ConfigurationAudit::take(profile, &top_level)?;
         self.audit.unchanged(&later)
     }
 
