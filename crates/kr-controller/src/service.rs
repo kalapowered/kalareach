@@ -254,6 +254,15 @@ pub struct Controller {
     inhibitor: Mutex<Inhibitor>,
     /// How far the last look at what this host has outstanding got, and what it saw.
     demand_scan: Mutex<DemandScan>,
+    /// Held while a session's closure is being finalised.
+    ///
+    /// Finding that no closure has been recorded and recording one are two steps. Two callers that
+    /// ran them at once would each find none and each write one, and the record a person reads
+    /// would be whichever finished last: a worker's own account of how its session ended could be
+    /// replaced by this daemon's account of a worker it found gone. The closure watcher and the
+    /// reconciliation this daemon does on its own both reach that point for the same session, so
+    /// the two steps are one transaction.
+    finalising: Mutex<()>,
     _lock: SingletonLock,
 }
 
@@ -282,7 +291,7 @@ struct SessionDemand {
     work: bool,
     /// Whether its worker reported a decision waiting to be answered.
     approval: bool,
-    /// Whether this host has a closure for it that it has not finished.
+    /// Whether this host has a closure for it that it has not finished recording.
     closing: bool,
 }
 
@@ -390,6 +399,7 @@ impl Controller {
             }),
             inhibitor: Mutex::new(Inhibitor::new()),
             demand_scan: Mutex::new(DemandScan::default()),
+            finalising: Mutex::new(()),
             _lock: lock,
         });
         // Reconnecting is not only verifying. A replacement daemon has to present the generation it
@@ -2553,8 +2563,17 @@ impl Controller {
                 observed.approval = true;
             }
             // A closure this host accepted and has not finished. Suspending in the middle of one
-            // is how a session's own processes stop being accounted for.
-            observed.closing = summary.state == SessionState::Closing;
+            // is how a session's own processes stop being accounted for. The worker's part of it
+            // ends before this host's does: it reports `closing` while it stops those processes
+            // and `closed` once they are stopped, and what is left then is this host recording
+            // the closure, which is also what takes the session out of the list above. So a
+            // closure counts from the first sign of one until then.
+            observed.closing =
+                matches!(summary.state, SessionState::Closing | SessionState::Closed)
+                    || scan
+                        .seen
+                        .get(&worker.descriptor.session_id)
+                        .is_some_and(|seen| seen.closing);
             scan.seen.insert(worker.descriptor.session_id, observed);
         }
         scan.cursor = scan.cursor.wrapping_add(asked);
@@ -3466,12 +3485,20 @@ impl Controller {
             .map(|summary| summary.desktop)
     }
 
+    /// Records how a session ended, once.
+    ///
+    /// The whole of it is one transaction: the closure already recorded is the answer where there
+    /// is one, and where there is not, the record written here is the only one written. Two
+    /// callers reach this for the same session, because the closure watcher and this daemon's own
+    /// reconciliation both act on a worker they find gone, and a second record would replace the
+    /// first rather than adding to it.
     async fn record_final(
         &self,
         session_id: SessionId,
         reason: ClosureReason,
         identity: &kr_protocol::identity::ProcessStartIdentity,
     ) -> Result<ClosureRecord> {
+        let _finalising = self.finalising.lock().await;
         if let Some(existing) = self.registry.lock().await.closure(session_id)? {
             return Ok(existing);
         }
@@ -3551,7 +3578,10 @@ impl Controller {
         let mut registry = self.registry.lock().await;
         registry.record_closure(record)?;
         drop(registry);
-        kr_ipc::descriptor::retire(&self.paths, record.session_id)?;
+        // This daemon's own view of the session goes as soon as the closure is recorded, before
+        // the published descriptor is removed and whether or not that succeeds. The closure is
+        // the fact; a worker kept in the directory after it would be a session this daemon still
+        // asked about, still counted as work outstanding, and still answered for.
         self.directory.lock().await.remove(record.session_id);
         self.connections.lock().await.remove(&record.session_id);
         // The barrier is told before the record is gone. A worker that has ended satisfies the
@@ -3564,6 +3594,7 @@ impl Controller {
         // host has ever run. A worker still on its way out may be holding it; on the platforms
         // where that refuses the removal, the next start writes the directory again.
         let _ = std::fs::remove_dir_all(self.paths.worker_dir(record.session_id));
+        kr_ipc::descriptor::retire(&self.paths, record.session_id)?;
         Ok(())
     }
 
