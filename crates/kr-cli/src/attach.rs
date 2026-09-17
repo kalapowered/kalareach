@@ -56,13 +56,15 @@ pub const GUARD_READY: u8 = b'A';
 /// is running and has not answered, and it is set above what starting one actually costs rather
 /// than above what the guard does after it has started.
 ///
-/// What it costs, measured: a guard that has been run before answers in 3 to 5 milliseconds. The
-/// **first** run of a newly written copy of it answers in 0.3 to 10.4 seconds, because the
-/// operating system checks a binary it has not seen before, once, and then remembers it; that is
-/// every first attach after an install or an upgrade. An ordinary run reached 3.1 seconds once in
-/// forty on a loaded machine. Two seconds sat inside all three of those ranges and turned a first
-/// attach into a failure, so the bound is a minute: far outside them, and still a bound, because a
-/// guard that is alive and silent for a minute is not going to answer.
+/// What it costs, measured from spawning a guard to reading its byte: a guard that has been run
+/// before answers in 3 to 5 milliseconds, and reached 3.1 seconds once in forty rounds on a loaded
+/// machine. The **first** run of a newly written copy answers in 0.3 to 10.4 seconds. The likeliest
+/// reading of that difference is the operating system checking a binary it has not seen before,
+/// once, and remembering it afterwards, which would make it every first attach after an install or
+/// an upgrade; the measurement establishes the cost, not the reason for it.
+///
+/// Two seconds sat inside all of those ranges. The bound is a minute: outside them, and still a
+/// bound, because a guard that is alive and silent for a minute is not going to answer.
 pub const GUARD_ARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The out-of-process restoration guard.
@@ -94,29 +96,11 @@ impl RestorationGuard {
         terminal: &ControllingTerminal,
         saved: &SavedModes,
     ) -> Result<Self> {
-        let (reader, writer) = std::io::pipe()
-            .map_err(|error| CliError::Terminal(format!("create the guard's pipe: {error}")))?;
-        let (ready_reader, ready_writer) = std::io::pipe()
-            .map_err(|error| CliError::Terminal(format!("create the guard's pipe: {error}")))?;
         let handle = terminal
             .handle()
             .try_clone()
             .map_err(|error| CliError::Terminal(format!("duplicate the terminal: {error}")))?;
-        let mut command = detached(program);
-        command
-            .arg("--modes")
-            .arg(saved.encode())
-            .stdin(Stdio::from(reader))
-            .stdout(Stdio::from(handle))
-            .stderr(Stdio::from(ready_writer));
-        let child = command
-            .spawn()
-            .map_err(|error| CliError::Terminal(format!("start the restoration guard: {error}")))?;
-        let mut guard = Self {
-            child,
-            release: Some(writer),
-            confirmations: Some(ready_reader),
-        };
+        let mut guard = Self::start(program, handle, saved)?;
         // The readiness byte. A guard that never sends it is stopped rather than trusted, because
         // the whole point of it is to be holding the state before the terminal changes.
         if let Err(silence) = guard.confirmed() {
@@ -127,6 +111,40 @@ impl RestorationGuard {
             )));
         }
         Ok(guard)
+    }
+
+    /// Starts a guard on a terminal and keeps the ends of its pipes this process needs.
+    ///
+    /// The `Command` is dropped as soon as the guard is running, and that is load-bearing rather
+    /// than tidiness: it is holding this process's copy of the write end of the report pipe, and
+    /// while it holds it a guard that has died leaves a pipe that never reaches its end. The read
+    /// would then wait out the whole deadline and report a guard that was still running, of a guard
+    /// that had already gone.
+    fn start(
+        program: &std::path::Path,
+        terminal: std::fs::File,
+        saved: &SavedModes,
+    ) -> Result<Self> {
+        let (reader, writer) = std::io::pipe()
+            .map_err(|error| CliError::Terminal(format!("create the guard's pipe: {error}")))?;
+        let (ready_reader, ready_writer) = std::io::pipe()
+            .map_err(|error| CliError::Terminal(format!("create the guard's pipe: {error}")))?;
+        let mut command = detached(program);
+        command
+            .arg("--modes")
+            .arg(saved.encode())
+            .stdin(Stdio::from(reader))
+            .stdout(Stdio::from(terminal))
+            .stderr(Stdio::from(ready_writer));
+        let child = command
+            .spawn()
+            .map_err(|error| CliError::Terminal(format!("start the restoration guard: {error}")))?;
+        drop(command);
+        Ok(Self {
+            child,
+            release: Some(writer),
+            confirmations: Some(ready_reader),
+        })
     }
 
     /// Waits for the guard's next confirmation, and says what happened when there is not one.
@@ -489,4 +507,57 @@ async fn call<P: serde::Serialize + ?Sized, T: serde::de::DeserializeOwned + ser
     value
         .to_typed()
         .map_err(|error| CliError::Other(error.to_string()))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::{GUARD_ARM_TIMEOUT, RestorationGuard};
+    use crate::terminal::SavedModes;
+
+    /// A guard that leaves without answering is reported at once, with how it left.
+    ///
+    /// This is about the report pipe rather than the deadline. A `Command` holds this process's own
+    /// copy of the write end for as long as it is alive, and while that copy is open a guard that
+    /// has already gone leaves a pipe that never reaches its end: the read waits out the whole
+    /// bound and then calls that guard "still running". [`RestorationGuard::start`] owns the
+    /// `Command` and returns before anything waits, which is what closes it; this pins the
+    /// behaviour that depends on it, from the two calls [`RestorationGuard::arm`] makes.
+    #[test]
+    fn a_guard_that_leaves_without_answering_is_reported_without_waiting_out_the_bound() {
+        let terminal = std::fs::File::create(
+            std::env::temp_dir().join(format!("kalareach-guard-test-{}", std::process::id())),
+        )
+        .expect("somewhere for the guard's own output to go");
+        let saved = SavedModes {
+            input: 0,
+            output: 0,
+            control: 0,
+            local: 0,
+            special: Vec::new(),
+        };
+
+        // `false` takes the arguments it is given, ignores them and exits, which is a guard that
+        // never reports readiness.
+        let mut guard =
+            RestorationGuard::start(std::path::Path::new("/usr/bin/false"), terminal, &saved)
+                .expect("starts something in the guard's place");
+        let started = std::time::Instant::now();
+        let silence = guard
+            .confirmed()
+            .expect_err("it exits without answering, so there is nothing to confirm");
+
+        assert!(
+            started.elapsed() < GUARD_ARM_TIMEOUT / 4,
+            "the report pipe ended with the process rather than waiting out the bound: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            silence.contains("ended without answering"),
+            "and the attach is told which of the four it was: {silence}"
+        );
+        assert!(
+            silence.contains("exit status"),
+            "with how the guard left: {silence}"
+        );
+    }
 }
