@@ -222,6 +222,9 @@ impl Controller {
         };
         *controller.directory.lock().await = directory;
         controller.recover_reservations().await?;
+        // Recovery has settled every reservation it can, so what is left under the workers
+        // directory that no session claims is nothing's.
+        controller.sweep_worker_dirs().await?;
         crate::transfer::serve(&controller)?;
         // The network comes up last. A paired device must not reach a daemon that has not yet
         // recovered its reservations and rebuilt its worker directory, because it would be told
@@ -1749,6 +1752,20 @@ impl Controller {
         // revocation takes: a revocation that has installed its revision has already withdrawn the
         // registrations that revision replaced, so what this reads is never a registration the
         // revocation is part way through removing.
+        // Everything the launch needs is prepared before the checks that admit it, so nothing
+        // between the last check and the launch can wait: a directory tree is several filesystem
+        // operations, and a slow disk would otherwise spend the rest of an accepted deadline here.
+        // The directory is inside this environment's state directory, which this daemon owns and
+        // which holds nothing a person keeps.
+        let working_directory = self.paths.worker_dir(reservation.session_id);
+        if let Err(error) =
+            kr_ipc::paths::create_private_tree(self.paths.state_root(), &working_directory)
+        {
+            // Nothing was started, so the reservation is resolved as a confirmed failure and stops
+            // occupying the environment.
+            self.resolve_failed(reservation.reservation_id).await?;
+            return Err(error.into());
+        }
         {
             let mut registry = self.registry.lock().await;
             registry.set_phase(reservation.reservation_id, LaunchPhase::Spawned)?;
@@ -1776,14 +1793,10 @@ impl Controller {
                     .lock()
                     .await
                     .remove(&reservation.reservation_id);
+                self.discard_worker_dir(reservation.session_id);
                 return Err(refusal);
             }
         }
-        // The directory the worker will run in, made before it is started so the launch cannot
-        // fail on a directory that does not exist yet. It is inside this environment's state
-        // directory, which this daemon owns and which holds nothing a person keeps.
-        let working_directory = self.paths.worker_dir(reservation.session_id);
-        kr_ipc::paths::create_private_tree(self.paths.state_root(), &working_directory)?;
         let launch = WorkerLaunch {
             reservation_id: reservation.reservation_id,
             session_id: reservation.session_id,
@@ -1811,6 +1824,7 @@ impl Controller {
                 let mut registry = self.registry.lock().await;
                 registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
                 drop(registry);
+                self.discard_worker_dir(reservation.session_id);
                 return Err(ControllerError::Supervision { detail });
             }
             // A process may be running. The create fails for the caller, and the reservation stays
@@ -1866,6 +1880,90 @@ impl Controller {
             deduplicated: false,
             presentation_error: Nullable::null(),
         })
+    }
+
+    /// Resolves a reservation that never reached a launch, and releases what it was holding.
+    ///
+    /// The phase is the durable half: a reservation recorded as failed stops occupying the
+    /// environment and is never resumed. The pending report and the directory prepared for the
+    /// worker go with it, because nothing is going to use either.
+    async fn resolve_failed(&self, reservation_id: ReservationId) -> Result<()> {
+        self.pending.lock().await.remove(&reservation_id);
+        let mut registry = self.registry.lock().await;
+        let session_id = registry
+            .reservation(reservation_id)?
+            .map(|reservation| reservation.session_id);
+        registry.set_phase(reservation_id, LaunchPhase::Failed)?;
+        drop(registry);
+        if let Some(session_id) = session_id {
+            self.discard_worker_dir(session_id);
+        }
+        Ok(())
+    }
+
+    /// Gives back the directory a worker was to run in.
+    ///
+    /// Best effort by design. A worker on its way out may still be holding it, which on Windows
+    /// refuses the removal; what that leaves is an empty directory, and the sweep this daemon runs
+    /// at startup takes it then.
+    fn discard_worker_dir(&self, session_id: SessionId) {
+        let _ = std::fs::remove_dir_all(self.paths.worker_dir(session_id));
+    }
+
+    /// Removes the directories of workers this environment no longer runs.
+    ///
+    /// One directory per session, and the session is the only thing that can say whether it is
+    /// still wanted. A launch that failed after its directory was made, a removal a platform
+    /// refused while the worker was exiting, and a daemon that died between the two all leave one
+    /// behind; this is where they go.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read.
+    async fn sweep_worker_dirs(&self) -> Result<()> {
+        let live = {
+            let registry = self.registry.lock().await;
+            let mut live: std::collections::BTreeSet<SessionId> = registry
+                .workers()?
+                .into_iter()
+                .map(|worker| worker.session_id)
+                .collect();
+            // Every phase in which something may still be running, or may still be resolved. A
+            // reservation that has not been settled keeps its directory.
+            for phase in [
+                LaunchPhase::Reserved,
+                LaunchPhase::Spawned,
+                LaunchPhase::Claimed,
+                LaunchPhase::Live,
+                LaunchPhase::Fenced,
+            ] {
+                live.extend(
+                    registry
+                        .reservations_in(phase)?
+                        .into_iter()
+                        .map(|reservation| reservation.session_id),
+                );
+            }
+            live
+        };
+        let Ok(entries) = std::fs::read_dir(self.paths.workers_dir()) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            // The name is the session the directory belongs to. Anything else under here was not
+            // put there by this daemon, and this daemon does not remove what it did not write.
+            let Some(session_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<SessionId>().ok())
+            else {
+                continue;
+            };
+            if !live.contains(&session_id) {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        Ok(())
     }
 
     async fn replay_create(
@@ -2578,15 +2676,16 @@ mod tests {
     }
 }
 
-/// A create that reserved its identity and then waited.
+/// A create the host refuses before it launches anything.
 ///
-/// The window these cover cannot be reached from outside the daemon: a create passes the
-/// admission check, writes its reservation, and only then waits. What holds it there is the map it
-/// records its pending launch report in, which is taken between the reservation and the transition
-/// to `spawned` and nowhere else during a create; and the connection table, which the transition
-/// itself reads.
+/// The windows these cover cannot be reached from outside the daemon: a create passes the
+/// admission check, writes its reservation, prepares what the launch needs and only then waits.
+/// What holds it there is the map it records its pending launch report in, which is taken between
+/// the reservation and the transition to `spawned` and nowhere else during a create, and the
+/// connection table, which the transition itself reads. What each of them has to leave behind is
+/// the same: no process, and a reservation that has stopped occupying the environment.
 #[cfg(test)]
-mod a_create_that_waited {
+mod a_create_that_launches_nothing {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -2853,6 +2952,57 @@ mod a_create_that_waited {
             registry.occupancy().expect("counts"),
             0,
             "the reservation it made is released"
+        );
+    }
+
+    /// What the launch needs is prepared before the create is admitted, and a preparation that
+    /// fails resolves the reservation rather than leaving it occupying the environment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_whose_directory_cannot_be_made_releases_its_reservation() {
+        let (temp, controller, asked) = daemon().await;
+        let environment_id = temp.environment_id();
+        let (connection_id, actor_id) = admitted(&controller).await;
+
+        // The directory every worker's own directory goes under is replaced by a file, so making
+        // one under it fails the way a full disk or a wrong permission would.
+        let workers = temp.environment().workers_dir();
+        std::fs::remove_dir_all(&workers).expect("clears the workers directory");
+        std::fs::write(&workers, b"not a directory").expect("puts a file in its place");
+
+        let accepted = AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_secs(30))
+                .expect("a deadline half a minute out"),
+            bound: DeadlineBound::RequestedTtl,
+        };
+        let error = controller
+            .session_create(
+                &actor_id,
+                &create_request(environment_id),
+                connection_id,
+                accepted,
+            )
+            .await
+            .expect_err("a create that cannot be prepared starts nothing");
+        assert!(
+            asked.lock().expect("the record is not poisoned").is_empty(),
+            "no worker is started for a create the host could not prepare: {error}"
+        );
+        let registry = controller.registry.lock().await;
+        assert_eq!(
+            registry.occupancy().expect("counts"),
+            0,
+            "the reservation it made is released"
+        );
+        assert_eq!(
+            registry
+                .reservations_in(LaunchPhase::Failed)
+                .expect("reads the reservations")
+                .len(),
+            1,
+            "and it is resolved rather than left to recovery"
         );
     }
 }
