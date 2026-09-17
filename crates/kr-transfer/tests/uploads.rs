@@ -1376,13 +1376,75 @@ fn an_invalidated_publication_answers_the_action_that_claimed_it() {
         .expect_err("refuses an upload that ended without publishing");
     assert_eq!(fresh.code(), refusal.code());
     assert_eq!(fresh.to_string(), refusal.to_string());
+
+    // So is one under an action of its own, which has nothing to record against: its refusal
+    // matches no claim, and the answer it keeps is the one it computed.
+    let another = harness
+        .finish_as(
+            transfer_id,
+            &bytes,
+            Some(&action(&harness, "upload.finish", &bytes)),
+        )
+        .expect_err("refuses a different action the same way");
+    assert_eq!(another.code(), refusal.code());
+    assert_eq!(another.to_string(), refusal.to_string());
+}
+
+/// KR-REQ-14.12, KR-REQ-24.09: an upload the sweep expired answers its open claim once, and the
+/// recovery pass behind the sweep does not answer it again.
+///
+/// The interleaving this reproduces: the sweep closes the row and releases the journal before it
+/// resolves the claims, and a retried finish arrives in that window. Whatever the retry is told has
+/// to be what every later copy of its action is told.
+#[test]
+fn an_expired_publication_answers_its_claim_once() {
+    let harness = Harness::create();
+    let bytes = pattern(64);
+    let claim = action(&harness, "upload.finish", &bytes);
+    let (transfer_id, _) = interrupted_publication(&harness, &bytes, "notes.bin", Some(&claim));
+
+    // The sweep's first commit, through the journal: the row is closed and its claim is still open,
+    // which is exactly what a retry can find between the sweep's two steps.
+    {
+        let mut store = kr_transfer::Store::open(
+            kr_transfer::StagingArea::store_path(&harness.host.environment()),
+            harness.host.environment_id(),
+        )
+        .expect("opens the journal");
+        store
+            .close_upload(
+                transfer_id,
+                UploadState::Expired,
+                Some("this upload was unfinished for longer than its expiry"),
+                kr_protocol::scalars::TimestampMs::new(support::START_MS + 2),
+                None,
+            )
+            .expect("closes the row");
+    }
+
+    let refusal = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect_err("refuses an upload that ended before it published");
+    assert_eq!(refusal.code(), ErrorCode::ResourceUnavailable);
+
+    // The pass behind the sweep finds the claim answered and leaves it alone.
+    let recovery = harness.service.recover().expect("recovers");
+    assert_eq!(
+        recovery.resolved_claims, 0,
+        "the claim was answered when the retry was refused"
+    );
+    let afterwards = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect_err("answers a copy of that action from the record");
+    assert_eq!(afterwards.code(), refusal.code());
+    assert_eq!(afterwards.to_string(), refusal.to_string());
 }
 
 /// KR-REQ-14.12, KR-REQ-24.09: two concurrent copies of one finish action on a publication that
 /// cannot be resolved are refused identically, whichever of them invalidates it.
 ///
-/// One of the two settles the action and the other finds it settled. Which is which is the
-/// machine's to decide; that they agree is not.
+/// Which copy settles the action, and whether the other reaches the record or the state first, is
+/// the machine's to decide. That they agree is not.
 #[test]
 fn two_concurrent_copies_of_one_finish_action_are_refused_the_same_way() {
     // Repeated, because the interleaving is what this is about: one copy can settle the action
