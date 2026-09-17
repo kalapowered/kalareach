@@ -930,16 +930,17 @@ async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_a
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let queries = answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
 
-    output.expect_within(b"attach-finished-", LIVENESS_DEADLINE, "the attach ended");
-    answered(queries);
     // The code, not merely "not zero": 3 is a host this command could not reach, and 6 is a
     // terminal that never answered. Accepting any failure would let a handshake that timed out
-    // satisfy every assertion below, which is the opposite of what this test is about.
-    assert!(
-        output.contains(b"attach-finished-3"),
-        "and it ended because nothing was listening rather than because the handshake failed: {}",
-        output.text().escape_debug()
+    // satisfy every assertion below, which is the opposite of what this test is about. The whole
+    // marker is waited for rather than checked after a wait for its prefix, because a terminal
+    // delivers what it is given in whatever reads it likes and the digit can arrive by itself.
+    output.expect_within(
+        b"attach-finished-3",
+        LIVENESS_DEADLINE,
+        "the attach ended because nothing was listening rather than because the handshake failed",
     );
+    answered(queries);
     assert!(
         output.contains(b"\x1b[?u"),
         "the handshake did happen, so this terminal's state was read: {}",
