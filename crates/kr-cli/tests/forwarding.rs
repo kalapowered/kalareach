@@ -267,13 +267,19 @@ impl TerminalOutput {
             .unwrap_or_default()
     }
 
+    /// Waits for the marker to appear, or for the deadline to pass.
+    ///
+    /// Two milliseconds, because one of the things that waits here is the thread that answers the
+    /// command's handshake, and that handshake has one second in total. A real terminal answers in
+    /// microseconds; a test that noticed the question fifty milliseconds later would be spending
+    /// the command's own bound on its own polling, and on a busy machine it would spend all of it.
     fn wait_for(&self, marker: &[u8], within: Duration) -> bool {
         let deadline = Instant::now() + within;
         while Instant::now() < deadline {
             if contains(&self.snapshot(), marker) {
                 return true;
             }
-            std::thread::sleep(Duration::from_millis(25));
+            std::thread::sleep(Duration::from_millis(2));
         }
         contains(&self.snapshot(), marker)
     }

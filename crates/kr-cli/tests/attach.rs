@@ -565,6 +565,12 @@ impl TerminalOutput {
     ///
     /// `what` says what the marker means to the caller, so a failure names both the wait and the
     /// thing waited for.
+    ///
+    /// It looks every two milliseconds, because one of the things that waits here is the thread
+    /// that answers the command's handshake, and that handshake has one second in total. A real
+    /// terminal answers in microseconds; a test that noticed the question fifty milliseconds later
+    /// would be spending the command's own bound on its own polling, and on a busy machine it would
+    /// spend all of it.
     fn expect_within(&self, marker: &[u8], within: Duration, what: &str) {
         let started = Instant::now();
         let deadline = started + within;
@@ -579,7 +585,7 @@ impl TerminalOutput {
                 String::from_utf8_lossy(marker),
                 self.text().escape_debug()
             );
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
 
