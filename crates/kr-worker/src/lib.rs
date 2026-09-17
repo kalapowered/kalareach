@@ -9,6 +9,7 @@
 //! | --- | --- |
 //! | [`action`] | Section 9's action model: freshness windows, de-duplication, cancellation, observation and the host time contract |
 //! | [`attachments`] | Attachments, geometry ownership and succession |
+//! | [`desktop`] | The desktop a session runs on, whether it is still there, and what may be done on it |
 //! | [`environment`] | The root shell's environment: what is inherited, what is replaced, what is refused |
 //! | [`history`] | Retained output: a resident window, an indexed spool and explicit gaps |
 //! | [`input`] | The single input lease, its epochs and paste-delimiter framing |
@@ -29,6 +30,7 @@
 pub mod action;
 pub mod attachments;
 pub mod conpty;
+pub mod desktop;
 pub mod environment;
 pub mod error;
 pub mod history;

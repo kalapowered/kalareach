@@ -109,6 +109,7 @@ pub const DESKTOP_VARIABLES: &[&str] = &[
     "DISPLAY",
     "WAYLAND_DISPLAY",
     "XAUTHORITY",
+    "XDG_CURRENT_DESKTOP",
     "XDG_RUNTIME_DIR",
     "XDG_SESSION_ID",
     "XDG_SESSION_TYPE",
@@ -121,6 +122,10 @@ impl ExecutionContext {
     /// started in, which is the login session the service manager placed it in. A headless worker
     /// takes none of them: it must keep working after that login session ends, and a session that
     /// carried a dead display would fail at the first application that used it.
+    ///
+    /// The presentation the create request chose is not an input here. An invisible session in a
+    /// desktop context keeps that desktop's access, because where a session is shown and where it
+    /// runs are different questions.
     #[must_use]
     pub fn resolve(profile: kr_protocol::identity::WorkerProfile) -> Self {
         let mut variables = BTreeMap::new();
@@ -141,28 +146,23 @@ impl ExecutionContext {
 
 /// Reads the login session a desktop-bound worker is tied to.
 ///
-/// The generation is what makes the binding checkable later: a session identifier that is reused
-/// after a logout names a different login, and a worker that compared only the identifier would
-/// keep running against a desktop that had gone.
+/// The binding is the desktop's derived name and the generation it was taken at. Both come from
+/// [`crate::desktop`], which asks the platform about the login session rather than reading a
+/// variable out of this process's own environment: a variable cannot say whether the login it
+/// names is still the one that is there, and the generation is what makes a reused session number
+/// a different desktop.
+///
+/// A host with no boot identity to bind to, or no graphical login session, has no binding. A
+/// session with no binding is bound to no desktop and cannot lose one.
 #[must_use]
 pub fn desktop_binding() -> kr_protocol::identity::DesktopBinding {
-    let named = std::env::var("XDG_SESSION_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .or_else(|| std::env::var("SECURITYSESSIONID").ok());
-    let generation = named.as_deref().and_then(|value| {
-        u64::from_str_radix(value.trim().trim_start_matches("0x"), 16)
-            .ok()
-            .or_else(|| value.trim().parse::<u64>().ok())
-    });
-    kr_protocol::identity::DesktopBinding {
-        desktop_session_id: kr_protocol::scalars::Nullable(named.and_then(|value| {
-            kr_protocol::ids::DesktopSessionId::new(value.trim().to_owned()).ok()
-        })),
-        login_generation: kr_protocol::scalars::Nullable(
-            generation.map(kr_protocol::scalars::U64::new),
-        ),
-    }
+    let Ok(boot) = kr_ipc::identity::boot_identity() else {
+        return kr_protocol::identity::DesktopBinding::none();
+    };
+    crate::desktop::binding(&crate::desktop::context(
+        kr_protocol::identity::WorkerProfile::DesktopBound,
+        boot,
+    ))
 }
 
 /// Builds the environment for one root shell.

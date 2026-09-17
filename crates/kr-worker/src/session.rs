@@ -172,6 +172,12 @@ pub struct Session {
     pending_input: Vec<InputBatch>,
     owned: Option<OwnedProcesses>,
     root_exit: Option<ShellExit>,
+    /// The desktop this session is bound to, where it is bound to one.
+    ///
+    /// A desktop-bound session belongs to one graphical login and closes with `desktop_lost` when
+    /// that login ends. The watch is what answers the question, and it answers it from a recorded
+    /// process identity rather than from this worker's own environment, which cannot change.
+    desktop: crate::desktop::Watch,
     /// The canonical grid. Every byte the terminal produces passes through it.
     engine: crate::projection::TerminalEngine,
     /// What the renderings this session has produced could not carry.
@@ -372,6 +378,10 @@ impl Session {
             owned: None,
             root_exit: None,
             content_scopes: std::collections::BTreeMap::new(),
+            // Bound before the shell starts, from the desktop the create request recorded. A
+            // desktop that has already gone by now is a session that never had one, and the watch
+            // says so from the first question rather than from a change it would never see.
+            desktop: crate::desktop::Watch::bind(config.worker_profile, &config.desktop),
             engine,
             restoration_losses: crate::render::Carried::default(),
             forwarding_held: std::collections::BTreeMap::new(),
@@ -468,23 +478,15 @@ impl Session {
     /// Returns whether the login session a desktop-bound worker was bound to has ended.
     ///
     /// A headless worker is bound to nothing and answers false: outliving a logout is what that
-    /// profile is for. A desktop-bound one is bound to a login generation, and a generation that is
-    /// gone means the desktop this session belongs to is gone with it.
-    #[must_use]
-    pub fn desktop_lost(&self) -> bool {
-        if self.config.worker_profile != WorkerProfile::DesktopBound {
-            return false;
-        }
-        let Some(bound) = self.config.desktop.login_generation.as_ref() else {
-            return false;
-        };
-        let current = crate::environment::desktop_binding();
-        // A binding this host can no longer read, or one that now names a different login, is a
-        // desktop that has ended. A reading that agrees is a desktop that has not.
-        current
-            .login_generation
-            .as_ref()
-            .is_none_or(|generation| generation.get() != bound.get())
+    /// profile is for. A desktop-bound one is bound to one graphical login, and a login that has
+    /// ended means the desktop this session belongs to is gone with it.
+    ///
+    /// The supervision asks this on every wake, so the answer costs one kernel query about the
+    /// process that owns the login session, taken at most once a second. Once the desktop has
+    /// gone the answer stays: a new login is a different desktop and nothing is ever rebound to
+    /// it.
+    pub fn desktop_lost(&mut self) -> bool {
+        self.desktop.lost(std::time::Instant::now())
     }
 
     /// Returns what the session owns, once its shell has started.
