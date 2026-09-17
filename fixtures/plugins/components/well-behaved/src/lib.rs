@@ -150,6 +150,13 @@ impl Guest for Component {
             // there is no way to enumerate what was not given and no way to construct one.
             return Err(Fault::Unreadable("that handle is not one this call was given".to_owned()));
         };
+        // A handle this call was not given. It cannot be constructed, only named, and naming one
+        // is what a component would do if it wanted somebody else's bytes. What comes back is
+        // reported either way, so the host's answer is visible rather than assumed.
+        let invented = match source_events::read("se-invented-by-the-component") {
+            Some(_) => "present",
+            None => "absent",
+        };
         let state = state();
         state.observed += 1;
         let text = core::str::from_utf8(&event.bytes)
@@ -163,7 +170,10 @@ impl Guest for Component {
         emit_message(
             "observation",
             state.observed,
-            &format!("{}: {text}", state.last_summary),
+            &format!(
+                "{}: {text} (invented handle: {invented})",
+                state.last_summary
+            ),
         )
     }
 

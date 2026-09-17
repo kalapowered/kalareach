@@ -93,24 +93,50 @@ Two bounds per call, measuring different things.
 
 The deadline is enforced with Wasmtime's epoch interruption. A thread advances the engine's epoch
 once a millisecond while a call is in flight, and sleeps when none is, so a host serving idle shells
-has no thread waking a thousand times a second on its behalf.
+has no thread waking a thousand times a second on its behalf. The counter tracks **elapsed time**
+rather than the number of times that thread woke up: each pass advances the epoch to where the
+monotonic clock says it should be, so a thread the scheduler kept waiting makes a deadline fire late
+by the length of its own delay and never by more.
 
 The instruction allowance is enforced with fuel. **Fuel is a work bound, not a measurement of
 processor time.** The two are not competitors: the deadline is what stops an ordinary call that is
 taking too long, and fuel is the ceiling on how much work one call can ever do, which holds even
-when a loaded machine delivers the epoch late. The failure says which bound ran out, and a fuel
-exhaustion is never described as a duration.
+when a loaded machine delivers the epoch late. The figure is 100 million units per millisecond of
+deadline, measured rather than guessed: at 2 million per millisecond fuel was stopping calls that
+were inside their deadline, at 20 million the two bounds were close enough that which one fired
+depended on how busy the machine was, and at 100 million the deadline is reliably first while the
+ceiling is still about an order of magnitude away rather than unreachable.
+
+The failure says which bound ran out, and a fuel exhaustion is never described as a duration. A host
+that could not start the epoch thread at all refuses to run a deadlined call rather than running one
+it cannot bound, and reports that as its own failure rather than the component's.
 
 ### Per instance
 
 | Bound | Value |
 | --- | --- |
-| Linear memory | 64 MiB |
-| Output per call | 1 MiB |
+| Linear memory, across every memory the instance has | 64 MiB |
+| Output per call, across the document and the returned value | 1 MiB |
 | Largest single document node | 1 MiB less 8 KiB |
-| Tables | 32, of at most 100 000 elements |
+| Cost of one node before its contents | 64 bytes |
+| Document nodes per call | 4096 |
 | Linear memories | 8 |
+| Tables | 32, of at most 100 000 elements each and 400 000 between them |
 | Core instances | 64 |
+
+Two of those are worth spelling out, because a looser reading of each would leave the bound doing
+nothing.
+
+**Per instance, not per memory.** A component may create several linear memories. A limiter that
+checked each one against 64 MiB would let eight of them reach half a gigabyte between them, so the
+limiter tracks the total across the store and refuses the growth that would take the total past the
+bound. Table elements are counted the same way.
+
+**One output budget, not one per kind.** A call's output is its document nodes *and* the value it
+returned. A checkpoint, an encoded response and a decoded projection are all bytes the host holds
+and the protocol carries; a budget that covered only the document would bound the smaller half. A
+node also costs a fixed 64 bytes before its strings are counted, because a component that emitted
+millions of empty nodes would otherwise emit them for nothing.
 
 A node is bounded below the call budget because the service protocol carries one node per frame on a
 control stream whose frames are 1 MiB including their envelope. A component with more to say emits
@@ -118,7 +144,9 @@ more nodes, which is what the node union is for.
 
 A refused allocation is recorded rather than only returned, so the failure can name the resource. A
 component that asked for a gigabyte and one that divided by zero both arrive as traps, and without
-the record they would produce the same disabled reason.
+the record they would produce the same disabled reason. A refusal is recorded only when this host's
+bound was the reason: a module whose own declared maximum is smaller is refused by that maximum, and
+saying "over its bound of 67108864" about it would be untrue.
 
 ## The observation queue
 
@@ -135,6 +163,15 @@ An authoritative native request is never evicted to make room for anything. If o
 admitted even after every ordinary observation has gone, the admission is refused instead: the
 broker still holds the request and its proven native path, and what is unavailable is the rich
 interpretation of it rather than the request. A dropped request would be a decision nobody made.
+
+## What happens to a document nobody is reading
+
+Events reach the caller over a bounded channel, and the binding's thread never waits on it: a
+component must not be blocked because a socket is slow, and a caller that has stopped reading must
+not be able to make this host grow without bound. So a full channel means the document is dropped,
+the loss is reported, and the component is asked to rebuild its view, which is the same answer a
+lost observation gets. A fault and a disabled notice are the exceptions and are never dropped:
+those two are the ones a caller cannot infer from anything else.
 
 ## Faults
 
@@ -153,6 +190,17 @@ So a faulted instance is replaced from the component that is already compiled, `
 and the binding asks for a snapshot, because the replacement has no presentation state. That is what
 makes the first two faults survivable rather than merely counted.
 
+The replacement is told what the host holds *now*: the current binding revision, the current rights
+and the attachments the draft holds, not the ones the binding was created with. It is bound to the
+current revision too, because binding a replacement to a revision that has moved on would have it
+presenting one execution's state against another's. And the snapshot comes before anything else is
+delivered: the rest of an observation batch stops at the fault and resumes after the snapshot, so
+nothing is interpreted against a document that no longer exists.
+
+The snapshot obligation is a number rather than a flag. A snapshot that was already running when a
+new gap appeared discharges the obligation it was asked for and not the new one, because it cannot
+have seen what the new gap lost.
+
 ## Compilation
 
 Lazily, at binding preparation, on a background pool, under its own budget:
@@ -169,9 +217,18 @@ its budget has its result discarded and reports the figure. A pool whose queue i
 next request rather than starting a hundred compiles.
 
 No call deadline contains a compile. The two steps are separate in the API for that reason: a
-component is compiled, and only then is an instance created and a call budget started. Each pool
-thread lowers its own scheduling priority when it starts; what that means is the platform's answer,
-and a platform that declines is not a failure, because the compile still runs off the hot path.
+component is compiled, and only then is an instance created and a call budget started. Instantiation
+and `bind` run on the binding's own thread rather than a caller's, and the caller's own deadline
+covers the whole preparation: the compile, the instantiation and `bind` together.
+
+The time half of the budget is a threshold on accepting a result rather than a cap on the work.
+Cranelift cannot be interrupted part way, so an over-budget compile has its result discarded and
+reports the figure; what bounds the resources already spent is the size bound and the pool's fixed
+threads and bounded queue.
+
+Each pool thread lowers its own scheduling priority when it starts, through the platform's own
+thread scheduling. What that means is the platform's answer, and a platform that declines is not a
+failure, because the compile still runs off the hot path, which is the property that matters.
 
 ## The compiled-code cache
 
@@ -183,21 +240,38 @@ Compiled machine code is filed under three things, all three necessary:
 | the engine's compatibility identity | a different engine expects a different artefact |
 | the target | machine code for one instruction set is not machine code for another |
 
-A serialised component is machine code. Reading one back is equivalent to loading a shared library,
-so it is done only for an artefact this host compiled itself, and "this host compiled it" is
-established by the manifest beside it, which records:
+A component this process compiled or loaded once is kept in memory, up to thirty-two of them, so a
+second binding of the same package neither compiles nor reads a file. For those, no question of
+provenance arises at all.
+
+For the rest, a serialised component is machine code. Reading one back is equivalent to loading a
+shared library, and it is worth being exact about which question the manifest beside it answers.
+
+**Which artefact is this?** The manifest answers that, and every answer is checked:
 
 - the digest of the Wasm the caller is asking for, so an artefact filed under one component cannot
   be served for another;
-- the engine's compatibility identity and the target;
-- the artefact's own digest and length, checked against the bytes on disk;
-- a marker saying it was produced by compiling validated Wasm in this process.
+- the engine's compatibility identity and the target, so an artefact another engine or another
+  instruction set produced is refused rather than loaded and trusted;
+- the artefact's own digest and length, checked against the bytes the host then hands to the
+  engine: the same bytes, read once, not the file reopened afterwards;
+- a marker saying a local compilation produced it, so an artefact that arrived any other way is a
+  miss rather than a load.
 
-A downloaded native-code artefact therefore cannot become a cache entry: it has no manifest, and a
-forged manifest still has to match a digest the caller supplied from the package it verified. The
-directory is owner-only on top of that. An entry that fails any check is removed and the component is
-compiled again, because a refused entry is a reason to recompile rather than a reason to refuse the
-binding.
+**Could somebody put machine code here on purpose?** The manifest does not answer that, and no
+manifest could: every field in it is one a writer of the directory could produce. What answers it is
+the directory, which is the owner's own and nobody else's. A process that can write there runs as
+this user and can replace the plugin host's own executable, so the cache is not where that boundary
+is drawn and this host does not pretend otherwise.
+
+What the checks do buy, on top of the directory, is that a *downloaded* artefact cannot become a
+cache entry by accident or by being dropped in: a payload fetched from a catalogue has no manifest,
+and one filed under a digest the caller did not verify is refused by name. Section 11's rule is that
+a downloaded native-code cache is never deserialised as validated Wasm, and that is the rule these
+checks keep.
+
+An entry that fails any check is removed and the component is compiled again, because a refused
+entry is a reason to recompile rather than a reason to refuse the binding.
 
 ## The service
 

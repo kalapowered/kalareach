@@ -1,14 +1,24 @@
 //! The per-instance resource bounds, and what a refused allocation is recorded as.
 //!
-//! Linear memory is the bound section 11 names: 64 MiB per instance. The table, memory and
-//! instance counts are bounded too, because a component that cannot grow its memory can still ask
-//! for a thousand tables, and a bound that only covered bytes would let it.
+//! Linear memory is the bound section 11 names: 64 MiB per **instance**. Per instance, not per
+//! memory: a component may create several linear memories, and a bound that checked each one on its
+//! own would let eight of them reach half a gigabyte between them. So the limiter tracks the total
+//! across the store and refuses the growth that would take the total past the bound.
 //!
-//! A refusal is recorded rather than only returned. Wasmtime turns a `false` from
-//! [`wasmtime::ResourceLimiter::memory_growing`] into a trap inside the component, which arrives at
-//! the call site as an ordinary trap; without a record the host could not tell a component that
-//! divided by zero from one that asked for a gigabyte. The recorded refusal is what names the
-//! second case in the disabled reason a person reads.
+//! Table elements, table counts, memory counts and instance counts are bounded too, because a
+//! component that cannot grow its memory can still ask for a thousand tables.
+//!
+//! # Why a refusal is recorded and not only returned
+//!
+//! Wasmtime turns a `false` from [`wasmtime::ResourceLimiter::memory_growing`] into a failed
+//! `memory.grow` inside the component, which the component may then turn into a trap. That trap
+//! arrives at the call site looking like any other, so without a record the host could not tell a
+//! component that divided by zero from one that asked for a gigabyte. The recorded refusal is what
+//! names the second case in the disabled reason a person reads.
+//!
+//! A refusal is recorded only when *this host's* bound was the reason. A module whose own declared
+//! maximum is smaller is refused by that maximum, and saying "over its bound of 67108864" about it
+//! would be a lie.
 
 use kr_plugin_sdk::limits::{INSTANCE_MEMORY_BYTES, InstanceLimits};
 
@@ -29,12 +39,18 @@ pub const MAX_INSTANCES: usize = 64;
 /// How many elements one table may hold.
 pub const MAX_TABLE_ELEMENTS: usize = 100_000;
 
+/// How many elements every table of one instance may hold between them.
+///
+/// The same reasoning as the memory bound: a per-table limit that thirty-two tables each reached
+/// would be no limit at all.
+pub const MAX_TOTAL_TABLE_ELEMENTS: usize = 400_000;
+
 /// Which bound a component ran into.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RefusedResource {
-    /// Linear memory, in bytes.
+    /// Linear memory, in bytes, across every memory of the instance.
     LinearMemory,
-    /// Table elements.
+    /// Table elements, across every table of the instance.
     TableElements,
 }
 
@@ -50,6 +66,8 @@ impl RefusedResource {
 }
 
 /// The bounds one component instance runs under.
+///
+/// One limiter per store, so the totals it tracks are one instance's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct InstanceLimiter {
     memory_bytes: u64,
@@ -57,6 +75,11 @@ pub struct InstanceLimiter {
     max_memories: usize,
     max_instances: usize,
     max_table_elements: usize,
+    max_total_table_elements: usize,
+    /// The sum of every linear memory's current size.
+    allocated_bytes: u64,
+    /// The sum of every table's current length.
+    allocated_elements: usize,
     refused: Option<RefusedResource>,
 }
 
@@ -70,6 +93,9 @@ impl InstanceLimiter {
             max_memories: MAX_MEMORIES,
             max_instances: MAX_INSTANCES,
             max_table_elements: MAX_TABLE_ELEMENTS,
+            max_total_table_elements: MAX_TOTAL_TABLE_ELEMENTS,
+            allocated_bytes: 0,
+            allocated_elements: 0,
             refused: None,
         }
     }
@@ -77,20 +103,21 @@ impl InstanceLimiter {
     /// Builds the limiter from a declared set of limits.
     #[must_use]
     pub const fn from_limits(limits: &InstanceLimits) -> Self {
-        Self {
-            memory_bytes: limits.memory_bytes.get(),
-            max_tables: MAX_TABLES,
-            max_memories: MAX_MEMORIES,
-            max_instances: MAX_INSTANCES,
-            max_table_elements: MAX_TABLE_ELEMENTS,
-            refused: None,
-        }
+        let mut limiter = Self::defaults();
+        limiter.memory_bytes = limits.memory_bytes.get();
+        limiter
     }
 
-    /// Returns the linear memory bound in bytes.
+    /// Returns the linear memory bound in bytes, across every memory of the instance.
     #[must_use]
     pub const fn memory_bytes(&self) -> u64 {
         self.memory_bytes
+    }
+
+    /// Returns how many bytes of linear memory the instance holds.
+    #[must_use]
+    pub const fn allocated_bytes(&self) -> u64 {
+        self.allocated_bytes
     }
 
     /// Returns the resource a refused allocation asked for, if one was refused.
@@ -100,7 +127,9 @@ impl InstanceLimiter {
     }
 
     /// Forgets any refusal, ready for the next call.
-    pub fn clear_refusal(&mut self) {
+    ///
+    /// The totals are not forgotten: they are the instance's, not the call's.
+    pub const fn clear_refusal(&mut self) {
         self.refused = None;
     }
 
@@ -114,7 +143,7 @@ impl InstanceLimiter {
             }),
             Some(RefusedResource::TableElements) => Some(RuntimeError::ResourceRefused {
                 resource: RefusedResource::TableElements.as_str(),
-                limit: self.max_table_elements as u64,
+                limit: self.max_total_table_elements as u64,
             }),
             None => None,
         }
@@ -130,30 +159,56 @@ impl Default for InstanceLimiter {
 impl wasmtime::ResourceLimiter for InstanceLimiter {
     fn memory_growing(
         &mut self,
-        _current: usize,
+        current: usize,
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        let allowed = u64::try_from(desired).is_ok_and(|desired| desired <= self.memory_bytes)
-            && maximum.is_none_or(|maximum| desired <= maximum);
-        if !allowed {
+        // `current` is this memory's size and `desired` is what it wants to become, so the total
+        // after the growth is the instance's total with this memory's contribution replaced.
+        let Ok(current) = u64::try_from(current) else {
             self.refused = Some(RefusedResource::LinearMemory);
+            return Ok(false);
+        };
+        let Ok(desired) = u64::try_from(desired) else {
+            self.refused = Some(RefusedResource::LinearMemory);
+            return Ok(false);
+        };
+        let total = self
+            .allocated_bytes
+            .saturating_sub(current)
+            .saturating_add(desired);
+        if total > self.memory_bytes {
+            self.refused = Some(RefusedResource::LinearMemory);
+            return Ok(false);
         }
-        Ok(allowed)
+        // A module's own declared maximum is the module's business. Refusing on it is right, and
+        // recording it as this host's bound would misname the reason.
+        if maximum.is_some_and(|maximum| u64::try_from(maximum).is_ok_and(|max| desired > max)) {
+            return Ok(false);
+        }
+        self.allocated_bytes = total;
+        Ok(true)
     }
 
     fn table_growing(
         &mut self,
-        _current: usize,
+        current: usize,
         desired: usize,
         maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
-        let allowed =
-            desired <= self.max_table_elements && maximum.is_none_or(|maximum| desired <= maximum);
-        if !allowed {
+        let total = self
+            .allocated_elements
+            .saturating_sub(current)
+            .saturating_add(desired);
+        if desired > self.max_table_elements || total > self.max_total_table_elements {
             self.refused = Some(RefusedResource::TableElements);
+            return Ok(false);
         }
-        Ok(allowed)
+        if maximum.is_some_and(|maximum| desired > maximum) {
+            return Ok(false);
+        }
+        self.allocated_elements = total;
+        Ok(true)
     }
 
     fn instances(&self) -> usize {
@@ -193,6 +248,7 @@ mod tests {
                 .expect("the limiter answers")
         );
         assert!(limiter.refused().is_none());
+        assert_eq!(limiter.allocated_bytes(), 64 * 1024 * 1024);
 
         assert!(
             !limiter
@@ -210,6 +266,79 @@ mod tests {
 
         limiter.clear_refusal();
         assert!(limiter.refused().is_none());
+        // Clearing a refusal does not forget what the instance holds.
+        assert_eq!(limiter.allocated_bytes(), 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn the_bound_is_the_instances_total_and_not_one_memory_at_a_time() {
+        let mut limiter = InstanceLimiter::defaults();
+        let forty = 40 * 1024 * 1024;
+        // Each of these is inside the 64 MiB bound on its own. Together they are not.
+        assert!(
+            limiter
+                .memory_growing(0, forty, None)
+                .expect("the limiter answers")
+        );
+        assert!(
+            !limiter
+                .memory_growing(0, forty, None)
+                .expect("the limiter answers"),
+            "two 40 MiB memories were admitted against a 64 MiB bound"
+        );
+        assert_eq!(limiter.refused(), Some(RefusedResource::LinearMemory));
+        assert_eq!(limiter.allocated_bytes(), forty as u64);
+
+        // A second memory that fits in what is left is admitted.
+        limiter.clear_refusal();
+        assert!(
+            limiter
+                .memory_growing(0, 20 * 1024 * 1024, None)
+                .expect("the limiter answers")
+        );
+        assert_eq!(limiter.allocated_bytes(), 60 * 1024 * 1024);
+    }
+
+    #[test]
+    fn a_refused_growth_is_not_counted_against_the_total() {
+        let mut limiter = InstanceLimiter::defaults();
+        let bound = 64 * 1024 * 1024;
+        assert!(
+            !limiter
+                .memory_growing(0, bound + 1, None)
+                .expect("the limiter answers")
+        );
+        assert_eq!(limiter.allocated_bytes(), 0);
+        limiter.clear_refusal();
+        // The whole bound is still available, because nothing was allocated.
+        assert!(
+            limiter
+                .memory_growing(0, bound, None)
+                .expect("the limiter answers")
+        );
+    }
+
+    #[test]
+    fn a_growing_memory_replaces_its_own_contribution_rather_than_adding_to_it() {
+        let mut limiter = InstanceLimiter::defaults();
+        let step = 8 * 1024 * 1024;
+        let mut size = 0;
+        for _ in 0..8 {
+            let next = size + step;
+            assert!(
+                limiter
+                    .memory_growing(size, next, None)
+                    .expect("the limiter answers"),
+                "one memory growing to {next} was refused"
+            );
+            size = next;
+        }
+        assert_eq!(limiter.allocated_bytes(), 64 * 1024 * 1024);
+        assert!(
+            !limiter
+                .memory_growing(size, size + 1, None)
+                .expect("the limiter answers")
+        );
     }
 
     #[test]
@@ -236,6 +365,25 @@ mod tests {
     }
 
     #[test]
+    fn the_table_bound_is_the_instances_total_as_well() {
+        let mut limiter = InstanceLimiter::defaults();
+        for index in 0..4 {
+            assert!(
+                limiter
+                    .table_growing(0, MAX_TABLE_ELEMENTS, None)
+                    .expect("the limiter answers"),
+                "table {index} was refused"
+            );
+        }
+        assert!(
+            !limiter
+                .table_growing(0, 1, None)
+                .expect("the limiter answers"),
+            "a fifth full table was admitted past the instance's total"
+        );
+    }
+
+    #[test]
     fn the_counts_are_bounded_as_well_as_the_bytes() {
         let limiter = InstanceLimiter::defaults();
         assert_eq!(limiter.tables(), MAX_TABLES);
@@ -244,13 +392,17 @@ mod tests {
     }
 
     #[test]
-    fn an_engine_declared_maximum_below_the_bound_still_applies() {
+    fn a_modules_own_maximum_is_refused_without_being_blamed_on_this_hosts_bound() {
         let mut limiter = InstanceLimiter::defaults();
         assert!(
             !limiter
                 .memory_growing(0, 1024, Some(512))
                 .expect("the limiter answers")
         );
-        assert_eq!(limiter.refused(), Some(RefusedResource::LinearMemory));
+        // The refusal was the module's own declared maximum, so nothing is recorded against the
+        // 64 MiB bound: a failure that said "over its bound of 67108864" would be untrue.
+        assert!(limiter.refused().is_none());
+        assert!(limiter.refusal().is_none());
+        assert_eq!(limiter.allocated_bytes(), 0);
     }
 }

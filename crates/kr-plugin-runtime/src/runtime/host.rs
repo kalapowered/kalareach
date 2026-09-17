@@ -40,7 +40,28 @@ use crate::runtime::limits::InstanceLimiter;
 /// control stream whose frames are 1 MiB including their envelope. Reserving the envelope here is
 /// what keeps a node that fits the call budget from being a node that cannot be delivered. A
 /// component that has more than this to say emits more nodes, which is what the node union is for.
-pub const MAX_NODE_BYTES: u64 = OUTPUT_BYTES_PER_CALL - 8 * 1024;
+pub const MAX_NODE_BYTES: u64 = OUTPUT_BYTES_PER_CALL - FRAME_ENVELOPE_BYTES;
+
+/// How much of a frame a node's envelope may take.
+///
+/// The frame's length prefix, the request correlation, the binding identifier, the export name and
+/// the node's own field names and CBOR headers. Eight kibibytes is far more than any of that, and
+/// being far more is the point: a node that fits the call budget must be one the protocol can
+/// deliver, and a bound that were merely exact would depend on the encoding staying the same.
+pub const FRAME_ENVELOPE_BYTES: u64 = 8 * 1024;
+
+/// What one emitted node costs of the call's output budget before its contents are counted.
+///
+/// A node is a record with two identifiers and a body, and it occupies host memory, a frame and a
+/// place in a document whatever its strings say. Without a fixed cost a component could emit
+/// millions of empty nodes for nothing, and "1 MiB of output per call" would bound only the text.
+pub const NODE_OVERHEAD_BYTES: u64 = 64;
+
+/// How many document nodes one call may emit.
+///
+/// The output budget and the per-node cost already bound this arithmetically. Stating it as well
+/// makes the bound a number a person can check rather than a division.
+pub const MAX_NODES_PER_CALL: usize = 4_096;
 
 /// One immutable source event, as the host holds it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -272,9 +293,12 @@ pub struct EmittedNode {
 
 impl EmittedNode {
     /// Returns the bytes this node spends of the call's output budget.
+    ///
+    /// Its strings plus a fixed cost for being a node at all, so a component cannot emit an
+    /// unbounded number of empty ones.
     #[must_use]
     pub fn output_bytes(&self) -> u64 {
-        (self.node_id.len() + self.body_json.len()) as u64
+        NODE_OVERHEAD_BYTES + (self.node_id.len() + self.body_json.len()) as u64
     }
 }
 
@@ -338,21 +362,49 @@ impl DocumentSink {
                 "a node of {bytes} bytes is over the {MAX_NODE_BYTES} byte bound for one node"
             ));
         }
+        if self.nodes.len() >= MAX_NODES_PER_CALL {
+            self.overran = true;
+            return Err(format!(
+                "this call has already emitted the {MAX_NODES_PER_CALL} nodes one call may emit"
+            ));
+        }
+        if !self.charge(bytes) {
+            return Err(format!(
+                "this call has {} of its {} byte output budget left",
+                self.remaining(),
+                self.budget
+            ));
+        }
+        self.nodes.push(node);
+        Ok(())
+    }
+
+    /// Charges `bytes` against this call's output budget.
+    ///
+    /// The document is not the only output a call produces: a checkpoint, an encoded response and
+    /// a decoded projection are all bytes the host has to hold and the protocol has to carry, and
+    /// section 11's "1 MiB output per call" is one budget over all of them rather than one for the
+    /// document and none for anything else.
+    ///
+    /// Returns false when the charge would take the call past its budget. The overrun is recorded
+    /// either way, so the call is a fault.
+    pub fn charge(&mut self, bytes: u64) -> bool {
         let Some(used) = self
             .used
             .checked_add(bytes)
             .filter(|used| *used <= self.budget)
         else {
             self.overran = true;
-            return Err(format!(
-                "this call has {} of its {} byte output budget left",
-                self.remaining(),
-                self.budget
-            ));
+            return false;
         };
         self.used = used;
-        self.nodes.push(node);
-        Ok(())
+        true
+    }
+
+    /// Returns how many bytes of this call's budget are spent.
+    #[must_use]
+    pub const fn used(&self) -> u64 {
+        self.used
     }
 }
 
@@ -440,6 +492,12 @@ impl HostState {
     #[must_use]
     pub const fn document(&self) -> &DocumentSink {
         &self.document
+    }
+
+    /// Returns the document output of the current call, to be charged or taken.
+    #[must_use]
+    pub const fn document_mut(&mut self) -> &mut DocumentSink {
+        &mut self.document
     }
 
     /// Takes the document output and resets the budget for the next call.
@@ -628,6 +686,59 @@ mod tests {
     }
 
     #[test]
+    fn a_node_costs_something_even_when_its_strings_are_empty() {
+        let mut state = state();
+        let before = state.remaining_output_bytes();
+        state
+            .emit(Node {
+                node_id: String::new(),
+                node_revision: 1,
+                body_json: String::new(),
+            })
+            .expect("an empty node is admitted");
+        assert_eq!(before - state.remaining_output_bytes(), NODE_OVERHEAD_BYTES);
+    }
+
+    #[test]
+    fn a_flood_of_empty_nodes_runs_out_of_budget_rather_than_running_for_ever() {
+        let mut state = state();
+        let mut emitted = 0_u64;
+        let refusal = loop {
+            let outcome = state.emit(Node {
+                node_id: String::new(),
+                node_revision: emitted,
+                body_json: String::new(),
+            });
+            match outcome {
+                Ok(()) => emitted += 1,
+                Err(refusal) => break refusal,
+            }
+            assert!(
+                emitted <= MAX_NODES_PER_CALL as u64,
+                "a call emitted more than the {MAX_NODES_PER_CALL} nodes one call may emit"
+            );
+        };
+        assert_eq!(emitted, MAX_NODES_PER_CALL as u64);
+        assert!(refusal.contains("nodes one call may emit"), "{refusal}");
+        assert!(state.overran_output());
+    }
+
+    #[test]
+    fn a_returned_value_is_charged_against_the_same_budget_as_the_document() {
+        let mut state = state();
+        state
+            .emit(Node {
+                node_id: "n0".to_owned(),
+                node_revision: 1,
+                body_json: "x".repeat(600 * 1024),
+            })
+            .expect("a 600 KiB node fits");
+        // A 600 KiB return value on top of it does not: one budget covers both.
+        assert!(!state.document_mut().charge(600 * 1024));
+        assert!(state.overran_output());
+    }
+
+    #[test]
     fn the_output_budget_is_one_mebibyte_per_call_and_resets() {
         let mut state = state();
         assert_eq!(state.remaining_output_bytes(), OUTPUT_BYTES_PER_CALL);
@@ -673,7 +784,9 @@ mod tests {
         assert!(state.overran_output());
         // A node is bounded below the call budget, so a node that fits one call always fits the
         // frame that carries it.
-        const { assert!(MAX_NODE_BYTES < OUTPUT_BYTES_PER_CALL) }
+        // A node is bounded below the call budget by at least a frame's envelope, so a node that
+        // fits one call is always one the protocol can deliver.
+        const { assert!(MAX_NODE_BYTES + FRAME_ENVELOPE_BYTES <= OUTPUT_BYTES_PER_CALL) }
     }
 
     #[test]

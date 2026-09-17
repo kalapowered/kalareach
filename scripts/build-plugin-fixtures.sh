@@ -53,6 +53,10 @@ ambient=(
 )
 components_list=("${sandboxed[@]}" "${ambient[@]}")
 
+# The components' own target directory, set explicitly. An inherited CARGO_TARGET_DIR would send
+# the build somewhere else and leave the copies below reading whatever an older build had put here.
+export CARGO_TARGET_DIR="$components/target"
+
 echo "build-plugin-fixtures: building ${#components_list[@]} components for $target"
 (
     cd "$components"

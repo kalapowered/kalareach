@@ -148,6 +148,10 @@ pub enum RuntimeError {
         limit: u64,
     },
     /// The call produced more output than one call may produce.
+    ///
+    /// The output the call had already produced is delivered: a presentation a person is entitled
+    /// to see does not disappear because of what the component did next. What this failure closes
+    /// is the call, and it counts as a fault, because the bound was stated.
     #[error("{call} produced more than the {limit} byte output budget for one call")]
     OutputBudget {
         /// Which export was running.
@@ -193,6 +197,15 @@ pub enum RuntimeError {
         /// What was wrong with the answer.
         detail: String,
     },
+    /// This host cannot enforce an elapsed deadline.
+    ///
+    /// The engine's epoch thread did not start, so nothing would stop a call at its deadline. This
+    /// is the host's failure and not the component's: it is never counted as a fault, because a
+    /// component that was never run cannot have misbehaved.
+    #[error(
+        "this host cannot enforce an elapsed deadline: the component engine's epoch thread did not start"
+    )]
+    DeadlinesUnenforceable,
     /// A call did not answer inside the deadline the caller set.
     ///
     /// This is the caller's own deadline, not the component's. It exists so that nothing on the
@@ -210,6 +223,7 @@ impl RuntimeError {
     /// Compilation failures do not. Section 11 requires that a cold compile cannot look like a
     /// slow observation, and a component that is slow to compile has not misbehaved at run time.
     /// Nor does a caller's own deadline: that measures the caller's patience, not the component.
+    /// Nor does a host that cannot enforce a deadline at all: that is this host's failure.
     #[must_use]
     pub const fn counts_as_fault(&self) -> bool {
         matches!(
@@ -265,6 +279,9 @@ mod tests {
         assert!(!slow.counts_as_fault());
         assert!(!RuntimeError::CompilationPressure { queued: 8 }.counts_as_fault());
         assert!(!RuntimeError::CallerDeadline { deadline_ms: 10 }.counts_as_fault());
+        // Nor is a host that cannot bound a call. Blaming the component for the host's missing
+        // thread would disable a binding that never ran.
+        assert!(!RuntimeError::DeadlinesUnenforceable.counts_as_fault());
     }
 
     #[test]

@@ -21,24 +21,36 @@
 //! # What is never deserialised
 //!
 //! A serialised component is machine code. Deserialising one is equivalent to loading a shared
-//! library: it is not validated Wasm and cannot be treated as such. So an artefact is read back
-//! only when it is one this process wrote, and "this process wrote it" is established by the
-//! manifest beside it:
+//! library: it is not validated Wasm, and nothing this host does to it makes it validated Wasm. So
+//! there are two separate questions, and it is worth being exact about which one the manifest
+//! answers.
 //!
-//! * the manifest names the Wasm digest the caller is asking for, so an artefact filed under one
-//!   component cannot be served for another;
-//! * it names the engine's compatibility hash, so an artefact from another engine is refused;
-//! * it names the artefact's own digest and length, which are checked against the bytes on disk,
-//!   so an artefact replaced after it was filed is refused;
-//! * it carries a marker saying it was produced by compiling validated Wasm in this process, which
-//!   nothing that arrives over a network has any reason to contain.
+//! **Which artefact is this?** The manifest answers that, and the answers are checked:
 //!
-//! A downloaded native-code artefact therefore cannot be introduced as a cache entry: it has no
-//! manifest, and a forged manifest still has to match a digest the caller supplied from the
-//! package it verified. The directory is owner-only on top of that, which is what keeps another
-//! user from writing either file.
+//! * it names the Wasm digest the caller is asking for, so an artefact filed under one component
+//!   cannot be served for another;
+//! * it names the engine's compatibility hash and the target, so an artefact another engine or
+//!   another instruction set produced is refused rather than loaded and trusted;
+//! * it names the artefact's own digest and length, which are checked against the bytes this host
+//!   then hands to the engine: the same bytes, read once, not the file reopened afterwards;
+//! * it carries a marker saying a local compilation produced it, so an artefact that arrived any
+//!   other way is a miss rather than a load.
+//!
+//! **Could somebody put machine code here on purpose?** The manifest does not answer that, and no
+//! manifest could: every field in it is one a writer of this directory could produce. What answers
+//! it is the directory, which is the owner's own and nobody else's. A process that can write here
+//! runs as this user and can replace the plugin host's own executable, so the cache is not where
+//! that boundary is drawn and this module does not pretend otherwise.
+//!
+//! What the checks above do buy, on top of the directory, is that a *downloaded* artefact cannot
+//! become a cache entry by accident or by being dropped in: a payload fetched from a catalogue has
+//! no manifest, and one filed under a digest the caller did not verify is refused by name. Section
+//! 11's rule is that a downloaded native-code cache is never deserialised as validated Wasm, and
+//! that is the rule these checks keep.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use kr_plugin_sdk::digest::PayloadDigest;
 use serde::{Deserialize, Serialize};
@@ -67,6 +79,15 @@ const MAX_MANIFEST_BYTES: u64 = 8 * 1024;
 /// at [`crate::runtime::compile::MAX_COMPONENT_BYTES`]. A file past this bound is not something
 /// this cache wrote.
 const MAX_ARTEFACT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// How many compiled components this cache keeps in memory.
+///
+/// A component this process compiled or loaded once is kept, so a second binding of the same
+/// package neither compiles nor reads a file: the one in memory is the one this process produced,
+/// and no question of provenance arises for it at all. Past this many, later components are served
+/// from disk; the bound is what keeps the convenience from becoming an unbounded cache of machine
+/// code.
+const MAX_RESIDENT: usize = 32;
 
 /// What a cache entry records about itself.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -145,10 +166,13 @@ fn hex_of(bytes: &[u8]) -> String {
     text
 }
 
-/// The on-disk cache of compiled components.
+/// The cache of compiled components: the ones in this process's memory, and the ones on disk.
 #[derive(Clone, Debug)]
 pub struct CompiledCache {
     root: PathBuf,
+    /// The components this process compiled or loaded, by entry. Shared by every clone, because
+    /// every clone is the same cache.
+    resident: Arc<Mutex<HashMap<String, wasmtime::component::Component>>>,
 }
 
 impl CompiledCache {
@@ -166,7 +190,39 @@ impl CompiledCache {
                 detail: error.to_string(),
             }
         })?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            resident: Arc::new(Mutex::new(HashMap::new())),
+        })
+    }
+
+    /// Returns how many compiled components this process is holding in memory.
+    #[must_use]
+    pub fn resident(&self) -> usize {
+        self.resident.lock().map_or(0, |resident| resident.len())
+    }
+
+    /// Returns the name an entry is held under in memory.
+    fn resident_name(key: &CacheKey) -> String {
+        format!("{}/{}", key.engine_directory(), key.entry_name())
+    }
+
+    /// Returns the component for a key if this process already has it in memory.
+    #[must_use]
+    pub fn resident_component(&self, key: &CacheKey) -> Option<wasmtime::component::Component> {
+        self.resident
+            .lock()
+            .ok()
+            .and_then(|resident| resident.get(&Self::resident_name(key)).cloned())
+    }
+
+    /// Keeps a component in memory, up to the resident bound.
+    fn keep(&self, key: &CacheKey, component: &wasmtime::component::Component) {
+        if let Ok(mut resident) = self.resident.lock()
+            && resident.len() < MAX_RESIDENT
+        {
+            resident.insert(Self::resident_name(key), component.clone());
+        }
     }
 
     /// Returns the root directory.
@@ -195,13 +251,17 @@ impl CompiledCache {
             .join(format!("{}.{MANIFEST_EXTENSION}", key.entry_name()))
     }
 
-    /// Reads an entry's manifest, checking it against the key.
+    /// Reads an entry's manifest and its artefact, checking them against the key.
+    ///
+    /// Returns the manifest and the artefact bytes together, because the bytes that were checked
+    /// and the bytes that are loaded have to be the same bytes: reopening the file afterwards
+    /// would check one thing and load another.
     ///
     /// # Errors
     ///
     /// Returns [`RuntimeError::CacheRefused`] when a manifest exists and does not match the key,
     /// the engine or the artefact on disk. A missing manifest is not a refusal; it is a miss.
-    pub fn verify(&self, key: &CacheKey) -> RuntimeResult<Option<CacheManifest>> {
+    pub fn verify(&self, key: &CacheKey) -> RuntimeResult<Option<(CacheManifest, Vec<u8>)>> {
         let manifest_path = self.manifest_path(key);
         let Some(bytes) = kr_ipc::paths::read_owner_only_file(&manifest_path, MAX_MANIFEST_BYTES)
             .map_err(|error| RuntimeError::CacheRefused {
@@ -265,37 +325,47 @@ impl CompiledCache {
                 "the artefact is not the bytes its manifest records",
             ));
         }
-        Ok(Some(manifest))
+        Ok(Some((manifest, artefact)))
     }
 
     /// Loads a cached component, or says there is none.
     ///
-    /// The `unsafe` block is this crate's only one. It is reached exactly once the manifest above
-    /// has established that the file is an artefact this host compiled from the very Wasm the
-    /// caller verified, with this engine, for this target, and that its bytes are unchanged since.
+    /// The `unsafe` block is this crate's only one, and it is handed the very bytes
+    /// [`Self::verify`] checked rather than a path to read again. `deserialize_file` would be the
+    /// obvious call here and is the wrong one twice over: it reopens the file, so the bytes it
+    /// loads need not be the bytes that were checked, and it maps the file for the component's
+    /// whole life, so a file that changed afterwards would change what is running.
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::CacheRefused`] when an entry exists and fails any of those checks,
-    /// or when the engine will not load a file that passed them.
+    /// Returns [`RuntimeError::CacheRefused`] when an entry exists and fails any of the checks, or
+    /// when the engine will not load bytes that passed them.
     pub fn load(
         &self,
         engine: &wasmtime::Engine,
         key: &CacheKey,
     ) -> RuntimeResult<Option<wasmtime::component::Component>> {
-        if self.verify(key)?.is_none() {
-            return Ok(None);
+        // What this process compiled or loaded already. Serving it from here is not only quicker:
+        // it is a component whose provenance is this process's own, with no file in the question.
+        if let Some(component) = self.resident_component(key) {
+            return Ok(Some(component));
         }
-        let path = self.artefact_path(key);
-        // SAFETY: `verify` has just read the manifest beside this file and established that it
-        // records this engine's compatibility hash, this host's target, the digest of the Wasm the
-        // caller verified, and the digest and length of the bytes now on disk; and that it carries
-        // the marker only a local compilation writes. The directory is owner-only. Nothing that
-        // arrived from outside this host can satisfy that, which is the condition section 11 puts
-        // on reading a serialised artefact back.
+        let Some((_manifest, artefact)) = self.verify(key)? else {
+            return Ok(None);
+        };
+        // SAFETY: these are the bytes `verify` has just checked, in memory, not a path reopened
+        // afterwards. It established that the manifest beside them records this engine's
+        // compatibility hash, this host's target, the digest of the Wasm the caller verified, and
+        // the digest and length of these bytes; and that it carries the marker only a local
+        // compilation writes. The directory they came from is the owner's own. That is the
+        // condition section 11 puts on reading a serialised artefact back rather than validating
+        // Wasm.
         #[allow(unsafe_code)]
-        let component = unsafe { wasmtime::component::Component::deserialize_file(engine, &path) }
-            .map_err(|error| RuntimeError::cache_refused(format!("{}: {error}", path.display())))?;
+        let component = unsafe { wasmtime::component::Component::deserialize(engine, &artefact) }
+            .map_err(|error| {
+            RuntimeError::cache_refused(format!("{}: {error}", self.artefact_path(key).display()))
+        })?;
+        self.keep(key, &component);
         Ok(Some(component))
     }
 
@@ -356,15 +426,19 @@ impl CompiledCache {
                 detail: error.to_string(),
             }
         })?;
+        self.keep(key, component);
         Ok(())
     }
 
-    /// Removes an entry, artefact and manifest together.
+    /// Removes an entry: the one in memory, and the artefact and manifest together.
     ///
     /// # Errors
     ///
     /// Returns [`RuntimeError::CacheUnusable`] when a present entry cannot be removed.
     pub fn remove(&self, key: &CacheKey) -> RuntimeResult<()> {
+        if let Ok(mut resident) = self.resident.lock() {
+            resident.remove(&Self::resident_name(key));
+        }
         for path in [self.manifest_path(key), self.artefact_path(key)] {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
@@ -428,7 +502,25 @@ mod tests {
     #[test]
     fn an_empty_cache_is_a_miss_rather_than_a_refusal() {
         let (_directory, cache) = cache();
-        assert_eq!(cache.verify(&key()).expect("a lookup"), None);
+        assert!(cache.verify(&key()).expect("a lookup").is_none());
+    }
+
+    #[test]
+    fn a_verified_entry_returns_the_bytes_that_were_checked() {
+        let (_directory, cache) = cache();
+        let key = key();
+        let artefact = b"machine code".to_vec();
+        write_manifest(&cache, &key, &manifest_for(&key, &artefact));
+        kr_ipc::paths::write_owner_only_file(&cache.artefact_path(&key), &artefact)
+            .expect("the artefact");
+
+        let (manifest, checked) = cache
+            .verify(&key)
+            .expect("a lookup")
+            .expect("the entry is there");
+        assert_eq!(manifest.wasm_digest, key.wasm_digest);
+        // The same bytes, so what is loaded cannot be something the file became afterwards.
+        assert_eq!(checked, artefact);
     }
 
     #[test]
@@ -508,9 +600,8 @@ mod tests {
         )
         .expect("the artefact");
 
-        assert_eq!(
-            cache.verify(&key).expect("a lookup"),
-            None,
+        assert!(
+            cache.verify(&key).expect("a lookup").is_none(),
             "an artefact with no manifest must be a miss, not a load"
         );
     }

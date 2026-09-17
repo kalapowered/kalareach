@@ -12,21 +12,26 @@ mod components;
 use std::sync::Arc;
 
 use kr_plugin_runtime::RuntimeError;
-use kr_plugin_runtime::runtime::binding::{BindingEvent, Runtime, RuntimeConfig};
+use kr_plugin_runtime::runtime::binding::{
+    BindingEvent, DEFAULT_EVENT_QUEUE, Runtime, RuntimeConfig,
+};
 use kr_plugin_runtime::runtime::bindings::{
-    ActionToken, Argument, EffectClass, NamedArgument, PreparedOperation, RequestSnapshot,
+    ActionToken, Argument, EffectClass, Fault, NamedArgument, PreparedOperation, RequestSnapshot,
 };
 use kr_plugin_runtime::runtime::budget::{CallBudget, CallKind};
 use kr_plugin_runtime::runtime::compile::{CompileBudget, CompileOrigin, compile_or_load};
 use kr_plugin_runtime::runtime::engine::RuntimeEngine;
 use kr_plugin_runtime::runtime::error::ExhaustedBound;
 use kr_plugin_runtime::runtime::host::{BindingFacts, MAX_NODE_BYTES};
-use kr_plugin_runtime::runtime::instance::Instance;
+use kr_plugin_runtime::runtime::instance::{CallOutcome, Instance};
 use kr_plugin_runtime::runtime::limits::InstanceLimiter;
 use kr_plugin_runtime::runtime::queue::Admission;
 use kr_plugin_sdk::limits::{
     FAULTS_BEFORE_DISABLE, INSTANCE_MEMORY_BYTES, OBSERVATION_QUEUE_BYTES, OUTPUT_BYTES_PER_CALL,
 };
+
+/// How long a test waits for a compile. Generous: a machine under load is not the case under test.
+const COMPILE_WAIT: core::time::Duration = core::time::Duration::from_secs(60);
 
 /// A cache directory that removes itself, and the runtime built over it.
 struct Host {
@@ -83,9 +88,33 @@ fn bound(wasm: &[u8], plugin: &str) -> (tempfile::TempDir, Instance) {
         binding_revision: 3,
         executable: "/usr/local/bin/example-agent".to_owned(),
     };
-    let outcome = instance.bind(target).expect("bind runs");
-    assert!(outcome.answered(), "bind declared a fault: {outcome:?}");
+    let outcome = instance.bind(target);
+    assert!(outcome.answered(), "bind did not answer: {outcome:?}");
     (directory, instance)
+}
+
+/// Returns the failure a call reported, or fails with what it produced instead.
+fn failed<T: core::fmt::Debug>(outcome: CallOutcome<T>, whatever: &str) -> RuntimeError {
+    match outcome.result {
+        Err(error) => error,
+        Ok(answer) => panic!("{whatever}: the call produced {answer:?}"),
+    }
+}
+
+/// Returns the value a call produced, or fails with what it produced instead.
+fn value<T: core::fmt::Debug>(outcome: CallOutcome<T>, whatever: &str) -> T {
+    match outcome.result {
+        Ok(Ok(value)) => value,
+        other => panic!("{whatever}: the call produced {other:?}"),
+    }
+}
+
+/// Returns the fault a component declared, or fails with what it produced instead.
+fn declared<T: core::fmt::Debug>(outcome: CallOutcome<T>, whatever: &str) -> Fault {
+    match outcome.result {
+        Ok(Err(fault)) => fault,
+        other => panic!("{whatever}: the call produced {other:?}"),
+    }
 }
 
 fn token(action: &str) -> ActionToken {
@@ -98,6 +127,36 @@ fn token(action: &str) -> ActionToken {
         parameter_hash: vec![7; 32],
         expires_at: 1_700_000_100_000,
     }
+}
+
+fn snapshot_of(request_id: &str) -> RequestSnapshot {
+    RequestSnapshot {
+        request_id: request_id.to_owned(),
+        handle: "se-1".to_owned(),
+        method: "fs.read".to_owned(),
+        class: kr_plugin_runtime::runtime::bindings::MethodClass::Observation,
+        received_at: 1_700_000_000_000,
+        deadline_at: Some(1_700_000_030_000),
+        offered_decisions: vec!["allow".to_owned(), "deny".to_owned()],
+        binding_revision: 3,
+    }
+}
+
+fn events() -> (
+    tokio::sync::mpsc::Sender<BindingEvent>,
+    tokio::sync::mpsc::Receiver<BindingEvent>,
+) {
+    tokio::sync::mpsc::channel(DEFAULT_EVENT_QUEUE)
+}
+
+async fn next_event(
+    received: &mut tokio::sync::mpsc::Receiver<BindingEvent>,
+    within: core::time::Duration,
+) -> Option<BindingEvent> {
+    tokio::time::timeout(within, received.recv())
+        .await
+        .ok()
+        .flatten()
 }
 
 // KR-REQ-04.07, KR-REQ-11.40: a component reaches the four plugin interfaces and nothing else.
@@ -153,22 +212,13 @@ fn kr_req_11_40_an_ambient_import_is_refused_and_named() {
     );
     // The message says which one, so a publisher can see what to remove.
     assert!(error.to_string().contains(import));
-    // And nothing was filed in the cache for it.
+    // And nothing was filed for it, on disk or in this process's memory.
+    let key = kr_plugin_runtime::runtime::compile::key_for(&engine, &wasm);
     assert!(
-        cache
-            .verify(&compiled_key(&engine, &wasm))
-            .ok()
-            .flatten()
-            .is_none(),
+        cache.verify(&key).ok().flatten().is_none(),
         "a refused component was cached"
     );
-}
-
-fn compiled_key(
-    engine: &RuntimeEngine,
-    wasm: &[u8],
-) -> kr_plugin_runtime::runtime::cache::CacheKey {
-    kr_plugin_runtime::runtime::compile::key_for(engine, wasm)
+    assert!(cache.resident_component(&key).is_none());
 }
 
 // KR-REQ-11.40: instructions are bounded with fuel, elapsed execution with deadlines, and neither
@@ -181,16 +231,16 @@ fn kr_req_11_40_fuel_and_deadlines_are_separate_bounds() {
 
     // A rate low enough that fuel runs out long before 10 ms could pass.
     let (_directory, mut starved) = instance(&wasm, "infinite-loop", 1);
-    starved
-        .bind(kr_plugin_runtime::runtime::bindings::Binding {
-            plugin_id: "kalareach/infinite-loop".to_owned(),
-            binding_revision: 3,
-            executable: "/usr/local/bin/example-agent".to_owned(),
-        })
-        .expect("bind runs");
-    let error = starved
-        .observe(components::scrape("se-1", "anything"))
-        .expect_err("an unbounded loop does not return");
+    let target = kr_plugin_runtime::runtime::bindings::Binding {
+        plugin_id: "kalareach/infinite-loop".to_owned(),
+        binding_revision: 3,
+        executable: "/usr/local/bin/example-agent".to_owned(),
+    };
+    assert!(starved.bind(target).answered(), "bind did not answer");
+    let error = failed(
+        starved.observe(components::scrape("se-1", "anything")),
+        "an unbounded loop returned",
+    );
     assert_eq!(
         error,
         RuntimeError::Exhausted {
@@ -205,12 +255,14 @@ fn kr_req_11_40_fuel_and_deadlines_are_separate_bounds() {
     assert!(!text.contains(" ms"));
     assert!(!text.contains("cpu"));
 
-    // With the ordinary rate the same loop runs past its elapsed deadline instead.
+    // With the ordinary rate the same loop runs past its elapsed deadline instead, and it is
+    // stopped within a small multiple of the 10 ms the deadline allows rather than eventually.
     let (_directory, mut ordinary) = bound(&wasm, "infinite-loop");
     let started = std::time::Instant::now();
-    let error = ordinary
-        .observe(components::scrape("se-1", "anything"))
-        .expect_err("an unbounded loop does not return");
+    let error = failed(
+        ordinary.observe(components::scrape("se-1", "anything")),
+        "an unbounded loop returned",
+    );
     let elapsed = started.elapsed();
     assert_eq!(
         error,
@@ -221,67 +273,121 @@ fn kr_req_11_40_fuel_and_deadlines_are_separate_bounds() {
         "an ordinary call reported {error}"
     );
     assert!(
-        elapsed < core::time::Duration::from_millis(2_000),
-        "the 10 ms observation deadline took {elapsed:?} to stop the call"
+        elapsed >= core::time::Duration::from_millis(9),
+        "the 10 ms deadline stopped the call after only {elapsed:?}"
+    );
+    assert!(
+        elapsed < core::time::Duration::from_millis(500),
+        "the 10 ms deadline took {elapsed:?} to stop the call"
     );
 }
 
-// KR-REQ-11.38: every per-instance limit, exercised against a component that tries to exceed it.
+// KR-REQ-11.38: every deadline section 11 states, on the export it belongs to.
 #[test]
-fn kr_req_11_38_the_deadlines_are_the_ones_section_eleven_states() {
+fn kr_req_11_38_every_export_is_stopped_by_its_own_deadline() {
     let Some(wasm) = components::component("infinite-loop") else {
         return;
     };
     let (_directory, mut instance) = bound(&wasm, "infinite-loop");
 
-    // Each export is stopped by its own deadline, and the observed elapsed time is on the order of
-    // that deadline rather than of another one. The upper bound is generous because a shared
-    // machine schedules the epoch thread when it pleases; the assertion is about which deadline
-    // applied, which the ordering below shows.
-    let mut elapsed = Vec::new();
-    for (kind, call) in [
+    // Every export that has a deadline, each stopped by its own. The lower bound is what shows the
+    // deadline applied rather than a shorter one; the upper bound is generous because a shared
+    // machine schedules the epoch thread when it pleases.
+    type Call = Box<dyn Fn(&mut Instance) -> RuntimeError>;
+    let cases: Vec<(CallKind, u64, Call)> = vec![
         (
             CallKind::Observe,
+            10,
             Box::new(|instance: &mut Instance| {
-                instance
-                    .observe(components::scrape("se-1", "x"))
-                    .map(|_outcome| ())
-            }) as Box<dyn Fn(&mut Instance) -> Result<(), RuntimeError>>,
+                failed(
+                    instance.observe(components::scrape("se-1", "x")),
+                    "observe returned",
+                )
+            }),
+        ),
+        (
+            CallKind::PrepareAction,
+            10,
+            Box::new(|instance: &mut Instance| {
+                failed(
+                    instance.prepare_action(token("anything"), Vec::new()),
+                    "prepare-action returned",
+                )
+            }),
+        ),
+        (
+            CallKind::DecodeRequest,
+            50,
+            Box::new(|instance: &mut Instance| {
+                failed(
+                    instance.decode_request(components::native_request("se-1", "req-1", "{}")),
+                    "decode-request returned",
+                )
+            }),
+        ),
+        (
+            CallKind::EncodeResponse,
+            50,
+            Box::new(|instance: &mut Instance| {
+                failed(
+                    instance.encode_response(snapshot_of("req-1"), "allow".to_owned(), None),
+                    "encode-response returned",
+                )
+            }),
         ),
         (
             CallKind::Snapshot,
-            Box::new(|instance: &mut Instance| instance.snapshot().map(|_outcome| ())),
+            100,
+            Box::new(|instance: &mut Instance| failed(instance.snapshot(), "snapshot returned")),
         ),
-    ] {
+        (
+            CallKind::Checkpoint,
+            100,
+            Box::new(|instance: &mut Instance| {
+                failed(instance.checkpoint(), "checkpoint returned")
+            }),
+        ),
+        (
+            CallKind::Restore,
+            100,
+            Box::new(|instance: &mut Instance| {
+                failed(instance.restore(Vec::new()), "restore returned")
+            }),
+        ),
+    ];
+
+    for (kind, deadline_ms, call) in cases {
+        assert_eq!(
+            kind.deadline_ms(),
+            Some(deadline_ms),
+            "{kind:?} does not carry the deadline section 11 gives it"
+        );
+        // A trapped instance cannot be entered again, so the previous case's is replaced first.
+        // The binding lifecycle does this on the caller's behalf; a caller using an instance
+        // directly does it itself, which is what `Instance::faulted` is for.
+        if instance.faulted() {
+            instance.replace().expect("the replacement binds");
+        }
         let started = std::time::Instant::now();
-        let error = call(&mut instance).expect_err("the loop does not return");
+        let error = call(&mut instance);
+        let elapsed = started.elapsed();
         assert_eq!(
             error,
             RuntimeError::Exhausted {
                 call: kind.as_str(),
                 bound: ExhaustedBound::Deadline,
-            }
+            },
+            "{kind:?} reported {error}"
         );
-        elapsed.push((kind, started.elapsed()));
+        assert!(
+            elapsed >= core::time::Duration::from_millis(deadline_ms - 1),
+            "{kind:?} was stopped after {elapsed:?}, before its {deadline_ms} ms deadline"
+        );
+        assert!(
+            elapsed < core::time::Duration::from_millis(deadline_ms * 5 + 500),
+            "{kind:?} took {elapsed:?} against a {deadline_ms} ms deadline"
+        );
     }
-
-    let observe = elapsed[0].1;
-    let snapshot = elapsed[1].1;
-    assert_eq!(elapsed[0].0, CallKind::Observe);
-    assert_eq!(elapsed[1].0, CallKind::Snapshot);
-    assert!(
-        observe >= core::time::Duration::from_millis(9),
-        "observe was stopped after {observe:?}, before its 10 ms deadline"
-    );
-    assert!(
-        snapshot >= core::time::Duration::from_millis(95),
-        "snapshot was stopped after {snapshot:?}, before its 100 ms deadline"
-    );
-    assert_eq!(CallKind::Observe.deadline_ms(), Some(10));
-    assert_eq!(CallKind::Snapshot.deadline_ms(), Some(100));
-    assert_eq!(CallKind::DecodeRequest.deadline_ms(), Some(50));
-    assert_eq!(CallKind::EncodeResponse.deadline_ms(), Some(50));
-    assert_eq!(CallKind::PrepareAction.deadline_ms(), Some(10));
 }
 
 // KR-REQ-11.38: 64 MiB of linear memory, and a refusal that names the resource.
@@ -291,9 +397,10 @@ fn kr_req_11_38_linear_memory_is_bounded_at_sixty_four_mebibytes() {
         return;
     };
     let (_directory, mut instance) = bound(&wasm, "memory-hog");
-    let error = instance
-        .snapshot()
-        .expect_err("a component that allocates without end does not return");
+    let error = failed(
+        instance.snapshot(),
+        "a component that allocates without end returned",
+    );
     assert_eq!(
         error,
         RuntimeError::ResourceRefused {
@@ -306,16 +413,18 @@ fn kr_req_11_38_linear_memory_is_bounded_at_sixty_four_mebibytes() {
     assert!(error.counts_as_fault());
 }
 
-// KR-REQ-11.38: 1 MiB of output per call, and the nodes emitted before the refusal are kept.
+// KR-REQ-11.38: 1 MiB of output per call, whether the component emits it or returns it.
 #[test]
 fn kr_req_11_38_output_is_bounded_at_one_mebibyte_per_call() {
     let Some(wasm) = components::component("oversized-output") else {
         return;
     };
     let (_directory, mut instance) = bound(&wasm, "oversized-output");
-    let error = instance
-        .snapshot()
-        .expect_err("a component that emits past its budget is a fault");
+
+    // Emitted. The refusal is a fault, and the nodes the call did emit travel with it.
+    let outcome = instance.snapshot();
+    let emitted = outcome.nodes.len();
+    let error = failed(outcome, "a component that emits past its budget answered");
     assert_eq!(
         error,
         RuntimeError::OutputBudget {
@@ -324,16 +433,35 @@ fn kr_req_11_38_output_is_bounded_at_one_mebibyte_per_call() {
         },
         "the failure was {error}"
     );
+    assert!(
+        emitted > 0,
+        "the nodes the call emitted before the refusal were discarded"
+    );
     const { assert!(MAX_NODE_BYTES < OUTPUT_BYTES_PER_CALL) }
 
     // A second call starts with a fresh budget rather than inheriting the exhausted one.
-    let error = instance.snapshot().expect_err("the same fault again");
+    let error = failed(instance.snapshot(), "the same fault again");
     assert_eq!(
         error,
         RuntimeError::OutputBudget {
             call: "snapshot",
             limit: OUTPUT_BYTES_PER_CALL,
         }
+    );
+
+    // Returned. This component's checkpoint returns two mebibytes of state, which a host that
+    // bounded only the document would have carried.
+    let error = failed(
+        instance.checkpoint(),
+        "a component that returns past its budget answered",
+    );
+    assert_eq!(
+        error,
+        RuntimeError::OutputBudget {
+            call: "checkpoint",
+            limit: OUTPUT_BYTES_PER_CALL,
+        },
+        "the failure was {error}"
     );
 }
 
@@ -347,11 +475,11 @@ fn kr_req_06_07_a_source_event_handle_carries_immutable_bytes_and_provenance() {
 
     let event = components::scrape("se-1", "the quick brown fox");
     let original: Vec<u8> = event.bytes.to_vec();
-    let outcome = instance.observe(event.clone()).expect("observe runs");
-    assert!(outcome.answered(), "observe declared {:?}", outcome.answer);
+    let outcome = instance.observe(event.clone());
+    let nodes = outcome.nodes.clone();
+    assert!(outcome.answered(), "observe did not answer: {outcome:?}");
     // The component saw the bytes and their provenance.
-    let text = outcome
-        .nodes
+    let text = nodes
         .iter()
         .map(|node| node.body_json.clone())
         .collect::<String>();
@@ -361,7 +489,7 @@ fn kr_req_06_07_a_source_event_handle_carries_immutable_bytes_and_provenance() {
     assert_eq!(event.bytes.to_vec(), original);
 
     // The same handle read twice gives the same bytes.
-    let again = instance.observe(event.clone()).expect("observe runs");
+    let again = instance.observe(event.clone());
     assert!(again.answered());
     assert!(
         again
@@ -370,29 +498,37 @@ fn kr_req_06_07_a_source_event_handle_carries_immutable_bytes_and_provenance() {
             .any(|node| node.body_json.contains("the quick brown fox"))
     );
 
-    // A handle this call was not given is absent, not someone else's bytes. The component reports
-    // the absence, which is an answer rather than a fault.
-    let outcome = instance
-        .observe(components::scrape("se-2", "another event"))
-        .expect("observe runs");
-    assert!(outcome.answered());
+    // A handle this call was not given reads as absent. The component asks for one it invented on
+    // every observation and reports what it got, so this is the component's own account of what it
+    // can reach rather than the host's account of what it offered.
+    let outcome = instance.observe(components::scrape("se-2", "another event"));
+    assert!(outcome.answered(), "observe did not answer: {outcome:?}");
+    let text = outcome
+        .nodes
+        .iter()
+        .map(|node| node.body_json.clone())
+        .collect::<String>();
+    assert!(
+        text.contains("invented handle: absent"),
+        "the component reported {text}"
+    );
 
     // Provenance travels with the event: a native request reads as one, a scrape does not.
     let request = components::native_request("se-3", "req-9", "{\"method\":\"write\"}");
-    let decoded = instance.decode_request(request).expect("decode runs");
-    let projection = decoded.answer.expect("the native request decodes");
+    let projection = value(
+        instance.decode_request(request),
+        "the native request decodes",
+    );
     assert_eq!(projection.request_id, "req-9");
     assert_eq!(
         projection.class,
         kr_plugin_runtime::runtime::bindings::MethodClass::Mutation
     );
 
-    let scraped = instance
-        .decode_request(components::scrape("se-4", "{\"method\":\"write\"}"))
-        .expect("decode runs");
-    let fault = scraped
-        .answer
-        .expect_err("a scrape cannot establish native approval authority");
+    let fault = declared(
+        instance.decode_request(components::scrape("se-4", "{\"method\":\"write\"}")),
+        "a scrape established native approval authority",
+    );
     assert!(
         kr_plugin_runtime::runtime::binding::fault_text(&fault).contains("not permitted"),
         "a scrape decoded as {fault:?}"
@@ -408,42 +544,30 @@ fn kr_req_11_21_decode_and_encode_return_values_and_never_send() {
     let (_directory, mut instance) = bound(&wasm, "well-behaved");
 
     let request = components::native_request("se-1", "req-1", "{\"method\":\"read\"}");
-    let decoded = instance
-        .decode_request(request.clone())
-        .expect("decode runs")
-        .answer
-        .expect("the request decodes");
+    let decoded = value(
+        instance.decode_request(request.clone()),
+        "the request decodes",
+    );
     assert_eq!(
         decoded.decisions,
         vec!["allow".to_owned(), "deny".to_owned()]
     );
 
-    let snapshot = RequestSnapshot {
-        request_id: "req-1".to_owned(),
-        handle: "se-1".to_owned(),
-        method: "fs.read".to_owned(),
-        class: kr_plugin_runtime::runtime::bindings::MethodClass::Observation,
-        received_at: 1_700_000_000_000,
-        deadline_at: Some(1_700_000_030_000),
-        offered_decisions: vec!["allow".to_owned(), "deny".to_owned()],
-        binding_revision: 3,
-    };
-    let encoded = instance
-        .encode_response(snapshot.clone(), "allow".to_owned(), Some(request))
-        .expect("encode runs")
-        .answer
-        .expect("the decision encodes");
+    let snapshot = snapshot_of("req-1");
+    let encoded = value(
+        instance.encode_response(snapshot.clone(), "allow".to_owned(), Some(request)),
+        "the decision encodes",
+    );
     // Bytes came back. They have not gone anywhere: the broker rechecks the pending request, the
     // actor grant and the binding revision, then claims and dispatches them.
     assert_eq!(encoded.request_id, "req-1");
     assert!(String::from_utf8_lossy(&encoded.bytes).contains("\"result\":\"allow\""));
 
     // A decision the upstream did not offer is refused rather than encoded.
-    let refused = instance
-        .encode_response(snapshot, "reboot".to_owned(), None)
-        .expect("encode runs")
-        .answer
-        .expect_err("an unoffered decision is refused");
+    let refused = declared(
+        instance.encode_response(snapshot, "reboot".to_owned(), None),
+        "an unoffered decision was encoded",
+    );
     assert!(
         kr_plugin_runtime::runtime::binding::fault_text(&refused)
             .contains("not one of the decisions")
@@ -461,38 +585,38 @@ fn kr_req_11_01_a_vendor_component_adds_detection_events_and_controls() {
     let Some(wasm) = components::well_behaved() else {
         return;
     };
-    let (_directory, mut instance) = bound(&wasm, "well-behaved");
+    let plugin = "well-behaved";
+    let (_directory, mut instance) = bound(&wasm, plugin);
 
     // Events: an observation produces presentation.
-    let observed = instance
-        .observe(components::scrape("se-1", "building project"))
-        .expect("observe runs");
+    let observed = instance.observe(components::scrape("se-1", "building project"));
     assert!(observed.answered());
     assert!(!observed.nodes.is_empty());
 
-    // Detection: a snapshot describes the bound execution the host matched.
-    let snapshot = instance.snapshot().expect("snapshot runs");
+    // Detection: the component describes the execution the host matched, reading the binding
+    // through its own import rather than being handed a conclusion. What it reports is the plugin
+    // identifier and the activity the host passed to `bind` and `upstream::state`.
+    let snapshot = instance.snapshot();
     assert!(snapshot.answered());
     let text = snapshot
         .nodes
         .iter()
         .map(|node| node.body_json.clone())
         .collect::<String>();
-    assert!(text.contains("kalareach/well-behaved"));
+    assert!(text.contains(&format!("kalareach/{plugin}")));
     assert!(text.contains("Running"), "the snapshot said {text}");
 
     // Controls: an invoked action becomes a plan naming an operation the broker performs.
-    let plan = instance
-        .prepare_action(
+    let plan = value(
+        instance.prepare_action(
             token("send-prompt"),
             vec![NamedArgument {
                 name: "prompt".to_owned(),
                 value: Argument::Text("run the tests".to_owned()),
             }],
-        )
-        .expect("prepare-action runs")
-        .answer
-        .expect("the action prepares");
+        ),
+        "the action prepares",
+    );
     assert_eq!(plan.class, EffectClass::UpstreamPrompt);
     let PreparedOperation::UpstreamMethod(call) = &plan.operation else {
         panic!("the plan proposed {:?}", plan.operation);
@@ -502,11 +626,10 @@ fn kr_req_11_01_a_vendor_component_adds_detection_events_and_controls() {
 
     // A plan can only name an operation the broker already performs. `present` is the one that
     // leaves the host entirely.
-    let plan = instance
-        .prepare_action(token("redraw"), Vec::new())
-        .expect("prepare-action runs")
-        .answer
-        .expect("the action prepares");
+    let plan = value(
+        instance.prepare_action(token("redraw"), Vec::new()),
+        "the action prepares",
+    );
     assert!(
         matches!(plan.operation, PreparedOperation::Present),
         "the plan proposed {:?}",
@@ -515,32 +638,27 @@ fn kr_req_11_01_a_vendor_component_adds_detection_events_and_controls() {
 
     // An action the manifest never registered is refused by the component, and would be refused by
     // the broker as well.
-    let refused = instance
-        .prepare_action(token("delete-everything"), Vec::new())
-        .expect("prepare-action runs")
-        .answer
-        .expect_err("an unregistered action is refused");
+    let refused = declared(
+        instance.prepare_action(token("delete-everything"), Vec::new()),
+        "an unregistered action prepared",
+    );
     assert!(kr_plugin_runtime::runtime::binding::fault_text(&refused).contains("refused"));
 
     // Checkpoint and restore round-trip the component's own presentation state.
-    let state = instance
-        .checkpoint()
-        .expect("checkpoint runs")
-        .answer
-        .expect("the component checkpoints");
+    let state = value(instance.checkpoint(), "the component checkpoints");
     assert!(!state.is_empty());
-    instance
-        .restore(state)
-        .expect("restore runs")
-        .answer
-        .expect("the component restores");
+    assert!(
+        instance.restore(state).answered(),
+        "the component did not restore"
+    );
 }
 
 // KR-REQ-11.02: the runtime carries no list of applications.
 #[test]
 fn kr_req_11_02_the_runtime_names_no_application() {
     // A core that had an exhaustive list of the applications it supports would have the names in
-    // it. The check is over the crate's own sources, because a list in a comment is a list.
+    // it. The check is over this crate's own sources, because a list in a comment is a list. It
+    // says nothing about the rest of core, which is each crate's own to keep.
     let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let mut files = Vec::new();
     collect_sources(&crate_root.join("src"), &mut files);
@@ -629,7 +747,7 @@ fn kr_req_11_41_compilation_is_cached_by_hash_and_engine() {
         .expect("the component compiles");
     assert_eq!(first.origin, CompileOrigin::Compiled);
 
-    // The same bytes under the same engine come back from the cache.
+    // The same bytes under the same engine come back rather than being compiled again.
     let second = compile_or_load(&engine, &cache, &wasm, CompileBudget::defaults())
         .expect("the component loads");
     assert_eq!(second.origin, CompileOrigin::Cached);
@@ -681,16 +799,15 @@ fn kr_req_11_41_a_downloaded_artefact_is_never_deserialised() {
         .expect("the component compiles");
     let artefact = std::fs::read(cache.artefact_path(&compiled.key)).expect("the artefact");
 
-    // A real serialised component, filed under a different component's digest: exactly what an
-    // attacker who could write into the cache would do, and what a "downloaded cache" would be.
+    // A real serialised component, filed under a different component's digest: which is what a
+    // downloaded native-code cache is, and what anything dropped into the directory is.
     let mut planted = compiled.key.clone();
     planted.wasm_digest = kr_plugin_sdk::digest::PayloadDigest::of(b"a component nobody compiled");
     planted.wasm_bytes = 27;
     kr_ipc::paths::write_owner_only_file(&cache.artefact_path(&planted), &artefact)
         .expect("the artefact");
-    assert_eq!(
-        cache.verify(&planted).expect("a lookup"),
-        None,
+    assert!(
+        cache.verify(&planted).expect("a lookup").is_none(),
         "an artefact with no manifest was treated as loadable"
     );
     assert!(
@@ -702,7 +819,7 @@ fn kr_req_11_41_a_downloaded_artefact_is_never_deserialised() {
     );
 
     // With a manifest copied from the genuine entry, the digest it records does not match the key
-    // the caller verified, and the entry is refused.
+    // the caller verified, and the entry is refused by name.
     let manifest = std::fs::read(cache.manifest_path(&compiled.key)).expect("the genuine manifest");
     kr_ipc::paths::write_owner_only_file(&cache.manifest_path(&planted), &manifest)
         .expect("the manifest");
@@ -713,16 +830,48 @@ fn kr_req_11_41_a_downloaded_artefact_is_never_deserialised() {
         error.to_string().contains("different wasm"),
         "the refusal was {error}"
     );
+
+    // And with the manifest rewritten to claim the planted key: every field made consistent, the
+    // artefact digest recomputed, the marker copied. That passes, and the module says so: every
+    // field of a manifest is one a writer of the directory can produce, so the manifest answers
+    // "which artefact is this" and not "who put it here".
+    let mut claimed: kr_plugin_runtime::runtime::cache::CacheManifest =
+        serde_json::from_slice(&manifest).expect("the manifest decodes");
+    claimed.wasm_digest = planted.wasm_digest;
+    claimed.wasm_bytes = planted.wasm_bytes;
+    kr_ipc::paths::write_owner_only_file(
+        &cache.manifest_path(&planted),
+        &serde_json::to_vec(&claimed).expect("a manifest"),
+    )
+    .expect("the manifest");
+    assert!(
+        cache.verify(&planted).expect("a lookup").is_some(),
+        "the rewritten manifest was refused for a reason that is not documented"
+    );
+
+    // What answers the second question is the directory. It is the owner's own, and a process that
+    // can write here runs as this user and can replace this host's executable, so the cache is not
+    // where that boundary is drawn.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let metadata = std::fs::metadata(cache.root()).expect("the cache directory");
+        assert_eq!(
+            metadata.permissions().mode() & 0o777,
+            0o700,
+            "the cache directory is not the owner's own"
+        );
+    }
 }
 
 // KR-REQ-11.41: a cold compile is not inside a call deadline, and does not count as a fault.
-#[test]
-fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
     let Some(wasm) = components::component("slow-compile") else {
         return;
     };
     let host = host();
-    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (events, mut received) = events();
 
     let compile_started = std::time::Instant::now();
     let compilation = host.runtime.compile(Arc::clone(&wasm)).expect("a compile");
@@ -734,7 +883,8 @@ fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
     );
 
     let compiled = compilation
-        .wait(core::time::Duration::from_secs(60))
+        .wait(COMPILE_WAIT)
+        .await
         .expect("the component compiles");
     let compile_elapsed = compiled.elapsed_ms;
     assert_eq!(compiled.origin, CompileOrigin::Compiled);
@@ -746,7 +896,13 @@ fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
 
     let handle = host
         .runtime
-        .instantiate(components::request("slow-compile", 4), &compiled, events)
+        .instantiate(
+            components::request("slow-compile", 4),
+            &compiled,
+            events,
+            COMPILE_WAIT,
+        )
+        .await
         .expect("the component instantiates");
 
     // The call budget starts now. An observation of a component that took `compile_elapsed`
@@ -754,7 +910,8 @@ fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
     // not part of it.
     let admission = handle.enqueue_observation(components::scrape("se-1", "x"));
     assert_eq!(admission, Admission::Queued);
-    let event = wait_for_event(&mut received, core::time::Duration::from_secs(5))
+    let event = next_event(&mut received, core::time::Duration::from_secs(5))
+        .await
         .expect("the observation produced something");
     match event {
         BindingEvent::Document { call, nodes } => {
@@ -772,12 +929,13 @@ fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
     // And the compile itself was not free, so the gap being crossed is a real one.
     eprintln!("the slow component compiled in {compile_elapsed} ms");
 
-    // A second preparation of the same component finds the artefact rather than compiling again.
+    // A second preparation of the same component finds it rather than compiling again.
     let cached = host
         .runtime
         .compile(wasm)
         .expect("a compile")
-        .wait(core::time::Duration::from_secs(60))
+        .wait(COMPILE_WAIT)
+        .await
         .expect("the component loads");
     assert_eq!(cached.origin, CompileOrigin::Cached);
     assert!(
@@ -787,59 +945,58 @@ fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
     );
 }
 
-fn wait_for_event(
-    received: &mut tokio::sync::mpsc::UnboundedReceiver<BindingEvent>,
-    within: core::time::Duration,
-) -> Option<BindingEvent> {
-    let deadline = std::time::Instant::now() + within;
-    loop {
-        match received.try_recv() {
-            Ok(event) => return Some(event),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
-                if std::time::Instant::now() >= deadline {
-                    return None;
-                }
-                std::thread::sleep(core::time::Duration::from_millis(2));
-            }
-            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => return None,
-        }
-    }
-}
-
 // KR-REQ-11.38: three faults within a minute disable the binding, with a named reason.
-#[test]
-fn kr_req_11_38_three_faults_in_a_minute_disable_the_binding() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_38_three_faults_in_a_minute_disable_the_binding() {
     let Some(wasm) = components::component("infinite-loop") else {
         return;
     };
     let host = host();
-    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (events, mut received) = events();
     let compiled = host
         .runtime
         .compile(wasm)
         .expect("a compile")
-        .wait(core::time::Duration::from_secs(60))
+        .wait(COMPILE_WAIT)
+        .await
         .expect("the component compiles");
     let handle = host
         .runtime
-        .instantiate(components::request("infinite-loop", 5), &compiled, events)
+        .instantiate(
+            components::request("infinite-loop", 5),
+            &compiled,
+            events,
+            COMPILE_WAIT,
+        )
+        .await
         .expect("the component instantiates");
 
-    for _ in 0..FAULTS_BEFORE_DISABLE {
-        handle.enqueue_observation(components::scrape("se-1", "x"));
+    for index in 0..FAULTS_BEFORE_DISABLE {
+        handle.enqueue_observation(components::scrape(&format!("se-{index}"), "x"));
     }
 
-    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(10);
+    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(30);
     let mut faults = 0;
     let mut disabled = None;
     while std::time::Instant::now() < deadline && disabled.is_none() {
-        match wait_for_event(&mut received, core::time::Duration::from_millis(500)) {
+        match next_event(&mut received, core::time::Duration::from_millis(500)).await {
             Some(BindingEvent::Fault { call, detail, .. }) => {
-                assert_eq!(call, CallKind::Observe);
-                assert!(detail.contains("deadline"), "the fault was {detail}");
+                // Every call this component makes runs out of something, including the snapshot it
+                // owes after the first fault. Which bound stops it is the machine's business: a
+                // loaded one delivers the epoch late and the fuel ceiling catches the call
+                // instead, and both are correct. What must be true is that the bound is named.
+                assert!(
+                    matches!(call, CallKind::Observe | CallKind::Snapshot),
+                    "the fault was in {call:?}"
+                );
+                assert!(
+                    detail.contains("deadline") || detail.contains("fuel"),
+                    "the fault was {detail}"
+                );
                 faults += 1;
             }
             Some(BindingEvent::Disabled { reason }) => disabled = Some(reason),
+            Some(BindingEvent::Gap(_) | BindingEvent::PresentationDropped { .. }) => {}
             Some(other) => panic!("the binding produced {other:?}"),
             None => {}
         }
@@ -857,32 +1014,37 @@ fn kr_req_11_38_three_faults_in_a_minute_disable_the_binding() {
     assert_eq!(handle.disabled_reason().as_deref(), Some(reason.as_str()));
 
     // A disabled binding runs nothing more, and says why rather than failing silently.
-    let error = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()
-        .expect("a runtime")
-        .block_on(handle.snapshot(core::time::Duration::from_millis(500)))
+    let error = handle
+        .snapshot(core::time::Duration::from_millis(500))
+        .await
         .expect_err("a disabled binding accepts no calls");
     assert!(matches!(error, RuntimeError::Disabled { .. }));
 }
 
 // KR-REQ-11.38: the 4 MiB observation queue, its explicit gap and the fresh snapshot that follows.
-#[test]
-fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
     let Some(wasm) = components::well_behaved() else {
         return;
     };
     let host = host();
-    let (events, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let (events, mut received) = events();
     let compiled = host
         .runtime
         .compile(wasm)
         .expect("a compile")
-        .wait(core::time::Duration::from_secs(60))
+        .wait(COMPILE_WAIT)
+        .await
         .expect("the component compiles");
     let handle = host
         .runtime
-        .instantiate(components::request("well-behaved", 6), &compiled, events)
+        .instantiate(
+            components::request("well-behaved", 6),
+            &compiled,
+            events,
+            COMPILE_WAIT,
+        )
+        .await
         .expect("the component instantiates");
 
     // Filling the queue faster than the component drains it. Each event is 64 KiB, so sixty-five
@@ -908,16 +1070,17 @@ fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
     );
 
     // The gap is reported, and a snapshot follows it.
-    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(20);
+    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(30);
     let mut saw_gap = false;
     let mut saw_snapshot = false;
     while std::time::Instant::now() < deadline && !(saw_gap && saw_snapshot) {
-        match wait_for_event(&mut received, core::time::Duration::from_millis(500)) {
+        match next_event(&mut received, core::time::Duration::from_millis(500)).await {
             Some(BindingEvent::Gap(gap)) => {
                 assert!(gap.events > 0);
                 assert!(gap.bytes > 0);
                 saw_gap = true;
             }
+            Some(BindingEvent::PresentationDropped { .. }) => {}
             Some(BindingEvent::Document { call, .. }) => {
                 if call == CallKind::Snapshot && saw_gap {
                     saw_snapshot = true;
@@ -935,26 +1098,42 @@ fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
 }
 
 // KR-REQ-06.06: which plugin, which bytes and which generation, together.
-#[test]
-fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() {
     let Some(wasm) = components::well_behaved() else {
         return;
     };
     let host = host();
-    let (events, _received) = tokio::sync::mpsc::unbounded_channel();
+    let (first_events, _first_received) = events();
     let compiled = host
         .runtime
         .compile(Arc::clone(&wasm))
         .expect("a compile")
-        .wait(core::time::Duration::from_secs(60))
+        .wait(COMPILE_WAIT)
+        .await
         .expect("the component compiles");
 
     let request = components::request("well-behaved", 7);
     let handle = host
         .runtime
-        .instantiate(request.clone(), &compiled, events.clone())
+        .instantiate(request.clone(), &compiled, first_events, COMPILE_WAIT)
+        .await
         .expect("the component instantiates");
     assert_eq!(handle.identity(), &request.identity);
+    assert_eq!(host.runtime.live_bindings(), 1);
+
+    // One binding, one instance. A second registration under the same identifier is refused rather
+    // than silently replacing an instance nothing could then reach or stop.
+    let (other_events, _other_received) = events();
+    let error = host
+        .runtime
+        .instantiate(request.clone(), &compiled, other_events, COMPILE_WAIT)
+        .await
+        .expect_err("a binding that is already live is refused");
+    assert!(
+        error.to_string().contains("already live"),
+        "the refusal was {error}"
+    );
     assert_eq!(host.runtime.live_bindings(), 1);
 
     // An upgrade under the same identifier is a different identity, so it cannot be mistaken for
@@ -966,6 +1145,20 @@ fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() {
         kr_plugin_sdk::version::PackageVersion::parse("1.1.0").expect("a version");
     assert!(!request.identity.is_same_binding_target(&upgraded.identity));
     assert!(request.identity.is_other_build_of(&upgraded.identity));
+
+    // And it binds under its own identifier, beside the first: an upgrade is a new binding rather
+    // than a mutation of a live one.
+    let mut second = upgraded.clone();
+    second.binding_id = kr_plugin_runtime::service::client::new_binding_id();
+    let (second_events, _second_received) = events();
+    let upgraded_handle = host
+        .runtime
+        .instantiate(second.clone(), &compiled, second_events, COMPILE_WAIT)
+        .await
+        .expect("the upgraded package binds under its own identifier");
+    assert_eq!(upgraded_handle.identity(), &second.identity);
+    assert_ne!(upgraded_handle.identity(), handle.identity());
+    assert_eq!(host.runtime.live_bindings(), 2);
 
     // The same bytes through a later catalogue generation are the same code, and still a distinct
     // record of which generation admitted them.
@@ -987,7 +1180,112 @@ fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() {
     assert_eq!(facts.plugin_id, request.identity.plugin_id.as_str());
 
     assert!(host.runtime.unbind(request.binding_id));
+    assert!(host.runtime.unbind(second.binding_id));
     assert_eq!(host.runtime.live_bindings(), 0);
+}
+
+// KR-REQ-11.41: a component this process compiled is served from memory, with no file involved.
+#[test]
+fn a_component_this_process_compiled_is_served_from_memory() {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let engine = engine();
+    let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(
+        directory.path().join("plugin-cache"),
+    )
+    .expect("a cache");
+
+    let first = compile_or_load(&engine, &cache, &wasm, CompileBudget::defaults())
+        .expect("the component compiles");
+    assert_eq!(first.origin, CompileOrigin::Compiled);
+    assert_eq!(cache.resident(), 1);
+    assert!(cache.resident_component(&first.key).is_some());
+
+    // Removing the files leaves the one in memory, which is the one this process produced: no
+    // question of provenance arises for it, because no file is read.
+    std::fs::remove_file(cache.artefact_path(&first.key)).expect("the artefact is removed");
+    std::fs::remove_file(cache.manifest_path(&first.key)).expect("the manifest is removed");
+    let second = compile_or_load(&engine, &cache, &wasm, CompileBudget::defaults())
+        .expect("the component loads");
+    assert_eq!(second.origin, CompileOrigin::Cached);
+
+    // Removing the entry removes the one in memory too, so a later load is a real miss.
+    cache.remove(&first.key).expect("the entry is removed");
+    assert_eq!(cache.resident(), 0);
+    let third = compile_or_load(&engine, &cache, &wasm, CompileBudget::defaults())
+        .expect("the component compiles again");
+    assert_eq!(third.origin, CompileOrigin::Compiled);
+}
+
+// A replaced instance is told what the host holds now, not what it held when the binding was made.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_after_a_fault_is_bound_to_the_current_revision() {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let engine = engine();
+    let cache = kr_plugin_runtime::runtime::cache::CompiledCache::open(
+        directory.path().join("plugin-cache"),
+    )
+    .expect("a cache");
+    let compiled = compile_or_load(&engine, &cache, &wasm, CompileBudget::defaults())
+        .expect("the component compiles");
+    let mut instance = Instance::new(
+        &engine,
+        &compiled.component,
+        components::facts("well-behaved"),
+        InstanceLimiter::defaults(),
+        kr_plugin_runtime::runtime::budget::FUEL_PER_DEADLINE_MS,
+    )
+    .expect("the component instantiates");
+    let target = kr_plugin_runtime::runtime::bindings::Binding {
+        plugin_id: "kalareach/well-behaved".to_owned(),
+        binding_revision: 3,
+        executable: "/usr/local/bin/example-agent".to_owned(),
+    };
+    assert!(instance.bind(target).answered());
+
+    // The binding moves on, and an attachment arrives.
+    let mut facts = components::facts("well-behaved");
+    facts.binding_revision = 11;
+    facts.activity = kr_plugin_runtime::runtime::host::BindingActivity::AwaitingPerson;
+    instance.set_binding_facts(facts);
+    instance.set_attachments(vec![kr_plugin_runtime::runtime::host::AttachmentFact {
+        attachment_id: "a-1".to_owned(),
+        name: "diagram.png".to_owned(),
+        media_type: "image/png".to_owned(),
+        size_bytes: 4096,
+        completed_at_ms: 9,
+    }]);
+
+    // A replacement is bound to the revision the host holds now, and keeps the attachment. A
+    // replacement given the original facts would present one execution's state against another's.
+    let nodes = instance.replace().expect("the replacement binds");
+    assert_eq!(instance.replacements(), 1);
+    assert_eq!(instance.facts().binding_revision, 11);
+    assert_eq!(instance.attachments().len(), 1);
+    let text = nodes
+        .iter()
+        .map(|node| node.body_json.clone())
+        .collect::<String>();
+    assert!(
+        text.contains("revision 11"),
+        "the replacement was bound to {text}"
+    );
+
+    // And it still sees the attachment and the new activity.
+    let snapshot = instance.snapshot();
+    assert!(snapshot.answered());
+    let text = snapshot
+        .nodes
+        .iter()
+        .map(|node| node.body_json.clone())
+        .collect::<String>();
+    assert!(text.contains("1 attachments"), "the snapshot said {text}");
+    assert!(text.contains("AwaitingPerson"), "the snapshot said {text}");
 }
 
 // The bounds a component runs under are the SDK's, not this crate's own numbers.

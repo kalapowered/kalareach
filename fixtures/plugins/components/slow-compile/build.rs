@@ -11,7 +11,12 @@ use std::fmt::Write as _;
 /// Each one is a short chain of arithmetic whose seed passes through `black_box`, so the optimiser
 /// cannot fold the chain into a constant and delete it. Together they are a few hundred kilobytes
 /// of Wasm and enough work to make a cold compile visible against a 10 ms deadline.
-const FUNCTIONS: usize = 4_000;
+///
+/// Sized so that the compile is seconds rather than milliseconds, and seconds rather than a
+/// minute: the tests run against a host built without optimisation, where the compiler is an order
+/// of magnitude slower than in a release build, and a fixture that took a minute there would be
+/// testing the compilation budget rather than the gap between a compile and a call deadline.
+const FUNCTIONS: usize = 1_000;
 
 /// How many arithmetic steps each function performs.
 const STEPS: usize = 24;

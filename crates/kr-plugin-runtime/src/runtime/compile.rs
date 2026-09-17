@@ -17,10 +17,15 @@
 //!   Machine code is a multiple of its input, so bounding the input is what bounds the memory a
 //!   compile can take.
 //! * **Time.** A compile that finishes outside [`CompileBudget::deadline_ms`] has its result
-//!   discarded and reports how long it took. Cranelift cannot be interrupted part way, so the
-//!   budget is enforced where it can be: the result of an over-budget compile is not used and not
-//!   cached, and the caller is told the figure rather than given a component that took too long to
-//!   produce.
+//!   discarded and reports how long it took. Cranelift cannot be interrupted part way, so this is
+//!   a threshold on accepting a result rather than a cap on the work: an over-budget compile is
+//!   not used and not cached, and the caller is told the figure. What bounds the resources already
+//!   spent is the size bound above and the pool below.
+//!
+//! The caller has a deadline of its own on top of both, and it is the one that matters to anything
+//! waiting: [`crate::runtime::binding::Runtime::prepare`] bounds the whole preparation -- the
+//! compile, the instantiation and `bind` -- and answers when that runs out, whatever the pool is
+//! still doing.
 //!
 //! The pool itself is the third bound. It has a fixed number of threads and a bounded queue, so a
 //! host that is asked to prepare a hundred bindings at once compiles a few at a time and refuses
@@ -34,13 +39,14 @@
 //!
 //! | Platform | What a pool thread does |
 //! | --- | --- |
-//! | macOS | joins the background quality-of-service class |
+//! | Apple and other Unix | takes the lowest priority its scheduling policy allows, through `pthread_setschedparam` |
 //! | Linux | takes the lowest niceness the thread scheduler allows |
 //! | Windows | takes the lowest thread priority |
 //!
 //! A platform that refuses is not a failure: the compile still runs off the hot path, which is the
 //! property that matters, and [`CompilePool::background_priority`] reports what was achieved
-//! rather than what was asked for.
+//! rather than what was asked for. Lowering a thread's priority is best effort on every one of
+//! them, so nothing here depends on it having worked.
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -217,7 +223,7 @@ impl CompilePool {
         cache: &CompiledCache,
         wasm: Arc<[u8]>,
         budget: CompileBudget,
-    ) -> RuntimeResult<mpsc::Receiver<RuntimeResult<Compiled>>> {
+    ) -> RuntimeResult<tokio::sync::oneshot::Receiver<RuntimeResult<Compiled>>> {
         let bytes = wasm.len() as u64;
         if bytes > budget.max_bytes {
             return Err(RuntimeError::ComponentTooLarge {
@@ -225,7 +231,9 @@ impl CompilePool {
                 limit: budget.max_bytes,
             });
         }
-        let (answer, wait) = mpsc::channel();
+        // A channel a caller can await rather than block on, so nothing that is waiting for a
+        // compile is holding a thread while it waits.
+        let (answer, wait) = tokio::sync::oneshot::channel();
         let engine = engine.clone();
         let cache = cache.clone();
         let job = Job(Box::new(move || {
@@ -288,10 +296,19 @@ pub fn compile_or_load(
     match cache.load(engine.engine(), &key) {
         Ok(Some(component)) => {
             imports::check(&component, engine.engine())?;
+            let elapsed_ms = elapsed_ms(started);
+            // The budget covers obtaining a component, not only compiling one. A load that took
+            // longer than a compile is allowed to take is a load this host does not accept either.
+            if elapsed_ms > budget.deadline_ms {
+                return Err(RuntimeError::CompilationTooSlow {
+                    elapsed_ms,
+                    budget_ms: budget.deadline_ms,
+                });
+            }
             return Ok(Compiled {
                 component,
                 origin: CompileOrigin::Cached,
-                elapsed_ms: elapsed_ms(started),
+                elapsed_ms,
                 key,
             });
         }
@@ -321,7 +338,8 @@ pub fn compile_or_load(
     }
     imports::check(&component, engine.engine())?;
     // Filing the artefact is a convenience for the next preparation, and a failure to file it is
-    // not a failure to prepare this binding.
+    // not a failure to prepare this binding. It also keeps the component in this process's memory,
+    // so a second binding of the same package neither compiles nor reads a file.
     let _ = cache.store(&key, &component);
     Ok(Compiled {
         component,

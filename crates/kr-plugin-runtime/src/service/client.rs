@@ -47,6 +47,14 @@ use crate::service::protocol::{
 /// told so and carries on; nothing on the terminal path is behind this.
 pub const DEFAULT_DEADLINE: core::time::Duration = core::time::Duration::from_secs(5);
 
+/// How long a worker waits for a registration.
+///
+/// A registration contains a compile, so it is the one request that can legitimately take seconds.
+/// It is deliberately longer than the host's own registration deadline: a client that gave up
+/// first would report its own patience as the host's failure.
+pub const REGISTER_DEADLINE: core::time::Duration =
+    core::time::Duration::from_millis(crate::runtime::compile::COMPILE_DEADLINE_MS + 5_000);
+
 /// One request's answer, on its way back to whoever asked.
 type Answer = oneshot::Sender<ResponseBody>;
 
@@ -172,15 +180,16 @@ impl PluginClient {
         component: &ComponentSource,
     ) -> RuntimeResult<Registration> {
         let body = self
-            .request(RequestBody::RegisterBinding(Box::new(
-                BindingRegistration {
+            .request_within(
+                RequestBody::RegisterBinding(Box::new(BindingRegistration {
                     binding_id: binding_id.get(),
                     identity: identity.clone(),
                     facts: wire_facts(facts),
                     executable: executable.to_owned(),
                     component: component.clone(),
-                },
-            )))
+                })),
+                REGISTER_DEADLINE,
+            )
             .await?;
         match body {
             ResponseBody::Registered { origin, elapsed_ms } => Ok(Registration {
@@ -356,6 +365,14 @@ impl PluginClient {
     }
 
     async fn request(&self, body: RequestBody) -> RuntimeResult<ResponseBody> {
+        self.request_within(body, DEFAULT_DEADLINE).await
+    }
+
+    async fn request_within(
+        &self,
+        body: RequestBody,
+        deadline: core::time::Duration,
+    ) -> RuntimeResult<ResponseBody> {
         let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (answer, reply) = oneshot::channel();
         self.waiting.lock().await.push((request_id, answer));
@@ -368,7 +385,7 @@ impl PluginClient {
                     detail: error.to_string(),
                 })?;
         }
-        match tokio::time::timeout(DEFAULT_DEADLINE, reply).await {
+        match tokio::time::timeout(deadline, reply).await {
             Ok(Ok(body)) => Ok(body),
             // The reader task dropped the sender, which means the connection is gone.
             Ok(Err(_)) => Err(RuntimeError::ServiceUnavailable {
@@ -380,7 +397,7 @@ impl PluginClient {
                     .await
                     .retain(|(waiting, _answer)| *waiting != request_id);
                 Err(RuntimeError::CallerDeadline {
-                    deadline_ms: millis(DEFAULT_DEADLINE),
+                    deadline_ms: millis(deadline),
                 })
             }
         }
@@ -495,6 +512,12 @@ mod tests {
     fn a_deadline_is_carried_in_whole_milliseconds() {
         assert_eq!(millis(core::time::Duration::from_millis(250)), 250);
         assert_eq!(millis(DEFAULT_DEADLINE), 5_000);
+    }
+
+    #[test]
+    fn a_registration_is_given_longer_than_the_host_gives_itself() {
+        // A client that gave up first would report its own patience as the host's failure.
+        assert!(REGISTER_DEADLINE > crate::service::host::REGISTER_DEADLINE);
     }
 
     #[test]

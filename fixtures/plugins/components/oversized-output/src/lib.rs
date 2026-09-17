@@ -1,10 +1,12 @@
-//! A component that emits more than one call may produce.
+//! A component that produces more than one call may produce.
 //!
-//! It ignores `remaining-output-bytes` and keeps emitting. The host refuses the node that would
-//! take the call past 1 MiB, tells the component so, and records the call as a fault: a component
-//! that tried to exceed a stated bound has misbehaved rather than answered. The nodes it emitted
-//! before that are kept, because a presentation a person is entitled to see does not disappear
-//! because of what came after it.
+//! Two ways, because a host might bound one and not the other. `observe` and `snapshot` ignore
+//! `remaining-output-bytes` and keep emitting nodes; `checkpoint` returns more state than one call
+//! may produce. Both are refused: the output budget is one budget over everything a call produces,
+//! and a component that tried to exceed a stated bound has misbehaved rather than answered.
+//!
+//! The nodes emitted before the refusal are kept, because a presentation a person is entitled to
+//! see does not disappear because of what came after it.
 
 #![no_std]
 #![no_main]
@@ -88,7 +90,12 @@ impl Guest for Component {
     }
 
     fn checkpoint() -> Result<Vec<u8>, Fault> {
-        Ok(Vec::new())
+        // More state than one call may produce, returned rather than emitted. A host that bounded
+        // only the document would carry it: the output budget is one budget over everything a call
+        // produces, so this is refused the same way a flood of nodes is. A little over rather than
+        // far over, because the point is the bound and not how long a component can spend
+        // allocating.
+        Ok(alloc::vec![0_u8; 1024 * 1024 + 64 * 1024])
     }
 
     fn restore(_state: Vec<u8>) -> Result<(), Fault> {

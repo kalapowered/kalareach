@@ -29,9 +29,15 @@ use kr_plugin_sdk::limits::{
 /// ceiling on how much work one call can ever do, and it holds even when the epoch thread is
 /// delayed by a loaded machine and the deadline arrives late.
 ///
-/// Set it lower and fuel starts stopping calls that are inside their deadline, which reports a
-/// work bound as though it were a time bound. Changing it changes how much work a call may do, and
-/// nothing about how long it may take.
+/// The figure is measured rather than guessed. On this project's own fixtures, a tight loop in a
+/// compiled component consumes somewhere between 2 million and 1000 million fuel units in the 10 ms
+/// an observation is allowed: 2 million per millisecond had fuel stopping calls that were inside
+/// their deadline, and 20 million per millisecond had the two bounds close enough that which one
+/// fired depended on how busy the machine was. At 100 million per millisecond the deadline is
+/// reliably what stops an ordinary slow call, and the ceiling is still about an order of magnitude
+/// away rather than unreachable.
+///
+/// Changing it changes how much work a call may do, and nothing about how long it may take.
 pub const FUEL_PER_DEADLINE_MS: u64 = 100_000_000;
 
 /// The work allowance instantiation and `bind` run under.

@@ -30,7 +30,9 @@ use kr_protocol::frame::StreamKind;
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Uuid;
 
-use crate::runtime::binding::{BindingEvent, BindingId, BindingRequest, Runtime, RuntimeConfig};
+use crate::runtime::binding::{
+    BindingEvent, BindingId, BindingRequest, DEFAULT_EVENT_QUEUE, Runtime, RuntimeConfig,
+};
 use crate::runtime::budget::CallKind;
 use crate::runtime::compile::CompileOrigin;
 use crate::runtime::error::RuntimeError;
@@ -42,12 +44,14 @@ use crate::service::protocol::{
     RequestBody, ResponseBody, WireFacts, WireNode, WireSourceEvent,
 };
 
-/// How long a registration's compilation may keep a worker waiting.
+/// How long a registration may keep a worker waiting.
 ///
-/// The compile itself is bounded by the compilation budget. This is the caller-visible half: a
-/// worker that has waited this long is told so and can carry on, and the compile continues and
-/// files its result, so the next registration of the same component is quick.
-pub const REGISTER_DEADLINE: core::time::Duration = core::time::Duration::from_secs(10);
+/// The compilation budget is what bounds the compile, and this is the same figure: a host that
+/// accepted a compile of up to that long has to be willing to wait for one. The worker's own
+/// deadline is a little longer again, so the answer a worker gets is the host's own rather than
+/// its patience running out first.
+pub const REGISTER_DEADLINE: core::time::Duration =
+    core::time::Duration::from_millis(crate::runtime::compile::COMPILE_DEADLINE_MS);
 
 /// What the plugin host was started with.
 #[derive(Clone, Debug)]
@@ -228,8 +232,8 @@ impl PluginHost {
     fn forward_notices(
         binding_id: BindingId,
         notices: tokio::sync::mpsc::UnboundedSender<Notice>,
-    ) -> tokio::sync::mpsc::UnboundedSender<BindingEvent> {
-        let (events, mut pending) = tokio::sync::mpsc::unbounded_channel::<BindingEvent>();
+    ) -> tokio::sync::mpsc::Sender<BindingEvent> {
+        let (events, mut pending) = tokio::sync::mpsc::channel::<BindingEvent>(DEFAULT_EVENT_QUEUE);
         tokio::spawn(async move {
             while let Some(event) = pending.recv().await {
                 if notices.send(notice_of(binding_id, event)).is_err() {
@@ -290,6 +294,7 @@ impl PluginHost {
                     .compile(wasm)
                     .map_err(|error| (name.clone(), error.to_string(), false))?
                     .wait(REGISTER_DEADLINE)
+                    .await
                     .map_err(|error| (name.clone(), error.to_string(), false))?;
                 let binding = BindingId::new(binding_id);
                 let request = BindingRequest {
@@ -300,7 +305,8 @@ impl PluginHost {
                 };
                 let events = Self::forward_notices(binding, notices.clone());
                 self.runtime
-                    .instantiate(request, &compiled, events)
+                    .instantiate(request, &compiled, events, REGISTER_DEADLINE)
+                    .await
                     .map_err(|error| (name, error.to_string(), false))?;
                 bindings.lock().await.push(binding);
                 Ok(ResponseBody::Registered {
@@ -527,6 +533,15 @@ fn notice_of(binding_id: BindingId, event: BindingEvent) -> Notice {
             binding_id,
             events: gap.events,
             bytes: gap.bytes,
+        },
+        // A dropped presentation is a gap in what the worker has seen rather than in what the
+        // component has: no event was lost, and the component is rebuilding its document. The
+        // worker is told by the same notice, with no events named, so it knows to expect a fresh
+        // document rather than a continuation.
+        BindingEvent::PresentationDropped { documents } => Notice::Gap {
+            binding_id,
+            events: 0,
+            bytes: u64::from(documents),
         },
         BindingEvent::Fault {
             call,

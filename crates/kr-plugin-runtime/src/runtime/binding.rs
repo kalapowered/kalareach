@@ -4,6 +4,9 @@
 //! own, because a component call is a blocking call into machine code and a store is a single
 //! thread's object. That thread is also the whole of what a slow component can hold up.
 //!
+//! Everything that runs a component runs on that thread: instantiation, `bind`, every call and
+//! every replacement after a fault. Nothing that runs a component runs on a caller's thread.
+//!
 //! # What never waits
 //!
 //! [`BindingHandle::enqueue_observation`] pushes onto the bounded queue and returns. It takes no
@@ -12,9 +15,13 @@
 //! presentation queues never wait for an observation callback: a caller on the terminal path has
 //! no way to end up behind a component even if it tries.
 //!
-//! Everything that does run a component is asynchronous and carries the caller's own deadline. A
-//! caller that stops waiting gets [`crate::RuntimeError::CallerDeadline`] and carries on; the
-//! component's own bounds still apply on its thread.
+//! Everything else is asynchronous and carries the caller's own deadline, including preparing the
+//! binding in the first place. A caller that stops waiting gets [`crate::RuntimeError::CallerDeadline`]
+//! and carries on; the component's own bounds still apply on its thread.
+//!
+//! [`BindingHandle::stop`] is the one exception, and it blocks on purpose: it is how a caller makes
+//! sure the thread is gone before it drops what the thread was using. A call already inside the
+//! component finishes first, and every call is bounded, so the wait is bounded too.
 //!
 //! # No instance for an idle shell
 //!
@@ -22,6 +29,16 @@
 //! compilation pool. It has no store, no instance, no binding thread and no epoch ticks. The first
 //! instance appears when a broker prepares a binding, which is when an application that uses one
 //! has actually been matched.
+//!
+//! # What bounds what
+//!
+//! | Thing | What bounds it |
+//! | --- | --- |
+//! | observations waiting for the component | the 4 MiB queue, which evicts and reports a gap |
+//! | the binding's command channel | what can enter it: observations go in the queue rather than the channel, and the pump is woken once rather than once per event; every other command is one caller's own request, with a payload the protocol has bounded at a frame and a deadline after which its caller has stopped waiting |
+//! | events waiting for the caller | a bounded channel; an overflow drops the presentation, says so, and asks the component to rebuild its document |
+//! | one call's output | 1 MiB over the document and the returned value together |
+//! | one instance's memory | 64 MiB across every linear memory it has |
 //!
 //! # What a plugin-host crash costs
 //!
@@ -32,6 +49,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -50,7 +68,7 @@ use crate::runtime::engine::RuntimeEngine;
 use crate::runtime::error::{RuntimeError, RuntimeResult};
 use crate::runtime::faults::{FaultCounter, FaultVerdict};
 use crate::runtime::host::{AttachmentFact, BindingFacts, EmittedNode, ScopedSourceEvent};
-use crate::runtime::instance::{CallOutcome, Instance};
+use crate::runtime::instance::{CallOutcome, Instance, OutputSize};
 use crate::runtime::limits::InstanceLimiter;
 use crate::runtime::queue::{Admission, ObservationGap, ObservationQueue};
 
@@ -60,6 +78,17 @@ use crate::runtime::queue::{Admission, ObservationGap, ObservationQueue};
 /// a person is waiting on. Sixteen is enough that the per-pass overhead is negligible and few
 /// enough that an interactive call is never far behind.
 const PUMP_BATCH: usize = 16;
+
+/// How many events a caller may be behind before presentations start being dropped.
+///
+/// A caller that stops reading must not be able to make this host grow without bound, and a
+/// component must not be blocked because a socket is slow. So the channel is bounded, and an
+/// overflow drops the presentation, says so, and asks the component to rebuild its document: the
+/// same answer a lost observation gets, for the same reason.
+pub const DEFAULT_EVENT_QUEUE: usize = 256;
+
+/// How long preparing a binding may take before the caller is told it has not finished.
+pub const DEFAULT_PREPARE_DEADLINE: core::time::Duration = core::time::Duration::from_secs(10);
 
 /// The identifier of one binding.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -93,7 +122,9 @@ pub struct BindingRequest {
     /// Which package, which bytes and which catalogue generation.
     ///
     /// All three, because an identifier alone would let an installed update turn an existing
-    /// binding into a different version.
+    /// binding into a different version. What this runtime does with the identity is record it and
+    /// report it: whether the package these bytes came from was verified against that hash is the
+    /// caller's to establish before it gets here.
     pub identity: PluginIdentity,
     /// The facts the component may read about the binding.
     pub facts: BindingFacts,
@@ -113,6 +144,11 @@ pub enum BindingEvent {
     },
     /// The observation stream has a gap, and a fresh snapshot follows.
     Gap(ObservationGap),
+    /// Documents were dropped because the caller was too far behind, and a fresh snapshot follows.
+    PresentationDropped {
+        /// How many documents went.
+        documents: u32,
+    },
     /// A call failed, and the binding survived it.
     Fault {
         /// Which export failed.
@@ -259,79 +295,93 @@ impl Runtime {
         Ok(Compilation { wait })
     }
 
-    /// Instantiates a compiled component and calls `bind`.
+    /// Instantiates a compiled component, calls `bind`, and starts the binding's thread.
     ///
-    /// The call budgets in [`crate::runtime::budget`] start after this returns, which is what
-    /// section 11 means by starting a call budget only once the instance is ready.
+    /// The instantiation and `bind` run on that thread rather than this one, and this call waits
+    /// for them with the caller's own deadline. The call budgets in [`crate::runtime::budget`]
+    /// start after they have finished, which is what section 11 means by starting a call budget
+    /// only once the instance is ready.
     ///
     /// # Errors
     ///
-    /// Returns [`RuntimeError::Instantiation`] when the instance cannot be created, or the failure
-    /// `bind` produced.
-    pub fn instantiate(
+    /// Returns [`RuntimeError::Instantiation`] when the thread cannot start or the instance cannot
+    /// be created or bound, [`RuntimeError::CallerDeadline`] when it has not finished by the
+    /// deadline, and [`RuntimeError::NoSuchBinding`]'s opposite -- a refusal naming the binding --
+    /// when that binding is already live.
+    pub async fn instantiate(
         &self,
         request: BindingRequest,
         compiled: &Compiled,
-        events: tokio::sync::mpsc::UnboundedSender<BindingEvent>,
+        events: tokio::sync::mpsc::Sender<BindingEvent>,
+        within: core::time::Duration,
     ) -> RuntimeResult<Arc<BindingHandle>> {
-        let target = WireBinding {
-            plugin_id: request.identity.plugin_id.as_str().to_owned(),
-            binding_revision: request.facts.binding_revision,
-            executable: request.executable.clone(),
-        };
-        let mut instance = Instance::new(
-            &self.engine,
-            &compiled.component,
-            request.facts.clone(),
-            InstanceLimiter::defaults(),
-            self.config.fuel_rate,
-        )?;
-        let bound = instance.bind(target)?;
-        if let Err(fault) = bound.answer {
+        let binding_id = request.binding_id;
+        // One binding, one instance. Replacing a live binding silently would leave an instance
+        // running that nothing could reach and nothing would stop.
+        if self.binding(binding_id).is_some() {
             return Err(RuntimeError::Instantiation {
-                detail: format!("bind declared a fault: {}", fault_text(&fault)),
+                detail: format!("binding {binding_id} is already live"),
             });
         }
 
         let handle = BindingHandle::start(
-            request.clone(),
-            instance,
+            request,
+            &self.engine,
+            &compiled.component,
+            self.config.fuel_rate,
             FaultCounter::new(Arc::clone(&self.config.clock)),
             events,
-        );
+        )?;
         let handle = Arc::new(handle);
+        match handle.ready(within).await {
+            Ok(()) => {}
+            Err(error) => {
+                handle.stop();
+                return Err(error);
+            }
+        }
         if let Ok(mut bindings) = self.bindings.lock() {
-            bindings.insert(request.binding_id, Arc::clone(&handle));
+            bindings.insert(binding_id, Arc::clone(&handle));
         }
         Ok(handle)
     }
 
     /// Prepares a binding: compile, instantiate, `bind`.
     ///
-    /// This is the convenience that does all three in order and waits for the compile. It is the
-    /// shape a broker wants when it has somewhere to await; the three steps are separate above for
-    /// when it does not.
+    /// All three inside one caller deadline, because all three are what a caller is waiting for.
+    /// A caller that runs out of patience loses nothing: the compile continues on its pool thread
+    /// and files its result, so the next preparation of the same component is quick.
     ///
     /// # Errors
     ///
     /// Returns the compilation, instantiation or `bind` failure, or
-    /// [`RuntimeError::CallerDeadline`] when the compile does not finish inside `deadline`.
-    pub fn prepare(
+    /// [`RuntimeError::CallerDeadline`] when the whole preparation does not finish inside
+    /// `deadline`.
+    pub async fn prepare(
         &self,
         request: BindingRequest,
         wasm: Arc<[u8]>,
         deadline: core::time::Duration,
-        events: tokio::sync::mpsc::UnboundedSender<BindingEvent>,
+        events: tokio::sync::mpsc::Sender<BindingEvent>,
     ) -> RuntimeResult<Arc<BindingHandle>> {
+        let started = std::time::Instant::now();
         let compilation = self.compile(wasm)?;
-        let compiled = compilation.wait(deadline)?;
-        self.instantiate(request, &compiled, events)
+        let compiled = compilation.wait(deadline).await?;
+        let remaining =
+            deadline
+                .checked_sub(started.elapsed())
+                .ok_or(RuntimeError::CallerDeadline {
+                    deadline_ms: millis(deadline),
+                })?;
+        self.instantiate(request, &compiled, events, remaining)
+            .await
     }
 
     /// Removes a binding and stops its thread.
     ///
-    /// The component's own state goes with it. Nothing a decision depends on was in there: pending
-    /// and dispatch state is the worker broker's.
+    /// Blocks until the thread is gone, so a caller knows the instance is no longer running when
+    /// this returns. The component's own state goes with it; nothing a decision depends on was in
+    /// there, because pending and dispatch state is the worker broker's.
     pub fn unbind(&self, binding_id: BindingId) -> bool {
         let handle = self
             .bindings
@@ -347,7 +397,7 @@ impl Runtime {
         }
     }
 
-    /// Removes every binding and stops every thread.
+    /// Removes every binding and stops every thread. Blocks, as [`Self::unbind`] does.
     pub fn unbind_all(&self) {
         let handles: Vec<Arc<BindingHandle>> = self
             .bindings
@@ -369,7 +419,7 @@ impl Drop for Runtime {
 /// A compilation that is under way.
 #[derive(Debug)]
 pub struct Compilation {
-    wait: mpsc::Receiver<RuntimeResult<Compiled>>,
+    wait: tokio::sync::oneshot::Receiver<RuntimeResult<Compiled>>,
 }
 
 impl Compilation {
@@ -382,15 +432,14 @@ impl Compilation {
     ///
     /// Returns the compilation failure, or [`RuntimeError::CallerDeadline`] when it has not
     /// finished by the deadline.
-    pub fn wait(self, deadline: core::time::Duration) -> RuntimeResult<Compiled> {
-        match self.wait.recv_timeout(deadline) {
-            Ok(outcome) => outcome,
-            Err(mpsc::RecvTimeoutError::Timeout) => Err(RuntimeError::CallerDeadline {
-                deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+    pub async fn wait(self, deadline: core::time::Duration) -> RuntimeResult<Compiled> {
+        match tokio::time::timeout(deadline, self.wait).await {
+            Ok(Ok(outcome)) => outcome,
+            // The pool dropped the sender, which means the pool is gone.
+            Ok(Err(_)) => Err(RuntimeError::CompilationPressure { queued: 0 }),
+            Err(_elapsed) => Err(RuntimeError::CallerDeadline {
+                deadline_ms: millis(deadline),
             }),
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(RuntimeError::CompilationPressure { queued: 0 })
-            }
         }
     }
 
@@ -399,11 +448,11 @@ impl Compilation {
     /// # Errors
     ///
     /// Returns the compilation failure when it has finished and failed.
-    pub fn poll(&self) -> Option<RuntimeResult<Compiled>> {
+    pub fn poll(&mut self) -> Option<RuntimeResult<Compiled>> {
         match self.wait.try_recv() {
             Ok(outcome) => Some(outcome),
-            Err(mpsc::TryRecvError::Empty) => None,
-            Err(mpsc::TryRecvError::Disconnected) => {
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => None,
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
                 Some(Err(RuntimeError::CompilationPressure { queued: 0 }))
             }
         }
@@ -432,7 +481,7 @@ enum Command {
         answer: Answer<DecodedRequest>,
     },
     EncodeResponse {
-        request: RequestSnapshot,
+        request: Box<RequestSnapshot>,
         decision: String,
         event: Option<ScopedSourceEvent>,
         answer: Answer<EncodedResponse>,
@@ -458,6 +507,9 @@ pub struct BindingHandle {
     commands: mpsc::Sender<Command>,
     queue: Arc<Mutex<ObservationQueue>>,
     disabled: Arc<Mutex<Option<String>>>,
+    stopping: Arc<AtomicBool>,
+    pump_pending: Arc<AtomicBool>,
+    ready: Mutex<Option<tokio::sync::oneshot::Receiver<RuntimeResult<()>>>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -472,34 +524,88 @@ impl core::fmt::Debug for BindingHandle {
 }
 
 impl BindingHandle {
+    /// Starts the binding's thread, which instantiates the component and binds it.
     fn start(
         request: BindingRequest,
-        instance: Instance,
+        engine: &RuntimeEngine,
+        component: &wasmtime::component::Component,
+        fuel_rate: u64,
         faults: FaultCounter,
-        events: tokio::sync::mpsc::UnboundedSender<BindingEvent>,
-    ) -> Self {
+        events: tokio::sync::mpsc::Sender<BindingEvent>,
+    ) -> RuntimeResult<Self> {
         let (commands, inbox) = mpsc::channel();
+        let (ready, readiness) = tokio::sync::oneshot::channel();
         let queue = Arc::new(Mutex::new(ObservationQueue::new()));
         let disabled = Arc::new(Mutex::new(None));
+        let stopping = Arc::new(AtomicBool::new(false));
+        let pump_pending = Arc::new(AtomicBool::new(false));
+
+        let target = WireBinding {
+            plugin_id: request.identity.plugin_id.as_str().to_owned(),
+            binding_revision: request.facts.binding_revision,
+            executable: request.executable.clone(),
+        };
+        let setup = WorkerSetup {
+            engine: engine.clone(),
+            component: component.clone(),
+            facts: request.facts.clone(),
+            fuel_rate,
+            target,
+        };
         let worker = BindingWorker {
-            instance,
+            instance: None,
             faults,
             events,
+            dropped_documents: 0,
             queue: Arc::clone(&queue),
             disabled: Arc::clone(&disabled),
+            stopping: Arc::clone(&stopping),
+            pump_pending: Arc::clone(&pump_pending),
+            commands: commands.clone(),
             identity: request.identity.clone(),
         };
         let name = format!("kr-plugin-binding-{}", request.binding_id);
         let thread = std::thread::Builder::new()
             .name(name)
-            .spawn(move || worker.run(inbox))
-            .ok();
-        Self {
+            .spawn(move || worker.run(setup, ready, inbox))
+            .map_err(|error| RuntimeError::Instantiation {
+                detail: format!("the binding's thread could not be started: {error}"),
+            })?;
+
+        Ok(Self {
             request,
             commands,
             queue,
             disabled,
-            thread: Mutex::new(thread),
+            stopping,
+            pump_pending,
+            ready: Mutex::new(Some(readiness)),
+            thread: Mutex::new(Some(thread)),
+        })
+    }
+
+    /// Waits for the instance to exist and `bind` to have answered.
+    ///
+    /// # Errors
+    ///
+    /// Returns the instantiation or `bind` failure, or [`RuntimeError::CallerDeadline`].
+    async fn ready(&self, within: core::time::Duration) -> RuntimeResult<()> {
+        let readiness = self
+            .ready
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take())
+            .ok_or_else(|| RuntimeError::Instantiation {
+                detail: "this binding's readiness was already taken".to_owned(),
+            })?;
+        match tokio::time::timeout(within, readiness).await {
+            Ok(Ok(outcome)) => outcome,
+            Ok(Err(_)) => Err(RuntimeError::Instantiation {
+                detail: "the binding's thread ended before it reported itself".to_owned(),
+            }),
+            Err(_elapsed) => Err(RuntimeError::CallerDeadline {
+                deadline_ms: millis(within),
+            }),
         }
     }
 
@@ -527,7 +633,7 @@ impl BindingHandle {
         self.queue.lock().map_or(0, |queue| queue.held_bytes())
     }
 
-    /// Returns true when the component owes a fresh snapshot after a gap.
+    /// Returns true when the component owes a fresh snapshot.
     #[must_use]
     pub fn snapshot_required(&self) -> bool {
         self.queue
@@ -539,6 +645,10 @@ impl BindingHandle {
     ///
     /// Never waits and never runs a component. A caller on the terminal path can call this while
     /// the component is in the middle of an unbounded loop, and it returns at once.
+    ///
+    /// The pump is woken only when it is not already awake, so a burst of observations adds one
+    /// command rather than one per event: the 4 MiB queue is what bounds a burst, and a command
+    /// channel that grew with it would be a second, unbounded copy of the same backlog.
     pub fn enqueue_observation(&self, event: ScopedSourceEvent) -> Admission {
         let admission = match self.queue.lock() {
             Ok(mut queue) => queue.push(event),
@@ -546,10 +656,18 @@ impl BindingHandle {
             // refused is the honest answer: nothing will interpret it.
             Err(_) => Admission::Refused { held_bytes: 0 },
         };
-        // Waking the pump is a send on an unbounded channel: it allocates and returns. A thread
-        // that has already stopped makes this fail, which is not a reason to fail the push.
-        let _ = self.commands.send(Command::Pump);
+        self.wake();
         admission
+    }
+
+    fn wake(&self) {
+        if !self.pump_pending.swap(true, Ordering::AcqRel) {
+            // A thread that has already stopped makes this fail, which is not a reason to fail the
+            // push: the event is in the queue and the queue is going away with the binding.
+            if self.commands.send(Command::Pump).is_err() {
+                self.pump_pending.store(false, Ordering::Release);
+            }
+        }
     }
 
     /// Asks the component for a fresh document.
@@ -611,7 +729,7 @@ impl BindingHandle {
         deadline: core::time::Duration,
     ) -> RuntimeResult<CallResult<EncodedResponse>> {
         self.dispatch(deadline, |answer| Command::EncodeResponse {
-            request,
+            request: Box::new(request),
             decision,
             event,
             answer,
@@ -657,9 +775,12 @@ impl BindingHandle {
 
     /// Stops the binding's thread and waits for it.
     ///
-    /// A thread in the middle of a component call finishes it first. Every call is bounded, so the
-    /// wait is bounded too.
+    /// The stop is a flag as well as a command, so it is honoured before the commands already in
+    /// the channel rather than after them: a caller that is closing a binding is not waiting for
+    /// its backlog. A call already inside the component finishes first, and every call is bounded.
     pub fn stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        // The command is what wakes a thread that is blocked waiting for one.
         let _ = self.commands.send(Command::Stop);
         if let Ok(mut slot) = self.thread.lock()
             && let Some(thread) = slot.take()
@@ -692,7 +813,7 @@ impl BindingHandle {
                 binding: self.request.binding_id.to_string(),
             }),
             Err(_elapsed) => Err(RuntimeError::CallerDeadline {
-                deadline_ms: u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX),
+                deadline_ms: millis(deadline),
             }),
         }
     }
@@ -704,27 +825,86 @@ impl Drop for BindingHandle {
     }
 }
 
+/// What the binding's thread needs to create its instance.
+struct WorkerSetup {
+    engine: RuntimeEngine,
+    component: wasmtime::component::Component,
+    facts: BindingFacts,
+    fuel_rate: u64,
+    target: WireBinding,
+}
+
 struct BindingWorker {
-    instance: Instance,
+    instance: Option<Instance>,
     faults: FaultCounter,
-    events: tokio::sync::mpsc::UnboundedSender<BindingEvent>,
+    events: tokio::sync::mpsc::Sender<BindingEvent>,
+    dropped_documents: u32,
     queue: Arc<Mutex<ObservationQueue>>,
     disabled: Arc<Mutex<Option<String>>>,
+    stopping: Arc<AtomicBool>,
+    pump_pending: Arc<AtomicBool>,
+    commands: mpsc::Sender<Command>,
     identity: PluginIdentity,
 }
 
 impl BindingWorker {
-    fn run(mut self, inbox: mpsc::Receiver<Command>) {
+    fn run(
+        mut self,
+        setup: WorkerSetup,
+        ready: tokio::sync::oneshot::Sender<RuntimeResult<()>>,
+        inbox: mpsc::Receiver<Command>,
+    ) {
+        // Instantiation and `bind` happen here, on this thread, so nothing a caller is holding is
+        // behind them and no caller's thread runs a component.
+        let started = Instance::new(
+            &setup.engine,
+            &setup.component,
+            setup.facts,
+            InstanceLimiter::defaults(),
+            setup.fuel_rate,
+        );
+        let outcome = match started {
+            Ok(mut instance) => {
+                let bound = instance.bind(setup.target);
+                let nodes = bound.nodes;
+                match bound.result {
+                    Ok(Ok(())) => {
+                        self.instance = Some(instance);
+                        // What `bind` drew is presentation like any other. Discarding it would
+                        // lose a component's first document for no reason.
+                        if !nodes.is_empty() {
+                            self.send(BindingEvent::Document {
+                                call: CallKind::Bind,
+                                nodes,
+                            });
+                        }
+                        Ok(())
+                    }
+                    Ok(Err(fault)) => Err(RuntimeError::Instantiation {
+                        detail: format!("bind declared a fault: {}", fault_text(&fault)),
+                    }),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        };
+        let failed = outcome.is_err();
+        // A caller that has given up is not an error; the thread ends either way.
+        let _ = ready.send(outcome);
+        if failed {
+            return;
+        }
+
         while let Ok(command) = inbox.recv() {
+            if self.stopping.load(Ordering::Acquire) {
+                return;
+            }
             match command {
                 Command::Pump => self.pump(),
                 Command::Snapshot(answer) => {
-                    let outcome = self.run_call(CallKind::Snapshot, |instance| instance.snapshot());
-                    if outcome.as_ref().is_ok_and(|result| result.answer.is_ok())
-                        && let Ok(mut queue) = self.queue.lock()
-                    {
-                        queue.snapshot_taken();
-                    }
+                    let owed = self.snapshot_owed();
+                    let outcome = self.run_call(CallKind::Snapshot, Instance::snapshot);
+                    self.discharge(&outcome, owed);
                     let _ = answer.send(outcome);
                 }
                 Command::PrepareAction {
@@ -750,13 +930,12 @@ impl BindingWorker {
                     answer,
                 } => {
                     let outcome = self.run_call(CallKind::EncodeResponse, move |instance| {
-                        instance.encode_response(request, decision, event)
+                        instance.encode_response(*request, decision, event)
                     });
                     let _ = answer.send(outcome);
                 }
                 Command::Checkpoint(answer) => {
-                    let outcome =
-                        self.run_call(CallKind::Checkpoint, |instance| instance.checkpoint());
+                    let outcome = self.run_call(CallKind::Checkpoint, Instance::checkpoint);
                     let _ = answer.send(outcome);
                 }
                 Command::Restore { state, answer } => {
@@ -764,9 +943,15 @@ impl BindingWorker {
                         self.run_call(CallKind::Restore, move |instance| instance.restore(state));
                     let _ = answer.send(outcome);
                 }
-                Command::SetFacts(facts) => self.instance.set_binding_facts(facts),
+                Command::SetFacts(facts) => {
+                    if let Some(instance) = self.instance.as_mut() {
+                        instance.set_binding_facts(facts);
+                    }
+                }
                 Command::SetAttachments(attachments) => {
-                    self.instance.set_attachments(attachments);
+                    if let Some(instance) = self.instance.as_mut() {
+                        instance.set_attachments(attachments);
+                    }
                 }
                 Command::Stop => return,
             }
@@ -774,6 +959,9 @@ impl BindingWorker {
     }
 
     fn pump(&mut self) {
+        // Cleared before the queue is read, so an event that arrives during this pass wakes the
+        // next one rather than being left in the queue with nobody coming for it.
+        self.pump_pending.store(false, Ordering::Release);
         if self.is_disabled() {
             // A disabled binding interprets nothing. The queue is cleared so a re-registration
             // starts from a snapshot rather than from a backlog nobody read.
@@ -782,83 +970,192 @@ impl BindingWorker {
             }
             return;
         }
-        let (drained, owes_snapshot) = match self.queue.lock() {
+        let (drained, owed, remaining) = match self.queue.lock() {
             Ok(mut queue) => {
-                let owes = queue.snapshot_required();
-                (queue.drain(PUMP_BATCH), owes)
+                let owed = queue.snapshot_owed();
+                let drained = queue.drain(PUMP_BATCH);
+                (drained, owed, !queue.is_empty())
             }
             Err(_) => return,
         };
         if let Some(gap) = drained.gap {
-            let _ = self.events.send(BindingEvent::Gap(gap));
+            self.send(BindingEvent::Gap(gap));
         }
-        if owes_snapshot {
+        if owed != 0 {
             // The component's view is stale: either events were lost, or the instance was replaced
             // after a fault and has no state left. Either way the contract's answer is a fresh
-            // snapshot, and it happens here because the component has no way to ask for one.
-            let outcome = self.run_call(CallKind::Snapshot, |instance| instance.snapshot());
-            if outcome.is_ok_and(|result| result.answer.is_ok())
-                && let Ok(mut queue) = self.queue.lock()
-            {
-                queue.snapshot_taken();
+            // snapshot, and it happens here because the component has no way to ask for one. The
+            // obligation is discharged by number, so a gap that appeared while this snapshot was
+            // running still asks for another.
+            let outcome = self.run_call(CallKind::Snapshot, Instance::snapshot);
+            self.discharge(&outcome, owed);
+            if outcome.is_err() {
+                // The snapshot faulted. Its replacement has no state either, so there is nothing
+                // to deliver observations against until a snapshot succeeds.
+                self.rearm(true);
+                return;
             }
         }
         for event in drained.events {
-            if self.is_disabled() {
+            if self.is_disabled() || self.stopping.load(Ordering::Acquire) {
                 return;
             }
-            let _ = self.run_call(CallKind::Observe, move |instance| instance.observe(event));
+            let outcome = self.run_call(CallKind::Observe, move |instance| instance.observe(event));
+            if outcome.is_err() {
+                // A faulted instance is replaced and owes a snapshot. Delivering the rest of this
+                // batch first would interpret events against a document that no longer exists, so
+                // the batch stops here and the next pass takes the snapshot before it continues.
+                self.rearm(true);
+                return;
+            }
+        }
+        self.rearm(remaining);
+    }
+
+    /// Wakes the pump again when there is more to do.
+    fn rearm(&self, needed: bool) {
+        if needed && !self.pump_pending.swap(true, Ordering::AcqRel) {
+            let _ = self.commands.send(Command::Pump);
+        }
+    }
+
+    fn snapshot_owed(&self) -> u64 {
+        self.queue.lock().map_or(0, |queue| queue.snapshot_owed())
+    }
+
+    /// Clears the snapshot obligation `owed` when the snapshot that answered it succeeded.
+    fn discharge<T>(&self, outcome: &RuntimeResult<CallResult<T>>, owed: u64) {
+        if owed == 0 {
+            return;
+        }
+        if outcome.as_ref().is_ok_and(|result| result.answer.is_ok())
+            && let Ok(mut queue) = self.queue.lock()
+        {
+            queue.snapshot_taken(owed);
         }
     }
 
     fn run_call<T, F>(&mut self, kind: CallKind, invoke: F) -> RuntimeResult<CallResult<T>>
     where
-        F: FnOnce(&mut Instance) -> RuntimeResult<CallOutcome<T>>,
+        T: OutputSize,
+        F: FnOnce(&mut Instance) -> CallOutcome<T>,
     {
         if let Some(reason) = self.disabled_reason() {
             return Err(RuntimeError::Disabled { reason });
         }
-        match invoke(&mut self.instance) {
-            Ok(outcome) => {
-                if !outcome.nodes.is_empty() {
-                    let _ = self.events.send(BindingEvent::Document {
-                        call: kind,
-                        nodes: outcome.nodes.clone(),
-                    });
-                }
-                Ok(CallResult {
-                    answer: outcome.answer.map_err(|fault| fault_text(&fault)),
-                    nodes: outcome.nodes,
-                })
-            }
-            Err(error) => {
-                if error.counts_as_fault() {
-                    let detail = error.to_string();
-                    match self.faults.record(&detail) {
-                        FaultVerdict::Continue { faults_in_window } => {
-                            // The binding survives, and the instance behind it does not: a trap is
-                            // terminal for a component instance. The replacement has no
-                            // presentation state, so the next pump rebuilds it from a snapshot.
-                            if let Ok(mut queue) = self.queue.lock() {
-                                queue.require_snapshot();
-                            }
-                            let _ = self.events.send(BindingEvent::Fault {
-                                call: kind,
-                                detail,
-                                faults_in_window,
-                            });
-                        }
-                        FaultVerdict::Disabled { reason } => {
-                            let reason =
-                                format!("{} is disabled: {reason}", self.identity.plugin_id);
-                            if let Ok(mut slot) = self.disabled.lock() {
-                                *slot = Some(reason.clone());
-                            }
-                            let _ = self.events.send(BindingEvent::Disabled { reason });
-                        }
+        let Some(instance) = self.instance.as_mut() else {
+            return Err(RuntimeError::NoSuchBinding {
+                binding: self.identity.plugin_id.as_str().to_owned(),
+            });
+        };
+
+        // A trapped instance cannot be entered again, so it is replaced first. The replacement has
+        // no presentation state, which is why it owes a snapshot.
+        if instance.faulted() {
+            match instance.replace() {
+                Ok(nodes) => {
+                    if let Ok(mut queue) = self.queue.lock() {
+                        queue.require_snapshot();
+                    }
+                    if !nodes.is_empty() {
+                        self.send(BindingEvent::Document {
+                            call: CallKind::Bind,
+                            nodes,
+                        });
                     }
                 }
+                Err(error) => {
+                    self.record_fault(kind, &error);
+                    return Err(error);
+                }
+            }
+        }
+
+        let Some(instance) = self.instance.as_mut() else {
+            return Err(RuntimeError::NoSuchBinding {
+                binding: self.identity.plugin_id.as_str().to_owned(),
+            });
+        };
+        let outcome = invoke(instance);
+        let nodes = outcome.nodes;
+        if !nodes.is_empty() {
+            self.send(BindingEvent::Document {
+                call: kind,
+                nodes: nodes.clone(),
+            });
+        }
+        match outcome.result {
+            Ok(answer) => Ok(CallResult {
+                answer: answer.map_err(|fault| fault_text(&fault)),
+                nodes,
+            }),
+            Err(error) => {
+                self.record_fault(kind, &error);
                 Err(error)
+            }
+        }
+    }
+
+    fn record_fault(&mut self, kind: CallKind, error: &RuntimeError) {
+        if !error.counts_as_fault() {
+            return;
+        }
+        let detail = error.to_string();
+        match self.faults.record(&detail) {
+            FaultVerdict::Continue { faults_in_window } => {
+                // The binding survives, and the instance behind it does not: a trap is terminal
+                // for a component instance. The replacement has no presentation state, so the
+                // component owes a snapshot before anything else is delivered to it.
+                if let Ok(mut queue) = self.queue.lock() {
+                    queue.require_snapshot();
+                }
+                self.send(BindingEvent::Fault {
+                    call: kind,
+                    detail,
+                    faults_in_window,
+                });
+            }
+            FaultVerdict::Disabled { reason } => {
+                let reason = format!("{} is disabled: {reason}", self.identity.plugin_id);
+                if let Ok(mut slot) = self.disabled.lock() {
+                    *slot = Some(reason.clone());
+                }
+                self.send(BindingEvent::Disabled { reason });
+            }
+        }
+    }
+
+    /// Sends one event to the caller, or records that a presentation was dropped.
+    ///
+    /// The channel is bounded, and this never waits on it: a component must not be blocked because
+    /// a caller is slow, and a caller that has stopped reading must not be able to make this host
+    /// grow without bound. So a full channel means the document goes, the loss is counted, and the
+    /// component is asked to rebuild its view -- the same answer a lost observation gets.
+    ///
+    /// A fault or a disabled notice is never dropped: those are the two a caller cannot infer from
+    /// anything else, so the send waits for room by blocking this thread, which is the binding's
+    /// own and nothing else's.
+    fn send(&mut self, event: BindingEvent) {
+        let must_arrive = matches!(
+            event,
+            BindingEvent::Fault { .. } | BindingEvent::Disabled { .. }
+        );
+        if self.dropped_documents > 0 {
+            let dropped = BindingEvent::PresentationDropped {
+                documents: self.dropped_documents,
+            };
+            if self.events.try_send(dropped).is_ok() {
+                self.dropped_documents = 0;
+            }
+        }
+        if must_arrive {
+            let _ = self.events.blocking_send(event);
+            return;
+        }
+        if self.events.try_send(event).is_err() {
+            self.dropped_documents = self.dropped_documents.saturating_add(1);
+            if let Ok(mut queue) = self.queue.lock() {
+                queue.require_snapshot();
             }
         }
     }
@@ -870,6 +1167,10 @@ impl BindingWorker {
     fn is_disabled(&self) -> bool {
         self.disabled_reason().is_some()
     }
+}
+
+fn millis(duration: core::time::Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 /// Renders a component-declared fault as the text a host records.
@@ -903,6 +1204,7 @@ mod tests {
         assert_eq!(runtime.live_bindings(), 0);
         // Nothing has been compiled either, so an idle shell costs an engine and a cache directory.
         assert!(runtime.cache().root().exists());
+        assert_eq!(runtime.cache().resident(), 0);
     }
 
     #[test]

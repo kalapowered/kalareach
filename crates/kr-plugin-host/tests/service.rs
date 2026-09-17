@@ -134,8 +134,10 @@ impl Host {
         let supervisor: Box<dyn WorkerSupervisor> = Box::new(DetachedSupervisor::new());
         let recorded: Arc<std::sync::Mutex<Option<ServiceLaunch>>> =
             Arc::new(std::sync::Mutex::new(None));
+        let seen: Arc<std::sync::Mutex<Option<u32>>> = Arc::new(std::sync::Mutex::new(None));
         let starter = {
             let recorded = Arc::clone(&recorded);
+            let seen = Arc::clone(&seen);
             move |plan: &HostLaunchPlan| {
                 let launch = ServiceLaunch {
                     label: plan.label.clone(),
@@ -147,7 +149,12 @@ impl Host {
                     *slot = Some(launch.clone());
                 }
                 match supervisor.start_service(&launch) {
-                    LaunchOutcome::Started(identity) => HostStartOutcome::Started(identity),
+                    LaunchOutcome::Started(identity) => {
+                        if let Ok(mut slot) = seen.lock() {
+                            *slot = u32::try_from(identity.pid.get()).ok();
+                        }
+                        HostStartOutcome::Started(identity)
+                    }
                     LaunchOutcome::NotStarted { detail } => HostStartOutcome::NotStarted { detail },
                     LaunchOutcome::Uncertain { detail, pid } => {
                         HostStartOutcome::Uncertain { detail, pid }
@@ -178,7 +185,12 @@ impl Host {
                 // job's diagnostics file in the owner-only state directory. Whatever the service
                 // manager left behind is booted out before this test gives up, so a failure does
                 // not leave a job loaded on the machine.
-                let diagnostics = format!("{}\n{}", self.diagnostics(), job_state(&launch.label));
+                let diagnostics = format!(
+                    "{}\n{}\nlaunched process: {}",
+                    self.diagnostics(),
+                    job_state(&launch.label),
+                    launched_state(seen.lock().ok().and_then(|slot| *slot))
+                );
                 retire_job(&launch.label);
                 panic!("the plugin host did not start and report itself: {error}\n{diagnostics}");
             }
@@ -280,6 +292,28 @@ impl Drop for Started {
                 .status();
         }
         retire_job(self.label());
+    }
+}
+
+/// Returns what the operating system says about a launched process, for a failure that needs it.
+fn launched_state(pid: Option<u32>) -> String {
+    let Some(pid) = pid else {
+        return "the launcher reported none".to_owned();
+    };
+    let output = std::process::Command::new("/bin/ps")
+        .args([
+            "-o",
+            "pid=,ppid=,pgid=,state=,command=",
+            "-p",
+            &pid.to_string(),
+        ])
+        .output();
+    match output {
+        Ok(output) if output.status.success() && !output.stdout.is_empty() => {
+            format!("{pid}: {}", String::from_utf8_lossy(&output.stdout).trim())
+        }
+        Ok(_) => format!("{pid}: gone"),
+        Err(error) => format!("{pid}: unreadable: {error}"),
     }
 }
 
