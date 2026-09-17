@@ -14,8 +14,13 @@ number, so the number alone would say a session created in one login belongs to 
 that number.
 
 Every platform has one process that owns its login session, and its kernel start value is the
-generation. A new login is a new process, so the two logins are told apart even when the platform
-hands out the same number.
+generation. On macOS and Linux that process is created with the login and dies with it, so two
+logins are told apart even when the platform hands out the same session number. On Windows the
+logon process owns the interactive session, and this host does not establish that a new one is
+started for each authenticated sign-in: where a session number and its logon process both outlive a
+sign-out, this host would read the next sign-in as the same desktop. Telling those apart needs a
+per-user agent in the session itself, which this build does not install, so the Windows answer is
+weaker than the other two and the tables below say where that shows.
 
 | | macOS | Linux | Windows |
 | --- | --- | --- | --- |
@@ -36,6 +41,11 @@ A session records that identity when it is created, and `kr status` prints it. A
 question afterwards, on every wake of its supervision: is the process that owns my login session
 still running, with the same start value? That is one kernel query, which is what lets it be asked
 that often.
+
+A worker that is already gone cannot be asked, so the host reads the desktop from that session's own
+journal and asks the platform about that login session by its own identifier. Which desktop the host
+has now is a different question: one user can hold several logins at once, and a worker that crashed
+while its own login carried on is a crash rather than a logout.
 
 ## What logout does
 
@@ -134,15 +144,21 @@ decision to be answered. An idle shell is not work, however much output it has p
 
 Work begins and ends without the host being told, so while the setting is on the host looks at the
 question every fifteen seconds, as well as whenever a session is created or closed and whenever it
-is asked. That interval plus the two seconds the host gives itself to ask its sessions is the bound
-on how long after work ends an assertion can still be held. While the setting is off nothing looks
-at anything.
+is asked. How long after work ends an assertion can still be held is that interval plus the bounded
+steps of one review: two seconds to ask its sessions, two for the platform's own power-source
+query, and two for the facility to let go of the assertion. Taking one is bounded at two seconds as
+well. Nothing on the path is unbounded, and while the setting is off nothing looks at anything.
+
+Of the four things that count, two have a producer in this build: a create the host has accepted and
+not finished, and a closure that is still stopping processes. Agent work and a decision waiting for
+an answer are read from what a session's worker reports about itself, and no worker reports either
+state yet, so they activate nothing until the component that runs agents does.
 
 | Platform | The facility | What it asks for |
 | --- | --- | --- |
 | macOS | a power-management assertion, through `caffeinate -i` | that the system does not sleep because nobody is using it. The display is not kept awake; that is the person's business |
 | Linux | the login manager's own sleep inhibitor, through `systemd-inhibit --what=sleep:idle --mode=block` | the same, and the inhibitor refuses automatic sleep rather than merely asking to be told about it |
-| Windows | an execution-state request from the per-user host agent | the same, for the session the agent runs in |
+| Windows | an execution-state request, made by a command this host runs | the same, for the session that command runs in |
 
 Each facility ties the assertion to the life of a process, and the host runs that process as a
 child with a pipe on its input. Releasing it is closing the pipe. Nothing is signalled, and a
@@ -163,6 +179,14 @@ pmset -g assertions
 The assertion KalaReach holds names the process it is held on behalf of, and `kr host power --json`
 reports the same process, so the two can be compared.
 
+That listing is also what the host itself waits for. An assertion is reported only once the
+platform has confirmed this one: macOS and Linux both name the holding process in a listing, and
+this host compares the process it started rather than the name it asked under, so another
+environment's inhibitor never acknowledges this one. Windows publishes no such listing an ordinary
+user can read, so the command holding the request reports that its call succeeded and that is what
+the host believes. A facility that is merely running holds nothing, and `kr host power` says the
+operating system did not confirm an assertion instead of claiming one.
+
 ## What may be done on a desktop
 
 Selecting a desktop is not evidence that anything may be done on it. `environment.capabilities`
@@ -177,13 +201,15 @@ those happened.
 | --- | --- | --- | --- |
 | macOS | the display server, and launching an application, which needs no privacy permission | a capability whose facility is not installed | a screen image, synthetic input and the accessibility tree. Each needs a permission granted per signed application; this host neither performs the operation nor reads the permission, so it says so |
 | Linux, X11 | the display server and launching an application | a context with no display or authority, which cannot reach the X server at all; a capability with no tool installed | a screen image and synthetic input where a tool is installed and this context holds the display. X11 grants those to any client that holds it, and nothing here has opened it |
-| Linux, Wayland | the display server and launching an application | a compositor that asks the user for the operation each time, such as GNOME's screen-sharing portal, which is a permission the user grants rather than one a tool holds; a capability with no tool installed | a screen image or synthetic input on a compositor that implements the protocols the installed tool uses, which `sway`, `river`, `hyprland`, `wayfire`, `labwc` and `niri` do. The answer names the compositor, the tool and the operation |
+| Linux, Wayland | the display server and launching an application | a capability with no tool installed | a screen image and synthetic input, on every compositor. Where the compositor is one of `sway`, `river`, `hyprland`, `wayfire`, `labwc` or `niri` and the tool is one built against the protocols they implement, the answer says no per-use permission stands in the way and that nothing has been run; where the tool goes through the input devices instead, or where the pair is not one this host can qualify, it says the route is not established rather than blaming a permission. Every answer names the compositor, the tool and the operation |
 | Windows | the display server, and launching an application in the interactive session | a capability whose facility is not installed | a screen image, synthetic input and the accessibility tree, which act on whatever is on the screen |
 
-Each record also names the facility it is about: its path, its length, and a digest of its
-contents. A tool replaced at the same path is a different file here even when it kept the path, the
-length and the timestamps. The digest is for noticing a change rather than for proving one: a
-capability record is evidence about what is feasible, never authority, and nothing here signs it.
+Each record also names the facility it is about: its path, the number of bytes read, and a digest
+of its contents. A tool replaced at the same path is a different file here even when it kept the
+path, the length and the timestamps. The file is read a block at a time, so a large facility costs
+time rather than memory and every one of them gets a content identity. The digest is for noticing a
+change rather than for proving one: a capability record is evidence about what is feasible, never
+authority, and nothing here signs it.
 
 The revision every record carries advances whenever any of this changes. It is kept in the
 environment's state directory and written before it is handed out, so a host that restarts does not

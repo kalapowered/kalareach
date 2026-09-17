@@ -140,9 +140,12 @@ desktop handles and no promise about the desktop rather than one that cannot rea
 
 Linux places a job in no login session at all: a user service manager started at boot has no
 display, no compositor socket and no session message bus, because those belong to a graphical login
-that happened later. So a desktop-bound worker's transient unit is given the graphical session's own
-handles explicitly, read back from where the desktop session publishes them. A headless worker is
-given none of them.
+that happened later. So a desktop-bound worker's transient unit is given the selected session's own
+handles explicitly, read from that session's leader, and every other login-session handle is removed
+from what the unit would otherwise inherit. Both halves matter on a host where one user is logged in
+twice: the manager holds one environment for the whole user, so what it offers is used only when it
+says which session it describes and says the selected one, and a handle that was not collected is
+cleared rather than left to arrive from the other login. A headless worker is given none of them.
 
 The fallback supervisor, which a host with no service manager uses, has no domains to choose
 between: a worker it starts is in whatever login context this daemon is in, and a headless worker
