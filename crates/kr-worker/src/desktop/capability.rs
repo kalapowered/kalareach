@@ -775,14 +775,18 @@ mod tests {
             .expect("the display server is a capability of its own");
         assert!(server.state.is_available());
         // Launching an application on a desktop needs no permission on any of these platforms, so
-        // the answer depends only on whether a launcher is installed, which differs between them.
+        // the answer depends on the launcher: one this host found and identified is available, one
+        // that is not installed is a missing installation, and one it found and could not identify
+        // establishes nothing. Which of the three a host gives differs between hosts.
         let launch = report
             .record(capabilities::APPLICATION_LAUNCH)
             .expect("a record");
         assert!(
             matches!(
                 launch.state,
-                CapabilityState::QualifiedAvailable | CapabilityState::MissingInstallation
+                CapabilityState::QualifiedAvailable
+                    | CapabilityState::MissingInstallation
+                    | CapabilityState::TemporarilyUnavailable
             ),
             "{launch:?}"
         );
@@ -791,6 +795,15 @@ mod tests {
             launch.identity.version.is_present(),
             "a launcher this host found and identified is the whole of that answer"
         );
+    }
+
+    /// A path of this test's own, in this host's temporary directory.
+    fn temporary(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "kalareach-facility-{name}-{}-{}",
+            std::process::id(),
+            kr_ipc::now_ms().get()
+        ))
     }
 
     #[test]
@@ -807,12 +820,17 @@ mod tests {
             )
         };
 
-        // A facility this host can read is identified by its contents.
-        let readable = std::env::current_exe().expect("this test is a file");
-        let (answer, identity) = asked(&readable.display().to_string());
+        // A facility this host can read within its bound is identified by its contents. The
+        // fixture is a file of this test's own making, because the answer depends on the file's
+        // size and a file that came from somewhere else could be any size.
+        let small = temporary("small");
+        std::fs::write(&small, b"a facility").expect("a file");
+        let (answer, identity) = asked(&small.display().to_string());
+        let _ = std::fs::remove_file(&small);
         assert_eq!(answer.state, CapabilityState::NotTested);
         let identity = identity.expect("a facility this host read has an identity");
         assert!(identity.contains("digest"), "{identity}");
+        assert!(identity.contains("10 bytes"), "{identity}");
 
         // One it cannot read has no identity, and an answer about a facility with no identity
         // would be an answer about whatever is at that path later.
@@ -830,11 +848,7 @@ mod tests {
         // And one larger than this host reads to identify it is the same answer. The file is made
         // by its length rather than by writing to it, so the test costs the reading and nothing
         // else.
-        let large = std::env::temp_dir().join(format!(
-            "kalareach-facility-bound-{}-{}",
-            std::process::id(),
-            kr_ipc::now_ms().get()
-        ));
+        let large = temporary("large");
         std::fs::File::create(&large)
             .expect("a file")
             .set_len(MAX_IDENTIFIED + 1)
