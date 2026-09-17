@@ -172,6 +172,14 @@ impl NoticeSink {
             return Offered::Closed;
         }
         let offered = queue.admit(notice);
+        // Admitting can be what ends the connection -- too many unfinished dropped documents, or
+        // something that had to arrive and would not fit. The caller is told by this answer rather
+        // than by the next one it happens to make.
+        let offered = if queue.overflowed {
+            Offered::Overflowed
+        } else {
+            offered
+        };
         drop(queue);
         // One waiter, so one wake-up, and it leaves a permit behind when nobody is waiting yet. A
         // wake-up that woke nobody would otherwise be lost between the reader looking at an empty

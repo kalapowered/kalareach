@@ -76,6 +76,30 @@ static PUBLICATIONS: std::sync::LazyLock<
 /// The source of publication numbers, which are never reused inside a process.
 static NEXT_PUBLICATION: AtomicU64 = AtomicU64::new(1);
 
+/// One acceptance still waiting for its publication.
+///
+/// Its drop is what tells a publication that nobody is waiting for it any more, whether the
+/// acceptance gave up on its own deadline or its caller stopped polling it.
+struct Waiting {
+    abandoned: Arc<core::sync::atomic::AtomicBool>,
+    finished: bool,
+}
+
+impl Waiting {
+    fn finished(mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.abandoned
+                .store(true, core::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
 /// Returns one environment's publication turn.
 fn publication_turn(environment_id: EnvironmentId) -> Arc<std::sync::Mutex<u64>> {
     PUBLICATIONS.lock().map_or_else(
@@ -748,7 +772,15 @@ impl HostReservation {
                     // a later launch has taken the environment's publication -- and the wait for it
                     // is inside the deadline like every other stage.
                     let turn = publication_turn(self.environment_id);
+                    // Set when this acceptance stops waiting, however it stops: its own deadline,
+                    // or a caller that dropped it. A publication still queued behind somebody
+                    // else's then publishes nothing, because a descriptor for a startup nobody is
+                    // waiting on is one no worker should find.
                     let abandoned = Arc::new(core::sync::atomic::AtomicBool::new(false));
+                    let waiting = Waiting {
+                        abandoned: Arc::clone(&abandoned),
+                        finished: false,
+                    };
                     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                     let publishing = {
                         let paths = environment.clone();
@@ -766,13 +798,9 @@ impl HostReservation {
                                 detail: format!("the descriptor could not be published: {error}"),
                             });
                         }
-                        Err(_elapsed) => {
-                            // This launch has stopped waiting. Its publication, if it is still
-                            // queued behind somebody else's, publishes nothing.
-                            abandoned.store(true, core::sync::atomic::Ordering::Release);
-                            return Err(LaunchError::NoRendezvous { deadline_ms });
-                        }
+                        Err(_elapsed) => return Err(LaunchError::NoRendezvous { deadline_ms }),
                     }
+                    waiting.finished();
 
                     // The host does not serve workers until it has this. Publishing a descriptor
                     // for a process that had already started answering would mean a worker could
