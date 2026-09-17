@@ -51,8 +51,9 @@ project.init / clone / adopt
   ├─ 2. probe it                       absent, empty, non-empty, or occupied
   ├─ 3. write the operation row        its key is the caller's action identifier
   ├─ 4. stage                          .kr-project-<32 hex>/tree beside the destination
-  ├─ 5. record the staged identity     the row moves to `publishing`
-  ├─ 6. publish                        one no-replace rename
+  ├─ 5. record the staged witness      its identity and its creation instant; the row moves to
+  │                                     `publishing`
+  ├─ 6. publish                        one no-replace rename of that exact object
   └─ 7. write the repository row       the row moves to `completed`, the claim is settled
 ```
 
@@ -70,24 +71,37 @@ finished building.
 **The publication replaces nothing.** On Linux and Apple platforms it is one system call that fails
 when the destination name is taken (`renameat2(RENAME_NOREPLACE)` and `renameatx_np(RENAME_EXCL)`),
 so an entry that appeared between the check and the publication is never overwritten however close
-the race is. Elsewhere the name is checked first and the published object's identity is compared
-afterwards, which detects a replacement rather than preventing it; the result says
-`OUTCOME_UNKNOWN` when they do not match.
+the race is. On Windows the guarantee is the platform's own: `MoveFileEx` refuses to rename a
+directory onto a name that exists, and `MOVEFILE_REPLACE_EXISTING` does not apply to a directory.
+The limits section below says which part of this has not been executed.
+
+**The object published is the object that was staged.** The publication re-reads the staged
+repository and refuses unless it is the one the row recorded, so a replacement between the recording
+and the rename is refused rather than published under the same action.
 
 **A crash is reconciled against the create token.** The operation row's key is the action identifier
-the caller submitted, and the staged repository's filesystem identity is recorded before the rename.
-So a replacement daemon never asks "does the name exist"; it asks which name holds *that object*.
+the caller submitted, and the staged repository's *witness* is recorded before the rename: its
+filesystem identity, and the instant the filesystem says it was created. So a replacement daemon
+never asks "does the name exist"; it asks which name holds *that object*. The creation instant is
+the second half of the witness because a filesystem reuses a device and inode pair once the object
+that held them is gone, and reuse with the same creation instant is not something a filesystem
+produces. Where a platform reports no creation instant, the witness is the identity alone and the
+host says so rather than claiming more.
 
 | What the replacement finds | What it does |
 | --- | --- |
 | The destination holds the staged object | Finishes the operation: writes the repository row and settles the claim |
 | The staging directory still holds it | Finishes the same publication, which is not another clone |
 | Neither holds it | Records the operation as unknown and keeps the staging path, named in the result |
-| No identity was recorded | Nothing was published: removes the staged content and closes the operation |
+| No witness was recorded | Nothing was published: removes the staged content and closes the operation |
 
 A staging sibling exists for a moment before the row that names it is updated, so recovery also
 removes any sibling no operation row accounts for, in the parents this host has used. Recovery runs
 before anything is served, so no operation is in flight when it does.
+
+A failure *after* the rename landed is not a failure of the operation: the repository exists. The
+row is in `publishing` with the witness, so the same reconciliation runs immediately rather than
+recording a failure nothing would revisit.
 
 **An operation is idempotent.** The action is claimed in the same transaction as the operation row,
 and the row's key *is* that action identifier, so a second copy of one action finds the claim rather
@@ -106,8 +120,15 @@ A network operation names three things and carries no fourth.
    transports Git can be talked into using is not closed.
 2. **The URL carries no credential.** A password in the authority is refused outright rather than
    stripped, because a caller that sent one has a credential in its own state and needs to know. An
-   `https` URL carries no user name either, since that is the half a helper looks the other half up
-   by. An `ssh` remote keeps its user, because ssh needs it.
+   `https` URL carries no user name either, since a token is often the user rather than the
+   password. A query and a fragment are refused as well: a repository URL needs neither, and
+   `?access_token=` is the other place a credential reaches remote state. An `ssh` remote keeps its
+   user, because ssh needs it and an ssh user name is not a secret.
+
+   No refusal repeats the URL it refused. A URL this host could not parse is one it could not redact
+   either, and a malformed authority is exactly where a credential sits, so a refusal names what is
+   wrong instead. Where a diagnostic from Git itself carries a URL, the whole user information is
+   removed unless the scheme is `ssh` and it holds no colon.
 3. **The provider** is the host name as this host resolved it, recorded beside the remote so a
    receipt says which service was reached.
 4. **The broker** is one this host has. It supplies a *program* — a credential helper, and an ssh
@@ -151,7 +172,7 @@ Five classes, five decisions:
 | --- | --- |
 | `dirty_file` | A tracked file with an uncommitted change |
 | `untracked_file` | A file Git neither tracks nor ignores |
-| `submodule` | A submodule working tree |
+| `submodule` | A submodule, counted from the index and never looked inside |
 | `generated_artefact` | A file an ignore rule covers |
 | `binary_file` | Cuts across the others: a dirty or untracked file whose content is binary |
 
@@ -222,23 +243,40 @@ nothing can prompt and nothing can page.
 
 **What configuration applies.** `GIT_CONFIG_NOSYSTEM=1`, and the global and system files both point
 at a zero-byte file this host owns, so the only configuration left is the repository's own. On top of
-it go command-line overrides, which beat every configuration file and reach every subprocess Git
-starts. Hooks are looked for in an empty directory this host owns; the filesystem monitor, the
-pager, the editor, the credential prompt, the proxy, the alternate-reference command, the external
-diff, the signature programs and the pack-serving hook are all set to nothing; the template
-directory a new repository copies hooks from is an empty one this host owns; every transport is
-refused and the one this operation validated is allowed back.
+it go the host's overrides, carried as `GIT_CONFIG_COUNT` with a `GIT_CONFIG_KEY_<n>` and
+`GIT_CONFIG_VALUE_<n>` pair for each one. That form has the same precedence as `git -c`, beats every
+configuration file and reaches every subprocess Git starts. It is used in place of `-c` because `-c`
+splits its argument at the first `=`, so a configuration key whose subsection contains one could not
+be overridden at all.
+
+Hooks are looked for in an empty directory this host owns; the filesystem monitor, the pager, the
+editor, the credential prompt, the proxy, the alternate-reference command, the external diff, the
+signature programs and the pack-serving hook are all set to nothing; the template directory a new
+repository copies hooks from is an empty one this host owns; every transport is refused and the one
+this operation validated is allowed back.
+
+**No submodule is entered.** A submodule is its own repository, and its configuration lives in the
+parent's modules directory, which the parent's own configuration listing does not read. A driver
+defined there is one the audit cannot see, and checking a submodule's dirtiness runs Git *inside*
+the submodule, where it would apply. So every read passes `--ignore-submodules=all` as well as
+setting `submodule.recurse=false` and `diff.ignoreSubmodules=all`, submodules are counted from the
+index, and the preview says that what a submodule holds is neither measured nor copied.
 
 **What the repository's own configuration is allowed to name.** A `filter`, `diff` or `merge` driver
 is named by an attribute and *defined* in configuration, and the set of names is whatever the
 repository chose, so a fixed list of overrides cannot cover it. The effective configuration is
 therefore read first, and every driver it defines is blanked by name.
 
+A driver's subsection keeps the bytes the repository chose, because a configuration subsection is
+case-sensitive: an override spelled `filter.mixed.clean` does not reach `filter.Mixed.clean`. A name
+holding a control character cannot be carried in an environment value at all, so a driver named that
+way is refused rather than left alone.
+
 The keys that remain are dealt with in one of two ways, and never ignored:
 
-* **Blanked.** A command-line override sets the key to nothing. The limitation is reported with the
-  result, because section 14 asks the host to expose a limitation rather than execute an ungranted
-  helper. Content a driver would have converted is read as it is stored.
+* **Blanked.** An override sets the key to nothing. The limitation is reported with the result,
+  because section 14 asks the host to expose a limitation rather than execute an ungranted helper.
+  Content a driver would have converted is read as it is stored.
 * **Refused.** `remote.<name>.vcs`, `remote.<name>.uploadpack`, `remote.<name>.receivepack`,
   `url.<base>.insteadOf` and `url.<base>.pushInsteadOf` are multi-valued or name the other side's
   program, so an override adds to them rather than replacing them. A *read* of such a repository is
@@ -254,16 +292,29 @@ what Git would run it during, and how this host stops it. The tests build a real
 each entry as a program that writes a sentinel file when it runs, and then take a status, a review
 refresh, a clone and an adoption against it. No sentinel may appear.
 
-### Two limits the host states rather than hides
+### Three limits the host states rather than hides
 
 **The publication's no-replace guarantee is the platform's.** On Linux and Apple platforms it is one
-system call. Elsewhere the check and the rename are two steps, and what the host offers is detection
-of a replacement rather than prevention of one.
+system call: `renameat2` with `RENAME_NOREPLACE`, and `renameatx_np` with `RENAME_EXCL`. On Windows
+it is `MoveFileEx`'s own refusal to rename a directory onto a name that exists, which
+`MOVEFILE_REPLACE_EXISTING` does not override for a directory. The occupancy check before the rename
+is a courtesy that gives a better diagnostic, and the identity comparison afterwards is a second
+check rather than the guarantee. The Windows path has not been executed on Windows in this build.
 
-**A read of a repository's configuration and the invocation that follows it are two reads.** The
-drivers the overrides blank are the ones the first read found. A repository whose configuration
-changes between the two is a concurrent external writer, which section 14 already treats as
-best-effort; the second read is the one the overrides were built from and nothing pretends otherwise.
+**A Git invocation resolves its own working directory and reads its own configuration.** Both are
+outside this host's handles: it passes a path with `-C`, and Git opens the configuration for itself.
+So a writer under the same operating-system account could put a different tree at that path, or add
+a driver the audit did not blank, between the check and the invocation. Neither is preventable
+through Git's own interface, so what this host does is notice. After every read it re-opens the
+path, compares both filesystem identities, re-reads the configuration and compares its digest; a
+result produced against something else is refused rather than returned. What remains is a change
+made and undone inside one invocation, which two readings cannot distinguish from no change at all.
+
+**A cancellation contains a process group on Unix and a single process elsewhere.** Every Git child
+this service starts leads its own process group, so a cancellation ends the helper, the ssh process
+and the credential helper along with Git. Windows containment is a Job Object, which is a call
+outside safe Rust and therefore not in this crate; a cancellation there ends the Git process and the
+result says that the host could not confirm the rest.
 
 ## Storage layout
 

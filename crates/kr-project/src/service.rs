@@ -369,7 +369,7 @@ impl ProjectService {
                 let Some(sibling) = staging else {
                     return Ok(ResolvedStep::Unresolved(None));
                 };
-                match publish(&sibling, &destination) {
+                match publish(&sibling, &destination, staged) {
                     Ok(identity) => {
                         self.finish_publication(row, &destination, identity, Some(sibling))?;
                         Ok(ResolvedStep::Completed)
@@ -746,6 +746,20 @@ impl ProjectService {
         match outcome {
             Ok(answer) => Ok((answer.project, answer.operation)),
             Err(error) => {
+                // A failure *after* the publication landed is not a failure of the operation: the
+                // repository exists. The row is in `publishing` with the staged object's witness,
+                // so it is reconciled against the create token exactly as a replacement daemon
+                // would reconcile it, rather than recorded as a failure nothing would revisit.
+                if let Some(current) = self.locked()?.operation(row.action_id)?
+                    && matches!(current.state, OperationState::Publishing)
+                    && matches!(
+                        self.resolve_operation(&current),
+                        Ok(ResolvedStep::Completed)
+                    )
+                    && let Some(answered) = self.answer_from_record::<CreationAnswer>(action)?
+                {
+                    return Ok((answered.project, answered.operation));
+                }
                 let state = if matches!(error, ProjectError::Cancelled { .. }) {
                     OperationState::Cancelled
                 } else if matches!(error, ProjectError::OutcomeUnknown { .. }) {
@@ -778,7 +792,7 @@ impl ProjectService {
                 let staging = StagingSibling::create(destination)?;
                 self.record_staging(row, &staging)?;
                 stage_init(&self.profile, &staging, initial_branch.as_deref(), cancel)?;
-                let staged = staging.staged_identity()?;
+                let staged = staging.staged_witness()?;
                 self.locked()?.set_operation_state(
                     row.action_id,
                     OperationState::Publishing,
@@ -787,14 +801,14 @@ impl ProjectService {
                     Some(staged),
                     Some(staging.name()),
                 )?;
-                let published = publish(&staging, destination)?;
+                let published = publish(&staging, destination, staged)?;
                 (Some(published), destination.path(), Some(staging))
             }
             CreatePlan::Clone { remote } => {
                 let staging = StagingSibling::create(destination)?;
                 self.record_staging(row, &staging)?;
                 stage_clone(&self.profile, &staging, remote, cancel)?;
-                let staged = staging.staged_identity()?;
+                let staged = staging.staged_witness()?;
                 self.locked()?.set_operation_state(
                     row.action_id,
                     OperationState::Publishing,
@@ -803,7 +817,7 @@ impl ProjectService {
                     Some(staged),
                     Some(staging.name()),
                 )?;
-                let published = publish(&staging, destination)?;
+                let published = publish(&staging, destination, staged)?;
                 (Some(published), destination.path(), Some(staging))
             }
         };
@@ -1176,7 +1190,8 @@ impl ProjectService {
                                 .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
                                 .with_cancellation(Arc::clone(&cancel)),
                         )?;
-                        publish(&staging, &destination)?;
+                        let staged = staging.staged_witness()?;
+                        publish(&staging, &destination, staged)?;
                         staging.remove(&destination)?;
                     }
                 }

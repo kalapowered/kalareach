@@ -147,6 +147,10 @@ where
         .arg("commit.gpgSign=false")
         .arg("-c")
         .arg("init.defaultBranch=main")
+        // A fixture builds a submodule from a path on this machine, which is the transport Git
+        // refuses by default. Nothing here reaches a network.
+        .arg("-c")
+        .arg("protocol.file.allow=always")
         .args(&arguments)
         .env_clear()
         .env("PATH", std::env::var_os("PATH").unwrap_or_default())
@@ -342,6 +346,162 @@ pub fn planted_repository(parent: &Path, name: &str, include_refused: bool) -> P
         sentinels,
         neutralised,
     }
+}
+
+/// A parent repository holding a submodule whose own configuration plants a filter.
+///
+/// The submodule's configuration lives in the parent's modules directory, which the parent's own
+/// configuration listing does not read: a driver defined there is one the audit cannot see. So the
+/// host must never enter a submodule, and this is the fixture that proves it does not.
+pub struct PlantedSubmodule {
+    /// The parent repository.
+    pub parent: PathBuf,
+    /// The submodule's path inside it.
+    pub submodule_path: String,
+    /// Where the submodule's filter would write if it ran.
+    pub sentinels: PathBuf,
+}
+
+impl PlantedSubmodule {
+    /// Returns the names of every sentinel that exists, which must be none.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the sentinel directory cannot be read for a reason other than its absence.
+    #[must_use]
+    pub fn escaped(&self) -> Vec<String> {
+        match std::fs::read_dir(&self.sentinels) {
+            Ok(entries) => {
+                let mut names: Vec<String> = entries
+                    .filter_map(|entry| {
+                        entry
+                            .ok()
+                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                    })
+                    .collect();
+                names.sort();
+                names
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => panic!("the sentinel directory could not be read: {error}"),
+        }
+    }
+}
+
+/// Builds a parent repository with a submodule whose own configuration plants a filter.
+///
+/// # Panics
+///
+/// Panics when the repositories cannot be built.
+pub fn planted_submodule(parent_directory: &Path, name: &str) -> PlantedSubmodule {
+    let sentinels = parent_directory.join(format!("{name}-submodule-sentinels"));
+    let marker = plant_marker(parent_directory, &format!("{name}-submodule"), &sentinels);
+    // The child, with an attribute that names a filter.
+    let child = parent_directory.join(format!("{name}-child"));
+    std::fs::create_dir_all(&child).expect("a directory for the child");
+    git_raw(&child, ["init", "--initial-branch=main"]);
+    write(
+        &child, "a.txt", "a
+",
+    );
+    write(
+        &child,
+        ".gitattributes",
+        "* filter=child
+",
+    );
+    git_raw(&child, ["add", "-A"]);
+    git_raw(&child, ["commit", "-m", "the child"]);
+    // The parent, with the child added as a submodule.
+    let parent = ordinary_repository(parent_directory, name);
+    git_raw(
+        &parent,
+        [
+            OsStr::new("submodule"),
+            OsStr::new("add"),
+            OsStr::new("--quiet"),
+            child.as_os_str(),
+            OsStr::new("vendor/child"),
+        ],
+    );
+    git_raw(&parent, ["commit", "-m", "the submodule"]);
+    // The filter is configured where the submodule's own repository is, which is inside the
+    // parent's modules directory rather than anywhere the parent's configuration names.
+    let inside = parent.join("vendor/child");
+    git_raw(
+        &inside,
+        [
+            OsStr::new("config"),
+            OsStr::new("--local"),
+            OsStr::new("--"),
+            OsStr::new("filter.child.clean"),
+            marker.as_os_str(),
+        ],
+    );
+    git_raw(
+        &inside,
+        [
+            OsStr::new("config"),
+            OsStr::new("--local"),
+            OsStr::new("--"),
+            OsStr::new("filter.child.smudge"),
+            marker.as_os_str(),
+        ],
+    );
+    // Something inside the submodule for the filter to be invoked on.
+    write(
+        &inside,
+        "a.txt",
+        "changed inside the submodule
+",
+    );
+    let _ = std::fs::remove_dir_all(&sentinels);
+    PlantedSubmodule {
+        parent,
+        submodule_path: "vendor/child".to_owned(),
+        sentinels,
+    }
+}
+
+/// Plants one execution-capable configuration key on a repository, with a name of this host's
+/// choosing rather than one the audit's own spelling would match.
+///
+/// # Panics
+///
+/// Panics when the configuration cannot be written.
+pub fn plant_named_driver(parent: &Path, repository: &Path, name: &str, key: &str) -> PathBuf {
+    let sentinels = parent.join(format!("{name}-sentinels"));
+    let marker = plant_marker(parent, name, &sentinels);
+    for leaf in ["clean", "smudge"] {
+        git_raw(
+            repository,
+            [
+                OsStr::new("config"),
+                OsStr::new("--local"),
+                OsStr::new("--"),
+                OsStr::new(&format!("filter.{key}.{leaf}")),
+                marker.as_os_str(),
+            ],
+        );
+    }
+    write(
+        repository,
+        ".gitattributes",
+        &format!(
+            "* filter={key}
+"
+        ),
+    );
+    git_raw(repository, ["add", "-A"]);
+    git_raw(repository, ["commit", "-m", "the attribute"]);
+    write(
+        repository,
+        "a.txt",
+        "changed after the commit
+",
+    );
+    let _ = std::fs::remove_dir_all(&sentinels);
+    sentinels
 }
 
 /// Copies the marker program out of the fixture with its sentinel directory substituted.

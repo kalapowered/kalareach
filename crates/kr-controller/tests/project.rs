@@ -102,26 +102,45 @@ async fn host() -> Host {
 async fn host_on(temp: kr_ipc::testing::TempHost, work: Arc<tempfile::TempDir>) -> Host {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let secrets = environment.secrets_dir();
-    let controller = Controller::start(ControllerSetup {
-        paths: environment.clone(),
-        environment_id,
-        identity: Box::new(move || {
-            let store = open_store(CONTROLLER_SECRET_SERVICE, &secrets)
-                .expect("a secret store for the test environment");
-            Ok(
-                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                    .expect("an identity"),
-            )
-        }),
-        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-        supervisor: Box::new(RefusingSupervisor),
-        worker_program: PathBuf::from("/nonexistent/kr-worker"),
-        build_id: build(),
-        release: "0".to_owned(),
-    })
-    .await
-    .expect("the daemon starts");
+    // A replacement daemon on the same environment has to wait for the one it replaces to release
+    // the singleton lock. The previous daemon's per-connection tasks hold a reference to it, so
+    // the release is not instantaneous even after the accept loop is stopped.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let controller = loop {
+        let secrets = environment.secrets_dir();
+        let attempt = Controller::start(ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store = open_store(CONTROLLER_SECRET_SERVICE, &secrets)
+                    .expect("a secret store for the test environment");
+                Ok(
+                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                        .expect("an identity"),
+                )
+            }),
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(RefusingSupervisor),
+            worker_program: PathBuf::from("/nonexistent/kr-worker"),
+            build_id: build(),
+            release: "0".to_owned(),
+        })
+        .await;
+        match attempt {
+            Ok(controller) => break controller,
+            Err(error) if std::time::Instant::now() < deadline => {
+                assert!(
+                    matches!(
+                        error,
+                        kr_controller::error::ControllerError::AlreadyRunning { .. }
+                    ),
+                    "the daemon starts: {error}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("the daemon starts: {error}"),
+        }
+    };
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
     let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
@@ -876,8 +895,9 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
         },
     };
 
+    let log = host.root().join("daemon.log");
     let mut first = start_daemon(&program, &host);
-    wait_for_daemon(&endpoint).await;
+    wait_for_daemon(&endpoint, &log).await;
     {
         let mut control = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
             .await
@@ -907,7 +927,7 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
     first.stop();
 
     let mut second = start_daemon(&program, &host);
-    wait_for_daemon(&endpoint).await;
+    wait_for_daemon(&endpoint, &log).await;
     let mut control = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects to the replacement");
@@ -1143,8 +1163,10 @@ fn start_daemon(program: &Path, host: &kr_ipc::testing::TempHost) -> Daemon {
 
 /// Waits for a daemon to answer on its control endpoint.
 #[cfg(unix)]
-async fn wait_for_daemon(endpoint: &kr_ipc::paths::Endpoint) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+async fn wait_for_daemon(endpoint: &kr_ipc::paths::Endpoint, log: &Path) {
+    // Generous, because this suite runs beside every other one in the workspace: a daemon that is
+    // still starting is not a daemon that failed, and a failure shows in its own log.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
     loop {
         if LocalClient::connect(endpoint, LocalClientKind::Cli, build())
             .await
@@ -1154,8 +1176,9 @@ async fn wait_for_daemon(endpoint: &kr_ipc::paths::Endpoint) {
         }
         assert!(
             std::time::Instant::now() < deadline,
-            "the daemon did not answer on {} within thirty seconds",
-            endpoint.as_text()
+            "the daemon did not answer on {} within two minutes, and its log says: {}",
+            endpoint.as_text(),
+            std::fs::read_to_string(log).unwrap_or_else(|error| format!("<unreadable: {error}>"))
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }

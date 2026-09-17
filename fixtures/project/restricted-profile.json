@@ -1,5 +1,5 @@
 {
-  "what_this_is": "Every execution-capable thing a project repository can name, as one document. The project service's tests build a real repository from this, plant each entry as a program that writes a sentinel file when it runs, and then run a status, a review refresh, a clone and an adoption against it. No sentinel may appear. This is the fixture behind KR-ACC-030, KR-REQ-14.23 and KR-REQ-14.24: argument-vector construction alone is not the isolation, so the isolation is tested by trying to trigger each helper.",
+  "what_this_is": "Every execution-capable thing a project repository can name, as one document. The project service's tests build a real repository from this, plant each entry as a program that writes a sentinel file when it runs, and then run a status, a review refresh, a clone and an adoption against it. No sentinel may appear. This is the fixture behind KR-ACC-030, KR-REQ-14.23 and KR-REQ-14.24: argument-vector construction alone is not the isolation, so the isolation is tested by trying to trigger each helper. Two of the entries are not configuration keys of the repository under test: a submodule's own configuration lives in the parent's modules directory, which the parent's configuration listing does not read, and a driver name is case-sensitive and may hold an equals sign, which a command-line `-c` override cannot express. Both are listed under `outside_the_repositorys_own_configuration`.",
   "marker_program": {
     "unix": "marker.sh",
     "windows": "marker.cmd",
@@ -11,7 +11,7 @@
       "key": "core.fsmonitor",
       "sentinel": "fsmonitor",
       "git_would_run_it_during": "every status and every index refresh",
-      "how_this_host_stops_it": "core.fsmonitor=false on the command line, which no configuration file can undo, plus core.untrackedCache=false and --no-optional-locks so no index is written"
+      "how_this_host_stops_it": "core.fsmonitor=false as an override no configuration file can undo, plus core.untrackedCache=false and --no-optional-locks so no index is written"
     },
     {
       "key": "core.hooksPath",
@@ -47,7 +47,7 @@
       "key": "diff.external",
       "sentinel": "external-diff",
       "git_would_run_it_during": "every diff",
-      "how_this_host_stops_it": "diff.external= on the command line, and every diff also passes --no-ext-diff"
+      "how_this_host_stops_it": "diff.external= as an override, and every diff also passes --no-ext-diff"
     },
     {
       "key": "core.pager",
@@ -59,7 +59,7 @@
       "key": "credential.helper",
       "sentinel": "credential-helper",
       "git_would_run_it_during": "any fetch that needs authentication",
-      "how_this_host_stops_it": "one empty credential.helper on the command line empties the whole list, including the per-URL entries, and only the approved broker's helper is appended after it"
+      "how_this_host_stops_it": "one empty credential.helper override empties the whole list, including the per-URL entries, and only the approved broker's helper is appended after it"
     },
     {
       "key": "core.sshCommand",
@@ -95,7 +95,7 @@
       "key": "uploadpack.packObjectsHook",
       "sentinel": "pack-objects-hook",
       "git_would_run_it_during": "serving a fetch from this repository",
-      "how_this_host_stops_it": "uploadpack.packObjectsHook=, which reaches the subprocess too because a command-line override travels to every child Git starts"
+      "how_this_host_stops_it": "uploadpack.packObjectsHook=, which reaches the subprocess too because the overrides travel in the environment and every child Git starts inherits them"
     },
     {
       "key": "gpg.program",
@@ -141,5 +141,25 @@
     "* filter=marker",
     "* diff=marker",
     "* merge=marker"
+  ],
+  "outside_the_repositorys_own_configuration": [
+    {
+      "what": "a filter driver defined in a submodule's own configuration",
+      "sentinel": "child-filter",
+      "git_would_run_it_during": "any status of the parent that checks a submodule's dirtiness, which runs Git inside the submodule",
+      "how_this_host_stops_it": "the parent's audit cannot see it, so this host never enters a submodule: every read passes --ignore-submodules=all, submodules are counted from the index, and the preview says that what a submodule holds is neither measured nor copied"
+    },
+    {
+      "what": "a filter driver whose name is mixed case or holds an equals sign",
+      "sentinel": "mixed-case, with-equals",
+      "git_would_run_it_during": "the same reads as any other filter driver",
+      "how_this_host_stops_it": "the audit keeps the bytes the repository chose, because a configuration subsection is case-sensitive, and the overrides travel as GIT_CONFIG_KEY_<n> and GIT_CONFIG_VALUE_<n> rather than as `git -c`, because `-c` splits its argument at the first equals sign"
+    },
+    {
+      "what": "a driver whose name holds a control character",
+      "sentinel": "none; the operation is refused",
+      "git_would_run_it_during": "the same reads as any other filter driver",
+      "how_this_host_stops_it": "the name cannot be carried in an environment value, so the driver cannot be neutralised and the operation is refused rather than run beside it"
+    }
   ]
 }

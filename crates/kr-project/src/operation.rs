@@ -251,6 +251,38 @@ impl StagingSibling {
         Ok(self.directory.subdirectory(&name)?.identity())
     }
 
+    /// Returns the staged repository's identity and the instant the filesystem says it was made.
+    ///
+    /// A filesystem reuses a device and inode pair after the object that held it is gone, so an
+    /// identity alone cannot tell this host's own staged repository from an unrelated one that
+    /// inherited its numbers. The creation instant is a second witness: reuse with the same
+    /// creation instant is not something a filesystem produces. Where the platform reports no
+    /// creation instant the witness is the identity alone, and [`StagedWitness`] says so.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Destination`] when the staged repository is not there.
+    pub fn staged_witness(&self) -> Result<StagedWitness> {
+        let name = RelativeName::parse(STAGED_TREE)?;
+        let staged = self.directory.subdirectory(&name)?;
+        let created_at_ms = staged
+            .handle()
+            .dir_metadata()
+            .ok()
+            .and_then(|metadata| metadata.created().ok().or_else(|| metadata.modified().ok()))
+            .and_then(|instant| {
+                instant
+                    .into_std()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+            })
+            .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
+        Ok(StagedWitness {
+            identity: staged.identity(),
+            created_at_ms,
+        })
+    }
+
     /// Removes the sibling and everything inside it.
     ///
     /// # Errors
@@ -276,13 +308,62 @@ impl StagingSibling {
     }
 }
 
+/// What this host recorded about the object it staged.
+///
+/// The identity is the answer to "which name holds that object". The creation instant is what
+/// keeps that answer from being satisfied by an unrelated object whose numbers were reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StagedWitness {
+    /// The staged repository's filesystem identity.
+    pub identity: ObjectIdentity,
+    /// When the filesystem says it was created, where the platform reports it.
+    pub created_at_ms: Option<u64>,
+}
+
+impl StagedWitness {
+    /// Returns whether a later reading is of the same object.
+    ///
+    /// The identities must match. The creation instants must match too where both readings have
+    /// one; where either does not, the identity is the whole of the witness and this host says so
+    /// rather than pretending to more.
+    #[must_use]
+    pub fn same_object(&self, later: &Self) -> bool {
+        if self.identity != later.identity {
+            return false;
+        }
+        match (self.created_at_ms, later.created_at_ms) {
+            (Some(first), Some(second)) => first == second,
+            _ => true,
+        }
+    }
+}
+
 /// Publishes the staged repository into the destination, replacing nothing.
+///
+/// The object published is required to be the one the caller recorded, so a replacement between
+/// the recording and the publication is refused rather than published under the same action.
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::Destination`] when the destination name is taken or the rename fails.
-pub fn publish(staging: &StagingSibling, destination: &Destination) -> Result<ObjectIdentity> {
-    let staged = staging.staged_identity()?;
+/// Returns [`ProjectError::Destination`] when the destination name is taken or the rename fails,
+/// or [`ProjectError::IdentityChanged`] when the staged object is not the recorded one.
+pub fn publish(
+    staging: &StagingSibling,
+    destination: &Destination,
+    expected: StagedWitness,
+) -> Result<ObjectIdentity> {
+    let found = staging.staged_witness()?;
+    if !expected.same_object(&found) {
+        return Err(ProjectError::IdentityChanged {
+            detail: format!(
+                "this operation staged the repository {} and {} now holds {}; nothing is published",
+                expected.identity,
+                staging.tree_path().display(),
+                found.identity
+            ),
+        });
+    }
+    let staged = found.identity;
     let tree = RelativeName::parse(STAGED_TREE)?;
     rename_no_replace(
         staging.directory(),
@@ -310,9 +391,15 @@ pub fn publish(staging: &StagingSibling, destination: &Destination) -> Result<Ob
 /// Renames one directory into another's single name, refusing to replace anything.
 ///
 /// On Linux and Apple platforms this is one system call that fails when the destination name is
-/// taken, so nothing unexpected can be replaced however close the race is. Elsewhere the name is
-/// checked first and the identity of the published object is compared afterwards, which detects a
-/// replacement rather than preventing it; [`publish`] does the comparison for both paths.
+/// taken: `renameat2` with `RENAME_NOREPLACE` and `renameatx_np` with `RENAME_EXCL`. Nothing
+/// unexpected can be replaced however close the race is.
+///
+/// On Windows the guarantee is the platform's own rather than a flag's: `MoveFileEx` reports an
+/// error when either name is a directory and the destination exists, and
+/// `MOVEFILE_REPLACE_EXISTING` does not apply to a directory. So renaming a staged repository onto
+/// a name that is taken fails there too. The occupancy check below is the courtesy that gives a
+/// better diagnostic, and [`publish`]'s identity comparison afterwards is the second check rather
+/// than the guarantee. That path has not been executed on Windows in this build.
 #[cfg(unix)]
 fn rename_no_replace(
     from: &AuthorisedDirectory,
@@ -382,18 +469,32 @@ pub enum Reconciliation {
 pub fn reconcile(
     destination: &Destination,
     staging: Option<&StagingSibling>,
-    staged: ObjectIdentity,
+    staged: StagedWitness,
 ) -> Result<Reconciliation> {
     if let Ok(published) = destination.parent().subdirectory(destination.name())
-        && published.identity() == staged
+        && let Ok(metadata) = published.handle().dir_metadata()
+        && staged.same_object(&StagedWitness {
+            identity: published.identity(),
+            created_at_ms: metadata
+                .created()
+                .ok()
+                .or_else(|| metadata.modified().ok())
+                .and_then(|instant| {
+                    instant
+                        .into_std()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .ok()
+                })
+                .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX)),
+        })
     {
-        return Ok(Reconciliation::Published(staged));
+        return Ok(Reconciliation::Published(staged.identity));
     }
     if let Some(staging) = staging
-        && let Ok(identity) = staging.staged_identity()
-        && identity == staged
+        && let Ok(found) = staging.staged_witness()
+        && staged.same_object(&found)
     {
-        return Ok(Reconciliation::Staged(staged));
+        return Ok(Reconciliation::Staged(staged.identity));
     }
     Ok(Reconciliation::Unknown)
 }

@@ -95,7 +95,13 @@ impl BrokerRegistry {
     pub fn discover(git: &GitProgram) -> Self {
         let helper = PLATFORM_HELPERS
             .iter()
-            .map(|name| git.exec_path().join(name))
+            .flat_map(|name| {
+                // Windows needs the executable suffix; the other platforms have none.
+                [
+                    git.exec_path().join(name),
+                    git.exec_path().join(format!("{name}.exe")),
+                ]
+            })
             .find(|candidate| candidate.is_file());
         let ssh = ssh_program(git);
         let ssh_command = ssh.map(|program| {
@@ -195,7 +201,7 @@ impl BrokerRegistry {
                 detail: format!(
                     "{} is not a remote name; a remote name is letters, digits, hyphens and \
                      underscores",
-                    requested.remote_name
+                    crate::git::redact(&requested.remote_name)
                 ),
             });
         }
@@ -203,8 +209,8 @@ impl BrokerRegistry {
         if parsed.transport != requested.transport {
             return Err(ProjectError::RemoteRejected {
                 detail: format!(
-                    "the caller named the {:?} transport and {} is the {:?} transport",
-                    requested.transport, requested.url, parsed.transport
+                    "the caller named the {:?} transport and this remote is the {:?} transport",
+                    requested.transport, parsed.transport
                 ),
             });
         }
@@ -290,9 +296,9 @@ impl ValidatedRemote {
     }
 }
 
-/// What a URL turned out to be.
+/// What a remote URL turned out to be, once this host had validated every part of it.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ParsedRemote {
+pub struct ProjectRemote {
     /// The transport it names.
     pub transport: RemoteTransport,
     /// The URL as this host will pass it to Git: no password, nothing rewritten.
@@ -309,7 +315,7 @@ pub struct ParsedRemote {
 /// # Errors
 ///
 /// Returns [`ProjectError::RemoteRejected`] naming what is wrong with the URL.
-pub fn parse_remote(url: &str) -> Result<ParsedRemote> {
+pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
     let trimmed = url.trim();
     if trimmed != url || trimmed.is_empty() {
         return Err(ProjectError::RemoteRejected {
@@ -324,6 +330,16 @@ pub fn parse_remote(url: &str) -> Result<ParsedRemote> {
             detail: "a remote URL carries no control character".to_owned(),
         });
     }
+    // A query or a fragment is how a token reaches a URL without going through the authority:
+    // `https://host/repo.git?access_token=...`. Neither is part of a repository URL, so both are
+    // refused before anything reads them, and nothing here repeats what one carried.
+    if trimmed.contains('?') || trimmed.contains('#') {
+        return Err(ProjectError::RemoteRejected {
+            detail: "a remote URL carries no query and no fragment; a repository URL needs \
+                     neither, and a credential travels in one"
+                .to_owned(),
+        });
+    }
     // `<transport>::<address>` is how Git names a remote helper program, so it is refused before
     // anything else reads the string. The test is Git's own: a doubled colon whose prefix is a
     // transport name. An IPv6 URL's `::` sits after a `:/`, so it is not one of these.
@@ -336,15 +352,14 @@ pub fn parse_remote(url: &str) -> Result<ParsedRemote> {
     {
         return Err(ProjectError::RemoteRejected {
             detail: format!(
-                "{} names the remote helper program git-remote-{}, which this host does not run",
-                trimmed,
+                "this remote names the helper program git-remote-{}, which this host does not run",
                 &trimmed[..colon]
             ),
         });
     }
     // A local path next, because it is the one form that is not a URL at all.
     if Path::new(trimmed).is_absolute() && !trimmed.contains("://") {
-        return Ok(ParsedRemote {
+        return Ok(ProjectRemote {
             transport: RemoteTransport::LocalPath,
             url: trimmed.to_owned(),
             provider: String::new(),
@@ -375,14 +390,16 @@ pub fn parse_remote(url: &str) -> Result<ParsedRemote> {
             });
         }
         check_host(host)?;
-        return Ok(ParsedRemote {
+        return Ok(ProjectRemote {
             transport: RemoteTransport::Ssh,
             url: trimmed.to_owned(),
             provider: host.to_ascii_lowercase(),
         });
     }
+    // The refusal below names what is wrong and not the URL: a URL this host could not parse is
+    // one it cannot redact either, and a malformed authority is exactly where a credential sits.
     let parsed = url::Url::parse(trimmed).map_err(|error| ProjectError::RemoteRejected {
-        detail: format!("{trimmed} is not a URL this host can read: {error}"),
+        detail: format!("this remote is not a URL this host can read: {error}"),
     })?;
     let transport = match parsed.scheme() {
         "https" => RemoteTransport::Https,
@@ -416,10 +433,10 @@ pub fn parse_remote(url: &str) -> Result<ParsedRemote> {
     let host = parsed
         .host_str()
         .ok_or_else(|| ProjectError::RemoteRejected {
-            detail: format!("{trimmed} names no host"),
+            detail: "this remote names no host".to_owned(),
         })?;
     check_host(host)?;
-    Ok(ParsedRemote {
+    Ok(ProjectRemote {
         transport,
         url: trimmed.to_owned(),
         provider: host.to_ascii_lowercase(),
@@ -435,7 +452,7 @@ fn check_host(host: &str) -> Result<()> {
     }
     if host.starts_with('-') || host.contains("..") || host.contains('/') {
         return Err(ProjectError::RemoteRejected {
-            detail: format!("{host} is not a host name"),
+            detail: format!("{} is not a host name", crate::git::redact(host)),
         });
     }
     Ok(())
@@ -498,6 +515,43 @@ mod tests {
         let refusal = parse_remote("git:secret@example.invalid:repository.git")
             .expect_err("a password in the scp-like form is refused");
         assert!(!refusal.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn a_credential_in_a_query_or_a_fragment_is_refused_and_never_repeated() {
+        // A token reaches a URL without going through the authority: this is the form a provider's
+        // own documentation sometimes suggests, and it would be stored as the remote's URL.
+        for url in [
+            "https://example.invalid/repo.git?access_token=SECRET",
+            "https://example.invalid/repo.git?private_token=SECRET&x=1",
+            "https://example.invalid/repo.git#SECRET",
+            "git@example.invalid:owner/repo.git?token=SECRET",
+        ] {
+            let refusal = parse_remote(url).expect_err("a query or a fragment is refused");
+            assert!(
+                !refusal.to_string().contains("SECRET"),
+                "the refusal does not repeat it: {refusal}"
+            );
+        }
+    }
+
+    #[test]
+    fn no_refusal_repeats_the_url_it_refused() {
+        // A URL this host could not parse is one it could not redact either, and a malformed
+        // authority is exactly where a credential sits. So a refusal names what is wrong rather
+        // than what it was given.
+        for url in [
+            "https://user:SECRET@example.invalid:notaport/repo.git",
+            "kr::https://user:SECRET@example.invalid/repo.git",
+            "ftp://user:SECRET@example.invalid/repo.git",
+            "https://SECRET@example.invalid/repo.git",
+        ] {
+            let refusal = parse_remote(url).expect_err("each of these is refused");
+            assert!(
+                !refusal.to_string().contains("SECRET"),
+                "{url} is refused without repeating what it carried: {refusal}"
+            );
+        }
     }
 
     #[test]

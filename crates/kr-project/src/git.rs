@@ -17,9 +17,12 @@
 //!    on the user's path is not reachable.
 //! 3. **What configuration applies.** `GIT_CONFIG_NOSYSTEM=1`, and `GIT_CONFIG_GLOBAL` and
 //!    `GIT_CONFIG_SYSTEM` both point at a zero-byte file this host owns, so the only configuration
-//!    left is the repository's own. On top of it go the `-c` overrides below, and a command-line
-//!    `-c` beats every configuration file and reaches every subprocess Git starts, which is what
-//!    makes them unanswerable.
+//!    left is the repository's own. On top of it go the overrides below, carried as
+//!    `GIT_CONFIG_COUNT` with a `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>` pair for each one.
+//!    That form has the same precedence as `git -c`, beats every configuration file, and reaches
+//!    every subprocess Git starts. It is used in place of `-c` because `-c` splits its argument at
+//!    the first `=`, so a configuration key whose subsection contains one could not be overridden
+//!    at all: `-c filter.with=equals.clean=` sets `filter.with` and leaves the driver alone.
 //! 4. **What the repository's own configuration is allowed to name.** A `filter`, `diff` or `merge`
 //!    driver is named by an attribute and *defined* in configuration, and the set of names is
 //!    unbounded, so a fixed list of overrides cannot cover it. Instead the effective configuration
@@ -218,22 +221,29 @@ pub const PERMITTED_SUBCOMMANDS: &[&str] = &[
     "worktree",
 ];
 
-/// Arguments no invocation carries, whatever subcommand it is.
+/// Short arguments no invocation carries, whatever subcommand it is.
+const FORBIDDEN_SHORT: &[&str] = &["-c", "-f", "-u"];
+
+/// Long arguments no invocation carries, whatever subcommand it is.
 ///
-/// `--force` is how a Git command is told to discard what is in the way. `-c` and the directory
-/// and program overrides are how one would be told to run something else, and the profile owns
-/// those rather than the caller.
-const FORBIDDEN_ARGUMENTS: &[&str] = &[
-    "-c",
-    "-f",
-    "-u",
-    "--exec-path",
-    "--git-dir",
-    "--work-tree",
-    "--namespace",
-    "--upload-pack",
-    "--receive-pack",
+/// `--force` is how a Git command is told to discard what is in the way; the rest are how one
+/// would be told to run something else or to work somewhere else, and the profile owns those
+/// rather than the caller. They are matched in both directions, because Git's own subcommand
+/// parser accepts an unambiguous abbreviation: `--conf` would reach `--config`.
+const FORBIDDEN_LONG: &[&str] = &[
+    "--attr-source",
+    "--config",
     "--config-env",
+    "--exec-path",
+    "--force",
+    "--git-dir",
+    "--namespace",
+    "--receive-pack",
+    "--recurse-submodules",
+    "--separate-git-dir",
+    "--super-prefix",
+    "--upload-pack",
+    "--work-tree",
 ];
 
 /// Refuses an argument vector this service does not run.
@@ -257,11 +267,22 @@ pub fn check_arguments(arguments: &[&OsStr]) -> Result<()> {
     for argument in arguments {
         let text = argument.to_string_lossy();
         let head = text.split_once('=').map_or(text.as_ref(), |(head, _)| head);
-        if FORBIDDEN_ARGUMENTS.contains(&head) || text.starts_with("--force") {
+        let refused = FORBIDDEN_SHORT.contains(&head)
+            // An attached short option: `-cfilter.x.clean=sh` is `-c` with its value stuck to it.
+            || FORBIDDEN_SHORT
+                .iter()
+                .any(|short| text.len() > short.len() && text.starts_with(short))
+            // A long option, or any abbreviation of one that Git's own parser would accept.
+            || (head.starts_with("--")
+                && head.len() > 2
+                && FORBIDDEN_LONG
+                    .iter()
+                    .any(|long| long.starts_with(head) || head.starts_with(long)));
+        if refused {
             return Err(ProjectError::InvalidArgument(format!(
                 "{text} is not an argument this service passes: a forced command discards what is \
-                 in the way, and the configuration and the programs are the profile's rather than \
-                 the caller's"
+                 in the way, and the configuration, the programs and the directories are the \
+                 profile's rather than the caller's"
             )));
         }
         // The one template directory an invocation may name is the empty one the profile already
@@ -530,6 +551,10 @@ impl RestrictedProfile {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        // The child leads its own process group, so ending it ends everything it started: a
+        // remote helper, an ssh process, a credential helper. Killing the child alone would leave
+        // those holding the connection this cancellation was meant to drop.
+        own_process_group(&mut command);
         let mut child = command.spawn().map_err(|error| ProjectError::GitFailed {
             detail: format!("{} could not start: {error}", request.describe()),
         })?;
@@ -549,26 +574,41 @@ impl RestrictedProfile {
             if let Some(cancel) = request.cancel.as_ref()
                 && cancel.requested()
             {
-                // This host started the process, so this host ends it, by the handle it holds
+                // This host started the group, so this host ends it, by the identity it recorded
                 // rather than by a name or a pattern that could match somebody else's work.
-                let _ = child.kill();
-                let _ = child.wait();
-                cancel.record_stop();
+                let stopped = end_group(&mut child);
+                if stopped {
+                    cancel.record_stop();
+                }
                 return Err(ProjectError::Cancelled {
-                    detail: format!("{} was stopped by its owner", request.describe()),
+                    detail: format!(
+                        "{} was stopped by its owner{}",
+                        request.describe(),
+                        if stopped {
+                            ""
+                        } else {
+                            ", and this host could not confirm that every process it started ended"
+                        }
+                    ),
                 });
             }
             if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                if let Some(cancel) = request.cancel.as_ref() {
+                let stopped = end_group(&mut child);
+                if let Some(cancel) = request.cancel.as_ref()
+                    && stopped
+                {
                     cancel.record_stop();
                 }
                 return Err(ProjectError::GitFailed {
                     detail: format!(
-                        "{} ran longer than {} milliseconds and was stopped",
+                        "{} ran longer than {} milliseconds and was stopped{}",
                         request.describe(),
-                        request.deadline.as_millis()
+                        request.deadline.as_millis(),
+                        if stopped {
+                            ""
+                        } else {
+                            ", and this host could not confirm that every process it started ended"
+                        }
                     ),
                 });
             }
@@ -599,6 +639,9 @@ impl RestrictedProfile {
 
     /// Builds the complete argument vector one invocation runs with.
     ///
+    /// The configuration overrides are not here: they travel in the environment, because a
+    /// command-line `-c` cannot express a key whose subsection contains an equals sign.
+    ///
     /// Public because the profile's fixture reads it: a profile whose overrides drifted from the
     /// documented list is a profile nobody noticed changing.
     #[must_use]
@@ -613,13 +656,6 @@ impl RestrictedProfile {
             // repository exactly as it found it.
             argv.push(OsString::from("--no-optional-locks"));
         }
-        for (key, value) in self.overrides(request) {
-            argv.push(OsString::from("-c"));
-            let mut setting = OsString::from(key);
-            setting.push("=");
-            setting.push(&value);
-            argv.push(setting);
-        }
         argv.extend(
             request
                 .arguments
@@ -633,6 +669,7 @@ impl RestrictedProfile {
     ///
     /// The order matters in one place: `credential.helper` is blanked first, which empties the
     /// list, and the approved broker's helper is appended after it. Everything else is independent.
+    /// Each pair reaches Git as `GIT_CONFIG_KEY_<n>` and `GIT_CONFIG_VALUE_<n>`, in this order.
     #[must_use]
     pub fn overrides(&self, request: &GitRequest<'_>) -> Vec<(String, OsString)> {
         let mut settings: Vec<(String, OsString)> = vec![
@@ -687,10 +724,19 @@ impl RestrictedProfile {
             // below.
             ("protocol.allow".to_owned(), OsString::from("never")),
             ("protocol.version".to_owned(), OsString::from("2")),
-            // A submodule is its own repository with its own configuration, so nothing here
-            // recurses into one without being asked.
+            // A submodule is its own repository, and its configuration lives in the parent's
+            // modules directory, which the parent's own configuration listing does not read. So a
+            // driver defined there is one the audit cannot see, and the only safe answer is never
+            // to enter a submodule: every read passes `--ignore-submodules=all` as well, because
+            // `submodule.recurse` alone does not stop a status from checking a submodule's
+            // dirtiness, and checking it runs Git inside the submodule.
             ("fetch.recurseSubmodules".to_owned(), OsString::from("no")),
             ("submodule.recurse".to_owned(), OsString::from("false")),
+            ("diff.ignoreSubmodules".to_owned(), OsString::from("all")),
+            (
+                "status.submoduleSummary".to_owned(),
+                OsString::from("false"),
+            ),
             // Objects a remote sends are checked rather than taken on trust.
             ("transfer.fsckObjects".to_owned(), OsString::from("true")),
             ("fetch.fsckObjects".to_owned(), OsString::from("true")),
@@ -758,9 +804,6 @@ impl RestrictedProfile {
                 OsString::from("GIT_CONFIG_SYSTEM"),
                 self.empty_config.as_os_str().to_owned(),
             ),
-            // An inherited `GIT_CONFIG_KEY_<n>` set is as strong as a command line, so the count
-            // that reads it is set to nothing.
-            (OsString::from("GIT_CONFIG_COUNT"), OsString::from("0")),
             (OsString::from("GIT_TERMINAL_PROMPT"), OsString::from("0")),
             (OsString::from("GIT_ASKPASS"), OsString::new()),
             (OsString::from("SSH_ASKPASS"), OsString::new()),
@@ -800,6 +843,21 @@ impl RestrictedProfile {
                 }),
             ),
         ];
+        // The overrides, as the environment form of `git -c`. Setting the count here also
+        // neutralises an inherited one: the child's environment is built from nothing, so the only
+        // key and value pairs Git reads are these.
+        let overrides = self.overrides(request);
+        environment.push((
+            OsString::from("GIT_CONFIG_COUNT"),
+            OsString::from(overrides.len().to_string()),
+        ));
+        for (index, (key, value)) in overrides.into_iter().enumerate() {
+            environment.push((
+                OsString::from(format!("GIT_CONFIG_KEY_{index}")),
+                OsString::from(key),
+            ));
+            environment.push((OsString::from(format!("GIT_CONFIG_VALUE_{index}")), value));
+        }
         if request.read_only {
             environment.push((OsString::from("GIT_OPTIONAL_LOCKS"), OsString::from("0")));
         }
@@ -814,6 +872,45 @@ impl RestrictedProfile {
         environment.extend(inherited_platform_environment(&self.home));
         environment
     }
+}
+
+/// Puts the child in a process group of its own, so ending it ends its descendants.
+///
+/// On Windows there is no equivalent that stays inside safe Rust: the containment there is a Job
+/// Object, which is a call into `kernel32`, and this crate does not leave safe Rust. So a
+/// cancellation on Windows ends the Git process and says it could not confirm the rest; the
+/// qualification pass on Windows owns closing that.
+#[cfg(unix)]
+fn own_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    command.process_group(0);
+}
+
+/// Puts the child in a process group of its own, so ending it ends its descendants.
+#[cfg(not(unix))]
+fn own_process_group(_command: &mut Command) {}
+
+/// Ends a child and everything it started, and says whether it could confirm that.
+#[cfg(unix)]
+fn end_group(child: &mut std::process::Child) -> bool {
+    let Ok(raw) = i32::try_from(child.id()) else {
+        return false;
+    };
+    // The child leads its own group, so its identifier is the group's. Nothing else on this
+    // machine is in it.
+    let Some(pid) = rustix::process::Pid::from_raw(raw) else {
+        return false;
+    };
+    let killed = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).is_ok();
+    let reaped = child.wait().is_ok();
+    killed && reaped
+}
+
+/// Ends a child and everything it started, and says whether it could confirm that.
+#[cfg(not(unix))]
+fn end_group(child: &mut std::process::Child) -> bool {
+    child.kill().is_ok() && child.wait().is_ok()
 }
 
 /// The separator between two entries of `PATH` on this platform.
@@ -1031,14 +1128,23 @@ impl GitOutput {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ConfigurationAudit {
     /// The driver sections and names to blank, as `("filter", "marker")`.
+    ///
+    /// The section is lowercase, because Git writes it that way. The name keeps the bytes the
+    /// repository chose, because a configuration subsection is case-sensitive and an override
+    /// spelled differently overrides nothing.
     pub drivers: Vec<(String, String)>,
-    /// The execution-capable keys that a command-line override empties.
+    /// The execution-capable keys that an override empties.
     pub blanked: Vec<String>,
     /// The execution-capable keys no override removes.
     ///
     /// An operation that would depend on one of these is refused rather than run, which is what
     /// section 14 means by exposing the limitation instead of executing it.
     pub refused: Vec<String>,
+    /// The digest of the listing this audit was taken from.
+    ///
+    /// A caller compares it against a second reading to find out whether the configuration
+    /// changed under an invocation. See [`ConfigurationAudit::unchanged`].
+    pub digest: [u8; 32],
 }
 
 impl ConfigurationAudit {
@@ -1078,14 +1184,28 @@ impl ConfigurationAudit {
             // Each record is `key` or `key\nvalue`. A key with no value is a boolean true.
             let key = record.split('\n').next().unwrap_or(record);
             let lower = key.to_ascii_lowercase();
-            if let Some((section, rest)) = lower.split_once('.')
-                && let Some((name, leaf)) = rest.rsplit_once('.')
+            // A driver's section and leaf are case-insensitive and Git writes them lowercase; its
+            // subsection is case-sensitive and Git writes it verbatim. So the section and the leaf
+            // are matched against the lowercase form and the name is taken from the key itself.
+            if let (Some((section, lower_rest)), Some((_, rest))) =
+                (lower.split_once('.'), key.split_once('.'))
+                && let (Some((_, leaf)), Some((name, _))) =
+                    (lower_rest.rsplit_once('.'), rest.rsplit_once('.'))
                 && !name.is_empty()
                 && DRIVER_SECTIONS.iter().any(|(known, keys)| {
                     *known == section && keys.iter().any(|(candidate, _)| *candidate == leaf)
                 })
             {
-                drivers.insert((section.to_owned(), name.to_owned()), ());
+                if name.chars().any(char::is_control) {
+                    // A subsection with a control character in it is not a name this host can put
+                    // in an environment value, so the driver cannot be neutralised and the
+                    // operation is refused instead of run beside it.
+                    refused.push(format!(
+                        "{section}.<a name holding a control character>.{leaf}"
+                    ));
+                } else {
+                    drivers.insert((section.to_owned(), name.to_owned()), ());
+                }
             }
             for rule in EXECUTION_KEYS {
                 if rule.matches(&lower) {
@@ -1104,7 +1224,30 @@ impl ConfigurationAudit {
             drivers: drivers.into_keys().collect(),
             blanked,
             refused,
+            digest: kr_cbor::sha256(listing.as_bytes()),
         }
+    }
+
+    /// Refuses when the configuration changed between this audit and a later reading.
+    ///
+    /// The overrides an invocation runs with are built from the drivers *this* audit found, and a
+    /// writer under the same operating-system account can add one afterwards. Nothing available
+    /// through Git's own interface prevents that, so what the host does is notice: a second reading
+    /// that differs means the result was produced under a configuration this host did not audit,
+    /// and the result is refused rather than returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::IdentityChanged`] when the two readings differ.
+    pub fn unchanged(&self, later: &Self) -> Result<()> {
+        if self.digest == later.digest {
+            return Ok(());
+        }
+        Err(ProjectError::IdentityChanged {
+            detail: "this repository's configuration changed while the host was reading it, so \
+                     what it read was produced under a configuration the host did not audit"
+                .to_owned(),
+        })
     }
 
     /// Returns the limitations this audit exposes, one line each.
@@ -1181,10 +1324,15 @@ pub fn redact(text: &str) -> String {
             })
             .unwrap_or(after.len());
         let (authority, tail) = after.split_at(end);
+        // The scheme decides whether a bare user name is a secret. A token is often the *user* of
+        // an https URL (`https://TOKEN:x-oauth-basic@host`, and `https://TOKEN@host`), so the whole
+        // user information goes. An ssh user name is not a secret and is diagnostic, so it stays
+        // unless it carries a colon.
+        let ssh = head.ends_with("ssh://");
         match authority.rsplit_once('@') {
-            Some((user, host)) if user.contains(':') => {
-                out.push_str(user.split(':').next().unwrap_or(""));
-                out.push_str(":<credential removed>@");
+            Some((user, host)) if user.contains(':') || !ssh => {
+                let _ = user;
+                out.push_str("<credential removed>@");
                 out.push_str(host);
             }
             _ => out.push_str(authority),
@@ -1349,17 +1497,7 @@ mod tests {
 
     #[test]
     fn a_found_driver_is_blanked_by_name_and_a_boolean_is_set_rather_than_emptied() {
-        let profile = RestrictedProfile {
-            git: GitProgram {
-                program: PathBuf::from("/usr/bin/git"),
-                exec_path: PathBuf::from("/usr/libexec/git-core"),
-                version: "git version 2.50.1".to_owned(),
-            },
-            empty_config: PathBuf::from("/state/git-profile/empty-config"),
-            hooks: PathBuf::from("/state/git-profile/hooks"),
-            template: PathBuf::from("/state/git-profile/template"),
-            home: PathBuf::from("/state/git-profile/home"),
-        };
+        let profile = test_profile();
         let arguments: [&OsStr; 1] = [OsStr::new("status")];
         let request = GitRequest::read(Path::new("/tree"), &arguments)
             .with_drivers(vec![("filter".to_owned(), "marker".to_owned())]);
@@ -1415,7 +1553,29 @@ mod tests {
             value("GIT_CONFIG_GLOBAL"),
             Some(OsString::from("/state/git-profile/empty-config"))
         );
-        assert_eq!(value("GIT_CONFIG_COUNT"), Some(OsString::from("0")));
+        // The overrides travel as key and value pairs, and the count is theirs.
+        let count = value("GIT_CONFIG_COUNT").expect("the count is set");
+        assert_eq!(
+            count.to_string_lossy().parse::<usize>().expect("a count"),
+            overrides.len(),
+            "every override is carried"
+        );
+        let carried: Vec<(OsString, OsString)> = (0..overrides.len())
+            .map(|index| {
+                (
+                    value(&format!("GIT_CONFIG_KEY_{index}")).expect("a key"),
+                    value(&format!("GIT_CONFIG_VALUE_{index}")).expect("a value"),
+                )
+            })
+            .collect();
+        assert_eq!(
+            carried,
+            overrides
+                .iter()
+                .map(|(key, value)| (OsString::from(key), value.clone()))
+                .collect::<Vec<_>>(),
+            "in the order the overrides are applied"
+        );
         assert_eq!(value("GIT_TERMINAL_PROMPT"), Some(OsString::from("0")));
         assert_eq!(value("GIT_OPTIONAL_LOCKS"), Some(OsString::from("0")));
         assert_eq!(value("GIT_ALLOW_PROTOCOL"), Some(OsString::new()));
@@ -1442,7 +1602,6 @@ mod tests {
             "GIT_OBJECT_DIRECTORY",
             "GIT_DIR",
             "GIT_WORK_TREE",
-            "GIT_CONFIG_KEY_0",
             "GIT_CONFIG_PARAMETERS",
             "GIT_TRACE",
         ] {
@@ -1451,21 +1610,17 @@ mod tests {
                 "{name} is not in the child's environment"
             );
         }
+        // The configuration overrides are not on the command line, because `-c` splits its
+        // argument at the first equals sign and a driver's name may hold one.
+        assert!(
+            !argv.contains(&OsString::from("-c")),
+            "no override travels as a command-line setting"
+        );
     }
 
     #[test]
     fn a_named_transport_is_allowed_back_and_the_broker_supplies_the_only_programs() {
-        let profile = RestrictedProfile {
-            git: GitProgram {
-                program: PathBuf::from("/usr/bin/git"),
-                exec_path: PathBuf::from("/usr/libexec/git-core"),
-                version: "git version 2.50.1".to_owned(),
-            },
-            empty_config: PathBuf::from("/state/git-profile/empty-config"),
-            hooks: PathBuf::from("/state/git-profile/hooks"),
-            template: PathBuf::from("/state/git-profile/template"),
-            home: PathBuf::from("/state/git-profile/home"),
-        };
+        let profile = test_profile();
         let arguments: [&OsStr; 1] = [OsStr::new("clone")];
         let helper = OsString::from("/usr/libexec/git-core/git-credential-osxkeychain");
         let request = GitRequest::write(Path::new("/stage"), &arguments).with_transport(
@@ -1581,19 +1736,160 @@ mod tests {
     fn a_credential_in_a_diagnostic_is_removed_rather_than_shown() {
         assert_eq!(
             redact("fatal: could not read https://user:secret@example.invalid/x.git"),
-            "fatal: could not read https://user:<credential removed>@example.invalid/x.git"
+            "fatal: could not read https://<credential removed>@example.invalid/x.git"
+        );
+        // A token is often the *user* of an https URL, so the whole user information goes rather
+        // than the password half of it.
+        assert_eq!(
+            redact("fatal: https://ghp_TOKEN:x-oauth-basic@example.invalid/x.git"),
+            "fatal: https://<credential removed>@example.invalid/x.git"
+        );
+        assert_eq!(
+            redact("fatal: https://ghp_TOKEN@example.invalid/x.git"),
+            "fatal: https://<credential removed>@example.invalid/x.git"
         );
         // Two URLs on one line are both covered.
         assert_eq!(
             redact("https://a:b@one.invalid/x https://c:d@two.invalid/y"),
-            "https://a:<credential removed>@one.invalid/x https://c:<credential removed>@two.invalid/y"
+            "https://<credential removed>@one.invalid/x https://<credential removed>@two.invalid/y"
         );
-        // A URL with a user and no password carries no secret, so it is left alone.
+        // An ssh user name is not a secret and is diagnostic, so it stays.
         assert_eq!(
             redact("ssh://git@example.invalid/x.git"),
             "ssh://git@example.invalid/x.git"
         );
+        // Unless it carries one.
+        assert_eq!(
+            redact("ssh://git:secret@example.invalid/x.git"),
+            "ssh://<credential removed>@example.invalid/x.git"
+        );
         assert_eq!(redact("nothing to redact"), "nothing to redact");
+    }
+
+    #[test]
+    fn a_driver_name_keeps_the_bytes_the_repository_chose() {
+        // A configuration subsection is case-sensitive, and Git writes it verbatim. An override
+        // spelled differently overrides nothing, so the audit keeps the name it read.
+        let audit = ConfigurationAudit::classify(
+            "filter.Mixed.clean\0echo\0filter.with=equals.clean\0echo\0",
+        );
+        assert_eq!(
+            audit.drivers,
+            vec![
+                ("filter".to_owned(), "Mixed".to_owned()),
+                ("filter".to_owned(), "with=equals".to_owned()),
+            ]
+        );
+        let profile = test_profile();
+        let arguments: [&OsStr; 1] = [OsStr::new("status")];
+        let request =
+            GitRequest::read(Path::new("/tree"), &arguments).with_drivers(audit.drivers.clone());
+        let overrides = profile.overrides(&request);
+        assert!(
+            overrides
+                .iter()
+                .any(|(key, value)| key == "filter.Mixed.clean" && value.is_empty()),
+            "the mixed-case driver is overridden under its own name"
+        );
+        // A key holding an equals sign is expressible only in the environment form, which is why
+        // the overrides travel there: the key and the value are separate variables.
+        let environment = profile.environment(&request);
+        let keys: Vec<String> = environment
+            .iter()
+            .filter(|(name, _)| name.to_string_lossy().starts_with("GIT_CONFIG_KEY_"))
+            .map(|(_, value)| value.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            keys.iter().any(|key| key == "filter.with=equals.clean"),
+            "a driver whose name holds an equals sign is overridden exactly: {keys:?}"
+        );
+    }
+
+    #[test]
+    fn a_driver_name_this_host_cannot_express_is_refused_rather_than_left_alone() {
+        let audit = ConfigurationAudit::classify("filter.bad\u{1}name.clean\0echo\0");
+        assert!(audit.drivers.is_empty());
+        let refusal = audit
+            .require_neutralised()
+            .expect_err("a name this host cannot carry is refused");
+        assert!(
+            refusal.to_string().contains("control character"),
+            "the refusal says why: {refusal}"
+        );
+    }
+
+    #[test]
+    fn a_configuration_that_changed_under_a_reading_is_refused_rather_than_returned() {
+        // The overrides an invocation runs with are the drivers the audit found. A writer that
+        // adds one afterwards is not something Git's interface lets this host prevent, so what it
+        // does is notice.
+        let first = ConfigurationAudit::classify("core.bare\0false\0");
+        let same = ConfigurationAudit::classify("core.bare\0false\0");
+        first.unchanged(&same).expect("nothing changed");
+        let later = ConfigurationAudit::classify("core.bare\0false\0filter.new.clean\0echo\0");
+        let refusal = first
+            .unchanged(&later)
+            .expect_err("a configuration that changed is refused");
+        assert_eq!(refusal.code(), kr_protocol::error::ErrorCode::SourceChanged);
+    }
+
+    #[test]
+    fn an_abbreviated_or_attached_option_is_refused_like_its_whole_form() {
+        // Git's own subcommand parser accepts an unambiguous abbreviation, and a short option may
+        // carry its value attached, so both forms are refused as the whole form is.
+        for refused in [
+            "--conf=filter.x.clean=sh",
+            "--config=filter.x.clean=sh",
+            "--config-e=core.pager=sh",
+            "-cfilter.x.clean=sh",
+            "--upload-pack=sh",
+            "--upl=sh",
+            "--attr-source=HEAD",
+            "--recurse-submodules",
+            "--separate-git-dir=/tmp/x",
+            "--super-prefix=x",
+        ] {
+            let arguments = [OsStr::new("clone"), OsStr::new(refused)];
+            assert!(
+                check_arguments(&arguments).is_err(),
+                "{refused} is not an argument this service passes"
+            );
+        }
+        // And the forms this service does pass are still accepted.
+        for permitted in [
+            "--porcelain=v2",
+            "--untracked-files=all",
+            "--ignored=matching",
+            "--ignore-submodules=all",
+            "--no-renames",
+            "--detach",
+            "--no-hardlinks",
+            "--no-checkout",
+            "--template=",
+            "--origin=origin",
+            "--initial-branch=main",
+            "--end-of-options",
+            "--path-format=absolute",
+        ] {
+            let arguments = [OsStr::new("status"), OsStr::new(permitted)];
+            check_arguments(&arguments)
+                .unwrap_or_else(|error| panic!("{permitted} is one this service passes: {error}"));
+        }
+    }
+
+    /// A profile whose directories are named but never created, for the tests that read its lists.
+    fn test_profile() -> RestrictedProfile {
+        RestrictedProfile {
+            git: GitProgram {
+                program: PathBuf::from("/usr/bin/git"),
+                exec_path: PathBuf::from("/usr/libexec/git-core"),
+                version: "git version 2.50.1".to_owned(),
+            },
+            empty_config: PathBuf::from("/state/git-profile/empty-config"),
+            hooks: PathBuf::from("/state/git-profile/hooks"),
+            template: PathBuf::from("/state/git-profile/template"),
+            home: PathBuf::from("/state/git-profile/home"),
+        }
     }
 
     #[test]

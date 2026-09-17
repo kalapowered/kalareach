@@ -525,7 +525,16 @@ application, so an envelope that names one is refused before anything runs.
 Some of these calls are long. A clone reaches the network and a materialisation copies files, so
 they run on blocking tasks and the journal's lock is never held across a subprocess. A cancellation
 therefore cannot reach inside a running clone: it sets the operation's flag, and the invocation that
-holds the child process ends the child *it* started, by the handle this process owns.
+holds the child ends the process group *it* started, by the identity this process recorded. On Unix
+that group holds every helper the clone spawned; on Windows the containment a Job Object would give
+is outside this crate, and a cancellation there says the host could not confirm that everything it
+started ended.
+
+This daemon's project mutations check the accepted deadline and the connection's authority
+immediately before the write, as its transfer mutations do. That is the boundary the host contract
+has today: a mutation still waits for a blocking thread and for the journal's lock after the check,
+and closing that gap means carrying the admission into the service's own transaction for every
+service rather than re-deriving it here.
 
 At startup the service resolves whatever an earlier daemon left unfinished, before anything is
 served. A publication that landed is completed; one that did not is either finished or cleaned up;

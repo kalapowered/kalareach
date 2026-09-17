@@ -40,6 +40,7 @@ use kr_transfer::ObjectIdentity;
 
 use crate::error::{ProjectError, Result};
 use crate::identity::RepositoryIdentity;
+use crate::operation::StagedWitness;
 
 /// The schema version this build reads.
 pub const SCHEMA_VERSION: i64 = 1;
@@ -136,11 +137,11 @@ pub struct OperationRow {
     pub destination_name: String,
     /// The private sibling the content was staged in, when one was made.
     pub staging_name: Option<String>,
-    /// The staged repository's filesystem identity, recorded before the publication.
+    /// What this host recorded about the object it staged, before the publication.
     ///
     /// This is what makes an interrupted publication resolvable: the question is not whether a
     /// name exists but which name holds *this object*.
-    pub staged_identity: Option<ObjectIdentity>,
+    pub staged_identity: Option<StagedWitness>,
     /// Why it ended, when it ended for a reason.
     pub detail: Option<String>,
     /// When it started.
@@ -348,6 +349,7 @@ impl Store {
                      staging_name          TEXT,
                      staged_device         INTEGER,
                      staged_file_id        INTEGER,
+                     staged_created_at_ms  INTEGER,
                      detail                TEXT,
                      started_at_ms         INTEGER NOT NULL,
                      ended_at_ms           INTEGER
@@ -464,7 +466,7 @@ impl Store {
         state: OperationState,
         detail: Option<&str>,
         ended_at_ms: Option<TimestampMs>,
-        staged_identity: Option<ObjectIdentity>,
+        staged_identity: Option<StagedWitness>,
         staging_name: Option<&str>,
     ) -> Result<()> {
         self.connection
@@ -475,15 +477,19 @@ impl Store {
                         ended_at_ms = COALESCE(?4, ended_at_ms),
                         staged_device = COALESCE(?5, staged_device),
                         staged_file_id = COALESCE(?6, staged_file_id),
-                        staging_name = COALESCE(?7, staging_name)
+                        staged_created_at_ms = COALESCE(?7, staged_created_at_ms),
+                        staging_name = COALESCE(?8, staging_name)
                   WHERE action_id = ?1",
                 params![
                     action_id.get().as_bytes().to_vec(),
                     operation_state_text(state),
                     detail,
                     ended_at_ms.map(|stamp| i64_of(stamp.get())),
-                    staged_identity.map(|identity| i64_of(identity.device)),
-                    staged_identity.map(|identity| i64_of(identity.file_id)),
+                    staged_identity.map(|staged| i64_of(staged.identity.device)),
+                    staged_identity.map(|staged| i64_of(staged.identity.file_id)),
+                    staged_identity
+                        .and_then(|staged| staged.created_at_ms)
+                        .map(i64_of),
                     staging_name,
                 ],
             )
@@ -1235,7 +1241,7 @@ fn announce(
 const OPERATION_COLUMNS: &str = "action_id, actor_id, environment_id, project_repository_id, \
      method, state, remote_name, remote_transport, remote_url, remote_provider, remote_broker, \
      flow, destination_state, parent_path, destination_name, staging_name, staged_device, \
-     staged_file_id, detail, started_at_ms, ended_at_ms";
+     staged_file_id, staged_created_at_ms, detail, started_at_ms, ended_at_ms";
 
 /// The columns a repository row is read from.
 const PROJECT_COLUMNS: &str = "project_repository_id, environment_id, label, origin, state, \
@@ -1256,9 +1262,10 @@ fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result
                                      method, state, remote_name, remote_transport, remote_url,
                                      remote_provider, remote_broker, flow, destination_state,
                                      parent_path, destination_name, staging_name, staged_device,
-                                     staged_file_id, detail, started_at_ms, ended_at_ms)
+                                     staged_file_id, staged_created_at_ms, detail, started_at_ms,
+                                     ended_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20, ?21)",
+                     ?18, ?19, ?20, ?21, ?22)",
             params![
                 row.action_id.get().as_bytes().to_vec(),
                 row.actor_id.as_str(),
@@ -1276,8 +1283,13 @@ fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result
                 row.parent_path,
                 row.destination_name,
                 row.staging_name,
-                row.staged_identity.map(|id| i64_of(id.device)),
-                row.staged_identity.map(|id| i64_of(id.file_id)),
+                row.staged_identity
+                    .map(|staged| i64_of(staged.identity.device)),
+                row.staged_identity
+                    .map(|staged| i64_of(staged.identity.file_id)),
+                row.staged_identity
+                    .and_then(|staged| staged.created_at_ms)
+                    .map(i64_of),
                 row.detail,
                 i64_of(row.started_at_ms.get()),
                 row.ended_at_ms.map(|stamp| i64_of(stamp.get())),
@@ -1297,6 +1309,7 @@ fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
     let destination_state: String = row.get(12)?;
     let device: Option<i64> = row.get(16)?;
     let file_id: Option<i64> = row.get(17)?;
+    let created_at_ms: Option<i64> = row.get(18)?;
     let remote = match (row.get::<_, Option<String>>(6)?, transport) {
         (Some(name), Some(transport)) => Some(RemoteSpecification {
             remote_name: name,
@@ -1325,16 +1338,19 @@ fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
         destination_name: row.get(14)?,
         staging_name: row.get(15)?,
         staged_identity: match (device, file_id) {
-            (Some(device), Some(file_id)) => Some(ObjectIdentity {
-                device: u64_of(device),
-                file_id: u64_of(file_id),
+            (Some(device), Some(file_id)) => Some(StagedWitness {
+                identity: ObjectIdentity {
+                    device: u64_of(device),
+                    file_id: u64_of(file_id),
+                },
+                created_at_ms: created_at_ms.map(u64_of),
             }),
             _ => None,
         },
-        detail: row.get(18)?,
-        started_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(19)?)),
+        detail: row.get(19)?,
+        started_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(20)?)),
         ended_at_ms: row
-            .get::<_, Option<i64>>(20)?
+            .get::<_, Option<i64>>(21)?
             .map(|stamp| TimestampMs::new(u64_of(stamp))),
     })
 }
@@ -1749,9 +1765,12 @@ mod tests {
         // The row is the create token, and it exists before anything is on disk.
         assert_eq!(read.state, OperationState::Staging);
         // The state change and the identity that resolves a publication are recorded together.
-        let staged = ObjectIdentity {
-            device: 16_777_234,
-            file_id: 98_765,
+        let staged = StagedWitness {
+            identity: ObjectIdentity {
+                device: 16_777_234,
+                file_id: 98_765,
+            },
+            created_at_ms: Some(1_700_000_000_000),
         };
         store
             .set_operation_state(

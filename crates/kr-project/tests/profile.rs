@@ -482,3 +482,116 @@ fn the_fixture_document_and_the_hosts_own_table_name_the_same_keys() {
         );
     }
 }
+
+#[test]
+fn a_submodules_own_filter_never_runs_because_this_host_never_enters_one() {
+    // A submodule's configuration lives in the parent's modules directory, which the parent's own
+    // configuration listing does not read. So a driver defined there is one the audit cannot see
+    // and cannot blank, and the only safe answer is never to enter the submodule. Checking a
+    // submodule's dirtiness is what would enter it, so every read passes `--ignore-submodules=all`
+    // and the submodules are counted from the index instead.
+    let fixture = Fixture::create();
+    let planted = support::planted_submodule(fixture.work(), "with-submodule");
+    let repository = OpenedRepository::open(
+        fixture.service().profile(),
+        fixture.environment_id(),
+        &planted.parent,
+    )
+    .expect("the parent opens");
+    // The audit genuinely cannot see the submodule's driver, which is why this matters.
+    assert!(
+        !repository
+            .audit()
+            .drivers
+            .iter()
+            .any(|(_, name)| name == "child"),
+        "the submodule's driver is invisible to the parent's audit: {:?}",
+        repository.audit().drivers
+    );
+    let surveyed = survey(
+        fixture.service().profile(),
+        &repository,
+        &PreviewRequest {
+            project_repository_id: kr_protocol::ids::ProjectRepositoryId::new(
+                kr_protocol::scalars::Uuid::from_bytes([3; 16]),
+            ),
+            kind: WorkspaceKind::Isolated,
+            policy: include_everything(),
+            base_revision: "HEAD",
+            base_reference: None,
+            base_change_set_id: None,
+            at_ms: kr_protocol::scalars::TimestampMs::new(1),
+        },
+    )
+    .expect("the status is read");
+    assert_eq!(
+        planted.escaped(),
+        Vec::<String>::new(),
+        "the submodule's own filter never ran"
+    );
+    // And the submodule is still counted and named, from the index.
+    let submodules: Vec<&str> = surveyed
+        .entries
+        .iter()
+        .filter(|entry| entry.class == kr_protocol::project::InclusionClass::Submodule)
+        .map(|entry| entry.path.as_str())
+        .collect();
+    assert_eq!(submodules, vec![planted.submodule_path.as_str()]);
+    let count = surveyed
+        .preview
+        .counts
+        .iter()
+        .find(|count| count.class == kr_protocol::project::InclusionClass::Submodule)
+        .expect("the preview counts submodules");
+    assert_eq!(count.total, kr_protocol::scalars::U64::new(1));
+    // And the host says what it did not look at.
+    assert!(
+        surveyed
+            .preview
+            .limitations
+            .iter()
+            .any(|line| line.contains("does not look inside one")),
+        "the limitation is stated: {:?}",
+        surveyed.preview.limitations
+    );
+}
+
+#[test]
+fn a_driver_named_in_a_spelling_an_override_could_miss_still_never_runs() {
+    // A configuration subsection is case-sensitive, and a command-line `-c` splits its argument at
+    // the first equals sign. Either would let a driver survive an override that was spelled or
+    // carried wrongly, so this plants both spellings in real repositories and asks for a status.
+    for (name, key) in [("mixed-case", "Mixed"), ("with-equals", "with=equals")] {
+        let fixture = Fixture::create();
+        let path = ordinary_repository(fixture.work(), name);
+        let sentinels = support::plant_named_driver(fixture.work(), &path, name, key);
+        let repository =
+            OpenedRepository::open(fixture.service().profile(), fixture.environment_id(), &path)
+                .expect("the repository opens");
+        assert!(
+            repository
+                .audit()
+                .drivers
+                .iter()
+                .any(|(section, found)| section == "filter" && found == key),
+            "the audit found {key} under its own spelling: {:?}",
+            repository.audit().drivers
+        );
+        let arguments: [&OsStr; 5] = [
+            OsStr::new("status"),
+            OsStr::new("--porcelain=v2"),
+            OsStr::new("-z"),
+            OsStr::new("--untracked-files=all"),
+            OsStr::new("--ignore-submodules=all"),
+        ];
+        fixture
+            .service()
+            .profile()
+            .run_checked(&repository.read(&arguments))
+            .expect("the status is read");
+        assert!(
+            !sentinels.exists(),
+            "the {key} driver never ran during the status"
+        );
+    }
+}

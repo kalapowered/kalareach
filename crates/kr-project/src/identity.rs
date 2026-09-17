@@ -218,6 +218,35 @@ impl OpenedRepository {
         &self.audit
     }
 
+    /// Confirms that the objects and the configuration an invocation ran against are still these.
+    ///
+    /// Two things a Git invocation does are outside this crate's handles. It resolves the path
+    /// `-C` names for itself, and it reads the configuration for itself. So a writer under the
+    /// same operating-system account could put a different tree at that path, or add a driver the
+    /// audit did not blank, between the check and the invocation.
+    ///
+    /// Neither is preventable through Git's own interface, so what this host does is notice:
+    /// re-open the path, compare both filesystem identities, re-read the configuration and compare
+    /// its digest. A result produced against something else is refused rather than returned. What
+    /// remains is a change made and undone inside one invocation, which two readings cannot
+    /// distinguish from no change at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::IdentityChanged`] when either identity or the configuration differs.
+    pub fn confirm(&self, profile: &RestrictedProfile) -> Result<()> {
+        let tree =
+            AuthorisedDirectory::open_root(self.work_tree.environment_id(), &self.top_level)?;
+        let git_dir =
+            AuthorisedDirectory::open_root(self.work_tree.environment_id(), &self.git_dir_path)?;
+        self.require_identity(RepositoryIdentity {
+            git_dir: git_dir.identity(),
+            work_tree: tree.identity(),
+        })?;
+        let later = ConfigurationAudit::take(profile, &self.top_level)?;
+        self.audit.unchanged(&later)
+    }
+
     /// Builds a read that runs under this repository's own driver overrides.
     #[must_use]
     pub fn read<'a>(&'a self, arguments: &'a [&'a OsStr]) -> GitRequest<'a> {

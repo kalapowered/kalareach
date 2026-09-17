@@ -143,6 +143,39 @@ pub fn parse_status(text: &str) -> Result<Vec<StatusEntry>> {
     Ok(entries)
 }
 
+/// Returns the submodule paths the index holds, without entering any of them.
+///
+/// A submodule is a `160000` entry in the index. Reading the index is a read of the repository this
+/// host has audited; entering the submodule would be a read of one it has not.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::GitFailed`] when the index cannot be read.
+pub fn submodule_paths(
+    profile: &RestrictedProfile,
+    repository: &OpenedRepository,
+) -> Result<Vec<String>> {
+    let arguments: [&OsStr; 3] = [
+        OsStr::new("ls-files"),
+        OsStr::new("--stage"),
+        OsStr::new("-z"),
+    ];
+    let reported = profile.run_checked(&repository.read(&arguments))?;
+    let mut paths = Vec::new();
+    for record in reported.split('\0') {
+        // `<mode> <object> <stage>\t<path>`
+        let Some((fields, path)) = record.split_once('\t') else {
+            continue;
+        };
+        if fields.starts_with("160000 ") && !path.is_empty() {
+            paths.push(path.to_owned());
+        }
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    Ok(paths)
+}
+
 fn malformed(record: &str) -> ProjectError {
     ProjectError::GitFailed {
         detail: format!(
@@ -185,21 +218,34 @@ pub fn survey(
     repository: &OpenedRepository,
     request: &PreviewRequest<'_>,
 ) -> Result<Survey> {
-    let arguments: [&OsStr; 6] = [
+    // `--ignore-submodules=all` is not an optimisation. Checking a submodule's dirtiness runs Git
+    // *inside* the submodule, and a submodule's configuration lives in the parent's modules
+    // directory, which the parent's own configuration listing does not read: a filter defined
+    // there is one the audit cannot see and cannot blank. So this host never enters a submodule,
+    // and counts them from the index instead.
+    let arguments: [&OsStr; 7] = [
         OsStr::new("status"),
         OsStr::new("--porcelain=v2"),
         OsStr::new("-z"),
         OsStr::new("--untracked-files=all"),
         OsStr::new("--ignored=matching"),
         OsStr::new("--no-renames"),
+        OsStr::new("--ignore-submodules=all"),
     ];
     let reported = profile.run_checked(&repository.read(&arguments))?;
+    let submodules = submodule_paths(profile, repository)?;
     // A wholly ignored directory is reported as one entry with a trailing separator, because that
     // is how the ignore rule matched. Expanded here so the counts are exact and an inclusion
     // copies the files rather than nothing.
     let mut budget = MAX_BINARY_SCAN_ENTRIES;
     let mut truncated = 0_u64;
-    let mut status: Vec<StatusEntry> = Vec::new();
+    let mut status: Vec<StatusEntry> = submodules
+        .into_iter()
+        .map(|path| StatusEntry {
+            path,
+            class: InclusionClass::Submodule,
+        })
+        .collect();
     for entry in parse_status(&reported)? {
         match entry.path.strip_suffix('/') {
             None => status.push(entry),
@@ -275,8 +321,17 @@ pub fn survey(
         })
         .collect();
     let omitted = u64::try_from(entries.len().saturating_sub(sample.len())).unwrap_or(u64::MAX);
+    // The configuration and the objects an invocation ran against have to still be the ones the
+    // audit and the identity check were taken from, or what it read was read under something else.
+    repository.confirm(profile)?;
     let mut limitations = limitations_for(request.kind);
     limitations.extend(repository.audit().limitations());
+    limitations.push(
+        "a submodule is its own repository with its own configuration, and this host does not look \
+         inside one: a submodule is counted and named, and what it holds is neither measured nor \
+         copied"
+            .to_owned(),
+    );
     if unscanned > 0 {
         limitations.push(format!(
             "{unscanned} paths beyond the first {MAX_BINARY_SCAN_ENTRIES} were not read, so they \
