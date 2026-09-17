@@ -56,9 +56,15 @@ pub use unix::{ControllingTerminal, SavedModes};
 /// shell receives escape sequences where it expects characters.
 ///
 /// The list includes the coordinate system, because a projected attachment installs the session's
-/// own: origin mode, the scroll region, the left and right margins, insert mode. A terminal left in
-/// insert mode types over itself and one left inside a region scrolls a strip of the screen, and
-/// neither is described by termios.
+/// own: origin mode, the scroll region, the left and right margins, insert mode, the designated
+/// character sets. A terminal left in insert mode types over itself, one left inside a region
+/// scrolls a strip of the screen, and one left in the graphics set draws lines where the person
+/// types letters; none of that is described by termios.
+///
+/// It ends with the colours, for the same reason. A projection installs the session's own
+/// foreground, background, cursor, pointer and selection colours and any indexed colour an
+/// application overrode, so the last thing a cleanup does is hand each of those back to the
+/// terminal's own configuration.
 ///
 /// What this cannot do is give back a state the terminal had *before* the attachment and never
 /// reported. Nothing asks a terminal whether its mouse reporting was on or its cursor was hidden:
@@ -66,7 +72,7 @@ pub use unix::{ControllingTerminal, SavedModes};
 /// not one this command may ask. So these put each of those modes into its documented default,
 /// which is the state a terminal is in when nothing has changed it, and the keyboard protocols -
 /// the one part a terminal does report - are put back to what it reported.
-pub const RESET_SEQUENCES: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b[?6l\x1b[4l\x1b[0 q\x1b(B\x0f";
+pub const RESET_SEQUENCES: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b[?6l\x1b[4l\x1b[0 q\x1b(B\x1b)B\x0f\x1b]104\x1b\\\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\\x1b]113\x1b\\\x1b]114\x1b\\\x1b]117\x1b\\\x1b]119\x1b\\";
 
 /// The sequence that puts `modifyOtherKeys` back to the value the terminal itself starts with.
 ///
@@ -353,7 +359,12 @@ pub fn input_context(terminal: &ControllingTerminal) -> kr_term::probe::InputCon
     }
 }
 
-/// Records that a probe has gone out on this terminal and did not finish.
+/// Records that a probe is going out on this terminal.
+///
+/// Written before the first question, not after a failure: a process killed in the middle of the
+/// exchange runs no error path at all, and the terminal it was asking is exactly the one whose
+/// stream may still deliver a reply. [`clear_contamination`] removes it once the terminator has
+/// arrived, which is the only thing that proves nothing else is coming.
 ///
 /// Best effort on purpose: a host whose runtime directory cannot be written is a host that cannot
 /// record anything, and refusing the attach over that would be refusing it for the wrong reason.
@@ -367,6 +378,17 @@ pub fn mark_contaminated(terminal: &ControllingTerminal) {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(&path, b"a probe on this terminal did not finish\n");
+}
+
+/// Clears the record, once an exchange has finished and no reply can still be in flight.
+///
+/// The terminator is what proves that, and nothing else does: the record is written before the
+/// first question goes out and removed only here, so a process that died in the middle of asking
+/// leaves the record behind for the next attempt to find.
+pub fn clear_contamination(terminal: &ControllingTerminal) {
+    if let Some(path) = contamination_marker(terminal) {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// The file that records a contaminated terminal, named after the terminal itself.
@@ -565,13 +587,19 @@ mod unix {
             let saved = self.modes()?;
             let mut asking = saved.clone();
             asking.make_raw();
-            // A read that returns what has arrived rather than waiting for a line, with its own
-            // bound in tenths of a second, so the deadline below is the one that decides.
+            // A read that returns what has arrived and waits for nothing: no line, and not a
+            // tenth of a second either. The deadline is one second for the whole exchange, and a
+            // read that waited a tenth of its own could carry the exchange past it; the loop
+            // watches the clock between reads instead, so nothing here outlasts the second.
             asking.special_codes[SpecialCodeIndex::VMIN] = 0;
-            asking.special_codes[SpecialCodeIndex::VTIME] = 1;
+            asking.special_codes[SpecialCodeIndex::VTIME] = 0;
             rustix::termios::tcsetattr(&self.handle, OptionalActions::Now, &asking).map_err(
                 |error| CliError::Terminal(format!("set the terminal's modes: {error}")),
             )?;
+            // Before the first byte of the first question. From here until the terminator this
+            // terminal's stream is one a late reply can arrive on, and a process that dies in
+            // between leaves this record as the only thing that knows.
+            super::mark_contaminated(self);
             let read = self.ask(&mut session, &request, started);
             let typed = session.typed().to_vec();
             // `Now` again, for the same reason: the exchange ends at the terminator, and anything
@@ -583,6 +611,9 @@ mod unix {
             let elapsed = elapsed_ms(started);
             match session.finish(elapsed) {
                 Ok(outcome) => {
+                    // The terminator arrived, so nothing else is coming and this stream is clean
+                    // again.
+                    super::clear_contamination(self);
                     let mut probe = Probe::from_outcome(&outcome);
                     // Whatever arrived and was not an answer is the person's, in the order they
                     // typed it. It never entered the terminal's input and it was never mistaken
@@ -635,14 +666,15 @@ mod unix {
                     // The session decides what an expired exchange is; this only stops reading.
                     return Ok(());
                 }
-                // Each read waits at most a tenth of a second, because the terminal was put into
-                // a mode where a read returns what has arrived rather than waiting for a line. The
-                // loop therefore cannot outlast the deadline by more than that tenth, and what
-                // happens at the deadline is the session's decision rather than this loop's: the
-                // exchange fails, and it never becomes live forwarding on a stream a late reply
-                // could still reach.
+                // The terminal returns what has arrived and waits for nothing, so the clock is
+                // checked between reads and the exchange ends within a millisecond of its
+                // deadline. What happens *at* the deadline is the session's decision rather than
+                // this loop's: the exchange fails, and it never becomes live forwarding on a
+                // stream a late reply could still reach.
                 match handle.read(&mut buffer) {
-                    Ok(0) => {}
+                    // Nothing has arrived yet. A moment's wait, rather than a spin that would
+                    // read a thousand times for every answer.
+                    Ok(0) => std::thread::sleep(std::time::Duration::from_millis(1)),
                     Ok(read) => {
                         if session
                             .observe(&buffer[..read], elapsed_ms(started))

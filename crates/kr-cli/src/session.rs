@@ -133,12 +133,10 @@ pub async fn run(
         Ok(probe) => probe,
         Err(error) => {
             // Nothing has begun forwarding, so the outer terminal's own keyboard negotiation is
-            // not this attachment's to clear. Its modes are put back, the terminal is recorded as
-            // one a probe has been sent to, and the failure is reported. The record is what makes
-            // the next attempt in this window require a fresh terminal rather than claiming a
-            // stream nobody can vouch for.
+            // not this attachment's to clear. Its modes are put back and the failure is reported.
+            // The record that makes the next attempt require a fresh terminal was written before
+            // the first question went out, and an exchange that did not finish leaves it there.
             let _ = terminal.restore(&saved, None);
-            crate::terminal::mark_contaminated(&terminal);
             guard.release();
             return Err(error);
         }
@@ -225,13 +223,16 @@ pub async fn run(
     // The terminal's size can change while the attachment runs. The session is told, so the
     // application sees the resize the way it would in any other terminal.
     let mut resized = window_changes();
-    // What this terminal shows while it is projected. A terminal nobody was allowed to ask about
-    // installs no keyboard protocol of the session's, because nothing could put back what
-    // installing one would take away.
-    let mut display = if options.no_probe {
-        crate::render::ProjectedDisplay::without_the_keyboard()
-    } else {
+    // What this terminal shows while it is projected. A terminal that did not report its own
+    // keyboard negotiation installs no protocol of the session's, because nothing could put back
+    // what installing one would take away: the cleanup writes back what the terminal *said*, and a
+    // terminal that said nothing would be left in whatever the session was using. That is the
+    // answer for `--no-probe`, which asks nothing, and equally for a profile whose questions do not
+    // include the keyboard, because nothing can be required of a terminal that never promised it.
+    let mut display = if probe.keyboard.is_known() {
         crate::render::ProjectedDisplay::new()
+    } else {
+        crate::render::ProjectedDisplay::without_the_keyboard()
     };
     let outcome = drive(
         &mut client,
