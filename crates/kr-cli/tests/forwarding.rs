@@ -63,7 +63,18 @@ fn command_binaries() -> &'static std::path::Path {
             std::path::Path::new(env!("CARGO_BIN_EXE_kr-attach-guard")),
         ] {
             let name = source.file_name().expect("the binary has a name");
-            std::fs::copy(source, root.join(name)).expect("copies a command binary");
+            let destination = root.join(name);
+            std::fs::copy(source, &destination).expect("copies a command binary");
+            // Run it once, here, where nothing is being timed. The operating system checks a binary
+            // it has not seen before on its first run and remembers it afterwards, and that check
+            // takes seconds where the run itself takes milliseconds. A test that paid it inside a
+            // wait would be measuring the check.
+            let _ = std::process::Command::new(&destination)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
         }
         root
     })
