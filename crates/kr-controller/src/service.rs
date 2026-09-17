@@ -3402,6 +3402,9 @@ impl Controller {
             match kr_ipc::identity::process_state(&identity) {
                 kr_ipc::identity::ProcessState::Ended => {
                     let _ = self.record_final(session_id, reason, &identity).await;
+                    // The closure this watcher was waiting on has finished, so what it was
+                    // counted as is over. Whoever asked for it is not waiting for this.
+                    self.review_power_soon();
                     return;
                 }
                 kr_ipc::identity::ProcessState::Running
