@@ -238,9 +238,11 @@ prompt cannot supply a protocol a compositor does not implement, so a tool built
 compositor family on another leaves the answer unestablished rather than blamed on a permission.
 
 A locked desktop refuses the screen and keeps the session: the capability says
-`temporarily_unavailable` and the session and its processes are unaffected. A session with no
-desktop (the headless profile, an SSH-only host, a host with no graphical login) has no desktop
-capability at all, and says so rather than reporting a permission problem.
+`temporarily_unavailable` and the session and its processes are unaffected. A session bound to no
+desktop (the headless profile, an SSH-only host, a host with no graphical login) gets no desktop
+capability answered, and says that rather than reporting a permission problem. Where the platform
+puts every one of a user's processes in that user's own interactive session, as Windows does, the
+record says that nothing establishes that such a session cannot reach a desktop either.
 
 There is no general desktop-control interface. Desktop automation here means your own tools running
 in the selected context under the permissions the operating system actually granted them; the

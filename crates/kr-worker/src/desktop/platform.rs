@@ -60,7 +60,11 @@ pub struct Login {
 }
 
 impl Login {
-    /// Returns the login of a context that is not in a graphical session.
+    /// Returns the login of a context bound to no login session.
+    ///
+    /// It is what a headless context takes and what a platform that named no graphical login
+    /// leaves. Either way it records that no login session was taken, which is not the same as the
+    /// platform having placed the context outside one.
     #[must_use]
     pub const fn none() -> Self {
         Self {
