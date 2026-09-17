@@ -1,0 +1,17 @@
+[package]
+name = "kr-fixture-ambient-import"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+# No `kr-fixture-support`, and therefore no `no_std`. This component is built the way a vendor
+# building against the standard library on `wasm32-wasip2` gets by default, which is what makes it
+# import `wasi:filesystem`, `wasi:cli/environment`, `wasi:clocks` and the rest. The runtime refuses
+# it for exactly that reason, and the refusal names the import.
+[dependencies]
+wit-bindgen = "=0.62.0"

@@ -1,0 +1,11 @@
+[package]
+name = "kr-fixture-support"
+description = "What a KalaReach test component needs that is not the contract: an allocator, a panic handler and the canonical ABI's reallocation hook"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dlmalloc.workspace = true

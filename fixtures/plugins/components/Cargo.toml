@@ -1,0 +1,38 @@
+# The test components, built for wasm32-wasip2.
+#
+# A separate workspace from the host crates on purpose. These are compiled for a different target,
+# with a different profile, and one of them deliberately imports interfaces the runtime refuses; none
+# of that belongs in the host workspace's dependency graph or its lockfile.
+
+[workspace]
+resolver = "3"
+members = [
+    "ambient-import",
+    "infinite-loop",
+    "memory-hog",
+    "oversized-output",
+    "slow-compile",
+    "support",
+    "well-behaved",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "BSD-3-Clause"
+publish = false
+
+[workspace.dependencies]
+dlmalloc = { version = "=0.2.11", features = ["global"] }
+kr-fixture-support = { path = "support", version = "=0.1.0" }
+wit-bindgen = { version = "=0.62.0", default-features = false, features = ["macros"] }
+
+# Small and optimised: these are read back by the runtime tests, and the compiled-code cache test
+# wants a component whose size is its own rather than its debug information's.
+[profile.release]
+opt-level = "s"
+panic = "abort"
+strip = true
+lto = true
+codegen-units = 1

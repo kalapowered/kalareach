@@ -1,0 +1,16 @@
+[package]
+name = "kr-fixture-slow-compile"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+build = "build.rs"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+kr-fixture-support.workspace = true
+wit-bindgen.workspace = true

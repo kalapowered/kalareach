@@ -29,6 +29,11 @@ dist/
 .env.*
 !.env.example
 
+# The test components, built for wasm32-wasip2 by scripts/build-plugin-fixtures.sh. Rust embeds
+# build paths in a component's custom sections, so two machines produce different bytes for the same
+# source; the components are built rather than committed.
+fixtures/plugins/components/build/
+
 # OS files
 .DS_Store
 Thumbs.db
