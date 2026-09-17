@@ -79,6 +79,17 @@ const BACKGROUND_SESSIONS: usize = 20;
 /// How many attached views it puts on them.
 const BACKGROUND_VIEWS: usize = 32;
 
+/// What each background session runs.
+///
+/// It has to still be there when the measurement starts, and building this background is itself
+/// slow on a busy machine: nineteen sessions, each with a pseudo-terminal, a shell, a session key
+/// and a secret store. A shell on a ten-minute clock took its session with it while the background
+/// was still being built - measured at 802 s to build on a machine at load 9 - and the measurement
+/// then failed attaching to a session that had closed exactly as it was told to, reporting
+/// `SessionClosed` for what was really its own setup time. A day is not a bound this can reach; it
+/// is the absence of one.
+const BACKGROUND_SHELL: &str = "sleep 86400";
+
 /// How often the recogniser measurement looks for the held byte.
 const POLL: Duration = Duration::from_micros(250);
 
@@ -295,7 +306,7 @@ async fn background() -> (Vec<Hosted>, Vec<LocalClient>) {
     let started = Instant::now();
     let mut sessions = Vec::new();
     for _ in 1..BACKGROUND_SESSIONS {
-        sessions.push(hosted("sleep 600").await);
+        sessions.push(hosted(BACKGROUND_SHELL).await);
     }
     let mut views = Vec::new();
     for index in 0..BACKGROUND_VIEWS {
