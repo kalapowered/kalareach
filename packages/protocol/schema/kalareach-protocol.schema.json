@@ -6390,6 +6390,11 @@
           "const": "no_service_manager",
           "description": "This host has no per-user service manager to ask.",
           "type": "string"
+        },
+        {
+          "const": "not_established",
+          "description": "The service mechanism is known and what the platform does to it at logout is not.\n\nThis is an answer rather than an omission. A definite answer this host has not established\nwould be worse than none: somebody would plan around it.",
+          "type": "string"
         }
       ]
     },

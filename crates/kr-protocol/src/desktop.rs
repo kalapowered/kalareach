@@ -855,6 +855,11 @@ pub enum LogoutPersistence {
     AvailableByChoice,
     /// This host has no per-user service manager to ask.
     NoServiceManager,
+    /// The service mechanism is known and what the platform does to it at logout is not.
+    ///
+    /// This is an answer rather than an omission. A definite answer this host has not established
+    /// would be worse than none: somebody would plan around it.
+    NotEstablished,
 }
 
 impl LogoutPersistence {
@@ -866,6 +871,7 @@ impl LogoutPersistence {
             Self::SurvivesLogout => "survives_logout",
             Self::AvailableByChoice => "available_by_choice",
             Self::NoServiceManager => "no_service_manager",
+            Self::NotEstablished => "not_established",
         }
     }
 }

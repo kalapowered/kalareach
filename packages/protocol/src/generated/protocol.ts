@@ -4137,7 +4137,12 @@ export interface ProfilePersistence {
   /**
    * What happens to a worker of that profile at logout.
    */
-  persistence: 'ends_at_logout' | 'survives_logout' | 'available_by_choice' | 'no_service_manager'
+  persistence:
+    | 'ends_at_logout'
+    | 'survives_logout'
+    | 'available_by_choice'
+    | 'no_service_manager'
+    | 'not_established'
   /**
    * How long a worker's execution context lasts.
    *
