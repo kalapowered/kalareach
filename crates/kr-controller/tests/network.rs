@@ -7,10 +7,12 @@
 //! authority changes underneath it: a revoked device is fenced before it is served again, and the
 //! remote path ending takes neither the worker nor a local attachment with it.
 //!
-//! Every path here is on the internal disk, and the worker is copied there before it is started. A
-//! process a service manager launches is its own identity to the operating system, and one that
-//! reaches a removable volume asks the person sitting at the machine for permission; a test suite
-//! must never do that.
+//! Every path here is on the internal disk: the worker is copied there before it is started, and
+//! the host gives it a working directory of its own there rather than letting it inherit this
+//! process's. A process a service manager launches is its own identity to the operating system,
+//! and one that reaches a removable volume asks the person sitting at the machine for permission;
+//! a test suite must never do that, so every create checks what the kernel actually gave the
+//! process it started.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -111,12 +113,6 @@ impl Host {
         let environment_id = temp.environment_id();
         let worker = temp.root().join("kr-worker");
         std::fs::copy(&worker_build, &worker).expect("copies the worker");
-        // A launched worker inherits this process's working directory, and this process starts in
-        // the build tree, which may be on a removable volume: a process a service manager started
-        // that reaches one asks the person at the machine for permission. This moves the process
-        // once, to a directory on the internal disk that outlives every test in this binary, so
-        // no test can leave another launching a worker from a directory it has just removed.
-        move_to_internal_disk();
         Some(Self {
             temp: Some(temp),
             worker,
@@ -327,25 +323,6 @@ impl Host {
     }
 }
 
-/// Moves this process out of the build tree, once, for every test in this binary.
-///
-/// The directory a launched worker inherits has to be on the internal disk, and it has to still
-/// exist: a per-test temporary root would be removed by whichever test finished first. The
-/// platform's own temporary directory is both.
-fn move_to_internal_disk() {
-    static MOVED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    MOVED.get_or_init(|| {
-        let internal = std::env::temp_dir();
-        std::env::set_current_dir(&internal).unwrap_or_else(|error| {
-            panic!(
-                "this suite launches processes and must not leave them a directory on a removable \
-                 volume; moving to {} failed: {error}",
-                internal.display()
-            )
-        });
-    });
-}
-
 /// Returns the worker binary beside this test's own.
 ///
 /// # Panics
@@ -453,7 +430,7 @@ fn create_params(environment_id: EnvironmentId, cwd: &Path) -> SessionCreatePara
 }
 
 async fn create(client: &mut LocalClient, host: &Host) -> SessionCreateResult {
-    client
+    let created: SessionCreateResult = client
         .mutate(
             Method::SessionCreate,
             ActionId::new(kr_ipc::new_uuid()),
@@ -463,7 +440,90 @@ async fn create(client: &mut LocalClient, host: &Host) -> SessionCreateResult {
         .await
         .expect("the call reaches the daemon")
         .map(|value| value.to_typed().expect("decodes"))
-        .unwrap_or_else(|error| panic!("the create failed: {error}"))
+        .unwrap_or_else(|error| panic!("the create failed: {error}"));
+    runs_where_the_host_put_it(host, created.session.session_id);
+    created
+}
+
+/// Returns the working directory the operating system gave a running process.
+///
+/// Read from the process table rather than from anything this test arranged: what is being checked
+/// is what the process actually got, and a launch that quietly inherited a directory looks exactly
+/// like one that was given the right one until the kernel is asked.
+fn working_directory_of(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/sbin/lsof")
+            .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Asserts that the worker this host started runs in the directory the host gave it.
+///
+/// A worker is deliberately not a child of the process that asked for it, so it inherits nothing
+/// worth having: a directory inherited from the daemon belongs to whoever started the daemon, and
+/// on this machine that is a build tree on a removable volume. A process holding one open is a
+/// volume the person at the machine cannot eject and, on macOS, a permission prompt for every
+/// rebuilt binary.
+fn runs_where_the_host_put_it(host: &Host, session_id: SessionId) {
+    let registry = Registry::open(host.paths().registry_database(), host.environment_id)
+        .expect("opens the registry");
+    let worker = registry
+        .workers()
+        .expect("reads the worker records")
+        .into_iter()
+        .find(|worker| worker.session_id == session_id)
+        .expect("the created session has a worker record");
+    let pid = u32::try_from(worker.process_identity.pid.get()).expect("a process identifier");
+    let Some(actual) = working_directory_of(pid) else {
+        // Nothing to compare against rather than a comparison that failed. Saying so is better
+        // than a pass that checked nothing.
+        eprintln!(
+            "skipped: this platform does not report another process's working directory here"
+        );
+        return;
+    };
+    let expected = std::fs::canonicalize(host.paths().worker_dir(session_id))
+        .expect("the worker's own directory exists");
+    assert_eq!(
+        std::fs::canonicalize(&actual).unwrap_or(actual),
+        expected,
+        "the worker runs in the directory the host configured"
+    );
+    let workspace = workspace_root();
+    assert!(
+        !expected.starts_with(&workspace),
+        "no process this suite starts has a working directory inside the workspace: {}",
+        expected.display()
+    );
+    assert!(
+        !host.worker.starts_with(&workspace),
+        "and the binary it started is not inside it either: {}",
+        host.worker.display()
+    );
+}
+
+/// Returns the workspace this test was built from.
+fn workspace_root() -> PathBuf {
+    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // `<workspace>/crates/<crate>`.
+    root.pop();
+    root.pop();
+    std::fs::canonicalize(&root).unwrap_or(root)
 }
 
 /// What a device the host has never seen looks like.

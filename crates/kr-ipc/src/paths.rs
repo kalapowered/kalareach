@@ -232,6 +232,7 @@ impl EnvironmentPaths {
             &self.spool_dir(),
             &self.jobs_dir(),
             &self.secrets_dir(),
+            &self.workers_dir(),
         ] {
             create_private_tree(&self.state_root, path)?;
         }
@@ -354,6 +355,25 @@ impl EnvironmentPaths {
     #[must_use]
     pub fn jobs_dir(&self) -> PathBuf {
         self.state_dir.join("jobs")
+    }
+
+    /// Returns the directory holding one directory per worker.
+    #[must_use]
+    pub fn workers_dir(&self) -> PathBuf {
+        self.state_dir.join("workers")
+    }
+
+    /// Returns the directory one worker process runs in.
+    ///
+    /// A worker is started by the platform's service manager rather than by the daemon, so it
+    /// inherits nothing worth having: the launcher's directory belongs to whoever ran the
+    /// installer, and a service manager's belongs to the system. It is given a directory of its
+    /// own instead, inside the environment it belongs to, which it can be relied on to be able to
+    /// read and which no user data is under. Holding it open for the life of the session also
+    /// keeps the worker from pinning a directory somebody may want to unmount.
+    #[must_use]
+    pub fn worker_dir(&self, session_id: SessionId) -> PathBuf {
+        self.workers_dir().join(session_id.to_string())
     }
 
     /// Returns the directory the secret-store fallback writes to.

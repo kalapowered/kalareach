@@ -33,6 +33,12 @@ echo
 # put their runtime directories, state directories and copied binaries there, so a process whose
 # command line names that root is one of ours and nothing else is. That is what makes the check
 # below an answer about this run rather than about whatever else the machine happens to be doing.
+#
+# Nothing it started may hold this directory open either. Cargo runs each suite from the workspace,
+# which can be on a removable volume, and a worker is not a child of whatever asked for it: the
+# host gives every process it launches a working directory of its own under the state directory,
+# and the suites check what the kernel actually gave it. The run root below is on the internal
+# disk, so those directories, the copied binaries, the sockets and the journals all are.
 run_root="$(mktemp -d "${TMPDIR:-/tmp}/kalareach-run.XXXXXX")"
 export TMPDIR="$run_root"
 

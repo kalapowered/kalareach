@@ -49,6 +49,14 @@ pub struct WorkerLaunch {
     pub state_directory: PathBuf,
     /// Where a generated job definition is written.
     pub jobs_directory: PathBuf,
+    /// The directory the worker process runs in.
+    ///
+    /// Set explicitly on every platform. A worker started through a service manager would
+    /// otherwise run in whatever directory that manager happens to be in, and one started by this
+    /// daemon directly would run in the daemon's, which is the directory of whoever started the
+    /// daemon. Neither is a directory the worker has any claim on, and either can be a volume the
+    /// person at the machine expects to be able to unmount.
+    pub working_directory: PathBuf,
 }
 
 impl WorkerLaunch {
@@ -195,11 +203,13 @@ impl LaunchdSupervisor {
              <key>RunAtLoad</key><false/>\n\
              <key>KeepAlive</key><false/>\n\
              <key>ProcessType</key>{process_type}\
+             <key>WorkingDirectory</key>{working_directory}\
              <key>StandardErrorPath</key>{diagnostics}\
              </dict>\n</plist>\n",
             label_value = plist_string(&label),
             arguments = arguments,
             process_type = plist_string("Interactive"),
+            working_directory = plist_string(&launch.working_directory.display().to_string()),
             // A worker that fails before it reaches the rendezvous has nowhere else to say why:
             // it has no terminal, no connection and no journal yet. This file is the one place
             // that diagnosis can go, and it lives in the owner-only state directory.
@@ -325,6 +335,8 @@ impl WorkerSupervisor for SystemdSupervisor {
             "Type=exec".to_owned(),
             "-p".to_owned(),
             "Restart=no".to_owned(),
+            "-p".to_owned(),
+            format!("WorkingDirectory={}", launch.working_directory.display()),
             "--quiet".to_owned(),
             launch.program.display().to_string(),
         ];
@@ -387,7 +399,11 @@ impl DetachedSupervisor {
 
 impl WorkerSupervisor for DetachedSupervisor {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
-        match detached_command(&launch.program, &launch.arguments()) {
+        match detached_command(
+            &launch.program,
+            &launch.arguments(),
+            &launch.working_directory,
+        ) {
             Ok(child) => settle(child),
             // The spawn itself failed, so no process exists.
             Err(error) => LaunchOutcome::NotStarted {
@@ -402,7 +418,7 @@ impl WorkerSupervisor for DetachedSupervisor {
 }
 
 #[cfg(unix)]
-fn detached_command(program: &Path, arguments: &[String]) -> Result<u32> {
+fn detached_command(program: &Path, arguments: &[String], working_directory: &Path) -> Result<u32> {
     use std::os::unix::process::CommandExt as _;
 
     // The worker gets its own process group here, and makes itself a session leader as soon as it
@@ -414,6 +430,9 @@ fn detached_command(program: &Path, arguments: &[String]) -> Result<u32> {
     let mut command = std::process::Command::new(program);
     command.process_group(0);
     command.args(arguments);
+    // Never the daemon's own directory: the worker outlives this daemon, so a directory inherited
+    // from it would be held open by a process nothing can see the parentage of.
+    command.current_dir(working_directory);
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -425,7 +444,7 @@ fn detached_command(program: &Path, arguments: &[String]) -> Result<u32> {
 }
 
 #[cfg(not(unix))]
-fn detached_command(program: &Path, arguments: &[String]) -> Result<u32> {
+fn detached_command(program: &Path, arguments: &[String], working_directory: &Path) -> Result<u32> {
     use std::os::windows::process::CommandExt as _;
 
     // A worker must outlive this daemon. A process started by a daemon that is itself inside a
@@ -438,6 +457,9 @@ fn detached_command(program: &Path, arguments: &[String]) -> Result<u32> {
     let mut command = std::process::Command::new(program);
     command.creation_flags(CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS);
     command.args(arguments);
+    // Never the daemon's own directory, for the same reason as on Unix: a current directory is a
+    // handle on a volume, and this process outlives the one that started it.
+    command.current_dir(working_directory);
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -559,6 +581,9 @@ mod tests {
             runtime_directory: PathBuf::from("/run/kr"),
             state_directory: PathBuf::from("/var/lib/kr"),
             jobs_directory: PathBuf::from("/var/lib/kr/jobs"),
+            working_directory: PathBuf::from(
+                "/var/lib/kr/workers/02020202-0202-0202-0202-020202020202",
+            ),
         }
     }
 
@@ -581,6 +606,26 @@ mod tests {
         assert_eq!(
             launch().label(),
             "kr-worker-01010101-0101-0101-0101-010101010101"
+        );
+    }
+
+    /// The job definition a service manager reads names the directory the worker runs in.
+    ///
+    /// A worker inheriting a directory is the thing this prevents: the launcher's directory is
+    /// whoever started the daemon's, and a service manager's is the system's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_job_definition_names_the_directory_the_worker_runs_in() {
+        let host = kr_ipc::testing::TempHost::create();
+        let mut launch = launch();
+        launch.jobs_directory = host.environment().jobs_dir();
+        let job = LaunchdSupervisor::write_job(&launch).expect("writes the job definition");
+        let document = std::fs::read_to_string(job).expect("reads it back");
+        assert!(
+            document.contains(
+                "<key>WorkingDirectory</key><string>/var/lib/kr/workers/02020202-0202-0202-0202-020202020202</string>"
+            ),
+            "the job names the worker's own directory: {document}"
         );
     }
 

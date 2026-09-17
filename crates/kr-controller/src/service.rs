@@ -1773,6 +1773,11 @@ impl Controller {
                 return Err(refusal);
             }
         }
+        // The directory the worker will run in, made before it is started so the launch cannot
+        // fail on a directory that does not exist yet. It is inside this environment's state
+        // directory, which this daemon owns and which holds nothing a person keeps.
+        let working_directory = self.paths.worker_dir(reservation.session_id);
+        kr_ipc::paths::create_private_tree(self.paths.state_root(), &working_directory)?;
         let launch = WorkerLaunch {
             reservation_id: reservation.reservation_id,
             session_id: reservation.session_id,
@@ -1786,6 +1791,7 @@ impl Controller {
             runtime_directory: self.paths.runtime_root().to_path_buf(),
             state_directory: self.paths.state_root().to_path_buf(),
             jobs_directory: self.paths.jobs_dir(),
+            working_directory,
         };
         let identity = match self.supervisor.start(&launch) {
             LaunchOutcome::Started(identity) => identity,
