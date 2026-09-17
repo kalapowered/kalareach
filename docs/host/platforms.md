@@ -22,7 +22,7 @@ hands out the same number.
 | The login session | the Aqua security session behind the user's graphical launchd domain | the login manager's session for the user's graphical login | the interactive logon session |
 | Read through | `launchctl print gui/<uid>`, whose handle is the security session and whose creator is the process below | `loginctl show-session`, for the session the login manager reports as the user's display | the task listing, for the session the worker's own process runs in |
 | The owning process | `loginwindow` | the session leader | that session's `winlogon` |
-| Also reported | whether the domain is the graphical one, and whether the screen is locked (the window server publishes that while it is, and nothing while it is not) | the session type (X11 or Wayland), its desktop environment, its state and its locked hint | whether the session is a remote desktop one |
+| Also reported | whether the domain is the graphical one, and whether the screen is locked while this user is the one at the console, which is the session the window server's lock state is about | the session type (X11 or Wayland), its desktop environment, its state and its locked hint | whether the session is a remote desktop one |
 | Not read | | | whether the session is attended, locked or disconnected, so its availability reads as unknown rather than as a screen that is there for the taking |
 
 A reading that names a login session but not its generation is not a desktop. The platform session
@@ -45,7 +45,7 @@ session ends, the session closes with `desktop_lost` and you create a new one.
 
 | Platform | `desktop_bound` | `headless_user` |
 | --- | --- | --- |
-| macOS | ends with the graphical login. The worker's job is bootstrapped into the user's graphical domain, and a logout tears that domain down | ends with the logout as well, and it is started outside the graphical login: its job goes into the background domain, so it has no Aqua access to inherit in the first place. macOS still ends a user's agents when the user logs out, including a background one; only a system-level daemon survives, and that is not a per-user execution context |
+| macOS | ends with the graphical login. The worker's job is bootstrapped into the user's graphical domain, and a logout tears that domain down | started outside the graphical login, in this user's background domain, so it has no Aqua access to inherit. That domain outlives the graphical login and goes with the user's last session of any kind. Outliving that needs a service in the system's own domain, which is a different execution context and an installation step this host does not take |
 | Linux | ends with the graphical login session | survives logout only while lingering is enabled for the user, which keeps the user's service manager running. It is off unless somebody enables it |
 | Windows | ends with the sign-out of the interactive session | ends with the sign-out. A per-user task runs in the user's own session and stops with it; work that must outlive a sign-out needs a service under an account granted the right to log on as a service |
 
@@ -56,7 +56,10 @@ a claim that a headless session survives logout also names what makes it survive
 On a host with no per-user service manager the fallback is a detached process in its own process
 group, reparented to the system's first process. A worker started that way is in whatever login
 context the control daemon is in, so a headless session there has the desktop's variables stripped
-rather than a login context of its own. `kr doctor` reports that as what it is.
+rather than a login context of its own. `kr doctor` reports that as what it is. Windows uses that
+fallback, and it also runs every one of a user's processes in that user's own interactive session,
+so a headless session there is a session with no desktop handles and no promise about the desktop
+rather than one that cannot reach it; its capability records say so.
 
 ### Enabling persistence on Linux
 
@@ -123,15 +126,17 @@ machine.
 ```
 
 With the setting on, an assertion is held while the host has verified foreground work or a request
-it has accepted and not answered: an agent working, a decision waiting for an answer, or a closure
-still stopping processes and draining their output. An idle shell is not work, however much output
-it has produced. The assertion is released when that ends, and `kr status`, `kr doctor` and
+it has accepted and not answered. Three things count: a session whose worker reports an agent at
+work, a session waiting for a decision to be answered, and a closure that is still stopping
+processes and draining their output. An idle shell is not work, however much output it has
+produced. The assertion is released when those end, and `kr status`, `kr doctor` and
 `kr host power` all print what is held and why.
 
 Work begins and ends without the host being told, so while the setting is on the host looks at the
-question every fifteen seconds as well as whenever a session is created or closed. That interval is
-the bound on how long after work ends an assertion can still be held. While the setting is off
-nothing looks at anything.
+question every fifteen seconds, as well as whenever a session is created or closed and whenever it
+is asked. That interval plus the two seconds the host gives itself to ask its sessions is the bound
+on how long after work ends an assertion can still be held. While the setting is off nothing looks
+at anything.
 
 | Platform | The facility | What it asks for |
 | --- | --- | --- |
@@ -175,10 +180,19 @@ those happened.
 | Linux, Wayland | the display server and launching an application | a compositor that asks the user for the operation each time, such as GNOME's screen-sharing portal, which is a permission the user grants rather than one a tool holds; a capability with no tool installed | a screen image or synthetic input on a compositor that implements the protocols the installed tool uses, which `sway`, `river`, `hyprland`, `wayfire`, `labwc` and `niri` do. The answer names the compositor, the tool and the operation |
 | Windows | the display server, and launching an application in the interactive session | a capability whose facility is not installed | a screen image, synthetic input and the accessibility tree, which act on whatever is on the screen |
 
-Each record also names the exact facility it is about, by path and by that file's size and
-modification time, so a tool replaced at the same path invalidates the answer rather than silently
-changing what the answer was about. The revision every record carries advances whenever any of this
-changes, which is what an action binding to an answer rechecks.
+Each record also names the facility it is about: its path, and the file itself as the filesystem
+describes it, which is which file it is, how long it is and when it last changed. A tool replaced
+at the same path is a different file by that description unless it matches in all three, which is
+what the record says it compared rather than claiming to have read the contents. The revision every
+record carries advances whenever any of this changes, and it is kept in the environment's state
+directory so a host that restarts never hands out a revision it has used before. An action that
+bound to an earlier revision rechecks it and is refused.
+
+The Wayland answers name the route as well as the tool, because the three routes a Wayland desktop
+offers are different things: a protocol the compositor implements, the desktop portal (which asks
+the user each time), and a tool's own service reaching the input devices directly. A permission
+prompt cannot supply a protocol a compositor does not implement, so a tool built for one
+compositor family on another leaves the answer unestablished rather than blamed on a permission.
 
 A locked desktop refuses the screen and keeps the session: the capability says
 `temporarily_unavailable` and the session and its processes are unaffected. A session with no

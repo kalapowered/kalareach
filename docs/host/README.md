@@ -134,8 +134,9 @@ that started perfectly well.
 The profile decides which login context a worker is started in, not only which variables it is
 given. On macOS a desktop-bound worker's job goes into the user's graphical domain and a headless
 one's into the background domain, because a headless worker inside the graphical login would have
-that login's access however little of its environment it was given. Windows starts a worker in the
-session its per-user agent runs in.
+that login's access however little of its environment it was given. Windows runs every one of a
+user's processes in that user's own interactive session, so a headless session there is one with no
+desktop handles and no promise about the desktop rather than one that cannot reach it.
 
 Linux places a job in no login session at all: a user service manager started at boot has no
 display, no compositor socket and no session message bus, because those belong to a graphical login
@@ -247,10 +248,13 @@ off until then, `kr host power` shows and changes it, and the two choices are se
 only, or battery as well.
 
 With it on, the host holds the platform's own assertion against automatic sleep while it has
-verified foreground work or a request it has accepted and not answered, and releases it when that
-ends. Work begins and ends without this daemon being told, so while the setting is on it looks at
-the question every fifteen seconds as well as whenever a session is created or closed; while the
-setting is off nothing looks at anything. Host status, `kr status` and `kr doctor` each print what
+verified foreground work or a request it has accepted and not answered: a session whose worker
+reports an agent at work, a session waiting for a decision to be answered, or a closure that is
+still stopping processes and draining their output. Work begins and ends without this daemon being
+told, so while the setting is on it looks at the question every fifteen seconds as well as whenever
+a session is created or closed and whenever it is asked; while the setting is off nothing looks at
+anything. Each session gets half a second to answer and the whole round two seconds, so the answer
+does not get slower as sessions are added. Host status, `kr status` and `kr doctor` each print what
 is held and why.
 
 The assertion is held by running the platform's facility as a child with a pipe on its input, so

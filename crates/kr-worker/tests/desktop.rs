@@ -313,6 +313,19 @@ fn the_desktop_identity_binds_the_user_the_platform_session_the_boot_and_the_gen
         // Either way there is no identity on this host to read, and the identity's own rules are
         // established by the assertions below on a reading taken from the platform's own shape.
         desktop::Reading::None | desktop::Reading::Unavailable => {
+            // A host whose platform does describe a graphical login must produce a complete
+            // identity from it. Anything else is this reader failing, not this host lacking a
+            // desktop, and the test says which by asking the platform itself.
+            #[cfg(target_os = "macos")]
+            assert!(
+                !std::process::Command::new("/bin/launchctl")
+                    .args(["print", &format!("gui/{}", kr_ipc::paths::current_uid())])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .is_ok_and(|status| status.success()),
+                "this host has a graphical login domain and no complete desktop identity was read"
+            );
             let context = desktop::context(WorkerProfile::DesktopBound, boot);
             assert!(!context.is_desktop());
             assert_eq!(context.kind, DesktopSessionKind::None);
@@ -580,6 +593,29 @@ async fn a_desktop_bound_session_closes_with_desktop_lost_when_its_login_ends() 
         ClosureReason::DesktopLost,
         "the closure names the desktop rather than the shell"
     );
+
+    // The control that makes the case above mean something: a watch bound to the desktop this
+    // host is actually in is not lost, however often it is asked.
+    if let Some(live) = live_desktop() {
+        let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+        let context = desktop::from_login(&live, WorkerProfile::DesktopBound, boot);
+        let mut watch =
+            desktop::Watch::bind(WorkerProfile::DesktopBound, &desktop::binding(&context));
+        let now = std::time::Instant::now();
+        assert!(
+            !watch.lost(now),
+            "a session bound to this host's own desktop has not lost it"
+        );
+        assert!(
+            !watch.lost(now + desktop::RECHECK_INTERVAL * 3),
+            "and asking again does not change that"
+        );
+        assert_eq!(
+            watch.bound_name(),
+            context.desktop_session_id.as_ref(),
+            "the watch is bound to the desktop the record names"
+        );
+    }
 }
 
 /// KR-REQ-03.23, KR-REQ-07.58: a graphical job the service manager tears down ends the processes
@@ -820,8 +856,14 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
         recorded.exists(),
         "the daemon recorded the boot it was running in"
     );
-    kr_ipc::paths::write_owner_only_file(&recorded, b"a boot this host is not running")
-        .expect("records another boot");
+    // A boot identity this host is not running, in the form the record holds: a damaged file is a
+    // damaged file rather than evidence of a reboot, so the test writes a real one.
+    let another = kr_protocol::identity::BootIdentity {
+        source: kr_protocol::identity::BootIdentitySource::BootTime,
+        value: kr_protocol::scalars::Bytes::new(b"a boot this host is not running".to_vec()),
+    };
+    let encoded = kr_cbor::to_canonical_vec(&another).expect("encodes");
+    kr_ipc::paths::write_owner_only_file(&recorded, &encoded).expect("records another boot");
 
     let second = host.start().await;
     let mut client = host.client().await;
@@ -842,12 +884,29 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
     }
     // And the record now names this boot, so a second start closes nothing again.
     let written = std::fs::read(&recorded).expect("reads the record");
-    assert_ne!(
-        written, b"a boot this host is not running",
+    let named: kr_protocol::identity::BootIdentity =
+        kr_cbor::from_canonical_slice(&written, &kr_cbor::Limits::DEFAULT).expect("decodes");
+    assert_eq!(
+        named,
+        kr_ipc::identity::boot_identity().expect("a boot identity"),
         "the daemon recorded the boot it is actually running in"
     );
+
     drop(client);
     second.stop().await;
+
+    // A damaged record is a damaged record. It closes nothing, and the daemon writes a good one.
+    kr_ipc::paths::write_owner_only_file(&recorded, b"not a boot identity").expect("writes");
+    let third = host.start().await;
+    let written = std::fs::read(&recorded).expect("reads the record");
+    let named: kr_protocol::identity::BootIdentity =
+        kr_cbor::from_canonical_slice(&written, &kr_cbor::Limits::DEFAULT).expect("decodes");
+    assert_eq!(
+        named,
+        kr_ipc::identity::boot_identity().expect("a boot identity"),
+        "a damaged record is replaced rather than acted on"
+    );
+    third.stop().await;
 
     for (session_id, endpoint) in endpoints {
         let Ok(endpoint) = kr_ipc::paths::Endpoint::from_path(&endpoint) else {
@@ -867,6 +926,48 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
             .await;
     }
     tokio::time::sleep(Duration::from_secs(1)).await;
+}
+
+/// KR-REQ-03.23: the desktop a session was created on outlives its worker, so a host that finds
+/// the worker gone can say whether the desktop went with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_desktop_a_session_was_created_on_is_readable_after_its_worker_has_gone() {
+    let host = Host::create();
+    let daemon = host.start().await;
+    let mut client = host.client().await;
+    let created = create(&mut client, &host, Presentation::Invisible, profile_here()).await;
+    let session_id = created.session.session_id;
+    close(&mut client, &host, session_id).await;
+
+    // The worker's own journal, read the way a daemon reads it after the worker has gone.
+    let journal =
+        kr_worker::journal::Journal::open_read_only(&host.paths().journal_database(session_id))
+            .expect("the journal outlives the worker");
+    let recorded = journal
+        .read_session(session_id)
+        .expect("the journal is readable")
+        .expect("the worker recorded what its session was");
+    assert_eq!(
+        recorded.worker_profile, created.session.worker_profile,
+        "the record says which execution context the session ran in"
+    );
+    assert_eq!(
+        recorded.desktop.desktop_session_id, created.session.desktop.desktop_session_id,
+        "and which desktop it was bound to, which is what a later daemon compares"
+    );
+    if profile_here() == WorkerProfile::DesktopBound {
+        assert!(
+            recorded.desktop.desktop_session_id.is_present(),
+            "a desktop-bound session records the desktop it was created on"
+        );
+        let live = live_desktop().expect("this host has a desktop");
+        assert_eq!(
+            desktop::describes(&live, &recorded.desktop),
+            Some(true),
+            "and that record still describes the desktop this host is in"
+        );
+    }
+    daemon.stop().await;
 }
 
 /// KR-REQ-03.24, KR-REQ-07.59: a headless session has no inherited graphical access, and this host
@@ -1249,11 +1350,22 @@ fn a_capability_record_per_desktop_says_what_produced_it_and_refuses_a_container
             );
         }
     }
-    // And a worker created in such an environment is given none of the desktop's own variables.
-    assert!(
-        !ContainerEnvironment::Container.reaches_parent_desktop(),
-        "a container profile has no parent desktop to inherit"
-    );
+    // And whatever this host is, the context it reports and the capabilities it answers agree
+    // about it: a container or a distribution reaches no parent desktop, and a host reaches its
+    // own.
+    assert!(!ContainerEnvironment::Container.reaches_parent_desktop());
+    assert!(!ContainerEnvironment::Wsl.reaches_parent_desktop());
+    assert!(ContainerEnvironment::Host.reaches_parent_desktop());
+    if !context.container.reaches_parent_desktop() {
+        for record in &report.records {
+            assert!(
+                !record.state.is_available(),
+                "{} was available inside a {}",
+                record.capability,
+                context.container.as_str()
+            );
+        }
+    }
 }
 
 /// KR-REQ-03.27, KR-REQ-07.69: the power setting is off until it is chosen, appears in host status
