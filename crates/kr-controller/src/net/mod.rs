@@ -314,6 +314,23 @@ impl Network {
         self.guard.host.revoke_device(device_id).await
     }
 
+    /// Establishes this host's clock again, on an approval its owner signed for that.
+    ///
+    /// A host whose wall clock was found to have gone backwards decides no grant's expiry from it
+    /// until this is called. Nothing else clears that, because nothing else is evidence about the
+    /// clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this environment has no owner, when the approval is not its owner's,
+    /// or when the record cannot be written.
+    pub async fn establish_clock(
+        &self,
+        approval: &kr_pairing::host::OwnerApproval<'_>,
+    ) -> Result<()> {
+        self.guard.host.establish_clock(approval).await
+    }
+
     /// Stops accepting connections and closes the endpoint.
     pub async fn shutdown(self) {
         self.guard.shutdown().await;
@@ -353,11 +370,19 @@ pub struct NetworkHost {
     /// whose record has gone must also lose the write boundary it is holding and whatever it owns
     /// at its worker. Nothing else needs them, which is why they are recorded here rather than in
     /// the daemon's own authority store.
-    live: std::sync::Mutex<std::collections::BTreeMap<ConnectionId, Arc<RemoteConnection>>>,
+    /// Weak, and deliberately: a connection is owned by the task serving it, and it holds this
+    /// daemon. An owning handle here would make the daemon, its host and every live connection one
+    /// cycle that nothing could ever drop.
+    live: std::sync::Mutex<std::collections::BTreeMap<ConnectionId, Weak<RemoteConnection>>>,
     /// This host's endpoint identity, which is what a pairing invitation pins.
     endpoint_id: EndpointKey,
     /// Expiry records this host owes its directory, and has not yet written.
     pending_expiry: Arc<devices::PendingExpiry>,
+    /// Set once this host's wall clock has been found to have gone backwards.
+    ///
+    /// The durable record is the one a later run reads; this holds the decision for this run,
+    /// including when that write fails. Only an owner's approval clears either.
+    clock_distrusted: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for NetworkHost {
@@ -497,9 +522,10 @@ impl NetworkHost {
         };
         if remaining == 0 {
             // Run out. The tombstone is what a later boot reads, where this boot's deadline means
-            // nothing any more.
-            self.devices
-                .record_expiry(record.device_id, kr_ipc::now_ms())?;
+            // nothing any more, and it is owed to the directory before anything tries to write it:
+            // a write that fails here is retried by the host's own task rather than forgotten.
+            self.pending_expiry.owe(record.device_id, kr_ipc::now_ms());
+            self.pending_expiry.settle(&self.devices);
             return Err(ControllerError::PermissionDenied {
                 detail: "this device's grant has run out; pair again".to_owned(),
             });
@@ -523,16 +549,16 @@ impl NetworkHost {
         let controller = self.daemon()?;
         let observed = self.devices.utc_at_least(kr_ipc::now_ms())?;
         if observed.behind_ms > CLOCK_TOLERANCE_MS {
-            // Written down, because the next connection would otherwise ask a clock this host has
-            // already found unreliable, and be answered plausibly.
-            self.devices.note_clock_untrusted(observed.now)?;
+            // The latch first, then the record. The latch is what holds the decision while this
+            // host runs, including when the write below fails; the record is what a later run
+            // reads. Neither one alone is enough.
+            self.distrust_clock(observed.now);
         }
-        // Recorded distrust stands until something authenticates the clock again. Reaching a
-        // moment this host had already written down is not that evidence: it proves neither what
-        // the time is now nor how much of it passed while the host was not running. What clears it
-        // is an owner present at the machine committing a pairing, which is an authenticated
-        // action on this host rather than a reading of the same untrusted clock.
-        if self.devices.clock_untrusted()? {
+        // Distrust stands until something authenticates the clock again. Reaching a moment this
+        // host had already written down is not that evidence: it proves neither what the time is
+        // now nor how much of it passed while the host was not running. Only
+        // [`NetworkHost::establish_clock`], which an owner's approval reaches, clears it.
+        if self.clock_untrusted()? {
             return Err(ControllerError::ClockUntrusted {
                 detail: "this host's clock went backwards and has not been established again, so \
                          it cannot say whether this device's grant has run out"
@@ -593,7 +619,7 @@ impl NetworkHost {
         self.live
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(connection_id, Arc::clone(&remote));
+            .insert(connection_id, Arc::downgrade(&remote));
         // The guard is what releases this connection, and it does it from a destructor because
         // this future is *cancelled* rather than finished the moment the control stream ends: the
         // transport races the handler against the stream and against the connection, so the end of
@@ -665,6 +691,77 @@ impl NetworkHost {
         controller.announce_authority_revision().await
     }
 
+    /// Records that this host's wall clock cannot be trusted, in memory and durably.
+    ///
+    /// The latch holds the decision for this run whatever storage does; the record is what a later
+    /// run reads. A write that fails is retried by the host's own task, which is also what
+    /// observes a rollback between connections.
+    fn distrust_clock(&self, now_ms: kr_protocol::scalars::TimestampMs) {
+        self.clock_distrusted
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Err(error) = self.devices.note_clock_untrusted(now_ms) {
+            eprintln!(
+                "kr-controller: could not record that this host's clock went backwards: {error}"
+            );
+        }
+    }
+
+    /// Returns whether this host's clock is one it may decide an expiry against.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be read. A host that cannot tell decides nothing.
+    fn clock_untrusted(&self) -> Result<bool> {
+        if self
+            .clock_distrusted
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(true);
+        }
+        self.devices.clock_untrusted()
+    }
+
+    /// Establishes this host's clock again, on an owner's authority.
+    ///
+    /// Nothing a clock says about itself can do this, and neither can another decision the owner
+    /// happened to make: section 9 wants qualified time evidence or an authenticated action about
+    /// *this*. So it is its own operation, and it needs an approval this host's owner signed for
+    /// it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this environment has no owner to approve it, when the approval is not
+    /// this host's owner's, or when the record cannot be written.
+    async fn establish_clock(&self, approval: &kr_pairing::host::OwnerApproval<'_>) -> Result<()> {
+        let pairing = self.pairing.as_ref().ok_or_else(|| {
+            ControllerError::NotConfigured(
+                "this environment has no owner to establish its clock".to_owned(),
+            )
+        })?;
+        pairing.accept_clock(approval)?;
+        self.devices.trust_clock()?;
+        self.clock_distrusted
+            .store(false, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Returns the live connections this predicate selects, holding each one for the caller.
+    ///
+    /// The map holds weak handles, so an entry whose connection has already gone is skipped: its
+    /// own guard removes it, and until then there is nothing there to fence.
+    fn live_connections(
+        &self,
+        wanted: impl Fn(&RemoteConnection) -> bool,
+    ) -> Vec<Arc<RemoteConnection>> {
+        self.live
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .filter_map(Weak::upgrade)
+            .filter(|remote| wanted(remote))
+            .collect()
+    }
+
     /// Fences every live connection whose registration has gone.
     ///
     /// A registration is what a remote connection writes under, and a revocation that withdraws
@@ -674,14 +771,7 @@ impl NetworkHost {
     /// connections directly; this is for a revocation that withdrew registrations without naming
     /// the devices holding them.
     async fn fence_withdrawn(&self) {
-        let live: Vec<Arc<RemoteConnection>> = self
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .map(Arc::clone)
-            .collect();
-        for remote in live {
+        for remote in self.live_connections(|_| true) {
             if remote.is_authorised().await {
                 continue;
             }
@@ -700,15 +790,7 @@ impl NetworkHost {
     /// what the connection owned at its worker, which is what a revoked device's attachment and
     /// input lease would otherwise keep holding.
     fn withdraw_device(&self, device_id: DeviceId) {
-        let withdrawn: Vec<Arc<RemoteConnection>> = self
-            .live
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .values()
-            .filter(|remote| remote.device_id() == device_id)
-            .map(Arc::clone)
-            .collect();
-        for remote in withdrawn {
+        for remote in self.live_connections(|remote| remote.device_id() == device_id) {
             remote.output().withdraw();
             // Releasing the worker link waits for a socket, so it belongs to a task rather than to
             // the critical section a revocation is holding.
@@ -911,6 +993,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         live: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         endpoint_id,
         pending_expiry: Arc::new(devices::PendingExpiry::default()),
+        clock_distrusted: std::sync::atomic::AtomicBool::new(false),
     });
     // The record of the wall clock moves while this host runs, whether or not anything asks it a
     // question. A mark that only advanced when a device connected would stand still through a
@@ -1092,7 +1175,20 @@ impl Controller {
                 }),
             };
         }
-        let deadline = self.forwarded_deadline(session_id, actor, accepted).await?;
+        // The accepted deadline as it stands, and no dispatch lease behind it. Section 9 asks for
+        // a live lease before a *remote dispatch*, and it exempts stopping owned execution from
+        // that: a device may always stop what it is authorised to stop, and a worker that has not
+        // acknowledged a revision yet is not a reason to refuse it. What still decides is the
+        // worker's own check of current authority when the close arrives.
+        let deadline = crate::service::remaining_deadline(
+            &*self.shared_clock,
+            &*self.clock,
+            accepted.deadline,
+            None,
+        )
+        .ok_or_else(|| ControllerError::WindowExpired {
+            detail: "the deadline this close was admitted under has passed".to_owned(),
+        })?;
         // The link is this close's own, and it is released whichever way the exchange ends.
         let (notifications, _unread) = tokio::sync::mpsc::channel(1);
         let proxy = self

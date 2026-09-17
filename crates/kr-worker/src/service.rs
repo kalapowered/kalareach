@@ -368,26 +368,34 @@ impl WorkerService {
             let reply = self.handle(&mut state, &peer, message).await;
             if let Some(reply) = reply {
                 // A close that was admitted happens, whether or not its acceptance can be written.
-                // Its bounded owner is armed *before* the write, because the write itself can wait
-                // for a socket nobody is reading: a gate that was only released afterwards would
-                // leave the session closing for exactly as long as that peer stayed away.
-                let armed = state.close_gate.take().map(|(action_id, gate)| {
-                    (
-                        action_id,
-                        gate.release_on_delivery(crate::runtime::ACCEPTANCE_DELIVERY_TIMEOUT),
-                    )
-                });
-                let written = write_frame(&writable, &writer, &reply, &withdrawn, protected).await;
-                if let Some((action_id, delivery)) = armed {
+                // What the two bounds here separate is the write and the delivery: the write gets
+                // its own bound, because a peer that has stopped reading must not hold a session
+                // closing for as long as it stays away; the wait for a *proxy* to pass the
+                // acceptance on starts after the write succeeded, so it cannot run out while the
+                // acceptance is still on its way.
+                let closing = state.close_gate.take();
+                // A write this bound abandons part way through leaves the connection carrying
+                // nothing more, which `false` is read as below. The close still happens: it was
+                // admitted.
+                let written = tokio::time::timeout(
+                    crate::runtime::ACCEPTANCE_WRITE_TIMEOUT,
+                    write_frame(&writable, &writer, &reply, &withdrawn, protected),
+                )
+                .await
+                .unwrap_or_default();
+                if let Some((action_id, gate)) = closing {
                     if written && state.client_kind == LocalClientKind::Controller {
                         // The requester is not the peer that was just written to: the daemon still
                         // has to pass the acceptance on. Termination waits for it to say so, or for
-                        // the bound this owner already holds.
-                        state.pending_delivery = Some((action_id, delivery));
+                        // the bound this owner holds from here.
+                        state.pending_delivery = Some((
+                            action_id,
+                            gate.release_on_delivery(crate::runtime::ACCEPTANCE_DELIVERY_TIMEOUT),
+                        ));
                     } else {
                         // Either the acceptance reached its own requester, or it reached nobody and
-                        // never will. Both end the wait now.
-                        delivery.confirm();
+                        // never will. Both release the gate now.
+                        gate.release();
                     }
                 }
                 if !written {

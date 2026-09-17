@@ -199,13 +199,6 @@ impl InvitationStore for SharedInvitations {
                     .map_err(|error| kr_pairing::PairingError::Store {
                         reason: error.to_string(),
                     })?;
-                // An owner is at this machine and has just confirmed a pairing on it. That is the
-                // authenticated action this host's clock needs to be trusted again after it was
-                // found to have gone backwards: nothing a clock says about itself can establish
-                // it, and until something does, no grant's expiry can be decided from the wall
-                // clock. A failure to clear it leaves the host refusing those decisions, which is
-                // the safe side of it.
-                let _ = self.devices.trust_clock();
                 self.state
                     .commitments
                     .lock()
@@ -255,6 +248,11 @@ impl InvitationStore for SharedInvitations {
 
 /// One direct invitation, and the owner that issued it.
 type Invitation = DirectInvitation<SharedInvitations, HostPairingClock>;
+
+/// What an owner confirms when it establishes this host's clock again.
+///
+/// The digest of this, and of nothing else, is what the confirmation is bound to.
+pub const CLOCK_PURPOSE: &str = "kr-host-clock/1";
 
 /// The host's pairing state machine, and the surface an unpaired connection reaches it through.
 pub struct PairingHost {
@@ -463,6 +461,44 @@ impl PairingHost {
 
     fn ledger(&self) -> std::sync::MutexGuard<'_, ConfirmationLedger> {
         self.ledger.lock().unwrap_or_else(|held| held.into_inner())
+    }
+
+    /// Accepts an owner's confirmation that this host may read its own clock again.
+    ///
+    /// Section 9 wants qualified time evidence or an authenticated action about the clock itself
+    /// before a host that found its clock going backwards decides another expiry from it. This is
+    /// the second of those, and it is bound to the clock: the digest covers this purpose and
+    /// nothing else, so an approval the owner gave for a pairing cannot be spent on it, and a
+    /// confirmation is consumed once like every other.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the approval is not this host's owner's, when it confirms something
+    /// else, or when the challenge has already been spent.
+    pub fn accept_clock(&self, approval: &OwnerApproval<'_>) -> Result<()> {
+        let digest = kr_pairing::confirm::action_digest(&CLOCK_PURPOSE)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        kr_pairing::confirm::accept_confirmation(
+            &mut self.ledger(),
+            &self.clock,
+            approval.request,
+            approval.proof,
+            approval.signer,
+            approval.enrolment,
+            &kr_pairing::confirm::ConfirmationExpectation {
+                action: SensitiveAction::ChangeHostAuthority,
+                action_digest: digest,
+                host_device_id: self.identity.device_id,
+                host_endpoint_id: self.identity.endpoint_id,
+                // It sends authority nowhere and grants nothing. What it changes is what this host
+                // will decide about the authority it has already issued.
+                destination_keys: None,
+                destination_rights: &kr_protocol::scalars::CanonicalSet::new(),
+            },
+        )
+        .map_err(|error| ControllerError::PermissionDenied {
+            detail: error.to_string(),
+        })
     }
 
     /// Returns the approval shape a caller presents, bound to this host's enrolled signer.

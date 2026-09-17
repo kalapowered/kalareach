@@ -164,6 +164,15 @@ impl Authorisation {
     /// attempt to write a frame: a decision made inside a poll cannot wait on a lock or a
     /// database. Writing the expiry down is [`Self::note_expiry`], which the checks that can
     /// afford it call.
+    /// Records that this grant has run out, and writes it down.
+    ///
+    /// For a caller that established the expiry some other way than by reading the deadline here:
+    /// the latch is what makes it an observation rather than a fence for another reason.
+    fn expire(&self) {
+        self.expired.store(true, Ordering::Release);
+        self.note_expiry();
+    }
+
     fn has_time_left(&self) -> bool {
         if self.expired.load(Ordering::Acquire) {
             return false;
@@ -186,8 +195,15 @@ impl Authorisation {
     /// whichever check made it, against a UTC moment that never goes earlier than the latest this
     /// host has recorded. What the host holds it does not lose: a write that fails here is retried
     /// by the host's own task, which outlives this connection.
+    ///
+    /// Only an expiry something actually observed is written. A connection can be fenced for
+    /// reasons that have nothing to do with its grant's lifetime - a device revocation, an
+    /// authority revision - and writing a tombstone for one of those would end a grant that had
+    /// years left on it.
     fn note_expiry(&self) {
-        self.expired.store(true, Ordering::Release);
+        if !self.expired.load(Ordering::Acquire) {
+            return;
+        }
         if !self.recorded.swap(true, Ordering::AcqRel) {
             let now = self
                 .devices
@@ -604,6 +620,13 @@ impl RemoteConnection {
             // Storage that cannot say whether this action has been dispatched says nothing about
             // the action. Section 7 does not let that stop an authorised stop, so a close goes on
             // and reports whatever durability it then had; anything else is refused.
+            //
+            // What a close then loses is this host's own check of `action.read` over the session,
+            // because it is the route that would have said the close is a resubmission. The
+            // worker's journal still decides idempotently, so a second close can come back from
+            // the receipt the first produced. What that returns is the outcome of this device's
+            // own close on a session its grant admits closing, and nothing else travels with it,
+            // so the stop is allowed to happen and the narrower check is the one that gives way.
             Err(RouteRefusal::Unavailable(error)) => {
                 if entry.method != Method::SessionClose {
                     return failure(mutation.request_id, error);
@@ -1099,7 +1122,9 @@ impl RemoteConnection {
             None,
         )
         .ok_or_else(|| {
-            self.authority.note_expiry();
+            // Nothing is left of the deadline, which is this grant having run out: the latch is
+            // set here because that is the observation, and the record follows it.
+            self.authority.expire();
             ProtocolError::new(
                 ErrorCode::PermissionDenied,
                 "this device's grant has run out",

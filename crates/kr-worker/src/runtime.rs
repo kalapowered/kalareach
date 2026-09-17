@@ -944,6 +944,13 @@ impl SessionRuntime {
     }
 }
 
+/// How long a worker waits for one acceptance to reach the transport it answers on.
+///
+/// A peer that has stopped reading must not hold a session closing for as long as it stays away,
+/// and a write that cannot finish inside this is one nothing is reading: the connection carries
+/// nothing more, and the close goes on, because it was admitted.
+pub const ACCEPTANCE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// How long a worker waits for a proxy to confirm it delivered the acceptance.
 ///
 /// A close that was admitted happens. Waiting for confirmation is what stops the requester's
