@@ -1406,10 +1406,22 @@ fn start_daemon(program: &std::path::Path, host: &kr_ipc::testing::TempHost) -> 
         .expect("starts the daemon")
 }
 
+/// How long a freshly started daemon is given to answer.
+///
+/// A daemon coming up opens its journals, reads its secrets and binds both of its endpoints, and on
+/// a machine that is building something else at the same time that has taken over half a minute.
+/// What the wait below asserts is that the daemon comes up at all, so its bound is generous: a run
+/// that reaches it is saying the daemon never answered, not that the machine was busy.
+#[cfg(unix)]
+const DAEMON_START_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Waits for a daemon to answer on its control endpoint.
+///
+/// A liveness wait, not a measurement. The poll is fast so a daemon that is up is used at once, the
+/// deadline is [`DAEMON_START_DEADLINE`], and the message says how long it actually waited.
 #[cfg(unix)]
 async fn wait_for_daemon(endpoint: &kr_ipc::paths::Endpoint) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let started = std::time::Instant::now();
     loop {
         if LocalClient::connect(endpoint, LocalClientKind::Cli, build())
             .await
@@ -1417,9 +1429,10 @@ async fn wait_for_daemon(endpoint: &kr_ipc::paths::Endpoint) {
         {
             return;
         }
+        let waited = started.elapsed();
         assert!(
-            std::time::Instant::now() < deadline,
-            "the daemon did not answer on {} within thirty seconds",
+            waited < DAEMON_START_DEADLINE,
+            "the daemon did not answer on {} in {waited:.1?}",
             endpoint.as_text()
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
