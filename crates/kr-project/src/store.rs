@@ -47,7 +47,7 @@ use crate::identity::RepositoryIdentity;
 use crate::operation::StagedWitness;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// What an inclusion records for a path whose outcome it has not established.
 pub const PROGRESS_PLANNED: &str = "planned";
@@ -505,11 +505,13 @@ impl Store {
             // write. A store at 3 has the right columns and the wrong contents, which is why the
             // version moves on for a change that adds no column at all. Version 5 is where a
             // retained item stopped being identified by its reason alone, so that protecting a
-            // reason cannot make two items one.
+            // reason cannot make two items one. Version 6 is where the rule reached inside a
+            // recorded answer, which holds free text of its own.
             Some(version) if version < SCHEMA_VERSION => {
                 add_missing_columns(&transaction)?;
                 rebuild_retained_items(&transaction)?;
                 protect_recorded_reasons(&transaction)?;
+                protect_recorded_answers(&transaction)?;
                 transaction
                     .execute(
                         "UPDATE schema_version SET version = ?1",
@@ -1735,7 +1737,8 @@ impl Store {
         actor_id: &ActorId,
         action_id: Uuid,
     ) -> Result<Option<RetainedAction>> {
-        self.connection
+        let record: Option<RetainedAction> = self
+            .connection
             .query_row(
                 "SELECT actor_id, action_id, method, payload_digest, subject, result, error_code,
                         error_detail, recorded_at_ms
@@ -1759,7 +1762,11 @@ impl Store {
                 },
             )
             .optional()
-            .map_err(ProjectError::store)
+            .map_err(ProjectError::store)?;
+        // A successful answer is kept whole, and it carries free text of its own. The columns beside
+        // it come back through the rule, and so does the answer: this is the last place this host
+        // can reach what an earlier build recorded before a repeat of the action returns it.
+        record.map(protect_recorded_answer).transpose()
     }
 
     /// Records one action's outcome, leaving an existing row alone.
@@ -2110,6 +2117,53 @@ fn protect_recorded_reasons(transaction: &Transaction<'_>) -> Result<()> {
                 )
                 .map_err(ProjectError::store)?;
         }
+    }
+    Ok(())
+}
+
+/// Puts the diagnostics inside the answers a store already holds through the rule.
+///
+/// An action's row keeps the whole successful reply, so a repeat of the action is answered from it.
+/// A build before the rule existed encoded whatever it had composed, and updating the reason
+/// *columns* does not reach that copy: the reply is one value, encoded.
+///
+/// What is rewritten is each diagnostic field inside the reply. The data fields and the row's own
+/// identity — who claimed the action, which action, which method, which request — are left exactly
+/// as they were, so a repeat still finds its own answer and still finds the same one.
+///
+/// A row this build cannot decode is left as it is rather than stopping the upgrade: a store that
+/// refuses to open is a daemon that never serves. Reading such a row refuses it, so nothing
+/// unprotected reaches a caller either way.
+fn protect_recorded_answers(transaction: &Transaction<'_>) -> Result<()> {
+    let mut statement = transaction
+        .prepare("SELECT rowid, method, result FROM actions WHERE result IS NOT NULL")
+        .map_err(ProjectError::store)?;
+    let mapped = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .map_err(ProjectError::store)?;
+    let mut rewritten: Vec<(i64, Vec<u8>)> = Vec::new();
+    for row in mapped {
+        let (rowid, method, stored) = row.map_err(ProjectError::store)?;
+        if let Ok(protected) = crate::answer::protect_stored_result(&method, &stored)
+            && protected != stored
+        {
+            rewritten.push((rowid, protected));
+        }
+    }
+    drop(statement);
+    for (rowid, protected) in rewritten {
+        transaction
+            .execute(
+                "UPDATE actions SET result = ?1 WHERE rowid = ?2",
+                params![protected, rowid],
+            )
+            .map_err(ProjectError::store)?;
     }
     Ok(())
 }
@@ -2535,6 +2589,21 @@ fn read_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRow> {
     })
 }
 
+/// Returns one recorded action whose stored answer has been through the rule.
+///
+/// The rule leaves its own output alone, so an answer this build recorded comes back byte for byte
+/// as it was stored. What this is *for* is an answer a build before the rule existed recorded: the
+/// row holds whatever that build encoded, and a repeat of the action returns it.
+fn protect_recorded_answer(mut record: RetainedAction) -> Result<RetainedAction> {
+    if let Some(stored) = record.result.take() {
+        record.result = Some(crate::answer::protect_stored_result(
+            &record.method,
+            &stored,
+        )?);
+    }
+    Ok(record)
+}
+
 /// Reads one free-text reason out of a stored row, through the rule.
 ///
 /// The rule leaves its own output alone, so a reason written under it comes back exactly as it was
@@ -2920,11 +2989,21 @@ mod tests {
                     .expect("it runs"),
                 1
             );
-            let record = store
-                .retained_action(&claimed.actor_id, claimed.action_id)
-                .expect("it reads")
-                .expect("it is there");
-            assert_eq!(record.result.as_deref(), Some(b"right".as_slice()));
+            // Read from the column rather than through `retained_action`, because what a claim is
+            // settled with here stands in for a typed result: reading one puts it through the rule,
+            // which needs the method's own result type. `answer` has the tests for that.
+            let stored: Option<Vec<u8>> = store
+                .connection
+                .query_row(
+                    "SELECT result FROM actions WHERE actor_id = ?1 AND action_id = ?2",
+                    params![
+                        claimed.actor_id.as_str(),
+                        claimed.action_id.as_bytes().to_vec()
+                    ],
+                    |row| row.get(0),
+                )
+                .expect("it reads");
+            assert_eq!(stored.as_deref(), Some(b"right".as_slice()));
             // A settled claim is not settled again.
             assert_eq!(
                 store

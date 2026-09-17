@@ -2212,3 +2212,149 @@ fn a_users_file_at_the_name_a_copy_would_use_is_never_removed() {
         "so the workspace holds the base's version rather than half of either"
     );
 }
+
+#[test]
+fn a_successful_answer_an_earlier_build_recorded_is_protected_before_a_repeat_returns_it() {
+    // An action's row keeps the whole successful reply, so a repeat of the action is answered from
+    // it rather than performed again. A build before the rule composed the reasons inside that
+    // reply without it, and rewriting the reason *columns* does not reach the reply: it is one
+    // value, encoded. So the reply goes through the rule where it is read, and the upgrade rewrites
+    // what the file holds.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "replayed");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "replayed".to_owned(),
+                kind: WorkspaceKind::SharedExisting,
+                isolation: Nullable(None),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(None),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 71)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    let pin = ChangeSetId::new(Uuid::from_bytes([72; 16]));
+    fixture
+        .service()
+        .retain(
+            workspace_id,
+            &RetainedRow {
+                kind: RetainedKind::PinnedChangeSet,
+                detail: "version 4 is pinned".to_owned(),
+                change_set_id: Some(pin),
+            },
+        )
+        .expect("the pin is recorded");
+    let submitted = action("workspace.remove", 73);
+    let params = WorkspaceRemoveParams {
+        workspace_id,
+        retention: RetentionPolicy::KeepEverything,
+    };
+    let answer = fixture
+        .service()
+        .workspace_remove(&params, Some(&submitted))
+        .expect("the removal is answered");
+    assert_eq!(answer.workspace.state, WorkspaceState::RemovalPending);
+    let journal_path = kr_project::ProjectService::root_of(&fixture.host().environment())
+        .join(kr_project::store::STORE_FILE_NAME);
+    let recorded: Vec<u8> = {
+        let journal = rusqlite::Connection::open(&journal_path).expect("the journal opens");
+        journal
+            .query_row(
+                "SELECT result FROM actions WHERE action_id = ?1",
+                rusqlite::params![submitted.action_id.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .expect("the recorded answer reads")
+    };
+    // The answer as a build before the rule would have recorded it: the same reply, with the
+    // reasons composed out of what the caller named.
+    let mut earlier: kr_protocol::project::WorkspaceRemoveResult =
+        kr_cbor::from_canonical_slice(&recorded, &kr_cbor::Limits::DEFAULT)
+            .expect("the recorded answer decodes");
+    earlier.workspace.detail = Nullable(Some(
+        "the tree at /w/access_token=REPLAYSECRET was kept".to_owned(),
+    ));
+    earlier.retained.push(kr_protocol::project::RetainedItem {
+        kind: RetainedKind::DirtyContent,
+        detail: "/w/access_token=REPLAYSECRET holds uncommitted work".to_owned(),
+        change_set_id: Nullable(None),
+    });
+    let unprotected = kr_cbor::to_canonical_vec(&earlier).expect("it encodes");
+    assert!(
+        String::from_utf8_lossy(&unprotected).contains("REPLAYSECRET"),
+        "the stand-in for an earlier build's answer holds what this host would not repeat"
+    );
+    let write_earlier_answer = || {
+        let journal = rusqlite::Connection::open(&journal_path).expect("the journal opens");
+        journal
+            .execute(
+                "UPDATE actions SET result = ?1 WHERE action_id = ?2",
+                rusqlite::params![unprotected.clone(), submitted.action_id.as_bytes().to_vec()],
+            )
+            .expect("an earlier build's answer is written");
+    };
+    write_earlier_answer();
+
+    // The repeat is answered from that row, and what it returns holds none of it.
+    let repeated = fixture
+        .service()
+        .workspace_remove(&params, Some(&submitted))
+        .expect("the repeat is answered from the journal");
+    let shown = format!("{repeated:?}");
+    assert!(
+        !shown.contains("REPLAYSECRET"),
+        "a recorded answer is put through the rule before it is returned: {shown}"
+    );
+    // And it is still the answer to that action: the same workspace, the same pin, the same
+    // decision about the working files.
+    assert_eq!(repeated.workspace.workspace_id, workspace_id);
+    assert_eq!(repeated.workspace.state, answer.workspace.state);
+    assert_eq!(repeated.working_files_removed, answer.working_files_removed);
+    assert!(
+        repeated
+            .workspace
+            .retained
+            .iter()
+            .any(|item| item.change_set_id == Nullable(Some(pin))),
+        "the pin the workspace holds is still named: {:?}",
+        repeated.workspace.retained
+    );
+
+    // A replacement daemon rewrites the file itself, so the bytes stop holding it too.
+    write_earlier_answer();
+    {
+        let journal = rusqlite::Connection::open(&journal_path).expect("the journal opens");
+        journal
+            .execute("UPDATE schema_version SET version = 3", [])
+            .expect("the version an earlier build recorded");
+    }
+    let replacement = fixture.reopen();
+    let stored: Vec<u8> = {
+        let journal = rusqlite::Connection::open(&journal_path).expect("the journal opens");
+        journal
+            .query_row(
+                "SELECT result FROM actions WHERE action_id = ?1",
+                rusqlite::params![submitted.action_id.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .expect("the recorded answer reads")
+    };
+    assert!(
+        !String::from_utf8_lossy(&stored).contains("REPLAYSECRET"),
+        "the upgrade rewrites what the file holds"
+    );
+    let repeated = replacement
+        .workspace_remove(&params, Some(&submitted))
+        .expect("the repeat is answered again");
+    assert_eq!(repeated.workspace.workspace_id, workspace_id);
+    assert!(!format!("{repeated:?}").contains("REPLAYSECRET"));
+}

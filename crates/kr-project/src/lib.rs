@@ -16,6 +16,7 @@
 //!
 //! | Module | What it owns |
 //! | --- | --- |
+//! | [`answer`] | The rule applied inside a recorded answer, so a repeat of an action says what the first one did |
 //! | [`git`] | The restricted execution profile: the program, the environment, the overrides, the audit |
 //! | [`identity`] | Repository identity by stable filesystem identity, and the handles every operation works through |
 //! | [`credential`] | Remotes, providers, the approved credential brokers and the transports this host uses |
@@ -89,6 +90,7 @@
 //! # }
 //! ```
 
+pub mod answer;
 pub mod credential;
 pub mod error;
 pub mod git;
