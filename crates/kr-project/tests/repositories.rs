@@ -995,10 +995,30 @@ fn a_cancellation_ends_the_subprocess_this_host_started() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
     let port = listener.local_addr().expect("its address").port();
     let held = std::thread::spawn(move || {
-        // Accept and hold: the connection stays open and nothing is written to it.
-        let accepted = listener.accept();
-        std::thread::sleep(Duration::from_secs(5));
-        drop(accepted);
+        // Accept and hold: the connection stays open and nothing is written to it. The wait is
+        // bounded, because whether the invocation reached the connection before its owner stopped
+        // it is a matter of how busy the machine is, and a thread waiting for a connection that is
+        // never coming would hold this test open for ever rather than failing it.
+        listener
+            .set_nonblocking(true)
+            .expect("the listener can be polled");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match listener.accept() {
+                Ok(accepted) => {
+                    std::thread::sleep(Duration::from_secs(5));
+                    drop(accepted);
+                    break;
+                }
+                Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(_) => break,
+            }
+        }
         drop(listener);
     });
 
