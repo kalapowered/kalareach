@@ -1201,7 +1201,7 @@ fn a_restart_mid_publish_resolves_by_identifier_without_losing_the_completed_fil
     }
     // The publish is interrupted between its two commits: the verification is durable, carrying
     // the identity of the object it verified, and the payload is still under its incomplete name.
-    interrupt_publish(&host, transfer_id, expected, payload_identity);
+    interrupt_publish(&host, transfer_id, expected, payload_identity, None);
 
     let clock = Arc::new(ManualClock::new(support::START_MS + 5_000));
     let service = TransferService::with_clock(&host.environment(), clock as Arc<_>)
@@ -1256,7 +1256,7 @@ fn a_restart_mid_publish_resolves_by_identifier_without_losing_the_completed_fil
 fn a_replaced_or_missing_payload_is_never_published() {
     let harness = Harness::create();
     let bytes = pattern(64);
-    let (transfer_id, staged) = interrupted_publication(&harness, &bytes, "notes.bin");
+    let (transfer_id, staged) = interrupted_publication(&harness, &bytes, "notes.bin", None);
 
     // Another writer replaces the payload with a file of the same length. Whether the replacement
     // is an object the filesystem gives a new identifier or one it gives the identifier the
@@ -1278,21 +1278,12 @@ fn a_replaced_or_missing_payload_is_never_published() {
 /// the bytes differ. Identity is the cheap first gate; the digest is what decides.
 #[test]
 fn a_payload_rewritten_in_place_is_invalidated_rather_than_published() {
-    use std::io::Write as _;
-
     let harness = Harness::create();
     let bytes = pattern(64);
-    let (transfer_id, staged) = interrupted_publication(&harness, &bytes, "notes.bin");
+    let (transfer_id, staged) = interrupted_publication(&harness, &bytes, "notes.bin", None);
     let verified = identity_of(&staged);
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&staged)
-        .expect("opens the staged payload where it lies");
-    file.write_all(&vec![0xA5_u8; bytes.len()])
-        .expect("overwrites every byte of it");
-    file.sync_all().expect("flushes the overwrite");
-    drop(file);
+    rewrite_in_place(&staged, bytes.len());
     assert_eq!(
         identity_of(&staged),
         verified,
@@ -1315,28 +1306,94 @@ fn a_payload_rewritten_in_place_is_invalidated_rather_than_published() {
     assert_publication_invalidated(&harness, transfer_id, recovery);
 }
 
+/// KR-REQ-24.09: a publication whose payload reached its published name before the journal caught
+/// up is invalidated too, when the bytes under that name are not the ones that were verified.
+///
+/// The other state an interrupted publish leaves: the move landed and the commit behind it did not.
+#[test]
+fn a_published_name_holding_altered_bytes_is_invalidated() {
+    let harness = Harness::create();
+    let bytes = pattern(64);
+    let (transfer_id, staged) = interrupted_publication(&harness, &bytes, "moved.bin", None);
+    let (_, published) = payload_paths(&harness, transfer_id, "moved.bin");
+    std::fs::rename(&staged, &published).expect("the move that the second commit never recorded");
+    let verified = identity_of(&published);
+
+    rewrite_in_place(&published, bytes.len());
+    assert_eq!(
+        identity_of(&published),
+        verified,
+        "a rename and an overwrite in place both leave the object's identity as it was"
+    );
+
+    let recovery = harness.service.recover().expect("recovers");
+    assert_publication_invalidated(&harness, transfer_id, recovery);
+}
+
+/// KR-REQ-24.09, KR-REQ-14.12: a publication that ends invalidated answers the action that claimed
+/// it, so every copy of that action is told what happened rather than being refused for the state
+/// the invalidation left behind.
+#[test]
+fn an_invalidated_publication_answers_the_action_that_claimed_it() {
+    let harness = Harness::create();
+    let bytes = pattern(64);
+    let claim = action(&harness, "upload.finish", &bytes);
+    let (transfer_id, staged) =
+        interrupted_publication(&harness, &bytes, "notes.bin", Some(&claim));
+    rewrite_in_place(&staged, bytes.len());
+
+    // The retried finish resolves the publication its own action claimed, finds bytes that are not
+    // the verified ones, and says so.
+    let refusal = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect_err("refuses to publish bytes that were never verified");
+    assert_eq!(refusal.code(), ErrorCode::AttachmentIntegrity);
+
+    // A copy of that action arriving before any recovery pass is owed the same answer, word for
+    // word, rather than a refusal for the state the invalidation left behind.
+    let repeat = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect_err("answers the repeat from the record");
+    assert_eq!(repeat.code(), refusal.code());
+    assert_eq!(repeat.to_string(), refusal.to_string());
+
+    // The claim is answered, so recovery has nothing left to settle, and a copy that arrives after
+    // it is answered the same way again.
+    assert_eq!(
+        harness.service.recover().expect("recovers"),
+        kr_transfer::Recovery::default(),
+        "the refusal left nothing for a recovery pass to resolve"
+    );
+    let afterwards = harness
+        .finish_as(transfer_id, &bytes, Some(&claim))
+        .expect_err("answers a later copy the same way");
+    assert_eq!(afterwards.code(), refusal.code());
+    assert_eq!(afterwards.to_string(), refusal.to_string());
+
+    // And a caller with no action of its own is told the same thing, not the bare state.
+    let fresh = harness
+        .finish_as(transfer_id, &bytes, None)
+        .expect_err("refuses an upload that ended without publishing");
+    assert_eq!(fresh.code(), refusal.code());
+    assert_eq!(fresh.to_string(), refusal.to_string());
+}
+
 /// KR-REQ-24.09: an interrupted publication that cannot be resolved does not stop the recovery
 /// pass, so the rows behind it are resolved rather than waiting for a start that never gets past
 /// this one.
 #[test]
 fn a_publication_behind_an_invalidated_one_is_still_resolved() {
-    use std::io::Write as _;
-
     let harness = Harness::create();
     let rewritten_bytes = pattern(64);
     let intact_bytes = pattern(128);
     let (rewritten, rewritten_path) =
-        interrupted_publication(&harness, &rewritten_bytes, "rewritten.bin");
-    let (intact, _) = interrupted_publication(&harness, &intact_bytes, "intact.bin");
+        interrupted_publication(&harness, &rewritten_bytes, "rewritten.bin", None);
+    // Reserved a millisecond later, so the pass reaches it after the one it must not stop on:
+    // pending publications are resolved in the order they were created.
+    harness.clock.advance(1);
+    let (intact, _) = interrupted_publication(&harness, &intact_bytes, "intact.bin", None);
 
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .open(&rewritten_path)
-        .expect("opens the first payload where it lies");
-    file.write_all(&vec![0xA5_u8; rewritten_bytes.len()])
-        .expect("overwrites every byte of it");
-    file.sync_all().expect("flushes the overwrite");
-    drop(file);
+    rewrite_in_place(&rewritten_path, rewritten_bytes.len());
 
     let recovery = harness.service.recover().expect("recovers");
     assert_eq!(
@@ -1444,13 +1501,15 @@ fn a_payload_a_closed_upload_left_behind_is_removed_by_recovery() {
 
 /// Stages one chunk and records the publication's intent, which is what an interrupted publish
 /// leaves behind: a durable verification carrying the identity of the object it was made against,
-/// and the payload still under its incomplete name.
+/// and the payload still under its incomplete name. `claimed_by` records the claim a publication
+/// made under an action carries, the way `upload.finish` does.
 ///
 /// Returns the transfer and the path of its payload.
 fn interrupted_publication(
     harness: &Harness,
     bytes: &[u8],
     original_file_name: &str,
+    claimed_by: Option<&kr_transfer::service::Action>,
 ) -> (TransferId, std::path::PathBuf) {
     let begun = harness
         .begin(bytes, "application/octet-stream", original_file_name)
@@ -1458,21 +1517,54 @@ fn interrupted_publication(
     harness
         .send(begun.transfer_id, bytes, 0)
         .expect("sends the chunk");
-    // Named rather than listed, so a test with more than one staged payload still knows which is
-    // which.
-    let staged = harness.service.staging().incomplete().display_path().join(
-        kr_transfer::StorageName::derive(begun.transfer_id, original_file_name)
-            .incomplete()
-            .expect("the payload's staged name")
-            .as_str(),
-    );
+    let (staged, _) = payload_paths(harness, begun.transfer_id, original_file_name);
     interrupt_publish(
         &harness.host,
         begun.transfer_id,
         digest(bytes),
         identity_of(&staged),
+        claimed_by,
     );
     (begun.transfer_id, staged)
+}
+
+/// The two paths one transfer's payload can be under: its incomplete name and its published name.
+///
+/// Derived rather than listed, so a test with more than one staged payload knows which is which.
+fn payload_paths(
+    harness: &Harness,
+    transfer_id: TransferId,
+    original_file_name: &str,
+) -> (std::path::PathBuf, std::path::PathBuf) {
+    let storage = kr_transfer::StorageName::derive(transfer_id, original_file_name);
+    (
+        harness.service.staging().incomplete().display_path().join(
+            storage
+                .incomplete()
+                .expect("the payload's staged name")
+                .as_str(),
+        ),
+        harness.service.staging().complete().display_path().join(
+            storage
+                .published()
+                .expect("the payload's published name")
+                .as_str(),
+        ),
+    )
+}
+
+/// Overwrites every byte of a file where it lies, which no filesystem can answer for with a new
+/// identity: the device and the file number are the ones the object already had.
+fn rewrite_in_place(path: &std::path::Path, byte_len: usize) {
+    use std::io::Write as _;
+
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("opens the payload where it lies");
+    file.write_all(&vec![0xA5_u8; byte_len])
+        .expect("overwrites every byte of it");
+    file.sync_all().expect("flushes the overwrite");
 }
 
 /// Asserts everything an invalidated publication leaves behind, whichever way it was invalidated.
@@ -1540,7 +1632,20 @@ fn interrupt_publish(
     transfer_id: TransferId,
     digest: Digest256,
     payload_identity: kr_transfer::ObjectIdentity,
+    claimed_by: Option<&kr_transfer::service::Action>,
 ) {
+    let recorded_at_ms = kr_protocol::scalars::TimestampMs::new(support::START_MS + 1);
+    // The claim a publication commits with its intent: the transfer it acts on and no result,
+    // because the handle does not exist until the second commit fills it in.
+    let claim = claimed_by.map(|action| kr_transfer::store::RetainedAction {
+        actor_id: action.actor_id.clone(),
+        action_id: action.action_id,
+        method: action.method.clone(),
+        payload_digest: action.payload_digest,
+        subject: Some(transfer_id),
+        result: None,
+        recorded_at_ms,
+    });
     let mut store = kr_transfer::Store::open(
         kr_transfer::StagingArea::store_path(&host.environment()),
         host.environment_id(),
@@ -1555,8 +1660,8 @@ fn interrupt_publish(
                 preview: None,
                 preview_unavailable: None,
             },
-            kr_protocol::scalars::TimestampMs::new(support::START_MS + 1),
-            None,
+            recorded_at_ms,
+            claim.as_ref(),
         )
         .expect("records the verification");
 }
@@ -1645,7 +1750,7 @@ fn a_sweep_during_an_unresolved_publication_leaves_no_charged_bytes() {
     }
     // The publish is durable and unresolved, and the clock then passes the twenty-four-hour
     // window, so the sweep and the publication both have a claim on this row.
-    interrupt_publish(&host, transfer_id, expected, payload_identity);
+    interrupt_publish(&host, transfer_id, expected, payload_identity, None);
     let clock = Arc::new(ManualClock::new(
         support::START_MS + kr_protocol::transfer::UNFINISHED_UPLOAD_LIFETIME.get() + 1,
     ));
@@ -1747,7 +1852,7 @@ fn a_cancellation_during_a_publication_releases_the_payload_and_the_bytes() {
             .path();
         payload_identity = identity_of(&staged);
     }
-    interrupt_publish(&host, transfer_id, expected, payload_identity);
+    interrupt_publish(&host, transfer_id, expected, payload_identity, None);
     let clock = Arc::new(ManualClock::new(support::START_MS + 10));
     let service = TransferService::with_clock(&host.environment(), clock as Arc<_>)
         .expect("a replacement service");

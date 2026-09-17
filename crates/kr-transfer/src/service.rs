@@ -765,9 +765,10 @@ impl TransferService {
     /// reservation, the layout and every chunk already accepted belong to the first declaration.
     ///
     /// The publish is two commits with a recoverable state between them, and the identity of the
-    /// verified object is what ties them together. The row records that identity before the file
-    /// moves; after the move the published name is opened and checked against it, so a file of the
-    /// same length that took the name in between is refused rather than published.
+    /// verified object is what ties them together. The row records that identity and that digest
+    /// before the file moves; the object is then opened, checked against the identity and read back
+    /// against the digest, so a file that took the name in between is invalidated rather than
+    /// published, and so is one rewritten where it lies.
     ///
     /// # Errors
     ///
@@ -821,7 +822,17 @@ impl TransferService {
                 UploadState::Publishing => {
                     check_declaration(&row, params)?;
                     let payloads = self.payloads.lock().map_err(|_| poisoned())?;
-                    self.resolve_publication(&row, now)?;
+                    // Read again under the lock that guards the payload. The state above was read
+                    // before this lock, and a copy of this action, a cancellation or a sweep can
+                    // have moved the row since. Resolving a publication from a state that is no
+                    // longer there is how a payload another state now owns gets removed.
+                    let publishing = {
+                        let store = self.locked()?;
+                        upload_of(&store, params.transfer_id, actor)?
+                    };
+                    if publishing.state == UploadState::Publishing {
+                        self.resolve_publication(&publishing, now)?;
+                    }
                     drop(payloads);
                     let store = self.locked()?;
                     let row = upload_of(&store, params.transfer_id, actor)?;
@@ -843,7 +854,16 @@ impl TransferService {
                             self.complete_claim(action, &result)?;
                             Ok(result)
                         }
-                        _ => Err(publication_refusal(&row)),
+                        _ => {
+                            drop(store);
+                            let refusal = publication_refusal(&row);
+                            // The claim this publication was made under is answered with the
+                            // refusal it ended in, so a copy that arrives before the next recovery
+                            // pass is owed this answer rather than one for the state this action's
+                            // own publication reached.
+                            self.refuse_claim(action, &refusal)?;
+                            Err(refusal)
+                        }
                     };
                 }
                 _ => {}
@@ -858,6 +878,13 @@ impl TransferService {
             // reached.
             if let Recorded::Answered(answered) = recorded_with(&store, action)? {
                 return Ok(answered);
+            }
+            // An upload that ended without publishing answers with the reason it ended, not with
+            // the bare state. That is the refusal the caller of the failed publication was given
+            // and the one the record hands a repeat of its action, so a caller asking now is told
+            // the same thing rather than something in another category.
+            if matches!(row.state, UploadState::Invalidated | UploadState::Expired) {
+                return Err(publication_refusal(&row));
             }
             self.check_live(&mut store, &row, "it cannot be finished")?;
             check_declaration(&row, params)?;
@@ -1021,7 +1048,13 @@ impl TransferService {
         let row = upload_of(&store, params.transfer_id, actor)?;
         drop(store);
         if row.state != UploadState::Published {
-            return Err(publication_refusal(&row));
+            let refusal = publication_refusal(&row);
+            // This call's own claim, answered with what became of the publication it recorded. A
+            // claim left open would be filled by the next recovery pass, and until then a copy of
+            // this action would be told the outcome is unknown or refused for a state this action
+            // reached itself.
+            self.refuse_claim(action, &refusal)?;
+            return Err(refusal);
         }
         let result = UploadFinishResult {
             handle: handle_of(&row)?,
@@ -1050,9 +1083,11 @@ impl TransferService {
     ///   handle over bytes this service never verified.
     /// * Neither name holding it means no handle can name it either, so the upload is invalidated.
     ///
-    /// Only storage and journal failures are reported. Every other answer leaves the row terminal
-    /// and its payloads discarded, so recovery resolves the rows behind this one instead of
-    /// stopping on it and finding the same payload again at the next start.
+    /// Only a failure that says nothing about the payload is reported: the journal, the storage, or
+    /// the staging directory no longer being the directory this service opened. Every answer about
+    /// the payload itself leaves the row terminal and its payloads discarded, so recovery resolves
+    /// the rows behind this one instead of stopping on it and finding the same payload again at
+    /// every start.
     fn resolve_publication(&self, row: &UploadRow, now: TimestampMs) -> Result<()> {
         let identity = row.payload_identity.ok_or_else(|| {
             TransferError::store("a publication was recorded without the identity it verified")
@@ -1085,8 +1120,9 @@ impl TransferService {
         }
         if let Some(mut file) = self.holds(self.staging.incomplete(), &incomplete, identity)? {
             let integrity = PayloadIntegrity::of(&mut file, row.declared_byte_len, verified)?;
-            // Closed before the move. This handle was opened to read bytes, not to move them, and
-            // Windows refuses to rename a file whose open handle did not ask for delete sharing.
+            // Closed before the move. The bytes have been read, the move belongs to the staging
+            // area rather than to this handle, and the platforms do not agree on what is allowed
+            // while one is held.
             drop(file);
             if let PayloadIntegrity::Altered(detail) = integrity {
                 return self.abandon_publication(row, &detail, now);
@@ -1131,14 +1167,24 @@ impl TransferService {
     /// One exit for every publication that cannot be completed, so all of them leave the same
     /// state behind: a terminal row carrying the reason, neither name holding a payload, the bytes
     /// released, and nothing for the next recovery pass to find.
+    ///
+    /// The transition is conditional on the row still publishing, and the removal happens only
+    /// when the transition did. A row something else has moved on belongs to that state, and so
+    /// does its payload: a publication another copy of the same finish completed must not have its
+    /// attachment removed, and a cancellation that already closed this transfer is not an integrity
+    /// failure to be overwritten with one. Whatever such a state left to clean up is marked on its
+    /// own row, which the cleanup retry in this same pass picks up.
     fn abandon_publication(&self, row: &UploadRow, detail: &str, now: TimestampMs) -> Result<()> {
-        self.locked()?.close_upload_from(
+        let invalidated = self.locked()?.close_upload_from(
             row.transfer_id,
             UploadState::Publishing,
             UploadState::Invalidated,
             Some(detail),
             now,
         )?;
+        if !invalidated {
+            return Ok(());
+        }
         self.discard_payloads(row)
     }
 
@@ -1825,8 +1871,9 @@ impl TransferService {
     /// recorded and the digest it verified: whichever name holds that object says what happened,
     /// and the digest says whether its bytes are still the ones that were verified. A row whose
     /// object is in neither place, or whose bytes are no longer those, is invalidated, because no
-    /// handle can name it. One row that cannot be resolved never stops the pass: it ends
-    /// invalidated and the rows behind it are resolved in the same pass.
+    /// handle can name it. Neither of those stops the pass: the row ends invalidated and the rows
+    /// behind it are resolved in the same pass. A storage or journal failure still does stop it,
+    /// because it says nothing about what the staging area holds.
     ///
     /// A payload whose upload is closed but whose bytes are still on disk is removed, and only then
     /// is its reservation released. That is the other half of the cleanup contract: a removal that
@@ -2282,6 +2329,31 @@ impl TransferService {
             .map(|_| ())
     }
 
+    /// Records the refusal a claimed action ended in, so every copy of it is owed the same one.
+    ///
+    /// A publication is claimed when its intent commits and answered when the move has landed. One
+    /// that cannot be completed has an answer too, and it is this refusal. Without recording it the
+    /// claim would stay open until the next recovery pass settled it, and a copy arriving in
+    /// between would be refused for the terminal state this action's own publication reached.
+    ///
+    /// Nothing replaces an answer already recorded, and a refusal that matches no claim changes
+    /// nothing: a call that never claimed anything, which is every retried finish that found
+    /// somebody else's publication, records nothing here.
+    fn refuse_claim(&self, action: Option<&Action>, refusal: &TransferError) -> Result<()> {
+        let Some(action) = action else {
+            return Ok(());
+        };
+        self.locked()?
+            .fail_action(
+                &action.actor_id,
+                action.action_id,
+                &action.method,
+                refusal.code().as_str(),
+                &refusal.to_string(),
+            )
+            .map(|_| ())
+    }
+
     /// Answers a refusal from the retained record when this action has already been performed.
     ///
     /// A precondition a request fails can be one its own first attempt created: the reservation it
@@ -2566,15 +2638,19 @@ fn check_declaration(row: &UploadRow, params: &UploadFinishParams) -> Result<()>
 
 /// The refusal a caller is owed when the publication it asked for did not complete.
 ///
-/// An invalidated publication is an integrity refusal carrying the reason the row recorded, which
-/// is the same answer a repeat of the same action is given from the record. Any other terminal
-/// state is that state: a cancellation that closed this transfer first is not an integrity
-/// failure, and saying so would spend the wrong code on it.
+/// A publication that ended invalidated or expired is an integrity refusal carrying the reason the
+/// row recorded. That is word for word the answer a repeat of the same action is given from the
+/// record, so the caller of the failing publication and every later copy of its action agree.
+///
+/// Any other terminal state is that state: a cancellation that closed this transfer first is not an
+/// integrity failure, and saying so would spend the wrong code on it.
 fn publication_refusal(row: &UploadRow) -> TransferError {
-    if row.state == UploadState::Invalidated {
-        return TransferError::integrity(row.invalid_reason.clone().unwrap_or_else(|| {
-            "the verified payload could not be published, so no handle names it".to_owned()
-        }));
+    if matches!(row.state, UploadState::Invalidated | UploadState::Expired) {
+        return TransferError::integrity(
+            row.invalid_reason
+                .clone()
+                .unwrap_or_else(|| "this upload ended without being published".to_owned()),
+        );
     }
     TransferError::WrongState {
         transfer: row.transfer_id.to_string(),
