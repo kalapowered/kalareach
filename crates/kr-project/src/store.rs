@@ -663,7 +663,34 @@ impl Store {
         Ok(rows)
     }
 
-    /// Records one staging path an operation left behind or removed.
+    /// Forgets one staging path, because nothing is there.
+    ///
+    /// A path this host neither removed nor left behind belongs in neither list: reporting it as
+    /// removed would claim a removal that never happened, and reporting it as retained would name
+    /// a directory a person cannot find.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn forget_staging_path(&mut self, action_id: ActionId, path: &str) -> Result<()> {
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        transaction
+            .execute(
+                "DELETE FROM operation_paths WHERE action_id = ?1 AND path = ?2",
+                params![action_id.get().as_bytes().to_vec(), path],
+            )
+            .map_err(ProjectError::store)?;
+        announce(
+            &transaction,
+            "project.operation.staging_absent",
+            &action_id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
+    }
+
+    /// Records one staging path and whether it is still there.
     ///
     /// # Errors
     ///

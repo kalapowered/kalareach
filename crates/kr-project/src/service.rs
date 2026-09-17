@@ -698,6 +698,19 @@ impl ProjectService {
             // The destination is untouched, so the staged content is removed and the operation is
             // recorded as failed under its own create token rather than started again.
             let mut left_behind: Option<String> = None;
+            // A name that was recorded and whose object is not there: the daemon died between
+            // recording the name and creating the directory. The path belongs in neither of the
+            // operation's lists — nothing removed it and nothing is retained — so the record is
+            // forgotten. It happens *before* the operation is closed, so a crash in between leaves
+            // the row unfinished and the next recovery asks the same question again.
+            let absent = match (named.as_deref(), had_sibling, unopened) {
+                (Some(path), false, false) => {
+                    let path = path.display().to_string();
+                    self.writable()?.forget_staging_path(row.action_id, &path)?;
+                    Some(path)
+                }
+                _ => None,
+            };
             // As above: the publication is committed, and a cleanup that fails is recorded rather
             // than allowed to undo it.
             if let Some(sibling) = staging {
@@ -744,15 +757,7 @@ impl ProjectService {
                     named.map(|path| path.display().to_string()),
                 ));
             }
-            if let Some(path) = named.as_deref()
-                && !had_sibling
-            {
-                // The name was recorded and nothing is at it: the daemon died between recording
-                // the name and creating the directory. The path record says so, so the operation's
-                // own result does not report a retained path that is not there.
-                let _ = self.writable().and_then(|mut store| {
-                    store.record_staging_path(row.action_id, &path.display().to_string(), true)
-                });
+            if absent.is_some() {
                 return Ok(ResolvedStep::Closed);
             }
             return Ok(match named {

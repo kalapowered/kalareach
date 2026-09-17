@@ -880,6 +880,18 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
             ],
         )
         .expect("the row names a sibling that was never created");
+    // The live run recorded the name it created as a path that is still there, which is what a
+    // daemon that died between the two writes leaves. Recovery has to take that record away.
+    journal
+        .execute(
+            "INSERT INTO operation_paths (action_id, path, removed) VALUES (?1, ?2, 0)
+             ON CONFLICT (action_id, path) DO UPDATE SET removed = 0",
+            rusqlite::params![
+                cloned.operation.action_id.get().as_bytes().to_vec(),
+                fixture.work().join(&absent).display().to_string(),
+            ],
+        )
+        .expect("the path is recorded as one that is still there");
     drop(journal);
     let replacement = fixture.reopen();
     let recovery = replacement.recover().expect("recovery runs once more");
@@ -898,6 +910,14 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
             .any(|path| path.ends_with(&absent)),
         "and the result does not name a path that is not there: {:?}",
         operation.retained_staging_paths
+    );
+    assert!(
+        !operation
+            .removed_staging_paths
+            .iter()
+            .any(|path| path.ends_with(&absent)),
+        "nor claim it removed one: {:?}",
+        operation.removed_staging_paths
     );
     assert!(
         operation

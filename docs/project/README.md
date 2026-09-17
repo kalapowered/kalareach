@@ -365,9 +365,14 @@ The keys that remain are dealt with in one of three ways, and never ignored:
   decided either way, so **every** operation on the repository is refused, a read included: a read
   that ran beside one of these could be a read that went through it.
 
-A configuration key can itself carry a credential — `[url "https://token@host/"]` puts one in the
-subsection — so every key on its way into a limitation or a refusal goes through the same redaction
-a URL does.
+A configuration key can itself carry a credential: `[url "https://token@host/"]` puts one in the
+subsection. A key on its way into a limitation or a refusal is therefore not parsed as a URL, which
+is what a subsection is not. A subsection that holds none of `:`, `@`, `?`, `#`, `"`, `'` or a
+control character is repeated as it is, because naming the remote or the driver is the whole use of
+the message. Anything else is replaced by its length and a fingerprint of its bytes: a person can
+still find the key in the file and tell two keys apart, and nothing the repository chose is echoed.
+Git's own standard error is a message rather than a key, and a URL in it goes through the URL
+redaction, which removes user information, a query and a fragment.
 
 Nothing here rewrites the user's Git configuration. The overrides live on one child process's
 command line and in its environment. A terminal command under broad shell access keeps normal Git

@@ -1350,7 +1350,7 @@ impl ConfigurationAudit {
         for key in &self.blanked {
             lines.push(format!(
                 "{} names {}, which this host does not execute for a repository operation",
-                redact(key),
+                key_for_diagnostic(key),
                 names_of(key)
             ));
         }
@@ -1358,14 +1358,14 @@ impl ConfigurationAudit {
             lines.push(format!(
                 "the {section} driver {} is defined and is not run, so content it would have \
                  converted is read as it is stored",
-                redact(name)
+                subsection_for_diagnostic(name)
             ));
         }
         for key in &self.refused {
             lines.push(format!(
                 "{} names {}, which no override removes, so an operation that would depend on it \
                  is refused",
-                redact(key),
+                key_for_diagnostic(key),
                 names_of(key)
             ));
         }
@@ -1373,7 +1373,7 @@ impl ConfigurationAudit {
             lines.push(format!(
                 "{} is a name this host cannot express as an override, so it does not read this \
                  repository at all",
-                redact(key)
+                key_for_diagnostic(key)
             ));
         }
         lines
@@ -1426,15 +1426,59 @@ impl ConfigurationAudit {
     }
 }
 
-/// Returns a list of keys for a diagnostic, with any credential a key carries removed.
-///
-/// A configuration key can hold a URL: `[url "https://token@host/"] insteadOf = ...` puts one in
-/// the subsection. So a key on its way into a message goes through the same redaction a URL does.
+/// Returns a list of configuration keys for a diagnostic, with nothing a subsection holds echoed.
 fn names(keys: &[String]) -> String {
     keys.iter()
-        .map(|key| redact(key))
+        .map(|key| key_for_diagnostic(key))
         .collect::<Vec<String>>()
         .join(", ")
+}
+
+/// Returns one configuration key for a diagnostic, with an unsafe subsection replaced.
+///
+/// A configuration key is `section.subsection.leaf`, and the subsection is whatever the repository
+/// chose: `[url "https://token@host/"] insteadOf = …` puts a credential in it. A URL redaction is
+/// the wrong instrument for that, because a subsection is not a URL. It is arbitrary text that can
+/// hold a quote, a control character or nothing at all, and every review of this branch found one
+/// more shape a URL parser read wrongly. So a subsection that *could* carry a credential is not
+/// parsed and not echoed: it is replaced, and the section, the leaf and a fingerprint are what a
+/// person gets. Those are enough to find the key in the file and to tell two keys apart.
+fn key_for_diagnostic(key: &str) -> String {
+    let (Some(first), Some(last)) = (key.find('.'), key.rfind('.')) else {
+        // No subsection at all. `core.pager` holds nothing a repository chose.
+        return key.to_owned();
+    };
+    if first == last {
+        return key.to_owned();
+    }
+    let section = &key[..first];
+    let subsection = &key[first + 1..last];
+    let leaf = &key[last + 1..];
+    format!("{section}.{}.{leaf}", subsection_for_diagnostic(subsection))
+}
+
+/// Returns one configuration subsection for a diagnostic, replaced where it could carry a secret.
+///
+/// A subsection that holds none of the characters a credential needs is repeated as it is, because
+/// naming the remote or the driver is the whole use of the diagnostic. Anything else is replaced
+/// by its length and a fingerprint of its bytes: a person can still tell two keys apart and find
+/// the one the message is about, and nothing the repository chose is echoed.
+fn subsection_for_diagnostic(subsection: &str) -> String {
+    let unsafe_to_echo = subsection.chars().any(|character| {
+        matches!(character, ':' | '@' | '?' | '#' | '"' | '\'') || character.is_control()
+    });
+    if !unsafe_to_echo {
+        return subsection.to_owned();
+    }
+    let digest = kr_cbor::sha256(subsection.as_bytes());
+    let mut fingerprint = String::with_capacity(16);
+    for byte in &digest[..8] {
+        fingerprint.push_str(&format!("{byte:02x}"));
+    }
+    format!(
+        "<a name of {} characters this host does not repeat, {fingerprint}>",
+        subsection.chars().count()
+    )
 }
 
 /// Returns what one execution-capable key names, for a diagnostic.

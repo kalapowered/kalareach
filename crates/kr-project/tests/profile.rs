@@ -666,6 +666,18 @@ fn a_configuration_key_that_carries_a_credential_is_not_repeated_in_a_diagnostic
             "cat",
         ],
     );
+    // A quote inside a subsection is text a URL parser cannot terminate on, which is exactly why
+    // a subsection is replaced rather than parsed.
+    support::git_raw(
+        &path,
+        [
+            "config",
+            "--local",
+            "--",
+            "url.https://example.invalid/x?next=\"quoted\"&access_token=QUOTEDSECRET.insteadOf",
+            "kx:",
+        ],
+    );
     let repository =
         OpenedRepository::open(fixture.service().profile(), fixture.environment_id(), &path)
             .expect("a read is allowed and states the limitation");
@@ -674,19 +686,30 @@ fn a_configuration_key_that_carries_a_credential_is_not_repeated_in_a_diagnostic
         limitations.to_ascii_lowercase().contains("insteadof"),
         "the limitation names the key: {limitations}"
     );
+    // A subsection is not a URL: it is whatever the repository chose. So one that could carry a
+    // credential is not parsed and not echoed, and what a person gets is the section, the leaf and
+    // a fingerprint that tells two keys apart.
     assert!(
-        limitations.contains("url.https://<credential removed>@example.invalid/"),
-        "what is left of the key is the key the repository holds: {limitations}"
+        limitations.contains("url.<a name of") && limitations.contains("this host does not repeat"),
+        "an unsafe subsection is replaced rather than parsed: {limitations}"
     );
     assert!(
-        limitations.contains("url.https://example.invalid/<query removed>"),
-        "a token in a query goes the same way: {limitations}"
+        limitations.contains(".insteadof"),
+        "and the leaf still says which key it was: {limitations}"
     );
     assert!(
-        limitations.contains("the filter driver https://<credential removed>@example.invalid/"),
-        "and a driver's own name goes through the same redaction: {limitations}"
+        limitations.contains("the filter driver <a name of"),
+        "a driver's own name is a subsection too: {limitations}"
     );
-    for secret in ["SECRET", "QUERYSECRET", "DRIVERSECRET"] {
+    for secret in [
+        "SECRET",
+        "QUERYSECRET",
+        "DRIVERSECRET",
+        "QUOTEDSECRET",
+        "example.invalid",
+        "tokenuser",
+        "driveruser",
+    ] {
         assert!(
             !limitations.contains(secret),
             "no limitation repeats what a key carried ({secret}): {limitations}"
@@ -696,7 +719,7 @@ fn a_configuration_key_that_carries_a_credential_is_not_repeated_in_a_diagnostic
         .audit()
         .require_neutralised()
         .expect_err("taking it into the registry is refused");
-    for secret in ["SECRET", "QUERYSECRET"] {
+    for secret in ["SECRET", "QUERYSECRET", "QUOTEDSECRET", "example.invalid"] {
         assert!(
             !refusal.to_string().contains(secret),
             "the refusal does not repeat it either ({secret}): {refusal}"
