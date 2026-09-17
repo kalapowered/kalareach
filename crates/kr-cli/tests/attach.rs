@@ -1037,7 +1037,7 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
             &hosted,
             &format!(
                 "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr")
+                kr().display()
             ),
         ))
         .expect("starts the shell");
@@ -1143,7 +1143,7 @@ async fn an_attach_that_fails_after_the_handshake_leaves_the_terminal_the_modes_
             &hosted,
             &format!(
                 "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr")
+                kr().display()
             ),
         ))
         .expect("starts the shell");
@@ -1729,7 +1729,7 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
             &outer,
             &format!(
                 "{} attach {display}; printf 'outer-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr")
+                kr().display()
             ),
         ))
         .expect("starts the shell");
@@ -1776,7 +1776,7 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
     // terminal, which answers as the sole responder for that session.
     let inner_command = format!(
         "{} attach {}; printf 'inner-finished-%s\\n' \"$?\"\n",
-        env!("CARGO_BIN_EXE_kr"),
+        kr().display(),
         inner_display.get()
     );
     types(inner_command.as_bytes());
@@ -1891,7 +1891,7 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
     // An orderly inner detach, from outside. The inner command ends, its status says a detach is
     // not a failure, and the outer attachment is untouched by the cleanup of an attachment that
     // was never holding this terminal.
-    let detach = std::process::Command::new(env!("CARGO_BIN_EXE_kr"))
+    let detach = std::process::Command::new(kr())
         .args(["detach", &inner_display.get().to_string()])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
