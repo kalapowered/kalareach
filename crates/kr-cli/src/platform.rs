@@ -210,8 +210,22 @@ mod console {
         /// Returns [`crate::CliError::TerminalProbeFailed`] on a stream a previous probe
         /// contaminated, which is the same refusal the other platform gives: a console that was
         /// never asked anything is still a console whose input may hold a late reply.
-        pub fn probe(&self, context: kr_term::probe::InputContext) -> Result<Probe> {
+        pub fn probe(
+            &self,
+            context: kr_term::probe::InputContext,
+            _profile: Option<&str>,
+        ) -> Result<Probe> {
             Probe::unasked(context)
+        }
+
+        /// A name for this console that no other console shares while it exists.
+        ///
+        /// The console host has no device path and no session identifier of the kind a terminal
+        /// has, so there is nothing here to name one by. A probe is never sent to it, so nothing
+        /// needs the name.
+        #[must_use]
+        pub const fn identity(&self) -> Option<String> {
+            None
         }
     }
 

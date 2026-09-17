@@ -24,7 +24,7 @@
 //!   [`ProjectedDisplay::losses`] is what a caller reports instead of presenting an approximation
 //!   as the session.
 
-use kr_client::projection::paint::{Comparison, Window};
+use kr_client::projection::paint::{Comparison, Keyboard, Window};
 use kr_client::projection::{Applied, Projection, Refusal};
 use kr_protocol::projection::{
     PROJECTION_DELTA_EVENT, PROJECTION_RESET_EVENT, PROJECTION_ROWS_EVENT,
@@ -84,13 +84,26 @@ pub struct ProjectedDisplay {
     losses: Comparison,
     frames: u64,
     installs: u64,
+    keyboard: Keyboard,
 }
 
 impl ProjectedDisplay {
-    /// A terminal showing nothing yet.
+    /// A terminal showing nothing yet, whose keyboard protocols may be installed.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A terminal whose keyboard protocols are not this attachment's to change.
+    ///
+    /// What `--no-probe` chooses: nobody was allowed to ask this terminal what it had negotiated,
+    /// so nothing installs a protocol that nothing could put back.
+    #[must_use]
+    pub fn without_the_keyboard() -> Self {
+        Self {
+            keyboard: Keyboard::Withhold,
+            ..Self::default()
+        }
     }
 
     /// Applies one event and returns what to write to the terminal.
@@ -104,7 +117,11 @@ impl ProjectedDisplay {
                 let Some(screen) = self.projection.screen() else {
                     return Drawn::default();
                 };
-                let painted = kr_client::projection::paint::install(screen, Window::of(screen));
+                let painted = kr_client::projection::paint::install(
+                    screen,
+                    Window::of(screen),
+                    self.keyboard,
+                );
                 self.losses.absorb(painted.comparison);
                 self.frames += 1;
                 self.installs += 1;
@@ -113,12 +130,17 @@ impl ProjectedDisplay {
                     resubscribe: false,
                 }
             }
-            Applied::Updated(rows) => {
+            Applied::Updated(changed) => {
                 let Some(screen) = self.projection.screen() else {
                     return Drawn::default();
                 };
-                let painted =
-                    kr_client::projection::paint::update(screen, Window::of(screen), &rows);
+                let painted = kr_client::projection::paint::update(
+                    screen,
+                    Window::of(screen),
+                    &changed.rows,
+                    changed.state,
+                    self.keyboard,
+                );
                 self.losses.absorb(painted.comparison);
                 self.frames += 1;
                 Drawn {
@@ -213,6 +235,43 @@ impl ProjectedDisplay {
             parts.push(format!(
                 "{} this terminal cannot place",
                 plural(self.losses.runs_replaced, "run", "runs")
+            ));
+        }
+        if self.losses.rows_outside > 0 {
+            parts.push(format!(
+                "{} of the session's rows outside this window, holding {}",
+                self.losses.rows_outside,
+                plural(
+                    usize::try_from(self.losses.cells_outside).unwrap_or(usize::MAX),
+                    "cell",
+                    "cells"
+                )
+            ));
+        }
+        if self.losses.keyboard_withheld {
+            parts.push(
+                "the session's keyboard protocols, which this terminal was never asked about"
+                    .to_owned(),
+            );
+        }
+        if self.losses.keyboard_stack > 0 {
+            parts.push(format!(
+                "{} the session holds, installed as a state rather than a stack",
+                plural(
+                    self.losses.keyboard_stack,
+                    "keyboard entry",
+                    "keyboard entries"
+                )
+            ));
+        }
+        if self.losses.controls_dropped > 0 {
+            parts.push(format!(
+                "{} whose control bytes were dropped",
+                plural(
+                    self.losses.controls_dropped,
+                    "title or link",
+                    "titles or links"
+                )
             ));
         }
         if self.losses.soft_wraps > 0 {

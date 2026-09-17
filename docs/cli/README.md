@@ -128,6 +128,22 @@ and a pending wrap is reported rather than reproduced, because every cursor plac
 `--take-geometry` makes this terminal the size owner. Ordinary attach never moves size ownership,
 and taking input never moves it either.
 
+A frame also establishes the coordinate system its addresses are written in. Origin mode off, no
+margins, the whole screen as the scroll region, replace rather than insert: a terminal that was
+being forwarded the stream a moment ago can be in any of those, and each one changes where an
+absolute address lands or what drawing a cell does to its neighbours. The session's own are
+installed after the last row, so a projection that becomes a direct presentation hands the
+application the terminal it is writing for. A window showing part of the grid cannot carry a margin,
+which is a row of the grid, and says so through the projection's own report rather than installing
+something close.
+
+The palette travels as state: the session's foreground, background, cursor and selection colours,
+every indexed colour an application overrode, and where the palette came from, recorded when the
+session was created. What a projection does not do is impose the profile's own table on the rest. An
+indexed colour nothing overrode is drawn in the destination's, exactly as it would be if this
+terminal were being forwarded the stream. Two terminals with different themes therefore agree about
+every colour the session set and keep their own for the ones it did not.
+
 ### The restoration guard
 
 A broken connection must not leave a terminal in raw mode, and the restoration has to survive the
@@ -137,15 +153,33 @@ So the saved state lives in another process. `kr attach` starts `kr-attach-guard
 touches the terminal and gives it one end of a pipe, its own handle on the terminal and the
 terminal's complete mode state.
 
-Only then does it ask the terminal anything. The capability handshake is bounded and synchronous. It
-asks the terminal's identity, its default foreground and background, which keyboard protocols it has
-negotiated (the Kitty protocol's flags and xterm's `modifyOtherKeys` level, neither of which termios
-describes) and whether it reports synchronised output, and it ends with the device-attributes request
-every terminal answers. Only that last reply is required: a terminal that does not implement the
-Kitty protocol answers nothing about it, and silence there is not a failure. Silence about the
-terminator is, because the terminator is the only thing that proves no earlier answer is still in
-flight. Reading the answers means putting the terminal into a mode where they arrive, which is why
-the guard exists first. The answers then reach the guard over the same pipe.
+* A clean exit restores the terminal and sends the guard a byte, and the guard leaves without
+  acting.
+* Any other end — a crash, `SIGKILL`, the machine running out of memory — closes the pipe. The
+  guard's read returns end of file and it restores the terminal itself.
+
+The guard runs in its own process group, so signals aimed at the attach process do not reach it, and
+it handles the background-write signal so that changing the terminal from the background is not a
+reason to stop it.
+
+Its limit is stated plainly: nothing recovers a terminal whose emulator has died, because there is
+nothing left to restore.
+
+Only then does it ask the terminal anything. The capability handshake is bounded and synchronous,
+and every question in it must be answered, so the questions follow the profile the terminal
+declares. A terminal calling itself `xterm-kitty` or `ghostty` is asked which keyboard protocols it
+has negotiated: the Kitty protocol's flags, and xterm's `modifyOtherKeys` level, neither of which
+termios describes. Every terminal is asked for its device attributes, and that reply is the
+terminator: the one thing that proves no earlier answer is still in flight.
+
+Nothing else is asked. A question whose answer is optional is not a question this command may ask,
+and nothing beyond the terminator can be required of a terminal calling itself `xterm-256color`:
+Terminal.app answers neither colour query, and requiring one would fail every attach there. What
+the command may do instead is not ask, which is the honest way to not know. A reply a terminal
+volunteers is still recorded, because a terminal that says what it has negotiated has told the
+truth about itself either way, and what it reported is what a cleanup puts back. Reading the answers
+means putting the terminal into a mode where they arrive, which is why the guard exists first. The
+answers then reach the guard over the same pipe.
 
 Nothing the terminal replies reaches the application. What the person typed during the exchange is
 kept apart from the answers, in the order they typed it, and is the first input the attachment
@@ -158,8 +192,9 @@ still receive a late reply. What the person typed while the host was asking is k
 answers and is the first input the attachment forwards.
 
 Both paths out put everything back: the mode words, the control characters, the sequences that undo
-what an application may have left enabled, and then the keyboard protocols the terminal had chosen
-for itself. A cleanup that runs before the attachment began forwarding, because the handshake failed
+what an application may have left enabled - the alternate screen, mouse reporting, bracketed paste,
+the coordinate system a projection installed - and then the keyboard protocols the terminal had
+chosen for itself. A cleanup that runs before the attachment began forwarding, because the handshake failed
 or the process was killed during it, leaves those protocols alone: nothing that had happened could
 have changed them.
 
@@ -182,17 +217,20 @@ which is the outer KalaReach terminal, and that worker answers as the sole respo
 session. `TERM_PROGRAM` is a hint about what the terminal is, never authentication and never proof
 of compatibility.
 
-* A clean exit restores the terminal and sends the guard a byte, and the guard leaves without
-  acting.
-* Any other end — a crash, `SIGKILL`, the machine running out of memory — closes the pipe. The
-  guard's read returns end of file and it restores the terminal itself.
+A paste passes through a nesting once. Each session in the chain frames it for the application
+reading it, so an application that turned bracketed paste on receives one pair of markers however
+many sessions the keystrokes crossed, and one that did not receives the text.
 
-The guard runs in its own process group, so signals aimed at the attach process do not reach it, and
-it handles the background-write signal so that changing the terminal from the background is not a
-reason to stop it.
+### Over SSH, including to the same host
 
-Its limit is stated plainly: nothing recovers a terminal whose emulator has died, because there is
-nothing left to restore.
+An attachment over SSH is an ordinary attachment. The terminal it asks is the pseudo-terminal
+`sshd` gave it, the replies come back over the same connection, and every capability comes from that
+exchange rather than from anything about the host: nothing is assumed because the far end happens to
+be this machine. A loopback, `ssh localhost kr attach 1`, is therefore the same path as a remote one,
+with two consequences worth stating. The handshake's one-second bound covers the round trip, so a
+link slow enough to lose the terminator fails that attach rather than continuing on a stream that may
+still deliver a late reply. And SSH's own escape character stays SSH's: `~.` closes the connection
+before the attachment sees it, exactly as it does inside any other full-screen application.
 
 ## `kr question`
 

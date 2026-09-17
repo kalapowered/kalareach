@@ -54,7 +54,19 @@ pub use unix::{ControllingTerminal, SavedModes};
 /// attachment which began forwarding, because only such an attachment could have changed them.
 /// Leaving a terminal in an enhanced key encoding is the failure a person cannot work around: their
 /// shell receives escape sequences where it expects characters.
-pub const RESET_SEQUENCES: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b(B\x0f";
+///
+/// The list includes the coordinate system, because a projected attachment installs the session's
+/// own: origin mode, the scroll region, the left and right margins, insert mode. A terminal left in
+/// insert mode types over itself and one left inside a region scrolls a strip of the screen, and
+/// neither is described by termios.
+///
+/// What this cannot do is give back a state the terminal had *before* the attachment and never
+/// reported. Nothing asks a terminal whether its mouse reporting was on or its cursor was hidden:
+/// there is no reply every qualified profile promises, and a question whose answer is optional is
+/// not one this command may ask. So these put each of those modes into its documented default,
+/// which is the state a terminal is in when nothing has changed it, and the keyboard protocols -
+/// the one part a terminal does report - are put back to what it reported.
+pub const RESET_SEQUENCES: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b[?6l\x1b[4l\x1b[0 q\x1b(B\x0f";
 
 /// The sequence that puts `modifyOtherKeys` back to the value the terminal itself starts with.
 ///
@@ -79,25 +91,37 @@ pub const KEYBOARD_RESTORE_SEQUENCES: &[u8] = b"\x1b[>4m";
 /// may still receive a late reply.
 pub const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// The questions this command asks beyond the terminator.
+/// The questions a declared profile asks, every one of which must be answered.
 ///
-/// Each one is optional on purpose. A terminal that does not implement the Kitty keyboard protocol
-/// answers nothing about it, and a terminal that does not answer a colour query is not a broken
-/// terminal; section 8's rule is that a reply the exchange *requires* must arrive, and the only
-/// reply every qualified terminal gives is the device-attributes terminator. These are asked ahead
-/// of it, so whatever a terminal chooses to answer has arrived by the time the terminator does.
-pub const OPTIONAL_PROBES: &[kr_term::probe::ProbeItem] = &[
-    kr_term::probe::ProbeItem::Version,
-    kr_term::probe::ProbeItem::Foreground,
-    kr_term::probe::ProbeItem::Background,
-    kr_term::probe::ProbeItem::KittyKeyboard,
-    kr_term::probe::ProbeItem::ModifyOtherKeys,
-    kr_term::probe::ProbeItem::SynchronisedOutput,
-];
+/// Section 8 is exact about this: the exchange "finishes with the qualified DA1 terminator after
+/// collecting every requested reply", and "a missing terminator or reply fails that attach
+/// attempt". A question whose answer is optional is therefore not a question this command may ask;
+/// what it may do is *not ask*, which the specification calls the honest way to not ask.
+///
+/// So the set follows the profile the terminal declares. Device attributes is in it always, because
+/// every qualified terminal answers it and answers it last, which is what makes it the terminator.
+/// A terminal that declares itself a Kitty terminal is expected to answer the keyboard query, and
+/// one that declares xterm's `modifyOtherKeys` support is expected to answer for its level. Nothing
+/// else is asked, because nothing else can be required of a terminal calling itself
+/// `xterm-256color`: Terminal.app answers neither colour query, and requiring one would fail every
+/// attach there.
+#[must_use]
+pub fn profile_questions(profile: Option<&str>) -> Vec<kr_term::probe::ProbeItem> {
+    use kr_term::probe::ProbeItem;
 
-/// The one reply the exchange requires, which is also its terminator.
-pub const REQUIRED_PROBES: &[kr_term::probe::ProbeItem] =
-    &[kr_term::probe::ProbeItem::DeviceAttributes];
+    let mut asked = Vec::new();
+    if let Some(name) = profile {
+        let name = name.to_ascii_lowercase();
+        if name.contains("kitty") || name.contains("ghostty") {
+            asked.push(ProbeItem::KittyKeyboard);
+        }
+        if name.contains("xterm-kitty") || name == "xterm" {
+            asked.push(ProbeItem::ModifyOtherKeys);
+        }
+    }
+    asked.push(ProbeItem::DeviceAttributes);
+    asked
+}
 
 /// What a bounded probe of the outer terminal established.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -313,6 +337,50 @@ impl KeyboardState {
     }
 }
 
+/// Whether a probe has already gone out on this terminal.
+///
+/// The answer is a fact about the terminal rather than about this process. Section 8: after a failed
+/// probe the stream is not clean, a retry needs a fresh input context, and calling `--no-probe` on
+/// the same stream does not purge whatever is still coming. A second `kr attach` in the window
+/// where the first one failed is looking at the same stream, so the record has to outlive the
+/// process that made it — and no longer than the terminal it is about, which is why it names the
+/// terminal's own device and session rather than the window a person is looking at.
+#[must_use]
+pub fn input_context(terminal: &ControllingTerminal) -> kr_term::probe::InputContext {
+    match contamination_marker(terminal) {
+        Some(path) if path.exists() => kr_term::probe::InputContext::Contaminated,
+        _ => kr_term::probe::InputContext::Clean,
+    }
+}
+
+/// Records that a probe has gone out on this terminal and did not finish.
+///
+/// Best effort on purpose: a host whose runtime directory cannot be written is a host that cannot
+/// record anything, and refusing the attach over that would be refusing it for the wrong reason.
+/// What the record buys is the *next* attempt, and its absence costs that attempt nothing it did
+/// not already have.
+pub fn mark_contaminated(terminal: &ControllingTerminal) {
+    let Some(path) = contamination_marker(terminal) else {
+        return;
+    };
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, b"a probe on this terminal did not finish\n");
+}
+
+/// The file that records a contaminated terminal, named after the terminal itself.
+fn contamination_marker(terminal: &ControllingTerminal) -> Option<std::path::PathBuf> {
+    let paths = kr_ipc::paths::HostPaths::discover().ok()?;
+    let name = terminal.identity()?;
+    Some(
+        paths
+            .runtime_root()
+            .join("probes")
+            .join(format!("{name}.contaminated")),
+    )
+}
+
 /// The size of a terminal, in character cells.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TerminalSize {
@@ -328,9 +396,7 @@ mod unix {
 
     use rustix::termios::{OptionalActions, SpecialCodeIndex, Termios, Winsize};
 
-    use super::{
-        KeyboardState, OPTIONAL_PROBES, Probe, REQUIRED_PROBES, RESET_SEQUENCES, TerminalSize,
-    };
+    use super::{KeyboardState, Probe, RESET_SEQUENCES, TerminalSize};
     use crate::error::{CliError, Result};
 
     /// A handle on this process's controlling terminal.
@@ -372,6 +438,23 @@ mod unix {
         #[must_use]
         pub const fn handle(&self) -> &File {
             &self.handle
+        }
+
+        /// A name for this terminal that no other terminal shares while it exists.
+        ///
+        /// The device and the session that owns it. A pseudo-terminal's path is reused by the
+        /// operating system, so the path alone would let a new window inherit a record about an old
+        /// one; the session identifier is what makes it this terminal.
+        #[must_use]
+        pub fn identity(&self) -> Option<String> {
+            let device = rustix::termios::ttyname(&self.handle, Vec::new()).ok()?;
+            let device = device.to_string_lossy().replace(['/', '\\'], "-");
+            let session = rustix::termios::tcgetsid(&self.handle).ok()?;
+            Some(format!(
+                "{}-{}",
+                device.trim_start_matches('-'),
+                session.as_raw_nonzero()
+            ))
         }
 
         /// Reads the terminal's current modes.
@@ -465,21 +548,19 @@ mod unix {
         /// [`PROBE_DEADLINE`], because the input stream may still receive a late reply and live
         /// forwarding must not begin on one that might. Returns [`CliError::Terminal`] when the
         /// terminal's modes cannot be read or set.
-        pub fn probe(&self, context: kr_term::probe::InputContext) -> Result<Probe> {
+        pub fn probe(
+            &self,
+            context: kr_term::probe::InputContext,
+            profile: Option<&str>,
+        ) -> Result<Probe> {
             use kr_term::probe::ProbeSession;
 
             // The clock is monotonic and starts at zero, so the one-second deadline is one second
             // of elapsed time whatever the wall clock does while the terminal is being asked.
             let started = std::time::Instant::now();
-            let (mut session, required) = ProbeSession::start(0, context, REQUIRED_PROBES)
+            let asked = super::profile_questions(profile);
+            let (mut session, request) = ProbeSession::start(0, context, &asked)
                 .map_err(|error| CliError::TerminalProbeFailed(error.to_string()))?;
-            let mut request = Vec::new();
-            for item in OPTIONAL_PROBES {
-                request.extend_from_slice(item.request());
-            }
-            // The terminator goes last. Everything a terminal chooses to answer has therefore been
-            // asked before the one reply that proves nothing else is still in flight.
-            request.extend_from_slice(&required);
 
             let saved = self.modes()?;
             let mut asking = saved.clone();
@@ -492,6 +573,7 @@ mod unix {
                 |error| CliError::Terminal(format!("set the terminal's modes: {error}")),
             )?;
             let read = self.ask(&mut session, &request, started);
+            let typed = session.typed().to_vec();
             // `Now` again, for the same reason: the exchange ends at the terminator, and anything
             // the person typed after it is still in the terminal's queue and is still theirs.
             rustix::termios::tcsetattr(&self.handle, OptionalActions::Now, &saved).map_err(
@@ -508,10 +590,16 @@ mod unix {
                     probe.typed = outcome.into_typed();
                     Ok(probe)
                 }
-                Err(error) => Err(CliError::TerminalProbeFailed(format!(
-                    "{error}; attach with --no-probe in a fresh terminal to use the conservative \
-                     profile without asking it anything"
-                ))),
+                Err(error) => {
+                    // The exchange failed. What the person typed during it is still theirs, and the
+                    // failure says so: this attach ends, and the bytes go nowhere rather than into
+                    // an application that was never given the keys.
+                    let _ = typed;
+                    Err(CliError::TerminalProbeFailed(format!(
+                        "{error}; attach again in a fresh terminal, where no reply to this \
+                         exchange can still arrive"
+                    )))
+                }
             }
         }
 
@@ -534,6 +622,12 @@ mod unix {
                 .map_err(|error| {
                     CliError::Terminal(format!("ask the terminal what it is: {error}"))
                 })?;
+            // The write is inside the deadline too. A terminal that cannot take the questions has
+            // already spent part of the one second the whole exchange has, and the reads that
+            // follow get what is left of it rather than a second of their own.
+            if elapsed_ms(started) > kr_term::probe::PROBE_DEADLINE_MS {
+                return Ok(());
+            }
             let mut buffer = [0_u8; 256];
             loop {
                 let elapsed = elapsed_ms(started);
@@ -541,6 +635,12 @@ mod unix {
                     // The session decides what an expired exchange is; this only stops reading.
                     return Ok(());
                 }
+                // Each read waits at most a tenth of a second, because the terminal was put into
+                // a mode where a read returns what has arrived rather than waiting for a line. The
+                // loop therefore cannot outlast the deadline by more than that tenth, and what
+                // happens at the deadline is the session's decision rather than this loop's: the
+                // exchange fails, and it never becomes live forwarding on a stream a late reply
+                // could still reach.
                 match handle.read(&mut buffer) {
                     Ok(0) => {}
                     Ok(read) => {
@@ -766,26 +866,39 @@ mod tests {
     fn a_terminals_answers_are_read_back_as_the_state_it_reported() {
         use kr_term::probe::{InputContext, ProbeSession};
 
+        // A Kitty terminal is expected to answer the keyboard query, so this profile asks it and
+        // requires it. The terminator is written last, because its answer is what proves no earlier
+        // one is still in flight.
+        let asked = profile_questions(Some("xterm-kitty"));
+        assert_eq!(
+            asked,
+            vec![
+                kr_term::probe::ProbeItem::KittyKeyboard,
+                kr_term::probe::ProbeItem::ModifyOtherKeys,
+                kr_term::probe::ProbeItem::DeviceAttributes
+            ]
+        );
         let (mut session, request) =
-            ProbeSession::start(0, InputContext::Clean, REQUIRED_PROBES).expect("a clean stream");
-        // The request this command writes: the optional questions, then the terminator.
-        let mut written = Vec::new();
-        for item in OPTIONAL_PROBES {
-            written.extend_from_slice(item.request());
-        }
-        written.extend_from_slice(&request);
+            ProbeSession::start(0, InputContext::Clean, &asked).expect("a clean stream");
         assert!(
-            written.ends_with(b"\x1b[c"),
+            request.ends_with(b"\x1b[c"),
             "the device-attributes terminator is written last: {:?}",
-            String::from_utf8_lossy(&written)
+            String::from_utf8_lossy(&request)
+        );
+        // And a terminal that promises nothing beyond the terminator is asked nothing beyond it: a
+        // question whose answer may not arrive is a question this command may not ask.
+        assert_eq!(
+            profile_questions(Some("xterm-256color")),
+            vec![kr_term::probe::ProbeItem::DeviceAttributes]
+        );
+        assert_eq!(
+            profile_questions(None),
+            vec![kr_term::probe::ProbeItem::DeviceAttributes]
         );
 
-        // Both keyboard protocols, a colour, and somebody typing through the middle of it.
+        // Both keyboard protocols, and somebody typing through the middle of the exchange.
         session
-            .observe(
-                b"\x1b[?5uhel\x1b]10;rgb:ab/cd/ef\x1b\\\x1b]11;rgb:12/34/56\x1b\\\x1b[Alo\x1b[>4;2m!\x1b[?62;22c",
-                5,
-            )
+            .observe(b"\x1b[?5uhel\x1b[Alo\x1b[>4;2m!\x1b[?62;22c", 5)
             .expect("the answers are well formed");
         let outcome = session.finish(6).expect("the terminator arrived");
         let probe = Probe::from_outcome(&outcome);
@@ -795,14 +908,6 @@ mod tests {
             probe.keyboard.restore_sequences(),
             b"\x1b[=5;1u\x1b[>4;2m".to_vec(),
             "the flags are set to what was read rather than pushed onto the terminal's stack"
-        );
-        assert_eq!(
-            probe.palette,
-            Some((
-                kr_term::palette::Rgb::new(0xab, 0xcd, 0xef),
-                kr_term::palette::Rgb::new(0x12, 0x34, 0x56)
-            )),
-            "the colours the terminal shared are what a session may adopt at creation"
         );
         assert_eq!(
             probe.typed,
@@ -817,8 +922,12 @@ mod tests {
     fn a_terminal_that_never_answers_fails_the_attempt() {
         use kr_term::probe::{InputContext, ProbeSession};
 
-        let (mut session, _) =
-            ProbeSession::start(0, InputContext::Clean, REQUIRED_PROBES).expect("a clean stream");
+        let (mut session, _) = ProbeSession::start(
+            0,
+            InputContext::Clean,
+            &profile_questions(Some("xterm-kitty")),
+        )
+        .expect("a clean stream");
         // Everything but the terminator. A short grace window cannot prove that all late replies
         // have disappeared, so the absence of the terminator is what fails the attempt.
         session
@@ -829,8 +938,8 @@ mod tests {
             "without the terminator the exchange did not finish"
         );
 
-        let (session, _) =
-            ProbeSession::start(0, InputContext::Clean, REQUIRED_PROBES).expect("a clean stream");
+        let (session, _) = ProbeSession::start(0, InputContext::Clean, &profile_questions(None))
+            .expect("a clean stream");
         assert!(
             session
                 .finish(kr_term::probe::PROBE_DEADLINE_MS + 1)
@@ -866,7 +975,7 @@ mod tests {
             "no-probe after a failed probe is refused rather than treated as clean"
         );
         assert!(
-            ProbeSession::start(0, InputContext::Contaminated, REQUIRED_PROBES).is_err(),
+            ProbeSession::start(0, InputContext::Contaminated, &profile_questions(None)).is_err(),
             "and so is a retry on the same stream"
         );
     }

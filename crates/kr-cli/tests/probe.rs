@@ -240,10 +240,11 @@ impl TerminalOutput {
     }
 }
 
-/// The queries this command writes, in the order it writes them.
+/// Every query the command could write, whichever profile a terminal declares.
 ///
-/// Device attributes is last and nothing may come after it: it is the terminator, and its answer is
-/// what proves every earlier question has been answered or ignored.
+/// The set it actually writes follows the profile, because section 8 requires every question asked
+/// to be answered: a terminal calling itself `xterm-256color` is asked the terminator and nothing
+/// else. These are all of them, so a test can prove that a question was *not* asked.
 const QUERIES: &[&[u8]] = &[
     b"\x1b[>0q",
     b"\x1b]10;?",
@@ -253,6 +254,9 @@ const QUERIES: &[&[u8]] = &[
     b"\x1b[?2026$p",
     b"\x1b[c",
 ];
+
+/// The one query a terminal that promises nothing beyond the terminator is asked.
+const TERMINATOR: &[u8] = b"\x1b[c";
 
 /// Reads everything the session's application actually received.
 fn application_saw(runtime: &SessionRuntime) -> Vec<u8> {
@@ -322,22 +326,27 @@ async fn the_exchange_ends_with_the_terminator_and_no_reply_reaches_the_applicat
         output.text().escape_debug()
     );
     let asked = output.snapshot();
-    let mut previous = 0;
+    // This terminal declares itself `xterm-256color`, which promises an answer to the terminator
+    // and to nothing else. Section 8 requires every question asked to be answered, so every other
+    // question is one this command may not ask: it is not asked, rather than asked and forgiven.
+    let terminator = offset_of(&asked, TERMINATOR).unwrap_or_else(|| {
+        panic!(
+            "the command asked for the device attributes: {}",
+            String::from_utf8_lossy(&asked).escape_debug()
+        )
+    });
     for query in QUERIES {
-        let at = offset_of(&asked, query).unwrap_or_else(|| {
-            panic!(
-                "the command asked {:?}: {}",
-                String::from_utf8_lossy(query),
-                String::from_utf8_lossy(&asked).escape_debug()
-            )
-        });
+        if *query == TERMINATOR {
+            continue;
+        }
         assert!(
-            at >= previous,
-            "the questions are written in order, and the terminator last: {:?} came too early",
-            String::from_utf8_lossy(query)
+            offset_of(&asked, query).is_none(),
+            "nothing else was asked of a terminal that promises nothing else: {:?} in {}",
+            String::from_utf8_lossy(query),
+            String::from_utf8_lossy(&asked).escape_debug()
         );
-        previous = at;
     }
+    let _ = terminator;
     writer
         .write_all(b"\x1b[?5u\x1b]10;rgb:ff/ff/ff\x1b\\typed-during\x1b[>4;2m\x1b[?62;22c")
         .expect("answers");
@@ -475,6 +484,7 @@ async fn no_probe_asks_the_terminal_nothing() {
             output.text().escape_debug()
         );
     }
+    let _ = TERMINATOR;
     let _ = shell.kill();
     let _ = shell.wait();
 }

@@ -116,18 +116,29 @@ pub async fn run(
     //
     // This process has written nothing to the terminal yet, so the stream is clean. `--no-probe` is
     // chosen here, before any probe: choosing it afterwards would not unsend the questions.
-    let context = kr_term::probe::InputContext::Clean;
+    // What this terminal declares itself to be decides which questions may be asked of it, because
+    // section 8 requires every question asked to be answered. A terminal the profile cannot require
+    // anything of beyond the terminator is asked only that.
+    let declared = std::env::var("TERM").ok();
+    // Whether a probe has already gone out on this terminal, which is a fact about the terminal
+    // rather than about this process: a second `kr attach` in a window where one failed is looking
+    // at the same input stream, and a late reply from the first is still coming to it.
+    let context = crate::terminal::input_context(&terminal);
     let probe = if options.no_probe {
         crate::terminal::Probe::unasked(context)
     } else {
-        terminal.probe(context)
+        terminal.probe(context, declared.as_deref())
     };
     let probe = match probe {
         Ok(probe) => probe,
         Err(error) => {
             // Nothing has begun forwarding, so the outer terminal's own keyboard negotiation is
-            // not this attachment's to clear. Its modes are put back and the failure is reported.
+            // not this attachment's to clear. Its modes are put back, the terminal is recorded as
+            // one a probe has been sent to, and the failure is reported. The record is what makes
+            // the next attempt in this window require a fresh terminal rather than claiming a
+            // stream nobody can vouch for.
             let _ = terminal.restore(&saved, None);
+            crate::terminal::mark_contaminated(&terminal);
             guard.release();
             return Err(error);
         }
@@ -214,6 +225,14 @@ pub async fn run(
     // The terminal's size can change while the attachment runs. The session is told, so the
     // application sees the resize the way it would in any other terminal.
     let mut resized = window_changes();
+    // What this terminal shows while it is projected. A terminal nobody was allowed to ask about
+    // installs no keyboard protocol of the session's, because nothing could put back what
+    // installing one would take away.
+    let mut display = if options.no_probe {
+        crate::render::ProjectedDisplay::without_the_keyboard()
+    } else {
+        crate::render::ProjectedDisplay::new()
+    };
     let outcome = drive(
         &mut client,
         descriptor,
@@ -228,6 +247,7 @@ pub async fn run(
         &handle,
         &terminal,
         resized.as_mut(),
+        &mut display,
     )
     .await;
 
@@ -237,6 +257,15 @@ pub async fn run(
     // writes them back as it is released, which is what keeps the two halves in order.
     terminal.restore(&raw_replaced, None)?;
     guard.release();
+    // Said after the terminal is its own again, never during the attachment: a sentence written
+    // into a terminal that is showing a projection would wrap, overwrite cells and scroll the
+    // bottom row, which is damage to the very screen it is describing.
+    if let Some(detail) = display.degradation() {
+        eprintln!(
+            "kr: this terminal was showing a projection of the session, and it did not carry all \
+             of it: {detail}"
+        );
+    }
     Ok((outcome, descriptor.session_id))
 }
 
@@ -281,6 +310,7 @@ async fn drive(
     output: &Arc<std::fs::File>,
     terminal: &ControllingTerminal,
     resized: Option<&mut WindowChanges>,
+    display: &mut crate::render::ProjectedDisplay,
 ) -> AttachOutcome {
     use std::io::Write as _;
 
@@ -299,13 +329,6 @@ async fn drive(
     let mut outstanding: std::collections::BTreeMap<kr_protocol::ids::RequestId, Outstanding> =
         std::collections::BTreeMap::new();
     let mut next_request = 1_u64;
-    // What this terminal is showing, for as long as it is being projected. A direct attachment
-    // never installs one: it is sent the application's own bytes and draws nothing of its own.
-    let mut display = crate::render::ProjectedDisplay::new();
-    // Said once, the first time the projection could not carry everything the session holds. A
-    // person told that something is outside their window can make it wider; one who is not told is
-    // looking at an approximation and does not know it.
-    let mut reported_degradation = false;
 
     // What the person typed while the host was asking the terminal what it was. It was buffered
     // rather than discarded, and it is the first thing the application receives, in the order it
@@ -391,15 +414,7 @@ async fn drive(
                                 }
                                 outstanding.insert(request_id, Outstanding::Resubscribe);
                             }
-                            if !reported_degradation
-                                && let Some(detail) = display.degradation()
-                            {
-                                reported_degradation = true;
-                                eprintln!(
-                                    "kr: this terminal is showing a projection of the session, and \
-                                     it does not carry all of it: {detail}"
-                                );
-                            }
+
                         }
                         // A resynchronisation marker means this terminal's view of the session is
                         // no longer continuous: its size changed, its presentation changed, or it
