@@ -222,6 +222,43 @@ pub fn execution_context_line(
     )
 }
 
+/// Renders the desktop this environment has as a line for a person.
+#[must_use]
+pub fn desktop_summary_line(report: &DesktopCapabilityReport) -> String {
+    let desktop = &report.desktop;
+    let Some(name) = desktop.desktop_session_id.as_ref() else {
+        return "no graphical login session, so no desktop to bind a session to".to_owned();
+    };
+    let unavailable = report
+        .records
+        .iter()
+        .filter(|record| !record.state.is_available())
+        .count();
+    format!(
+        "desktop {name} ({}, {}, {} of {} capabilities established)",
+        desktop.display_server.as_str(),
+        desktop.availability.as_str(),
+        report.records.len() - unavailable,
+        report.records.len()
+    )
+}
+
+/// Renders what a logout does to each execution profile, one line each.
+#[must_use]
+pub fn persistence_lines(persistence: &[kr_protocol::desktop::ProfilePersistence]) -> Vec<String> {
+    persistence
+        .iter()
+        .map(|entry| {
+            format!(
+                "a {} session at logout: {} ({})",
+                entry.profile.as_str(),
+                entry.persistence.as_str(),
+                entry.mechanism
+            )
+        })
+        .collect()
+}
+
 /// Renders the desktop a session runs on as a line for a person.
 #[must_use]
 pub fn desktop_line(summary: &SessionSummary) -> String {

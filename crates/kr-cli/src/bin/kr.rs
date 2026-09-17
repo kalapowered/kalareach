@@ -471,6 +471,18 @@ async fn run(cli: Cli) -> Result<Completion> {
             let mut client = open_controller(&environment.paths, build_id()).await?;
             let info: HostInfoResult = typed(client.request(Method::HostInfo, &()).await?)?;
             let checks: HostDoctorResult = typed(client.request(Method::HostDoctor, &()).await?)?;
+            // What this environment can currently do, which is where the desktop, what a logout
+            // does to each profile, and the capability evidence come from.
+            let capabilities: kr_protocol::desktop::EnvironmentCapabilitiesResult = typed(
+                client
+                    .request(
+                        Method::EnvironmentCapabilities,
+                        &kr_protocol::desktop::EnvironmentCapabilitiesParams {
+                            environment_id: environment.environment_id,
+                        },
+                    )
+                    .await?,
+            )?;
             // One document, whether the diagnostics passed or not. A command that printed a result
             // and then a failure would give a reader two documents to reconcile.
             if cli.json {
@@ -478,6 +490,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                     "ok": checks.healthy,
                     "host": report::host(&info),
                     "doctor": report::doctor(&checks),
+                    "environment": report::environment_capabilities(&capabilities),
                 }));
             } else {
                 println!(
@@ -488,6 +501,10 @@ async fn run(cli: Cli) -> Result<Completion> {
                     "sessions are created in the {} execution context by default",
                     info.default_worker_profile.as_str()
                 );
+                println!("{}", report::desktop_summary_line(&capabilities.desktop));
+                for line in report::persistence_lines(&capabilities.persistence) {
+                    println!("{line}");
+                }
                 println!("{}", info.power.describe());
                 print!("{}", report::doctor_lines(&checks));
                 if arguments.verbose {
