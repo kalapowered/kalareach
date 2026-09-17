@@ -216,11 +216,12 @@ those happened.
 
 Each record also names the facility it is about: its path, the number of bytes read, and a digest
 of its contents. A tool replaced at the same path is a different file here even when it kept the
-path, the length and the timestamps. The file is read a block at a time, up to sixty-four
-mebibytes, so identifying a facility costs one block of memory and a bounded amount of time. A file
-with more in it than that is not identified at all, and the capability it serves then says that
-this host could not identify its facility rather than claiming anything about it. The digest is for
-noticing a
+path, the length and the timestamps. The file is read a block at a time, and the bound is on the
+work rather than on the clock: at most sixty-four mebibytes and the block that crosses that line
+are read, in blocks of sixty-four kibibytes, and how long that takes is the filesystem's business.
+A file with more in it than that is not identified at all, and the capability it serves then says
+that this host could not identify its facility rather than claiming anything about it. The digest
+is for noticing a
 change rather than for proving one: a capability record is evidence about what is feasible, never
 authority, and nothing here signs it.
 

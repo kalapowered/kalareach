@@ -641,15 +641,16 @@ fn runnable(path: &std::path::Path) -> bool {
 /// timestamps.
 ///
 /// The work is bounded twice over. The file is read a block at a time, so identifying it costs one
-/// block of memory whatever its size, and at most [`MAX_IDENTIFIED`] bytes are read, so it costs a
-/// bounded amount of time as well. A file with more than that in it has no identity here, and
-/// neither has one that cannot be read: both are answered as the facility this host could not
-/// identify rather than as a facility described by its metadata, because a length and a timestamp
-/// are what an installer keeps.
+/// block of memory whatever its size, and the read stops once more than [`MAX_IDENTIFIED`] bytes
+/// have been taken, so it reads at most that much plus the block that crossed the line. A file
+/// with more than that in it has no identity here, and neither has one that cannot be read: both
+/// are answered as the facility this host could not identify rather than as a facility described
+/// by its metadata, because a length and a timestamp are what an installer keeps.
 ///
-/// The bound is on the work and not on the clock. A facility that was identified a moment ago and
-/// unidentifiable now, because the host was busy, would advance the capability revision without
-/// anything having changed.
+/// The bound is on the work and not on the clock, and that is deliberate rather than an omission.
+/// How long reading those bytes takes is the filesystem's business, and a deadline would make the
+/// answer depend on how busy the host was: a facility identified a moment ago and unidentifiable
+/// now would advance the capability revision without anything about the facility having changed.
 ///
 /// The digest is for noticing a change rather than for proving one: a capability record is
 /// evidence about what is feasible, never authority, and nothing here signs it.
