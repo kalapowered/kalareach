@@ -2660,10 +2660,11 @@ fn check_declaration(row: &UploadRow, params: &UploadFinishParams) -> Result<()>
 /// spent. Every caller is told that, and so is every copy of the action, because the refusal is
 /// recorded on the claim as it happens.
 ///
-/// Any other ended state is that state. A cancellation that closed this transfer first is not an
-/// integrity failure, and neither is an expiry: an upload that ran out of time did not fail a
-/// digest, and answering as though it had would spend the wrong code on it and disagree with the
-/// refusal the expiry itself gives.
+/// Any other ended state is that state, named as it stands rather than explained: a cancellation
+/// closed this transfer, an expiry ran out its time either before it published or after its
+/// retention, and neither of those is an integrity failure. An upload that ran out of time did not
+/// fail a digest, and answering as though it had would spend the wrong code on it and disagree with
+/// the refusal the expiry itself gives.
 fn publication_refusal(row: &UploadRow) -> TransferError {
     if row.state == UploadState::Invalidated {
         return TransferError::integrity(
@@ -2675,7 +2676,7 @@ fn publication_refusal(row: &UploadRow) -> TransferError {
     TransferError::WrongState {
         transfer: row.transfer_id.to_string(),
         state: row.state.as_str(),
-        detail: "this upload ended before it published, so it cannot be finished".to_owned(),
+        detail: "this upload has ended, so it cannot be finished".to_owned(),
     }
 }
 
