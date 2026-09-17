@@ -43,7 +43,7 @@ Where the session runs is a separate choice, and these two are mutually exclusiv
 | Flag | What happens |
 | --- | --- |
 | `--desktop` | Run in this host's current desktop. The session closes with `desktop_lost` when that desktop's login ends |
-| `--headless` | Run in this host's headless user context, with no inherited graphical access |
+| `--headless` | Run in this host's headless user context, which is given none of the desktop's own handles. What that means for reaching a desktop differs by platform, and `kr doctor` says which |
 
 Neither is the default. Without one, the session runs where the host says it creates sessions: a
 desktop host uses its own desktop and an SSH-only or headless installation uses its configured
@@ -58,7 +58,9 @@ execution context desktop_bound: desktop macos_security_session:uid=501:session=
 
 `--invisible` is about the terminal and nothing else. An invisible session in a desktop context
 keeps that desktop's access, so a command inside it can open a browser on the screen in front of
-you; it is not a headless mode and it does not survive a logout.
+you, and it closes with the desktop like any other desktop-bound session. It is not a headless
+mode: what survives a logout is decided by the execution context, not by whether a terminal was
+opened.
 
 `--environment`, `--cwd`, `--shell` and `--shell-mode` select execution properties. For `--attach`
 the creating terminal's size is registered before the shell starts, so the first prompt is drawn at

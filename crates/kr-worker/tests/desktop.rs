@@ -856,6 +856,29 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
         recorded.exists(),
         "the daemon recorded the boot it was running in"
     );
+
+    // A damaged record is a damaged record. This runs first, while the sessions are still live,
+    // because what it establishes is that nothing was closed on the strength of one.
+    kr_ipc::paths::write_owner_only_file(&recorded, b"not a boot identity").expect("writes");
+    let damaged = host.start().await;
+    let mut client = host.client().await;
+    for session_id in [headless.session.session_id] {
+        assert!(
+            closed(&mut client, session_id).await.is_none(),
+            "a damaged boot record closed a live session"
+        );
+    }
+    let written = std::fs::read(&recorded).expect("reads the record");
+    let named: kr_protocol::identity::BootIdentity =
+        kr_cbor::from_canonical_slice(&written, &kr_cbor::Limits::DEFAULT)
+            .expect("a damaged record is replaced with a good one");
+    assert_eq!(
+        named,
+        kr_ipc::identity::boot_identity().expect("a boot identity"),
+        "and the good one names the boot this host is running"
+    );
+    drop(client);
+    damaged.stop().await;
     // A boot identity this host is not running, in the form the record holds: a damaged file is a
     // damaged file rather than evidence of a reboot, so the test writes a real one.
     let another = kr_protocol::identity::BootIdentity {
@@ -895,19 +918,6 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
     drop(client);
     second.stop().await;
 
-    // A damaged record is a damaged record. It closes nothing, and the daemon writes a good one.
-    kr_ipc::paths::write_owner_only_file(&recorded, b"not a boot identity").expect("writes");
-    let third = host.start().await;
-    let written = std::fs::read(&recorded).expect("reads the record");
-    let named: kr_protocol::identity::BootIdentity =
-        kr_cbor::from_canonical_slice(&written, &kr_cbor::Limits::DEFAULT).expect("decodes");
-    assert_eq!(
-        named,
-        kr_ipc::identity::boot_identity().expect("a boot identity"),
-        "a damaged record is replaced rather than acted on"
-    );
-    third.stop().await;
-
     for (session_id, endpoint) in endpoints {
         let Ok(endpoint) = kr_ipc::paths::Endpoint::from_path(&endpoint) else {
             continue;
@@ -941,7 +951,7 @@ async fn the_desktop_a_session_was_created_on_is_readable_after_its_worker_has_g
 
     // The worker's own journal, read the way a daemon reads it after the worker has gone.
     let journal =
-        kr_worker::journal::Journal::open_read_only(&host.paths().journal_database(session_id))
+        kr_worker::journal::Journal::open_read_only(host.paths().journal_database(session_id))
             .expect("the journal outlives the worker");
     let recorded = journal
         .read_session(session_id)
@@ -1065,6 +1075,14 @@ async fn a_headless_session_inherits_no_graphical_access_and_logout_is_reported_
         LogoutPersistence::AvailableByChoice => assert!(
             headless.detail.to_ascii_lowercase().contains("explicit"),
             "an available-by-choice answer says the choice is explicit: {}",
+            headless.detail
+        ),
+        LogoutPersistence::NotEstablished => assert!(
+            headless
+                .detail
+                .to_ascii_lowercase()
+                .contains("not established"),
+            "an answer this host has not established says so: {}",
             headless.detail
         ),
         LogoutPersistence::EndsAtLogout | LogoutPersistence::NoServiceManager => {}
@@ -1599,8 +1617,9 @@ fn per_user_startup_uses_the_platform_service_mechanism_and_changes_no_sleep_pol
     #[cfg(target_os = "macos")]
     assert_eq!(
         persistence.persistence,
-        LogoutPersistence::EndsAtLogout,
-        "this platform ends a user's agents at logout"
+        LogoutPersistence::NotEstablished,
+        "this platform's background domain outlives the graphical login and this host does not \
+         read how long it lasts"
     );
 
     // Starting a host, and asking it anything, never writes a power setting.

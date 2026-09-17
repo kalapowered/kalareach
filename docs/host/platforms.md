@@ -45,7 +45,7 @@ session ends, the session closes with `desktop_lost` and you create a new one.
 
 | Platform | `desktop_bound` | `headless_user` |
 | --- | --- | --- |
-| macOS | ends with the graphical login. The worker's job is bootstrapped into the user's graphical domain, and a logout tears that domain down | started outside the graphical login, in this user's background domain, so it has no Aqua access to inherit. That domain outlives the graphical login and goes with the user's last session of any kind. Outliving that needs a service in the system's own domain, which is a different execution context and an installation step this host does not take |
+| macOS | ends with the graphical login. The worker's job is bootstrapped into the user's graphical domain, and a logout tears that domain down | started outside the graphical login, in this user's background domain, so it has no Aqua access to inherit. That domain outlives the graphical login; how long it lasts after the user's last session is the platform's own behaviour, which this host does not read, so it reports the lifetime as not established rather than guessing. Work that must outlive a logout with certainty needs a service in the system's own domain, which is a different execution context and an installation step this host does not take |
 | Linux | ends with the graphical login session | survives logout only while lingering is enabled for the user, which keeps the user's service manager running. It is off unless somebody enables it |
 | Windows | ends with the sign-out of the interactive session | ends with the sign-out. A per-user task runs in the user's own session and stops with it; work that must outlive a sign-out needs a service under an account granted the right to log on as a service |
 
@@ -126,10 +126,10 @@ machine.
 ```
 
 With the setting on, an assertion is held while the host has verified foreground work or a request
-it has accepted and not answered. Three things count: a session whose worker reports an agent at
-work, a session waiting for a decision to be answered, and a closure that is still stopping
-processes and draining their output. An idle shell is not work, however much output it has
-produced. The assertion is released when those end, and `kr status`, `kr doctor` and
+it has accepted and not answered. Four things count, and the host reads each of them rather than
+guessing: a create it has accepted and not finished, a closure that is still stopping processes and
+draining their output, a session whose worker reports an agent at work, and a session waiting for a
+decision to be answered. An idle shell is not work, however much output it has produced. The assertion is released when those end, and `kr status`, `kr doctor` and
 `kr host power` all print what is held and why.
 
 Work begins and ends without the host being told, so while the setting is on the host looks at the
@@ -180,13 +180,15 @@ those happened.
 | Linux, Wayland | the display server and launching an application | a compositor that asks the user for the operation each time, such as GNOME's screen-sharing portal, which is a permission the user grants rather than one a tool holds; a capability with no tool installed | a screen image or synthetic input on a compositor that implements the protocols the installed tool uses, which `sway`, `river`, `hyprland`, `wayfire`, `labwc` and `niri` do. The answer names the compositor, the tool and the operation |
 | Windows | the display server, and launching an application in the interactive session | a capability whose facility is not installed | a screen image, synthetic input and the accessibility tree, which act on whatever is on the screen |
 
-Each record also names the facility it is about: its path, and the file itself as the filesystem
-describes it, which is which file it is, how long it is and when it last changed. A tool replaced
-at the same path is a different file by that description unless it matches in all three, which is
-what the record says it compared rather than claiming to have read the contents. The revision every
-record carries advances whenever any of this changes, and it is kept in the environment's state
-directory so a host that restarts never hands out a revision it has used before. An action that
-bound to an earlier revision rechecks it and is refused.
+Each record also names the facility it is about: its path, its length, and a digest of its
+contents. A tool replaced at the same path is a different file here even when it kept the path, the
+length and the timestamps. The digest is for noticing a change rather than for proving one: a
+capability record is evidence about what is feasible, never authority, and nothing here signs it.
+
+The revision every record carries advances whenever any of this changes. It is kept in the
+environment's state directory and written before it is handed out, so a host that restarts does not
+hand out a revision it has used before; where that record cannot be read the revision stays at
+zero, which claims nothing, rather than starting again from one.
 
 The Wayland answers name the route as well as the tool, because the three routes a Wayland desktop
 offers are different things: a protocol the compositor implements, the desktop portal (which asks
