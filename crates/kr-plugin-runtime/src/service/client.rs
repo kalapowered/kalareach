@@ -649,15 +649,17 @@ impl PluginClient {
 
         let exchange = async {
             {
-                // A frame that is half written and then abandoned -- by a failure, by a deadline,
-                // or by a caller that stopped polling -- leaves the writer unable to start another
-                // one. There is no way back from that on this connection, so the guard ends it
-                // unless the write finished.
+                let mut writer = self.writer.lock().await;
+                // Armed once the writer is held, and not before: a caller whose deadline ran out
+                // while it was queueing for the writer has written nothing, and ending the
+                // connection over that would be a failure it did not cause. From here on, a frame
+                // that is half written and then abandoned -- by a failure, by a deadline, or by a
+                // caller that stopped polling -- leaves the writer unable to start another one, and
+                // there is no way back from that on this connection.
                 let attempt = Attempting {
                     pending: &self.pending,
                     finished: false,
                 };
-                let mut writer = self.writer.lock().await;
                 let written = writer.write_message(&Request { request_id, body }).await;
                 attempt.finished(written.is_ok());
                 written.map_err(|error| RuntimeError::ServiceUnavailable {
