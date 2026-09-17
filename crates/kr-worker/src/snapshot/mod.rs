@@ -388,7 +388,10 @@ pub fn install(
                     let empty = ProjectedRow {
                         row: wire::row_id(row.stable_id)?,
                         soft_wrapped: row.soft_wrapped,
-                        truncated: true,
+                        // Truncated because content was given up, not because the row arrived
+                        // empty: a row the session holds blank has lost nothing, and a client that
+                        // was told otherwise would report a loss that never happened.
+                        truncated: row.truncated || !row.runs.is_empty(),
                         runs: Vec::new(),
                     };
                     held = held.saturating_add(wire::row_cost(&empty).bytes);

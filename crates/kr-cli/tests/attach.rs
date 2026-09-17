@@ -769,6 +769,47 @@ fn final_modes(stream: &[u8]) -> std::collections::BTreeMap<String, bool> {
     modes
 }
 
+/// The mouse tracking a stream leaves a terminal in, as a terminal actually keeps it.
+///
+/// Not three switches: one state. `CSI ? 1000 h`, `CSI ? 1002 h` and `CSI ? 1003 h` each *replace*
+/// whichever tracking was in force, and resetting any of the three turns tracking off whichever of
+/// them had turned it on. A restoration that wrote a terminal's own `1000 h` and then the `1002 l`
+/// of a mode that was never on would leave it with no mouse reporting at all, and a check that read
+/// the three as independent booleans would not notice.
+fn mouse_tracking(stream: &[u8]) -> Option<u16> {
+    let mut tracking = None;
+    let mut index = 0;
+    while index + 3 < stream.len() {
+        if &stream[index..index + 3] != b"\x1b[?" {
+            index += 1;
+            continue;
+        }
+        let mut at = index + 3;
+        let mut number = String::new();
+        while let Some(byte) = stream.get(at).copied() {
+            if byte.is_ascii_digit() {
+                number.push(char::from(byte));
+                at += 1;
+            } else {
+                break;
+            }
+        }
+        let Ok(mode) = number.parse::<u16>() else {
+            index += 3;
+            continue;
+        };
+        if matches!(mode, 1000 | 1002 | 1003) {
+            match stream.get(at) {
+                Some(b'h') => tracking = Some(mode),
+                Some(b'l') => tracking = None,
+                _ => {}
+            }
+        }
+        index += 3;
+    }
+    tracking
+}
+
 /// The last position a sequence appears at in a stream.
 fn last_index(stream: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || stream.len() < needle.len() {
@@ -1037,6 +1078,16 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
              documented default: {modes:?}"
         );
     }
+    // And the mouse as a terminal actually keeps it: one tracking state rather than three
+    // switches. This terminal reported click reporting on, so that is what it is owed, and a
+    // restoration that wrote the reset of a mode it never had after that set would have left it
+    // with nothing.
+    assert_eq!(
+        mouse_tracking(&output.bytes()),
+        Some(1000),
+        "the terminal's own mouse reporting is what it ends with: {}",
+        output.text().escape_debug()
+    );
     // The reset block still ran: a mode the terminal said nothing about is still cleared, and the
     // ones it did answer for are written after it rather than instead of it.
     let reset = last_index(&output.bytes(), kr_cli::terminal::RESET_SEQUENCES)
@@ -1046,6 +1097,90 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
     assert!(
         restored > reset,
         "the values the terminal reported are written over the defaults, not before them"
+    );
+    let _ = shell.kill();
+    let _ = shell.wait();
+}
+
+/// KR-REQ-08.84: an attach that fails after the handshake still leaves the terminal its own modes.
+///
+/// The guard writes the reset block on every path out, and that block is the documented default for
+/// every one of these modes. So the values the terminal reported reach the guard as soon as they are
+/// read, before anything else can fail: a worker that cannot be reached must not cost a person the
+/// mouse reporting they had, which nothing in the failed attempt ever touched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attach_that_fails_after_the_handshake_leaves_the_terminal_the_modes_it_reported() {
+    let hosted = hosted("while true; do echo ready; sleep 1; done").await;
+    // A second session, published and never served: its endpoint has no listener, so the command
+    // resolves it, asks the terminal what it is, and then fails to reach the worker.
+    let unreachable = DisplayNumber::new(2);
+    let descriptor = WorkerDescriptor {
+        session_id: SessionId::new(kr_ipc::new_uuid()),
+        display_number: unreachable,
+        endpoint: hosted
+            .temp
+            .environment()
+            .worker_endpoint(unreachable)
+            .expect("an endpoint")
+            .as_text(),
+        ..hosted.descriptor.clone()
+    };
+    kr_ipc::descriptor::publish(&hosted.temp.environment(), &descriptor)
+        .expect("publishes the descriptor");
+
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let display = unreachable.get().to_string();
+    let mut shell = pty
+        .slave
+        .spawn_command(shell_running(
+            &hosted,
+            &format!(
+                "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
+                env!("CARGO_BIN_EXE_kr")
+            ),
+        ))
+        .expect("starts the shell");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    answer_keyboard_and_mode_queries(&output, pty.master.take_writer().expect("a writer"));
+
+    assert!(
+        output.wait_for(b"attach-finished-", Duration::from_secs(60)),
+        "the attach ended: {}",
+        output.text().escape_debug()
+    );
+    assert!(
+        !output.contains(b"attach-finished-0"),
+        "and it failed, because nothing is listening on that endpoint: {}",
+        output.text().escape_debug()
+    );
+    // The handshake did happen: this terminal was asked, and it answered.
+    assert!(
+        output.contains(b"\x1b[?1000$p"),
+        "the terminal was asked what its mouse reporting was: {}",
+        output.text().escape_debug()
+    );
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while Instant::now() < deadline && mouse_tracking(&output.bytes()) != Some(1000) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        mouse_tracking(&output.bytes()),
+        Some(1000),
+        "the mouse reporting this terminal had is what it is left with: {}",
+        output.text().escape_debug()
+    );
+    let modes = final_modes(&output.bytes());
+    assert_eq!(
+        modes.get("?25").copied(),
+        Some(false),
+        "and the cursor it had hidden is still hidden: {modes:?}"
     );
     let _ = shell.kill();
     let _ = shell.wait();

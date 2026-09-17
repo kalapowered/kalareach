@@ -237,8 +237,9 @@ impl Qualification {
         if let Some(identity) = &self.width_unqualified {
             parts.push(format!(
                 "it calls itself {identity}, which is not qualified for the character widths this \
-                 session measures with, so a character it draws wider than the session does costs \
-                 that character's own cell and nothing after it"
+                 session measures with, so a character it draws wider than the session does can \
+                 cover the blank cell beside it, and every cluster after that one still lands on \
+                 the column the session holds it at"
             ));
         }
         if parts.is_empty() {

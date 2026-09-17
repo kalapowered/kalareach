@@ -233,16 +233,25 @@ impl ScreenModes {
     /// default: what follows is the value this terminal actually had, for each mode it answered
     /// for. A mode it did not answer for keeps the default, because a value nobody read is not one
     /// anything can restore.
+    ///
+    /// Every reset is written before every set, because the three mouse tracking modes are not
+    /// three independent switches. A terminal keeps one tracking state, and resetting *any* of 1000,
+    /// 1002 and 1003 turns reporting off whichever of them had turned it on: writing them in mode
+    /// order would restore a terminal's click reporting and then switch it off again with the reset
+    /// of a mode that was never on. Resets first, then sets, and the terminal ends in the state it
+    /// reported.
     #[must_use]
     pub fn restore_sequences(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        for (mode, held) in kr_term::probe::SavedMode::ALL.iter().zip(self.modes.iter()) {
-            let Some(set) = held else {
-                continue;
-            };
-            let number = mode.number();
-            let action = if *set { 'h' } else { 'l' };
-            out.extend_from_slice(format!("\x1b[?{number}{action}").as_bytes());
+        for wanted in [false, true] {
+            for (mode, held) in kr_term::probe::SavedMode::ALL.iter().zip(self.modes.iter()) {
+                if *held != Some(wanted) {
+                    continue;
+                }
+                let number = mode.number();
+                let action = if wanted { 'h' } else { 'l' };
+                out.extend_from_slice(format!("\x1b[?{number}{action}").as_bytes());
+            }
         }
         out
     }
@@ -1260,9 +1269,28 @@ mod tests {
         );
         assert_eq!(
             probe.modes.restore_sequences(),
-            b"\x1b[?25l\x1b[?1000h\x1b[?1002l\x1b[?1003l\x1b[?1006h\x1b[?2004h".to_vec(),
-            "and each goes back to the value the terminal itself reported"
+            b"\x1b[?25l\x1b[?1002l\x1b[?1003l\x1b[?1000h\x1b[?1006h\x1b[?2004h".to_vec(),
+            "each goes back to the value the terminal itself reported, and every reset is written \
+             before every set: a terminal keeps one mouse tracking state, so resetting 1002 after \
+             setting 1000 would switch off the reporting that was just restored"
         );
+        let sequences = probe.modes.restore_sequences();
+        let text = String::from_utf8(sequences).expect("the sequences are text");
+        let last_reset = ["\x1b[?1000l", "\x1b[?1002l", "\x1b[?1003l"]
+            .iter()
+            .filter_map(|sequence| text.rfind(sequence))
+            .max();
+        let first_set = ["\x1b[?1000h", "\x1b[?1002h", "\x1b[?1003h"]
+            .iter()
+            .filter_map(|sequence| text.find(sequence))
+            .min();
+        if let (Some(reset), Some(set)) = (last_reset, first_set) {
+            assert!(
+                reset < set,
+                "no mouse mode is switched off after one is switched on: {}",
+                text.escape_debug()
+            );
+        }
     }
 
     /// KR-REQ-08.84: a terminal that answers no mode report is defaulted, and the attach stands.

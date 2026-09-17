@@ -147,6 +147,12 @@ pub async fn run(
     // anything of this attachment's changed them. Held here because the rest of the probe is handed
     // to the loop, and the restoration at the end of this function needs them.
     let modes = probe.modes;
+    // The guard is told them *here*, before anything else can fail. Whatever happens from now on -
+    // a worker that cannot be reached, an attachment the host refuses, this process killed outright
+    // - the guard puts the terminal back, and what it writes is the reset block. That block is the
+    // documented default for every one of these modes, so a guard that had not been told them would
+    // clear a person's mouse reporting on the way out of a failure that never touched it.
+    guard.learn_modes(&modes);
 
     let mut client = crate::resolve::open_worker(descriptor, crate::build_id()).await?;
     // A terminal attachment claims the session's size. Section 8 makes that the default: a
@@ -209,7 +215,6 @@ pub async fn run(
     // on its way here told it nothing.
     if !options.no_probe {
         guard.learn_keyboard(&keyboard);
-        guard.learn_modes(&modes);
         guard.begin_keyboard()?;
     }
     let raw_replaced = terminal.enter_raw_mode()?;
