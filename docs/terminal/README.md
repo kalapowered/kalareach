@@ -1060,7 +1060,7 @@ the erasure covers that is not already empty.
 | Host | Plain stream | Stream that scrolls | Where it was measured |
 | --- | --- | --- | --- |
 | Apple M4 Pro, 12 processors | 11.9 to 12.4 MiB/s | 10.6 to 11.5 MiB/s | local runs of this revision |
-| AMD EPYC 7763 64-Core, 4 processors | 6.1 MiB/s | 5.9 MiB/s | `core-ci` runs 35165588315 and 35167627730 |
+| AMD EPYC 7763 64-Core, 4 processors | 6.1 to 6.2 MiB/s | 5.9 MiB/s | `core-ci` runs 35165588315, 35167627730 and 35169947110 |
 | AMD EPYC 9V74 80-Core, 4 processors | 5.9 to 7.5 MiB/s | 6.1 to 7.7 MiB/s | `core-ci` runs 35168759717 and 35164400630 |
 | Intel Xeon Platinum 8573C, 4 processors | 8.0 MiB/s | 7.4 MiB/s | `core-ci` run 35163469612 |
 
