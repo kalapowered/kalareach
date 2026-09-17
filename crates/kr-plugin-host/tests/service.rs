@@ -958,19 +958,21 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     // the whole of it rather than for part of it. The call count is what turns that from an
     // expectation into evidence: it counts calls the component finished, so a count that grew
     // across the window is a component that was executing inside it.
+    let window = std::time::Instant::now();
     let before_calls = plugin
         .health()
         .await
         .expect("a health report")
         .component_calls;
-    let window = std::time::Instant::now();
     let during = collect(&mut terminal, Duration::from_millis(800)).await;
-    let collected = window.elapsed();
     let after_calls = plugin
         .health()
         .await
         .expect("a health report")
         .component_calls;
+    // Measured from before the first sample to after the second, so the bound below covers the
+    // whole stretch the two samples bracket rather than the collection alone.
+    let bracketed = window.elapsed();
     assert!(
         after_calls > before_calls,
         "the component finished no calls during the window: {before_calls} before, {after_calls} \
@@ -980,8 +982,8 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     // between them finished them while the terminal was being collected from, not before or after
     // some much longer stretch.
     assert!(
-        collected < Duration::from_millis(1_500),
-        "the collection took {collected:?}, so the samples bracket more than it"
+        bracketed < Duration::from_millis(1_600),
+        "the samples bracket {bracketed:?}, which is more than the collection they are for"
     );
     let during = String::from_utf8_lossy(&during).into_owned();
     let after = highest_line(&during).unwrap_or(0);
@@ -997,7 +999,7 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     );
 
     assert!(
-        window.elapsed() >= Duration::from_millis(800),
+        bracketed >= Duration::from_millis(800),
         "the window was shorter than it was asked to be"
     );
 

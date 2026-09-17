@@ -456,7 +456,17 @@ impl PluginClient {
             },
         };
         match self.offered.try_send(request) {
-            Ok(()) => Handoff::Accepted,
+            Ok(()) => {
+                // The connection can end between the check above and this point, and closing sets
+                // the total to zero rather than subtracting: a charge made after that would be a
+                // charge for an event in a queue nobody is reading, and it would make every later
+                // offer a refusal instead of the refusal it should be.
+                if self.pending.is_closed() {
+                    release(&self.offered_bytes, cost);
+                    return Handoff::Unavailable;
+                }
+                Handoff::Accepted
+            }
             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 release(&self.offered_bytes, cost);
                 Handoff::Refused { held_bytes: held }

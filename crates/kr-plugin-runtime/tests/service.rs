@@ -661,8 +661,21 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
 
     let (outcome, finished_at) = calling.await.expect("the call finished");
     // The call ran: either the component answered it or its own deadline stopped it. Both are the
-    // component executing; what would not be is the call never having started.
-    let _ran = outcome;
+    // component executing; what would not be is the call never having started, and a refusal that
+    // named no binding would be exactly that.
+    match outcome {
+        Ok(called) => assert!(
+            called.answered() || called.fault.is_some(),
+            "the snapshot returned neither an answer nor a fault"
+        ),
+        Err(error) => assert!(
+            matches!(
+                error,
+                RuntimeError::CallerDeadline { .. } | RuntimeError::ServiceProtocol { .. }
+            ),
+            "the snapshot never reached the component: {error}"
+        ),
+    }
     assert!(
         answered_at < finished_at,
         "the observation was answered after the call it was offered behind had finished"
