@@ -436,6 +436,7 @@ impl TerminalEngine {
         gate: LaneGate,
         now_ms: u64,
         budget: usize,
+        scope: crate::render::Scope,
     ) -> Result<(crate::snapshot::Update, Filtered)> {
         let viewport = self.viewport_for(dimensions);
         // The state without its rows, and then the rows a bounded run at a time as the pages are
@@ -447,8 +448,15 @@ impl TerminalEngine {
         viewport.top_row = self.engine.grid().visible_top_row();
         snapshot.viewport = viewport;
         let degraded = self.resident_state_truncated();
-        let update =
-            crate::snapshot::install(&snapshot, viewport, reason, degraded, budget, &self.engine)?;
+        let update = crate::snapshot::install(
+            &snapshot,
+            viewport,
+            reason,
+            degraded,
+            budget,
+            scope,
+            &self.engine,
+        )?;
         Ok((update, settled))
     }
 
@@ -464,11 +472,15 @@ impl TerminalEngine {
     /// # Errors
     ///
     /// Returns an error when the engine's state cannot be spelled on the wire.
-    pub fn minimum_projection_install(&self, dimensions: Dimensions) -> Result<usize> {
+    pub fn minimum_projection_install(
+        &self,
+        dimensions: Dimensions,
+        scope: crate::render::Scope,
+    ) -> Result<usize> {
         let viewport = self.anchored_viewport(dimensions);
         let mut state = self.engine.screen_state(viewport);
         state.viewport = viewport;
-        crate::snapshot::minimum_install(&state, viewport, &self.engine)
+        crate::snapshot::minimum_install(&state, viewport, scope, &self.engine)
     }
 
     /// Builds what one client is owed, given the screen it already holds.
@@ -777,6 +789,7 @@ mod projection_tests {
                 LaneGate::default(),
                 0,
                 crate::output::DEFAULT_SEND_QUEUE_BYTES,
+                crate::render::Scope::WholeScreen,
             )
             .expect("a snapshot");
         let pages: Vec<&kr_protocol::projection::ProjectionRowPage> = update
@@ -811,6 +824,62 @@ mod projection_tests {
         );
     }
 
+    /// A client drawn the live screen alone is paged the buffer that is showing and no other.
+    ///
+    /// Section 10's live-screen exception reaches the screen that is showing and never the buffer
+    /// that is not. A rendered restoration does not paint the other buffer for such a caller, and a
+    /// projection does not page it either: the rows are not sent, so there is nothing for a client
+    /// to draw or to keep.
+    #[test]
+    fn a_live_screen_scope_is_not_paged_the_buffer_that_is_not_showing() {
+        let mut engine = engine();
+        let mut stream = Vec::new();
+        stream.extend_from_slice(b"what the shell left behind\r\n");
+        stream.extend_from_slice(b"\x1b[?1049h");
+        stream.extend_from_slice(b"an application's screen\r\n");
+        engine.feed(0, &stream, LaneGate::default(), 0);
+
+        for (scope, expected) in [
+            (crate::render::Scope::WholeScreen, 2),
+            (crate::render::Scope::LiveScreen, 1),
+        ] {
+            let (update, _) = engine
+                .projection_install(
+                    dimensions(80, 24),
+                    ProjectionResetReason::Attached,
+                    LaneGate::default(),
+                    0,
+                    crate::output::DEFAULT_SEND_QUEUE_BYTES,
+                    scope,
+                )
+                .expect("a snapshot");
+            let buffers: std::collections::BTreeSet<kr_protocol::projection::ProjectedBuffer> =
+                update
+                    .events
+                    .iter()
+                    .filter_map(|outgoing| match &outgoing.event {
+                        kr_protocol::projection::ProjectionEvent::Rows(page) => Some(page.buffer),
+                        _ => None,
+                    })
+                    .collect();
+            assert_eq!(
+                buffers.len(),
+                expected,
+                "{scope:?} is paged {expected} buffer(s): {buffers:?}"
+            );
+            assert!(
+                buffers.contains(&kr_protocol::projection::ProjectedBuffer::Alternate),
+                "the buffer that is showing is always paged: {buffers:?}"
+            );
+            if scope == crate::render::Scope::LiveScreen {
+                assert!(
+                    !buffers.contains(&kr_protocol::projection::ProjectedBuffer::Primary),
+                    "and what the shell left behind is not: {buffers:?}"
+                );
+            }
+        }
+    }
+
     /// KR-REQ-08.79: a screen that fits arrives whole, however unevenly its content is spread.
     ///
     /// The bound is on the whole installation, not on each row's share of it. One long row among
@@ -840,6 +909,7 @@ mod projection_tests {
                 LaneGate::default(),
                 0,
                 512 * 1024,
+                crate::render::Scope::WholeScreen,
             )
             .expect("a snapshot");
         let total: usize = update.events.iter().map(|outgoing| outgoing.bytes).sum();
@@ -904,6 +974,7 @@ mod projection_tests {
                 LaneGate::default(),
                 0,
                 budget,
+                crate::render::Scope::WholeScreen,
             )
             .expect("a snapshot");
         let total: usize = update.events.iter().map(|outgoing| outgoing.bytes).sum();
@@ -921,6 +992,7 @@ mod projection_tests {
                 LaneGate::default(),
                 0,
                 total,
+                crate::render::Scope::WholeScreen,
             )
             .expect("a snapshot");
         let carried: usize = tight.events.iter().map(|outgoing| outgoing.bytes).sum();
@@ -952,6 +1024,7 @@ mod projection_tests {
                 LaneGate::default(),
                 0,
                 0,
+                crate::render::Scope::WholeScreen,
             )
             .expect("a snapshot")
             .0
@@ -968,6 +1041,7 @@ mod projection_tests {
                     LaneGate::default(),
                     0,
                     budget,
+                    crate::render::Scope::WholeScreen,
                 )
                 .expect("a snapshot");
             let carried: usize = tried.events.iter().map(|outgoing| outgoing.bytes).sum();
@@ -1025,6 +1099,7 @@ mod projection_tests {
                 LaneGate::default(),
                 0,
                 crate::output::DEFAULT_SEND_QUEUE_BYTES,
+                crate::render::Scope::WholeScreen,
             )
             .expect("a snapshot");
         let held = Held {
@@ -1130,6 +1205,7 @@ mod projection_tests {
                 LaneGate::default(),
                 0,
                 crate::output::DEFAULT_SEND_QUEUE_BYTES,
+                crate::render::Scope::WholeScreen,
             )
             .expect("a snapshot");
         let held = Held {
@@ -1156,6 +1232,7 @@ mod projection_tests {
                 LaneGate::default(),
                 0,
                 crate::output::DEFAULT_SEND_QUEUE_BYTES,
+                crate::render::Scope::WholeScreen,
             )
             .expect("a snapshot");
         let stale = Held {

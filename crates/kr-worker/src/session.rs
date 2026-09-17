@@ -804,7 +804,8 @@ impl Session {
     /// spelled on the wire.
     pub fn minimum_projection_install(&self, attachment_id: AttachmentId) -> Result<usize> {
         let dimensions = self.attachment_dimensions(attachment_id)?;
-        self.engine.minimum_projection_install(dimensions)
+        self.engine
+            .minimum_projection_install(dimensions, self.content_scope(attachment_id))
     }
 
     /// Returns one attachment's own dimensions, falling back to the session's canonical geometry.
@@ -1835,9 +1836,12 @@ impl Session {
                 // message a client cannot use part of, so a screen too large for that queue is cut
                 // to it and marked degraded rather than refused for ever.
                 let budget = self.hub.limit_of(attachment_id);
+                // And how much of the screen this client's authority reaches: a caller drawn the
+                // live screen alone is paged the buffer that is showing and never the other one.
+                let scope = self.content_scope(attachment_id);
                 match self
                     .engine
-                    .projection_install(dimensions, reason, gate, now, budget)
+                    .projection_install(dimensions, reason, gate, now, budget, scope)
                 {
                     Ok((update, settled)) => {
                         // Taking a snapshot settles the screen. It changes no display state here,

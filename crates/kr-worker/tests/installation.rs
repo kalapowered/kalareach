@@ -164,6 +164,7 @@ fn building_an_installation_holds_a_run_of_rows_rather_than_the_screen() {
             LaneGate::default(),
             0,
             kr_worker::render::Keyboard::Install,
+            kr_worker::render::Scope::WholeScreen,
         )
     });
     assert!(
@@ -182,6 +183,7 @@ fn building_an_installation_holds_a_run_of_rows_rather_than_the_screen() {
             LaneGate::default(),
             0,
             QUEUE,
+            kr_worker::render::Scope::WholeScreen,
         )
     });
     let (tall_install, tall_peak) = peak_of(|| {
@@ -191,6 +193,7 @@ fn building_an_installation_holds_a_run_of_rows_rather_than_the_screen() {
             LaneGate::default(),
             0,
             QUEUE,
+            kr_worker::render::Scope::WholeScreen,
         )
     });
     let short_install = short_install.expect("the short session installs").0;

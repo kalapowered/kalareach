@@ -283,6 +283,11 @@ fn outgoing(event: ProjectionEvent) -> Outgoing {
 /// time, and what the conversion keeps is charged to `budget`, so the two together are what an
 /// installation costs whatever the session is holding.
 ///
+/// `scope` is how much of the screen this client's authority reaches. Section 10's live-screen
+/// exception is the screen that is showing and never the buffer that is not, so a client holding
+/// that authority is paged the active buffer alone: the other buffer's rows are not sent, in the
+/// same way a rendered restoration does not paint them.
+///
 /// # Errors
 ///
 /// Returns an error when a row's stable identifier is not a forward count, which this engine
@@ -293,6 +298,7 @@ pub fn install(
     reason: ProjectionResetReason,
     degraded: bool,
     budget: usize,
+    scope: crate::render::Scope,
     rows: &impl RowSource,
 ) -> Result<Update> {
     let generation = snapshot.projection_generation;
@@ -367,7 +373,15 @@ pub fn install(
     // why some of the session is missing from this screen. It is what the header says out loud.
     let mut cut = false;
     let mut held = 0_usize;
-    for buffer in [wire::buffer(snapshot.active_buffer), inactive_buffer] {
+    let paged_buffers: &[ProjectedBuffer] = match scope {
+        crate::render::Scope::WholeScreen => {
+            &[wire::buffer(snapshot.active_buffer), inactive_buffer]
+        }
+        // The buffer that is not showing is outside this client's authority, so it is not converted
+        // and not sent. What it holds is neither drawn nor described.
+        crate::render::Scope::LiveScreen => &[wire::buffer(snapshot.active_buffer)],
+    };
+    for buffer in paged_buffers.iter().copied() {
         let mut kept: Vec<ProjectedRow> = Vec::new();
         let mut first = 0_usize;
         loop {
@@ -529,6 +543,7 @@ pub fn install(
 pub fn minimum_install(
     snapshot: &Snapshot,
     viewport: Viewport,
+    scope: crate::render::Scope,
     rows: &impl RowSource,
 ) -> Result<usize> {
     // A queue of nothing: every row is emptied as it is converted, which is what the smallest
@@ -540,6 +555,7 @@ pub fn minimum_install(
         ProjectionResetReason::longest(),
         true,
         0,
+        scope,
         rows,
     )?
     .bytes())
