@@ -138,9 +138,12 @@ and the protocol carries; a budget that covered only the document would bound th
 node also costs a fixed 64 bytes before its strings are counted, because a component that emitted
 millions of empty nodes would otherwise emit them for nothing.
 
-A node is bounded below the call budget because the service protocol carries one node per frame on a
-control stream whose frames are 1 MiB including their envelope. A component with more to say emits
-more nodes, which is what the node union is for.
+A node is bounded below the call budget because a control frame is 1 MiB including its envelope, so
+a node that fitted the budget exactly would be a node the protocol could not carry. A component with
+more to say emits more nodes, which is what the node union is for, and a document of many nodes is
+sent as however many frames it takes rather than as one frame that would be refused. The value a
+call returns is bounded the same way: a checkpoint the runtime admitted is a checkpoint one frame
+can deliver.
 
 A refused allocation is recorded rather than only returned, so the failure can name the resource. A
 component that asked for a gigabyte and one that divided by zero both arrive as traps, and without
@@ -166,12 +169,26 @@ interpretation of it rather than the request. A dropped request would be a decis
 
 ## What happens to a document nobody is reading
 
-Events reach the caller over a bounded channel, and the binding's thread never waits on it: a
-component must not be blocked because a socket is slow, and a caller that has stopped reading must
-not be able to make this host grow without bound. So a full channel means the document is dropped,
-the loss is reported, and the component is asked to rebuild its view, which is the same answer a
-lost observation gets. A fault and a disabled notice are the exceptions and are never dropped:
-those two are the ones a caller cannot infer from anything else.
+Three bounded queues stand between a component and a worker that has stopped reading, and none of
+them grows: the binding's own event channel, the connection's notice queue in the host, and the
+client's notice queue in the worker. Each drops presentation and keeps the rest.
+
+A component must not be blocked because a socket is slow, and a reader that has stopped reading must
+not be able to make either process grow without bound. So a full queue means the oldest documents go,
+the loss is reported as a gap with no events named, and the component is asked to rebuild its view,
+which is the same answer a lost observation gets.
+
+A fault and a disabled notice are never dropped: those two are the ones a reader cannot infer from
+anything else. What keeps that from being a hole in the bound is that their text is clipped where it
+is built and a connection holds a bounded number of bindings, each of which faults a bounded number
+of times before it is disabled. The binding's thread does wait for room to report one, and it waits
+for two seconds and no longer; after that it disables the binding itself, which is what the notice it
+could not deliver would have asked for.
+
+A binding also holds a bounded number of unanswered calls. A caller whose deadline ran out has
+stopped waiting, but its request is still on the binding's thread until that thread reaches it, and
+the thread skips the ones whose callers have gone rather than spending a call's budget on an answer
+nobody will read.
 
 ## Faults
 
@@ -295,9 +312,23 @@ life. It is never written to disk, placed in an argument vector or put in an env
 nothing that is not that process can answer for it even with full access to the runtime directory.
 
 The launcher records the process identity the service manager reported *before* the host connects,
-and compares it with the connecting peer and with what the claim says. Exactly one rendezvous per
-reservation succeeds, and each launch has a rendezvous address of its own, named after its
-reservation, so a claim can never arrive on an address two launches meant.
+and compares it with the connecting peer as the kernel names it, with what the claim says, and with
+the boot this launcher is running in. A peer the kernel will not name is refused rather than taken on
+the strength of a signature. Exactly one rendezvous per reservation succeeds: the second claim for a
+reservation is refused by a record the launcher keeps and is counted, so two processes claiming one
+reservation is something a host can see rather than infer. Each launch also has a rendezvous address
+of its own, named after its reservation, so a claim can never arrive on an address two launches meant.
+
+The deadline covers receiving and checking the claim, not merely accepting a connection. A peer that
+connects and then says nothing does not hold a startup open, and a refused claim does not end the
+wait: the launcher keeps listening until its deadline and reports the last refusal if nothing better
+arrives.
+
+The host binds the endpoint workers will use *before* it reports itself and holds that listener until
+it serves. A bind, a release and a second bind would let another launch win the endpoint between
+them, and the descriptor the daemon published would then name the process that lost. The host also
+waits to be told its claim was accepted before it serves anybody: a host answering workers before the
+daemon had accepted it would be serving as a process the daemon might still refuse.
 
 On success the launcher publishes an owner-only descriptor at `plugin-host.json` in the environment's
 runtime directory. A worker reads it, challenges the process behind the endpoint, and talks to that
@@ -323,6 +354,20 @@ a frame without one is news.
 | `unbind` | remove the binding and its instance |
 | `health` | ask what the host is doing |
 
+A binding belongs to the connection that registered it. Another connection that has the identifier
+finds no binding, which is the same answer it would get for one nobody ever registered, and a
+connection that ends takes its own bindings and nobody else's.
+
+An observation is answered on the task that read it, because it enters no component: it is a queue
+push. Everything that can enter a component runs in a task of its own, so reading the next request
+never waits for the last one to finish. A connection holds up to sixteen such calls at once and up
+to sixty-four bindings; past either, the next request is refused rather than queued.
+
+The rich calls a broker makes in process -- `prepare-action`, `decode-request`, `encode-response`,
+and revising a binding's facts and attachments -- are not in this protocol yet. They are in the
+runtime crate's own API, which is where the broker task will find them; what travels between a worker
+and the host today is the set above.
+
 A component's bytes travel as a location rather than as a payload: a control frame is bounded at
 1 MiB and a component may be sixteen times that. The worker sends the payload's path and the digest
 it verified against the catalogue, and the host checks the file against that digest before compiling
@@ -341,6 +386,11 @@ cannot destroy an approval ledger.
 
 The broker itself, the gateway, the native proxy and action tokens are a separate piece of work. What
 it builds on is the API in `crates/kr-plugin-runtime`: prepare a binding, offer events to its queue,
-invoke a control, ask for an interpretation, take a checkpoint, unbind. Every one of those is
-asynchronous and carries the caller's own deadline, so nothing on the terminal path can end up behind
-a component.
+invoke a control, ask for an interpretation, take a checkpoint, unbind.
+
+Offering an event never waits at all. Every call carries the caller's own deadline and returns when
+it runs out, so nothing on the terminal path can end up behind a component. `unbind` is the one that
+blocks: it waits for the binding's thread so that a caller knows the instance has stopped before it
+drops what the instance was using, and the wait is bounded because the call the thread is finishing
+is bounded. A caller that must not block drops its handle instead, which signals the thread without
+waiting for it.

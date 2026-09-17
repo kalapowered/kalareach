@@ -36,20 +36,25 @@
 //! use std::sync::Arc;
 //!
 //! use kr_plugin_runtime::runtime::{Runtime, RuntimeConfig};
-//! use kr_plugin_runtime::runtime::binding::BindingRequest;
+//! use kr_plugin_runtime::runtime::binding::{BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE};
 //!
-//! # fn example(request: BindingRequest, wasm: Arc<[u8]>) -> Result<(), kr_plugin_runtime::RuntimeError> {
+//! # async fn example(request: BindingRequest, wasm: Arc<[u8]>) -> Result<(), kr_plugin_runtime::RuntimeError> {
 //! let runtime = Runtime::new(RuntimeConfig::new("/var/lib/kalareach/plugin-cache"))?;
-//! let (events, received) = tokio::sync::mpsc::unbounded_channel();
+//! let (events, received) = tokio::sync::mpsc::channel(DEFAULT_EVENT_QUEUE);
+//!
+//! // Every binding belongs to somebody: one owner per worker connection, and one per caller that
+//! // prepares bindings of its own. A lookup by another owner finds nothing.
+//! let owner = BindingOwner::next();
 //!
 //! // Compilation happens on a background thread under its own budget, and the deadline here is
-//! // the caller's own. No call deadline includes a compile.
+//! // the caller's own, across every stage. No call deadline includes a compile.
 //! let binding = runtime.prepare(
+//!     owner,
 //!     request,
 //!     wasm,
 //!     core::time::Duration::from_secs(5),
 //!     events,
-//! )?;
+//! ).await?;
 //!
 //! // Delivering an observation runs nothing and waits for nothing. Document nodes, gaps and
 //! // faults arrive on `received`.
