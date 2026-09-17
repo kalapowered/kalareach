@@ -1,10 +1,10 @@
 //! Putting a worker in the selected desktop's session.
 //!
 //! A macOS job bootstrapped into the user's graphical domain is in the Aqua login session by
-//! construction, so nothing has to be carried across. Windows runs every one of a user's processes
-//! in that user's own interactive session, so a worker this daemon starts is in the session this
-//! daemon is in; selecting a different logon session would need a per-user agent running in it,
-//! which this build does not install.
+//! construction, so nothing has to be carried across. On Windows a worker is a child of this
+//! daemon and runs in the logon session this daemon runs in, which is the only session this host
+//! puts a worker in: choosing another one means starting the worker from an agent already inside
+//! it, and the desktop-bound profile there is the daemon's own session rather than a selected one.
 //!
 //! Linux does need it. A user service manager started at boot — which is what a lingering user
 //! has — has no display, no compositor socket and no session message bus, because those belong to

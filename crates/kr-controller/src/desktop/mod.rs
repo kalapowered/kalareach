@@ -183,18 +183,19 @@ mod platform {
 
     /// Windows ends a per-user task when the user signs out.
     ///
-    /// A scheduled task registered for the user runs in the user's own session and is stopped when
-    /// that session ends. Running work across a sign-out needs a service under an account with the
-    /// right to log on as a service, which is an explicit installation choice and a different
-    /// execution context from the user's own.
+    /// A worker runs in the user's own logon session and is stopped when that session ends.
+    /// Running work across a sign-out needs a service under an account with the right to log on as
+    /// a service, which is an explicit installation choice and a different execution context from
+    /// the user's own.
     pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, String) {
         (
             LogoutPersistence::EndsAtLogout,
-            "per-user host agent",
-            "Windows stops a user's own per-user task when the user signs out, so a headless \
-             session on this platform ends with the sign-out. Work that must outlive it needs a \
-             service installed under an account granted the right to log on as a service, which \
-             is a separate explicit choice."
+            "a detached process in the user's own logon session",
+            "A worker on this platform is a detached process in the user's own logon session, and \
+             Windows ends that session's processes when the user signs out, so a headless session \
+             here ends with the sign-out. Work that must outlive it needs a service installed \
+             under an account granted the right to log on as a service, which is a separate \
+             explicit choice."
                 .to_owned(),
         )
     }
