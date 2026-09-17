@@ -234,7 +234,10 @@ fn malformed(record: &str) -> ProjectError {
     ProjectError::GitFailed {
         detail: format!(
             "a status record is not one this format defines: {}",
-            record.chars().take(64).collect::<String>()
+            // The record is the repository's own text, and a path in it is repository text like
+            // any other, so it goes through the same rule Git's standard error does rather than
+            // into a caller's hands as it stands.
+            crate::git::redact(&record.chars().take(64).collect::<String>())
         ),
     }
 }
