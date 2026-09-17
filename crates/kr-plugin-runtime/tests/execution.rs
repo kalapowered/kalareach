@@ -929,7 +929,7 @@ async fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
         .await
         .expect("the observation produced something");
     match event {
-        BindingEvent::Document { call, nodes } => {
+        BindingEvent::Document { call, nodes, .. } => {
             assert_eq!(call, CallKind::Observe);
             assert!(!nodes.is_empty());
         }
@@ -1422,7 +1422,7 @@ async fn a_document_nobody_received_asks_the_component_to_draw_again() {
     let mut drew = false;
     while !drew && std::time::Instant::now() < deadline {
         match next_event(&mut received, core::time::Duration::from_millis(200)).await {
-            Some(BindingEvent::Document { call, nodes }) => {
+            Some(BindingEvent::Document { call, nodes, .. }) => {
                 if call == CallKind::Snapshot {
                     assert!(!nodes.is_empty());
                     drew = true;

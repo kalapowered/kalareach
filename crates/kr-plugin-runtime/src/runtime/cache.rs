@@ -167,16 +167,22 @@ fn hex_of(bytes: &[u8]) -> String {
 }
 
 /// The cache of compiled components: the ones in this process's memory, and the ones on disk.
+/// One compiled component this process is holding, and what it was made from.
+#[derive(Clone, Debug)]
+struct Resident {
+    component: wasmtime::component::Component,
+    artefact_bytes: u64,
+}
+
+/// The compiled-code cache: a directory of artefacts, and what this process is holding from it.
 #[derive(Clone, Debug)]
 pub struct CompiledCache {
     root: PathBuf,
-    /// The components this process compiled or loaded, by entry. Shared by every clone, because
-    /// every clone is the same cache.
-    resident: Arc<Mutex<HashMap<String, wasmtime::component::Component>>>,
-    /// How many artefact bytes those components were made from, so a host can report what its
-    /// compiled cache is costing rather than only how many entries it holds. Section 5 asks for
+    /// Each entry's component and the artefact bytes it was made from. Shared by every clone,
+    /// because every clone is the same cache. The bytes are what lets a host report what its
+    /// compiled cache is costing rather than only how many entries it holds: section 5 asks for
     /// resource accounting that includes compiled caches, and a count of entries is not that.
-    resident_bytes: Arc<std::sync::atomic::AtomicU64>,
+    resident: Arc<Mutex<HashMap<String, Resident>>>,
 }
 
 impl CompiledCache {
@@ -197,7 +203,6 @@ impl CompiledCache {
         Ok(Self {
             root,
             resident: Arc::new(Mutex::new(HashMap::new())),
-            resident_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -208,10 +213,14 @@ impl CompiledCache {
     }
 
     /// Returns how many compiled bytes this process is holding in memory.
+    ///
+    /// The artefacts those components were made from, which is what this host can measure: what the
+    /// engine then holds for one is the engine's own and is not reported as though it were known.
     #[must_use]
     pub fn resident_bytes(&self) -> u64 {
-        self.resident_bytes
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.resident.lock().map_or(0, |resident| {
+            resident.values().map(|held| held.artefact_bytes).sum()
+        })
     }
 
     /// Returns the name an entry is held under in memory.
@@ -222,22 +231,25 @@ impl CompiledCache {
     /// Returns the component for a key if this process already has it in memory.
     #[must_use]
     pub fn resident_component(&self, key: &CacheKey) -> Option<wasmtime::component::Component> {
-        self.resident
-            .lock()
-            .ok()
-            .and_then(|resident| resident.get(&Self::resident_name(key)).cloned())
+        self.resident.lock().ok().and_then(|resident| {
+            resident
+                .get(&Self::resident_name(key))
+                .map(|held| held.component.clone())
+        })
     }
 
     /// Keeps a component in memory, up to the resident bound.
     fn keep(&self, key: &CacheKey, component: &wasmtime::component::Component, bytes: u64) {
         if let Ok(mut resident) = self.resident.lock()
             && resident.len() < MAX_RESIDENT
-            && resident
-                .insert(Self::resident_name(key), component.clone())
-                .is_none()
         {
-            self.resident_bytes
-                .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
+            resident.insert(
+                Self::resident_name(key),
+                Resident {
+                    component: component.clone(),
+                    artefact_bytes: bytes,
+                },
+            );
         }
     }
 

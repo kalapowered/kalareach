@@ -33,8 +33,8 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Uuid;
 
 use crate::runtime::binding::{
-    BindingEvent, BindingId, BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE, Runtime,
-    RuntimeConfig, Unbound, remaining_of,
+    BindingEvent, BindingHandle, BindingId, BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE,
+    Runtime, RuntimeConfig, Unbound, remaining_of,
 };
 use crate::runtime::budget::CallKind;
 use crate::runtime::compile::CompileOrigin;
@@ -87,6 +87,15 @@ const NOTICE_DRAIN: core::time::Duration = core::time::Duration::from_secs(2);
 /// peer.
 const WRITE_DEADLINE: core::time::Duration = core::time::Duration::from_secs(10);
 
+/// How many payload reads this host will have outstanding at once.
+///
+/// A read is blocking work on a thread of its own, and a caller that stopped waiting for one does
+/// not stop it: the file is still being read. Without a bound, a worker that registered, gave up,
+/// and registered again could leave a growing number of reads behind it. The permit is held inside
+/// the read rather than by the caller, so it is released when the read ends rather than when the
+/// caller does.
+const MAX_CONCURRENT_READS: usize = 8;
+
 /// How much of a refusal is carried back to the worker.
 ///
 /// A refusal names a component's own failure, and a component chooses those words. Clipping them
@@ -109,6 +118,8 @@ pub struct PluginHost {
     identity: HostIdentity,
     runtime: Arc<Runtime>,
     config: HostConfig,
+    /// How many payload reads may be under way at once, across every connection.
+    reads: Arc<tokio::sync::Semaphore>,
     /// The packages directory, opened once. Every payload is opened relative to this handle, which
     /// is what keeps a component's location inside it a property of the open rather than of a
     /// comparison made before it.
@@ -163,6 +174,7 @@ impl PluginHost {
             identity,
             runtime: Arc::new(runtime),
             config,
+            reads: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_READS)),
             packages: Arc::new(packages),
             started: std::time::Instant::now(),
         })
@@ -250,6 +262,7 @@ impl PluginHost {
             work: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CALLS)),
             bindings: BindingPlaces::default(),
             conversation: Arc::clone(&conversation),
+            registered: Registered::default(),
         });
 
         // One task writes notices, so a burst of document nodes from one binding cannot interleave
@@ -259,6 +272,7 @@ impl PluginHost {
             stream,
             notice_writer,
             Arc::clone(&conversation),
+            Arc::clone(&served.registered),
         ));
 
         Arc::clone(&self).read_requests(reader, &served).await;
@@ -282,6 +296,10 @@ impl PluginHost {
         // running that nothing could reach.
         let all = u32::try_from(MAX_CONCURRENT_CALLS).unwrap_or(u32::MAX);
         let _finished = served.work.acquire_many(all).await;
+
+        if let Ok(mut held) = served.registered.lock() {
+            held.clear();
+        }
 
         // The worker is gone. Its bindings go with it: a binding exists to serve one worker's
         // connection, and nothing durable was in it. Stopping one joins its thread, so it happens
@@ -369,26 +387,16 @@ impl PluginHost {
     fn forward_notices(
         binding_id: BindingId,
         notices: NoticeSink,
-        binding: Arc<tokio::sync::OnceCell<Arc<crate::runtime::binding::BindingHandle>>>,
         conversation: Arc<Conversation>,
     ) -> tokio::sync::mpsc::Sender<BindingEvent> {
         let (events, mut pending) = tokio::sync::mpsc::channel::<BindingEvent>(DEFAULT_EVENT_QUEUE);
-        let mut documents = 0_u64;
         tokio::spawn(async move {
             while let Some(event) = pending.recv().await {
-                if matches!(event, BindingEvent::Document { .. }) {
-                    documents = documents.saturating_add(1);
-                }
-                for notice in notices_of(binding_id, documents, event) {
+                for notice in notices_of(binding_id, event) {
                     match notices.send(notice) {
-                        Offered::Kept => {}
-                        // The reader never saw what the component drew, so the component draws
-                        // again. Without this the binding would sit on a document nobody has.
-                        Offered::Dropped => {
-                            if let Some(handle) = binding.get() {
-                                handle.require_snapshot();
-                            }
-                        }
+                        // A dropped document is answered where the loss is reported, because the
+                        // binding that lost one is not always the binding that made room.
+                        Offered::Kept | Offered::Dropped => {}
                         // What had to arrive would not fit. Nothing further this connection said
                         // could be answered honestly, so it is over.
                         Offered::Overflowed => {
@@ -448,7 +456,11 @@ impl PluginHost {
                 let result = binding
                     .snapshot(core::time::Duration::from_millis(deadline_ms))
                     .await;
-                called_of(result.map(|result| result.answer.map(|()| CallValue::Document)))
+                called_of(
+                    result.map(|result| {
+                        (result.answer.map(|()| CallValue::Document), result.document)
+                    }),
+                )
             }
             RequestBody::Checkpoint {
                 binding_id,
@@ -458,7 +470,9 @@ impl PluginHost {
                 let result = binding
                     .checkpoint(core::time::Duration::from_millis(deadline_ms))
                     .await;
-                called_of(result.map(|result| result.answer.map(CallValue::State)))
+                called_of(
+                    result.map(|result| (result.answer.map(CallValue::State), result.document)),
+                )
             }
             RequestBody::Restore {
                 binding_id,
@@ -469,7 +483,11 @@ impl PluginHost {
                 let result = binding
                     .restore(state, core::time::Duration::from_millis(deadline_ms))
                     .await;
-                called_of(result.map(|result| result.answer.map(|()| CallValue::Document)))
+                called_of(
+                    result.map(|result| {
+                        (result.answer.map(|()| CallValue::Document), result.document)
+                    }),
+                )
             }
             RequestBody::Unbind { binding_id } => {
                 // Removing a binding waits for its thread, so it happens off the executor.
@@ -485,6 +503,9 @@ impl PluginHost {
                 if matches!(removed, Unbound::Stopped) {
                     served.bindings.give_back();
                 }
+                if let Ok(mut held) = served.registered.lock() {
+                    held.remove(&binding_id);
+                }
                 Ok(ResponseBody::Unbound {
                     existed: removed.existed(),
                 })
@@ -493,6 +514,9 @@ impl PluginHost {
                 live_bindings: self.runtime.live_bindings() as u64,
                 connection_bindings: served.bindings.taken() as u64,
                 binding_bound: MAX_BINDINGS_PER_CONNECTION as u64,
+                component_calls: served.registered.lock().map_or(0, |held| {
+                    held.values().map(|handle| handle.completed_calls()).sum()
+                }),
                 resident_components: self.runtime.cache().resident() as u64,
                 resident_bytes: self.runtime.cache().resident_bytes(),
                 queued_notice_bytes: served.notices.held_bytes(),
@@ -528,10 +552,32 @@ impl PluginHost {
 
         // Reading a file is blocking work, and a payload is up to sixteen mebibytes. Neither
         // belongs on the executor that is reading this connection's next request.
+        //
+        // A place among the reads this host will have under way is taken first, and the read holds
+        // it rather than this caller: a caller whose deadline ran out does not stop the read, so a
+        // place released here would let abandoned reads accumulate behind the ones this host is
+        // still waiting for.
+        let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
+        let reads = Arc::clone(&self.reads);
+        let permit = tokio::time::timeout(remaining, reads.acquire_owned())
+            .await
+            .map_err(|_elapsed| {
+                (
+                    RuntimeError::CallerDeadline {
+                        deadline_ms: u64::try_from(REGISTER_DEADLINE.as_millis())
+                            .unwrap_or(u64::MAX),
+                    }
+                    .to_string(),
+                    false,
+                )
+            })?
+            .map_err(|_closed| ("this host is no longer reading payloads".to_owned(), false))?;
         let packages = Arc::clone(&self.packages);
         let root = self.config.packages_root.clone();
-        let reading =
-            tokio::task::spawn_blocking(move || read_component(&packages, &root, &component));
+        let reading = tokio::task::spawn_blocking(move || {
+            let _place = permit;
+            read_component(&packages, &root, &component)
+        });
         // Inside the registration's own deadline, like every other stage: a read that is somehow
         // still going when the worker has stopped waiting is not one this host keeps waiting for.
         let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
@@ -568,14 +614,9 @@ impl PluginHost {
             facts: facts_of(&facts),
             executable,
         };
-        // The forwarder is started before the instance exists, because the instance reports what
-        // `bind` drew as it is created. The cell is how it learns which binding it is forwarding
-        // for, so that a document the worker never received can be asked for again.
-        let handle = Arc::new(tokio::sync::OnceCell::new());
         let events = Self::forward_notices(
             binding,
             served.notices.clone(),
-            Arc::clone(&handle),
             Arc::clone(&served.conversation),
         );
         let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
@@ -584,7 +625,9 @@ impl PluginHost {
             .instantiate(served.owner, request, &compiled, events, remaining)
             .await
             .map_err(refusal)?;
-        let _first = handle.set(bound);
+        if let Ok(mut held) = served.registered.lock() {
+            held.insert(binding_id, bound);
+        }
         admitted.keep();
         Ok(ResponseBody::Registered {
             origin: match compiled.origin {
@@ -642,7 +685,16 @@ struct Served {
     bindings: BindingPlaces,
     /// Whether it is still worth talking on.
     conversation: Arc<Conversation>,
+    /// The bindings this connection holds, by identifier.
+    ///
+    /// The notice writer needs them: when it tells a worker that documents were lost, it asks the
+    /// binding they belonged to to draw again. A document can be evicted to make room for another
+    /// binding's, so which binding lost one is the queue's answer rather than the forwarder's.
+    registered: Registered,
 }
+
+/// The bindings one connection holds.
+type Registered = Arc<std::sync::Mutex<std::collections::HashMap<Uuid, Arc<BindingHandle>>>>;
 
 /// Whether one connection is still worth talking on.
 ///
@@ -662,8 +714,12 @@ impl Conversation {
     }
 
     /// Ends the connection. Saying so twice is the same as saying it once.
+    ///
+    /// Replaced rather than sent: a `send` with nobody currently watching keeps the old value, and
+    /// the reading loop only watches while it is between requests. A connection that failed while
+    /// its last request was being answered would otherwise be one nothing ever recorded as over.
     fn end(&self) {
-        let _told = self.over.send(true);
+        let _previous = self.over.send_replace(true);
     }
 
     /// Returns true once the connection is over.
@@ -749,8 +805,28 @@ async fn write_notices(
     mut notices: NoticeStream,
     writer: Arc<tokio::sync::Mutex<FrameWriter>>,
     conversation: Arc<Conversation>,
+    registered: Registered,
 ) {
     while let Some(notice) = notices.recv().await {
+        // A document the worker never received leaves it with a stale view, and the component is
+        // the only thing that can rebuild one. Which binding lost a document is the queue's answer
+        // rather than any one forwarder's: a document is evicted to make room for whatever needed
+        // it, which may belong to another binding entirely.
+        if let Notice::Gap {
+            binding_id,
+            documents,
+            ..
+        } = &notice
+            && *documents > 0
+        {
+            let handle = registered
+                .lock()
+                .ok()
+                .and_then(|held| held.get(binding_id).cloned());
+            if let Some(handle) = handle {
+                handle.require_snapshot();
+            }
+        }
         let written = tokio::time::timeout(WRITE_DEADLINE, async {
             let mut writer = writer.lock().await;
             writer.write_message(&Frame::Notice(notice)).await
@@ -843,16 +919,18 @@ fn clipped(text: String) -> String {
 }
 
 fn called_of(
-    result: Result<Result<CallValue, String>, RuntimeError>,
+    result: Result<(Result<CallValue, String>, Option<u64>), RuntimeError>,
 ) -> Result<ResponseBody, (String, bool)> {
     match result {
-        Ok(Ok(value)) => Ok(ResponseBody::Called {
+        Ok((Ok(value), document)) => Ok(ResponseBody::Called {
             value: Some(value),
             fault: None,
+            document,
         }),
-        Ok(Err(fault)) => Ok(ResponseBody::Called {
+        Ok((Err(fault), document)) => Ok(ResponseBody::Called {
             value: None,
             fault: Some(clipped(fault)),
+            document,
         }),
         Err(error) => Err(refusal(error)),
     }
@@ -884,10 +962,14 @@ fn admission_of(admission: Admission) -> ResponseBody {
 /// mebibyte across many nodes, and a control frame carries a mebibyte including its envelope, so a
 /// document sent whole would be a document that fitted every stated bound and still could not be
 /// delivered. Each node is already bounded below one frame, so every chunk holds at least one node.
-fn notices_of(binding_id: BindingId, document: u64, event: BindingEvent) -> Vec<Notice> {
+fn notices_of(binding_id: BindingId, event: BindingEvent) -> Vec<Notice> {
     let binding_id = binding_id.get();
     match event {
-        BindingEvent::Document { call, nodes } => {
+        BindingEvent::Document {
+            call,
+            document,
+            nodes,
+        } => {
             let call = call.as_str().to_owned();
             let mut chunks: Vec<Notice> = Vec::new();
             let mut holding: Vec<WireNode> = Vec::new();
@@ -1448,9 +1530,9 @@ mod tests {
             .collect();
         let notices = notices_of(
             binding,
-            7,
             BindingEvent::Document {
                 call: CallKind::Snapshot,
+                document: 7,
                 nodes,
             },
         );
@@ -1482,9 +1564,9 @@ mod tests {
         let binding = BindingId::new(Uuid::from_bytes([5; 16]));
         let notices = notices_of(
             binding,
-            1,
             BindingEvent::Document {
                 call: CallKind::Observe,
+                document: 1,
                 nodes: vec![crate::runtime::host::EmittedNode {
                     node_id: "n0".to_owned(),
                     node_revision: 3,
@@ -1495,7 +1577,6 @@ mod tests {
         assert_eq!(notices.len(), 1);
         let faults = notices_of(
             binding,
-            1,
             BindingEvent::Fault {
                 call: CallKind::Observe,
                 detail: "the component trapped".to_owned(),

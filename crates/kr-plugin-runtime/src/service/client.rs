@@ -124,11 +124,25 @@ pub enum Handoff {
 /// One request's answer, on its way back to whoever asked.
 type Answer = oneshot::Sender<ResponseBody>;
 
+/// What one client shuts down when its connection ends.
+///
+/// Set once, after the tasks exist. Closing the connection has to be one thing: a flag that stops
+/// new requests, the waiting senders dropped, the reader and the writer of offered events stopped,
+/// and the notice queue closed. Doing only the first two would leave a reader waiting on a socket
+/// nothing will answer and a caller offering events nothing will send.
+#[derive(Debug)]
+struct Transport {
+    reader: tokio::task::AbortHandle,
+    offers: tokio::task::AbortHandle,
+    notices: NoticeSink,
+}
+
 /// The requests this client is waiting on, and whether its connection still exists.
 #[derive(Debug, Default)]
 struct Pending {
     waiting: Mutex<HashMap<u64, Answer>>,
     closed: AtomicBool,
+    transport: Mutex<Option<Transport>>,
 }
 
 impl Pending {
@@ -168,6 +182,28 @@ impl Pending {
             waiting.clear();
         } else {
             self.closed.store(true, Ordering::Release);
+        }
+        // And the transport goes with them: a reader still waiting on the socket, or a writer still
+        // sending events, would be this client carrying on with a connection it has declared over.
+        if let Ok(mut transport) = self.transport.lock()
+            && let Some(transport) = transport.take()
+        {
+            transport.reader.abort();
+            transport.offers.abort();
+            transport.notices.close();
+        }
+    }
+
+    /// Records what closing this connection has to stop.
+    fn serves(&self, transport: Transport) {
+        if self.closed.load(Ordering::Acquire) {
+            transport.reader.abort();
+            transport.offers.abort();
+            transport.notices.close();
+            return;
+        }
+        if let Ok(mut slot) = self.transport.lock() {
+            *slot = Some(transport);
         }
     }
 
@@ -279,7 +315,7 @@ impl PluginClient {
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
         let pending = Arc::new(Pending::default());
         let (sink, notices) = notices::channel();
-        let reader_task = tokio::spawn(read_frames(reader, Arc::clone(&pending), sink));
+        let reader_task = tokio::spawn(read_frames(reader, Arc::clone(&pending), sink.clone()));
 
         // The handoff the terminal path uses: bounded, written by a task of its own, never waited
         // on by whoever offered the event.
@@ -291,6 +327,12 @@ impl PluginClient {
             Arc::clone(&offered_bytes),
             Arc::clone(&pending),
         ));
+        // What closing this connection has to stop, recorded before anything can close it.
+        pending.serves(Transport {
+            reader: reader_task.abort_handle(),
+            offers: offer_task.abort_handle(),
+            notices: sink,
+        });
 
         let client = Self {
             writer,
@@ -588,12 +630,17 @@ impl PluginClient {
             .request_within(body, deadline.saturating_add(ROUND_TRIP_ALLOWANCE))
             .await?;
         match answered {
-            ResponseBody::Called { value, fault } => Ok(Called {
+            ResponseBody::Called {
+                value,
+                fault,
+                document,
+            } => Ok(Called {
                 state: match value {
                     Some(CallValue::State(state)) => Some(state),
                     Some(CallValue::Document) | None => None,
                 },
                 fault,
+                document,
             }),
             ResponseBody::Refused {
                 detail, disabled, ..
@@ -710,6 +757,11 @@ pub struct Called {
     pub state: Option<Vec<u8>>,
     /// The fault the component declared, where it declared one.
     pub fault: Option<String>,
+    /// Which of this binding's documents the call drew, where it drew one.
+    ///
+    /// The notices that carry that document name the same number, so a caller can tell which
+    /// document belongs to which call, and nothing here means the call drew nothing.
+    pub document: Option<u64>,
 }
 
 impl Called {
@@ -864,11 +916,13 @@ mod tests {
         let answered = Called {
             state: None,
             fault: None,
+            document: Some(1),
         };
         assert!(answered.answered());
         let refused = Called {
             state: None,
             fault: Some("refused: not mine".to_owned()),
+            document: None,
         };
         assert!(!refused.answered());
     }

@@ -49,7 +49,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -172,6 +172,11 @@ pub enum BindingEvent {
     Document {
         /// Which export emitted them.
         call: CallKind,
+        /// Which of this binding's documents they are, counted from one.
+        ///
+        /// A caller that made the call can match its answer to the document the call drew, and a
+        /// reader that is sent the document in pieces can tell which pieces belong together.
+        document: u64,
         /// The nodes.
         nodes: Vec<EmittedNode>,
     },
@@ -783,6 +788,11 @@ pub struct CallResult<T> {
     pub answer: Result<T, String>,
     /// The nodes it emitted while answering.
     pub nodes: Vec<EmittedNode>,
+    /// Which of this binding's documents those nodes are, where the call drew one.
+    ///
+    /// Nothing for a call that drew nothing, which is how a caller tells an empty document from one
+    /// it has not been given yet.
+    pub document: Option<u64>,
 }
 
 enum Command {
@@ -837,6 +847,7 @@ pub struct BindingHandle {
     pump_pending: Arc<AtomicBool>,
     pending: Arc<PendingUpdates>,
     outstanding: Arc<AtomicUsize>,
+    calls: Arc<AtomicU64>,
     ready: Mutex<Option<tokio::sync::oneshot::Receiver<RuntimeResult<()>>>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -869,6 +880,7 @@ impl BindingHandle {
         let pump_pending = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(PendingUpdates::default());
         let outstanding = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::new(AtomicU64::new(0));
 
         let target = WireBinding {
             plugin_id: request.identity.plugin_id.as_str().to_owned(),
@@ -887,6 +899,8 @@ impl BindingHandle {
             faults,
             events,
             dropped_documents: 0,
+            documents: 0,
+            calls: Arc::clone(&calls),
             queue: Arc::clone(&queue),
             disabled: Arc::clone(&disabled),
             stopping: Arc::clone(&stopping),
@@ -913,6 +927,7 @@ impl BindingHandle {
             pump_pending,
             pending,
             outstanding,
+            calls,
             ready: Mutex::new(Some(readiness)),
             thread: Mutex::new(Some(thread)),
         })
@@ -1173,6 +1188,15 @@ impl BindingHandle {
         self.outstanding.load(Ordering::Acquire)
     }
 
+    /// Returns how many calls into the component have finished.
+    ///
+    /// What a caller uses to tell a component that was working during some stretch of time from one
+    /// that was merely bound: the count grew, so calls ran.
+    #[must_use]
+    pub fn completed_calls(&self) -> u64 {
+        self.calls.load(Ordering::Acquire)
+    }
+
     async fn dispatch<T, F>(
         &self,
         deadline: core::time::Duration,
@@ -1233,6 +1257,11 @@ struct BindingWorker {
     faults: FaultCounter,
     events: tokio::sync::mpsc::Sender<BindingEvent>,
     dropped_documents: u32,
+    /// How many documents this binding has drawn, which is what numbers the next one.
+    documents: u64,
+    /// How many calls into the component have finished, for a caller that wants to know whether
+    /// the component was working during some stretch of time rather than merely bound.
+    calls: Arc<AtomicU64>,
     queue: Arc<Mutex<ObservationQueue>>,
     disabled: Arc<Mutex<Option<String>>>,
     stopping: Arc<AtomicBool>,
@@ -1269,10 +1298,7 @@ impl BindingWorker {
                         // What `bind` drew is presentation like any other. Discarding it would
                         // lose a component's first document for no reason.
                         if !nodes.is_empty() {
-                            self.send(BindingEvent::Document {
-                                call: CallKind::Bind,
-                                nodes,
-                            });
+                            self.draw(CallKind::Bind, nodes);
                         }
                         Ok(())
                     }
@@ -1529,10 +1555,7 @@ impl BindingWorker {
                         queue.require_snapshot();
                     }
                     if !nodes.is_empty() {
-                        self.send(BindingEvent::Document {
-                            call: CallKind::Bind,
-                            nodes,
-                        });
+                        self.draw(CallKind::Bind, nodes);
                     }
                 }
                 Err(error) => {
@@ -1549,17 +1572,14 @@ impl BindingWorker {
             });
         };
         let outcome = invoke(instance);
+        self.calls.fetch_add(1, Ordering::AcqRel);
         let nodes = outcome.nodes;
-        if !nodes.is_empty() {
-            self.send(BindingEvent::Document {
-                call: kind,
-                nodes: nodes.clone(),
-            });
-        }
+        let document = (!nodes.is_empty()).then(|| self.draw(kind, nodes.clone()));
         match outcome.result {
             Ok(answer) => Ok(CallResult {
                 answer: answer.map_err(|fault| fault_text(&fault)),
                 nodes,
+                document,
             }),
             Err(error) => {
                 self.record_fault(kind, &error);
@@ -1598,6 +1618,18 @@ impl BindingWorker {
                 self.send(BindingEvent::Disabled { reason });
             }
         }
+    }
+
+    /// Sends one document and returns the number it was given.
+    fn draw(&mut self, call: CallKind, nodes: Vec<EmittedNode>) -> u64 {
+        self.documents = self.documents.saturating_add(1);
+        let document = self.documents;
+        self.send(BindingEvent::Document {
+            call,
+            document,
+            nodes,
+        });
+        document
     }
 
     /// Sends one event to the caller, or records that a presentation was dropped.
@@ -1849,6 +1881,7 @@ mod tests {
             events
                 .try_send(BindingEvent::Document {
                     call: CallKind::Observe,
+                    document: 1,
                     nodes: Vec::new(),
                 })
                 .expect("there is room");

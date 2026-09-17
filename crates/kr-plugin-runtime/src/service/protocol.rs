@@ -421,6 +421,12 @@ pub enum ResponseBody {
         /// The fault the component declared, where it declared one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fault: Option<String>,
+        /// Which of this binding's documents the call drew, where it drew one.
+        ///
+        /// Nothing means the call drew nothing, which is how a caller tells an empty document from
+        /// one whose notices have not arrived yet.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        document: Option<u64>,
     },
     /// The binding is gone.
     Unbound {
@@ -460,6 +466,12 @@ pub struct HostHealth {
     pub connection_bindings: u64,
     /// How many one connection may hold.
     pub binding_bound: u64,
+    /// How many calls into a component this connection's bindings have finished.
+    ///
+    /// A count that grew between two health reports is a component that was running between them,
+    /// which is what tells a caller that its own progress happened alongside one rather than after
+    /// it.
+    pub component_calls: u64,
     /// How many compiled components the cache is holding in memory.
     pub resident_components: u64,
     /// How many compiled bytes those components were made from.
@@ -669,6 +681,7 @@ mod tests {
             body: ResponseBody::Called {
                 value: Some(CallValue::State(b"resumable".to_vec())),
                 fault: None,
+                document: Some(3),
             },
         });
         // The document a call drew travels as its own frames, so a caller reads it from the

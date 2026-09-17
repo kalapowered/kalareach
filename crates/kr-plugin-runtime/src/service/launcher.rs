@@ -507,9 +507,10 @@ fn fence(reservation_id: ReservationId, listener: Listener) -> HostFence {
     let (stop, mut stopping) = tokio::sync::watch::channel(false);
     let counted = Arc::clone(&duplicates);
     tokio::spawn(async move {
-        // A listener that keeps failing is one this fence can do nothing with, and spinning on it
-        // would cost a core for nothing. Anything that arrives resets the count.
-        let mut failures = 0_u32;
+        // The listener is held for as long as the fence is, and is given up only when the fence is
+        // dropped. A fence that stopped listening while its holder still believed it owned the
+        // address would be the opposite of what it is for. A listener that keeps failing is waited
+        // on rather than abandoned, because spinning on it would cost a core for nothing.
         loop {
             tokio::select! {
                 _stopped = stopping.changed() => return,
@@ -519,13 +520,8 @@ fn fence(reservation_id: ReservationId, listener: Listener) -> HostFence {
                     // reservation is something a host should be able to see. A connection that
                     // failed on arrival is a claim that arrived all the same.
                     counted.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
-                    if accepted.is_ok() {
-                        failures = 0;
-                    } else {
-                        failures += 1;
-                        if failures > 64 {
-                            return;
-                        }
+                    if accepted.is_err() {
+                        tokio::time::sleep(core::time::Duration::from_millis(50)).await;
                     }
                 }
             }
@@ -679,24 +675,42 @@ impl HostReservation {
                     // Publishing and acknowledging are inside the deadline too: a host waiting to
                     // be told it was accepted is a host that is not serving, and a launcher that
                     // took an unbounded time over either would be holding it there.
+                    // Publishing writes a file, flushes it and renames it, none of which a timer
+                    // can interrupt, so it happens off the executor and its own wait is bounded.
                     let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-                    let settled = tokio::time::timeout(left, async {
-                        publish_descriptor(environment, &descriptor)?;
-                        // The host does not serve workers until it has this. Publishing a
-                        // descriptor for a process that had already started answering would mean a
-                        // worker could reach a host the launcher was still deciding about.
-                        let accepted = RendezvousAccepted {
-                            reservation_id: descriptor.reservation_id,
-                            environment_id: descriptor.environment_id,
-                            endpoint: descriptor.endpoint.clone(),
-                        };
-                        writer.write_message(&accepted).await?;
-                        Ok::<(), LaunchError>(())
-                    })
-                    .await;
-                    match settled {
+                    let publishing = {
+                        let paths = environment.clone();
+                        let descriptor = descriptor.clone();
+                        tokio::task::spawn_blocking(move || publish_descriptor(&paths, &descriptor))
+                    };
+                    match tokio::time::timeout(left, publishing).await {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(error))) => return Err(error),
+                        Ok(Err(error)) => {
+                            return Err(LaunchError::Refused {
+                                detail: format!("the descriptor could not be published: {error}"),
+                            });
+                        }
+                        Err(_elapsed) => return Err(LaunchError::NoRendezvous { deadline_ms }),
+                    }
+
+                    // The host does not serve workers until it has this. Publishing a descriptor
+                    // for a process that had already started answering would mean a worker could
+                    // reach a host the launcher was still deciding about. A deadline already spent
+                    // is a startup this launcher is no longer waiting for, so the acknowledgement
+                    // is not sent at all rather than sent late.
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if left.is_zero() {
+                        return Err(LaunchError::NoRendezvous { deadline_ms });
+                    }
+                    let accepted = RendezvousAccepted {
+                        reservation_id: descriptor.reservation_id,
+                        environment_id: descriptor.environment_id,
+                        endpoint: descriptor.endpoint.clone(),
+                    };
+                    match tokio::time::timeout(left, writer.write_message(&accepted)).await {
                         Ok(Ok(())) => {}
-                        Ok(Err(error)) => return Err(error),
+                        Ok(Err(error)) => return Err(LaunchError::Endpoint(error)),
                         Err(_elapsed) => return Err(LaunchError::NoRendezvous { deadline_ms }),
                     }
                     // One reservation, one host: the endpoint stays this launcher's, and every

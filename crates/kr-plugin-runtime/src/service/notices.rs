@@ -308,60 +308,89 @@ impl Queued {
         } else {
             Offered::Kept
         };
-        if let Some(held) = self.lost.get_mut(&binding_id) {
-            held.events = held.events.saturating_add(loss.events);
-            held.bytes = held.bytes.saturating_add(loss.bytes);
-            held.documents = held.documents.saturating_add(loss.documents);
-            self.dropped = self.dropped.saturating_add(loss.documents);
+        if self.merge(binding_id, loss) {
             return answer;
         }
         // A binding this queue has no loss record for yet. The record is one more thing the queue
         // holds, so it is charged like anything else.
         while self.held + NOTICE_OVERHEAD_BYTES > MAX_NOTICE_BYTES && self.evict_oldest_document() {
         }
+        // Making room may have created this binding's record, if what it evicted was this
+        // binding's document. Merging again is what keeps one binding to one record and one charge.
+        if self.merge(binding_id, loss) {
+            return answer;
+        }
         if self.held + NOTICE_OVERHEAD_BYTES > MAX_NOTICE_BYTES {
             self.closed = true;
             self.overflowed = true;
             return Offered::Overflowed;
         }
+        self.charge_loss(binding_id, loss);
+        answer
+    }
+
+    /// Adds one loss to a record this queue already holds, and says whether it did.
+    fn merge(&mut self, binding_id: Uuid, loss: Loss) -> bool {
+        let Some(held) = self.lost.get_mut(&binding_id) else {
+            return false;
+        };
+        held.events = held.events.saturating_add(loss.events);
+        held.bytes = held.bytes.saturating_add(loss.bytes);
+        held.documents = held.documents.saturating_add(loss.documents);
+        self.dropped = self.dropped.saturating_add(loss.documents);
+        true
+    }
+
+    /// Starts one binding's loss record, and charges the queue for holding it.
+    fn charge_loss(&mut self, binding_id: Uuid, loss: Loss) {
         self.held += NOTICE_OVERHEAD_BYTES;
         self.lost.insert(binding_id, loss);
         self.lost_order.push_back(binding_id);
         self.dropped = self.dropped.saturating_add(loss.documents);
-        answer
     }
 
-    /// Drops the oldest document, if there is one, and says whether it dropped anything.
+    /// Drops the oldest document, whole, and says whether it dropped anything.
+    ///
+    /// Whole, because half a document is worse than none: a reader that received some of a
+    /// document's frames and not others could not tell which it was missing, and the last frame
+    /// surviving would tell it the document was complete. Every frame of the oldest one goes
+    /// together, and the loss is counted once.
     fn evict_oldest_document(&mut self) -> bool {
-        let Some(position) = self
-            .waiting
-            .iter()
-            .position(|notice| matches!(notice, Notice::Document { .. }))
-        else {
+        let Some((binding_id, document)) = self.waiting.iter().find_map(|notice| match notice {
+            Notice::Document {
+                binding_id,
+                document,
+                ..
+            } => Some((*binding_id, *document)),
+            _ => None,
+        }) else {
             return false;
         };
-        let Some(dropped) = self.waiting.remove(position) else {
-            return false;
-        };
-        self.held = self.held.saturating_sub(notice_bytes(&dropped));
-        let binding_id = dropped.binding_id();
+        let mut freed = 0;
+        self.waiting.retain(|notice| {
+            let theirs = matches!(
+                notice,
+                Notice::Document {
+                    binding_id: held,
+                    document: number,
+                    ..
+                } if *held == binding_id && *number == document
+            );
+            if theirs {
+                freed += notice_bytes(notice);
+            }
+            !theirs
+        });
+        self.held = self.held.saturating_sub(freed);
         // Counted here rather than through `absorb`, which would try to make room again while it
         // is making room.
-        match self.lost.get_mut(&binding_id) {
-            Some(held) => held.documents = held.documents.saturating_add(1),
-            None => {
-                self.lost.insert(
-                    binding_id,
-                    Loss {
-                        documents: 1,
-                        ..Loss::default()
-                    },
-                );
-                self.lost_order.push_back(binding_id);
-                self.held += NOTICE_OVERHEAD_BYTES;
-            }
+        let one = Loss {
+            documents: 1,
+            ..Loss::default()
+        };
+        if !self.merge(binding_id, one) {
+            self.charge_loss(binding_id, one);
         }
-        self.dropped = self.dropped.saturating_add(1);
         true
     }
 
