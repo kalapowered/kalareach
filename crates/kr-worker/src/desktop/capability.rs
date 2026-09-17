@@ -11,22 +11,27 @@
 //!
 //! A probe here is bounded and disclosed, and it stays inside two rules from section 11: it never
 //! mutates unrelated user data, and it declares its own effects. So the probes are platform
-//! queries — is there a graphical login, which display server, is the facility installed — and
-//! nothing that changes a user's screen, clipboard or input.
+//! queries: is there a graphical login, which display server, is the facility installed and
+//! executable, and what exactly is the facility. Nothing here changes a user's screen, clipboard
+//! or input, and nothing here performs an operation that would ask the person at the machine for
+//! an operating-system permission.
 //!
-//! That is a deliberate boundary rather than a shortcut. On macOS the check that would establish
-//! screen capture *is* a capture, and the first capture by a program without the permission asks
-//! the person at the machine for it. A background probe must not do that on its own, so the record
-//! says [`CapabilityState::NotTested`] and names the permission. The setup assistant runs those
-//! checks with the person present, and its result replaces this one.
+//! That boundary is what the states are about. A platform query can refuse a capability outright:
+//! there is no desktop, the tool is not installed, the screen is locked, this is a container.
+//! What it cannot do is establish that a screen image can be taken or a keystroke delivered,
+//! because on every platform the operation itself is the check. Those records therefore say
+//! [`CapabilityState::NotTested`] and name what is missing, and an action that wants the answer
+//! performs its own operation and reports what happened.
 //!
-//! # Where an answer is real
+//! # What the display server changes
 //!
-//! On X11, a client holding the display and its authority may capture and inject without a further
-//! permission, so a present tool is a complete answer. On Wayland neither goes through the display
-//! server: capture is the compositor's own business and injection needs a compositor-specific
-//! facility, so the answer depends on the compositor and the tool together. That pair is what
-//! [`decide_unix`] reads, and it is why two Linux hosts running the same distribution can give
+//! On X11 a client that holds the display and its authority needs no further permission, so what
+//! is left unestablished is only whether the display opens. On Wayland neither a screen image nor
+//! synthetic input goes through the display server: capture is the compositor's own business and
+//! injection needs a compositor-specific facility, so the answer depends on the compositor and the
+//! tool together. A compositor that asks the user for a screen image each time is a
+//! [`CapabilityState::PermissionRequired`] the platform itself establishes. That pair is what
+//! [`decide_unix`] reads, and it is why two Linux hosts running the same distribution give
 //! different answers.
 
 use kr_protocol::desktop::{
@@ -110,8 +115,8 @@ pub fn report(
                 state: answer.state,
                 evidence_source: answer.evidence,
                 identity: CapabilityIdentity {
+                    version: Nullable(facility_identity(answer.tool.as_ref())),
                     binary: Nullable(answer.tool),
-                    version: Nullable::null(),
                     package: Nullable::null(),
                     schema: Nullable::null(),
                     profile: Nullable::some(desktop.worker_profile),
@@ -223,9 +228,9 @@ fn context_refusal(capability: &str, desktop: &DesktopContext) -> Option<Answer>
 ///
 /// Launching an application needs no privacy permission, so a present facility settles it. Screen
 /// capture, input injection and the accessibility tree each need one that is granted per signed
-/// application, and the check that would establish it is the operation itself: performing it is
-/// what asks the person at the machine. So the record names the permission and says nothing has
-/// established either answer.
+/// application. This host does not perform the operation that would establish it, and does not
+/// read the platform's permission state, so the record names the permission and says that neither
+/// answer has been established.
 fn decide_macos(capability: &str, tool: Option<String>) -> Answer {
     let Some(tool) = tool else {
         return Answer::refused(
@@ -251,8 +256,9 @@ fn decide_macos(capability: &str, tool: Option<String>) -> Answer {
         state: CapabilityState::NotTested,
         evidence: CapabilityEvidenceSource::NotProbed,
         reason: Some(format!(
-            "macOS grants {permission} per signed application, and the check that would establish \
-             it asks the person at this machine; the setup assistant runs it with them present"
+            "macOS grants {permission} per signed application. Nothing here has performed the \
+             operation this capability is, and nothing here reads the permission itself, so this \
+             is not established either way"
         )),
         tool: Some(tool),
     }
@@ -261,8 +267,8 @@ fn decide_macos(capability: &str, tool: Option<String>) -> Answer {
 /// The answer on Windows.
 ///
 /// A process attached to an interactive logon session can start an application there. Taking an
-/// image of that session's screen, and sending it input, are checks that belong with the person
-/// present: an unattended probe would act on whatever is on the screen.
+/// image of that session's screen, and sending it input, act on whatever is on the screen, so
+/// nothing here does either.
 fn decide_windows(capability: &str, tool: Option<String>) -> Answer {
     let Some(tool) = tool else {
         return Answer::refused(
@@ -283,8 +289,9 @@ fn decide_windows(capability: &str, tool: Option<String>) -> Answer {
         state: CapabilityState::NotTested,
         evidence: CapabilityEvidenceSource::NotProbed,
         reason: Some(
-            "nothing has taken an image of this session's screen or sent it input; the setup \
-             assistant runs that check in the session with the person present"
+            "nothing here has taken an image of this session's screen or sent it input, and \
+             neither is something to try on a screen somebody may be looking at, so this is not \
+             established either way"
                 .to_owned(),
         ),
         tool: Some(tool),
@@ -293,22 +300,34 @@ fn decide_windows(capability: &str, tool: Option<String>) -> Answer {
 
 /// The answer on a Unix desktop, which depends on the display server and the tool together.
 ///
-/// X11 hands a client that holds the display and its authority everything, so a present tool is
-/// the whole answer. Wayland hands it nothing: capture goes through the compositor's own portal,
-/// injection through a compositor-specific facility, and a tool built for one compositor family
-/// does not work on another. That is why the record names the compositor beside the tool.
+/// X11 hands a client that holds the display and its authority everything, so what is left
+/// unestablished there is only whether the display opens: the record says so and names the tool.
+/// Wayland hands it nothing. Capture goes through the compositor's own portal, injection through a
+/// compositor-specific facility, and a tool built for one compositor family does not work on
+/// another, so the compositor is named beside the tool. A compositor that asks the user for the
+/// operation each time is the one case the platform itself settles, and it settles it as a
+/// permission the user grants rather than one a tool holds.
 #[must_use]
 pub fn decide_unix(capability: &str, desktop: &DesktopContext, tool: Option<String>) -> Answer {
     let compositor = desktop
         .compositor
         .as_ref()
         .map_or_else(String::new, |value| value.to_ascii_lowercase());
+    let named_compositor = if compositor.is_empty() {
+        "this compositor".to_owned()
+    } else {
+        compositor.clone()
+    };
     match desktop.display_server {
         DisplayServer::X11 => match tool {
             Some(tool) if display_reachable() => Answer {
-                state: CapabilityState::QualifiedAvailable,
-                evidence: CapabilityEvidenceSource::PlatformQuery,
-                reason: None,
+                state: CapabilityState::NotTested,
+                evidence: CapabilityEvidenceSource::NotProbed,
+                reason: Some(format!(
+                    "X11 grants this to a client that holds the display and its authority, and \
+                     this context holds both. Nothing here has opened the display with {tool}, so \
+                     whether it opens is not established"
+                )),
                 tool: Some(tool),
             },
             Some(tool) => Answer {
@@ -329,9 +348,15 @@ pub fn decide_unix(capability: &str, desktop: &DesktopContext, tool: Option<Stri
         },
         DisplayServer::Wayland => match tool {
             Some(tool) if wlroots(&compositor) => Answer {
-                state: CapabilityState::QualifiedAvailable,
-                evidence: CapabilityEvidenceSource::PlatformQuery,
-                reason: None,
+                state: CapabilityState::NotTested,
+                evidence: CapabilityEvidenceSource::NotProbed,
+                reason: Some(format!(
+                    "{named_compositor} implements the protocols {tool} uses for \
+                     {}, so no per-use permission stands in the way. Nothing here has run it, and \
+                     a tool can still be refused by a device permission or a missing service of \
+                     its own",
+                    wayland_route(capability)
+                )),
                 tool: Some(tool),
             },
             Some(tool) => Answer {
@@ -339,13 +364,9 @@ pub fn decide_unix(capability: &str, desktop: &DesktopContext, tool: Option<Stri
                 evidence: CapabilityEvidenceSource::PlatformQuery,
                 reason: Some(format!(
                     "on Wayland {} goes through the compositor rather than the display server, \
-                     and {} asks the user for it each time rather than granting it to a tool",
-                    wayland_route(capability),
-                    if compositor.is_empty() {
-                        "this compositor"
-                    } else {
-                        compositor.as_str()
-                    }
+                     and {named_compositor} asks the user for it each time rather than granting \
+                     it to a tool",
+                    wayland_route(capability)
                 )),
                 tool: Some(tool),
             },
@@ -355,9 +376,9 @@ pub fn decide_unix(capability: &str, desktop: &DesktopContext, tool: Option<Stri
                 format!(
                     "no installed tool on this host serves this capability on {}",
                     if compositor.is_empty() {
-                        "Wayland"
+                        "Wayland".to_owned()
                     } else {
-                        compositor.as_str()
+                        compositor
                     }
                 ),
             ),
@@ -438,21 +459,56 @@ fn candidates(capability: &str, display_server: DisplayServer) -> &'static [&'st
     }
 }
 
-/// Returns the absolute path of an installed facility, where it is installed.
+/// Returns the absolute path of an installed facility, where one is installed and runnable.
 ///
 /// A candidate given as an absolute path is checked where it is. A bare name is looked for in the
 /// execution context's own search path, because a facility installed for the user is as real as
 /// one installed for everybody, and the search path is part of the context the session runs in.
+/// A file that is not executable is not a facility: it would fail at the first attempt to run it.
 fn installed(candidate: &str) -> Option<String> {
     let path = std::path::Path::new(candidate);
     if path.is_absolute() {
-        return path.is_file().then(|| candidate.to_owned());
+        return runnable(path).then(|| candidate.to_owned());
     }
     let search = std::env::var_os("PATH")?;
     std::env::split_paths(&search)
         .map(|directory| directory.join(candidate))
-        .find(|full| full.is_file())
+        .find(|full| runnable(full))
         .map(|full| full.display().to_string())
+}
+
+/// Returns whether a path is a file this context could run.
+fn runnable(path: &std::path::Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+/// Returns the exact identity of an installed facility.
+///
+/// Section 11 requires the record to name the exact thing the answer was established about, so
+/// that an installed upgrade invalidates it rather than silently changing what the record is
+/// about. The size and the modification time are what a replacement at the same path changes.
+fn facility_identity(tool: Option<&String>) -> Option<String> {
+    let metadata = std::fs::metadata(tool?).ok()?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or_else(|| "unknown".to_owned(), |since| since.as_secs().to_string());
+    Some(format!("{} bytes, modified {modified}", metadata.len()))
 }
 
 #[cfg(test)]
@@ -602,7 +658,8 @@ mod tests {
 
     #[test]
     fn the_linux_answer_distinguishes_x11_wayland_and_the_compositor_and_tool_pair() {
-        // X11 with a tool present: the display server itself grants it.
+        // X11 with a tool present: the display server grants this to any client that holds the
+        // display, so the only thing left is whether the display opens.
         let x11 = decide_unix(
             capabilities::INPUT_INJECTION,
             &desktop(DisplayServer::X11, Some("i3")),
@@ -614,7 +671,7 @@ mod tests {
             &desktop(DisplayServer::Wayland, Some("sway")),
             Some("/usr/bin/wtype".to_owned()),
         );
-        // The same tool on a compositor that asks the user each time instead.
+        // The same operation on a compositor that asks the user for it each time instead.
         let portal = decide_unix(
             capabilities::SCREEN_CAPTURE,
             &desktop(DisplayServer::Wayland, Some("GNOME")),
@@ -627,14 +684,22 @@ mod tests {
             None,
         );
 
-        assert_eq!(wlroots.state, CapabilityState::QualifiedAvailable);
+        // None of the four claims the capability is available: nothing here runs the operation.
+        for answer in [&x11, &wlroots, &portal, &bare] {
+            assert!(
+                !answer.state.is_available(),
+                "a tool on a disk is not a capability: {answer:?}"
+            );
+            assert!(answer.reason.is_some(), "{answer:?}");
+        }
+        // And each of the four says something different about why.
         assert_eq!(portal.state, CapabilityState::PermissionRequired);
         assert!(
             portal
                 .reason
                 .as_ref()
-                .is_some_and(|reason| reason.contains("gnome")),
-            "the answer names the compositor it is about: {portal:?}"
+                .is_some_and(|reason| reason.contains("gnome") && reason.contains("screen image")),
+            "the answer names the compositor and the operation it is about: {portal:?}"
         );
         assert_eq!(bare.state, CapabilityState::MissingInstallation);
         assert!(
@@ -643,16 +708,30 @@ mod tests {
                 .is_some_and(|reason| reason.contains("kde")),
             "{bare:?}"
         );
+        assert_eq!(wlroots.state, CapabilityState::NotTested);
+        assert!(
+            wlroots
+                .reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("sway")
+                    && reason.contains("synthetic input")),
+            "a wlroots answer names the compositor, the tool and the operation: {wlroots:?}"
+        );
         // The X11 answer depends on whether this context holds a display, which a test host may
         // not. Both answers are about X11 and neither is the Wayland one.
         assert!(
             matches!(
                 x11.state,
-                CapabilityState::QualifiedAvailable | CapabilityState::PermissionRequired
+                CapabilityState::NotTested | CapabilityState::PermissionRequired
             ),
             "{x11:?}"
         );
-        assert_ne!(x11.state, CapabilityState::MissingInstallation);
+        assert!(
+            x11.reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("X11") || reason.contains("X server")),
+            "an X11 answer says it is about X11: {x11:?}"
+        );
     }
 
     #[test]

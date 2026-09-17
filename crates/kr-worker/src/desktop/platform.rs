@@ -18,8 +18,14 @@
 //! supervision, and a reading that cost a subprocess each time would spend more of a processor on
 //! watching nothing happen than the whole host is allowed while idle.
 //!
-//! A reading the platform refuses to give is unknown, never death. A desktop-bound session is
-//! closed only when the platform says the login session has ended.
+//! # Three answers, not two
+//!
+//! [`Reading`] separates *there is no graphical login* from *this host could not find out*. The
+//! distinction decides whether a desktop-bound session closes: a platform that says the login
+//! session has gone is a logout, and a platform that would not answer is an unknown, which leaves
+//! the previous answer standing. A reading that cannot name the login-session generation is not a
+//! desktop at all, because a platform session number without a generation cannot tell one login
+//! from the next one to be given that number.
 
 use kr_protocol::desktop::{
     DesktopAvailability, DesktopGenerationSource, DesktopSessionKind, DisplayServer,
@@ -69,10 +75,44 @@ impl Login {
         }
     }
 
-    /// Returns whether this reading names a graphical login session.
+    /// Returns whether this reading names a graphical login session completely.
+    ///
+    /// Completely is the operative word. A reading with an identifier and no generation names a
+    /// number that the platform may hand out again, and a desktop identity built on it would say a
+    /// session created in one login belongs to the next.
     #[must_use]
     pub fn is_desktop(&self) -> bool {
-        self.kind != DesktopSessionKind::None && self.platform_session.is_some()
+        self.kind != DesktopSessionKind::None
+            && self.platform_session.is_some()
+            && self.generation.is_some()
+    }
+}
+
+/// What a platform said when it was asked about this user's graphical login.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Reading {
+    /// It described one.
+    Desktop(Login),
+    /// It answered, and this user has no graphical login session.
+    None,
+    /// It did not answer, so neither conclusion is established.
+    Unavailable,
+}
+
+impl Reading {
+    /// Returns the login this reading describes, where it describes one.
+    #[must_use]
+    pub const fn login(&self) -> Option<&Login> {
+        match self {
+            Self::Desktop(login) => Some(login),
+            Self::None | Self::Unavailable => None,
+        }
+    }
+
+    /// Returns the login this reading describes, or the empty one.
+    #[must_use]
+    pub fn login_or_none(&self) -> Login {
+        self.login().cloned().unwrap_or_else(Login::none)
     }
 }
 
@@ -87,18 +127,17 @@ pub enum Presence {
     Unknown,
 }
 
-/// Asks whether a recorded login session is still present, cheaply.
+/// Asks whether a recorded login session's owning process is still running.
 ///
 /// The recorded owning process is the question. A process identifier alone would be worthless —
 /// the operating system reuses one within milliseconds — so the recorded start identity is
 /// compared with it, which is what makes a new login's owning process a different answer rather
 /// than the same one.
 #[must_use]
-pub fn presence(login: &Login) -> Presence {
-    let Some(anchor) = login.anchor.as_ref() else {
-        // Nothing was anchored, so nothing here can say. A session with no anchor was never bound
-        // to a desktop this host can watch, and `Watch` treats that as never lost rather than as
-        // lost at once.
+pub fn presence(anchor: Option<&ProcessStartIdentity>) -> Presence {
+    let Some(anchor) = anchor else {
+        // Nothing was anchored, so nothing here can say. The caller asks the platform again
+        // instead, on its own slower cadence.
         return Presence::Unknown;
     };
     match kr_ipc::identity::process_state(anchor) {
@@ -109,35 +148,53 @@ pub fn presence(login: &Login) -> Presence {
 }
 
 /// Reads the graphical login session this process's user currently has.
-///
-/// Returns [`Login::none`] where there is none, which is what a headless installation, an
-/// SSH-only host and a container all read as.
 #[must_use]
-pub fn read_login(uid: u32) -> Login {
+pub fn read_login(uid: u32) -> Reading {
     implementation::read_login(uid)
 }
 
-/// Runs a platform command and returns what it printed, or nothing when it failed.
-///
-/// A platform facility that refuses to answer leaves the reading empty rather than producing a
-/// guess. Nothing here interpolates text into a command line: the argument vector is a vector.
+/// What running a platform command produced.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-fn output(program: &str, arguments: &[&str]) -> Option<String> {
-    let output = std::process::Command::new(program)
+enum Printed {
+    /// It ran and succeeded.
+    Output(String),
+    /// It ran and reported a failure, which is the platform answering.
+    Failed,
+    /// It could not be run at all, so the platform was never asked.
+    NotRun,
+}
+
+/// Runs a platform command and says what came of it.
+///
+/// The difference between a command that failed and one that never ran is the whole of the
+/// distinction [`Reading`] exists for. Nothing here interpolates text into a command line: the
+/// argument vector is a vector.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn run(program: &str, arguments: &[&str]) -> Printed {
+    let Ok(output) = std::process::Command::new(program)
         .args(arguments)
         .stdin(std::process::Stdio::null())
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+    else {
+        return Printed::NotRun;
+    };
+    if output.status.success() {
+        Printed::Output(String::from_utf8_lossy(&output.stdout).into_owned())
+    } else {
+        Printed::Failed
     }
-    Some(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// Reads the start identity of a login session's owning process.
+///
+/// A start value of zero is not a start value: it is what a platform reader returns when it could
+/// not open the process. Treating it as a generation would give every unreadable process the same
+/// one.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn anchor(pid: u32) -> Option<ProcessStartIdentity> {
-    kr_ipc::identity::process_start_identity(pid).ok()
+    kr_ipc::identity::process_start_identity(pid)
+        .ok()
+        .filter(|identity| identity.start_value.get() > 0)
 }
 
 /// How many lines of a domain description are read before the header is taken to have ended.
@@ -149,7 +206,7 @@ const HEADER_LINES: usize = 64;
 
 #[cfg(target_os = "macos")]
 mod implementation {
-    use super::{Login, anchor, output};
+    use super::{Login, Printed, Reading, anchor, run};
     use kr_protocol::desktop::{
         DesktopAvailability, DesktopGenerationSource, DesktopSessionKind, DisplayServer,
     };
@@ -159,10 +216,13 @@ mod implementation {
     /// The domain is the login session: it exists while the user is logged in graphically, it
     /// carries the security session identifier as its handle, and it names the process that
     /// created it. A user with no graphical login has no such domain, and the command says so by
-    /// failing, which is the same answer this host gives for a headless installation.
-    pub(super) fn read_login(uid: u32) -> Login {
-        let Some(printed) = output("/bin/launchctl", &["print", &format!("gui/{uid}")]) else {
-            return Login::none();
+    /// failing.
+    pub(super) fn read_login(uid: u32) -> Reading {
+        let printed = match run("/bin/launchctl", &["print", &format!("gui/{uid}")]) {
+            Printed::Output(printed) => printed,
+            // The domain is not there, which is what a graphical logout leaves behind.
+            Printed::Failed => return Reading::None,
+            Printed::NotRun => return Reading::Unavailable,
         };
         let fields = super::domain_header(&printed);
         let Some(handle) = fields
@@ -170,50 +230,71 @@ mod implementation {
             .find(|(key, _)| *key == "handle")
             .map(|(_, value)| (*value).to_owned())
         else {
-            return Login::none();
+            return Reading::Unavailable;
         };
         // `session = Aqua` is the domain saying it is the graphical one. A background domain
         // carries no desktop, and a session whose name this host does not recognise is not
         // presented as one.
-        let graphic_access = fields
+        if !fields
             .iter()
-            .any(|(key, value)| *key == "session" && *value == "Aqua");
-        if !graphic_access {
-            return Login::none();
+            .any(|(key, value)| *key == "session" && *value == "Aqua")
+        {
+            return Reading::None;
         }
         let creator = fields
             .iter()
             .find(|(key, _)| *key == "creator")
             .and_then(|(_, value)| super::creator_pid(value));
         let anchored = creator.and_then(anchor);
-        Login {
+        if anchored.is_none() {
+            // The domain is there and the process that owns it is not readable, so this host
+            // cannot name the generation. Half an identity is not one.
+            return Reading::Unavailable;
+        }
+        Reading::Desktop(Login {
             kind: DesktopSessionKind::MacosSecuritySession,
             platform_session: Some(handle),
             generation: anchored.as_ref().map(|identity| identity.start_value.get()),
-            generation_source: if anchored.is_some() {
-                DesktopGenerationSource::MacosSessionCreator
-            } else {
-                DesktopGenerationSource::Unavailable
-            },
+            generation_source: DesktopGenerationSource::MacosSessionCreator,
             anchor: anchored,
             graphic_access: true,
             // A macOS screen-sharing client joins the console user's own session rather than
             // creating a second one, so this host does not present an Aqua session as remote.
             remote: false,
-            // The Aqua session exists, which is what a bound session depends on. macOS publishes
-            // no lock state this host can read without involving the person at the machine, so a
-            // locked desktop reads as present here: its session and processes keep running, which
-            // is what the distinction between availability and process life is for.
-            availability: DesktopAvailability::Available,
+            availability: availability(),
             display_server: DisplayServer::Quartz,
             compositor: Some("Aqua".to_owned()),
+        })
+    }
+
+    /// Reads whether the session's screen is locked.
+    ///
+    /// The window server publishes the lock state in the device registry while the screen is
+    /// locked and publishes nothing while it is not, so an absent key is an answer rather than a
+    /// failure. A registry this host cannot read at all is what `unknown` is for.
+    fn availability() -> DesktopAvailability {
+        match run("/usr/sbin/ioreg", &["-n", "Root", "-d1", "-k", LOCK_KEY]) {
+            Printed::Output(printed) => {
+                if printed
+                    .lines()
+                    .any(|line| line.contains(LOCK_KEY) && line.contains("Yes"))
+                {
+                    DesktopAvailability::Locked
+                } else {
+                    DesktopAvailability::Available
+                }
+            }
+            Printed::Failed | Printed::NotRun => DesktopAvailability::Unknown,
         }
     }
+
+    /// The device-registry key the window server publishes while the screen is locked.
+    const LOCK_KEY: &str = "CGSSessionScreenIsLocked";
 }
 
 #[cfg(target_os = "linux")]
 mod implementation {
-    use super::{Login, anchor, output};
+    use super::{Login, Printed, Reading, anchor, run};
     use kr_protocol::desktop::{
         DesktopAvailability, DesktopGenerationSource, DesktopSessionKind, DisplayServer,
     };
@@ -224,11 +305,13 @@ mod implementation {
     /// notice not to parse them, and `loginctl` is the documented way to the same facts. The
     /// user's display session is the graphical one; this process's own session is used when the
     /// login manager names it, because a worker started inside a session belongs to that one.
-    pub(super) fn read_login(uid: u32) -> Login {
-        let Some(id) = session_id(uid) else {
-            return Login::none();
+    pub(super) fn read_login(uid: u32) -> Reading {
+        let id = match session_id(uid) {
+            Ok(Some(id)) => id,
+            Ok(None) => return Reading::None,
+            Err(()) => return Reading::Unavailable,
         };
-        let Some(printed) = output(
+        let printed = match run(
             "loginctl",
             &[
                 "show-session",
@@ -243,8 +326,11 @@ mod implementation {
                 "--property=Desktop",
                 "--property=Name",
             ],
-        ) else {
-            return Login::none();
+        ) {
+            Printed::Output(printed) => printed,
+            // The manager answered that it has no such session, which is what a logout leaves.
+            Printed::Failed => return Reading::None,
+            Printed::NotRun => return Reading::Unavailable,
         };
         let fields = super::key_values(&printed);
         let field = |name: &str| {
@@ -253,61 +339,68 @@ mod implementation {
                 .find(|(key, _)| key == name)
                 .map(|(_, value)| value.clone())
         };
-        let kind = field("Type").unwrap_or_default();
-        let display_server = match kind.as_str() {
+        let display_server = match field("Type").unwrap_or_default().as_str() {
             "x11" => DisplayServer::X11,
             "wayland" => DisplayServer::Wayland,
             // A text login is not a desktop. Reporting it as one would offer a display that is
             // not there.
-            "tty" | "" => return Login::none(),
+            "tty" | "" => return Reading::None,
             _ => DisplayServer::Unknown,
         };
         let anchored = field("Leader")
             .and_then(|value| value.parse::<u32>().ok())
             .and_then(anchor);
+        if anchored.is_none() {
+            // The session is there and its leader is not readable, so the generation cannot be
+            // named and this reading is not an identity.
+            return Reading::Unavailable;
+        }
         let state = field("State").unwrap_or_default();
         let locked = field("LockedHint").is_some_and(|value| value == "yes");
         let active = field("Active").is_some_and(|value| value == "yes");
-        Login {
+        Reading::Desktop(Login {
             kind: DesktopSessionKind::LinuxLogind,
             platform_session: Some(id),
             generation: anchored.as_ref().map(|identity| identity.start_value.get()),
-            generation_source: if anchored.is_some() {
-                DesktopGenerationSource::LinuxSessionLeader
-            } else {
-                DesktopGenerationSource::Unavailable
-            },
+            generation_source: DesktopGenerationSource::LinuxSessionLeader,
             anchor: anchored,
             graphic_access: true,
             remote: field("Remote").is_some_and(|value| value == "yes"),
             availability: super::availability(&state, locked, active),
             display_server,
             compositor: field("Desktop").filter(|value| !value.is_empty()),
-        }
+        })
     }
 
-    /// Returns the graphical session identifier to read.
-    fn session_id(uid: u32) -> Option<String> {
+    /// Returns the graphical session identifier to read, or nothing when there is none.
+    ///
+    /// The error is the login manager not answering, which is a different thing from the user not
+    /// having a graphical session.
+    fn session_id(uid: u32) -> Result<Option<String>, ()> {
         if let Ok(own) = std::env::var("XDG_SESSION_ID")
             && !own.trim().is_empty()
         {
-            return Some(own.trim().to_owned());
+            return Ok(Some(own.trim().to_owned()));
         }
-        let printed = output(
+        match run(
             "loginctl",
             &["show-user", &uid.to_string(), "--property=Display"],
-        )?;
-        super::key_values(&printed)
-            .into_iter()
-            .find(|(key, _)| key == "Display")
-            .map(|(_, value)| value)
-            .filter(|value| !value.is_empty())
+        ) {
+            Printed::Output(printed) => Ok(super::key_values(&printed)
+                .into_iter()
+                .find(|(key, _)| key == "Display")
+                .map(|(_, value)| value)
+                .filter(|value| !value.is_empty())),
+            // The manager has no record of this user, so the user has no session.
+            Printed::Failed => Ok(None),
+            Printed::NotRun => Err(()),
+        }
     }
 }
 
 #[cfg(windows)]
 mod implementation {
-    use super::{Login, anchor, output};
+    use super::{Login, Printed, Reading, anchor, run};
     use kr_protocol::desktop::{
         DesktopAvailability, DesktopGenerationSource, DesktopSessionKind, DisplayServer,
     };
@@ -321,39 +414,47 @@ mod implementation {
     /// signs in to different sessions over a remote desktop connection and through user
     /// switching, and a worker belongs to exactly one of them. The session's own logon process
     /// anchors the generation, so a reused session number after a sign-out is a different desktop.
-    pub(super) fn read_login(_uid: u32) -> Login {
-        let Some(session) = own_session() else {
-            return Login::none();
+    pub(super) fn read_login(_uid: u32) -> Reading {
+        let session = match own_session() {
+            Ok(Some(session)) => session,
+            Ok(None) => return Reading::None,
+            Err(()) => return Reading::Unavailable,
         };
-        let remote = std::env::var("SESSIONNAME")
-            .is_ok_and(|name| !name.eq_ignore_ascii_case("console") && !name.is_empty());
         // Session 0 is the service session. It has no desktop, and a worker started there is not
         // a desktop execution host whatever else is true of it.
         if session == 0 {
-            return Login::none();
+            return Reading::None;
         }
-        let anchored = logon_process(session).and_then(anchor);
-        Login {
+        let anchored = match logon_process(session) {
+            Ok(Some(pid)) => anchor(pid),
+            // No logon process owns that session, so it is not an interactive login.
+            Ok(None) => return Reading::None,
+            Err(()) => return Reading::Unavailable,
+        };
+        if anchored.is_none() {
+            return Reading::Unavailable;
+        }
+        let remote = std::env::var("SESSIONNAME")
+            .is_ok_and(|name| !name.eq_ignore_ascii_case("console") && !name.is_empty());
+        Reading::Desktop(Login {
             kind: DesktopSessionKind::WindowsInteractive,
             platform_session: Some(session.to_string()),
             generation: anchored.as_ref().map(|identity| identity.start_value.get()),
-            generation_source: if anchored.is_some() {
-                DesktopGenerationSource::WindowsSessionLogon
-            } else {
-                DesktopGenerationSource::Unavailable
-            },
+            generation_source: DesktopGenerationSource::WindowsSessionLogon,
             anchor: anchored,
             graphic_access: true,
             remote,
-            availability: DesktopAvailability::Available,
+            // Whether the session is attended, locked or disconnected is not something this host
+            // reads, and an unlocked desktop is not something it may assume.
+            availability: DesktopAvailability::Unknown,
             display_server: DisplayServer::WindowsDesktop,
             compositor: None,
-        }
+        })
     }
 
     /// Returns the session number this process runs in.
-    fn own_session() -> Option<u32> {
-        let printed = output(
+    fn own_session() -> Result<Option<u32>, ()> {
+        match run(
             "tasklist",
             &[
                 "/FI",
@@ -362,15 +463,17 @@ mod implementation {
                 "CSV",
                 "/NH",
             ],
-        )?;
-        super::task_rows(&printed)
-            .into_iter()
-            .find_map(|row| row.session)
+        ) {
+            Printed::Output(printed) => Ok(super::task_rows(&printed)
+                .into_iter()
+                .find_map(|row| row.session)),
+            Printed::Failed | Printed::NotRun => Err(()),
+        }
     }
 
     /// Returns the identifier of the logon process that owns one session.
-    fn logon_process(session: u32) -> Option<u32> {
-        let printed = output(
+    fn logon_process(session: u32) -> Result<Option<u32>, ()> {
+        match run(
             "tasklist",
             &[
                 "/FI",
@@ -379,21 +482,23 @@ mod implementation {
                 "CSV",
                 "/NH",
             ],
-        )?;
-        super::task_rows(&printed)
-            .into_iter()
-            .find(|row| row.session == Some(session))
-            .and_then(|row| row.pid)
+        ) {
+            Printed::Output(printed) => Ok(super::task_rows(&printed)
+                .into_iter()
+                .find(|row| row.session == Some(session))
+                .and_then(|row| row.pid)),
+            Printed::Failed | Printed::NotRun => Err(()),
+        }
     }
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod implementation {
-    use super::Login;
+    use super::Reading;
 
     /// A platform this host has no desktop reading for has no desktop.
-    pub(super) const fn read_login(_uid: u32) -> Login {
-        Login::none()
+    pub(super) const fn read_login(_uid: u32) -> Reading {
+        Reading::None
     }
 }
 
@@ -493,6 +598,7 @@ fn task_rows(printed: &str) -> Vec<TaskRow> {
 
 #[cfg(test)]
 mod tests {
+    use super::{Login, Presence, presence};
     #[cfg(target_os = "macos")]
     use super::{creator_pid, domain_header};
 
@@ -547,6 +653,35 @@ mod tests {
         assert_eq!(creator_pid("loginwindow[606]"), Some(606));
         assert_eq!(creator_pid("launchd[1]"), Some(1));
         assert_eq!(creator_pid("loginwindow"), None);
+    }
+
+    #[test]
+    fn a_reading_with_no_generation_is_not_a_desktop() {
+        let mut login = Login::none();
+        login.kind = kr_protocol::desktop::DesktopSessionKind::LinuxLogind;
+        login.platform_session = Some("2".to_owned());
+        assert!(
+            !login.is_desktop(),
+            "a session number the platform may hand out again is not an identity"
+        );
+        login.generation = Some(7);
+        assert!(login.is_desktop());
+    }
+
+    #[test]
+    fn nothing_anchored_is_unknown_rather_than_ended() {
+        assert_eq!(presence(None), Presence::Unknown);
+    }
+
+    #[test]
+    fn a_process_that_is_gone_is_ended_and_this_one_is_present() {
+        let own = kr_ipc::identity::current_process_start_identity().expect("this process");
+        assert_eq!(presence(Some(&own)), Presence::Present);
+        // The same identifier with a start value no process of this identifier has. The kernel
+        // describes the process and the start value disagrees, which is the reuse case.
+        let mut reused = own.clone();
+        reused.start_value = kr_protocol::scalars::U64::new(own.start_value.get() + 1);
+        assert_eq!(presence(Some(&reused)), Presence::Ended);
     }
 
     #[cfg(target_os = "linux")]

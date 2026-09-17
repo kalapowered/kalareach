@@ -55,7 +55,7 @@ use kr_protocol::identity::{BootIdentity, DesktopBinding, ProcessStartIdentity, 
 use kr_protocol::ids::DesktopSessionId;
 use kr_protocol::scalars::{Nullable, U64};
 
-pub use platform::{Login, Presence};
+pub use platform::{Login, Presence, Reading};
 
 /// The shortest time between two readings of whether a bound desktop is still there.
 ///
@@ -76,8 +76,11 @@ pub const REREAD_INTERVAL: Duration = Duration::from_secs(30);
 /// The reading describes one login session and says nothing about permissions: whether a command
 /// may capture the screen or send input is [`capability`]'s question, and selecting a desktop is
 /// not evidence for either.
+///
+/// Three answers, not two: the platform can describe a login session, say there is none, or fail
+/// to answer. A desktop-bound session closes on the second and not on the third.
 #[must_use]
-pub fn current() -> Login {
+pub fn current() -> Reading {
     platform::read_login(kr_ipc::paths::current_uid())
 }
 
@@ -89,7 +92,7 @@ pub fn current() -> Login {
 #[must_use]
 pub fn context(profile: WorkerProfile, boot: BootIdentity) -> DesktopContext {
     let login = if profile == WorkerProfile::DesktopBound {
-        current()
+        current().login_or_none()
     } else {
         Login::none()
     };
@@ -108,7 +111,11 @@ pub fn from_login(login: &Login, profile: WorkerProfile, boot: BootIdentity) -> 
     let reaches_desktop = container.reaches_parent_desktop();
     let desktop = reaches_desktop && login.is_desktop();
     DesktopContext {
-        desktop_session_id: Nullable(desktop.then(|| derive_name(login, uid, &boot)).flatten()),
+        desktop_session_id: Nullable(
+            desktop
+                .then(|| derive_name(login, uid, &os_user(), &boot))
+                .flatten(),
+        ),
         kind: if desktop {
             login.kind
         } else {
@@ -158,16 +165,27 @@ pub fn binding(context: &DesktopContext) -> DesktopBinding {
 /// Derives the name of one desktop context.
 ///
 /// The name carries the user, the platform session, the generation and the boot, so two contexts
-/// with the same name are the same desktop. It is bounded opaque text: a host whose boot identity
-/// will not fit in one has no name, and every field is still in the record.
+/// with the same name are the same desktop. Both the account name and the numeric identifier are
+/// in it, because a platform that does not number its users has only the name and one that does
+/// has both.
+///
+/// A reading with no generation has no name. A platform session number without a generation cannot
+/// tell one login from the next one given that number, and a name that omitted it would say two
+/// desktops were one.
+///
+/// It is bounded opaque text: a host whose boot identity will not fit in one has no name, and every
+/// field is still in the record.
 #[must_use]
-pub fn derive_name(login: &Login, uid: u32, boot: &BootIdentity) -> Option<DesktopSessionId> {
+pub fn derive_name(
+    login: &Login,
+    uid: u32,
+    user: &str,
+    boot: &BootIdentity,
+) -> Option<DesktopSessionId> {
     let session = login.platform_session.as_deref()?;
-    let generation = login
-        .generation
-        .map_or_else(|| "none".to_owned(), |value| value.to_string());
+    let generation = login.generation?;
     DesktopSessionId::new(format!(
-        "{}:uid={uid}:session={session}:generation={generation}:boot={}",
+        "{}:user={user}:uid={uid}:session={session}:generation={generation}:boot={}",
         login.kind.as_str(),
         hex(boot.value.as_slice())
     ))
@@ -175,7 +193,8 @@ pub fn derive_name(login: &Login, uid: u32, boot: &BootIdentity) -> Option<Deskt
 }
 
 /// Returns the operating-system user this worker runs as.
-fn os_user() -> String {
+#[must_use]
+pub fn os_user() -> String {
     for name in ["USER", "LOGNAME", "USERNAME"] {
         if let Ok(value) = std::env::var(name)
             && !value.trim().is_empty()
@@ -280,9 +299,15 @@ impl Watch {
     /// Binds a session of this profile to the desktop its create request recorded.
     ///
     /// The live reading is taken here, which is what supplies the process the watch then asks
-    /// about. A reading that already names a different desktop from the recorded one is a desktop
-    /// that ended between the create request and the shell: the watch says so from the start
-    /// rather than waiting for a change it would never see.
+    /// about. Each of the three readings means something different:
+    ///
+    /// * a login session that is the recorded one binds the watch to the process that owns it;
+    /// * a login session that is a different one, or a platform that says there is no graphical
+    ///   login at all, is a desktop that ended between the create request and the shell, and the
+    ///   watch says so from the start rather than waiting for a change it would never see;
+    /// * a platform that would not answer binds without that process. The watch reports no loss
+    ///   and asks the platform again on the slower cadence, because a reading this host could not
+    ///   take is not evidence that anything ended.
     #[must_use]
     pub fn bind(profile: WorkerProfile, recorded: &DesktopBinding) -> Self {
         if profile != WorkerProfile::DesktopBound {
@@ -292,14 +317,17 @@ impl Watch {
             // Nothing was recorded, so this session is bound to no desktop and cannot lose one.
             return Self::none();
         }
-        let live = current();
-        let matches = describes(&live, recorded);
+        let (anchor, lost) = match current() {
+            Reading::Desktop(live) if describes(&live, recorded) => (live.anchor, false),
+            Reading::Desktop(_) | Reading::None => (None, true),
+            Reading::Unavailable => (None, false),
+        };
         Self {
             bound: Some(Bound {
                 recorded: recorded.clone(),
-                anchor: matches.then(|| live.anchor.clone()).flatten(),
+                anchor,
             }),
-            lost: !matches,
+            lost,
             asked: None,
         }
     }
@@ -329,18 +357,24 @@ impl Watch {
             return false;
         }
         self.asked = Some(now);
-        self.lost = match bound.anchor.as_ref() {
-            Some(anchor) => {
-                let login = Login {
-                    anchor: Some(anchor.clone()),
-                    ..Login::none()
-                };
-                platform::presence(&login) == Presence::Ended
-            }
-            // No process was named, so the platform is asked again about the session itself. A
-            // reading that no longer describes the recorded desktop is a desktop that has ended.
-            None => !describes(&current(), &bound.recorded),
-        };
+        match platform::presence(bound.anchor.as_ref()) {
+            Presence::Present => {}
+            Presence::Ended => self.lost = true,
+            // Either nothing was anchored or the kernel would not answer, so the platform is asked
+            // again about the session itself. A reading that describes the recorded desktop also
+            // supplies the process to ask about from here on; one that describes a different
+            // desktop, or none at all, is a desktop that has ended; one the platform would not
+            // give leaves the answer where it was.
+            Presence::Unknown => match current() {
+                Reading::Desktop(live) if describes(&live, &bound.recorded) => {
+                    if let Some(bound) = self.bound.as_mut() {
+                        bound.anchor = live.anchor;
+                    }
+                }
+                Reading::Desktop(_) | Reading::None => self.lost = true,
+                Reading::Unavailable => {}
+            },
+        }
         self.lost
     }
 
@@ -356,13 +390,13 @@ impl Watch {
 /// Returns whether a live reading describes the desktop a create request recorded.
 ///
 /// The name is the whole identity, so where one was recorded the name decides. A record that
-/// carries only a generation — which a host whose boot identity would not fit in a name produces —
+/// carries only a generation, which a host whose boot identity would not fit in a name produces,
 /// is compared on the generation, and a generation that has moved is a different login.
 fn describes(live: &Login, recorded: &DesktopBinding) -> bool {
     if let Some(name) = recorded.desktop_session_id.as_ref() {
         let live_name = kr_ipc::identity::boot_identity()
             .ok()
-            .and_then(|boot| derive_name(live, kr_ipc::paths::current_uid(), &boot));
+            .and_then(|boot| derive_name(live, kr_ipc::paths::current_uid(), &os_user(), &boot));
         return live_name.as_ref() == Some(name);
     }
     match recorded.login_generation.as_ref() {
@@ -401,10 +435,16 @@ mod tests {
 
     #[test]
     fn the_name_binds_the_user_the_session_the_generation_and_the_boot() {
-        let name = derive_name(&login("100019", Some(42)), 501, &boot(&[0xab, 0xcd]))
-            .expect("a desktop has a name");
+        let name = derive_name(
+            &login("100019", Some(42)),
+            501,
+            "someone",
+            &boot(&[0xab, 0xcd]),
+        )
+        .expect("a desktop has a name");
         let text = name.as_str();
         assert!(text.contains("macos_security_session"), "{text}");
+        assert!(text.contains("user=someone"), "{text}");
         assert!(text.contains("uid=501"), "{text}");
         assert!(text.contains("session=100019"), "{text}");
         assert!(text.contains("generation=42"), "{text}");
@@ -413,16 +453,54 @@ mod tests {
 
     #[test]
     fn a_reused_session_number_in_a_new_login_is_a_different_name() {
-        let first = derive_name(&login("2", Some(1_000)), 1_000, &boot(&[1])).expect("a name");
-        let again = derive_name(&login("2", Some(2_000)), 1_000, &boot(&[1])).expect("a name");
-        let rebooted = derive_name(&login("2", Some(1_000)), 1_000, &boot(&[2])).expect("a name");
-        let other_user = derive_name(&login("2", Some(1_000)), 1_001, &boot(&[1])).expect("a name");
-        assert_ne!(first, again, "a new login is a new generation");
-        assert_ne!(first, rebooted, "a session number outlives no reboot");
+        let named = |session: &str, generation: Option<u64>, uid: u32, user: &str, seed: u8| {
+            derive_name(&login(session, generation), uid, user, &boot(&[seed])).expect("a name")
+        };
+        let first = named("2", Some(1_000), 1_000, "someone", 1);
         assert_ne!(
-            first, other_user,
+            first,
+            named("2", Some(2_000), 1_000, "someone", 1),
+            "a new login is a new generation"
+        );
+        assert_ne!(
+            first,
+            named("2", Some(1_000), 1_000, "someone", 2),
+            "a session number outlives no reboot"
+        );
+        assert_ne!(
+            first,
+            named("2", Some(1_000), 1_001, "someone", 1),
             "another user's desktop is another desktop"
         );
+        assert_ne!(
+            first,
+            named("2", Some(1_000), 1_000, "somebody", 1),
+            "and a platform that numbers no users still tells them apart"
+        );
+    }
+
+    #[test]
+    fn a_reading_with_no_generation_has_no_name_and_is_no_desktop() {
+        assert!(
+            derive_name(&login("2", None), 1_000, "someone", &boot(&[1])).is_none(),
+            "a session number the platform may hand out again is not an identity"
+        );
+        let context = from_login(&login("2", None), WorkerProfile::DesktopBound, boot(&[1]));
+        assert!(
+            !context.is_desktop(),
+            "and a context built from it names no desktop"
+        );
+        assert!(!context.graphic_access);
+    }
+
+    #[test]
+    fn a_platform_that_will_not_answer_is_not_a_lost_desktop() {
+        // The platform readings this host can take are not controllable from a test, so this
+        // exercises the rule the three readings turn on: a reading the host could not take is not
+        // evidence that anything ended, which is what `Watch::bind` and `Watch::lost` do with it.
+        assert!(Reading::Unavailable.login().is_none());
+        assert_eq!(Reading::None.login_or_none(), Login::none());
+        assert!(Watch::none().bound_name().is_none());
     }
 
     #[test]
