@@ -847,8 +847,13 @@ impl Controller {
                 // a reservation that was fenced while this report was in flight stays fenced,
                 // because the report does not answer the question fencing asked.
                 let mut registry = self.registry.lock().await;
-                registry.resolve_claim(reservation_id, LaunchPhase::Failed)?;
+                let resolved = registry.resolve_claim(reservation_id, LaunchPhase::Failed)?;
                 drop(registry);
+                // Only a reservation this report actually resolved. A fenced one is still
+                // somebody's question, and the directory stays until it is answered.
+                if resolved {
+                    self.discard_worker_dir(claim.session_id);
+                }
                 self.resolve(reservation_id, Err(error)).await;
                 Ok(())
             }
@@ -3018,6 +3023,134 @@ mod a_create_that_launches_nothing {
                 .len(),
             1,
             "and it is resolved rather than left to recovery"
+        );
+    }
+
+    /// Returns the sessions that still have a directory under this environment's workers folder.
+    fn worker_dirs(temp: &kr_ipc::testing::TempHost) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(temp.environment().workers_dir()) else {
+            return Vec::new();
+        };
+        let mut names: Vec<String> = entries
+            .flatten()
+            .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A launch that is confirmed not to have started gives its directory back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_whose_launch_never_started_leaves_no_directory() {
+        let (temp, controller, asked) = daemon().await;
+        let environment_id = temp.environment_id();
+        let (connection_id, actor_id) = admitted(&controller).await;
+        let accepted = AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_secs(30))
+                .expect("a deadline half a minute out"),
+            bound: DeadlineBound::RequestedTtl,
+        };
+        controller
+            .session_create(
+                &actor_id,
+                &create_request(environment_id),
+                connection_id,
+                accepted,
+            )
+            .await
+            .expect_err("this supervisor starts nothing");
+        assert_eq!(
+            asked.lock().expect("the record is not poisoned").len(),
+            1,
+            "the launch was prepared and attempted"
+        );
+        assert!(
+            worker_dirs(&temp).is_empty(),
+            "and the directory it was prepared with is given back: {:?}",
+            worker_dirs(&temp)
+        );
+    }
+
+    /// The directory a create is refused before its launch goes back with the reservation.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_refused_create_leaves_no_directory() {
+        let (temp, controller, asked) = daemon().await;
+        let environment_id = temp.environment_id();
+        let (connection_id, actor_id) = admitted(&controller).await;
+        let accepted = AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_millis(300))
+                .expect("a deadline a moment out"),
+            bound: DeadlineBound::RequestedTtl,
+        };
+        let mutation = create_request(environment_id);
+        let paused = controller.admitted.lock().await;
+        let create = tokio::spawn({
+            let controller = Arc::clone(&controller);
+            let actor_id = actor_id.clone();
+            async move {
+                controller
+                    .session_create(&actor_id, &mutation, connection_id, accepted)
+                    .await
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        drop(paused);
+        create
+            .await
+            .expect("the create finishes")
+            .expect_err("a create whose deadline has passed starts nothing");
+        assert!(asked.lock().expect("the record is not poisoned").is_empty());
+        assert!(
+            worker_dirs(&temp).is_empty(),
+            "the directory goes with the reservation: {:?}",
+            worker_dirs(&temp)
+        );
+    }
+
+    /// The sweep keeps what a reservation still claims and removes what nothing does.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_sweep_removes_only_the_directories_no_session_claims() {
+        let (temp, controller, _asked) = daemon().await;
+        let environment = temp.environment();
+        // One directory belonging to a reservation that is still unresolved, and one belonging to
+        // nothing at all.
+        let reserved = {
+            let mut registry = controller.registry.lock().await;
+            registry
+                .reserve(
+                    &kr_protocol::ids::ActorId::new("local:test").expect("a principal"),
+                    kr_ipc::new_uuid(),
+                    kr_protocol::scalars::Digest256::from_bytes([7; 32]),
+                    &[0xa0],
+                    kr_ipc::now_ms(),
+                )
+                .expect("reserves")
+                .reservation
+                .session_id
+        };
+        let stray = kr_protocol::ids::SessionId::new(kr_ipc::new_uuid());
+        for session_id in [reserved, stray] {
+            kr_ipc::paths::create_private_tree(
+                environment.state_root(),
+                &environment.worker_dir(session_id),
+            )
+            .expect("makes the directory");
+        }
+
+        controller
+            .sweep_worker_dirs()
+            .await
+            .expect("the sweep runs");
+        assert_eq!(
+            worker_dirs(&temp),
+            vec![reserved.to_string()],
+            "a reservation nothing has settled keeps its directory; a session nobody knows does not"
         );
     }
 }
