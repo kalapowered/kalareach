@@ -529,7 +529,8 @@ A closed session carries its record instead of a null:
 did not pass. The host object carries `default_worker_profile` and the same `power` object. The
 environment object is what `environment.capabilities` answers: the desktop and one record per
 capability, the profile new sessions get, what a logout does to each profile on this platform, and
-the power state. In text form those become a line for the desktop, a line per profile and the same
+the power state. Each capability record carries the facility it is about and that facility's
+identity, which is what to compare after installing a new version of a tool. In text form those become a line for the desktop, a line per profile and the same
 inhibition line.
 
 `kr host power --json` returns `{ "ok": true, "environment_id": "...", "power": { ... } }`. The

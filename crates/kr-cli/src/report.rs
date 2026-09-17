@@ -165,6 +165,7 @@ pub fn capability(record: &CapabilityRecord) -> Value {
         "state": record.state.as_str(),
         "evidence_source": record.evidence_source.as_str(),
         "binary": record.identity.binary.as_ref().cloned(),
+        "facility_identity": record.identity.version.as_ref().cloned(),
         "profile": record.identity.profile.as_ref().map(|profile| profile.as_str()),
         "invalidation": record
             .invalidation
