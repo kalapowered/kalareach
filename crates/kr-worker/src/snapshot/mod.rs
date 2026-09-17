@@ -380,6 +380,21 @@ pub fn install(
             }
             first = first.saturating_add(run.len());
             for row in &run {
+                if budget <= held {
+                    // The rows before this one have spent the queue. This row and the ones after it
+                    // carry their envelope and nothing else, and converting them first only to cut
+                    // them back to it would be the whole screen's worth of work for nothing.
+                    cut |= !row.runs.is_empty();
+                    let empty = ProjectedRow {
+                        row: wire::row_id(row.stable_id)?,
+                        soft_wrapped: row.soft_wrapped,
+                        truncated: true,
+                        runs: Vec::new(),
+                    };
+                    held = held.saturating_add(wire::row_cost(&empty).bytes);
+                    kept.push(empty);
+                    continue;
+                }
                 let mut row = wire::row(row)?;
                 truncate_row(&mut row);
                 let cost = wire::row_cost(&row).bytes;
@@ -496,6 +511,35 @@ pub fn install(
         events,
         base: Base { cursor, generation },
     })
+}
+
+/// What the smallest installation of this screen costs a subscriber's queue.
+///
+/// Every message of it, not the largest of them: the reset, the header and the pages with every row
+/// emptied. A screen can always be cut down to this and never below it, so a queue smaller than this
+/// figure is one no screen can cross. Such a subscriber is refused when it asks for its queue,
+/// because the alternative is a resynchronisation it would ask for again, and again.
+///
+/// # Errors
+///
+/// Returns an error when a row's stable identifier is not a forward count.
+pub fn minimum_install(
+    snapshot: &Snapshot,
+    viewport: Viewport,
+    rows: &impl RowSource,
+) -> Result<usize> {
+    // A queue of nothing: every row is emptied as it is converted, which is what the smallest
+    // installation is. The reason is the one every first installation carries; it costs the same
+    // whichever it is.
+    Ok(install(
+        snapshot,
+        viewport,
+        ProjectionResetReason::Attached,
+        true,
+        0,
+        rows,
+    )?
+    .bytes())
 }
 
 /// The same row with nothing in it, which is what its envelope costs.

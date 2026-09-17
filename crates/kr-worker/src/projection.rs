@@ -452,6 +452,25 @@ impl TerminalEngine {
         Ok((update, settled))
     }
 
+    /// What the smallest installation of this screen costs a subscriber's queue.
+    ///
+    /// The whole of one - the reset, the header and the pages - with every row emptied, which is as
+    /// small as this session's screen can be made. A queue below it is one no screen can cross, and
+    /// a client with one is told so when it asks rather than being resynchronised for ever.
+    ///
+    /// It changes nothing: measuring a screen is not a reason to settle one, so this reads the state
+    /// where it stands rather than taking a snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the engine's state cannot be spelled on the wire.
+    pub fn minimum_projection_install(&self, dimensions: Dimensions) -> Result<usize> {
+        let viewport = self.anchored_viewport(dimensions);
+        let mut state = self.engine.screen_state(viewport);
+        state.viewport = viewport;
+        crate::snapshot::minimum_install(&state, viewport, &self.engine)
+    }
+
     /// Builds what one client is owed, given the screen it already holds.
     ///
     /// The answer is a bounded update, nothing at all, or a fresh screen with the reason it is one:

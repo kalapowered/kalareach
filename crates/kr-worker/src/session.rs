@@ -792,6 +792,21 @@ impl Session {
         Ok(())
     }
 
+    /// What the smallest screen this session can install on one attachment costs its send queue.
+    ///
+    /// Every message of the installation, not the largest one: a client holding some of them holds
+    /// no screen. It is what [`Self::subscribe_within`] refuses a smaller queue against, and it
+    /// changes nothing about the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attachment is unknown, or when the engine's state cannot be
+    /// spelled on the wire.
+    pub fn minimum_projection_install(&self, attachment_id: AttachmentId) -> Result<usize> {
+        let dimensions = self.attachment_dimensions(attachment_id)?;
+        self.engine.minimum_projection_install(dimensions)
+    }
+
     /// Returns one attachment's own dimensions, falling back to the session's canonical geometry.
     fn attachment_dimensions(&self, attachment_id: AttachmentId) -> Result<Dimensions> {
         Ok(self
@@ -1464,7 +1479,11 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns an error when the attachment is unknown.
+    /// Returns an error when the attachment is unknown, and
+    /// [`WorkerError::InvalidArgument`] when a projected attachment asks for a queue too small to
+    /// hold the smallest screen this session can be installed with. That refusal is definite: a
+    /// client cannot be sent part of a screen, so the alternative would be a resynchronisation it
+    /// would answer by asking for the same screen again.
     pub fn subscribe_within(
         &mut self,
         attachment_id: AttachmentId,
@@ -1477,6 +1496,16 @@ impl Session {
         }
         let limit = send_queue_bytes.clamp(1, self.config.send_queue_bytes);
         let presentation = self.presentation_of(attachment_id);
+        if presentation == crate::output::Presentation::Projected {
+            let minimum = self.minimum_projection_install(attachment_id)?;
+            if limit < minimum {
+                return Err(WorkerError::InvalidArgument(format!(
+                    "a send queue of {limit} bytes cannot carry this session's screen: the \
+                     smallest one it can be installed with is {minimum} bytes, and a client holding \
+                     part of a screen holds none of it"
+                )));
+            }
+        }
         Ok(self.hub.subscribe(attachment_id, limit, presentation))
     }
 

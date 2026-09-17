@@ -1602,3 +1602,98 @@ async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() 
         );
     }
 }
+
+/// KR-REQ-08.79 and KR-ACC-007: a queue too small for any screen is refused, once and for good.
+///
+/// A projected client is installed from one screen: the reset, the header and every page of rows.
+/// It can hold part of that and draw nothing, so a queue below the smallest screen this session can
+/// be cut down to is a queue no screen can ever cross. Telling such a client its queue is full would
+/// have it ask for the same screen again, and again. It is told when it asks instead, with the
+/// figure it would need, and the refusal is one no retry of the same request can turn into a
+/// success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_queue_too_small_for_any_screen_is_refused_when_it_is_asked_for() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let config = SessionConfig {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id: temp.environment_id(),
+        display_number: DisplayNumber::new(1),
+        shell: ShellCommand {
+            program: "/bin/sh".to_owned(),
+            arguments: vec!["-c".to_owned(), "exec cat".to_owned()],
+            cwd: "/".to_owned(),
+            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+        },
+        shell_mode: ShellMode::NativeCompat,
+        worker_profile: WorkerProfile::HeadlessUser,
+        desktop: DesktopBinding::none(),
+        dimensions: Dimensions::new(CANONICAL.0, CANONICAL.1),
+        journal_path: Some(environment.journal_database(session_id)),
+        spool_directory: Some(environment.session_spool(session_id)),
+        send_queue_bytes: 8 * 1024 * 1024,
+        resident_bytes: 1024 * 1024,
+    };
+    let mut session = Session::open(config).expect("opens the session");
+    session.launch().expect("launches the shell");
+
+    // A terminal of another size, which is why it is projected and served a screen as state.
+    let projected = AttachmentId::new(kr_ipc::new_uuid());
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    session
+        .attach(
+            &SessionAttachParams {
+                session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(Dimensions::new(SMALLER.0, SMALLER.1)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested: requested.clone(),
+            },
+            requested,
+            projected,
+        )
+        .expect("attaches");
+
+    let minimum = session
+        .minimum_projection_install(projected)
+        .expect("the smallest screen this session can be installed with");
+    assert!(
+        minimum > 0,
+        "an installation is never nothing: it is a reset, a header and a page at the very least"
+    );
+
+    let refusal = session
+        .subscribe_within(projected, minimum - 1)
+        .expect_err("a queue below the smallest screen is refused");
+    assert_eq!(
+        refusal.code(),
+        kr_protocol::error::ErrorCode::InvalidArgument,
+        "the refusal is definite: {refusal}"
+    );
+    assert_eq!(
+        refusal.code().retry_category(),
+        kr_protocol::error::RetryCategory::ConfigurationChange,
+        "and not something a client may simply ask for again: {refusal}"
+    );
+    assert!(
+        refusal.to_string().contains(&minimum.to_string()),
+        "it names what the client would need: {refusal}"
+    );
+    assert!(
+        !refusal
+            .to_string()
+            .to_ascii_lowercase()
+            .contains("queue is full"),
+        "and it is not the answer a client is given for falling behind: {refusal}"
+    );
+
+    // The figure is the bound itself, not a margin above it: a queue of exactly the minimum is a
+    // queue a screen fits, so it is accepted.
+    session
+        .subscribe_within(projected, minimum)
+        .expect("a queue of exactly the smallest screen is enough");
+}

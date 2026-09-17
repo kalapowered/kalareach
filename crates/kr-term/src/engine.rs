@@ -1383,6 +1383,17 @@ impl Engine {
         now_ms: u64,
     ) -> (Snapshot, FeedOutcome) {
         let settled = self.quiesce(now_ms);
+        (self.screen_state(viewport), settled)
+    }
+
+    /// The screen's state for `viewport`, without its rows and without settling anything.
+    ///
+    /// [`Self::snapshot_without_rows`] is this after the held text tail has been released, which is
+    /// what a client is given. This is for the caller that only wants to know what the state
+    /// *costs* - the header of an installation, and how many rows follow it - because measuring a
+    /// screen is not a reason to change one.
+    #[must_use]
+    pub fn screen_state(&self, viewport: Viewport) -> Snapshot {
         let rows = Vec::new();
         let (oldest, _) = self.grid.stable_range();
         // The other buffer's own retention, because a client is sent both buffers' rows and each
@@ -1392,7 +1403,7 @@ impl Engine {
         let (top, bottom) = self.grid.margins_vertical();
         let (left, right) = self.grid.margins_horizontal();
         let (g0, g1) = self.grid.charsets();
-        let snapshot = Snapshot {
+        Snapshot {
             projection_generation: self.projection_generation,
             output_cursor: self.lexer.committed_offset(),
             active_buffer: self.active_buffer(),
@@ -1436,8 +1447,7 @@ impl Engine {
             evicted: oldest > 0,
             inactive_oldest_retained_row: inactive_oldest,
             inactive_evicted: inactive_oldest > 0,
-        };
-        (snapshot, settled)
+        }
     }
 
     /// A bounded run of one buffer's visible rows, starting at the `first` visible row.
