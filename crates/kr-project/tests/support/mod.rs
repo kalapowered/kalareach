@@ -390,10 +390,17 @@ impl PlantedSubmodule {
 
 /// Builds a parent repository with a submodule whose own configuration plants a filter.
 ///
+/// The submodule sits at `submodule_path` inside the parent, so a test can choose a path of its
+/// own and look for it in what the host says afterwards.
+///
 /// # Panics
 ///
 /// Panics when the repositories cannot be built.
-pub fn planted_submodule(parent_directory: &Path, name: &str) -> PlantedSubmodule {
+pub fn planted_submodule(
+    parent_directory: &Path,
+    name: &str,
+    submodule_path: &str,
+) -> PlantedSubmodule {
     let sentinels = parent_directory.join(format!("{name}-submodule-sentinels"));
     let marker = plant_marker(parent_directory, &format!("{name}-submodule"), &sentinels);
     // The child, with an attribute that names a filter.
@@ -421,13 +428,13 @@ pub fn planted_submodule(parent_directory: &Path, name: &str) -> PlantedSubmodul
             OsStr::new("add"),
             OsStr::new("--quiet"),
             child.as_os_str(),
-            OsStr::new("vendor/child"),
+            OsStr::new(submodule_path),
         ],
     );
     git_raw(&parent, ["commit", "-m", "the submodule"]);
     // The filter is configured where the submodule's own repository is, which is inside the
     // parent's modules directory rather than anywhere the parent's configuration names.
-    let inside = parent.join("vendor/child");
+    let inside = parent.join(submodule_path);
     git_raw(
         &inside,
         [
@@ -458,7 +465,7 @@ pub fn planted_submodule(parent_directory: &Path, name: &str) -> PlantedSubmodul
     let _ = std::fs::remove_dir_all(&sentinels);
     PlantedSubmodule {
         parent,
-        submodule_path: "vendor/child".to_owned(),
+        submodule_path: submodule_path.to_owned(),
         sentinels,
     }
 }

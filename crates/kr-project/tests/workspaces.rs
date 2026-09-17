@@ -1645,18 +1645,21 @@ fn a_workspace_holding_a_populated_submodule_is_kept_rather_than_removed() {
     // The status a removal reads asks Git to ignore submodules, because looking inside one would
     // run under a configuration this host has not audited. So an empty status is an empty status
     // of the tree *outside* its submodules, and work inside one is work this host has not read.
+    //
+    // The reason it records names two pieces of text this host did not write: the workspace's own
+    // path and the submodule's path out of the index. They carry a marker each, so a message that
+    // repeats either one is caught wherever it surfaces — the answer, a later read, and the repeat
+    // of the action, which is answered from the journal's own copy.
+    const TREE: &str = "access_token=HOLDERSECRET";
+    const NESTED: &str = "vendor/access_token=NESTEDSECRET";
     let fixture = Fixture::create();
-    let planted = support::planted_submodule(fixture.work(), "submodule-holder");
+    let planted = support::planted_submodule(fixture.work(), TREE, NESTED);
     let project = fixture
         .service()
         .project_adopt(
             &actor(),
             &ProjectAdoptParams {
-                destination: destination(
-                    fixture.environment_id(),
-                    fixture.work(),
-                    "submodule-holder",
-                ),
+                destination: destination(fixture.environment_id(), fixture.work(), TREE),
                 label: "holder".to_owned(),
                 flow: AdoptionFlow::ExistingCheckout,
             },
@@ -1685,18 +1688,17 @@ fn a_workspace_holding_a_populated_submodule_is_kept_rather_than_removed() {
         .expect("the workspace is created");
     let workspace_id = created.workspace.0.expect("it exists").workspace_id;
     assert!(
-        planted.parent.join("vendor/child").is_dir(),
+        planted.parent.join(NESTED).is_dir(),
         "the submodule's own tree is populated"
     );
+    let removal = action("workspace.remove", 62);
+    let params = WorkspaceRemoveParams {
+        workspace_id,
+        retention: RetentionPolicy::KeepEverything,
+    };
     let answer = fixture
         .service()
-        .workspace_remove(
-            &WorkspaceRemoveParams {
-                workspace_id,
-                retention: RetentionPolicy::KeepEverything,
-            },
-            Some(&action("workspace.remove", 62)),
-        )
+        .workspace_remove(&params, Some(&removal))
         .expect("the removal is answered");
     assert_eq!(answer.workspace.state, WorkspaceState::RemovalPending);
     assert!(
@@ -1707,34 +1709,57 @@ fn a_workspace_holding_a_populated_submodule_is_kept_rather_than_removed() {
         "the host says the submodule is work it has not read: {:?}",
         answer.retained
     );
-    // And that reason is a *successful* answer's field, read back out of the journal, so what a
-    // caller sent is not in it and what this host wrote is.
-    let read: kr_protocol::project::WorkspaceReadResult = fixture
+    // Every diagnostic in the first answer, in the read that follows it, and in the repeat of the
+    // action. Each of those is a *successful* reply: none of them crosses the error boundary, and
+    // the last is the journal's own copy rather than a message composed again.
+    let read = fixture
         .service()
         .workspace_read(&WorkspaceReadParams { workspace_id })
         .expect("the workspace reads");
-    for item in &read.workspace.retained {
-        assert!(
-            !item.detail.contains("submodule-holder/vendor"),
-            "a path in a retained reason is not repeated as it was: {:?}",
-            item.detail
-        );
-        assert!(
-            item.detail.contains("does not look inside"),
-            "and this host's own words are: {:?}",
-            item.detail
-        );
+    let repeated = fixture
+        .service()
+        .workspace_remove(&params, Some(&removal))
+        .expect("the repeat is answered from the journal");
+    let mut reasons: Vec<String> = Vec::new();
+    for summary in [&answer.workspace, &read.workspace, &repeated.workspace] {
+        reasons.extend(summary.detail.0.clone());
+        reasons.extend(summary.retained.iter().map(|item| item.detail.clone()));
+    }
+    for item in answer.retained.iter().chain(repeated.retained.iter()) {
+        reasons.push(item.detail.clone());
     }
     assert!(
-        planted.parent.join("vendor/child/a.txt").is_file(),
+        reasons
+            .iter()
+            .any(|reason| reason.contains("does not look inside")),
+        "the reason is in all three: {reasons:?}"
+    );
+    for reason in &reasons {
+        assert!(
+            !reason.contains("HOLDERSECRET"),
+            "no reason repeats the workspace's own path: {reason}"
+        );
+        assert!(
+            !reason.contains("NESTEDSECRET"),
+            "and none repeats the submodule's path out of the index: {reason}"
+        );
+    }
+    // The path the caller named is still answered with, because that is the value the request
+    // asked about rather than something this host is explaining.
+    assert!(
+        read.workspace.display_path.contains(TREE),
+        "a display path is data: {}",
+        read.workspace.display_path
+    );
+    assert!(
+        planted.parent.join(NESTED).join("a.txt").is_file(),
         "nothing inside the submodule was touched"
     );
     // And no marker inside the submodule ran while the removal measured what the workspace holds.
     assert!(
-        !planted.sentinels.exists()
-            || std::fs::read_dir(&planted.sentinels)
-                .is_ok_and(|mut entries| entries.next().is_none()),
-        "no planted helper ran"
+        planted.escaped().is_empty(),
+        "no planted helper ran: {:?}",
+        planted.escaped()
     );
 }
 

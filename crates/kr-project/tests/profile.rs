@@ -491,7 +491,7 @@ fn a_submodules_own_filter_never_runs_because_this_host_never_enters_one() {
     // submodule's dirtiness is what would enter it, so every read passes `--ignore-submodules=all`
     // and the submodules are counted from the index instead.
     let fixture = Fixture::create();
-    let planted = support::planted_submodule(fixture.work(), "with-submodule");
+    let planted = support::planted_submodule(fixture.work(), "with-submodule", "vendor/child");
     let repository = OpenedRepository::open(
         fixture.service().profile(),
         fixture.environment_id(),
