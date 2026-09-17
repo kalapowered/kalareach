@@ -2055,8 +2055,13 @@ impl Controller {
             },
             Method::SessionClose => {
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
-                self.session_close(mutation, &actor, accepted, carried)
-                    .await
+                let closed = self
+                    .session_close(mutation, &actor, accepted, carried)
+                    .await;
+                // A closure the host has accepted and not finished is a request outstanding, and
+                // the setting decides whether that keeps the machine awake while it finishes.
+                let _ = self.power_state().await;
+                closed
             }
             Method::AgentToolsInstall | Method::AgentToolsRemove => {
                 self.agent_tools_change(actor_id, mutation, method, connection_id, accepted)
@@ -2264,30 +2269,37 @@ impl Controller {
 
     /// Returns what this host has outstanding that justifies keeping it awake.
     ///
-    /// Both counts are of admitted work rather than of activity. A session counts when its worker
-    /// reports an agent working or a decision waiting for an answer; a create this daemon has
-    /// accepted and not yet resolved counts as a request outstanding. An idle shell counts for
-    /// nothing, however much output it has produced.
+    /// Both counts are of admitted work rather than of activity. A session counts as work when its
+    /// worker reports an agent working. A request counts as outstanding when the host has accepted
+    /// it and not finished it: a decision waiting for an answer, a closure that is still stopping
+    /// processes and draining their output, and a create that has not reported its worker yet. An
+    /// idle shell counts for nothing, however much output it has produced.
     async fn demand(&self) -> Demand {
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         let mut sessions_with_work = 0;
-        let mut awaiting = 0;
+        let mut outstanding = 0;
         for worker in workers {
             if let Ok(summary) = self.read_from_worker(&worker).await {
-                match summary.application_state.as_ref() {
-                    Some(kr_protocol::session::ApplicationState::AgentBusy) => {
-                        sessions_with_work += 1;
-                    }
-                    Some(kr_protocol::session::ApplicationState::AwaitingApproval) => {
-                        awaiting += 1;
-                    }
-                    _ => {}
+                if summary.application_state.as_ref()
+                    == Some(&kr_protocol::session::ApplicationState::AgentBusy)
+                {
+                    sessions_with_work += 1;
+                }
+                if summary.application_state.as_ref()
+                    == Some(&kr_protocol::session::ApplicationState::AwaitingApproval)
+                {
+                    outstanding += 1;
+                }
+                // A closure this host accepted and has not finished. Suspending in the middle of
+                // one is how a session's own processes stop being accounted for.
+                if summary.state == SessionState::Closing {
+                    outstanding += 1;
                 }
             }
         }
         Demand {
             sessions_with_work,
-            pending_requests: awaiting + self.pending.lock().await.len() as u64,
+            pending_requests: outstanding + self.pending.lock().await.len() as u64,
         }
     }
 
