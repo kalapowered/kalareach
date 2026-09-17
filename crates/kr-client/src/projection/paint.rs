@@ -945,6 +945,7 @@ mod fixtures {
             hyperlinks: BTreeMap::new(),
             oldest_retained_row: 0,
             evicted: false,
+            degraded: false,
         };
         let window = Window::of(&screen);
         (screen, window)

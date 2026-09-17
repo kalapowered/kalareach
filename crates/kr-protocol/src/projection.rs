@@ -550,6 +550,13 @@ pub struct ProjectionSnapshot {
     pub oldest_retained_row: U64,
     /// Whether rows below `oldest_retained_row` have been evicted.
     pub evicted: bool,
+    /// Whether the session has had to shorten content to stay inside a resident-state bound.
+    ///
+    /// Section 8 requires truncation to have an explicit projection degradation, and a client in
+    /// projected mode cannot see it any other way: a cell whose combining marks were dropped at
+    /// the per-cell bound, a title cut to its limit and a hyperlink the link table refused all
+    /// arrive looking like content the application wrote. This says they do not.
+    pub degraded: bool,
 }
 
 /// One page of rows belonging to one buffer of one snapshot.
@@ -626,6 +633,8 @@ pub struct ProjectionDelta {
     pub oldest_retained_row: U64,
     /// Whether rows below `oldest_retained_row` have been evicted.
     pub evicted: bool,
+    /// Whether the session has had to shorten content to stay inside a resident-state bound.
+    pub degraded: bool,
 }
 
 /// Why a projection was reset.

@@ -488,41 +488,6 @@ impl WorkerService {
                                 return;
                             }
                         }
-                        // A projected attachment is installed from state and draws it itself; one
-                        // whose destination is a terminal of the session's own size is installed
-                        // from bytes. Exactly one of the two is present.
-                        for event in &joined.projection {
-                            let event_type = event.event_type();
-                            let frame = match event {
-                                ProjectionEvent::Reset(reset) => {
-                                    notification(&stream_id, sequence, event_type, reset)
-                                }
-                                ProjectionEvent::Snapshot(header) => {
-                                    notification(&stream_id, sequence, event_type, header)
-                                }
-                                ProjectionEvent::Rows(page) => {
-                                    notification(&stream_id, sequence, event_type, page)
-                                }
-                                ProjectionEvent::Delta(delta) => {
-                                    notification(&stream_id, sequence, event_type, delta)
-                                }
-                            };
-                            let Some(frame) = frame else {
-                                continue;
-                            };
-                            sequence += 1;
-                            if !write_frame(
-                                &delivery_writable,
-                                &sender,
-                                &frame,
-                                &delivery_withdrawn,
-                                true,
-                            )
-                            .await
-                            {
-                                return;
-                            }
-                        }
                         if !send_screen(
                             &delivery_writable,
                             &sender,
@@ -2401,6 +2366,10 @@ impl WorkerService {
         // queue is started in the presentation the screen it was actually given supports.
         let joined = session.join(params.attachment_id)?;
         let stream = session.subscribe(params.attachment_id)?;
+        // A projected attachment's screen is queued now, through the subscription that has just
+        // been created, so it is charged to that subscriber's own bound. It is the first thing in
+        // the queue and therefore still the first thing the client receives.
+        session.install_projection(params.attachment_id)?;
         let oldest = session.snapshot().oldest_retained_cursor.get();
         // A client whose position has fallen out of the retained window is told so. The screen it
         // is about to be drawn is current either way; the gap says that what happened in between is
@@ -2415,7 +2384,6 @@ impl WorkerService {
         state.restoration = Some(JoinedScreen {
             cursor,
             bytes: joined.bytes,
-            projection: joined.projection,
             gap,
         });
         encode(&EventsSubscribeResult {
@@ -2803,12 +2771,11 @@ pub struct JoinedScreen {
     /// The cursor the screen was taken at. Live output continues from here.
     pub cursor: u64,
     /// The bytes that draw it, for an attachment whose destination is a terminal of this size.
-    pub bytes: Vec<u8>,
-    /// The events that install it, for a projected attachment.
     ///
-    /// A projected attachment holds the canonical grid as state and draws it itself, so it is sent
-    /// the snapshot and its row pages rather than a rendering somebody else made for it.
-    pub projection: Vec<kr_protocol::projection::ProjectionEvent>,
+    /// Empty for a projected attachment: it holds the canonical grid as state and draws it itself,
+    /// and its screen is queued through its own subscription so that it is charged to that
+    /// subscriber's bound rather than written around it.
+    pub bytes: Vec<u8>,
     /// The part of the stream that is no longer readable, when the client had fallen behind it.
     pub gap: Option<kr_protocol::recovery::HistoryGap>,
 }

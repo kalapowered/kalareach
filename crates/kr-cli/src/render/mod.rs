@@ -142,6 +142,23 @@ impl ProjectedDisplay {
         self.projection.screen().is_some()
     }
 
+    /// Discards the screen, because the session has said this terminal's view is no longer it.
+    ///
+    /// Called when the command is told to resynchronise or cannot decode an update. Drawing what
+    /// was held until the fresh screen arrives would be drawing something the session has already
+    /// said is not the session.
+    pub fn discard(&mut self) {
+        self.projection.discard();
+    }
+
+    /// Whether the session has said it shortened content to stay inside a resident-state bound.
+    #[must_use]
+    pub fn session_degraded(&self) -> bool {
+        self.projection
+            .screen()
+            .is_some_and(|screen| screen.degraded)
+    }
+
     /// What every frame so far could not carry.
     #[must_use]
     pub const fn losses(&self) -> Comparison {
@@ -170,10 +187,15 @@ impl ProjectedDisplay {
     /// a person told that something was clipped can ask for a wider window.
     #[must_use]
     pub fn degradation(&self) -> Option<String> {
-        if self.losses.complete() {
+        if self.losses.complete() && !self.session_degraded() {
             return None;
         }
         let mut parts = Vec::new();
+        if self.session_degraded() {
+            // The session's own answer, not this terminal's: content it had to shorten to stay
+            // inside a resident-state bound is content no window size can show.
+            parts.push("content the session shortened to stay inside its own bounds".to_owned());
+        }
         if self.losses.cells_clipped > 0 {
             let cells = usize::try_from(self.losses.cells_clipped).unwrap_or(usize::MAX);
             parts.push(format!(

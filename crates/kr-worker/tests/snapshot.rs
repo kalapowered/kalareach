@@ -498,6 +498,25 @@ async fn a_projected_attachment_receives_bounded_updates_rather_than_a_repaint_p
             CANONICAL.1
         );
     }
+    // And they carry the application's output rather than being empty messages with a valid cursor
+    // chain: each batch's text is in the rows of one of them.
+    let carried: Vec<String> = deltas
+        .iter()
+        .flat_map(|delta| {
+            delta.rows.iter().map(|row| {
+                row.runs
+                    .iter()
+                    .map(|run| run.text.as_str())
+                    .collect::<String>()
+            })
+        })
+        .collect();
+    for batch in ["second", "third"] {
+        assert!(
+            carried.iter().any(|row| row.contains(batch)),
+            "the {batch} batch reached the client as an update: {carried:?}"
+        );
+    }
     // The updates chain: each one continues from the cursor the previous one ended at.
     let mut held = events
         .iter()

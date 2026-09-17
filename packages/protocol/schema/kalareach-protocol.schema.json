@@ -9277,6 +9277,10 @@
           "$ref": "#/$defs/ProjectedCursor",
           "description": "The cursor after the update."
         },
+        "degraded": {
+          "description": "Whether the session has had to shorten content to stay inside a resident-state bound.",
+          "type": "boolean"
+        },
         "dimensions": {
           "anyOf": [
             {
@@ -9460,7 +9464,8 @@
         "dimensions",
         "saved_cursors",
         "oldest_retained_row",
-        "evicted"
+        "evicted",
+        "degraded"
       ],
       "type": "object"
     },
@@ -9586,6 +9591,10 @@
           "$ref": "#/$defs/ProjectedCursor",
           "description": "The cursor."
         },
+        "degraded": {
+          "description": "Whether the session has had to shorten content to stay inside a resident-state bound.\n\nSection 8 requires truncation to have an explicit projection degradation, and a client in\nprojected mode cannot see it any other way: a cell whose combining marks were dropped at\nthe per-cell bound, a title cut to its limit and a hyperlink the link table refused all\narrive looking like content the application wrote. This says they do not.",
+          "type": "boolean"
+        },
         "dimensions": {
           "$ref": "#/$defs/Dimensions",
           "description": "The canonical dimensions."
@@ -9694,7 +9703,8 @@
         "hyperlink",
         "palette",
         "oldest_retained_row",
-        "evicted"
+        "evicted",
+        "degraded"
       ],
       "type": "object"
     },

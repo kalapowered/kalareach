@@ -91,12 +91,21 @@ pub struct Screen {
     pub palette: PaletteState,
     /// The rows of each buffer, by stable identifier.
     pub rows: BTreeMap<(ProjectedBuffer, u64), ProjectedRow>,
-    /// The hyperlink ranges, by the row they belong to.
-    pub hyperlinks: BTreeMap<u64, Vec<HyperlinkRange>>,
+    /// The hyperlink ranges, by the buffer and the row they belong to.
+    ///
+    /// Both buffers hold a row zero, so a range keyed by the row alone would let the primary
+    /// buffer's link answer for a cell of the alternate buffer.
+    pub hyperlinks: BTreeMap<(ProjectedBuffer, u64), Vec<HyperlinkRange>>,
     /// The oldest row still retained anywhere.
     pub oldest_retained_row: u64,
     /// Whether rows below `oldest_retained_row` have been evicted.
     pub evicted: bool,
+    /// Whether the session has had to shorten content to stay inside a resident-state bound.
+    ///
+    /// The session says so explicitly, because a client drawing the canonical grid cannot tell a
+    /// cell whose combining marks were dropped at the per-cell bound from a cell the application
+    /// wrote that way.
+    pub degraded: bool,
 }
 
 /// Which spelling a tracked mode has, in a form a map can be keyed by.
@@ -158,10 +167,13 @@ impl Screen {
     /// a scheme that would launch an external application needs the client's own policy first.
     #[must_use]
     pub fn hyperlink_at(&self, row: u64, column: u64) -> Option<&str> {
-        self.hyperlinks.get(&row)?.iter().find_map(|range| {
-            (range.start_column.get() <= column && column < range.end_column.get())
-                .then_some(range.uri.as_str())
-        })
+        self.hyperlinks
+            .get(&(self.active_buffer, row))?
+            .iter()
+            .find_map(|range| {
+                (range.start_column.get() <= column && column < range.end_column.get())
+                    .then_some(range.uri.as_str())
+            })
     }
 
     /// The base this screen is, for the next update to continue from.
@@ -219,7 +231,7 @@ impl std::fmt::Display for Refusal {
 struct Installing {
     header: Box<ProjectionSnapshot>,
     rows: BTreeMap<(ProjectedBuffer, u64), ProjectedRow>,
-    hyperlinks: BTreeMap<u64, Vec<HyperlinkRange>>,
+    hyperlinks: BTreeMap<(ProjectedBuffer, u64), Vec<HyperlinkRange>>,
 }
 
 /// One client's projection of a session.
@@ -231,11 +243,25 @@ pub struct Projection {
     generation: Option<u64>,
 }
 
+/// DEC private mode 66, the application keypad.
+const KEYPAD_MODE: u64 = 66;
+
 impl Projection {
     /// A client holding nothing.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Discards the screen and any snapshot part way through arriving.
+    ///
+    /// Called wherever an update cannot be applied. Section 8's rule is that a mismatch installs a
+    /// new snapshot, and holding the old screen until it arrives would mean drawing a screen the
+    /// host has already said is not the session. A caller that has just been told to resynchronise
+    /// calls this before it asks.
+    pub fn discard(&mut self) {
+        self.screen = None;
+        self.installing = None;
     }
 
     /// The screen this client holds, once a snapshot has completed.
@@ -288,11 +314,16 @@ impl Projection {
 
     fn page(&mut self, page: ProjectionRowPage) -> Applied {
         let Some(installing) = self.installing.as_mut() else {
+            // A page for a snapshot this client is not installing. Whatever it holds is not what
+            // the session is sending, so it goes: a later final page must not be able to complete
+            // an installation out of the pages of two different snapshots.
+            self.discard();
             return Applied::Refused(Refusal::UnexpectedPage);
         };
         if page.projection_generation != installing.header.projection_generation
             || page.output_cursor != installing.header.output_cursor
         {
+            self.discard();
             return Applied::Refused(Refusal::WrongGeneration);
         }
         for row in page.rows {
@@ -309,15 +340,25 @@ impl Projection {
     }
 
     fn delta(&mut self, delta: ProjectionDelta) -> Applied {
-        let Some(screen) = self.screen.as_mut() else {
+        let Some(screen) = self.screen.as_ref() else {
+            self.discard();
             return Applied::Refused(Refusal::NoScreen);
         };
+        // Another generation is another screen, and another cursor is another moment in this one.
+        // What this client holds is then no longer the session, so it is discarded here rather
+        // than left for the next update to be applied to: a client that kept drawing it would be
+        // showing something nobody wrote.
         if delta.projection_generation.get() != screen.generation {
+            self.discard();
             return Applied::Refused(Refusal::WrongGeneration);
         }
         if delta.base_cursor.get() != screen.cursor_at {
+            self.discard();
             return Applied::Refused(Refusal::BaseMismatch);
         }
+        let Some(screen) = self.screen.as_mut() else {
+            return Applied::Refused(Refusal::NoScreen);
+        };
         let mut changed: Vec<u64> = Vec::with_capacity(delta.rows.len());
         // The viewport is applied before the rows. A scroll moves which identifiers are shown
         // without changing one of them, so a client that drew the rows against the old window
@@ -329,23 +370,30 @@ impl Projection {
             changed.push(row.row.get());
             screen.rows.insert((delta.buffer, row.row.get()), row);
         }
+        // A row that changed brings its own link ranges and nothing else: the row was redrawn, so
+        // whatever it held before is gone. Merging instead would leave a target clickable over
+        // cells that no longer carry it, which is the one thing inert metadata must not do.
+        for row in &changed {
+            screen.hyperlinks.remove(&(delta.buffer, *row));
+        }
         for range in delta.hyperlinks {
             screen
                 .hyperlinks
-                .entry(range.row.get())
-                .or_default()
-                .retain(|held| {
-                    held.end_column <= range.start_column || held.start_column >= range.end_column
-                });
-            screen
-                .hyperlinks
-                .entry(range.row.get())
+                .entry((delta.buffer, range.row.get()))
                 .or_default()
                 .push(range);
         }
         screen.cursor = delta.cursor;
         screen.cursor_at = delta.next_cursor.get();
         for mode in delta.modes {
+            // DECNKM is the keypad's own mode, and a screen carries that state twice: once as a
+            // mode and once as the field an input encoder reads. They move together, or an encoder
+            // would go on sending the wrong keys until the next snapshot.
+            if mode.kind == kr_protocol::projection::ProjectedModeKind::Dec
+                && mode.mode.get() == KEYPAD_MODE
+            {
+                screen.keypad_application = mode.enabled;
+            }
             screen
                 .modes
                 .insert((mode.kind.into(), mode.mode.get()), mode.enabled);
@@ -385,11 +433,19 @@ impl Projection {
         }
         screen.oldest_retained_row = delta.oldest_retained_row.get();
         screen.evicted = delta.evicted;
+        screen.degraded = delta.degraded;
         // Rows below the oldest retained one are gone from the session, so holding them would be
-        // holding something no later update can name.
+        // holding something no later update can name. Only for the buffer this update names: the
+        // alternate buffer keeps no scrollback, and applying the primary's cutoff to it would give
+        // up the whole of the screen a snapshot had just installed.
         let oldest = screen.oldest_retained_row;
-        screen.rows.retain(|(_, row), _| *row >= oldest);
-        screen.hyperlinks.retain(|row, _| *row >= oldest);
+        let buffer = delta.buffer;
+        screen
+            .rows
+            .retain(|(held, row), _| *held != buffer || *row >= oldest);
+        screen
+            .hyperlinks
+            .retain(|(held, row), _| *held != buffer || *row >= oldest);
         if scrolled {
             // Every visible line moved, so every one of them is redrawn. Nothing was reflowed and
             // no row changed; what changed is which rows the window holds.
@@ -411,15 +467,16 @@ fn screen_of(installing: Installing) -> Screen {
     for mode in &header.modes {
         modes.insert((mode.kind.into(), mode.mode.get()), mode.enabled);
     }
-    let mut hyperlinks = installing.hyperlinks;
+    let mut hyperlinks: BTreeMap<(ProjectedBuffer, u64), Vec<HyperlinkRange>> =
+        installing.hyperlinks;
     // A run that is inside a link carries the target, so the ranges follow from the rows rather
     // than being sent twice. Reconnection restores them as inert metadata: a later click works,
     // and nothing here activates anything.
-    for row in installing.rows.values() {
+    for ((buffer, _), row) in &installing.rows {
         for run in &row.runs {
             if let Some(uri) = run.hyperlink.as_ref() {
                 hyperlinks
-                    .entry(row.row.get())
+                    .entry((*buffer, row.row.get()))
                     .or_default()
                     .push(HyperlinkRange {
                         row: row.row,
@@ -455,6 +512,7 @@ fn screen_of(installing: Installing) -> Screen {
         hyperlinks,
         oldest_retained_row: header.oldest_retained_row.get(),
         evicted: header.evicted,
+        degraded: header.degraded,
     }
 }
 
@@ -559,6 +617,7 @@ mod tests {
             palette: palette(PaletteProvenance::DarkPreset),
             oldest_retained_row: U64::ZERO,
             evicted: false,
+            degraded: false,
         })
     }
 
@@ -634,6 +693,7 @@ mod tests {
             saved_cursors: Nullable::null(),
             oldest_retained_row: U64::ZERO,
             evicted: false,
+            degraded: false,
         })
     }
 
@@ -686,18 +746,23 @@ mod tests {
         );
     }
 
-    /// KR-REQ-08.83: a delta that names another base is refused rather than applied.
+    /// KR-REQ-08.83: a delta that names another base is refused, and what was held is discarded.
     #[test]
-    fn a_delta_against_another_base_is_refused() {
-        let mut projection = Projection::new();
-        projection.apply(ProjectionEvent::Snapshot(header(3, 40)));
-        projection.apply(ProjectionEvent::Rows(page(
-            3,
-            40,
-            vec![row(0, "ab", None)],
-            false,
-        )));
+    fn a_delta_against_another_base_is_refused_and_discards_the_screen() {
+        let installed = || {
+            let mut projection = Projection::new();
+            projection.apply(ProjectionEvent::Snapshot(header(3, 40)));
+            projection.apply(ProjectionEvent::Rows(page(
+                3,
+                40,
+                vec![row(0, "ab", None)],
+                false,
+            )));
+            projection
+        };
 
+        // A cursor that is not the one this client holds.
+        let mut projection = installed();
         assert_eq!(
             projection.apply(ProjectionEvent::Delta(delta(
                 39,
@@ -705,9 +770,16 @@ mod tests {
                 3,
                 vec![row(0, "zz", None)]
             ))),
-            Applied::Refused(Refusal::BaseMismatch),
-            "a cursor that is not the one this client holds"
+            Applied::Refused(Refusal::BaseMismatch)
         );
+        assert!(
+            projection.screen().is_none(),
+            "what it held is not the session any more, so it is not drawn while a snapshot is \
+             asked for"
+        );
+
+        // The same cursor in another generation is another screen.
+        let mut projection = installed();
         assert_eq!(
             projection.apply(ProjectionEvent::Delta(delta(
                 40,
@@ -715,17 +787,22 @@ mod tests {
                 4,
                 vec![row(0, "zz", None)]
             ))),
-            Applied::Refused(Refusal::WrongGeneration),
-            "the same cursor in another generation is another screen"
+            Applied::Refused(Refusal::WrongGeneration)
         );
-        let screen = projection.screen().expect("a screen");
-        assert_eq!(screen.cursor_at, 40, "nothing refused was applied");
+        assert!(projection.screen().is_none());
+        // And nothing that arrives afterwards can be applied to it.
         assert_eq!(
-            screen.row(0).expect("row 0").runs[0].text,
-            "ab",
-            "and the row the client holds is untouched"
+            projection.apply(ProjectionEvent::Delta(delta(
+                40,
+                48,
+                3,
+                vec![row(0, "zz", None)]
+            ))),
+            Applied::Refused(Refusal::NoScreen)
         );
 
+        // The one that does name the base this client holds.
+        let mut projection = installed();
         assert_eq!(
             projection.apply(ProjectionEvent::Delta(delta(
                 40,
@@ -738,6 +815,123 @@ mod tests {
         let screen = projection.screen().expect("a screen");
         assert_eq!(screen.cursor_at, 48);
         assert_eq!(screen.row(0).expect("row 0").runs[0].text, "zz");
+    }
+
+    /// KR-REQ-08.83: a page for another snapshot cannot complete the one being installed.
+    #[test]
+    fn a_page_from_another_snapshot_discards_the_installation() {
+        let mut projection = Projection::new();
+        projection.apply(ProjectionEvent::Snapshot(header(1, 0)));
+        projection.apply(ProjectionEvent::Rows(page(
+            1,
+            0,
+            vec![row(0, "first half", None)],
+            true,
+        )));
+        // A final page belonging to another snapshot. Completing the installation with it would
+        // make one screen out of the halves of two.
+        assert_eq!(
+            projection.apply(ProjectionEvent::Rows(page(
+                2,
+                9,
+                vec![row(1, "other half", None)],
+                false
+            ))),
+            Applied::Refused(Refusal::WrongGeneration)
+        );
+        assert!(projection.screen().is_none(), "no screen was made");
+        assert!(
+            !projection.installing(),
+            "and the half that had arrived is not waiting for the next page to finish it"
+        );
+    }
+
+    /// KR-REQ-08.83: the keypad state and its mode move together.
+    #[test]
+    fn the_keypad_state_travels_with_its_mode() {
+        let mut projection = Projection::new();
+        projection.apply(ProjectionEvent::Snapshot(header(1, 0)));
+        projection.apply(ProjectionEvent::Rows(page(1, 0, Vec::new(), false)));
+        assert!(!projection.screen().expect("a screen").keypad_application);
+
+        let mut keypad = delta(0, 3, 1, Vec::new());
+        keypad.modes = vec![ProjectedMode {
+            kind: ProjectedModeKind::Dec,
+            mode: U64::new(66),
+            enabled: true,
+        }];
+        projection.apply(ProjectionEvent::Delta(keypad));
+        let screen = projection.screen().expect("a screen");
+        assert!(
+            screen.keypad_application,
+            "an input encoder reads this field, and it now says what the mode says"
+        );
+        assert!(screen.mode(ProjectedModeSpelling::Dec, 66));
+    }
+
+    /// KR-ACC-002: a row redrawn without a link leaves no link behind.
+    #[test]
+    fn a_row_redrawn_without_a_link_leaves_no_link_behind() {
+        let mut projection = Projection::new();
+        projection.apply(ProjectionEvent::Snapshot(header(1, 0)));
+        projection.apply(ProjectionEvent::Rows(page(
+            1,
+            0,
+            vec![row(0, "docs", Some("https://example.invalid/guide"))],
+            false,
+        )));
+        assert!(
+            projection
+                .screen()
+                .expect("a screen")
+                .hyperlink_at(0, 1)
+                .is_some()
+        );
+
+        // The application redraws that row as plain text. The target is gone from the session, so
+        // it has to be gone from the client: inert metadata that outlived its cells would make a
+        // later click open something nobody is looking at.
+        projection.apply(ProjectionEvent::Delta(delta(
+            0,
+            5,
+            1,
+            vec![row(0, "text", None)],
+        )));
+        assert_eq!(
+            projection.screen().expect("a screen").hyperlink_at(0, 1),
+            None
+        );
+    }
+
+    /// KR-REQ-08.79: the alternate buffer keeps no scrollback, so no eviction applies to it.
+    #[test]
+    fn an_eviction_of_the_primary_history_leaves_the_alternate_screen_alone() {
+        let mut projection = Projection::new();
+        projection.apply(ProjectionEvent::Snapshot(header(1, 0)));
+        let mut alternate = page(1, 0, vec![row(0, "the application", None)], true);
+        alternate.buffer = ProjectedBuffer::Alternate;
+        projection.apply(ProjectionEvent::Rows(alternate));
+        projection.apply(ProjectionEvent::Rows(page(
+            1,
+            0,
+            vec![row(0, "the shell", None), row(1, "and more", None)],
+            false,
+        )));
+
+        let mut evicting = delta(0, 3, 1, Vec::new());
+        evicting.oldest_retained_row = U64::new(1);
+        evicting.evicted = true;
+        projection.apply(ProjectionEvent::Delta(evicting));
+        let screen = projection.screen().expect("a screen");
+        assert!(
+            screen.rows.contains_key(&(ProjectedBuffer::Alternate, 0)),
+            "the alternate buffer's row zero is the whole of that screen, not evicted history"
+        );
+        assert!(
+            !screen.rows.contains_key(&(ProjectedBuffer::Primary, 0)),
+            "and the primary buffer's evicted row is gone"
+        );
+        assert!(screen.rows.contains_key(&(ProjectedBuffer::Primary, 1)));
     }
 
     /// KR-REQ-08.80: an update before any snapshot is refused, and a reset discards the screen.

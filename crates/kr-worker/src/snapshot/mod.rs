@@ -18,11 +18,18 @@
 //! | What | Bound | Where it comes from |
 //! | --- | --- | --- |
 //! | Rows in one page | [`MAX_PROJECTION_PAGE_ROWS`] | Section 8's history-page limit |
-//! | Encoded bytes in one page | [`MAX_PROJECTION_PAGE_BYTES`] | The same |
-//! | Rows in one delta | One page's worth | Past it the update is a repaint, and a snapshot is sent |
+//! | Encoded bytes in one page | [`PAGE_BYTES`] | Section 8's page limit and the control-frame limit, whichever binds |
+//! | Values in one page | [`PAGE_ITEMS`] | The codec's own item limit |
+//! | Rows in one delta | One page's worth of all three | Past any of them the update is a repaint, and a snapshot is sent |
 //! | Replay window | The engine's checkpoint window | A base outside it is a gap |
 //!
-//! A row that alone exceeds the byte bound is not dropped and not silently shortened: its runs are
+//! Every one of those is **measured** rather than estimated: a page is built from the encoded cost
+//! of each row, and the event that carries it is charged to its subscriber's queue at the length it
+//! actually encodes to. An estimate of a structure this shape is wrong by an order of magnitude,
+//! and a page built from a wrong estimate is a frame the transport refuses to carry — which is a
+//! client left with no screen and no marker telling it so.
+//!
+//! A row that alone exceeds a page bound is not dropped and not silently shortened: its runs are
 //! cut and the row is marked truncated, which is the explicit projection degradation section 8
 //! asks for.
 
@@ -39,6 +46,7 @@ use kr_protocol::projection::{
 use kr_protocol::scalars::{Nullable, U64};
 use kr_term::palette::{Palette, PaletteSource, Rgb};
 use kr_term::snapshot::{ActiveBuffer, Delta, Snapshot, Viewport};
+use wire::Cost;
 
 use crate::error::Result;
 
@@ -154,11 +162,50 @@ impl Bases {
     }
 }
 
+/// What a frame may cost, in bytes.
+///
+/// The smaller of section 8's page limit and what a control frame can carry once the notification
+/// around it and the stream header in front of it are accounted for. A page that met the first and
+/// missed the second would be built and then refused by the transport.
+pub const PAGE_BYTES: usize = {
+    let framed = kr_protocol::limits::MAX_CONTROL_FRAME_LEN
+        - kr_protocol::limits::MAX_STREAM_HEADER_LEN
+        - ENVELOPE_RESERVE;
+    let section_eight = MAX_PROJECTION_PAGE_BYTES as usize;
+    if framed < section_eight {
+        framed
+    } else {
+        section_eight
+    }
+};
+
+/// What a frame may cost, in values.
+///
+/// The codec counts every scalar, array, map and key against one limit for the whole message, and
+/// a page of one run per cell reaches it long before the byte limit. The reserve is the page's own
+/// fields and the notification around it.
+pub const PAGE_ITEMS: usize = 65_536 - ENVELOPE_RESERVE_ITEMS;
+
+/// What the notification around a payload costs, with room to spare.
+const ENVELOPE_RESERVE: usize = 8 * 1024;
+
+/// What the notification around a payload costs in values, with room to spare.
+const ENVELOPE_RESERVE_ITEMS: usize = 1_024;
+
+/// One event, with what it costs the subscriber's queue.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Outgoing {
+    /// The event.
+    pub event: ProjectionEvent,
+    /// The bytes it encodes to, which is what its subscriber's queue is charged.
+    pub bytes: usize,
+}
+
 /// The events one attachment is owed, and the base it holds once they have been sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Update {
     /// The events, in the order they must be delivered.
-    pub events: Vec<ProjectionEvent>,
+    pub events: Vec<Outgoing>,
     /// The base the client holds after applying them.
     pub base: Base,
 }
@@ -169,6 +216,28 @@ impl Update {
     pub fn is_empty(&self) -> bool {
         self.events.is_empty()
     }
+
+    /// What every event in it costs a subscriber's queue.
+    #[must_use]
+    pub fn bytes(&self) -> usize {
+        self.events
+            .iter()
+            .fold(0_usize, |total, event| total.saturating_add(event.bytes))
+    }
+}
+
+/// Wraps one event with the cost of the payload it carries.
+fn outgoing(event: ProjectionEvent) -> Outgoing {
+    let bytes = match &event {
+        ProjectionEvent::Reset(reset) => wire::measure(reset),
+        ProjectionEvent::Snapshot(header) => wire::measure(header),
+        ProjectionEvent::Rows(page) => wire::measure(page),
+        ProjectionEvent::Delta(delta) => wire::measure(delta),
+    }
+    // A payload the codec cannot represent is charged the whole frame, so the subscriber whose
+    // queue it would fill is resynchronised rather than sent something nothing can decode.
+    .map_or(PAGE_BYTES, |cost| cost.bytes);
+    Outgoing { event, bytes }
 }
 
 /// Builds the events that install `snapshot` on a client showing `viewport`.
@@ -185,17 +254,18 @@ pub fn install(
     snapshot: &Snapshot,
     viewport: Viewport,
     reason: ProjectionResetReason,
+    degraded: bool,
 ) -> Result<Update> {
     let generation = snapshot.projection_generation;
     let cursor = snapshot.output_cursor;
     let oldest = wire::row_id(snapshot.oldest_retained_row)?;
     let mut events = vec![
-        ProjectionEvent::Reset(ProjectionReset {
+        outgoing(ProjectionEvent::Reset(ProjectionReset {
             projection_generation: U64::new(generation),
             cursor: U64::new(cursor),
             reason,
-        }),
-        ProjectionEvent::Snapshot(Box::new(ProjectionSnapshot {
+        })),
+        outgoing(ProjectionEvent::Snapshot(Box::new(ProjectionSnapshot {
             projection_generation: U64::new(generation),
             output_cursor: U64::new(cursor),
             active_buffer: wire::buffer(snapshot.active_buffer),
@@ -227,7 +297,8 @@ pub fn install(
             palette: wire::palette(&snapshot.palette),
             oldest_retained_row: oldest,
             evicted: snapshot.evicted,
-        })),
+            degraded,
+        }))),
     ];
 
     // The buffer that is not showing is paged first, so a client that switches to it later already
@@ -242,14 +313,29 @@ pub fn install(
         (inactive_buffer, &snapshot.inactive_rows),
         (wire::buffer(snapshot.active_buffer), &snapshot.rows),
     ] {
+        // Retention belongs to the buffer that has a scrollback. The alternate buffer keeps no
+        // history, so its own oldest row is the first row it holds and nothing below it was ever
+        // evicted; labelling its pages with the primary's cutoff would tell a client to give up
+        // rows that are the whole of that screen.
+        let (page_oldest, page_evicted) = if buffer == ProjectedBuffer::Primary {
+            (oldest, snapshot.evicted)
+        } else {
+            (
+                rows.first()
+                    .map(|row| wire::row_id(row.stable_id))
+                    .transpose()?
+                    .unwrap_or(U64::ZERO),
+                false,
+            )
+        };
         for page in paginate(wire::rows(rows)?) {
             pages.push(ProjectionRowPage {
                 projection_generation: U64::new(generation),
                 output_cursor: U64::new(cursor),
                 buffer,
                 rows: page,
-                oldest_retained_row: oldest,
-                evicted: snapshot.evicted,
+                oldest_retained_row: page_oldest,
+                evicted: page_evicted,
                 more: true,
             });
         }
@@ -270,7 +356,11 @@ pub fn install(
     if let Some(last) = pages.last_mut() {
         last.more = false;
     }
-    events.extend(pages.into_iter().map(ProjectionEvent::Rows));
+    events.extend(
+        pages
+            .into_iter()
+            .map(|page| outgoing(ProjectionEvent::Rows(page))),
+    );
     Ok(Update {
         events,
         base: Base { cursor, generation },
@@ -303,6 +393,7 @@ pub fn advance(
     viewport: Viewport,
     oldest_retained_row: i64,
     evicted: bool,
+    degraded: bool,
     held_viewport: Option<Viewport>,
 ) -> Result<Owed> {
     let mut rows = wire::rows(&delta.rows)?;
@@ -320,46 +411,52 @@ pub fn advance(
     }
     let generation = delta.projection_generation;
     Ok(Owed::Update(Update {
-        events: vec![ProjectionEvent::Delta(Box::new(ProjectionDelta {
-            base_cursor: U64::new(delta.base_cursor),
-            next_cursor: U64::new(delta.next_cursor),
-            projection_generation: U64::new(generation),
-            buffer: wire::buffer(buffer),
-            viewport: wire::viewport(viewport)?,
-            rows,
-            cursor: wire::cursor(delta.cursor),
-            modes: delta.modes.iter().map(|entry| wire::mode(*entry)).collect(),
-            margins: Nullable(delta.margins.map(wire::margins)),
-            rendition: Nullable(delta.rendition.map(wire::rendition)),
-            tab_stops: Nullable(
-                delta
-                    .tab_stops
-                    .as_ref()
-                    .map(|stops| stops.iter().map(|at| wire::cells(*at)).collect()),
-            ),
-            charsets: Nullable(delta.charsets.as_ref().map(wire::charsets)),
-            hyperlinks: wire::hyperlinks(&delta.hyperlinks)?,
-            hyperlink: Nullable(delta.hyperlink.as_ref().map(|uri| {
-                kr_protocol::projection::HyperlinkChange {
-                    uri: Nullable(uri.clone()),
-                }
-            })),
-            title: Nullable(delta.title.as_ref().map(wire::title)),
-            title_stack: Nullable(
-                delta
-                    .title_stack
-                    .as_ref()
-                    .map(|stack| stack.iter().map(wire::saved_title).collect()),
-            ),
-            keyboard: Nullable(delta.keyboard.as_ref().map(wire::keyboard)),
-            palette: Nullable(delta.palette.as_ref().map(wire::palette)),
-            dimensions: Nullable(delta.dimensions.map(|size| {
-                kr_protocol::session::Dimensions::new(u64::from(size.cols), u64::from(size.rows))
-            })),
-            saved_cursors: Nullable(delta.saved_cursors.as_ref().map(wire::saved_cursors)),
-            oldest_retained_row: wire::row_id(oldest_retained_row)?,
-            evicted,
-        }))],
+        events: vec![outgoing(ProjectionEvent::Delta(Box::new(
+            ProjectionDelta {
+                base_cursor: U64::new(delta.base_cursor),
+                next_cursor: U64::new(delta.next_cursor),
+                projection_generation: U64::new(generation),
+                buffer: wire::buffer(buffer),
+                viewport: wire::viewport(viewport)?,
+                rows,
+                cursor: wire::cursor(delta.cursor),
+                modes: delta.modes.iter().map(|entry| wire::mode(*entry)).collect(),
+                margins: Nullable(delta.margins.map(wire::margins)),
+                rendition: Nullable(delta.rendition.map(wire::rendition)),
+                tab_stops: Nullable(
+                    delta
+                        .tab_stops
+                        .as_ref()
+                        .map(|stops| stops.iter().map(|at| wire::cells(*at)).collect()),
+                ),
+                charsets: Nullable(delta.charsets.as_ref().map(wire::charsets)),
+                hyperlinks: wire::hyperlinks(&delta.hyperlinks)?,
+                hyperlink: Nullable(delta.hyperlink.as_ref().map(|uri| {
+                    kr_protocol::projection::HyperlinkChange {
+                        uri: Nullable(uri.clone()),
+                    }
+                })),
+                title: Nullable(delta.title.as_ref().map(wire::title)),
+                title_stack: Nullable(
+                    delta
+                        .title_stack
+                        .as_ref()
+                        .map(|stack| stack.iter().map(wire::saved_title).collect()),
+                ),
+                keyboard: Nullable(delta.keyboard.as_ref().map(wire::keyboard)),
+                palette: Nullable(delta.palette.as_ref().map(wire::palette)),
+                dimensions: Nullable(delta.dimensions.map(|size| {
+                    kr_protocol::session::Dimensions::new(
+                        u64::from(size.cols),
+                        u64::from(size.rows),
+                    )
+                })),
+                saved_cursors: Nullable(delta.saved_cursors.as_ref().map(wire::saved_cursors)),
+                oldest_retained_row: wire::row_id(oldest_retained_row)?,
+                evicted,
+                degraded,
+            },
+        )))],
         base: Base {
             cursor: delta.next_cursor,
             generation,
@@ -401,63 +498,38 @@ pub fn reset(generation: u64, cursor: u64, reason: ProjectionResetReason) -> Pro
     })
 }
 
-/// What one event costs a subscriber's send queue.
-///
-/// The queue is bounded in bytes and an event is not bytes until something encodes it, so the cost
-/// is measured here rather than guessed at by the hub. It counts the rows the way a page bound
-/// counts them and adds a fixed envelope for the state around them, which is what the header and
-/// the delta carry whatever their rows are.
-#[must_use]
-pub fn event_bytes(event: &ProjectionEvent) -> usize {
-    /// What a header costs before its rows: the modes, the palette, the tab stops and the rest.
-    const HEADER_ENVELOPE: usize = 4 * 1024;
-    /// What a delta or a reset costs before its rows.
-    const UPDATE_ENVELOPE: usize = 512;
-    let rows = |rows: &[ProjectedRow]| -> usize {
-        rows.iter()
-            .fold(0_u64, |total, row| {
-                total.saturating_add(wire::row_bytes(row))
-            })
-            .try_into()
-            .unwrap_or(usize::MAX)
-    };
-    match event {
-        ProjectionEvent::Reset(_) => UPDATE_ENVELOPE,
-        ProjectionEvent::Snapshot(_) => HEADER_ENVELOPE,
-        ProjectionEvent::Rows(page) => UPDATE_ENVELOPE.saturating_add(rows(&page.rows)),
-        ProjectionEvent::Delta(delta) => UPDATE_ENVELOPE.saturating_add(rows(&delta.rows)),
-    }
-}
-
-/// Whether these rows fit one page under both bounds.
+/// Whether these rows fit one page under every bound.
 fn fits_one_page(rows: &[ProjectedRow]) -> bool {
     if rows.len() as u64 > MAX_PROJECTION_PAGE_ROWS {
         return false;
     }
-    let total: u64 = rows.iter().fold(0_u64, |total, row| {
-        total.saturating_add(wire::row_bytes(row))
-    });
-    total <= MAX_PROJECTION_PAGE_BYTES
+    let mut total = Cost::default();
+    for row in rows {
+        total.absorb(wire::row_cost(row));
+    }
+    total.fits(PAGE_BYTES, PAGE_ITEMS)
 }
 
-/// Splits rows into pages, each inside both bounds.
+/// Splits rows into pages, each inside every bound.
 ///
 /// A row larger than a whole page is still representable: it is cut to the bound and marked
 /// truncated, because a reader that could never get past it would never see the rows after it.
 fn paginate(rows: Vec<ProjectedRow>) -> Vec<Vec<ProjectedRow>> {
     let mut pages: Vec<Vec<ProjectedRow>> = Vec::new();
     let mut page: Vec<ProjectedRow> = Vec::new();
-    let mut bytes = 0_u64;
+    let mut held = Cost::default();
     for mut row in rows {
         truncate_row(&mut row);
-        let cost = wire::row_bytes(&row);
-        let full = page.len() as u64 >= MAX_PROJECTION_PAGE_ROWS
-            || bytes.saturating_add(cost) > MAX_PROJECTION_PAGE_BYTES;
+        let cost = wire::row_cost(&row);
+        let mut with_it = held;
+        with_it.absorb(cost);
+        let full =
+            page.len() as u64 >= MAX_PROJECTION_PAGE_ROWS || !with_it.fits(PAGE_BYTES, PAGE_ITEMS);
         if full && !page.is_empty() {
             pages.push(core::mem::take(&mut page));
-            bytes = 0;
+            held = Cost::default();
         }
-        bytes = bytes.saturating_add(cost);
+        held.absorb(cost);
         page.push(row);
     }
     if !page.is_empty() {
@@ -466,30 +538,39 @@ fn paginate(rows: Vec<ProjectedRow>) -> Vec<Vec<ProjectedRow>> {
     pages
 }
 
-/// Cuts one row's runs to the page bound, marking it truncated when anything was left out.
+/// Cuts one row's runs to the page bounds, marking it truncated when anything was left out.
+///
+/// Both bounds, because a row of one run per cell reaches the codec's item limit while its bytes
+/// are still well inside the frame.
 fn truncate_row(row: &mut ProjectedRow) {
-    if wire::row_bytes(row) <= MAX_PROJECTION_PAGE_BYTES {
+    if wire::row_cost(row).fits(PAGE_BYTES, PAGE_ITEMS) {
         return;
     }
-    let mut kept: Vec<kr_protocol::projection::CellRun> = Vec::new();
-    let mut bytes = wire::row_bytes(&ProjectedRow {
+    let empty = ProjectedRow {
         row: row.row,
         soft_wrapped: row.soft_wrapped,
         truncated: true,
         runs: Vec::new(),
-    });
+    };
+    let envelope = wire::row_cost(&empty);
+    let mut kept: Vec<kr_protocol::projection::CellRun> = Vec::new();
+    let mut held = envelope;
     for run in core::mem::take(&mut row.runs) {
-        let cost = wire::row_bytes(&ProjectedRow {
-            row: row.row,
-            soft_wrapped: row.soft_wrapped,
-            truncated: true,
-            runs: vec![run.clone()],
+        let mut one = empty.clone();
+        one.runs = vec![run.clone()];
+        // What this run adds is what a row holding only it costs, less the row's own envelope,
+        // which the running total already carries.
+        let alone = wire::row_cost(&one);
+        let mut with_it = held;
+        with_it.absorb(Cost {
+            bytes: alone.bytes.saturating_sub(envelope.bytes),
+            items: alone.items.saturating_sub(envelope.items),
         });
-        if bytes.saturating_add(cost) > MAX_PROJECTION_PAGE_BYTES {
+        if !with_it.fits(PAGE_BYTES, PAGE_ITEMS) {
             row.truncated = true;
             break;
         }
-        bytes = bytes.saturating_add(cost);
+        held = with_it;
         kept.push(run);
     }
     row.runs = kept;
@@ -525,6 +606,20 @@ mod tests {
         assert_eq!(pages[2].len(), 500);
     }
 
+    /// Measures one page as the transport would carry it.
+    fn framed(page: &[ProjectedRow]) -> Cost {
+        wire::measure(&ProjectionRowPage {
+            projection_generation: U64::new(1),
+            output_cursor: U64::ZERO,
+            buffer: ProjectedBuffer::Primary,
+            rows: page.to_vec(),
+            oldest_retained_row: U64::ZERO,
+            evicted: false,
+            more: true,
+        })
+        .expect("a page the codec can represent")
+    }
+
     #[test]
     fn a_page_holds_at_most_the_byte_bound() {
         let wide = "y".repeat(200 * 1024);
@@ -535,10 +630,58 @@ mod tests {
             "twelve rows of 200 KiB do not fit one page"
         );
         for page in &pages {
-            let total: u64 = page.iter().map(wire::row_bytes).sum();
+            // The page as one message, which is what the transport carries and what it refuses.
+            let cost = framed(page);
             assert!(
-                total <= MAX_PROJECTION_PAGE_BYTES,
-                "a page stayed inside the byte bound"
+                cost.bytes <= kr_protocol::limits::MAX_CONTROL_FRAME_LEN,
+                "a page fits one control frame: {cost:?}"
+            );
+            assert!(cost.items <= 65_536, "and the codec's item limit: {cost:?}");
+        }
+    }
+
+    /// KR-REQ-08.83: a page of one run per cell reaches the value bound long before the byte one.
+    #[test]
+    fn a_page_holds_at_most_the_value_bound() {
+        // Twenty rows of 120 columns, every cell its own run, which is what alternating attributes
+        // produce. Their bytes are well inside one frame; their values are not, and a bound counted
+        // in bytes alone would put them all in one page.
+        let cell = |column: u64| CellRun {
+            column: U64::new(column),
+            cells: U64::new(1),
+            text: "x".to_owned(),
+            rendition: CellRendition::PLAIN,
+            hyperlink: Nullable::null(),
+        };
+        let rows: Vec<ProjectedRow> = (0..20)
+            .map(|id| ProjectedRow {
+                row: U64::new(id),
+                soft_wrapped: false,
+                truncated: false,
+                runs: (0..120).map(cell).collect(),
+            })
+            .collect();
+        let bytes: usize = rows.iter().map(|row| wire::row_cost(row).bytes).sum();
+        let items: usize = rows.iter().map(|row| wire::row_cost(row).items).sum();
+        assert!(
+            bytes < PAGE_BYTES,
+            "all twenty rows are inside the byte bound: {bytes} bytes"
+        );
+        assert!(
+            items > PAGE_ITEMS,
+            "and outside the value bound: {items} values"
+        );
+        let pages = paginate(rows);
+        assert!(
+            pages.len() > 1,
+            "and are still more than one page, because the values are what bind"
+        );
+        for page in &pages {
+            let cost = framed(page);
+            assert!(cost.items <= 65_536, "each page is decodable: {cost:?}");
+            assert!(
+                cost.bytes <= kr_protocol::limits::MAX_CONTROL_FRAME_LEN,
+                "and carryable: {cost:?}"
             );
         }
     }
@@ -639,6 +782,7 @@ mod tests {
                 ActiveBuffer::Primary,
                 window,
                 0,
+                false,
                 false,
                 Some(window)
             )

@@ -431,7 +431,8 @@ impl TerminalEngine {
         let mut viewport = viewport;
         viewport.top_row = self.engine.grid().visible_top_row();
         snapshot.viewport = viewport;
-        let update = crate::snapshot::install(&snapshot, viewport, reason)?;
+        let degraded = self.resident_state_truncated();
+        let update = crate::snapshot::install(&snapshot, viewport, reason, degraded)?;
         Ok((update, settled))
     }
 
@@ -462,8 +463,24 @@ impl TerminalEngine {
             self.anchored_viewport(dimensions),
             oldest,
             oldest > 0,
+            self.resident_state_truncated(),
             Some(held.viewport),
         )
+    }
+
+    /// Whether this session has had to shorten content to stay inside a resident-state bound.
+    ///
+    /// Section 8 requires truncation to have an explicit projection degradation. A client drawing
+    /// the canonical grid cannot tell a cell whose combining marks were dropped at the per-cell
+    /// bound from a cell the application wrote that way, so the fact travels with the projection.
+    #[must_use]
+    pub fn resident_state_truncated(&self) -> bool {
+        self.engine
+            .diagnostic_totals()
+            .into_iter()
+            .any(|(kind, total)| {
+                kind == kr_term::diag::DiagnosticKind::ResidentStateTruncated && total > 0
+            })
     }
 
     /// The generation every projection update currently names.

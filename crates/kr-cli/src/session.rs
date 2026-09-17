@@ -362,8 +362,9 @@ async fn drive(
                                 )
                             else {
                                 // A payload this build cannot decode is not drawn and not guessed
-                                // at. The screen is asked for again, which is what any update this
-                                // terminal cannot apply leads to.
+                                // at. What is held goes with it, because the next thing drawn has
+                                // to be a screen this terminal was actually sent.
+                                display.discard();
                                 let request_id = kr_protocol::ids::RequestId::new(next_request);
                                 next_request += 1;
                                 if !resubscribe(client, descriptor, request_id, attachment_id).await
@@ -406,6 +407,10 @@ async fn drive(
                         // a window would lose their session — so the marker is answered by asking
                         // for the screen again, which is what the marker is for.
                         if notification.event_type.as_str() == "session.resync" {
+                            // Whatever this terminal was holding is no longer the session's screen.
+                            // It is discarded before the fresh one is asked for, so nothing is
+                            // drawn from it in between.
+                            display.discard();
                             let request_id = kr_protocol::ids::RequestId::new(next_request);
                             next_request += 1;
                             if !resubscribe(client, descriptor, request_id, attachment_id).await {

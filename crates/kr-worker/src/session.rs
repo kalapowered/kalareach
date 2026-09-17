@@ -124,17 +124,18 @@ pub struct Interrupted {
 
 /// The screen one attachment joins on.
 ///
-/// Exactly one of the two halves is present, and which one depends on how that attachment is
-/// served: `bytes` for a terminal the session's own size that can take the stream, `projection`
-/// for a client that holds the canonical grid as state and draws it itself.
+/// Only a terminal the session's own size that can take the stream has one here. A projected
+/// client holds the canonical grid as state and draws it itself, and its screen is queued through
+/// its own subscription so that it is charged to that subscriber's bound.
 #[derive(Clone, Debug, Default)]
 pub struct Joined {
     /// The cursor the screen was taken at. Live output continues from here.
     pub cursor: u64,
     /// The bytes that put a terminal into the session's state.
+    ///
+    /// Empty for a projected attachment: its screen is state rather than bytes, and it is queued
+    /// through its own subscription by [`Session::install_projection`].
     pub bytes: Vec<u8>,
-    /// The events that install the canonical screen on a projected client.
-    pub projection: Vec<kr_protocol::projection::ProjectionEvent>,
 }
 
 /// One live session.
@@ -713,52 +714,53 @@ impl Session {
     /// Returns [`WorkerError::UnknownAttachment`] when the identifier names no attachment of this
     /// session.
     pub fn join(&mut self, attachment_id: AttachmentId) -> Result<Joined> {
-        let dimensions = self.attachment_dimensions(attachment_id)?;
         // Whether this attachment may be handed the stream at all is settled first. A screen and a
         // byte cursor have to name the same boundary, so an attachment joining while the parser is
         // mid-sequence is served a projection and moves to forwarding when a boundary arrives.
         self.settle_forwarding(kr_ipc::now_ms().get());
-        if self.presentation_of(attachment_id) != crate::output::Presentation::Projected {
-            let (cursor, bytes) = self.restoration(attachment_id)?;
+        if self.presentation_of(attachment_id) == crate::output::Presentation::Projected {
+            // The screen is settled here, before this attachment has a queue, and whatever that
+            // released is delivered to the attachments that were already watching. Settling inside
+            // the snapshot instead would let this client's snapshot swallow a character that was
+            // owed to another.
+            self.deliver(crate::projection::Filtered::default());
+            // Its own screen is state, and it goes through the queue like every other delivery, so
+            // that it is charged to this subscriber's bound rather than written around it. That
+            // happens in `install_projection`, once the queue exists.
             return Ok(Joined {
-                cursor,
-                bytes,
-                projection: Vec::new(),
+                cursor: self.history.next_cursor(),
+                bytes: Vec::new(),
             });
         }
-        // The screen is settled first, and whatever that released is delivered to the attachments
-        // that were already watching. Settling inside the snapshot instead would let one client's
-        // snapshot swallow a character that was owed to another.
-        self.deliver(crate::projection::Filtered::default());
-        let gate = self.lane_gate();
-        let now = kr_ipc::now_ms().get();
-        let (update, settled) = self.engine.projection_install(
-            dimensions,
-            ProjectionResetReason::Attached,
-            gate,
-            now,
-        )?;
-        debug_assert!(
-            settled.direct.is_empty() && settled.effects.is_empty(),
-            "the screen is settled before this snapshot is taken"
-        );
-        // It can still return replies the response lane released in the moment between, and those
-        // are the application's rather than this subscriber's screen.
-        self.queue_replies(settled.replies);
-        // The base is recorded last, so it is the screen this client is about to be sent rather
-        // than one an earlier subscription of the same attachment was left holding.
-        self.projections.record(
-            attachment_id,
-            crate::snapshot::Held {
-                base: update.base,
-                viewport: self.engine.anchored_viewport(dimensions),
-            },
-        );
-        Ok(Joined {
-            cursor: update.base.cursor,
-            bytes: Vec::new(),
-            projection: update.events,
-        })
+        let (cursor, bytes) = self.restoration(attachment_id)?;
+        Ok(Joined { cursor, bytes })
+    }
+
+    /// Queues the screen a projected attachment joins on, through its own subscription.
+    ///
+    /// Called after the subscription exists, because the events are charged to that subscriber's
+    /// queue: a screen written around the queue is a screen a client with an eight-kilobyte bound
+    /// could be sent several megabytes of. They are the first thing in the queue, so they are still
+    /// the first thing the client receives.
+    ///
+    /// A direct attachment is a no-op here: its screen is the bytes [`Session::join`] returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the attachment is unknown or the engine's state cannot be spelled on
+    /// the wire.
+    pub fn install_projection(&mut self, attachment_id: AttachmentId) -> Result<()> {
+        if self.presentation_of(attachment_id) != crate::output::Presentation::Projected {
+            return Ok(());
+        }
+        let dimensions = self.attachment_dimensions(attachment_id)?;
+        let oldest = self.history.oldest_retained_cursor();
+        // Forgetting first is what makes this an install rather than a continuation: whatever an
+        // earlier subscription of this attachment was left holding is not what it is about to be
+        // sent.
+        self.projections.forget(attachment_id);
+        let _ = self.publish_projection(attachment_id, dimensions, None, oldest);
+        Ok(())
     }
 
     /// Returns one attachment's own dimensions, falling back to the session's canonical geometry.
@@ -1758,13 +1760,15 @@ impl Session {
             base: update.base,
             viewport: self.engine.anchored_viewport(dimensions),
         };
-        for event in update.events {
-            let cost = crate::snapshot::event_bytes(&event);
-            let cursor = event.cursor();
-            if self
-                .hub
-                .publish_projection(attachment_id, cursor, event, cost, oldest)
-            {
+        for outgoing in update.events {
+            let cursor = outgoing.event.cursor();
+            if self.hub.publish_projection(
+                attachment_id,
+                cursor,
+                outgoing.event,
+                outgoing.bytes,
+                oldest,
+            ) {
                 // Its queue filled part way through. What it has is not a screen, so the base goes
                 // with it and the fresh snapshot it asks for starts again.
                 self.projections.forget(attachment_id);

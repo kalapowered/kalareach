@@ -327,22 +327,75 @@ pub fn hyperlinks(values: &[kr_term::snapshot::HyperlinkRange]) -> Result<Vec<Hy
         .collect()
 }
 
-/// How many bytes one row costs a page.
+/// What something costs the wire.
 ///
-/// It counts everything the row carries rather than only its text, because a row of short runs
-/// with long hyperlink targets costs many times what its characters do. The figure is the wire
-/// cost of the row as this module spells it, which is what a page bound is about.
+/// Both numbers matter, because both are bounds a frame has to stay inside: the encoded length
+/// against the control-frame limit, and the number of values against the codec's own item limit. A
+/// page of one run per cell reaches the second long before the first, so counting bytes alone
+/// would build a page nothing could decode.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Cost {
+    /// Encoded bytes.
+    pub bytes: usize,
+    /// Values, counting every scalar, array, map and key, the way the codec counts them.
+    pub items: usize,
+}
+
+impl Cost {
+    /// Takes another cost into this one.
+    pub const fn absorb(&mut self, other: Self) {
+        self.bytes = self.bytes.saturating_add(other.bytes);
+        self.items = self.items.saturating_add(other.items);
+    }
+
+    /// Whether this cost is inside both bounds.
+    #[must_use]
+    pub const fn fits(self, bytes: usize, items: usize) -> bool {
+        self.bytes <= bytes && self.items <= items
+    }
+}
+
+/// Measures what one value costs the wire, by encoding it.
+///
+/// Measured rather than estimated. An estimate of a structure this shape is wrong by an order of
+/// magnitude - a plain run encodes to about two hundred bytes and forty values, not to the length
+/// of its text - and a page built from a wrong estimate is a frame the transport refuses to carry,
+/// which leaves a client with no screen and no marker telling it so.
+///
+/// Returns nothing for a value the codec cannot represent, which nothing in this module produces.
 #[must_use]
-pub fn row_bytes(value: &ProjectedRow) -> u64 {
-    /// What a row costs before any run: the identifier, two markers and the list envelope.
-    const ROW_ENVELOPE: u64 = 32;
-    /// What a run costs before its text: two counts, the rendition and the link envelope.
-    const RUN_ENVELOPE: u64 = 48;
-    value.runs.iter().fold(ROW_ENVELOPE, |total, run| {
-        total
-            .saturating_add(RUN_ENVELOPE)
-            .saturating_add(run.text.len() as u64)
-            .saturating_add(run.hyperlink.as_ref().map_or(0, |uri| uri.len() as u64))
+pub fn measure<T: serde::Serialize + ?Sized>(value: &T) -> Option<Cost> {
+    let encoded = kr_cbor::to_canonical_value(value).ok()?;
+    Some(Cost {
+        bytes: kr_cbor::encode(&encoded).len(),
+        items: values_in(&encoded),
+    })
+}
+
+/// Counts the values in an encoded message, the way the codec's own limit counts them.
+fn values_in(value: &kr_cbor::CanonicalValue) -> usize {
+    match value {
+        kr_cbor::CanonicalValue::Array(items) => 1 + items.iter().map(values_in).sum::<usize>(),
+        kr_cbor::CanonicalValue::Map(entries) => {
+            1 + entries
+                .entries()
+                .iter()
+                .map(|(_, held)| 1 + values_in(held))
+                .sum::<usize>()
+        }
+        _ => 1,
+    }
+}
+
+/// What one row costs a page.
+///
+/// Measured, for the reason [`measure`] gives. A row the codec cannot represent is reported at the
+/// largest cost there is, so it is cut rather than built into a frame nothing can decode.
+#[must_use]
+pub fn row_cost(value: &ProjectedRow) -> Cost {
+    measure(value).unwrap_or(Cost {
+        bytes: usize::MAX,
+        items: usize::MAX,
     })
 }
 
@@ -357,7 +410,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rows_cost_counts_its_link_targets_and_not_only_its_text() {
+    fn a_rows_cost_is_what_it_encodes_to_rather_than_the_length_of_its_text() {
         let plain = ProjectedRow {
             row: U64::ZERO,
             soft_wrapped: false,
@@ -370,9 +423,37 @@ mod tests {
                 hyperlink: Nullable::null(),
             }],
         };
+        let cost = row_cost(&plain);
+        // The encoded form of one run is the rendition's whole map and the row's own fields, which
+        // is two orders of magnitude more than its two characters. A bound taken from the text
+        // would build a page the transport refuses.
+        assert!(
+            cost.bytes > 100,
+            "one run of two characters encodes to {} bytes",
+            cost.bytes
+        );
+        assert!(
+            cost.items > 20,
+            "and to {} values, which is what the codec's item limit counts",
+            cost.items
+        );
+        assert_eq!(
+            cost,
+            measure(&plain).expect("a row the codec can represent"),
+            "the row's cost is the measurement of the row"
+        );
+
         let mut linked = plain.clone();
         linked.runs[0].hyperlink =
             Nullable::some("https://example.invalid/a-long-target".to_owned());
-        assert!(row_bytes(&linked) > row_bytes(&plain));
+        let linked = row_cost(&linked);
+        assert!(
+            linked.bytes > cost.bytes,
+            "a link target is bytes on the wire: {linked:?} against {cost:?}"
+        );
+        assert_eq!(
+            linked.items, cost.items,
+            "and one value either way, present or null, which is why both are counted"
+        );
     }
 }
