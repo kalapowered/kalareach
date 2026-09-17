@@ -134,7 +134,12 @@ pub fn install(
                 .map_err(|error| CliError::Other(format!("{}: {error}", entry.path)))?
         };
         entry.change = Some(change);
-        entry.installed = !dry_run || change == Change::Unchanged;
+        // A dry run reports what is there; a real one reports what it just wrote.
+        entry.installed = if dry_run {
+            startup::installed(path)
+        } else {
+            true
+        };
     }
     Ok(reported)
 }
@@ -159,7 +164,11 @@ pub fn remove(package: &ShellPackage, layout: &HomeLayout, dry_run: bool) -> Res
                 .map_err(|error| CliError::Other(format!("{}: {error}", entry.path)))?
         };
         entry.change = Some(change);
-        entry.installed = dry_run && startup::installed(path) && change == Change::Absent;
+        entry.installed = if dry_run {
+            startup::installed(path)
+        } else {
+            false
+        };
     }
     Ok(reported)
 }

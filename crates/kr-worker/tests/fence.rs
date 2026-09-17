@@ -1138,7 +1138,41 @@ async fn a_live_session_that_loses_its_hooks_stops_attributing_and_stops_install
             "the pre-EOF hook stays fail-safe"
         );
         assert!(driver.fence().is_none(), "the fence went with the hooks");
+        assert_eq!(
+            driver.state(),
+            FenceState::Outside,
+            "the reader the session can no longer speak for is deregistered"
+        );
     }
+
+    // And a takeover afterwards starts no exchange, so no fence is published and no detach proof is
+    // handed out by a session the phase says is degraded.
+    let second = AttachmentId::new(kr_ipc::new_uuid());
+    {
+        let params = terminal(wired.session_id);
+        let mut session = wired.runtime.session();
+        session
+            .attach(&params, params.requested.clone(), second)
+            .expect("attaches");
+        session
+            .acquire_input(second, ConnectionId::new(kr_ipc::new_uuid()), None)
+            .expect("takes the keys");
+    }
+    let quiet = tokio::time::timeout(Duration::from_millis(500), wired.bridge.recv()).await;
+    assert!(
+        quiet.is_err(),
+        "a degraded session asks the reader for nothing: {quiet:?}"
+    );
+    assert!(
+        wired
+            .runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .fence()
+            .is_none(),
+        "and publishes no fence"
+    );
     wired.close().await;
 }
 

@@ -26,7 +26,9 @@ use kr_protocol::method::Method;
 use kr_protocol::scalars::Nullable;
 use kr_protocol::session::{EnvironmentVariable, Presentation, SessionCreateParams, ShellMode};
 use kr_shell_integration::contract::qualification::ShellKind;
-use kr_shell_integration::host::package::{MANIFEST_BASENAME, PackageManifest, PackageSet};
+use kr_shell_integration::host::package::{
+    MANIFEST_BASENAME, PACKAGE_ROOT_VARIABLE, PackageManifest, PackageSet,
+};
 use kr_shell_integration::host::startup::{self, Change, HomeLayout};
 use kr_shell_integration::host::terminal::{
     self, Source, TerminalApplication, TerminalUnavailable,
@@ -513,18 +515,18 @@ fn the_terminal_is_chosen_in_order_and_a_host_with_none_says_so_once() {
 /// KR-REQ-07.16, KR-REQ-07.85: the packages a build produced, when it produced any.
 #[test]
 fn the_built_packages_are_qualified_where_this_run_has_them() {
-    let Some(root) = std::env::var_os("KR_SHELL_PACKAGES_BUILT") else {
+    let Some(root) = std::env::var_os(PACKAGE_ROOT_VARIABLE) else {
         // The packages are built by their own tooling and are not a prerequisite for this suite.
         // Nothing is asserted about a package this run does not have.
         eprintln!(
-            "skipped: KR_SHELL_PACKAGES_BUILT names no directory, so no built package is checked"
+            "skipped: {PACKAGE_ROOT_VARIABLE} names no directory, so no built package is checked"
         );
         return;
     };
     let set = PackageSet::discover(Path::new(&root)).expect("reads the built packages");
     assert!(
         !set.packages().is_empty(),
-        "KR_SHELL_PACKAGES_BUILT named {root:?} and it holds no package manifest"
+        "{PACKAGE_ROOT_VARIABLE} named {root:?} and it holds no package manifest"
     );
     for package in set.packages() {
         assert!(

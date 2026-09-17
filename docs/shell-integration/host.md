@@ -223,7 +223,7 @@ and mode, and where each guarded entry goes and whether it is there. It writes n
 | Zsh | `.zshrc` inside the configured `ZDOTDIR` when there is one |
 | Bash | `.bashrc`, plus the first login file this user has when it does not already source `.bashrc` |
 | Fish | a guarded `conf.d` entry; it loads before `config.fish` and its own activation is deferred until after it |
-| PowerShell | the user's own profile, added to rather than replaced |
+| PowerShell | the user's own profile, added to rather than replaced. The path this build writes is the Unix profile location; the Windows one is named in this task's handoff |
 
 The entry is delimited by `# >>> KalaReach shell integration >>>` and `# <<< KalaReach shell
 integration <<<`, and its body is one line that sources the package's own file. Nothing of the
@@ -255,10 +255,12 @@ Three things this document would otherwise be read as promising, and are not tru
 `root.editor.enter`, `root.editor.leave`, `root.editor.fence`, `root.eof.detach` and
 `root.command.accepted` are reachable from a validated root registration over private IPC and
 nowhere else. That is true of the transport rather than only of an authority table: they travel on
-the bridge endpoint as its own frames, there is no frame on the worker's client endpoint that
-carries one, and no other process can open the bridge. The group itself is read from the protocol
-registry rather than written out again here, so a method that joins it is covered without anything
-being kept in step by hand.
+the bridge endpoint as its own frames, and there is no frame on the worker's client endpoint that
+carries one — a request naming one of them is refused by the dispatch, because no handler serves it.
+Another process of the same user can open the endpoint; what it cannot do is authenticate as the
+root shell the worker launched. The group itself is read from the protocol registry rather than
+written out again here, so a method that joins it is covered without anything being kept in step by
+hand.
 
 `shell.launch` is not in that group. It is a host-authorised operation a client asks for, bound to
 the same fence.
