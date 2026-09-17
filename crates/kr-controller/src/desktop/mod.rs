@@ -70,6 +70,9 @@ pub fn capabilities(
 ///
 /// Both profiles are reported, in profile order, whichever one this host creates sessions with:
 /// the answer for the other is what a person needs to choose between them.
+///
+/// The mechanism a desktop-bound worker's answer names is the supervisor this host actually
+/// selected, because that is what a logout acts on.
 #[must_use]
 pub fn persistence(supervisor: &str) -> Vec<ProfilePersistence> {
     vec![
@@ -129,9 +132,22 @@ mod platform {
     ///
     /// The setting is the user's own, it is enabled by an explicit choice, and this host never
     /// enables it as a side effect of installing itself or of creating a session.
+    ///
+    /// A host with no user service manager to ask has no such setting either. That is reported as
+    /// what it is rather than as a choice the person could make, because on such a host a worker
+    /// is a detached process and what a logout does to it is the platform's own behaviour.
     pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, String) {
-        let lingering = super::agent::lingering(kr_ipc::paths::current_uid());
-        let (persistence, detail) = if lingering {
+        if !crate::supervision::SystemdSupervisor::available() {
+            return (
+                LogoutPersistence::NoServiceManager,
+                "a detached process, reparented to the system's first process",
+                "This host has no per-user service manager, so a session's worker is a detached \
+                 process rather than a service. What a logout does to it is the platform's own \
+                 behaviour and this host does not claim to know it."
+                    .to_owned(),
+            );
+        }
+        let (persistence, detail) = if super::agent::lingering(kr_ipc::paths::current_uid()) {
             (
                 LogoutPersistence::SurvivesLogout,
                 "Lingering is enabled for this user, so the user service manager keeps running \

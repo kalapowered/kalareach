@@ -11,10 +11,13 @@
 //! would inherit nothing and every desktop tool in the session would fail at its first call.
 //!
 //! So the graphical session's own environment is collected here and passed to the worker's unit.
-//! The desktop session publishes it into the user manager at login, through the same mechanism a
-//! desktop file or a login script uses, and [`environment`] reads it back from there. Where the
-//! manager has nothing, the session leader's own environment is read instead, which is the same
-//! process the desktop reading anchors on.
+//! The session's leader is asked first, because its environment is that session's by definition:
+//! the user manager holds one environment for the whole user, which on a host with two concurrent
+//! logins can describe either of them or neither. The manager is the fallback, and what it offers
+//! is used only when it names the session this host selected or names no session at all.
+//!
+//! The selected session's own identifier travels with the rest, so the worker reads the session
+//! this host chose rather than looking one up again.
 //!
 //! Nothing here enables anything. Lingering, in particular, is reported and never set: a session
 //! that turned on a persistence setting as a side effect of being created would be exactly what
@@ -83,28 +86,47 @@ fn environ_pairs(block: &str) -> Vec<(String, String)> {
 
 #[cfg(target_os = "linux")]
 mod platform {
-    /// Reads the graphical session's environment, from the user manager and then the session
-    /// leader.
+    /// Reads the graphical session's environment, from its leader and then the user manager.
     ///
-    /// The manager is asked first because that is where a desktop session publishes its
-    /// environment for exactly this purpose. A session that published nothing leaves the leader,
-    /// whose own environment is the session's by definition.
+    /// The leader's own environment is that session's, so it is read first. The user manager holds
+    /// one environment for the user rather than one per session, so what it offers is accepted
+    /// only when it names the selected session or names none at all: on a host where the same user
+    /// is logged in twice, the manager can be describing the other login.
     pub(super) fn desktop_environment() -> Vec<(String, String)> {
+        let Some(session) = display_session() else {
+            return Vec::new();
+        };
         let mut collected = Vec::new();
-        if let Some(printed) = output("systemctl", &["--user", "show-environment"]) {
-            collected.extend(super::key_values(&printed));
+        if let Some(leader) = session_leader(&session)
+            && let Ok(block) = std::fs::read_to_string(format!("/proc/{leader}/environ"))
+        {
+            collected.extend(super::environ_pairs(&block));
         }
         if collected
             .iter()
             .any(|(name, _)| name == "DISPLAY" || name == "WAYLAND_DISPLAY")
         {
-            return collected;
+            return with_session(collected, &session);
         }
-        if let Some(leader) = session_leader()
-            && let Ok(block) = std::fs::read_to_string(format!("/proc/{leader}/environ"))
-        {
-            collected.extend(super::environ_pairs(&block));
+        if let Some(printed) = output("systemctl", &["--user", "show-environment"]) {
+            let offered = super::key_values(&printed);
+            let names_another = offered.iter().any(|(name, value)| {
+                name == "XDG_SESSION_ID" && !value.is_empty() && value != &session
+            });
+            if !names_another {
+                collected.extend(offered);
+            }
         }
+        with_session(collected, &session)
+    }
+
+    /// Returns the collected environment with the selected session named in it.
+    ///
+    /// The worker reads its own desktop from the session this names, so a set that carried another
+    /// session's identifier would have the worker bind to a desktop this host did not select.
+    fn with_session(mut collected: Vec<(String, String)>, session: &str) -> Vec<(String, String)> {
+        collected.retain(|(name, _)| name != "XDG_SESSION_ID");
+        collected.push(("XDG_SESSION_ID".to_owned(), session.to_owned()));
         collected
     }
 
@@ -121,19 +143,23 @@ mod platform {
         })
     }
 
-    /// Returns the leader of this user's graphical session.
-    fn session_leader() -> Option<u32> {
+    /// Returns this user's graphical session, as the login manager names it.
+    fn display_session() -> Option<String> {
         let uid = kr_ipc::paths::current_uid();
-        let display = output(
+        let printed = output(
             "loginctl",
             &["show-user", &uid.to_string(), "--property=Display"],
         )?;
-        let session = super::key_values(&display)
+        super::key_values(&printed)
             .into_iter()
             .find(|(key, _)| key == "Display")
             .map(|(_, value)| value)
-            .filter(|value| !value.is_empty())?;
-        let printed = output("loginctl", &["show-session", &session, "--property=Leader"])?;
+            .filter(|value| !value.is_empty())
+    }
+
+    /// Returns the leader of one session.
+    fn session_leader(session: &str) -> Option<u32> {
+        let printed = output("loginctl", &["show-session", session, "--property=Leader"])?;
         super::key_values(&printed)
             .into_iter()
             .find(|(key, _)| key == "Leader")

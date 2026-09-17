@@ -54,6 +54,19 @@ use kr_transport::clock::{ContinuousClock, ContinuousInstant};
 
 use crate::error::{ControllerError, Result};
 
+/// How long a facility is given to exit after its input ends.
+pub const RELEASE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often the releasing facility is asked whether it has exited.
+const RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// How long a facility is given to hold its assertion before it is believed.
+///
+/// A process that exits immediately did not take an assertion, whatever it was asked for. This is
+/// the only wait on the acquisition path, and it happens once per assertion rather than once per
+/// query.
+const ACQUIRE_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// What the host currently has outstanding.
 ///
 /// Both counts are of work the host has admitted rather than of activity it has guessed at. An
@@ -138,6 +151,13 @@ pub struct Inhibitor {
     held: Option<Held>,
     /// Why no assertion is held although the setting is on, when that is the case.
     withheld: Option<String>,
+    /// Whether something is already looking at this setting on a cadence.
+    ///
+    /// It lives here rather than beside the daemon's other state so that taking an assertion and
+    /// taking responsibility for reviewing it happen inside one lock. A mark kept outside this
+    /// lock could be cleared by a review that had just finished while another caller was taking
+    /// an assertion, leaving that assertion with nothing watching it.
+    reviewing: bool,
 }
 
 /// One held assertion.
@@ -166,7 +186,19 @@ impl Inhibitor {
         Self {
             held: None,
             withheld: None,
+            reviewing: false,
         }
+    }
+
+    /// Returns whether something is already reviewing this setting.
+    #[must_use]
+    pub const fn reviewing(&self) -> bool {
+        self.reviewing
+    }
+
+    /// Records whether something is reviewing this setting.
+    pub const fn set_reviewing(&mut self, reviewing: bool) {
+        self.reviewing = reviewing;
     }
 
     /// Takes or releases the assertion for what the host currently has outstanding.
@@ -210,10 +242,24 @@ impl Inhibitor {
             return;
         };
         drop(held.facility.stdin.take());
-        // The facility exits as soon as it sees the end of its input. Waiting for it is what turns
-        // "the assertion is released" from a hope into a fact, and it is bounded because the only
-        // thing it is waiting for has already happened.
-        let _ = held.facility.wait();
+        // The facility exits as soon as it sees the end of its input, and waiting for it is what
+        // turns "the assertion is released" from a hope into a fact. The wait is bounded: a
+        // facility that does not exit when its input ends is ended, because an assertion that
+        // stayed held because its holder hung would be a machine that stopped sleeping for good.
+        // The process being ended is this daemon's own child and nothing else.
+        let deadline = std::time::Instant::now() + RELEASE_PATIENCE;
+        loop {
+            match held.facility.try_wait() {
+                Ok(Some(_)) | Err(_) => return,
+                Ok(None) => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = held.facility.kill();
+                let _ = held.facility.wait();
+                return;
+            }
+            std::thread::sleep(RELEASE_POLL);
+        }
     }
 
     /// Returns what this inhibitor is currently doing.
@@ -252,14 +298,37 @@ impl Inhibitor {
             return self.state(setting, self.demand_of(reason), power);
         }
         match platform::hold() {
-            Some((facility, holder)) => {
-                self.held = Some(Held {
-                    facility,
-                    reason,
-                    since_ms: kr_ipc::now_ms(),
-                    holder,
-                });
-                self.withheld = None;
+            Some((mut facility, holder)) => {
+                // A facility that has already exited holds nothing. Its assertion lasts exactly as
+                // long as the process does, so a process that is gone is an assertion that was
+                // never taken, and reporting one would be reporting a machine that will not sleep
+                // when it will.
+                std::thread::sleep(ACQUIRE_SETTLE);
+                match facility.try_wait() {
+                    Ok(None) => {
+                        self.held = Some(Held {
+                            facility,
+                            reason,
+                            since_ms: kr_ipc::now_ms(),
+                            holder,
+                        });
+                        self.withheld = None;
+                    }
+                    Ok(Some(status)) => {
+                        self.withheld = Some(format!(
+                            "this host's sleep-assertion facility ended at once ({status}), so \
+                             its sleep policy is unchanged"
+                        ));
+                    }
+                    Err(error) => {
+                        let _ = facility.kill();
+                        let _ = facility.wait();
+                        self.withheld = Some(format!(
+                            "this host could not tell whether its sleep-assertion facility \
+                             started ({error}), so its sleep policy is unchanged"
+                        ));
+                    }
+                }
             }
             None => {
                 self.withheld = Some(
@@ -482,18 +551,21 @@ mod platform {
 
     /// Reads whether this host is running on mains power.
     ///
-    /// A machine with no battery reports no battery status, and a machine with no battery is on
-    /// mains.
+    /// A machine that has no battery is on mains, and a query that failed says nothing at all.
+    /// Those are different answers: collapsing them would let a `mains_only` setting hold an
+    /// assertion on a laptop whose battery this host could not read.
     pub(super) fn power_source() -> PowerSource {
         let Ok(output) = Command::new("powershell.exe")
             .args([
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
-                "$status = Get-CimInstance -ClassName BatteryStatus -Namespace root\\wmi \
-                 -ErrorAction SilentlyContinue; \
-                 if ($null -eq $status) { 'ac power' } \
-                 elseif ($status.PowerOnline) { 'ac power' } else { 'battery' }",
+                "try { \
+                   $status = Get-CimInstance -ClassName BatteryStatus -Namespace root\\wmi \
+                     -ErrorAction Stop; \
+                   if ($null -eq $status) { 'ac power' } \
+                   elseif ($status.PowerOnline) { 'ac power' } else { 'battery' } \
+                 } catch { 'unknown' }",
             ])
             .stdin(Stdio::null())
             .output()

@@ -6,7 +6,7 @@
 //!
 //! | Platform | How the worker is started | Where its identity comes from |
 //! | --- | --- | --- |
-//! | macOS | a per-session launchd job, bootstrapped into the GUI domain and started once with `launchctl kickstart -p` | the kickstart output's process identifier, then `proc_pidinfo` |
+//! | macOS | a per-session launchd job, bootstrapped into the domain the profile names and started once with `launchctl kickstart -p` | the kickstart output's process identifier, then `proc_pidinfo` |
 //! | Linux with systemd | a transient user *service*, `systemd-run --user --unit=... -p Type=exec -p Restart=no` | `systemctl --user show -p MainPID`, then `/proc/<pid>/stat` |
 //! | other Unix | a `setsid` launch, reparented to init | the spawned child's identifier, then `/proc` or `proc_pidinfo` |
 //! | Windows | the spawned child, outside the daemon's kill-on-close Job | the child's identifier and creation time |
@@ -18,6 +18,12 @@
 //! connects, and the rendezvous compares it with the connecting peer. That is what stops another
 //! process from claiming a reservation it was not started for.
 //!
+//! The profile decides the login context, not only the environment. A desktop-bound worker is
+//! started in the graphical login session, and a headless one is started outside it: on macOS in
+//! the background domain rather than the graphical one. The fallback supervisor has no domains to
+//! choose between, so a worker it starts is in whatever login context this daemon is in, and a
+//! headless worker there has the environment stripped rather than a login context of its own.
+//!
 //! # Services that are not workers
 //!
 //! A session worker is not the only thing whose lifetime must not belong to the daemon. The plugin
@@ -25,11 +31,13 @@
 //! invalidate every rich binding on the host. So the platform paths above are expressed over
 //! [`ServiceLaunch`], which is a label, a program, an argument vector and somewhere to write a job
 //! definition, and a worker launch is one of those with a worker's arguments in it. Everything a
-//! worker gets from being its own job, a service gets the same way.
+//! worker gets from being its own job, a service gets the same way. A service that belongs to no
+//! login session is started in the graphical domain and loads under no session type of its own;
+//! only a worker names one, because only a worker has a profile.
 
 use std::path::{Path, PathBuf};
 
-use kr_protocol::identity::ProcessStartIdentity;
+use kr_protocol::identity::{ProcessStartIdentity, WorkerProfile};
 use kr_protocol::worker::ReservationId;
 
 use crate::error::{ControllerError, Result};
@@ -75,6 +83,12 @@ pub struct WorkerLaunch {
     /// service manager started at boot has none of them and a worker that inherited nothing would
     /// fail at the first desktop tool it ran.
     pub desktop_environment: Vec<(String, String)>,
+    /// How long the worker's execution context lasts.
+    ///
+    /// It decides which login context the worker is started in, which is a different thing from
+    /// which variables it is given: a headless worker that was started inside the graphical login
+    /// would have that login's access whatever its environment said.
+    pub profile: WorkerProfile,
 }
 
 impl WorkerLaunch {
@@ -257,7 +271,35 @@ impl LaunchdSupervisor {
             .is_ok_and(|status| status.success())
     }
 
-    fn write_job(launch: &ServiceLaunch) -> Result<PathBuf> {
+    /// Returns the bootstrap domain a worker of this profile belongs in.
+    ///
+    /// The graphical domain is the user's Aqua login session: a job in it has that desktop's
+    /// access and goes away with the login. The background domain is the same user without it,
+    /// which is what a headless profile means on this platform.
+    fn domain(profile: WorkerProfile) -> String {
+        let uid = kr_ipc::paths::current_uid();
+        match profile {
+            WorkerProfile::DesktopBound => format!("gui/{uid}"),
+            WorkerProfile::HeadlessUser => format!("user/{uid}"),
+        }
+    }
+
+    /// Returns the session type a job of this profile may be loaded into.
+    ///
+    /// It is written into the job definition as well as chosen as the domain, so a job that is
+    /// somehow bootstrapped into the other domain does not load there.
+    const fn session_type(profile: WorkerProfile) -> &'static str {
+        match profile {
+            WorkerProfile::DesktopBound => "Aqua",
+            WorkerProfile::HeadlessUser => "Background",
+        }
+    }
+
+    /// Writes one job definition, for the session type its launch belongs to.
+    ///
+    /// A service that is not a worker belongs to no login session and names no type: it is loaded
+    /// wherever it is bootstrapped, which is this user's graphical domain.
+    fn write_job(launch: &ServiceLaunch, session_type: Option<&str>) -> Result<PathBuf> {
         let label = launch.label.clone();
         let path = launch.jobs_directory.join(format!("{label}.plist"));
         let mut arguments = String::new();
@@ -276,12 +318,17 @@ impl LaunchdSupervisor {
              <key>KeepAlive</key><false/>\n\
              <key>ProcessType</key>{process_type}\
              <key>WorkingDirectory</key>{working_directory}\
+             {session_type}\
              <key>StandardErrorPath</key>{diagnostics}\
              </dict>\n</plist>\n",
             label_value = plist_string(&label),
             arguments = arguments,
             process_type = plist_string("Interactive"),
             working_directory = plist_string(&launch.working_directory.display().to_string()),
+            session_type = session_type.map_or_else(String::new, |session_type| format!(
+                "<key>LimitLoadToSessionType</key>{}",
+                plist_string(session_type)
+            )),
             // A worker that fails before it reaches the rendezvous has nowhere else to say why:
             // it has no terminal, no connection and no journal yet. This file is the one place
             // that diagnosis can go, and it lives in the owner-only state directory.
@@ -311,15 +358,45 @@ fn plist_string(value: &str) -> String {
 #[cfg(target_os = "macos")]
 impl WorkerSupervisor for LaunchdSupervisor {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
-        self.start_service(&launch.service())
+        // The domain the profile names. A headless worker in the graphical domain would have that
+        // login's access however little of its environment it was given.
+        self.start_job(
+            &launch.service(),
+            &Self::domain(launch.profile),
+            Some(Self::session_type(launch.profile)),
+        )
     }
 
     fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
-        let domain = format!("gui/{}", kr_ipc::paths::current_uid());
+        // A service that is not a worker belongs to no login session, so it names no session type
+        // and is bootstrapped into this user's graphical domain, where the daemon itself is.
+        self.start_job(
+            launch,
+            &format!("gui/{}", kr_ipc::paths::current_uid()),
+            None,
+        )
+    }
+
+    fn describe(&self) -> String {
+        "launchd, one bootstrapped job per session: the user's graphical domain for a \
+         desktop-bound session and the background domain for a headless one"
+            .to_owned()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl LaunchdSupervisor {
+    /// Bootstraps one job into a domain and starts it.
+    fn start_job(
+        &self,
+        launch: &ServiceLaunch,
+        domain: &str,
+        session_type: Option<&str>,
+    ) -> LaunchOutcome {
         let label = launch.label.clone();
         // Writing the job definition and loading it start nothing: `RunAtLoad` is false, so until
         // the kickstart there is no process to be uncertain about.
-        let job = match Self::write_job(launch) {
+        let job = match Self::write_job(launch, session_type) {
             Ok(job) => job,
             Err(error) => {
                 return LaunchOutcome::NotStarted {
@@ -331,7 +408,7 @@ impl WorkerSupervisor for LaunchdSupervisor {
         // leaves nothing running, however it failed.
         if let Err(error) = run(
             "/bin/launchctl",
-            &["bootstrap", &domain, &job.display().to_string()],
+            &["bootstrap", domain, &job.display().to_string()],
         ) {
             return LaunchOutcome::NotStarted {
                 detail: error.detail(),
@@ -363,10 +440,6 @@ impl WorkerSupervisor for LaunchdSupervisor {
             };
         };
         settle(pid)
-    }
-
-    fn describe(&self) -> String {
-        "launchd, one bootstrapped job per session in the user's GUI domain".to_owned()
     }
 }
 
@@ -495,15 +568,28 @@ impl DetachedSupervisor {
 
 impl WorkerSupervisor for DetachedSupervisor {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
-        self.start_service(&launch.service())
+        // A worker is given the selected desktop's own handles; nothing else this supervisor
+        // starts belongs to a login session, so nothing else is given any.
+        self.spawn(&launch.service(), &launch.desktop_environment)
     }
 
     fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
+        self.spawn(launch, &[])
+    }
+
+    fn describe(&self) -> String {
+        "a detached process in its own group, reparented to init when this daemon exits".to_owned()
+    }
+}
+
+impl DetachedSupervisor {
+    /// Starts one process, with whatever login-session environment its launch carries.
+    fn spawn(&self, launch: &ServiceLaunch, desktop: &[(String, String)]) -> LaunchOutcome {
         match detached_command(
             &launch.program,
             &launch.arguments,
             &launch.working_directory,
-            &launch.desktop_environment,
+            desktop,
         ) {
             Ok(child) => settle(child),
             // The spawn itself failed, so no process exists.
@@ -511,10 +597,6 @@ impl WorkerSupervisor for DetachedSupervisor {
                 detail: error.to_string(),
             },
         }
-    }
-
-    fn describe(&self) -> String {
-        "a detached process in its own group, reparented to init when this daemon exits".to_owned()
     }
 }
 
@@ -701,6 +783,7 @@ mod tests {
                 "/var/lib/kr/workers/02020202-0202-0202-0202-020202020202",
             ),
             desktop_environment: Vec::new(),
+            profile: WorkerProfile::HeadlessUser,
         }
     }
 
@@ -815,14 +898,38 @@ mod tests {
         let host = kr_ipc::testing::TempHost::create();
         let mut launch = launch();
         launch.jobs_directory = host.environment().jobs_dir();
-        let job =
-            LaunchdSupervisor::write_job(&launch.service()).expect("writes the job definition");
+        let job = LaunchdSupervisor::write_job(&launch.service(), Some("Aqua"))
+            .expect("writes the job definition");
         let document = std::fs::read_to_string(job).expect("reads it back");
         assert!(
             document.contains(
                 "<key>WorkingDirectory</key><string>/var/lib/kr/workers/02020202-0202-0202-0202-020202020202</string>"
             ),
             "the job names the worker's own directory: {document}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_headless_worker_is_started_outside_the_graphical_login() {
+        let uid = kr_ipc::paths::current_uid();
+        assert_eq!(
+            LaunchdSupervisor::domain(WorkerProfile::DesktopBound),
+            format!("gui/{uid}"),
+            "a desktop-bound worker belongs in the graphical login session"
+        );
+        assert_eq!(
+            LaunchdSupervisor::domain(WorkerProfile::HeadlessUser),
+            format!("user/{uid}"),
+            "a headless worker belongs outside it, or it would inherit its access"
+        );
+        assert_eq!(
+            LaunchdSupervisor::session_type(WorkerProfile::DesktopBound),
+            "Aqua"
+        );
+        assert_eq!(
+            LaunchdSupervisor::session_type(WorkerProfile::HeadlessUser),
+            "Background"
         );
     }
 

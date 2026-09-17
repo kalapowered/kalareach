@@ -71,6 +71,19 @@ pub mod net;
 /// How long a closing worker is watched before the controller stops waiting for it to end.
 pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The file this environment's current boot identity is recorded in.
+///
+/// It lives in the state directory rather than the runtime one because it has to outlive the boot
+/// it names, and a runtime directory does not.
+pub const BOOT_FILE: &str = "boot";
+
+/// The longest boot record this host reads.
+const BOOT_FILE_LIMIT: u64 = 1_024;
+
+/// What a caller is told when it asks for a desktop this host does not have.
+const NO_DESKTOP_TO_BIND: &str = "this host has no graphical login session to bind a session to; create it in the headless \
+     user profile instead";
+
 /// How long a desktop reading is reused before the platform is asked again.
 ///
 /// The reading costs a conversation with the platform's session facilities, and the answer changes
@@ -78,11 +91,14 @@ pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// question asks the platform rather than the cache.
 pub const DESKTOP_REREAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// How often a held sleep assertion is reviewed.
+/// How often the sleep setting is looked at while it is on.
 ///
-/// This runs only while an assertion is held, which is only while the host has admitted work that
-/// justifies one. An idle host reviews nothing, because there is nothing to release.
+/// This runs only while the owner has enabled the setting, so a host that has not is not paying
+/// for it. It is also the bound on how long after work ends an assertion can still be held.
 pub const POWER_REVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long one worker is given to say what it has outstanding.
+pub const DEMAND_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// How long the rendezvous waits for the launcher to report the worker's identity.
 pub const LAUNCH_IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -200,13 +216,9 @@ pub struct Controller {
     /// The desktop this host has, as last read, and the capability revision that reading is
     /// evidence for.
     desktop: Mutex<DesktopReading>,
-    /// The sleep assertion this daemon holds, where it holds one.
+    /// The sleep assertion this daemon holds, where it holds one, and whether a review of it is
+    /// running.
     inhibitor: Mutex<Inhibitor>,
-    /// Whether a held assertion is already being reviewed.
-    ///
-    /// The review exists to release an assertion when the work that justified it ends. It runs
-    /// only while one is held, so a host with nothing outstanding runs no timer at all.
-    power_review: std::sync::atomic::AtomicBool,
     _lock: SingletonLock,
 }
 
@@ -217,10 +229,16 @@ struct DesktopReading {
     context: DesktopContext,
     /// The revision the capability records of this context are evidence for.
     ///
-    /// It advances when the desktop changes, which a new login always is. Section 11 requires
-    /// evidence to be invalidated on a desktop generation change, and an advancing revision is how
-    /// an action notices.
+    /// It advances whenever the evidence changes: a new login, a tool installed or replaced, a
+    /// permission that now answers differently, a screen that is now locked. Section 11 requires
+    /// evidence to be invalidated when any of those move, and an advancing revision is how an
+    /// action that bound to the old answer notices.
+    ///
+    /// It starts at the moment this daemon began serving rather than at one, so a daemon that
+    /// restarts does not hand out a revision it has used before.
     revision: CapabilityRevision,
+    /// The records that revision was established for, so a change to any of them can be seen.
+    records: Vec<kr_protocol::desktop::CapabilityRecord>,
     /// When the platform was last asked.
     read_at: std::time::Instant,
 }
@@ -258,6 +276,7 @@ impl Controller {
         let identity = (setup.identity)()?;
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
         let boot = setup.boot_identity.clone();
+        let started_at_ms = kr_ipc::now_ms();
         let clock = Arc::new(SystemContinuousClock::new());
         let authority_revision = registry.authority_revision()?;
         let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths).await?);
@@ -289,14 +308,14 @@ impl Controller {
             worker_program: kr_ipc::paths::resolve_here(setup.worker_program)?,
             build_id: setup.build_id,
             release: setup.release,
-            started_at_ms: kr_ipc::now_ms(),
+            started_at_ms,
             desktop: Mutex::new(DesktopReading {
                 context: crate::desktop::current(boot.clone()),
-                revision: CapabilityRevision::new(1),
+                revision: CapabilityRevision::new(started_at_ms.get()),
+                records: Vec::new(),
                 read_at: std::time::Instant::now(),
             }),
             inhibitor: Mutex::new(Inhibitor::new()),
-            power_review: std::sync::atomic::AtomicBool::new(false),
             _lock: lock,
         });
         // Reconnecting is not only verifying. A replacement daemon has to present the generation it
@@ -2059,8 +2078,9 @@ impl Controller {
                     .session_close(mutation, &actor, accepted, carried)
                     .await;
                 // A closure the host has accepted and not finished is a request outstanding, and
-                // the setting decides whether that keeps the machine awake while it finishes.
-                let _ = self.power_state().await;
+                // the setting decides whether that keeps the machine awake while it finishes. The
+                // caller's answer does not wait for that decision.
+                self.review_power_soon();
                 closed
             }
             Method::AgentToolsInstall | Method::AgentToolsRemove => {
@@ -2189,21 +2209,38 @@ impl Controller {
 
     /// Returns the desktop this host has, and the revision its capability evidence belongs to.
     ///
-    /// The platform is asked again when the reading is older than [`DESKTOP_REREAD_INTERVAL`]. A
-    /// reading that names a different desktop advances the revision, because evidence taken in one
-    /// login is not evidence about the next.
+    /// The platform is asked again when the reading is older than [`DESKTOP_REREAD_INTERVAL`].
     async fn desktop(&self) -> (DesktopContext, CapabilityRevision) {
         let mut reading = self.desktop.lock().await;
         if reading.read_at.elapsed() >= DESKTOP_REREAD_INTERVAL {
-            let current = crate::desktop::current(self.boot_identity.clone());
-            if !current.is_same_desktop(&reading.context) {
-                reading.revision =
-                    CapabilityRevision::new(reading.revision.get().saturating_add(1));
-            }
-            reading.context = current;
+            reading.context = crate::desktop::current(self.boot_identity.clone());
             reading.read_at = std::time::Instant::now();
         }
         (reading.context.clone(), reading.revision)
+    }
+
+    /// Builds the capability report for this host's desktop, at its current revision.
+    ///
+    /// The records are compared with the ones the current revision was established for, ignoring
+    /// the revision itself and when each was observed. Anything else that has changed is a change
+    /// in the evidence, and the revision advances with it: a new login, a tool installed or
+    /// replaced, a permission that now answers differently, a desktop that is now locked. An
+    /// action bound to the old revision is then refused and asks again, which is what section 11
+    /// requires of evidence that has gone stale.
+    async fn capability_report(&self) -> kr_protocol::desktop::DesktopCapabilityReport {
+        let (context, revision) = self.desktop().await;
+        let mut report =
+            crate::desktop::capabilities(self.paths.environment_id(), context, revision);
+        let mut reading = self.desktop.lock().await;
+        if comparable(&report.records) != comparable(&reading.records) {
+            let advanced = CapabilityRevision::new(reading.revision.get().saturating_add(1));
+            reading.revision = advanced;
+            for record in &mut report.records {
+                record.revision = advanced;
+            }
+            reading.records = report.records.clone();
+        }
+        report
     }
 
     /// Returns the execution profile this host creates sessions with when a request chooses none.
@@ -2214,14 +2251,23 @@ impl Controller {
     /// Returns what this host's sleep inhibition is doing, taking or releasing the assertion.
     ///
     /// Every caller that can have changed an input asks this, which is how the assertion follows
-    /// the work rather than a clock. While one is held, a review keeps asking until the work ends,
-    /// because the end of a shell's own job is not something this daemon is told about.
+    /// the work rather than a clock. A review keeps asking while the setting is on, because
+    /// neither the start nor the end of a shell's own job is something this daemon is told about.
     pub async fn power_state(self: &Arc<Self>) -> SleepInhibitionState {
         let state = self.evaluate_power().await;
-        if state.active {
-            self.review_power();
-        }
+        self.review_power(&state);
         state
+    }
+
+    /// Looks at the setting beside something else this daemon is doing.
+    ///
+    /// The caller's own answer does not wait for it: what the host does about its own sleep policy
+    /// is never a reason to hold a receipt.
+    fn review_power_soon(self: &Arc<Self>) {
+        let controller = Arc::clone(self);
+        tokio::spawn(async move {
+            let _ = controller.power_state().await;
+        });
     }
 
     /// Takes or releases the assertion for what this host currently has outstanding.
@@ -2245,26 +2291,49 @@ impl Controller {
             .evaluate(setting, demand, source)
     }
 
-    /// Keeps reviewing a held assertion until the work that justified it ends.
-    fn review_power(self: &Arc<Self>) {
-        if self
-            .power_review
-            .swap(true, std::sync::atomic::Ordering::AcqRel)
-        {
+    /// Keeps looking at the setting while it can still change what is held.
+    ///
+    /// The review exists because the work this host inhibits sleep for begins and ends without it
+    /// being told: a shell starts a job, an agent finishes a turn, a closure drains its output. It
+    /// runs while the setting is on, and stops when the setting is off and nothing is held, so a
+    /// host whose owner has not chosen this runs no timer at all.
+    ///
+    /// The mark that says a review is running is taken and cleared inside the inhibitor's own
+    /// lock, together with the assertion it is reviewing. A mark kept outside that lock could be
+    /// cleared by a review that had just finished while another caller was taking an assertion,
+    /// leaving that assertion with nothing watching it.
+    fn review_power(self: &Arc<Self>, state: &SleepInhibitionState) {
+        if !Self::review_wanted(state) {
             return;
         }
         let controller = Arc::clone(self);
         tokio::spawn(async move {
+            {
+                let mut inhibitor = controller.inhibitor.lock().await;
+                if inhibitor.reviewing() {
+                    return;
+                }
+                inhibitor.set_reviewing(true);
+            }
             loop {
                 tokio::time::sleep(POWER_REVIEW_INTERVAL).await;
-                if !controller.evaluate_power().await.active {
-                    break;
+                let state = controller.evaluate_power().await;
+                let mut inhibitor = controller.inhibitor.lock().await;
+                if !Self::review_wanted(&state) {
+                    inhibitor.set_reviewing(false);
+                    return;
                 }
             }
-            controller
-                .power_review
-                .store(false, std::sync::atomic::Ordering::Release);
         });
+    }
+
+    /// Returns whether the setting can still change what is held.
+    const fn review_wanted(state: &SleepInhibitionState) -> bool {
+        state.active
+            || !matches!(
+                state.setting,
+                kr_protocol::desktop::SleepInhibitionSetting::Off
+            )
     }
 
     /// Returns what this host has outstanding that justifies keeping it awake.
@@ -2274,27 +2343,36 @@ impl Controller {
     /// it and not finished it: a decision waiting for an answer, a closure that is still stopping
     /// processes and draining their output, and a create that has not reported its worker yet. An
     /// idle shell counts for nothing, however much output it has produced.
+    ///
+    /// Each worker is given a bounded moment to answer. A session whose worker holds its socket
+    /// and stops answering must not be able to keep this host awake for good, and it must not be
+    /// able to delay the answer another session is waiting for either.
     async fn demand(&self) -> Demand {
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         let mut sessions_with_work = 0;
         let mut outstanding = 0;
         for worker in workers {
-            if let Ok(summary) = self.read_from_worker(&worker).await {
-                if summary.application_state.as_ref()
-                    == Some(&kr_protocol::session::ApplicationState::AgentBusy)
-                {
-                    sessions_with_work += 1;
-                }
-                if summary.application_state.as_ref()
-                    == Some(&kr_protocol::session::ApplicationState::AwaitingApproval)
-                {
-                    outstanding += 1;
-                }
-                // A closure this host accepted and has not finished. Suspending in the middle of
-                // one is how a session's own processes stop being accounted for.
-                if summary.state == SessionState::Closing {
-                    outstanding += 1;
-                }
+            let summary = tokio::time::timeout(DEMAND_PATIENCE, self.read_from_worker(&worker))
+                .await
+                .ok()
+                .and_then(std::result::Result::ok);
+            let Some(summary) = summary else {
+                continue;
+            };
+            if summary.application_state.as_ref()
+                == Some(&kr_protocol::session::ApplicationState::AgentBusy)
+            {
+                sessions_with_work += 1;
+            }
+            if summary.application_state.as_ref()
+                == Some(&kr_protocol::session::ApplicationState::AwaitingApproval)
+            {
+                outstanding += 1;
+            }
+            // A closure this host accepted and has not finished. Suspending in the middle of one
+            // is how a session's own processes stop being accounted for.
+            if summary.state == SessionState::Closing {
+                outstanding += 1;
             }
         }
         Demand {
@@ -2318,46 +2396,51 @@ impl Controller {
                 self.paths.environment_id()
             )));
         }
-        let (context, revision) = self.desktop().await;
+        let desktop = self.capability_report().await;
         encode(&EnvironmentCapabilitiesResult {
             environment_id: self.paths.environment_id(),
-            default_worker_profile: crate::desktop::default_profile(&context),
-            desktop: crate::desktop::capabilities(self.paths.environment_id(), context, revision),
+            default_worker_profile: crate::desktop::default_profile(&desktop.desktop),
+            desktop,
             persistence: crate::desktop::persistence(&self.supervisor.describe()),
             power: self.power_state().await,
         })
     }
 
-    /// Closes every session published in an earlier boot.
+    /// Closes every session recorded in an earlier boot.
     ///
     /// A reboot ends the live executions of both profiles: a desktop-bound worker went with its
     /// login session and a headless one went with the machine. The record says the host restarted,
     /// which is what happened, rather than describing a worker that vanished.
+    ///
+    /// The boot this environment last ran in is kept in its own state directory, beside the
+    /// registry, because that is the only place that survives what a reboot removes. A runtime
+    /// directory does not: on most hosts it is cleared with the boot it belonged to, taking the
+    /// published descriptors with it, so a daemon that compared descriptors would find nothing to
+    /// compare after exactly the event it was looking for.
     async fn close_previous_boot(&self) -> Result<()> {
-        let rows = {
-            let registry = self.registry.lock().await;
-            registry.workers()?
-        };
-        for entry in kr_ipc::descriptor::read_all(&self.paths)? {
-            let Ok(descriptor) = entry.descriptor else {
-                continue;
+        let path = self.paths.state_dir().join(BOOT_FILE);
+        let current = kr_cbor::to_canonical_vec(&self.boot_identity)
+            .map_err(|error| ControllerError::registry(error.to_string()))?;
+        let recorded = kr_ipc::paths::read_owner_only_file(&path, BOOT_FILE_LIMIT)?;
+        // A host with no record has not run here before, so there is nothing of an earlier boot to
+        // close. A record this daemon cannot read is not evidence of a reboot either.
+        if recorded.as_ref().is_some_and(|bytes| bytes != &current) {
+            let rows = {
+                let registry = self.registry.lock().await;
+                registry.workers()?
             };
-            if descriptor.boot_identity == self.boot_identity {
-                continue;
+            for row in rows {
+                self.directory.lock().await.remove(row.session_id);
+                self.record_final(
+                    row.session_id,
+                    ClosureReason::HostShutdown,
+                    &row.process_identity,
+                )
+                .await?;
             }
-            let Some(row) = rows
-                .iter()
-                .find(|row| row.session_id == descriptor.session_id)
-            else {
-                continue;
-            };
-            self.directory.lock().await.remove(descriptor.session_id);
-            self.record_final(
-                descriptor.session_id,
-                ClosureReason::HostShutdown,
-                &row.process_identity,
-            )
-            .await?;
+        }
+        if recorded.as_deref() != Some(current.as_slice()) {
+            kr_ipc::paths::write_owner_only_file(&path, &current)?;
         }
         Ok(())
     }
@@ -2380,7 +2463,7 @@ impl Controller {
         })
     }
 
-    async fn host_doctor(&self) -> Result<ParamsValue> {
+    async fn host_doctor(self: &Arc<Self>) -> Result<ParamsValue> {
         let mut checks = Vec::new();
         checks.push(DoctorCheck {
             id: "runtime-directory".to_owned(),
@@ -2416,6 +2499,41 @@ impl Controller {
                 }),
             ),
         });
+        let power = self.power_state().await;
+        checks.push(DoctorCheck {
+            id: "sleep-setting".to_owned(),
+            title: "This host's sleep policy is the owner's choice".to_owned(),
+            status: DoctorStatus::Ok,
+            detail: format!(
+                "{} (setting read from {})",
+                power.describe(),
+                self.paths
+                    .state_dir()
+                    .join(kr_protocol::desktop::setting::FILE_NAME)
+                    .display()
+            ),
+            remedy: Nullable(
+                (power.setting == kr_protocol::desktop::SleepInhibitionSetting::Off).then(|| {
+                    "kr host power --set mains_only keeps this host awake for work it has \
+                     admitted, while it is on mains power."
+                        .to_owned()
+                }),
+            ),
+        });
+        for entry in crate::desktop::persistence(&self.supervisor.describe()) {
+            checks.push(DoctorCheck {
+                id: format!("logout-{}", entry.profile.as_str()),
+                title: format!("What a logout does to a {} session", entry.profile.as_str()),
+                status: DoctorStatus::Ok,
+                detail: format!(
+                    "{} through {}: {}",
+                    entry.persistence.as_str(),
+                    entry.mechanism,
+                    entry.detail
+                ),
+                remedy: Nullable::null(),
+            });
+        }
         let pending = self.revision_pending().await?;
         checks.push(DoctorCheck {
             id: "authority-revision".to_owned(),
@@ -2538,18 +2656,6 @@ impl Controller {
         if let Some(refusal) = create.palette_refusal() {
             return Err(ControllerError::InvalidArgument(refusal));
         }
-        // A desktop-bound session needs a desktop. This host does not manufacture one: an SSH
-        // connection is a transport rather than a graphical login, and a request that asked to be
-        // bound to a desktop that is not there would be given a session bound to nothing.
-        if create.worker_profile == WorkerProfile::DesktopBound {
-            let (desktop, _) = self.desktop().await;
-            if !desktop.is_desktop() || !desktop.graphic_access {
-                return Err(ControllerError::NotConfigured(
-                    "this host has no graphical login session to bind a session to; create it in                      the headless user profile instead"
-                        .to_owned(),
-                ));
-            }
-        }
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         // The create request itself is recorded with the reservation, before anything is spawned.
@@ -2571,8 +2677,31 @@ impl Controller {
         };
         let reservation = admission.reservation;
         if admission.deduplicated {
+            // A repeated token resolves to the session it already created, whatever this host's
+            // conditions are now. A desktop that has gone since is a reason not to start a new
+            // session rather than a reason to withhold the answer about one that already exists.
             return self.replay_create(&reservation).await;
         }
+
+        // A desktop-bound session needs a desktop, and this host does not manufacture one: an SSH
+        // connection is a transport rather than a graphical login, and a request bound to a
+        // desktop that is not there would be given a session bound to nothing. The desktop's own
+        // environment is collected in the same breath, because both are conversations with the
+        // platform and neither may happen after the deadline below is checked.
+        let desktop_environment = if create.worker_profile == WorkerProfile::DesktopBound {
+            let (desktop, _) = self.desktop().await;
+            if !desktop.is_desktop() || !desktop.graphic_access {
+                let mut registry = self.registry.lock().await;
+                registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
+                drop(registry);
+                return Err(ControllerError::NotConfigured(
+                    NO_DESKTOP_TO_BIND.to_owned(),
+                ));
+            }
+            crate::desktop::agent::environment(create.worker_profile)
+        } else {
+            Vec::new()
+        };
 
         let (sender, receiver) = oneshot::channel();
         self.pending
@@ -2645,9 +2774,12 @@ impl Controller {
             working_directory,
             // The desktop the worker is started in. Two platforms place a per-user job in the
             // login session that started it and need nothing here; Linux publishes the session's
-            // display, compositor and message bus into the user manager, and this is where they
-            // are collected for the worker's own unit.
-            desktop_environment: crate::desktop::agent::environment(create.worker_profile),
+            // display, compositor and message bus into the user manager, and that is what was
+            // collected above.
+            desktop_environment,
+            // Which login context the worker is started in at all, which its environment alone
+            // does not decide.
+            profile: create.worker_profile,
         };
         let identity = match self.supervisor.start(&launch) {
             LaunchOutcome::Started(identity) => identity,
@@ -2712,8 +2844,9 @@ impl Controller {
             .ok_or_else(|| ControllerError::supervision("the worker is not in the directory"))?;
         let summary = self.read_from_worker(&worker).await?;
         // A new session can be the work that justifies keeping this host awake, and the setting
-        // decides whether it does.
-        let _ = self.power_state().await;
+        // decides whether it does. That is looked at beside this answer rather than before it:
+        // what the host does about its own sleep policy is no reason to hold a caller's receipt.
+        self.review_power_soon();
         encode(&SessionCreateResult {
             session: summary,
             endpoint: Nullable::some(ready.endpoint),
@@ -3059,22 +3192,35 @@ impl Controller {
     ///
     /// Returns an error when the registry cannot be read or written.
     pub async fn reconcile(&self, session_id: SessionId) -> Result<Option<ClosureRecord>> {
-        let identity = {
+        let row = {
             let registry = self.registry.lock().await;
             registry
                 .workers()?
                 .into_iter()
                 .find(|record| record.session_id == session_id)
-                .map(|record| record.process_identity)
         };
-        let Some(identity) = identity else {
+        let Some(row) = row else {
             return Ok(None);
         };
+        let identity = row.process_identity;
         match kr_ipc::identity::process_state(&identity) {
-            kr_ipc::identity::ProcessState::Ended => self
-                .record_final(session_id, ClosureReason::WorkerCrash, &identity)
-                .await
-                .map(Some),
+            kr_ipc::identity::ProcessState::Ended => {
+                // Why the worker is gone, where this host can tell. A desktop-bound worker on a
+                // host that no longer has a graphical login went with that login: the platform
+                // ended the job with the domain it was in, which is what a logout does, and the
+                // worker had no chance to write its own record. Anything else is a worker that
+                // ended for reasons this host does not know.
+                let reason = if row.profile == WorkerProfile::DesktopBound
+                    && !self.desktop().await.0.is_desktop()
+                {
+                    ClosureReason::DesktopLost
+                } else {
+                    ClosureReason::WorkerCrash
+                };
+                self.record_final(session_id, reason, &identity)
+                    .await
+                    .map(Some)
+            }
             _ => Ok(None),
         }
     }
@@ -3399,6 +3545,25 @@ const fn forwarded_to_worker(method: Method) -> bool {
 }
 
 /// Returns the sentence a caller is given when a window cannot first-admit a request.
+/// Returns capability records in the form two reports are compared in.
+///
+/// The revision is what the comparison decides, so it cannot be part of it, and the moment each
+/// record was observed changes on every report whether anything else did or not. Everything else
+/// is evidence.
+fn comparable(
+    records: &[kr_protocol::desktop::CapabilityRecord],
+) -> Vec<kr_protocol::desktop::CapabilityRecord> {
+    records
+        .iter()
+        .map(|record| {
+            let mut record = record.clone();
+            record.revision = CapabilityRevision::new(0);
+            record.observed_at_ms = TimestampMs::new(0);
+            record
+        })
+        .collect()
+}
+
 const fn window_refusal_detail(refusal: kr_transport::window::WindowRefusal) -> &'static str {
     use kr_transport::window::WindowRefusal;
     match refusal {
