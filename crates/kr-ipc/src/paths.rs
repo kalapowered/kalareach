@@ -55,11 +55,18 @@ pub struct HostPaths {
 
 impl HostPaths {
     /// Builds the roots from explicit paths.
+    ///
+    /// A relative root is resolved against the directory this process was started in, once, here.
+    /// Every path an installation has is derived from these two, and some of them are given to a
+    /// process that runs somewhere else: a worker is started in a directory of its own, and a
+    /// relative root would mean a different place to it. Resolving them at the top is what keeps
+    /// one installation's paths naming the same directories in every process that holds them, and
+    /// what lets an endpoint one process signs be the endpoint another compares it with.
     #[must_use]
     pub fn new(runtime_root: impl Into<PathBuf>, state_root: impl Into<PathBuf>) -> Self {
         Self {
-            runtime_root: runtime_root.into(),
-            state_root: state_root.into(),
+            runtime_root: resolved(runtime_root.into()),
+            state_root: resolved(state_root.into()),
         }
     }
 
@@ -474,6 +481,14 @@ impl core::fmt::Display for Endpoint {
     fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         formatter.write_str(&self.as_text())
     }
+}
+
+/// Returns `path` against the directory this process was started in.
+///
+/// It is left as it is when it cannot be resolved, which means a current directory the operating
+/// system will not report: nothing is gained by refusing a path that may still work.
+fn resolved(path: PathBuf) -> PathBuf {
+    std::path::absolute(&path).unwrap_or(path)
 }
 
 /// The file that records which environment owns a directory whose name is only a prefix.
@@ -1024,6 +1039,28 @@ mod tests {
         let second = paths.open_environment_id().expect("reads");
         assert_eq!(first, second);
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A host that was given relative roots holds absolute ones.
+    ///
+    /// The roots travel: a worker is started in a directory of its own and is told where the
+    /// installation is, and a relative root would send it somewhere else. Everything derived from
+    /// them travels with them, including the endpoint one process signs and another compares.
+    #[test]
+    fn a_relative_root_is_resolved_where_the_host_is_built() {
+        let paths = HostPaths::new("kr-relative-runtime", "kr-relative-state");
+        let here = std::env::current_dir().expect("this process has a directory");
+        assert_eq!(paths.runtime_root(), here.join("kr-relative-runtime"));
+        assert_eq!(paths.state_root(), here.join("kr-relative-state"));
+        let environment = paths.environment(EnvironmentId::new(crate::new_uuid()));
+        assert!(environment.runtime_dir().is_absolute());
+        assert!(environment.state_dir().is_absolute());
+        assert!(
+            environment
+                .worker_dir(SessionId::new(crate::new_uuid()))
+                .starts_with(paths.state_root()),
+            "and every path below them stays inside the root it was derived from"
+        );
     }
 
     #[test]

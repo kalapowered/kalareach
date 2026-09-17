@@ -1416,17 +1416,38 @@ impl Drop for EnvironmentSecrets {
 /// Starts the copied daemon on this test's own directories, with no worker program.
 #[cfg(unix)]
 fn start_daemon(program: &std::path::Path, host: &kr_ipc::testing::TempHost) -> Daemon {
+    start_daemon_with(program, host, false)
+}
+
+/// Starts the copied daemon, naming its directories relatively when `relative` is set.
+///
+/// A daemon is ordinarily given absolute directories, and an installation that gives it relative
+/// ones is giving them against the directory it is started in. Everything the daemon derives from
+/// them travels: the endpoints it binds, the roots it hands a worker it starts, and the endpoint
+/// identity a worker signs and this daemon later compares. All of that has to name the same
+/// directories as the ones this test derives from its own absolute root.
+#[cfg(unix)]
+fn start_daemon_with(
+    program: &std::path::Path,
+    host: &kr_ipc::testing::TempHost,
+    relative: bool,
+) -> Daemon {
     let logs = host.root().join("daemon.log");
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&logs)
         .expect("opens the daemon's log");
+    let (runtime_dir, state_dir) = if relative {
+        (std::path::PathBuf::from("r"), std::path::PathBuf::from("s"))
+    } else {
+        (host.root().join("r"), host.root().join("s"))
+    };
     let daemon = std::process::Command::new(program)
         .arg("--runtime-dir")
-        .arg(host.root().join("r"))
+        .arg(runtime_dir)
         .arg("--state-dir")
-        .arg(host.root().join("s"))
+        .arg(state_dir)
         // This test creates no sessions, and a worker that cannot be found is refused rather than
         // started.
         .arg("--worker")
@@ -1554,4 +1575,74 @@ async fn wait_for_daemon(endpoint: &kr_ipc::paths::Endpoint) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
+}
+
+/// A daemon given relative directories names the same places as one given absolute ones.
+///
+/// It is started in a directory of its own with `--runtime-dir r --state-dir s`. This test knows
+/// only the absolute root, and derives the endpoint, the environment identity and the registry
+/// from it. If the daemon resolved those names anywhere but where it was started, it would bind a
+/// different socket and this test would never reach it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemon_given_relative_directories_binds_the_endpoints_this_test_derives() {
+    let host = kr_ipc::testing::TempHost::create();
+    let environment = host.environment();
+    let environment_id = host.environment_id();
+    let program = host.root().join("kr-controller");
+    std::fs::copy(env!("CARGO_BIN_EXE_kr-controller"), &program).expect("copies the daemon");
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let secrets = EnvironmentSecrets {
+        environment_id,
+        secrets: environment.secrets_dir(),
+    };
+
+    let mut daemon = start_daemon_with(&program, &host, true);
+    wait_for_daemon(&endpoint).await;
+    let mut control = LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the daemon this test started");
+    let info: kr_protocol::hostinfo::HostInfoResult = typed(
+        &control
+            .request(Method::HostInfo, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("host.info succeeds"),
+    );
+    assert_eq!(
+        info.environment_id, environment_id,
+        "the daemon opened this test's own environment"
+    );
+    // And the directories it reports are the absolute ones this test knows, not the two words it
+    // was given. Compared as directories rather than as text: a temporary root reached through a
+    // symbolic link is one directory under two names, and what is under test is which directory
+    // the daemon resolved to.
+    let environments: kr_protocol::hostinfo::EnvironmentListResult = typed(
+        &control
+            .request(Method::EnvironmentList, &())
+            .await
+            .expect("the call reaches the daemon")
+            .expect("environment.list succeeds"),
+    );
+    let listed = environments
+        .environments
+        .first()
+        .expect("the daemon lists the environment it owns");
+    let same = |reported: &str, derived: &std::path::Path| {
+        let reported = std::path::PathBuf::from(reported);
+        assert!(reported.is_absolute(), "{} is absolute", reported.display());
+        assert_eq!(
+            std::fs::canonicalize(&reported).expect("the daemon's directory exists"),
+            std::fs::canonicalize(derived).expect("this test's directory exists"),
+            "{} and {} are one directory",
+            reported.display(),
+            derived.display()
+        );
+    };
+    same(&listed.runtime_directory, environment.runtime_dir());
+    same(&listed.state_directory, environment.state_dir());
+
+    drop(control);
+    daemon.stop();
+    secrets.remove().expect("removes the daemon's secrets");
 }

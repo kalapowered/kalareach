@@ -1749,7 +1749,7 @@ impl Controller {
         // operations, and a slow disk would otherwise spend the rest of an accepted deadline here.
         // The directory is inside this environment's state directory, which this daemon owns and
         // which holds nothing a person keeps.
-        let working_directory = launch_path(self.paths.worker_dir(reservation.session_id))?;
+        let working_directory = self.paths.worker_dir(reservation.session_id);
         if let Err(error) =
             kr_ipc::paths::create_private_tree(self.paths.state_root(), &working_directory)
         {
@@ -1808,14 +1808,14 @@ impl Controller {
             session_id: reservation.session_id,
             environment_id: self.paths.environment_id(),
             display_number: reservation.display_number,
-            program: launch_path(self.worker_program.clone())?,
-            rendezvous: launch_path(self.paths.rendezvous_endpoint()?.as_path().to_path_buf())?,
+            program: self.worker_program.clone(),
+            rendezvous: self.paths.rendezvous_endpoint()?.as_path().to_path_buf(),
             // The roots, not this environment's directories: the worker derives its own paths
             // from the environment identity, and giving it the derived directory would make it
             // apply the prefix twice.
-            runtime_directory: launch_path(self.paths.runtime_root().to_path_buf())?,
-            state_directory: launch_path(self.paths.state_root().to_path_buf())?,
-            jobs_directory: launch_path(self.paths.jobs_dir())?,
+            runtime_directory: self.paths.runtime_root().to_path_buf(),
+            state_directory: self.paths.state_root().to_path_buf(),
+            jobs_directory: self.paths.jobs_dir(),
             working_directory,
         };
         let identity = match self.supervisor.start(&launch) {
@@ -2543,20 +2543,6 @@ fn error_reply(request_id: RequestId, code: ErrorCode, message: impl Into<String
     ControlFrame::Response(Response {
         request_id,
         outcome: Outcome::Error(ProtocolError::new(code, message)),
-    })
-}
-
-/// Returns a path a launch can carry, absolute against this daemon's own directory.
-///
-/// The worker runs in a directory this daemon chooses rather than the one this daemon runs in, so
-/// a path this daemon was given relatively would name a different place to it. Making every path
-/// in a launch absolute here is what keeps the two agreeing about where the environment is.
-fn launch_path(path: PathBuf) -> Result<PathBuf> {
-    std::path::absolute(&path).map_err(|error| {
-        ControllerError::supervision(format!(
-            "{} could not be resolved against this daemon's own directory: {error}",
-            path.display()
-        ))
     })
 }
 
