@@ -25,29 +25,6 @@ env:
   KR_TEST_ARTIFACTS_DIR: /tmp/kr-test-artifacts
 
 jobs:
-  # TEMPORARY: the slow-observer suite on its own, several times, to settle why it fails on this
-  # runner class and passes elsewhere. Removed once the answer is recorded.
-  backpressure:
-    name: backpressure
-    runs-on: ubuntu-24.04
-    steps:
-      - name: Check out
-        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
-
-      - name: Install the pinned toolchain
-        run: |
-          rustup show active-toolchain || rustup toolchain install
-          rustc --version
-          cargo --version
-          nproc
-
-      - name: Slow observer, three times
-        run: |
-          for attempt in 1 2 3; do
-            echo "attempt $attempt"
-            cargo test --locked -p kr-worker --test backpressure -- --nocapture
-          done
-
   rust:
     name: rust
     runs-on: ubuntu-24.04
