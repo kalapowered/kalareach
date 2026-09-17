@@ -87,6 +87,14 @@ const PUMP_BATCH: usize = 16;
 /// same answer a lost observation gets, for the same reason.
 pub const DEFAULT_EVENT_QUEUE: usize = 256;
 
+/// How long the binding's thread waits for room to report a fault.
+///
+/// A fault and a disabled notice are the two a caller cannot infer from anything else, so they are
+/// worth waiting for. Waiting without a bound would let a caller that stopped reading hold this
+/// thread, and a stop would then wait on a send that waits on the caller. After this long the
+/// binding disables itself instead, which is what the notice would have asked for.
+const FAULT_DELIVERY_WAIT: core::time::Duration = core::time::Duration::from_secs(2);
+
 /// How long preparing a binding may take before the caller is told it has not finished.
 pub const DEFAULT_PREPARE_DEADLINE: core::time::Duration = core::time::Duration::from_secs(10);
 
@@ -549,12 +557,21 @@ enum Command {
         state: Vec<u8>,
         answer: Answer<()>,
     },
-    SetFacts(BindingFacts),
-    SetAttachments(Vec<AttachmentFact>),
     Stop,
 }
 
 type Answer<T> = tokio::sync::oneshot::Sender<RuntimeResult<CallResult<T>>>;
+
+/// What a caller has changed and the component has not been told yet.
+///
+/// A slot rather than a message, so a second change replaces the first instead of queueing behind
+/// it: what a component wants to know is the current state, and being told an older one after a
+/// newer one would be worse than not being told at all.
+#[derive(Debug, Default)]
+struct PendingUpdates {
+    facts: Mutex<Option<BindingFacts>>,
+    attachments: Mutex<Option<Vec<AttachmentFact>>>,
+}
 
 /// A live binding.
 ///
@@ -567,6 +584,7 @@ pub struct BindingHandle {
     disabled: Arc<Mutex<Option<String>>>,
     stopping: Arc<AtomicBool>,
     pump_pending: Arc<AtomicBool>,
+    pending: Arc<PendingUpdates>,
     ready: Mutex<Option<tokio::sync::oneshot::Receiver<RuntimeResult<()>>>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -597,6 +615,7 @@ impl BindingHandle {
         let disabled = Arc::new(Mutex::new(None));
         let stopping = Arc::new(AtomicBool::new(false));
         let pump_pending = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(PendingUpdates::default());
 
         let target = WireBinding {
             plugin_id: request.identity.plugin_id.as_str().to_owned(),
@@ -619,6 +638,7 @@ impl BindingHandle {
             disabled: Arc::clone(&disabled),
             stopping: Arc::clone(&stopping),
             pump_pending: Arc::clone(&pump_pending),
+            pending: Arc::clone(&pending),
             commands: commands.clone(),
             identity: request.identity.clone(),
         };
@@ -637,6 +657,7 @@ impl BindingHandle {
             disabled,
             stopping,
             pump_pending,
+            pending,
             ready: Mutex::new(Some(readiness)),
             thread: Mutex::new(Some(thread)),
         })
@@ -822,13 +843,23 @@ impl BindingHandle {
     }
 
     /// Replaces the facts the component reads about its binding.
+    ///
+    /// The latest replaces the last rather than queueing behind it: only the current facts are
+    /// worth telling a component, and a caller that revised them twice while a call was running
+    /// did not mean the component to be told the older set afterwards.
     pub fn set_facts(&self, facts: BindingFacts) {
-        let _ = self.commands.send(Command::SetFacts(facts));
+        if let Ok(mut slot) = self.pending.facts.lock() {
+            *slot = Some(facts);
+        }
+        self.wake();
     }
 
-    /// Replaces the attachments the current draft holds.
+    /// Replaces the attachments the current draft holds. Coalesced, as the facts are.
     pub fn set_attachments(&self, attachments: Vec<AttachmentFact>) {
-        let _ = self.commands.send(Command::SetAttachments(attachments));
+        if let Ok(mut slot) = self.pending.attachments.lock() {
+            *slot = Some(attachments);
+        }
+        self.wake();
     }
 
     /// Stops the binding's thread and waits for it.
@@ -915,6 +946,7 @@ struct BindingWorker {
     disabled: Arc<Mutex<Option<String>>>,
     stopping: Arc<AtomicBool>,
     pump_pending: Arc<AtomicBool>,
+    pending: Arc<PendingUpdates>,
     commands: mpsc::Sender<Command>,
     identity: PluginIdentity,
 }
@@ -1015,16 +1047,6 @@ impl BindingWorker {
                         self.run_call(CallKind::Restore, move |instance| instance.restore(state));
                     let _ = answer.send(outcome);
                 }
-                Command::SetFacts(facts) => {
-                    if let Some(instance) = self.instance.as_mut() {
-                        instance.set_binding_facts(facts);
-                    }
-                }
-                Command::SetAttachments(attachments) => {
-                    if let Some(instance) = self.instance.as_mut() {
-                        instance.set_attachments(attachments);
-                    }
-                }
                 Command::Stop => return,
             }
         }
@@ -1042,15 +1064,20 @@ impl BindingWorker {
             }
             return;
         }
-        let (drained, owed, remaining) = match self.queue.lock() {
-            Ok(mut queue) => {
-                let owed = queue.snapshot_owed();
-                let drained = queue.drain(PUMP_BATCH);
-                (drained, owed, !queue.is_empty())
-            }
-            Err(_) => return,
+        self.apply_pending();
+
+        // The gap, then the snapshot it obliges, then the events. Nothing leaves the queue before
+        // the component is in a state to interpret it: an event this pass removed and then
+        // abandoned would be an event nobody ever accounted for.
+        let Some((owed, gap)) = self
+            .queue
+            .lock()
+            .ok()
+            .map(|mut queue| (queue.snapshot_owed(), queue.take_gap()))
+        else {
+            return;
         };
-        if let Some(gap) = drained.gap {
+        if let Some(gap) = gap {
             self.send(BindingEvent::Gap(gap));
         }
         if owed != 0 {
@@ -1060,28 +1087,70 @@ impl BindingWorker {
             // obligation is discharged by number, so a gap that appeared while this snapshot was
             // running still asks for another.
             let outcome = self.run_call(CallKind::Snapshot, Instance::snapshot);
-            self.discharge(&outcome, owed);
-            if outcome.is_err() {
-                // The snapshot faulted. Its replacement has no state either, so there is nothing
-                // to deliver observations against until a snapshot succeeds.
+            if !self.discharge(&outcome, owed) {
+                // The snapshot failed, or the component declined it. Either way the obligation
+                // stands, and delivering observations against a document that does not exist
+                // would interpret them against nothing.
                 self.rearm(true);
                 return;
             }
         }
-        for event in drained.events {
+
+        for _ in 0..PUMP_BATCH {
             if self.is_disabled() || self.stopping.load(Ordering::Acquire) {
                 return;
             }
+            // One at a time, so a fault costs the event that caused it and not the batch.
+            let Some(event) = self.take_one() else {
+                return;
+            };
+            let lost = event.clone();
             let outcome = self.run_call(CallKind::Observe, move |instance| instance.observe(event));
             if outcome.is_err() {
-                // A faulted instance is replaced and owes a snapshot. Delivering the rest of this
-                // batch first would interpret events against a document that no longer exists, so
-                // the batch stops here and the next pass takes the snapshot before it continues.
+                // A faulted instance is replaced and owes a snapshot. The event that faulted is
+                // one the component never took in, so it is recorded as lost; the events still in
+                // the queue are still in the queue, and the next pass takes the snapshot before it
+                // delivers any of them.
+                if let Ok(mut queue) = self.queue.lock() {
+                    queue.taken_event_was_lost(&lost);
+                }
                 self.rearm(true);
                 return;
             }
         }
-        self.rearm(remaining);
+        self.rearm(self.queue.lock().is_ok_and(|queue| !queue.is_empty()));
+    }
+
+    /// Tells the component what a caller has changed since the last call.
+    fn apply_pending(&mut self) {
+        let facts = self
+            .pending
+            .facts
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        let attachments = self
+            .pending
+            .attachments
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(instance) = self.instance.as_mut() {
+            if let Some(facts) = facts {
+                instance.set_binding_facts(facts);
+            }
+            if let Some(attachments) = attachments {
+                instance.set_attachments(attachments);
+            }
+        }
+    }
+
+    /// Takes the oldest observation, if there is one.
+    fn take_one(&self) -> Option<ScopedSourceEvent> {
+        self.queue
+            .lock()
+            .ok()
+            .and_then(|mut queue| queue.take_one())
     }
 
     /// Wakes the pump again when there is more to do.
@@ -1096,15 +1165,18 @@ impl BindingWorker {
     }
 
     /// Clears the snapshot obligation `owed` when the snapshot that answered it succeeded.
-    fn discharge<T>(&self, outcome: &RuntimeResult<CallResult<T>>, owed: u64) {
-        if owed == 0 {
-            return;
-        }
-        if outcome.as_ref().is_ok_and(|result| result.answer.is_ok())
+    ///
+    /// Returns whether it did. A component that declined the snapshot has not rebuilt its view any
+    /// more than one whose snapshot faulted, so the obligation stands either way.
+    fn discharge<T>(&self, outcome: &RuntimeResult<CallResult<T>>, owed: u64) -> bool {
+        let answered = outcome.as_ref().is_ok_and(|result| result.answer.is_ok());
+        if answered
+            && owed != 0
             && let Ok(mut queue) = self.queue.lock()
         {
             queue.snapshot_taken(owed);
         }
+        answered
     }
 
     fn run_call<T, F>(&mut self, kind: CallKind, invoke: F) -> RuntimeResult<CallResult<T>>
@@ -1143,6 +1215,7 @@ impl BindingWorker {
             }
         }
 
+        self.apply_pending();
         let Some(instance) = self.instance.as_mut() else {
             return Err(RuntimeError::NoSuchBinding {
                 binding: self.identity.plugin_id.as_str().to_owned(),
@@ -1208,10 +1281,6 @@ impl BindingWorker {
     /// anything else, so the send waits for room by blocking this thread, which is the binding's
     /// own and nothing else's.
     fn send(&mut self, event: BindingEvent) {
-        let must_arrive = matches!(
-            event,
-            BindingEvent::Fault { .. } | BindingEvent::Disabled { .. }
-        );
         if self.dropped_documents > 0 {
             let dropped = BindingEvent::PresentationDropped {
                 documents: self.dropped_documents,
@@ -1220,15 +1289,47 @@ impl BindingWorker {
                 self.dropped_documents = 0;
             }
         }
-        if must_arrive {
-            let _ = self.events.blocking_send(event);
+        let must_arrive = matches!(
+            event,
+            BindingEvent::Fault { .. } | BindingEvent::Disabled { .. }
+        );
+        if !must_arrive {
+            if self.events.try_send(event).is_err() {
+                self.dropped_documents = self.dropped_documents.saturating_add(1);
+                if let Ok(mut queue) = self.queue.lock() {
+                    queue.require_snapshot();
+                }
+            }
             return;
         }
-        if self.events.try_send(event).is_err() {
-            self.dropped_documents = self.dropped_documents.saturating_add(1);
-            if let Ok(mut queue) = self.queue.lock() {
-                queue.require_snapshot();
+
+        // A fault and a disabled notice are the two a caller cannot infer from anything else, so
+        // they are worth waiting for room. Waiting without a bound is not: a caller that has
+        // stopped reading would hold this thread for ever, and a stop would then be waiting for a
+        // send that is waiting for the caller. So the wait is bounded and gives up.
+        let deadline = std::time::Instant::now() + FAULT_DELIVERY_WAIT;
+        let mut event = event;
+        loop {
+            match self.events.try_send(event) {
+                Ok(()) => return,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => event = returned,
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
             }
+            if self.stopping.load(Ordering::Acquire) || std::time::Instant::now() >= deadline {
+                // Nobody is reading, so nobody is going to act on this binding either. Disabling
+                // it locally is what stops it running anything more, which is what the notice
+                // would have asked for.
+                if let Ok(mut slot) = self.disabled.lock()
+                    && slot.is_none()
+                {
+                    *slot = Some(format!(
+                        "{} is disabled: its host stopped reading what the binding reported",
+                        self.identity.plugin_id
+                    ));
+                }
+                return;
+            }
+            std::thread::sleep(core::time::Duration::from_millis(5));
         }
     }
 

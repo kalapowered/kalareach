@@ -254,6 +254,34 @@ impl ObservationQueue {
         }
     }
 
+    /// Takes the gap, if there is one.
+    ///
+    /// Separate from taking events, because a gap has to be reported and its snapshot taken before
+    /// any event after it is interpreted, and taking events at the same time would mean holding
+    /// them somewhere the queue no longer accounts for.
+    pub fn take_gap(&mut self) -> Option<ObservationGap> {
+        (!self.gap.is_empty()).then(|| core::mem::take(&mut self.gap))
+    }
+
+    /// Takes the oldest event, if there is one.
+    ///
+    /// One at a time is what lets a caller stop after a fault without having removed events it is
+    /// not going to deliver.
+    pub fn take_one(&mut self) -> Option<ScopedSourceEvent> {
+        let event = self.events.pop_front()?;
+        self.held_bytes = self.held_bytes.saturating_sub(event.queue_bytes());
+        Some(event)
+    }
+
+    /// Records that one event was taken and then not delivered.
+    ///
+    /// A fault costs the event that caused it. Saying so is what keeps the stream's account
+    /// complete: the component's view is missing that event, and a gap is how it learns to rebuild.
+    pub fn taken_event_was_lost(&mut self, event: &ScopedSourceEvent) {
+        self.gap.absorb(1, event.queue_bytes());
+        self.raise_obligation();
+    }
+
     /// Takes up to `limit` events, with the gap that precedes them.
     pub fn drain(&mut self, limit: usize) -> Drained {
         let gap = (!self.gap.is_empty()).then(|| core::mem::take(&mut self.gap));
@@ -481,6 +509,29 @@ mod tests {
             Admission::Refused { .. }
         ));
         assert!(other.is_empty());
+    }
+
+    #[test]
+    fn one_event_at_a_time_leaves_the_rest_where_they_were() {
+        let mut queue = ObservationQueue::new();
+        for index in 0..3 {
+            queue.push(scrape(&format!("se-{index}"), 32));
+        }
+        let first = queue.take_one().expect("an event");
+        assert_eq!(first.handle.as_str(), "se-0");
+        assert_eq!(queue.len(), 2);
+
+        // A fault on that event is the event's loss, and the account says so.
+        queue.taken_event_was_lost(&first);
+        assert!(queue.snapshot_required());
+        let gap = queue.take_gap().expect("the lost event is a gap");
+        assert_eq!(gap.events, 1);
+
+        // And the two that were never taken are still there, in order.
+        assert_eq!(queue.take_one().expect("an event").handle.as_str(), "se-1");
+        assert_eq!(queue.take_one().expect("an event").handle.as_str(), "se-2");
+        assert!(queue.take_one().is_none());
+        assert_eq!(queue.held_bytes(), 0);
     }
 
     #[test]
