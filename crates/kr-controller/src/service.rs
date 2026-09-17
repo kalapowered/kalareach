@@ -1752,14 +1752,20 @@ impl Controller {
         {
             let mut registry = self.registry.lock().await;
             registry.set_phase(reservation.reservation_id, LaunchPhase::Spawned)?;
-            let refusal = if self.clock.now() >= accepted.deadline {
-                Some(ControllerError::WindowExpired {
-                    detail:
-                        "the deadline this create was admitted under passed before it could start"
+            // The registration first, because reading it waits: the connection table is taken
+            // under this guard, and a revocation can be part way through taking it. The deadline
+            // is checked afterwards, so the last thing between this create and its launch is a
+            // reading of the clock with nothing left to wait for.
+            let refusal = match self.authorised(connection_id).await.err() {
+                Some(withdrawn) => Some(withdrawn),
+                None if self.clock.now() >= accepted.deadline => {
+                    Some(ControllerError::WindowExpired {
+                        detail: "the deadline this create was admitted under passed before it \
+                                 could start"
                             .to_owned(),
-                })
-            } else {
-                self.authorised(connection_id).await.err()
+                    })
+                }
+                None => None,
             };
             if let Some(refusal) = refusal {
                 // Nothing was started, so the reservation is resolved as a confirmed failure and
@@ -2558,14 +2564,15 @@ mod tests {
     }
 }
 
-/// A create that reserved its identity and then waited across a revocation.
+/// A create that reserved its identity and then waited.
 ///
-/// The window this covers cannot be reached from outside the daemon: a create passes the
-/// admission check, writes its reservation, and only then waits. What holds it here is the map it
+/// The window these cover cannot be reached from outside the daemon: a create passes the
+/// admission check, writes its reservation, and only then waits. What holds it there is the map it
 /// records its pending launch report in, which is taken between the reservation and the transition
-/// to `spawned` and nowhere else during a create.
+/// to `spawned` and nowhere else during a create; and the connection table, which the transition
+/// itself reads.
 #[cfg(test)]
-mod create_across_a_revocation {
+mod a_create_that_waited {
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
@@ -2635,8 +2642,12 @@ mod create_across_a_revocation {
         }
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_create_that_waited_across_a_revocation_launches_nothing() {
+    /// Starts a daemon on a tree of its own, with a supervisor that starts nothing.
+    async fn daemon() -> (
+        kr_ipc::testing::TempHost,
+        Arc<Controller>,
+        Arc<Mutex<Vec<WorkerLaunch>>>,
+    ) {
         let temp = kr_ipc::testing::TempHost::create();
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -2662,7 +2673,11 @@ mod create_across_a_revocation {
         })
         .await
         .expect("the daemon starts");
+        (temp, controller, asked)
+    }
 
+    /// Registers one connection, the way a caller's handshake does.
+    async fn admitted(controller: &Controller) -> (ConnectionId, kr_protocol::ids::ActorId) {
         let connection_id = ConnectionId::new(kr_ipc::new_uuid());
         let actor_id = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
         controller
@@ -2677,6 +2692,29 @@ mod create_across_a_revocation {
             )
             .await
             .expect("the connection is registered");
+        (connection_id, actor_id)
+    }
+
+    /// Waits until the create under test has written its reservation.
+    async fn reserved(controller: &Controller) {
+        loop {
+            let registry = controller.registry.lock().await;
+            let reserved = registry
+                .reservations_in(LaunchPhase::Reserved)
+                .expect("reads the reservations");
+            drop(registry);
+            if !reserved.is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_that_waited_across_a_revocation_launches_nothing() {
+        let (temp, controller, asked) = daemon().await;
+        let environment_id = temp.environment_id();
+        let (connection_id, actor_id) = admitted(&controller).await;
 
         let accepted = AcceptedDeadline {
             deadline: controller
@@ -2701,17 +2739,7 @@ mod create_across_a_revocation {
         });
         // The reservation is durable before the launch, so its row is what says the create has
         // reached the point this test is about.
-        loop {
-            let registry = controller.registry.lock().await;
-            let reserved = registry
-                .reservations_in(LaunchPhase::Reserved)
-                .expect("reads the reservations");
-            drop(registry);
-            if !reserved.is_empty() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        reserved(&controller).await;
 
         // The revocation completes while the create waits: the revision is advanced and every
         // registration made under the old one is withdrawn.
@@ -2751,13 +2779,75 @@ mod create_across_a_revocation {
             "the reservation it made is released"
         );
     }
+
+    /// The deadline is the last thing checked before the launch.
+    ///
+    /// Reading the registration waits, and a create that queues behind a revocation taking the
+    /// connection table can spend the rest of its accepted lifetime there. A registration that
+    /// still stands is not permission to start a shell under a deadline that has since passed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_whose_deadline_passed_while_it_waited_launches_nothing() {
+        let (temp, controller, asked) = daemon().await;
+        let environment_id = temp.environment_id();
+        let (connection_id, actor_id) = admitted(&controller).await;
+
+        let accepted = AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_millis(300))
+                .expect("a deadline a moment out"),
+            bound: DeadlineBound::RequestedTtl,
+        };
+        let mutation = create_request(environment_id);
+
+        // The create stops at the transition to `spawned`, which reads the connection table.
+        let paused = controller.admitted.lock().await;
+        let create = tokio::spawn({
+            let controller = Arc::clone(&controller);
+            let actor_id = actor_id.clone();
+            async move {
+                controller
+                    .session_create(&actor_id, &mutation, connection_id, accepted)
+                    .await
+            }
+        });
+        // Long enough for the deadline to pass while the create is held here. The registry lock
+        // is held by the create while it waits for the connection table, so nothing here asks the
+        // registry what the create has reached: the deadline is absolute, and a create that has
+        // not started yet still finds it spent by the time it looks.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        drop(paused);
+
+        let outcome = create.await.expect("the create finishes");
+        let error = outcome.expect_err("a create whose deadline has passed starts nothing");
+        assert_eq!(
+            error.code(),
+            ErrorCode::PermissionDenied,
+            "an expired freshness window is refused as such: {error}"
+        );
+        assert!(
+            matches!(error, ControllerError::WindowExpired { .. }),
+            "the receipt says the deadline passed: {error}"
+        );
+        assert!(
+            asked.lock().expect("the record is not poisoned").is_empty(),
+            "no worker is started for a create the host refused"
+        );
+        let registry = controller.registry.lock().await;
+        assert_eq!(
+            registry.occupancy().expect("counts"),
+            0,
+            "the reservation it made is released"
+        );
+    }
 }
 
 /// A close to a worker that stops answering.
 ///
 /// The daemon holds one connection per worker, and a close is the operation most likely to meet a
 /// worker that has stopped answering: it is asking that worker to stop. What this covers is the
-/// connection afterwards — that the caller is told, that the link is not put back in the shared
+/// connection afterwards: that the caller is told, that the link is not put back in the shared
 /// slot part way through an exchange, and that the next caller is not waiting behind the first.
 #[cfg(test)]
 mod a_close_a_worker_never_answers {
@@ -2806,8 +2896,8 @@ mod a_close_a_worker_never_answers {
 
     /// An endpoint that proves itself as a worker and then answers nothing.
     ///
-    /// It completes the handshake the daemon makes before it will speak to a worker at all — the
-    /// version exchange, the challenge over the descriptor's key and the controller generation —
+    /// It completes the handshake the daemon makes before it will speak to a worker at all (the
+    /// version exchange, the challenge over the descriptor's key and the controller generation)
     /// and then reads whatever arrives without replying. That is a worker that has stopped
     /// answering, which is different from one that has gone: the connection stays open.
     fn serve_silent_worker(

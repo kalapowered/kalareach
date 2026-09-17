@@ -708,7 +708,7 @@ impl RemoteConnection {
                 let mutation = mutation.clone();
                 let request_id = mutation.request_id;
                 // The connection travels with the create. A create reserves its identity and then
-                // waits — for a lock, for a process to start, for that process to report itself —
+                // waits for a lock, for a process to start and for that process to report itself,
                 // and a revocation that completes during that wait must stop the launch. The
                 // daemon checks this connection's registration again at the moment the launch
                 // becomes possible, which nothing out here can do on its behalf.
