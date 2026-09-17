@@ -1057,16 +1057,23 @@ the erasure covers that is not already empty.
 
 | Host | Plain stream | Stream that scrolls | Where it was measured |
 | --- | --- | --- | --- |
-| Apple M4 Pro, 12 processors | 11.9 to 12.3 MiB/s | 10.8 to 11.5 MiB/s | local runs of this revision |
-| AMD EPYC 7763 64-Core, 4 processors | 5.9 MiB/s | 5.7 to 5.8 MiB/s | `core-ci` runs 35159810650, 35161103854 and 35162316456 |
-| AMD EPYC 9V74 80-Core, 4 processors | 7.3 MiB/s | 7.4 MiB/s | `core-ci` run 35158750320 |
+| Apple M4 Pro, 12 processors | 11.9 to 12.4 MiB/s | 10.6 to 11.5 MiB/s | local runs of this revision |
+| AMD EPYC 7763 64-Core, 4 processors | 6.1 MiB/s | 5.9 MiB/s | `core-ci` runs 35165588315 and 35167627730 |
+| AMD EPYC 9V74 80-Core, 4 processors | 7.5 MiB/s | 7.7 MiB/s | `core-ci` run 35164400630 |
+| Intel Xeon Platinum 8573C, 4 processors | 8.0 MiB/s | 7.4 MiB/s | `core-ci` run 35163469612 |
+
+The slowest of those hosts is where the comparison is clearest. `core-ci` measured 3.79 MiB/s on the
+stream that scrolls, below the target, on an AMD EPYC 7763 twenty minutes before it measured
+5.86 MiB/s on one of the same class, and the two runs differ only in this engine.
 
 Each row is one host's sampled runs and not a fixed property of that processor. The platform names a
 class of processor rather than a machine, and one named class has answered a third apart on the
 plain stream across the runs behind this revision, so the rows above are not a ranking of
 processors. The runs named are `core-ci` runs of this revision's terminal engine, each one retaining
 the figures, the processor and the verdict it measured, so a row can be read back to the run it came
-from.
+from. The two four-processor rows measured at 7.4 MiB/s and above were taken a few commits before
+the last change to the output path, which only takes work off it; the rows for the slowest host are
+of the engine as it stands.
 
 Section 27 asks a reference host for at least four CPU cores and 8 GiB, so four processors is the
 floor a host has to meet the target on, and every four-processor host above meets it on both
