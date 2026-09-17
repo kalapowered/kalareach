@@ -212,6 +212,7 @@ pub enum Change {
 ///
 /// Returns the underlying failure when the file cannot be read or written.
 pub fn install(path: &Path, body: &str) -> std::io::Result<Change> {
+    let _writing = writing();
     let existing = read_or_empty(path)?;
     let (change, updated) = match strip(&existing) {
         Some((before, after)) => {
@@ -246,19 +247,40 @@ pub fn install(path: &Path, body: &str) -> std::io::Result<Change> {
 ///
 /// Returns the underlying failure when the file cannot be read or written.
 pub fn remove(path: &Path) -> std::io::Result<Change> {
+    let _writing = writing();
     let existing = read_or_empty(path)?;
     let Some((before, after)) = strip(&existing) else {
         return Ok(Change::Absent);
     };
     let rebuilt = format!("{before}{after}");
     // A file this entry created and nothing else ever wrote to goes with it. One the user owns
-    // stays, with their own lines exactly as they left them.
-    if rebuilt.trim().is_empty() && before.trim().is_empty() {
+    // stays, with their own lines exactly as they left them. A link the user made is theirs
+    // whatever the file it names holds: deleting it would leave that file behind with the entry
+    // still in it, and the shell reading a path that no longer exists.
+    let created_here = rebuilt.trim().is_empty()
+        && before.trim().is_empty()
+        && !path
+            .symlink_metadata()
+            .is_ok_and(|data| data.file_type().is_symlink());
+    if created_here {
         std::fs::remove_file(path)?;
     } else {
         replace(path, &existing, &rebuilt)?;
     }
     Ok(Change::Removed)
+}
+
+/// Serialises this process's own startup-file writes.
+///
+/// Installing and removing both read a file, rebuild it and write it back. Two of them running at
+/// once against the same file could otherwise interleave and lose one of the two results. It says
+/// nothing about another process, which is what the check before the rename is for.
+fn writing() -> std::sync::MutexGuard<'static, ()> {
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    WRITING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// Returns whether a file holds a KalaReach entry.
@@ -287,23 +309,21 @@ fn strip(contents: &str) -> Option<(String, String)> {
 ///
 /// Three things the rename has to respect. A startup file is often a symlink into a dotfiles
 /// checkout, so the replacement is written over the file the link points at and the link is left
-/// alone. The file may have changed since it was read, and a replacement built on stale contents
-/// would silently drop whatever was written in between, so the contents are checked again first.
-/// And the file beside it is created exclusively under a name of this call's own, so nothing that
-/// happens to be there is truncated and two calls cannot share one temporary.
+/// alone. The file beside it is created exclusively under a name of this call's own, so nothing
+/// that happens to be there is truncated and two calls cannot share one temporary. And the file
+/// may have changed since the caller read it, so the contents and the file's own identity are
+/// checked again immediately before the rename, once the slow part is behind us: a replacement
+/// built on stale contents would silently drop whatever was saved in between.
+///
+/// That last check is as good as this can be without the platform offering a comparison and a
+/// rename in one step. This process's own calls are serialised against each other; a writer
+/// outside it that saves inside the rename itself is not detected, and its save is what the rename
+/// replaces.
 fn replace(path: &Path, expected: &str, contents: &str) -> std::io::Result<()> {
     // The file the configuration actually lives in. A symlink is a deliberate arrangement of the
     // user's, and renaming over the link would replace it with a regular file and quietly cut the
     // startup entry off from the checkout it belongs to.
-    let target = match path.symlink_metadata() {
-        Ok(data) if data.file_type().is_symlink() => std::fs::canonicalize(path)?,
-        _ => path.to_path_buf(),
-    };
-    if read_or_empty(&target)? != expected {
-        return Err(std::io::Error::other(
-            "the startup file changed while this entry was being written, so nothing was written",
-        ));
-    }
+    let target = resolved(path)?;
     let directory = target.parent().unwrap_or_else(|| Path::new("."));
     let name = target.file_name().map_or_else(
         || String::from("startup"),
@@ -314,26 +334,53 @@ fn replace(path: &Path, expected: &str, contents: &str) -> std::io::Result<()> {
     let permissions = std::fs::metadata(&target)
         .ok()
         .map(|data| data.permissions());
-    match write_new(&temporary, contents) {
-        Ok(()) => {}
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(error);
+    let identity = identity_of(&target);
+    let prepared = write_new(&temporary, contents).and_then(|()| {
+        if let Some(permissions) = permissions {
+            std::fs::set_permissions(&temporary, permissions)?;
         }
-    }
-    if let Some(permissions) = permissions
-        && let Err(error) = std::fs::set_permissions(&temporary, permissions)
-    {
+        // The check the rename stands on, taken here rather than before the write: the write, the
+        // permissions and the flush are where the time goes, and a check taken before them says
+        // nothing about the file the rename is about to replace.
+        if read_or_empty(&target)? != expected || identity_of(&target) != identity {
+            return Err(std::io::Error::other(
+                "the startup file changed while this entry was being written, so nothing was \
+                 written",
+            ));
+        }
+        std::fs::rename(&temporary, &target)
+    });
+    if prepared.is_err() {
         let _ = std::fs::remove_file(&temporary);
-        return Err(error);
     }
-    match std::fs::rename(&temporary, &target) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            Err(error)
-        }
+    prepared
+}
+
+/// Returns the file a startup path resolves to, following a link the user made.
+fn resolved(path: &Path) -> std::io::Result<std::path::PathBuf> {
+    match path.symlink_metadata() {
+        Ok(data) if data.file_type().is_symlink() => std::fs::canonicalize(path),
+        _ => Ok(path.to_path_buf()),
     }
+}
+
+/// Returns what says this is still the same file, as far as the platform will say.
+///
+/// A file that was replaced between the caller's read and this rename is a different file, whatever
+/// its contents happen to be, and the entry belongs in whichever one the startup path names now.
+#[cfg(unix)]
+fn identity_of(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    std::fs::metadata(path)
+        .ok()
+        .map(|data| (data.dev(), data.ino()))
+}
+
+#[cfg(not(unix))]
+fn identity_of(path: &Path) -> Option<(u64, u64)> {
+    let _ = path;
+    None
 }
 
 /// Creates one file that was not there before and writes it out in full.
@@ -486,6 +533,35 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read_to_string(&real).expect("reads"), theirs);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn removing_an_entry_from_a_linked_file_keeps_the_link_and_empties_the_file_it_names() {
+        // The link is the user's arrangement, not this entry's. Deleting it because the file it
+        // names came out empty would leave the shell reading a path that is not there, and the
+        // checkout holding an entry nothing can remove.
+        let root = tempfile::tempdir().expect("a directory");
+        let checkout = root.path().join("dotfiles");
+        std::fs::create_dir_all(&checkout).expect("creates");
+        let real = checkout.join("zshrc");
+        std::fs::write(&real, "").expect("writes an empty file");
+        let link = root.path().join(".zshrc");
+        std::os::unix::fs::symlink(&real, &link).expect("links");
+
+        let body = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), false);
+        assert_eq!(install(&link, &body).expect("installs"), Change::Added);
+        assert_eq!(remove(&link).expect("removes"), Change::Removed);
+        assert!(
+            link.symlink_metadata()
+                .expect("the link is still there")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !installed(&real),
+            "and the file it names no longer holds the entry"
+        );
     }
 
     #[cfg(unix)]

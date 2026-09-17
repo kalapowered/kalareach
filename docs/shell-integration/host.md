@@ -246,9 +246,15 @@ It changes no other setting of that tool and affects no ordinary terminal.
 Either one writes the file beside itself and renames it over, so a full disk or a crash leaves the
 configuration as it was rather than half of it. The file beside it is created exclusively, under a
 name of that call's own and owner-only from its first byte. A startup file that is a symbolic link
-into a checkout is written through: the link stays a link, and the entry lands in the file it names.
+into a checkout is written through: the link stays a link, and the entry lands in the file it names,
+whether the entry is being added or removed.
+
 A file that changed between being read and being written is left alone and the change is reported,
-because a replacement built on what was read would throw away whatever was saved in between.
+because a replacement built on what was read would throw away whatever was saved in between. The
+contents and the file's own identity are checked immediately before the rename, after the write and
+the flush, so the window is the rename itself. That is as narrow as the platform allows: a comparison
+and a rename are two steps, and an editor that saves inside that window has its save replaced. Two of
+these commands running at once are serialised against each other.
 
 ## Section 23's private group
 
