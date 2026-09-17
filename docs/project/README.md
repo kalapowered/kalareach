@@ -375,9 +375,9 @@ still find the key in the file and tell two keys apart, and nothing the reposito
 **Git's own standard error is not repeated at all.** Git prints the configuration key *and the
 value* it objected to, and a value is unconstrained text; Git also cuts its own diagnostics off at
 four kilobytes, so what reaches this host can be a credential whose every character of punctuation
-the truncation removed. Fourteen reviews of this service each found one more shape a rule over that
-text read wrongly, and the last two found shapes with no URL and no punctuation in them at all.
-There is no rule over unconstrained text that tells a secret from a message.
+the truncation removed. A rule that decides from the shape of that text reads some of those shapes
+wrongly, including ones with no URL and no punctuation in them at all: there is no rule over
+unconstrained text that tells a secret from a message.
 
 So what a failure says is: the class Git named in its first word (`fatal`, `error`, `warning`,
 `hint`), how many characters there were, and a fingerprint of them. Two failures can be told apart
@@ -396,9 +396,13 @@ whitespace and `- _ . , ; : ( ) ! ' * + ~ /`. Otherwise it becomes its length an
 That covers a branch name, a revision, a broker name, a destination's parent, the paths `rev-parse`
 reports, a malformed status record (whole, before it is shortened), a submodule path from the
 index, and a decoding refusal from the wire. It is applied where each message is composed, so this
-host's own words stay legible, **and** again at the two places every message passes through: the
-conversion into a wire error, and the write that retains a failure in the journal. A bar at the
-place everything passes does not depend on anybody remembering.
+host's own words stay legible, **and** again wherever a message becomes something somebody reads: a
+failure becomes text in exactly one place, and the whole of it goes through the rule there, so a
+caller inside this host, a log line, the daemon's own standard error and the wire all read the same
+sentence. The journal is under the same bar on both sides: every write that keeps free text and
+every read of one, including the diagnostics inside a stored answer, which is what a repeat of an
+action is answered from. A bar at the places everything passes does not depend on anybody
+remembering.
 
 Nothing here rewrites the user's Git configuration. The overrides live on one child process's
 command line and in its environment. A terminal command under broad shell access keeps normal Git
@@ -500,6 +504,13 @@ store rather than which columns it has, so the step runs for every version below
 and adds whatever is missing instead of trusting a number to describe a shape. A store from a
 *later* build is refused rather than half read.
 
+The same upgrade carries the *contents* forward, because a store an earlier build wrote holds the
+text that build composed: every free-text reason in it goes through the rule, and so does each
+diagnostic inside a recorded answer, decoded by the method that produced it and encoded again. The
+data fields and the row's own identity are untouched, so a repeat of an action still finds its own
+answer. A recorded answer this build cannot decode is left alone rather than stopping the upgrade,
+and reading one refuses it: a store that will not open is a daemon that never serves.
+
 | Table | What it holds |
 | --- | --- |
 | `operations` | One row per creation, keyed by the caller's action identifier: the create token |
@@ -509,7 +520,7 @@ and adds whatever is missing instead of trusting a number to describe a shape. A
 | `workspaces` | One row per working copy, with its policy, its base and its tree's identity |
 | `workspace_sessions` | Which sessions are bound to a workspace, and which are still live |
 | `workspace_runs` | Which automation runs are bound to it, and which are still live |
-| `workspace_retained` | Dirty content, pinned change sets and review evidence |
+| `workspace_retained` | Dirty content, pinned change sets and review evidence, each identified by its kind, its reason and the change set it names |
 | `actions` | One row per claimed action: the claim, and its result when there is one |
 | `events`, `cursors` | The outbox and its consumers |
 
