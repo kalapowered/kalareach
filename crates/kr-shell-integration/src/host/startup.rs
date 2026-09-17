@@ -235,7 +235,7 @@ pub fn install(path: &Path, body: &str) -> std::io::Result<Change> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        replace(path, &updated)?;
+        replace(path, &existing, &updated)?;
     }
     Ok(change)
 }
@@ -256,7 +256,7 @@ pub fn remove(path: &Path) -> std::io::Result<Change> {
     if rebuilt.trim().is_empty() && before.trim().is_empty() {
         std::fs::remove_file(path)?;
     } else {
-        replace(path, &rebuilt)?;
+        replace(path, &existing, &rebuilt)?;
     }
     Ok(Change::Removed)
 }
@@ -284,23 +284,76 @@ fn strip(contents: &str) -> Option<(String, String)> {
 /// the user's own configuration with it. The new contents are written beside the file and renamed
 /// over it, which on every platform this host runs on is one step: the file is either what it was
 /// or what it is going to be, and never half of either.
-fn replace(path: &Path, contents: &str) -> std::io::Result<()> {
-    let mut temporary = path.as_os_str().to_os_string();
-    temporary.push(".kalareach-new");
-    let temporary = std::path::PathBuf::from(temporary);
-    // The permissions of the file being replaced, so a profile that was owner-only stays so.
-    let permissions = std::fs::metadata(path).ok().map(|data| data.permissions());
-    std::fs::write(&temporary, contents)?;
-    if let Some(permissions) = permissions {
-        std::fs::set_permissions(&temporary, permissions)?;
+///
+/// Three things the rename has to respect. A startup file is often a symlink into a dotfiles
+/// checkout, so the replacement is written over the file the link points at and the link is left
+/// alone. The file may have changed since it was read, and a replacement built on stale contents
+/// would silently drop whatever was written in between, so the contents are checked again first.
+/// And the file beside it is created exclusively under a name of this call's own, so nothing that
+/// happens to be there is truncated and two calls cannot share one temporary.
+fn replace(path: &Path, expected: &str, contents: &str) -> std::io::Result<()> {
+    // The file the configuration actually lives in. A symlink is a deliberate arrangement of the
+    // user's, and renaming over the link would replace it with a regular file and quietly cut the
+    // startup entry off from the checkout it belongs to.
+    let target = match path.symlink_metadata() {
+        Ok(data) if data.file_type().is_symlink() => std::fs::canonicalize(path)?,
+        _ => path.to_path_buf(),
+    };
+    if read_or_empty(&target)? != expected {
+        return Err(std::io::Error::other(
+            "the startup file changed while this entry was being written, so nothing was written",
+        ));
     }
-    match std::fs::rename(&temporary, path) {
+    let directory = target.parent().unwrap_or_else(|| Path::new("."));
+    let name = target.file_name().map_or_else(
+        || String::from("startup"),
+        |name| name.to_string_lossy().into_owned(),
+    );
+    let temporary = directory.join(format!(".{name}.kalareach-{}", kr_ipc::new_uuid()));
+    // The permissions of the file being replaced, so a profile that was owner-only stays so.
+    let permissions = std::fs::metadata(&target)
+        .ok()
+        .map(|data| data.permissions());
+    match write_new(&temporary, contents) {
+        Ok(()) => {}
+        Err(error) => {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(error);
+        }
+    }
+    if let Some(permissions) = permissions
+        && let Err(error) = std::fs::set_permissions(&temporary, permissions)
+    {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    match std::fs::rename(&temporary, &target) {
         Ok(()) => Ok(()),
         Err(error) => {
             let _ = std::fs::remove_file(&temporary);
             Err(error)
         }
     }
+}
+
+/// Creates one file that was not there before and writes it out in full.
+///
+/// Exclusive creation and owner-only permissions from the first byte: nothing that is already at
+/// that name is opened, and nothing else on the machine can read a half-written profile. The
+/// contents reach the disk before the caller renames the file into place.
+fn write_new(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(contents.as_bytes())?;
+    file.sync_all()
 }
 
 fn read_or_empty(path: &Path) -> std::io::Result<String> {
@@ -396,6 +449,100 @@ mod tests {
         assert_eq!(remove(&path).expect("removes"), Change::Removed);
         assert_eq!(std::fs::read_to_string(&path).expect("reads"), theirs);
         assert_eq!(remove(&path).expect("removes"), Change::Absent);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_startup_file_that_is_a_link_keeps_pointing_at_the_file_it_named() {
+        // A startup file is very often a link into a checkout of the user's own. Writing the entry
+        // has to reach the file the link names, or the entry would land in a regular file that
+        // replaced the link and every later change in the checkout would stop arriving.
+        let root = tempfile::tempdir().expect("a directory");
+        let checkout = root.path().join("dotfiles");
+        std::fs::create_dir_all(&checkout).expect("creates");
+        let real = checkout.join("zshrc");
+        let theirs = "export EDITOR=vim\n";
+        std::fs::write(&real, theirs).expect("writes");
+        let link = root.path().join(".zshrc");
+        std::os::unix::fs::symlink(&real, &link).expect("links");
+
+        let body = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), false);
+        assert_eq!(install(&link, &body).expect("installs"), Change::Added);
+        assert!(
+            link.symlink_metadata()
+                .expect("reads")
+                .file_type()
+                .is_symlink(),
+            "the link is still a link"
+        );
+        let written = std::fs::read_to_string(&real).expect("reads");
+        assert!(written.starts_with(theirs) && written.contains(MARKER_BEGIN));
+
+        assert_eq!(remove(&link).expect("removes"), Change::Removed);
+        assert!(
+            link.symlink_metadata()
+                .expect("reads")
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&real).expect("reads"), theirs);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn nothing_beside_the_startup_file_is_written_over_and_nothing_is_left_behind() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = tempfile::tempdir().expect("a directory");
+        let path = root.path().join(".zshrc");
+        std::fs::write(&path, "setopt autocd\n").expect("writes");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).expect("sets");
+        // A file at the name the replacement used to take. Nothing may open it.
+        let bystander = root.path().join(".zshrc.kalareach-new");
+        std::fs::write(&bystander, "not ours\n").expect("writes");
+
+        let body = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), false);
+        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert_eq!(
+            std::fs::read_to_string(&bystander).expect("reads"),
+            "not ours\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("reads")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600,
+            "the file keeps the permissions it had"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(root.path())
+            .expect("lists")
+            .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
+            .filter(|name| {
+                let name = name.to_string_lossy();
+                name.contains("kalareach-") && name != ".zshrc.kalareach-new"
+            })
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[test]
+    fn a_startup_file_that_changed_since_it_was_read_is_left_alone() {
+        // `install` reads, rebuilds and writes. Between the read and the write the user's editor
+        // may have saved the same file, and a replacement built on what was read would throw that
+        // away without a word.
+        let root = tempfile::tempdir().expect("a directory");
+        let path = root.path().join(".zshrc");
+        std::fs::write(&path, "first\n").expect("writes");
+        let rebuilt = "first\nours\n";
+        std::fs::write(&path, "theirs, saved in between\n").expect("writes");
+        let error = replace(&path, "first\n", rebuilt).expect_err("refuses");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads"),
+            "theirs, saved in between\n"
+        );
+        assert!(error.to_string().contains("changed"), "{error}");
     }
 
     #[test]

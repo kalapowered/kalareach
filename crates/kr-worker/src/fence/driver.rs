@@ -123,71 +123,80 @@ impl LaunchAnswer {
     }
 }
 
+/// One thing the machine asked the worker to do.
+///
+/// A step per action, kept in the order the outcome listed them. The order is the contract's, not
+/// a convenience: input released before the fence that explains why it waited, a revocation before
+/// the interrupt that caused it, and a detach acknowledged only once the attachment is gone.
+#[derive(Debug)]
+pub enum Step {
+    /// Queue a batch for the pseudo-terminal.
+    Write(InputBatch),
+    /// Deliver an `editor_busy` event to the attachment it names.
+    EditorBusy(Box<EditorBusyEvent>),
+    /// Remove an attachment.
+    RemoveAttachment(AttachmentId),
+    /// Send the configured native interrupt to the foreground process group.
+    Interrupt(InterruptAction),
+    /// Close a takeover receipt.
+    Receipt(TakeoverReceipt),
+    /// Record a command the reader installed after its transaction had been revoked.
+    LateInstallation(Box<ShellLaunchResult>),
+    /// Answer the client waiting on one launch.
+    Launch(LaunchTransactionId, Box<LaunchAnswer>),
+    /// Send one frame to the bridge.
+    Send(Outbound),
+}
+
 /// Everything one stimulus left for the worker to do.
 ///
-/// The fields are in the order the caller applies them, which is the order the machine listed the
-/// actions in: held input is released before the event that explains why it waited, and a fence is
-/// invalidated before a detach is acknowledged.
+/// `steps` is the machine's own action list, in its own order, and the caller walks it from front
+/// to back. The rest is what the stimulus says about itself rather than something to carry out: an
+/// accounting total, a refusal the caller owes its own client, or a decision for the runtime.
 #[derive(Debug, Default)]
 pub struct Effects {
-    /// Batches to queue for the pseudo-terminal, in order.
-    pub write: Vec<InputBatch>,
+    /// What to do, in the order the machine said to do it.
+    pub steps: Vec<Step>,
     /// Accepted input that was dropped rather than delivered.
     pub discarded_bytes: u64,
     /// Bytes the machine has taken into its hold.
     pub held_added: usize,
     /// Bytes the machine has let go of, by writing them or dropping them.
     pub held_removed: usize,
-    /// The `editor_busy` events to deliver to their attachments.
-    pub editor_busy: Vec<EditorBusyEvent>,
-    /// Attachments to remove.
-    pub remove_attachments: Vec<AttachmentId>,
-    /// True when the configured native interrupt is to be sent to the foreground group.
-    pub interrupt: Option<InterruptAction>,
     /// The refusal an interrupt request is owed.
     pub interrupt_refused: Option<LeaseFault>,
     /// The refusal a client's input is owed.
     pub input_refused: Option<InputRefusal>,
-    /// The launch answers that became final, with the caller each belongs to.
-    pub launch_answers: Vec<(LaunchTransactionId, LaunchAnswer)>,
-    /// Commands the reader installed after their transaction had been revoked.
-    pub late_installations: Vec<ShellLaunchResult>,
     /// The origin recorded for an accepted line.
     pub acceptance: Option<AcceptedOrigin>,
     /// The lease change the worker acknowledges.
     pub lease_acknowledged: Option<LeaseAcknowledgement>,
-    /// The takeover receipts this stimulus completed.
-    pub receipts: Vec<TakeoverReceipt>,
     /// The loss that closes the creating session, when one does.
     pub close_session: Option<IntegrationLoss>,
-    /// The frames for the bridge, in the order the machine produced them.
-    ///
-    /// They travel with the rest rather than going straight to the connection, because some of them
-    /// answer something the session has still to do: a detach is acknowledged after the attachment
-    /// is removed, not before, and the bridge must not be told otherwise.
-    pub outbound: Vec<Outbound>,
 }
 
 impl Effects {
+    /// Returns the native interrupt this stimulus admitted, when it admitted one.
+    #[must_use]
+    pub fn interrupt(&self) -> Option<InterruptAction> {
+        self.steps.iter().find_map(|step| match step {
+            Step::Interrupt(action) => Some(*action),
+            _ => None,
+        })
+    }
+
     fn merge(&mut self, other: Self) {
-        self.write.extend(other.write);
+        self.steps.extend(other.steps);
         self.discarded_bytes = self.discarded_bytes.saturating_add(other.discarded_bytes);
         self.held_added = self.held_added.saturating_add(other.held_added);
         self.held_removed = self.held_removed.saturating_add(other.held_removed);
-        self.editor_busy.extend(other.editor_busy);
-        self.remove_attachments.extend(other.remove_attachments);
-        self.interrupt = other.interrupt.or(self.interrupt);
         self.interrupt_refused = other.interrupt_refused.or(self.interrupt_refused);
         self.input_refused = other.input_refused.or(self.input_refused);
-        self.launch_answers.extend(other.launch_answers);
-        self.late_installations.extend(other.late_installations);
         self.acceptance = other.acceptance.or_else(|| self.acceptance.take());
         self.lease_acknowledged = other
             .lease_acknowledged
             .or_else(|| self.lease_acknowledged.take());
-        self.receipts.extend(other.receipts);
         self.close_session = other.close_session.or(self.close_session);
-        self.outbound.extend(other.outbound);
     }
 }
 
@@ -526,12 +535,12 @@ impl FenceDriver {
         if !self.phase.permits_launch() {
             let reason = LaunchRejectionReason::FenceInvalid;
             return Effects {
-                launch_answers: vec![(
+                steps: vec![Step::Launch(
                     transaction,
-                    LaunchAnswer::Refused {
+                    Box::new(LaunchAnswer::Refused {
                         reason,
                         code: reason.code(),
-                    },
+                    }),
                 )],
                 ..Effects::default()
             };
@@ -716,10 +725,10 @@ impl FenceDriver {
     /// sent.
     fn answer(&mut self, effects: &mut Effects, outcome: EventOutcome) {
         if let Some(id) = self.answering {
-            effects.outbound.push(Outbound::EventResult {
+            effects.steps.push(Step::Send(Outbound::EventResult {
                 id,
                 result: Box::new(outcome),
-            });
+            }));
         }
     }
 
@@ -728,12 +737,13 @@ impl FenceDriver {
         let outcome = self.machine.apply(at, stimulus);
         let mut effects = Effects::default();
         // What the machine did with it. A reader event it ignored belongs to something that has
-        // ended, and nothing this driver remembers may be updated from one.
-        self.ignored = outcome.actions.len() == 1
-            && matches!(
-                outcome.actions.first(),
-                Some(Action::IgnoreStale(StaleMessage::ReaderEvent))
-            );
+        // ended, and nothing this driver remembers may be updated from one. The machine sweeps its
+        // own deadlines before it reads the stimulus, so an expiry can put actions of its own in
+        // front of the refusal: the refusal is looked for anywhere in the list, not only alone.
+        self.ignored = outcome
+            .actions
+            .iter()
+            .any(|action| matches!(action, Action::IgnoreStale(StaleMessage::ReaderEvent)));
         for action in &outcome.actions {
             let produced = self.carry_out(action, context, outcome.state);
             effects.merge(produced);
@@ -747,11 +757,9 @@ impl FenceDriver {
         let mut effects = Effects::default();
         match action {
             Action::AskFence(params) => {
-                effects
-                    .outbound
-                    .push(Outbound::Request(Box::new(WorkerRequest::Fence(
-                        params.clone(),
-                    ))));
+                effects.steps.push(Step::Send(Outbound::Request(Box::new(
+                    WorkerRequest::Fence(params.clone()),
+                ))));
             }
             Action::Hold(input) => {
                 if let Some(held) = self.hold.get_mut(input) {
@@ -761,7 +769,7 @@ impl FenceDriver {
             }
             Action::Forward(input) => {
                 if let Some(held) = self.hold.remove(input) {
-                    effects.write.push(held.batch);
+                    effects.steps.push(Step::Write(held.batch));
                 }
             }
             Action::Release(order) => {
@@ -771,7 +779,7 @@ impl FenceDriver {
                             effects.held_removed =
                                 effects.held_removed.saturating_add(held.batch.len());
                         }
-                        effects.write.push(held.batch);
+                        effects.steps.push(Step::Write(held.batch));
                     }
                 }
             }
@@ -789,40 +797,38 @@ impl FenceDriver {
             }
             Action::RefuseInput(refusal) => effects.input_refused = Some(*refusal),
             Action::CancelNativeOperations(cancel) => {
-                effects
-                    .outbound
-                    .push(Outbound::Request(Box::new(WorkerRequest::Cancel(
-                        cancel.clone(),
-                    ))));
+                effects.steps.push(Step::Send(Outbound::Request(Box::new(
+                    WorkerRequest::Cancel(cancel.clone()),
+                ))));
             }
             Action::PublishFence(fence) => {
                 self.published = Some(fence.fence_id);
-                effects
-                    .outbound
-                    .push(Outbound::Publication(FencePublication::Published(
-                        fence.clone(),
-                    )));
+                effects.steps.push(Step::Send(Outbound::Publication(
+                    FencePublication::Published(fence.clone()),
+                )));
             }
             Action::WithholdFence(reason) => {
-                effects
-                    .outbound
-                    .push(Outbound::Publication(FencePublication::Withheld {
+                effects.steps.push(Step::Send(Outbound::Publication(
+                    FencePublication::Withheld {
                         reason: *reason,
                         state,
-                    }));
+                    },
+                )));
             }
             Action::InvalidateFence(reason) => {
                 if let Some(fence_id) = self.published.take() {
-                    effects
-                        .outbound
-                        .push(Outbound::Publication(FencePublication::Invalidated {
+                    effects.steps.push(Step::Send(Outbound::Publication(
+                        FencePublication::Invalidated {
                             fence_id,
                             reason: withheld_for(*reason),
                             state,
-                        }));
+                        },
+                    )));
                 }
             }
-            Action::EmitEditorBusy(event) => effects.editor_busy.push(event.clone()),
+            Action::EmitEditorBusy(event) => effects
+                .steps
+                .push(Step::EditorBusy(Box::new(event.clone()))),
             Action::AcknowledgeLeaseChange(acknowledgement) => {
                 self.receipt = Some(TakeoverReceipt {
                     epoch: acknowledgement.lease.epoch,
@@ -835,7 +841,9 @@ impl FenceDriver {
                 });
                 effects.lease_acknowledged = Some(acknowledgement.clone());
             }
-            Action::RemoveAttachment(attachment) => effects.remove_attachments.push(*attachment),
+            Action::RemoveAttachment(attachment) => {
+                effects.steps.push(Step::RemoveAttachment(*attachment));
+            }
             Action::AcknowledgeDetach(result) => {
                 self.answer(&mut effects, EventOutcome::Detached(result.clone()));
             }
@@ -847,11 +855,9 @@ impl FenceDriver {
             }
             Action::SendLaunch(request) => {
                 self.live_launch = Some(request.transaction);
-                effects
-                    .outbound
-                    .push(Outbound::Request(Box::new(WorkerRequest::Launch(
-                        request.clone(),
-                    ))));
+                effects.steps.push(Step::Send(Outbound::Request(Box::new(
+                    WorkerRequest::Launch(request.clone()),
+                ))));
             }
             Action::RevokeLaunch {
                 transaction,
@@ -861,30 +867,31 @@ impl FenceDriver {
                     self.live_launch = None;
                 }
                 self.awaiting.push_back(*transaction);
-                effects.outbound.push(Outbound::Revocation {
+                effects.steps.push(Step::Send(Outbound::Revocation {
                     transaction: *transaction,
                     reason: *reason,
-                });
+                }));
             }
             Action::InstallLaunch(result) => {
                 if let Some(transaction) = self.resolve_launch(context) {
-                    effects
-                        .launch_answers
-                        .push((transaction, LaunchAnswer::Installed(result.clone())));
+                    effects.steps.push(Step::Launch(
+                        transaction,
+                        Box::new(LaunchAnswer::Installed(result.clone())),
+                    ));
                 }
             }
             Action::RejectLaunch { reason, code } => {
                 if let Some(transaction) = self.resolve_launch(context) {
-                    effects.launch_answers.push((
+                    effects.steps.push(Step::Launch(
                         transaction,
-                        LaunchAnswer::Refused {
+                        Box::new(LaunchAnswer::Refused {
                             reason: *reason,
                             code: *code,
-                        },
+                        }),
                     ));
                 }
             }
-            Action::Interrupt(action) => effects.interrupt = Some(*action),
+            Action::Interrupt(action) => effects.steps.push(Step::Interrupt(*action)),
             Action::RefuseInterrupt(fault) => effects.interrupt_refused = Some(*fault),
             Action::RecordAcceptance(origin) => {
                 effects.acceptance = Some(origin.clone());
@@ -908,9 +915,11 @@ impl FenceDriver {
                 receipt.epoch = *epoch;
                 receipt.reader_discards =
                     reader_discards.map_or(ReaderDiscards::Unknown, ReaderDiscards::Known);
-                effects.receipts.push(receipt);
+                effects.steps.push(Step::Receipt(receipt));
             }
-            Action::LateInstallation(result) => effects.late_installations.push(result.clone()),
+            Action::LateInstallation(result) => effects
+                .steps
+                .push(Step::LateInstallation(Box::new(result.clone()))),
             Action::IgnoreStale(_) => {}
         }
         effects
@@ -973,4 +982,196 @@ fn detach_error(rejection: DetachRejection) -> ProtocolError {
         DetachRejection::SessionClosing => "this session is closing",
     };
     ProtocolError::new(rejection.code(), detail)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use kr_protocol::ids::AttachmentId;
+    use kr_protocol::root::{
+        CwdRevision, EditorBufferRevision, EditorKeymap, EditorState, FenceAcknowledgement,
+        KeyQueueSnapshot, LaunchCommand, PendingReaderInput, ReaderContext,
+    };
+    use kr_protocol::scalars::Uuid;
+    use kr_shell_integration::contract::events::HooksActivated;
+    use kr_transport::clock::ManualClock;
+
+    use super::*;
+
+    fn session() -> SessionId {
+        SessionId::new(Uuid::from_bytes([0x37; 16]))
+    }
+
+    fn lease() -> LeaseView {
+        LeaseView {
+            epoch: InputLeaseEpoch::new(1),
+            holder: Some(AttachmentId::new(Uuid::from_bytes([0x41; 16]))),
+        }
+    }
+
+    fn editor() -> EditorState {
+        EditorState {
+            buffer_empty: true,
+            buffer_revision: EditorBufferRevision::new(1),
+            keymap: EditorKeymap::Emacs,
+            pending: PendingReaderInput::NONE,
+        }
+    }
+
+    fn entered(prompt: u64, revision: u64) -> BridgeEvent {
+        BridgeEvent::EditorEnter(RootEditorEnterParams {
+            session_id: session(),
+            root_process: kr_ipc::identity::current_process_start_identity().expect("this process"),
+            prompt_generation: PromptGeneration::new(prompt),
+            reader_revision: ReaderRevision::new(revision),
+            reader_context: ReaderContext::Primary,
+            editor: editor(),
+            cwd_revision: CwdRevision::new(1),
+        })
+    }
+
+    fn left(prompt: u64, revision: u64) -> BridgeEvent {
+        BridgeEvent::EditorLeave(RootEditorLeaveParams {
+            session_id: session(),
+            prompt_generation: PromptGeneration::new(prompt),
+            reader_revision: ReaderRevision::new(revision),
+            reason: EditorLeaveReason::Cancellation,
+        })
+    }
+
+    fn idled(prompt: u64, revision: u64) -> BridgeEvent {
+        BridgeEvent::ReaderIdle(ReaderIdle {
+            session_id: session(),
+            prompt_generation: PromptGeneration::new(prompt),
+            reader_revision: ReaderRevision::new(revision),
+            reader_context: ReaderContext::Primary,
+            snapshot: KeyQueueSnapshot::drained(),
+            editor: editor(),
+            cwd_revision: CwdRevision::new(1),
+        })
+    }
+
+    /// A driver whose bridge has registered, whose hooks are live and whose reader is in an
+    /// exchange that has not been answered.
+    fn qualified(clock: &Arc<ManualClock>) -> FenceDriver {
+        let mut driver = FenceDriver::new(session(), lease(), Arc::clone(clock) as Arc<_>);
+        assert!(driver.registered(ShellKind::Zsh));
+        let _ = driver.bridge_event(
+            RequestId::new(1),
+            &BridgeEvent::HooksActivated(HooksActivated {
+                session_id: session(),
+                prompt_generation: PromptGeneration::new(1),
+            }),
+        );
+        assert!(driver.phase().retains_fence());
+        driver
+    }
+
+    #[test]
+    fn a_stale_report_that_arrives_after_a_deadline_does_not_take_the_reader_with_it() {
+        // The machine sweeps its own deadlines before it reads a message, so a stale report that
+        // arrives late produces the expiry's actions and then the refusal. Both belong to the same
+        // outcome, and the refusal is what says the reader named in the report is not the running
+        // one: nothing the driver remembers may be replaced from it.
+        let clock = Arc::new(ManualClock::new());
+        let mut driver = qualified(&clock);
+        let _ = driver.bridge_event(RequestId::new(2), &entered(2, 2));
+        clock.advance(Duration::from_millis(400));
+        let _ = driver.bridge_event(RequestId::new(3), &left(1, 1));
+
+        // The reader entered at (2, 2) is still the one running, so a loss that costs the fence
+        // deregisters it and the machine leaves the editor behind.
+        let _ = driver.integration_lost(IntegrationLoss::SemanticHookLoss);
+        assert_eq!(driver.state(), FenceState::Outside);
+    }
+
+    #[test]
+    fn a_stale_idle_that_arrives_after_a_deadline_does_not_become_the_remembered_reader() {
+        let clock = Arc::new(ManualClock::new());
+        let mut driver = qualified(&clock);
+        let _ = driver.bridge_event(RequestId::new(2), &entered(3, 3));
+        clock.advance(Duration::from_millis(400));
+        let _ = driver.bridge_event(RequestId::new(3), &idled(1, 1));
+        let _ = driver.integration_lost(IntegrationLoss::SemanticHookLoss);
+        assert_eq!(driver.state(), FenceState::Outside);
+    }
+
+    #[test]
+    fn the_steps_stay_in_the_order_the_machine_listed_its_actions() {
+        // One list, in the machine's own order. An interrupt that revokes a launch revokes it
+        // first, and held input is released before the publication that explains why it waited.
+        let clock = Arc::new(ManualClock::new());
+        let mut driver = qualified(&clock);
+        let effects = driver.bridge_event(RequestId::new(2), &entered(1, 1));
+        let fence_id = effects
+            .steps
+            .iter()
+            .find_map(|step| match step {
+                Step::Send(Outbound::Request(request)) => match request.as_ref() {
+                    WorkerRequest::Fence(params) => Some(params.fence_id),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("the reader was asked for a fence");
+        let _ = driver.bridge_answer(&BridgeAnswer::Fence(
+            kr_protocol::root::RootEditorFenceResult::Acknowledged(FenceAcknowledgement {
+                fence_id,
+                reader_context: ReaderContext::Primary,
+                prompt_generation: PromptGeneration::new(1),
+                reader_revision: ReaderRevision::new(1),
+                queues: kr_protocol::root::QueueDrainReport::CLEAR,
+                snapshot: KeyQueueSnapshot::drained(),
+                editor: editor(),
+                cwd_revision: CwdRevision::new(1),
+            }),
+        ));
+        assert!(driver.fence().is_some(), "the fence is published");
+        let requester = lease().holder.expect("a holder");
+        let transaction = LaunchTransactionId::new(kr_ipc::new_uuid());
+        let effects = driver.launch_requested(
+            ShellLaunchParams {
+                session_id: session(),
+                command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
+                expected_prompt_generation: PromptGeneration::new(1),
+                expected_buffer_revision: EditorBufferRevision::new(1),
+            },
+            requester,
+            transaction,
+        );
+        assert!(
+            effects
+                .steps
+                .iter()
+                .any(|step| matches!(step, Step::Send(Outbound::Request(_)))),
+            "the launch reached the reader: {:?}",
+            effects.steps
+        );
+
+        // The reader never answers. The interrupt arrives after the transaction's deadline, so the
+        // same outcome revokes the launch and then interrupts.
+        clock.advance(Duration::from_millis(400));
+        let effects = driver.interrupt_requested(
+            requester,
+            InputLeaseEpoch::new(1),
+            InterruptAction::NativeInterrupt,
+        );
+        let revoked = effects
+            .steps
+            .iter()
+            .position(|step| matches!(step, Step::Send(Outbound::Revocation { .. })));
+        let interrupted = effects
+            .steps
+            .iter()
+            .position(|step| matches!(step, Step::Interrupt(_)));
+        let (Some(revoked), Some(interrupted)) = (revoked, interrupted) else {
+            panic!("both the revocation and the interrupt: {:?}", effects.steps);
+        };
+        assert!(
+            revoked < interrupted,
+            "the launch is revoked before the interrupt that revoked it: {:?}",
+            effects.steps
+        );
+    }
 }

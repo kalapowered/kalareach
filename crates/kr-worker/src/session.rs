@@ -558,16 +558,17 @@ impl Session {
 
     /// Carries out what one fence stimulus left for the session to do.
     ///
-    /// The order is the machine's: released input reaches the writer before the event that explains
-    /// why it waited, and an attachment is removed after the fence that named it has gone.
+    /// One pass over the machine's own action list, front to back, carrying out each step where the
+    /// machine put it. Nothing is grouped and nothing is reordered: released input reaches the
+    /// writer before the fence that explains why it waited, a launch is revoked before the
+    /// interrupt that revoked it, and a detach is acknowledged only after its attachment is gone.
     pub fn apply_fence_effects(&mut self, effects: crate::fence::Effects) -> FenceOutcome {
+        use crate::fence::Step;
+
         self.held_input_bytes = self
             .held_input_bytes
             .saturating_add(effects.held_added)
             .saturating_sub(effects.held_removed);
-        for batch in effects.write {
-            self.queue_input(batch);
-        }
         if effects.discarded_bytes > 0 && effects.lease_acknowledged.is_none() {
             // Input this session accepted and never delivered, with no answer to report it in. It
             // is carried until an acquire has somewhere to put it. A lease change *does* have an
@@ -577,49 +578,52 @@ impl Session {
                 .bytes
                 .saturating_add(effects.discarded_bytes);
         }
-        for event in &effects.editor_busy {
-            self.hub.publish_event(
-                event.attachment_id,
-                crate::output::OutputDelivery::EditorBusy(Box::new(event.clone())),
-            );
-        }
-        for attachment_id in effects.remove_attachments {
-            // A detach the reader asked for removes exactly the attachment the fence named.
-            let _ = self.detach(attachment_id);
-        }
-        if effects.interrupt.is_some() {
-            self.interrupt_failed = self
-                .interrupt_foreground()
-                .err()
-                .map(|error| error.to_string());
-        }
-        if let Some(receipt) = effects.receipts.last() {
-            self.takeover_receipt = Some(*receipt);
-        }
-        self.late_installations
-            .extend(effects.late_installations.iter().cloned());
-        // Every caller waiting for one of these is answered here, on the step that produced the
-        // answer. A closure, a lost bridge and a reader's decision all reach this line.
-        for (transaction, answer) in &effects.launch_answers {
-            if let Some(sender) = self.launches.remove(transaction) {
-                let _ = sender.send(answer.clone());
-            }
-        }
-        // The frames go last, on the step that produced them: the bridge is told a detach happened
-        // after the attachment is gone, never before.
-        if let Some(driver) = self.fence.as_ref() {
-            for frame in effects.outbound {
-                driver.send(frame);
-            }
-        }
-        self.pump_replies();
-        FenceOutcome {
-            launch_answers: effects.launch_answers,
-            receipts: effects.receipts,
+        let mut outcome = FenceOutcome {
             acceptance: effects.acceptance,
             lease_acknowledged: effects.lease_acknowledged,
             close_session: effects.close_session,
+            ..FenceOutcome::default()
+        };
+        for step in effects.steps {
+            match step {
+                Step::Write(batch) => self.queue_input(batch),
+                Step::EditorBusy(event) => self.hub.publish_event(
+                    event.attachment_id,
+                    crate::output::OutputDelivery::EditorBusy(event),
+                ),
+                Step::RemoveAttachment(attachment_id) => {
+                    // A detach the reader asked for removes exactly the attachment the fence named.
+                    let _ = self.detach(attachment_id);
+                }
+                Step::Interrupt(_) => {
+                    self.interrupt_failed = self
+                        .interrupt_foreground()
+                        .err()
+                        .map(|error| error.to_string());
+                }
+                Step::Receipt(receipt) => {
+                    self.takeover_receipt = Some(receipt);
+                    outcome.receipts.push(receipt);
+                }
+                Step::LateInstallation(result) => self.late_installations.push(*result),
+                Step::Launch(transaction, answer) => {
+                    // Every caller waiting for one of these is answered here, on the step that
+                    // produced the answer. A closure, a lost bridge and a reader's decision all
+                    // reach this line.
+                    if let Some(sender) = self.launches.remove(&transaction) {
+                        let _ = sender.send((*answer).clone());
+                    }
+                    outcome.launch_answers.push((transaction, *answer));
+                }
+                Step::Send(frame) => {
+                    if let Some(driver) = self.fence.as_ref() {
+                        driver.send(frame);
+                    }
+                }
+            }
         }
+        self.pump_replies();
+        outcome
     }
 
     /// Sends the terminal's configured interrupt to the foreground process group.
@@ -1654,6 +1658,13 @@ impl Session {
                 ),
             });
         }
+        if !self.accepts_external_input() {
+            // Section 7 paragraph 4: in managed mode nothing external reaches the terminal until
+            // the private reader and pre-EOF bridge are authenticated and ABI-checked. The refusal
+            // is decided before the recogniser is fed, so a refused frame leaves no half-open paste
+            // behind it and no prefix waiting on a timer.
+            return Err(Self::unauthenticated());
+        }
         let outcome = self.framer.push(bytes, now);
         // The recogniser can hold bytes back, so what this push forwards may carry bytes an
         // earlier write handed over. Whichever authority ends first is the one that decides: an
@@ -1699,6 +1710,26 @@ impl Session {
         })
     }
 
+    /// Returns whether the session's integration admits bytes from outside it.
+    ///
+    /// A session with no managed reader always does. A managed one does only once its private
+    /// reader and pre-EOF bridge have been authenticated and ABI-checked, and stops again if that
+    /// integration is lost.
+    fn accepts_external_input(&self) -> bool {
+        self.fence
+            .as_ref()
+            .is_none_or(|driver| driver.phase().accepts_external_input())
+    }
+
+    /// Returns the refusal an unauthenticated managed session owes a client's bytes.
+    fn unauthenticated() -> WorkerError {
+        WorkerError::PreconditionFailed {
+            detail: "this session's root integration has not been authenticated, so it accepts \
+                     no external input yet"
+                .to_owned(),
+        }
+    }
+
     /// Offers one batch of a client's bytes to the terminal.
     ///
     /// Every client byte goes through here, whether it arrived in a frame or was released by the
@@ -1721,16 +1752,11 @@ impl Session {
             return Ok(());
         };
         if !driver.phase().accepts_external_input() {
-            // Section 7 paragraph 4: in managed mode nothing external reaches the terminal until the
-            // private reader and pre-EOF bridge are authenticated and ABI-checked. The endpoint is
-            // open before then so a session that is still being created is reachable; what it
-            // serves is everything but this.
-            return Err(WorkerError::PreconditionFailed {
-                detail:
-                    "this session's root integration has not been authenticated, so it accepts \
-                         no external input yet"
-                        .to_owned(),
-            });
+            // The same gate again, for the bytes that reach this path without passing through a
+            // frame: a prefix the recogniser's own timer released, or one a mode change let go of.
+            // Those were accepted while the integration was authenticated and may arrive after a
+            // loss took the phase back, and the terminal is owed no external byte after that.
+            return Err(Self::unauthenticated());
         }
         let effects = driver.input_arrived(
             attachment_id,
@@ -1853,7 +1879,7 @@ impl Session {
                 kr_protocol::input::InterruptAction::NativeInterrupt,
             );
             let refused = effects.interrupt_refused;
-            let interrupt = effects.interrupt;
+            let interrupt = effects.interrupt();
             let _ = self.apply_fence_effects(effects);
             if let Some(fault) = refused {
                 return Err(match fault {

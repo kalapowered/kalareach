@@ -22,6 +22,12 @@ use crate::contract::transport::WINDOWS_PIPE_PREFIX;
 use crate::contract::transport::{Bootstrap, BridgeEndpoint, ENDPOINT_BASENAME, EndpointKind};
 use crate::host::error::{HostError, Result};
 
+/// How many characters of an identifier a bridge endpoint's name carries.
+const SHORT_NAME_LEN: usize = 6;
+
+/// How many names a session tries before it gives up on binding an endpoint.
+const ENDPOINT_NAME_ATTEMPTS: usize = 8;
+
 /// The session's bridge endpoint, bound and ready to accept the root shell.
 ///
 /// It owns the listener, the address in the form the bootstrap variable carries, and the secret
@@ -100,7 +106,17 @@ impl HostEndpoint {
         // directory of this session's own inside it. Every component costs bytes a socket address
         // does not have, and it is the same protection either way.
         kr_ipc::paths::create_private_tree(runtime_root, runtime_dir)?;
-        Self::open_named(session_id, runtime_dir, &session_basename(session_id))
+        // The derived name first, because a name a person can read back from the session identifier
+        // is worth having. Six characters is not an identity, though, so a second live session
+        // whose identifier begins the same way asks for another name rather than failing to start.
+        let mut basename = session_basename(session_id);
+        for _ in 1..ENDPOINT_NAME_ATTEMPTS {
+            match Self::open_named(session_id, runtime_dir, &basename) {
+                Err(HostError::Ipc(error)) if occupied(&error) => basename = spare_basename(),
+                outcome => return outcome,
+            }
+        }
+        Self::open_named(session_id, runtime_dir, &basename)
     }
 
     #[cfg(unix)]
@@ -198,9 +214,31 @@ pub fn session_basename(session_id: SessionId) -> String {
     let short: String = text
         .chars()
         .filter(char::is_ascii_hexdigit)
-        .take(6)
+        .take(SHORT_NAME_LEN)
         .collect();
     format!("b{short}")
+}
+
+/// Returns a name for a session whose derived one is taken.
+///
+/// Six characters again, so the address stays the same length whichever name is used. It says
+/// nothing about the session, which is what the descriptor is for.
+fn spare_basename() -> String {
+    let text = kr_ipc::new_uuid().to_string();
+    let short: String = text
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .take(SHORT_NAME_LEN)
+        .collect();
+    format!("b{short}")
+}
+
+/// Returns whether a bind failed because a live listener already holds the address.
+fn occupied(error: &kr_ipc::IpcError) -> bool {
+    matches!(
+        error,
+        kr_ipc::IpcError::Socket { source, .. } if source.kind() == std::io::ErrorKind::AddrInUse
+    )
 }
 
 /// Returns the kind of endpoint this platform listens on.
@@ -397,6 +435,39 @@ mod tests {
         assert_ne!(
             name,
             session_basename(SessionId::new(Uuid::from_bytes([0x5b; 16])))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn two_sessions_whose_identifiers_begin_alike_both_get_an_endpoint() {
+        // Six characters is a name, not an identity. Two live sessions of one environment whose
+        // identifiers share those six characters both start; the second is simply given another
+        // name, of the same length, and the descriptor still carries the whole identity.
+        let root = owner_only_directory();
+        let runtime = root.path().join("runtime");
+        let mut first_bytes = [0x11; 16];
+        first_bytes[15] = 0x01;
+        let mut second_bytes = [0x11; 16];
+        second_bytes[15] = 0x02;
+        let first_id = SessionId::new(Uuid::from_bytes(first_bytes));
+        let second_id = SessionId::new(Uuid::from_bytes(second_bytes));
+        assert_eq!(
+            session_basename(first_id),
+            session_basename(second_id),
+            "the two identifiers must begin alike for this to test anything"
+        );
+
+        let first = HostEndpoint::open_for_session(root.path(), &runtime, first_id).expect("binds");
+        let second =
+            HostEndpoint::open_for_session(root.path(), &runtime, second_id).expect("binds too");
+        assert_ne!(first.address().path, second.address().path);
+        assert_eq!(second.address().validate(), Ok(()));
+        assert_eq!(second.session_id(), second_id);
+        assert_eq!(
+            second.address().path.len(),
+            first.address().path.len(),
+            "a spare name is the same length as the derived one"
         );
     }
 

@@ -10,15 +10,18 @@ changing any of it.
 
 One session, one endpoint, bound before the root shell starts.
 
-On Unix it is a socket file named `shell-bridge` inside a directory of its own in the environment's
-runtime tree. The directory is owner-only (`0700`) and is checked rather than repaired: one that is
-group-readable, owned by somebody else or reached through a symbolic link is refused, because the
-host cannot tell whether it was widened by accident or by someone else. The socket itself is `0600`
-and is removed when the session ends, and only if it is still the same socket this session bound.
+On Unix it is a socket file in the environment's runtime directory, which is owner-only (`0700`) and
+is checked rather than repaired: one that is group-readable, owned by somebody else or reached
+through a symbolic link is refused, because the host cannot tell whether it was widened by accident
+or by someone else. The socket itself is `0600` and is removed when the session ends, and only if it
+is still the same socket this session bound.
 
-The directory's name is eight characters of the session identifier. That is not brevity for its own
+Its name is `b` and six characters of the session identifier, so the host adds one separator and
+seven characters to whatever runtime root it is installed under. That is not brevity for its own
 sake: a Unix socket address is copied into a fixed array of 104 bytes on the tightest platform, and a
-runtime root inside a temporary directory already spends most of it.
+runtime root inside a temporary directory already spends most of it. Six characters are a name rather
+than an identity, so a second live session whose identifier begins the same way is given another name
+of the same length; the whole identity is in the descriptor either way.
 
 On Windows it is a named pipe, `\\.\pipe\kalareach-<uid>-<session>-shell-bridge`. The pipe namespace
 has no directory permissions to inherit, so the pipe carries an owner-only access-control list
@@ -102,10 +105,11 @@ reader the bridge last reported, so the machine deregisters it. Without that the
 a registered editor and start another exchange at the next lease change, and a session the phase says
 is degraded would publish a fence and hand out a detach proof it cannot stand behind.
 
-The stimulus and everything that came of it happen under one session lock, and the frames for the
-bridge go out at the end of it. Releasing the lock between the two would let another writer put a
-batch in front of one the machine had just released, and sending a frame in the middle would tell
-the bridge a detach had happened before the attachment was gone.
+The stimulus and everything that came of it happen under one session lock, and the actions are
+carried out as one list, front to back, including the frames for the bridge. Releasing the lock
+between the two would let another writer put a batch in front of one the machine had just released;
+grouping the actions by kind would tell the bridge a detach had happened before the attachment was
+gone, or interrupt an application before the launch that interrupt revoked had been called off.
 
 | Action | What the worker does |
 | --- | --- |
@@ -238,6 +242,13 @@ runs without rewriting anything they own. Nothing replaces `.bashrc`, points a s
 It changes no other setting of that tool and affects no ordinary terminal.
 
 `kr shell remove` deletes exactly the marked entry. Everything the user wrote stays as they left it.
+
+Either one writes the file beside itself and renames it over, so a full disk or a crash leaves the
+configuration as it was rather than half of it. The file beside it is created exclusively, under a
+name of that call's own and owner-only from its first byte. A startup file that is a symbolic link
+into a checkout is written through: the link stays a link, and the entry lands in the file it names.
+A file that changed between being read and being written is left alone and the change is reported,
+because a replacement built on what was read would throw away whatever was saved in between.
 
 ## Section 23's private group
 

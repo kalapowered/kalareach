@@ -1084,6 +1084,67 @@ async fn a_stock_shell_session_claims_no_managed_editor() {
     let _ = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed()).await;
 }
 
+/// Section 7 paragraph 4: nothing external reaches the terminal before the bridge is authenticated.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_managed_session_takes_no_input_before_its_bridge_has_authenticated() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let config = configuration(&temp, ShellMode::Managed);
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens the session");
+    session.launch().expect("launches the shell");
+    session.install_fence(FenceDriver::new(
+        session_id,
+        LeaseView::unheld(InputLeaseEpoch::new(0)),
+        Arc::new(SystemContinuousClock::new()),
+    ));
+    let params = terminal(session_id);
+    let holder = AttachmentId::new(kr_ipc::new_uuid());
+    session
+        .attach(&params, params.requested.clone(), holder)
+        .expect("attaches");
+    session
+        .acquire_input(holder, ConnectionId::new(kr_ipc::new_uuid()), None)
+        .expect("takes the keys");
+    let epoch = session.lease().epoch.get();
+
+    // A whole frame is refused, and so is one that is only part of a delimiter: a refusal that let
+    // the recogniser keep the prefix would leave the session inside a paste nothing opened.
+    for (sequence, bytes) in [b"\x1b[200~".as_slice(), b"\x1b".as_slice()]
+        .into_iter()
+        .enumerate()
+    {
+        let error = session
+            .write_input(
+                holder,
+                epoch,
+                sequence as u64,
+                bytes,
+                std::time::Instant::now(),
+            )
+            .expect_err("refused before the bridge authenticated");
+        assert!(
+            matches!(
+                error,
+                kr_worker::error::WorkerError::PreconditionFailed { .. }
+            ),
+            "{error}"
+        );
+    }
+    assert!(
+        retained(&session).is_empty(),
+        "and nothing reached the terminal"
+    );
+    assert_eq!(
+        session.expire_paste_prefix(std::time::Instant::now()),
+        0,
+        "the recogniser is holding nothing, so no prefix is waiting on a timer"
+    );
+
+    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _ = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed()).await;
+}
+
 /// KR-REQ-07.22: a loss before the session has qualified closes the session that was being made.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_integration_failure_before_qualification_closes_the_creating_session() {
