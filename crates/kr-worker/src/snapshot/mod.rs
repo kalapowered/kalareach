@@ -255,6 +255,7 @@ pub fn install(
     viewport: Viewport,
     reason: ProjectionResetReason,
     degraded: bool,
+    budget: usize,
 ) -> Result<Update> {
     let generation = snapshot.projection_generation;
     let cursor = snapshot.output_cursor;
@@ -308,11 +309,51 @@ pub fn install(
         ActiveBuffer::Primary => ProjectedBuffer::Alternate,
         ActiveBuffer::Alternate => ProjectedBuffer::Primary,
     };
-    let mut pages = Vec::new();
-    for (buffer, rows) in [
+    // What the reset and the header cost. They come before any row and a client cannot use a row
+    // without them, so they are the part of the budget the rows do not get.
+    let fixed: usize = events.iter().map(|outgoing| outgoing.bytes).sum();
+    let mut carried: Vec<(ProjectedBuffer, &Vec<kr_term::grid::GridRow>)> = vec![
         (inactive_buffer, &snapshot.inactive_rows),
         (wire::buffer(snapshot.active_buffer), &snapshot.rows),
-    ] {
+    ];
+    let mut converted: Vec<(ProjectedBuffer, Vec<ProjectedRow>)> = Vec::new();
+    for (buffer, rows) in core::mem::take(&mut carried) {
+        let mut rows = wire::rows(rows)?;
+        for row in &mut rows {
+            truncate_row(row);
+        }
+        converted.push((buffer, rows));
+    }
+    // A screen has to arrive whole or not at all: a client that holds some of the pages holds no
+    // screen and draws nothing. So a screen larger than this subscriber's own send queue is cut to
+    // fit it and said to be cut, rather than being refused, resynchronised and refused again.
+    let mut rows_total = Cost::default();
+    let mut row_count = 0_usize;
+    for (_, rows) in &converted {
+        for row in rows {
+            rows_total.absorb(wire::row_cost(row));
+            row_count += 1;
+        }
+    }
+    let room = budget.saturating_sub(fixed);
+    let cut = row_count > 0 && rows_total.bytes > room;
+    if cut {
+        let share = room / row_count;
+        for (_, rows) in &mut converted {
+            for row in rows {
+                truncate_row_to(row, share, PAGE_ITEMS);
+            }
+        }
+        if let Some(Outgoing {
+            event: ProjectionEvent::Snapshot(header),
+            ..
+        }) = events.get_mut(1)
+        {
+            header.degraded = true;
+        }
+    }
+    let mut pages = Vec::new();
+    for (buffer, rows) in converted {
         // Retention belongs to the buffer that has a scrollback. The alternate buffer keeps no
         // history, so its own oldest row is the first row it holds and nothing below it was ever
         // evicted; labelling its pages with the primary's cutoff would tell a client to give up
@@ -320,15 +361,9 @@ pub fn install(
         let (page_oldest, page_evicted) = if buffer == ProjectedBuffer::Primary {
             (oldest, snapshot.evicted)
         } else {
-            (
-                rows.first()
-                    .map(|row| wire::row_id(row.stable_id))
-                    .transpose()?
-                    .unwrap_or(U64::ZERO),
-                false,
-            )
+            (rows.first().map_or(U64::ZERO, |row| row.row), false)
         };
-        for page in paginate(wire::rows(rows)?) {
+        for page in paginate(rows) {
             pages.push(ProjectionRowPage {
                 projection_generation: U64::new(generation),
                 output_cursor: U64::new(cursor),
@@ -410,53 +445,63 @@ pub fn advance(
         truncate_row(row);
     }
     let generation = delta.projection_generation;
+    let update = ProjectionDelta {
+        base_cursor: U64::new(delta.base_cursor),
+        next_cursor: U64::new(delta.next_cursor),
+        projection_generation: U64::new(generation),
+        buffer: wire::buffer(buffer),
+        viewport: wire::viewport(viewport)?,
+        rows,
+        cursor: wire::cursor(delta.cursor),
+        modes: delta.modes.iter().map(|entry| wire::mode(*entry)).collect(),
+        margins: Nullable(delta.margins.map(wire::margins)),
+        rendition: Nullable(delta.rendition.map(wire::rendition)),
+        tab_stops: Nullable(
+            delta
+                .tab_stops
+                .as_ref()
+                .map(|stops| stops.iter().map(|at| wire::cells(*at)).collect()),
+        ),
+        charsets: Nullable(delta.charsets.as_ref().map(wire::charsets)),
+        hyperlinks: wire::hyperlinks(&delta.hyperlinks)?,
+        hyperlink: Nullable(delta.hyperlink.as_ref().map(|uri| {
+            kr_protocol::projection::HyperlinkChange {
+                uri: Nullable(uri.clone()),
+            }
+        })),
+        title: Nullable(delta.title.as_ref().map(wire::title)),
+        title_stack: Nullable(
+            delta
+                .title_stack
+                .as_ref()
+                .map(|stack| stack.iter().map(wire::saved_title).collect()),
+        ),
+        keyboard: Nullable(delta.keyboard.as_ref().map(wire::keyboard)),
+        palette: Nullable(delta.palette.as_ref().map(wire::palette)),
+        dimensions: Nullable(delta.dimensions.map(|size| {
+            kr_protocol::session::Dimensions::new(u64::from(size.cols), u64::from(size.rows))
+        })),
+        saved_cursors: Nullable(delta.saved_cursors.as_ref().map(wire::saved_cursors)),
+        oldest_retained_row: wire::row_id(oldest_retained_row)?,
+        evicted,
+        degraded,
+    };
+    // The whole message, measured, and not only its rows. A delta carries the state that changed
+    // with them: a hyperlink change repeats its target, a title stack can hold twenty of them, and
+    // a palette carries every override. Rows that fit a page say nothing about what the rest of the
+    // message adds, and a message the transport refuses is a client that is told nothing at all.
+    let Some(cost) = wire::measure(&update) else {
+        return Ok(Owed::Snapshot(ProjectionResetReason::Repaint));
+    };
+    if !cost.fits(PAGE_BYTES, PAGE_ITEMS) {
+        // Too large to be one bounded update. A snapshot pages, so it can carry what this cannot.
+        return Ok(Owed::Snapshot(ProjectionResetReason::Repaint));
+    }
     Ok(Owed::Update(Update {
-        events: vec![outgoing(ProjectionEvent::Delta(Box::new(
-            ProjectionDelta {
-                base_cursor: U64::new(delta.base_cursor),
-                next_cursor: U64::new(delta.next_cursor),
-                projection_generation: U64::new(generation),
-                buffer: wire::buffer(buffer),
-                viewport: wire::viewport(viewport)?,
-                rows,
-                cursor: wire::cursor(delta.cursor),
-                modes: delta.modes.iter().map(|entry| wire::mode(*entry)).collect(),
-                margins: Nullable(delta.margins.map(wire::margins)),
-                rendition: Nullable(delta.rendition.map(wire::rendition)),
-                tab_stops: Nullable(
-                    delta
-                        .tab_stops
-                        .as_ref()
-                        .map(|stops| stops.iter().map(|at| wire::cells(*at)).collect()),
-                ),
-                charsets: Nullable(delta.charsets.as_ref().map(wire::charsets)),
-                hyperlinks: wire::hyperlinks(&delta.hyperlinks)?,
-                hyperlink: Nullable(delta.hyperlink.as_ref().map(|uri| {
-                    kr_protocol::projection::HyperlinkChange {
-                        uri: Nullable(uri.clone()),
-                    }
-                })),
-                title: Nullable(delta.title.as_ref().map(wire::title)),
-                title_stack: Nullable(
-                    delta
-                        .title_stack
-                        .as_ref()
-                        .map(|stack| stack.iter().map(wire::saved_title).collect()),
-                ),
-                keyboard: Nullable(delta.keyboard.as_ref().map(wire::keyboard)),
-                palette: Nullable(delta.palette.as_ref().map(wire::palette)),
-                dimensions: Nullable(delta.dimensions.map(|size| {
-                    kr_protocol::session::Dimensions::new(
-                        u64::from(size.cols),
-                        u64::from(size.rows),
-                    )
-                })),
-                saved_cursors: Nullable(delta.saved_cursors.as_ref().map(wire::saved_cursors)),
-                oldest_retained_row: wire::row_id(oldest_retained_row)?,
-                evicted,
-                degraded,
-            },
-        )))],
+        events: vec![Outgoing {
+            event: ProjectionEvent::Delta(Box::new(update)),
+            bytes: cost.bytes,
+        }],
         base: Base {
             cursor: delta.next_cursor,
             generation,
@@ -543,7 +588,17 @@ fn paginate(rows: Vec<ProjectedRow>) -> Vec<Vec<ProjectedRow>> {
 /// Both bounds, because a row of one run per cell reaches the codec's item limit while its bytes
 /// are still well inside the frame.
 fn truncate_row(row: &mut ProjectedRow) {
-    if wire::row_cost(row).fits(PAGE_BYTES, PAGE_ITEMS) {
+    truncate_row_to(row, PAGE_BYTES, PAGE_ITEMS);
+}
+
+/// Cuts one row to a bound of the caller's, marking it truncated when anything was given up.
+///
+/// The page bound is the usual one. A smaller one is what a subscriber's own send queue leaves for
+/// each row of a screen it could not otherwise be sent at all: a client holding part of a screen
+/// holds no screen, so a snapshot that does not fit is cut and said to be cut, rather than being
+/// refused over and over.
+fn truncate_row_to(row: &mut ProjectedRow, bytes: usize, items: usize) {
+    if wire::row_cost(row).fits(bytes, items) {
         return;
     }
     let empty = ProjectedRow {
@@ -566,7 +621,7 @@ fn truncate_row(row: &mut ProjectedRow) {
             bytes: alone.bytes.saturating_sub(envelope.bytes),
             items: alone.items.saturating_sub(envelope.items),
         });
-        if !with_it.fits(PAGE_BYTES, PAGE_ITEMS) {
+        if !with_it.fits(bytes, items) {
             row.truncated = true;
             break;
         }
@@ -731,6 +786,78 @@ mod tests {
         assert_eq!(bases.held(id).map(|held| held.viewport), Some(window));
         bases.forget_all();
         assert!(bases.is_empty());
+    }
+
+    /// KR-REQ-08.83: a delta is measured whole, not by its rows.
+    ///
+    /// A delta carries the state that changed with the rows, and a hyperlink change repeats its
+    /// target for every range. Six rows fit any page; six rows plus six hundred long targets fit no
+    /// frame at all, and a message the transport refuses leaves a client holding nothing.
+    #[test]
+    fn a_delta_whose_state_does_not_fit_a_frame_asks_for_a_snapshot() {
+        let rows: Vec<kr_term::grid::GridRow> = (0..6)
+            .map(|id| kr_term::grid::GridRow {
+                stable_id: id,
+                soft_wrapped: false,
+                truncated: false,
+                runs: Vec::new(),
+            })
+            .collect();
+        let target: String = std::iter::repeat_n('u', 1_900).collect();
+        let hyperlinks: Vec<kr_term::snapshot::HyperlinkRange> = (0..600)
+            .map(|index| kr_term::snapshot::HyperlinkRange {
+                row: index % 6,
+                start_col: 0,
+                end_col: 1,
+                uri: format!("https://example.invalid/{index}/{target}"),
+            })
+            .collect();
+        let window = Viewport {
+            top_row: 0,
+            rows: 6,
+            left_col: 0,
+            cols: 80,
+        };
+        let delta = Delta {
+            base_cursor: 0,
+            next_cursor: 1,
+            projection_generation: 1,
+            rows,
+            cursor: kr_term::snapshot::CursorState {
+                col: 0,
+                row: 0,
+                visible: true,
+                style: 1,
+                pending_wrap: false,
+            },
+            modes: Vec::new(),
+            margins: None,
+            rendition: None,
+            tab_stops: None,
+            charsets: None,
+            hyperlinks,
+            title: None,
+            keyboard: None,
+            palette: None,
+            dimensions: None,
+            title_stack: None,
+            saved_cursors: None,
+            hyperlink: None,
+        };
+        assert_eq!(
+            advance(
+                &delta,
+                ActiveBuffer::Primary,
+                window,
+                0,
+                false,
+                false,
+                Some(window)
+            )
+            .expect("an answer"),
+            Owed::Snapshot(ProjectionResetReason::Repaint),
+            "the rows fit a page and the message does not, so the client is sent a fresh screen"
+        );
     }
 
     /// KR-REQ-08.83: a change larger than one bounded update is a repaint, and pages.

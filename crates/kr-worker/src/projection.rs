@@ -435,6 +435,7 @@ impl TerminalEngine {
         reason: ProjectionResetReason,
         gate: LaneGate,
         now_ms: u64,
+        budget: usize,
     ) -> Result<(crate::snapshot::Update, Filtered)> {
         let viewport = self.viewport_for(dimensions);
         let (mut snapshot, settled) = self.engine.snapshot(viewport, now_ms);
@@ -443,7 +444,7 @@ impl TerminalEngine {
         viewport.top_row = self.engine.grid().visible_top_row();
         snapshot.viewport = viewport;
         let degraded = self.resident_state_truncated();
-        let update = crate::snapshot::install(&snapshot, viewport, reason, degraded)?;
+        let update = crate::snapshot::install(&snapshot, viewport, reason, degraded, budget)?;
         Ok((update, settled))
     }
 
@@ -729,6 +730,79 @@ mod projection_tests {
         TerminalEngine::new(dimensions(80, 24)).expect("a canonical grid")
     }
 
+    /// KR-REQ-08.79 and KR-REQ-08.80: a screen larger than a subscriber's queue is cut to it,
+    /// explicitly, rather than refused for ever.
+    ///
+    /// A client holding some of a snapshot's pages holds no screen and draws nothing, so a screen
+    /// that cannot fit the queue it must pass through has to be cut and say so. Refusing it instead
+    /// would resynchronise the client, produce the same screen again and refuse it again.
+    #[test]
+    fn a_screen_too_large_for_a_subscribers_queue_is_cut_and_says_so() {
+        let mut engine = engine();
+        // A distinct long hyperlink target on every cell of every row, which is what the wire has
+        // to repeat per run. Legal, and far larger than the queue below.
+        let mut stream = Vec::new();
+        for row in 0..24_u32 {
+            for column in 0..80_u32 {
+                let target = format!(
+                    "https://example.invalid/{row}/{column}/{}",
+                    "u".repeat(1_900)
+                );
+                stream
+                    .extend_from_slice(format!("\x1b]8;;{target}\x1b\\x\x1b]8;;\x1b\\").as_bytes());
+            }
+            stream.extend_from_slice(b"\r\n");
+        }
+        engine.feed(0, &stream, LaneGate::default(), 0);
+        let budget = 256 * 1024;
+        let (update, _) = engine
+            .projection_install(
+                dimensions(80, 24),
+                ProjectionResetReason::Attached,
+                LaneGate::default(),
+                0,
+                budget,
+            )
+            .expect("a snapshot");
+        let total: usize = update.events.iter().map(|outgoing| outgoing.bytes).sum();
+        assert!(
+            total <= budget,
+            "the whole screen fits the queue it has to pass through: {total} bytes against {budget}"
+        );
+        let header = update
+            .events
+            .iter()
+            .find_map(|outgoing| match &outgoing.event {
+                kr_protocol::projection::ProjectionEvent::Snapshot(header) => Some(header),
+                _ => None,
+            })
+            .expect("a header");
+        assert!(
+            header.degraded,
+            "and the client is told that what it is holding is not all of the session"
+        );
+        let pages: Vec<&kr_protocol::projection::ProjectionRowPage> = update
+            .events
+            .iter()
+            .filter_map(|outgoing| match &outgoing.event {
+                kr_protocol::projection::ProjectionEvent::Rows(page) => Some(page),
+                _ => None,
+            })
+            .collect();
+        assert!(!pages.is_empty(), "the rows still arrive");
+        assert!(
+            pages.iter().filter(|page| !page.more).count() == 1,
+            "and the last page clears `more`, so the screen completes"
+        );
+        assert!(
+            pages
+                .iter()
+                .flat_map(|page| page.rows.iter())
+                .any(|row| row.truncated),
+            "the rows that were cut say they were cut"
+        );
+    }
+
     /// KR-REQ-08.80 and KR-REQ-08.83: a base outside the replay window asks for a fresh screen.
     #[test]
     fn a_base_outside_the_bounded_replay_window_asks_for_a_fresh_snapshot() {
@@ -739,6 +813,7 @@ mod projection_tests {
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
                 0,
+                crate::output::DEFAULT_SEND_QUEUE_BYTES,
             )
             .expect("a snapshot");
         let held = Held {
@@ -843,6 +918,7 @@ mod projection_tests {
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
                 0,
+                crate::output::DEFAULT_SEND_QUEUE_BYTES,
             )
             .expect("a snapshot");
         let held = Held {
@@ -868,6 +944,7 @@ mod projection_tests {
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
                 0,
+                crate::output::DEFAULT_SEND_QUEUE_BYTES,
             )
             .expect("a snapshot");
         let stale = Held {

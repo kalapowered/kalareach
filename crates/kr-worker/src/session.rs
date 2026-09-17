@@ -717,7 +717,10 @@ impl Session {
         // Whether this attachment may be handed the stream at all is settled first. A screen and a
         // byte cursor have to name the same boundary, so an attachment joining while the parser is
         // mid-sequence is served a projection and moves to forwarding when a boundary arrives.
-        self.settle_forwarding(kr_ipc::now_ms().get());
+        // This attachment is named as the one installing, because a join is a fresh start whatever
+        // it was being served a moment ago: an attachment that is already forwarding and asks for
+        // a screen is asking to begin again, and beginning again has to meet a boundary.
+        self.settle_forwarding(kr_ipc::now_ms().get(), Some(attachment_id));
         if self.presentation_of(attachment_id) == crate::output::Presentation::Projected {
             // The screen is settled here, before this attachment has a queue, and whatever that
             // released is delivered to the attachments that were already watching. Settling inside
@@ -861,8 +864,9 @@ impl Session {
         // Whether this attachment may forward depends on where the parser stands, which is a fact
         // about this moment rather than about the attachment. It is settled here so the answer the
         // attach reports is the answer the session will act on, rather than one that changes
-        // between the attach and the subscription.
-        self.settle_forwarding(kr_ipc::now_ms().get());
+        // between the attach and the subscription. This attachment has nothing to continue from,
+        // so it is the one installing.
+        self.settle_forwarding(kr_ipc::now_ms().get(), Some(attachment_id));
         if let Some(settled) = self
             .attachments
             .summaries()
@@ -1454,7 +1458,7 @@ impl Session {
     /// physical terminal the middle of an escape sequence. Until a boundary arrives it is held, and
     /// section 8's 250 ms is the point at which the answer becomes "stay projected" rather than
     /// "wait": waiting longer would not make the stream safer, it would only delay the screen.
-    fn settle_forwarding(&mut self, now_ms: u64) {
+    fn settle_forwarding(&mut self, now_ms: u64, installing: Option<AttachmentId>) {
         self.attachments
             .set_carryable(self.engine.direct_is_carryable());
         let projected: std::collections::BTreeSet<AttachmentId> = self
@@ -1473,12 +1477,17 @@ impl Session {
             }
             if self.hub.presentation_of(id) == Some(crate::output::Presentation::Direct)
                 && !self.hub.is_resynchronising(id)
+                && installing != Some(id)
+                && !self.forwarding_held.contains_key(&id)
             {
                 // Already forwarding, and continuing: the boundary rule is about the moment
-                // forwarding *begins*, and this stream has not stopped. A subscriber that has been
-                // told to resynchronise is a different case: it is waiting for a fresh screen, so
-                // the screen it gets and the bytes after it have to meet at a boundary like any
-                // other transition, and the exemption does not apply to it.
+                // forwarding *begins*, and this stream has not stopped. Two cases are not that.
+                // Three cases are not that. A subscriber that has been told to resynchronise is
+                // waiting for a fresh screen; one that is asking for a screen right now is
+                // beginning again from whatever it is given; and one already waiting for a
+                // boundary is still waiting for it, whatever it was being served when it asked.
+                // For all three the screen and the bytes after it have to meet at a boundary like
+                // any other transition, so the exemption does not apply.
                 self.forwarding_held.remove(&id);
                 self.attachments.hold_forwarding(id, false);
                 continue;
@@ -1737,9 +1746,13 @@ impl Session {
             crate::snapshot::Owed::Snapshot(reason) => {
                 let gate = self.lane_gate();
                 let now = kr_ipc::now_ms().get();
+                // The subscriber's own send queue is what a screen has to fit: this is the one
+                // message a client cannot use part of, so a screen too large for that queue is cut
+                // to it and marked degraded rather than refused for ever.
+                let budget = self.hub.limit_of(attachment_id);
                 match self
                     .engine
-                    .projection_install(dimensions, reason, gate, now)
+                    .projection_install(dimensions, reason, gate, now, budget)
                 {
                     Ok((update, settled)) => {
                         // Taking a snapshot settles the screen. It changes no display state here,
@@ -1808,7 +1821,7 @@ impl Session {
         // it, because that answer depends on where the parser stands and not only on a size.
         self.attachments
             .set_carryable(self.engine.direct_is_carryable());
-        self.settle_forwarding(kr_ipc::now_ms().get());
+        self.settle_forwarding(kr_ipc::now_ms().get(), None);
         let projected = self.attachments.projected();
         if !projected.is_empty() {
             // Taking a snapshot settles the screen, which releases whatever the engine was holding

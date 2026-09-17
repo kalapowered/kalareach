@@ -246,6 +246,19 @@ impl OutputHub {
         self.subscribers.is_empty()
     }
 
+    /// What one subscriber's send queue holds, in bytes.
+    ///
+    /// Zero for an attachment that has no subscription, because nothing can be queued for one.
+    /// This is the bound a whole screen has to fit: a client that holds some of a snapshot's pages
+    /// holds no screen at all, so the screen is cut to this and marked degraded rather than being
+    /// refused every time it is asked for.
+    #[must_use]
+    pub fn limit_of(&self, attachment_id: AttachmentId) -> usize {
+        self.subscribers
+            .get(&attachment_id)
+            .map_or(0, |subscriber| subscriber.limit)
+    }
+
     /// Returns true when this subscriber is waiting for a fresh snapshot.
     #[must_use]
     pub fn is_resynchronising(&self, attachment_id: AttachmentId) -> bool {
