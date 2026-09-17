@@ -205,12 +205,13 @@ impl Pending {
             transport.offered_bytes.store(0, Ordering::Release);
             if let Ok(mut writer) = transport.writer.try_lock() {
                 let _closed = writer.take();
-            } else {
+            } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
                 // Somebody is mid-write. They hold the only reference that matters and will find
                 // the connection closed when they look; taking it from under them is not something
-                // a lock is for.
+                // a lock is for. This runs on a runtime only when there is one: closing can happen
+                // in a drop, and a drop is not somewhere to assume an executor.
                 let writer = Arc::clone(&transport.writer);
-                tokio::spawn(async move {
+                handle.spawn(async move {
                     let _closed = writer.lock().await.take();
                 });
             }
