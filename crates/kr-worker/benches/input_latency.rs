@@ -292,6 +292,7 @@ async fn controlling(
 /// The sessions are idle, which is what the section says, and the views hold live connections to
 /// them. They are returned so they outlive the measurement.
 async fn background() -> (Vec<Hosted>, Vec<LocalClient>) {
+    let started = Instant::now();
     let mut sessions = Vec::new();
     for _ in 1..BACKGROUND_SESSIONS {
         sessions.push(hosted("sleep 600").await);
@@ -322,7 +323,13 @@ async fn background() -> (Vec<Hosted>, Vec<LocalClient>) {
             )
             .await
             .expect("reaches the worker")
-            .unwrap_or_else(|refusal| panic!("attaches: {refusal:?}{}", why(session)))
+            .unwrap_or_else(|refusal| {
+                panic!(
+                    "attaches, {:?} after this background began{}: {refusal:?}",
+                    started.elapsed(),
+                    why(session)
+                )
+            })
             .to_typed()
             .expect("decodes");
         let mut streams = CanonicalSet::new();
