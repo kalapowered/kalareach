@@ -243,6 +243,14 @@ impl PluginHost {
             notices_task.abort();
         }
 
+        // Work that was already running is waited for first. Every task that could still be
+        // registering a binding holds one of these permits, so taking them all is how this waits
+        // for them without a second way of counting them; each is bounded by its own deadline. A
+        // registration that finished after its bindings were released would leave an instance
+        // running that nothing could reach.
+        let all = u32::try_from(MAX_CONCURRENT_CALLS).unwrap_or(u32::MAX);
+        let _finished = served.work.acquire_many(all).await;
+
         // The worker is gone. Its bindings go with it: a binding exists to serve one worker's
         // connection, and nothing durable was in it. Stopping one joins its thread, so it happens
         // off the executor.
