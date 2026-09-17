@@ -404,14 +404,45 @@ mod tests {
     #[tokio::test]
     async fn a_host_with_no_child_signal_asks_the_shell_itself_rather_than_waiting_for_the_sweep() {
         // What a host without a child signal falls back to, which is the one thing that decides how
-        // long an exit can go unnoticed there. It is the short poll, not the sweep: Windows reports
-        // a process ending on a handle this module cannot wait on, and a session whose shell had
-        // left would otherwise stay live for half a minute.
-        assert_eq!(ChildExits(None).patience(), CHILD_POLL_INTERVAL);
+        // long an exit can go unnoticed there. It is the short poll, not the sweep: a session whose
+        // shell had left would otherwise stay live for half a minute.
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                ChildExits(None).patience(),
+                CHILD_POLL_INTERVAL,
+                "a signal this host would not deliver leaves the shell's status on the clock"
+            );
+            assert_eq!(
+                ChildExits::open().patience(),
+                IDLE_SWEEP_INTERVAL,
+                "and where the signal is there, the clock is only the backstop behind it"
+            );
+        }
+        // Windows reports a process ending on a handle this module cannot wait on, so the poll is
+        // the whole answer there rather than a fallback.
+        #[cfg(not(unix))]
+        assert_eq!(ChildExits::open().patience(), CHILD_POLL_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn the_sweep_wakes_a_session_that_nothing_else_has_anything_to_say_about() {
+        // The backstop, exercised rather than asserted about: no child has ended, nothing has been
+        // marked, and the wake still arrives and still observes. The sweep is dated an interval ago
+        // so the deadline is already due, because a test that waited out the real one would take
+        // half a minute to say this.
+        let activity = Activity::new();
+        let mut supervision =
+            Supervision::begin(Arc::clone(&activity), Instant::now() - IDLE_SWEEP_INTERVAL);
+
+        let wake = tokio::time::timeout(OBSERVE_INTERVAL, supervision.next())
+            .await
+            .expect("the sweep comes round");
+
         assert_eq!(
-            ChildExits::open().patience(),
-            IDLE_SWEEP_INTERVAL,
-            "and where the signal is there, the clock is only the backstop behind it"
+            wake,
+            Wake::Ownership,
+            "and what it is for is the boundary nothing else reports on"
         );
     }
 

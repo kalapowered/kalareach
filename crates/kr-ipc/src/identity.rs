@@ -310,9 +310,14 @@ mod platform {
                     detail: "a /proc stat line without a thread count".to_owned(),
                 },
             },
-            // The kernel prints these for a process that has been reaped, which is a state no
-            // reader of `/proc` should meet; it is not a live process either way.
-            'X' | 'x' => super::ProcessState::Ended,
+            // A state no reader of `/proc` should meet, and one that does not prove what it looks
+            // like it proves: during an `exec` the kernel lets another thread take the leader's
+            // identifier and start time and marks the old leader dead, so a reading that catches
+            // that moment can say `X` of a process that is carrying on. Nothing here concludes a
+            // death from it.
+            'X' | 'x' => super::ProcessState::Unknown {
+                detail: format!("a /proc stat line whose state is `{state}`"),
+            },
             // Running, sleeping, waiting on disk, stopped, traced or idle: all of them are a
             // process that is there. A letter this reader has never heard of is not a death, but it
             // is not something to claim either.
@@ -468,7 +473,7 @@ mod platform {
         }
 
         #[test]
-        fn a_sleeping_process_is_running_and_a_collected_one_is_not() {
+        fn a_live_state_is_running_and_a_dead_one_establishes_nothing() {
             assert_eq!(
                 decide(&line("S", 1, 987_654), 987_654),
                 ProcessState::Running
@@ -477,7 +482,22 @@ mod platform {
                 decide(&line("R", 8, 987_654), 987_654),
                 ProcessState::Running
             );
-            assert_eq!(decide(&line("X", 1, 987_654), 987_654), ProcessState::Ended);
+            // `X` looks like proof and is not: an `exec` hands the leader's identifier and start
+            // time to another thread and marks the old leader dead, so this can be the state of a
+            // process that is carrying on. One thread or many, the answer is that nothing is known.
+            for threads in [1, 4] {
+                assert!(
+                    matches!(
+                        decide(&line("X", threads, 987_654), 987_654),
+                        ProcessState::Unknown { .. }
+                    ),
+                    "a dead leader with {threads} thread(s) is not a death this reader can claim"
+                );
+                assert!(matches!(
+                    decide(&line("x", threads, 987_654), 987_654),
+                    ProcessState::Unknown { .. }
+                ));
+            }
         }
 
         #[test]
