@@ -1,0 +1,46 @@
+[package]
+name = "kr-project"
+description = "The KalaReach project service: repositories, workspaces, the restricted Git execution profile and staged publish"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+cap-std.workspace = true
+kr-cbor.workspace = true
+kr-ipc.workspace = true
+kr-protocol.workspace = true
+kr-transfer.workspace = true
+rusqlite = { workspace = true, features = ["bundled"] }
+serde.workspace = true
+thiserror.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+# The no-replace rename a staged repository is published with: `renameat2(RENAME_NOREPLACE)` on
+# Linux and `renameatx_np(RENAME_EXCL)` on Apple, both as safe wrappers.
+rustix = { workspace = true, features = ["fs", "process"] }
+
+[dev-dependencies]
+kr-ipc = { workspace = true, features = ["testing"] }
+# The recovery tests put the journal into the state a crash leaves, which means writing the rows a
+# dying daemon would have left rather than asking the service to pretend.
+rusqlite = { workspace = true, features = ["bundled"] }
+# The restricted-profile fixture is one committed document, read by the tests that plant it.
+serde_json.workspace = true
+tempfile.workspace = true
+
+[features]
+# The tests that build real repositories with installed Git, including the restricted-profile
+# fixtures whose planted helpers must never run. On by default so a plain `cargo test` runs them;
+# a host without Git turns them off rather than reporting a failure it cannot fix.
+default = ["git-fixtures"]
+git-fixtures = []
+
+[lints]
+workspace = true

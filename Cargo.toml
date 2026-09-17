@@ -9,6 +9,7 @@ members = [
     "crates/kr-ipc",
     "crates/kr-pairing",
     "crates/kr-plugin-sdk",
+    "crates/kr-project",
     "crates/kr-protocol",
     "crates/kr-shell-integration",
     "crates/kr-term",
@@ -54,6 +55,7 @@ kr-controller = { path = "crates/kr-controller", version = "=0.1.0" }
 kr-crypto = { path = "crates/kr-crypto", version = "=0.1.0" }
 kr-ipc = { path = "crates/kr-ipc", version = "=0.1.0" }
 kr-pairing = { path = "crates/kr-pairing", version = "=0.1.0" }
+kr-project = { path = "crates/kr-project", version = "=0.1.0" }
 kr-protocol = { path = "crates/kr-protocol", version = "=0.1.0" }
 kr-term = { path = "crates/kr-term", version = "=0.1.0" }
 kr-transfer = { path = "crates/kr-transfer", version = "=0.1.0" }

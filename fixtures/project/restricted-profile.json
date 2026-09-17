@@ -1,0 +1,145 @@
+{
+  "what_this_is": "Every execution-capable thing a project repository can name, as one document. The project service's tests build a real repository from this, plant each entry as a program that writes a sentinel file when it runs, and then run a status, a review refresh, a clone and an adoption against it. No sentinel may appear. This is the fixture behind KR-ACC-030, KR-REQ-14.23 and KR-REQ-14.24: argument-vector construction alone is not the isolation, so the isolation is tested by trying to trigger each helper.",
+  "marker_program": {
+    "unix": "marker.sh",
+    "windows": "marker.cmd",
+    "how_it_is_planted": "The script is copied into the fixture repository with @SENTINELS@ replaced by an absolute directory on the internal disk. It takes one argument, the name of the entry that invoked it, and appends that name to a file of the same name inside that directory. It exits zero, so a helper that runs does not also fail the command and hide itself."
+  },
+  "sentinel_directory": "sentinels",
+  "neutralised": [
+    {
+      "key": "core.fsmonitor",
+      "sentinel": "fsmonitor",
+      "git_would_run_it_during": "every status and every index refresh",
+      "how_this_host_stops_it": "core.fsmonitor=false on the command line, which no configuration file can undo, plus core.untrackedCache=false and --no-optional-locks so no index is written"
+    },
+    {
+      "key": "core.hooksPath",
+      "sentinel": "hooks-path-post-checkout",
+      "git_would_run_it_during": "a checkout, a clone and a worktree creation",
+      "how_this_host_stops_it": "core.hooksPath points at a directory this host owns and keeps empty, so no hook is ever found, wherever the repository put its own"
+    },
+    {
+      "key": "filter.marker.clean",
+      "sentinel": "filter-clean",
+      "git_would_run_it_during": "a status or a diff that reads working-tree content, and any add",
+      "how_this_host_stops_it": "the effective configuration is read first and every filter driver it defines is blanked by name, because the set of driver names is whatever the repository chose"
+    },
+    {
+      "key": "filter.marker.smudge",
+      "sentinel": "filter-smudge",
+      "git_would_run_it_during": "a checkout",
+      "how_this_host_stops_it": "blanked by name with the rest of its driver"
+    },
+    {
+      "key": "filter.marker.process",
+      "sentinel": "filter-process",
+      "git_would_run_it_during": "a status, a diff or a checkout, as the long-running form of the two above",
+      "how_this_host_stops_it": "blanked by name with the rest of its driver"
+    },
+    {
+      "key": "diff.marker.textconv",
+      "sentinel": "textconv",
+      "git_would_run_it_during": "a diff of a path whose attributes name this driver",
+      "how_this_host_stops_it": "blanked by name, and every diff also passes --no-textconv"
+    },
+    {
+      "key": "diff.external",
+      "sentinel": "external-diff",
+      "git_would_run_it_during": "every diff",
+      "how_this_host_stops_it": "diff.external= on the command line, and every diff also passes --no-ext-diff"
+    },
+    {
+      "key": "core.pager",
+      "sentinel": "pager",
+      "git_would_run_it_during": "any command whose output would be paged",
+      "how_this_host_stops_it": "--no-pager, core.pager=cat, GIT_PAGER=cat, and a child with no terminal"
+    },
+    {
+      "key": "credential.helper",
+      "sentinel": "credential-helper",
+      "git_would_run_it_during": "any fetch that needs authentication",
+      "how_this_host_stops_it": "one empty credential.helper on the command line empties the whole list, including the per-URL entries, and only the approved broker's helper is appended after it"
+    },
+    {
+      "key": "core.sshCommand",
+      "sentinel": "ssh-command",
+      "git_would_run_it_during": "any fetch over ssh",
+      "how_this_host_stops_it": "core.sshCommand is set to the approved broker's program, or to nothing when there is no ssh transport"
+    },
+    {
+      "key": "core.editor",
+      "sentinel": "editor",
+      "git_would_run_it_during": "any command that would open an editor",
+      "how_this_host_stops_it": "core.editor=false, sequence.editor=false, GIT_EDITOR=false, and no subcommand that needs one is in the allowlist"
+    },
+    {
+      "key": "core.askPass",
+      "sentinel": "askpass",
+      "git_would_run_it_during": "a prompt for a credential",
+      "how_this_host_stops_it": "core.askPass=, GIT_ASKPASS=, SSH_ASKPASS=, GIT_TERMINAL_PROMPT=0 and an empty DISPLAY"
+    },
+    {
+      "key": "core.gitProxy",
+      "sentinel": "git-proxy",
+      "git_would_run_it_during": "a fetch over the git protocol",
+      "how_this_host_stops_it": "core.gitProxy=, and the git protocol is not a transport this host uses at all"
+    },
+    {
+      "key": "core.alternateRefsCommand",
+      "sentinel": "alternate-refs",
+      "git_would_run_it_during": "a listing of an alternate object store's references",
+      "how_this_host_stops_it": "core.alternateRefsCommand="
+    },
+    {
+      "key": "uploadpack.packObjectsHook",
+      "sentinel": "pack-objects-hook",
+      "git_would_run_it_during": "serving a fetch from this repository",
+      "how_this_host_stops_it": "uploadpack.packObjectsHook=, which reaches the subprocess too because a command-line override travels to every child Git starts"
+    },
+    {
+      "key": "gpg.program",
+      "sentinel": "gpg",
+      "git_would_run_it_during": "creating or verifying a signature",
+      "how_this_host_stops_it": "every gpg program is set to false, and log.showSignature=false"
+    },
+    {
+      "key": "init.templateDir",
+      "sentinel": "template-hook-post-checkout",
+      "git_would_run_it_during": "an init or a clone, which copies the template's hooks into the new repository",
+      "how_this_host_stops_it": "init.templateDir points at an empty directory this host owns, and every clone also passes --template="
+    },
+    {
+      "key": "merge.marker.driver",
+      "sentinel": "merge-driver",
+      "git_would_run_it_during": "a merge of a path whose attributes name this driver",
+      "how_this_host_stops_it": "blanked by name with the other drivers, and no merge subcommand is in the allowlist"
+    }
+  ],
+  "refused": [
+    {
+      "key": "remote.origin.vcs",
+      "value": "planted",
+      "why": "it names the remote helper program git-remote-planted, and a remote helper is not something a command-line override removes: the operation is refused instead"
+    },
+    {
+      "key": "url.https://example.invalid/.insteadOf",
+      "value": "kr:",
+      "why": "URL rewriting is multi-valued, so an override adds to the list rather than replacing it; an operation that would resolve a URL through it is refused instead"
+    }
+  ],
+  "hooks": [
+    "post-checkout",
+    "post-index-change",
+    "pre-commit",
+    "post-merge",
+    "reference-transaction",
+    "post-applypatch",
+    "fsmonitor-watchman"
+  ],
+  "attributes": [
+    "* filter=marker",
+    "* diff=marker",
+    "* merge=marker"
+  ]
+}

@@ -1,0 +1,1974 @@
+//! `projects.sqlite`: the project journal.
+//!
+//! Write-ahead logging with full synchronisation, forward-only migrations, and every state change
+//! committed together with the outbox row that announces it. What the order of the writes buys is
+//! the recovery section 24 asks for: immutable workspace versions and partial progress survive the
+//! daemon's death, and cleanup respects pins.
+//!
+//! * An **operation** row exists before anything is created on disk, and its primary key is the
+//!   action identifier the caller submitted. That row *is* the create token: a crash or an
+//!   ambiguous publish is reconciled against it rather than retried as another clone.
+//! * Publication is two commits with the staged object's filesystem identity between them. The row
+//!   moves to `publishing` naming the staging directory, the destination name and that identity;
+//!   then the directory is renamed; then the row moves to `completed` and the repository row is
+//!   written. A daemon that dies in the middle resolves it by asking which name holds *that
+//!   object*.
+//! * A **workspace** row is written before its working tree is materialised and moves to `ready`
+//!   only when the tree exists, so a partly materialised workspace is a row in `materialising`
+//!   rather than a workspace that looks usable.
+//! * A **retained** row is what stops a removal: dirty content, a pinned change set and review
+//!   evidence each get one, and a removal that finds any of them leaves the workspace in
+//!   `removal_pending` until the user approves.
+//! * An **action** row claims a mutation in the same transaction as its effect, so two copies of
+//!   one action agree about what happened.
+
+use std::path::Path;
+
+use kr_protocol::error::ErrorCode;
+use kr_protocol::ids::{
+    ActionId, ActorId, ChangeSetId, EnvironmentId, ProjectRepositoryId, SessionId, WorkspaceId,
+};
+use kr_protocol::project::{
+    AdoptionFlow, DestinationState, InclusionChoice, InclusionPolicy, IsolationMechanism,
+    OperationState, ProjectOrigin, ProjectState, RemoteSpecification, RemoteTransport,
+    RetainedKind, RetentionPolicy, WorkspaceKind, WorkspaceState,
+};
+use kr_protocol::scalars::{Digest256, TimestampMs, U64, Uuid};
+use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
+
+use kr_transfer::ObjectIdentity;
+
+use crate::error::{ProjectError, Result};
+use crate::identity::RepositoryIdentity;
+
+/// The schema version this build reads.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// The directory, under the environment's state directory, that the project service owns.
+pub const PROJECTS_DIRECTORY: &str = "projects";
+
+/// The project store's filename inside that directory.
+pub const STORE_FILE_NAME: &str = "projects.sqlite";
+
+/// One recorded repository.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectRow {
+    /// Its environment-local identity.
+    pub project_repository_id: ProjectRepositoryId,
+    /// The environment that owns it.
+    pub environment_id: EnvironmentId,
+    /// The label the user gave it.
+    pub label: String,
+    /// How it came to be known here.
+    pub origin: ProjectOrigin,
+    /// What state the record is in.
+    pub state: ProjectState,
+    /// The stable filesystem identity of its repository and of the working tree it was recorded
+    /// against.
+    pub identity: RepositoryIdentity,
+    /// The path it was created or adopted at, for a person to read.
+    pub display_path: String,
+    /// The remote it was cloned from, when it has one.
+    pub remote: Option<RemoteSpecification>,
+    /// When the record was written.
+    pub created_at_ms: TimestampMs,
+}
+
+/// One recorded workspace.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorkspaceRow {
+    /// Its identity.
+    pub workspace_id: WorkspaceId,
+    /// The repository it is a working copy of.
+    pub project_repository_id: ProjectRepositoryId,
+    /// The environment that owns it.
+    pub environment_id: EnvironmentId,
+    /// The label the user gave it.
+    pub label: String,
+    /// Which kind it is.
+    pub kind: WorkspaceKind,
+    /// How an isolated workspace is separated.
+    pub isolation: Option<IsolationMechanism>,
+    /// The inclusion policy it was created under.
+    pub policy: InclusionPolicy,
+    /// What state it is in.
+    pub state: WorkspaceState,
+    /// The revision it started from.
+    pub base_revision: String,
+    /// The change-set version it materialised, when it named one.
+    pub base_change_set_id: Option<ChangeSetId>,
+    /// The stable filesystem identity of its working tree.
+    pub identity: Option<ObjectIdentity>,
+    /// The path its working tree is at.
+    pub display_path: String,
+    /// The retention policy a removal was requested under, when one was.
+    pub retention: Option<RetentionPolicy>,
+    /// When it was created.
+    pub created_at_ms: TimestampMs,
+    /// When it was removed, once it was.
+    pub removed_at_ms: Option<TimestampMs>,
+}
+
+/// One recorded repository operation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OperationRow {
+    /// The action that started it, which is the create token.
+    pub action_id: ActionId,
+    /// The actor that submitted it. Only that actor may cancel it.
+    pub actor_id: ActorId,
+    /// The environment that owns it.
+    pub environment_id: EnvironmentId,
+    /// The repository it creates.
+    pub project_repository_id: ProjectRepositoryId,
+    /// Which method started it.
+    pub method: String,
+    /// What state it is in.
+    pub state: OperationState,
+    /// The remote it reaches, when it reaches one.
+    pub remote: Option<RemoteSpecification>,
+    /// The adoption flow the caller chose, when it chose one.
+    pub flow: Option<AdoptionFlow>,
+    /// The destination's state when the operation was admitted.
+    pub destination_state: DestinationState,
+    /// The parent directory the destination is in.
+    pub parent_path: String,
+    /// The single name inside it.
+    pub destination_name: String,
+    /// The private sibling the content was staged in, when one was made.
+    pub staging_name: Option<String>,
+    /// The staged repository's filesystem identity, recorded before the publication.
+    ///
+    /// This is what makes an interrupted publication resolvable: the question is not whether a
+    /// name exists but which name holds *this object*.
+    pub staged_identity: Option<ObjectIdentity>,
+    /// Why it ended, when it ended for a reason.
+    pub detail: Option<String>,
+    /// When it started.
+    pub started_at_ms: TimestampMs,
+    /// When it ended, once it has.
+    pub ended_at_ms: Option<TimestampMs>,
+}
+
+/// One thing a workspace holds that its removal has to account for.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedRow {
+    /// What kind of thing it is.
+    pub kind: RetainedKind,
+    /// What it is, in the host's own words.
+    pub detail: String,
+    /// The change set it belongs to, when it belongs to one.
+    pub change_set_id: Option<ChangeSetId>,
+}
+
+/// One staging path an operation left behind or removed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StagingPathRow {
+    /// The path.
+    pub path: String,
+    /// True when this host removed it.
+    pub removed: bool,
+}
+
+/// The action one mutation is performed under.
+///
+/// A mutation whose idempotency is its action identifier commits this together with the state it
+/// changes, in one transaction. A second attempt at the same action therefore finds the first
+/// already recorded and changes nothing, whether it arrives after the reply was lost or beside it
+/// on another connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Action {
+    /// The actor performing it.
+    pub actor_id: ActorId,
+    /// The durable operation identity.
+    pub action_id: Uuid,
+    /// The method being performed.
+    pub method: String,
+    /// The digest of the payload it was submitted with.
+    pub payload_digest: Digest256,
+}
+
+/// One retained mutation outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetainedOutcome {
+    /// The mutation succeeded, and this is the canonically encoded result it returned.
+    Ok(Vec<u8>),
+    /// The mutation failed, and this is the error it returned.
+    Error {
+        /// The stable protocol code.
+        code: ErrorCode,
+        /// The message.
+        detail: String,
+    },
+}
+
+/// One row of the action table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RetainedAction {
+    /// The actor.
+    pub actor_id: ActorId,
+    /// The action identifier.
+    pub action_id: Uuid,
+    /// The method it was performed under.
+    pub method: String,
+    /// The payload digest it was submitted with.
+    pub payload_digest: Digest256,
+    /// The operation it claimed, for an effect whose result comes later.
+    pub subject: Option<Uuid>,
+    /// The encoded result, once there is one.
+    pub result: Option<Vec<u8>>,
+    /// The failure code, when it failed.
+    pub error_code: Option<String>,
+    /// The failure message, when it failed.
+    pub error_detail: Option<String>,
+    /// When the row was written.
+    pub recorded_at_ms: TimestampMs,
+}
+
+/// The project journal of one environment.
+#[derive(Debug)]
+pub struct Store {
+    connection: Connection,
+    environment_id: EnvironmentId,
+}
+
+impl Store {
+    /// Opens the store for an environment, creating it on first use.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the database cannot be opened or migrated.
+    pub fn open(path: impl AsRef<Path>, environment_id: EnvironmentId) -> Result<Self> {
+        let connection = Connection::open(path.as_ref()).map_err(ProjectError::store)?;
+        Self::prepare(connection, environment_id)
+    }
+
+    /// Opens a store that exists only for the life of this process.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the database cannot be created.
+    pub fn in_memory(environment_id: EnvironmentId) -> Result<Self> {
+        Self::prepare(
+            Connection::open_in_memory().map_err(ProjectError::store)?,
+            environment_id,
+        )
+    }
+
+    fn prepare(connection: Connection, environment_id: EnvironmentId) -> Result<Self> {
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(ProjectError::store)?;
+        connection
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(ProjectError::store)?;
+        connection
+            .pragma_update(None, "foreign_keys", "ON")
+            .map_err(ProjectError::store)?;
+        let store = Self {
+            connection,
+            environment_id,
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
+    fn migrate(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
+                 CREATE TABLE IF NOT EXISTS projects (
+                     project_repository_id BLOB PRIMARY KEY,
+                     environment_id        BLOB NOT NULL,
+                     label                 TEXT NOT NULL,
+                     origin                TEXT NOT NULL,
+                     state                 TEXT NOT NULL,
+                     git_dir_device        INTEGER NOT NULL,
+                     git_dir_file_id       INTEGER NOT NULL,
+                     work_tree_device      INTEGER NOT NULL,
+                     work_tree_file_id     INTEGER NOT NULL,
+                     display_path          TEXT NOT NULL,
+                     remote_name           TEXT,
+                     remote_transport      TEXT,
+                     remote_url            TEXT,
+                     remote_provider       TEXT,
+                     remote_broker         TEXT,
+                     created_at_ms         INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS workspaces (
+                     workspace_id          BLOB PRIMARY KEY,
+                     project_repository_id BLOB NOT NULL,
+                     environment_id        BLOB NOT NULL,
+                     label                 TEXT NOT NULL,
+                     kind                  TEXT NOT NULL,
+                     isolation             TEXT,
+                     dirty_files           TEXT NOT NULL,
+                     untracked_files       TEXT NOT NULL,
+                     submodules            TEXT NOT NULL,
+                     binary_files          TEXT NOT NULL,
+                     generated_artefacts   TEXT NOT NULL,
+                     state                 TEXT NOT NULL,
+                     base_revision         TEXT NOT NULL,
+                     base_change_set_id    BLOB,
+                     tree_device           INTEGER,
+                     tree_file_id          INTEGER,
+                     display_path          TEXT NOT NULL,
+                     retention             TEXT,
+                     created_at_ms         INTEGER NOT NULL,
+                     removed_at_ms         INTEGER
+                 );
+                 CREATE TABLE IF NOT EXISTS workspace_sessions (
+                     workspace_id BLOB NOT NULL,
+                     session_id   BLOB NOT NULL,
+                     live         INTEGER NOT NULL DEFAULT 1,
+                     PRIMARY KEY (workspace_id, session_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS workspace_retained (
+                     workspace_id  BLOB NOT NULL,
+                     kind          TEXT NOT NULL,
+                     detail        TEXT NOT NULL,
+                     change_set_id BLOB,
+                     PRIMARY KEY (workspace_id, kind, detail)
+                 );
+                 CREATE TABLE IF NOT EXISTS operations (
+                     action_id             BLOB PRIMARY KEY,
+                     actor_id              TEXT NOT NULL,
+                     environment_id        BLOB NOT NULL,
+                     project_repository_id BLOB NOT NULL,
+                     method                TEXT NOT NULL,
+                     state                 TEXT NOT NULL,
+                     remote_name           TEXT,
+                     remote_transport      TEXT,
+                     remote_url            TEXT,
+                     remote_provider       TEXT,
+                     remote_broker         TEXT,
+                     flow                  TEXT,
+                     destination_state     TEXT NOT NULL,
+                     parent_path           TEXT NOT NULL,
+                     destination_name      TEXT NOT NULL,
+                     staging_name          TEXT,
+                     staged_device         INTEGER,
+                     staged_file_id        INTEGER,
+                     detail                TEXT,
+                     started_at_ms         INTEGER NOT NULL,
+                     ended_at_ms           INTEGER
+                 );
+                 CREATE TABLE IF NOT EXISTS operation_paths (
+                     action_id BLOB NOT NULL,
+                     path      TEXT NOT NULL,
+                     removed   INTEGER NOT NULL,
+                     PRIMARY KEY (action_id, path)
+                 );
+                 CREATE TABLE IF NOT EXISTS actions (
+                     actor_id       TEXT NOT NULL,
+                     action_id      BLOB NOT NULL,
+                     method         TEXT NOT NULL,
+                     payload_digest BLOB NOT NULL,
+                     subject        BLOB,
+                     result         BLOB,
+                     error_code     TEXT,
+                     error_detail   TEXT,
+                     recorded_at_ms INTEGER NOT NULL,
+                     PRIMARY KEY (actor_id, action_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS events (
+                     sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+                     kind           TEXT NOT NULL,
+                     subject        TEXT NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS cursors (
+                     consumer TEXT PRIMARY KEY,
+                     sequence INTEGER NOT NULL
+                 );",
+            )
+            .map_err(ProjectError::store)?;
+        let recorded: Option<i64> = self
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .optional()
+            .map_err(ProjectError::store)?;
+        match recorded {
+            None => {
+                self.connection
+                    .execute(
+                        "INSERT INTO schema_version (version) VALUES (?1)",
+                        params![SCHEMA_VERSION],
+                    )
+                    .map_err(ProjectError::store)?;
+            }
+            Some(version) if version == SCHEMA_VERSION => {}
+            Some(version) => {
+                return Err(ProjectError::StoreUnavailable {
+                    detail: format!(
+                        "this project store is at schema version {version}; this build reads \
+                         {SCHEMA_VERSION}"
+                    ),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the environment this store belongs to.
+    #[must_use]
+    pub const fn environment_id(&self) -> EnvironmentId {
+        self.environment_id
+    }
+
+    /// Begins a transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the transaction cannot be started.
+    pub fn transaction(&mut self) -> Result<Transaction<'_>> {
+        self.connection.transaction().map_err(ProjectError::store)
+    }
+
+    // ----- operations -----------------------------------------------------------------------
+
+    /// Writes an operation row and claims its action, in one transaction.
+    ///
+    /// The row exists before anything is created on disk, and its key is the action identifier, so
+    /// a crash afterwards is reconciled against this row rather than retried as another clone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails, or
+    /// [`ProjectError::IdConflict`] when the action was already used for another request.
+    pub fn begin_operation(&mut self, row: &OperationRow, action: Option<&Action>) -> Result<()> {
+        let transaction = self.transaction()?;
+        // The claim comes first, because the operation's own key is the action identifier: a
+        // second copy of one action would otherwise be refused for a unique-key collision rather
+        // than told that its action is already claimed.
+        if let Some(action) = action {
+            claim_action(&transaction, action, Some(row.action_id.get()))?;
+        }
+        insert_operation(&transaction, row)?;
+        announce(
+            &transaction,
+            "project.operation.began",
+            &row.action_id.to_string(),
+            row.started_at_ms,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
+    }
+
+    /// Moves an operation to a new state, recording what is known about it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn set_operation_state(
+        &self,
+        action_id: ActionId,
+        state: OperationState,
+        detail: Option<&str>,
+        ended_at_ms: Option<TimestampMs>,
+        staged_identity: Option<ObjectIdentity>,
+        staging_name: Option<&str>,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE operations
+                    SET state = ?2,
+                        detail = COALESCE(?3, detail),
+                        ended_at_ms = COALESCE(?4, ended_at_ms),
+                        staged_device = COALESCE(?5, staged_device),
+                        staged_file_id = COALESCE(?6, staged_file_id),
+                        staging_name = COALESCE(?7, staging_name)
+                  WHERE action_id = ?1",
+                params![
+                    action_id.get().as_bytes().to_vec(),
+                    operation_state_text(state),
+                    detail,
+                    ended_at_ms.map(|stamp| i64_of(stamp.get())),
+                    staged_identity.map(|identity| i64_of(identity.device)),
+                    staged_identity.map(|identity| i64_of(identity.file_id)),
+                    staging_name,
+                ],
+            )
+            .map_err(ProjectError::store)?;
+        Ok(())
+    }
+
+    /// Returns one operation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the row cannot be read.
+    pub fn operation(&self, action_id: ActionId) -> Result<Option<OperationRow>> {
+        self.connection
+            .query_row(
+                &format!("SELECT {OPERATION_COLUMNS} FROM operations WHERE action_id = ?1"),
+                params![action_id.get().as_bytes().to_vec()],
+                read_operation,
+            )
+            .optional()
+            .map_err(ProjectError::store)
+    }
+
+    /// Returns every operation in one of the named states.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the rows cannot be read.
+    pub fn operations_in(&self, states: &[OperationState]) -> Result<Vec<OperationRow>> {
+        let mut rows = Vec::new();
+        for state in states {
+            let mut statement = self
+                .connection
+                .prepare(&format!(
+                    "SELECT {OPERATION_COLUMNS} FROM operations WHERE state = ?1 \
+                     ORDER BY started_at_ms"
+                ))
+                .map_err(ProjectError::store)?;
+            let mapped = statement
+                .query_map(params![operation_state_text(*state)], read_operation)
+                .map_err(ProjectError::store)?;
+            for row in mapped {
+                rows.push(row.map_err(ProjectError::store)?);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Records one staging path an operation left behind or removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn record_staging_path(
+        &self,
+        action_id: ActionId,
+        path: &str,
+        removed: bool,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO operation_paths (action_id, path, removed) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (action_id, path) DO UPDATE SET removed = ?3",
+                params![action_id.get().as_bytes().to_vec(), path, removed],
+            )
+            .map_err(ProjectError::store)?;
+        Ok(())
+    }
+
+    /// Returns the staging paths one operation accounts for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the rows cannot be read.
+    pub fn staging_paths(&self, action_id: ActionId) -> Result<Vec<StagingPathRow>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT path, removed FROM operation_paths WHERE action_id = ?1 ORDER BY path")
+            .map_err(ProjectError::store)?;
+        let mapped = statement
+            .query_map(params![action_id.get().as_bytes().to_vec()], |row| {
+                Ok(StagingPathRow {
+                    path: row.get(0)?,
+                    removed: row.get(1)?,
+                })
+            })
+            .map_err(ProjectError::store)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row.map_err(ProjectError::store)?);
+        }
+        Ok(rows)
+    }
+
+    // ----- repositories ---------------------------------------------------------------------
+
+    /// Publishes a repository: the row, the operation's completion and the claim's result, in one
+    /// transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn complete_operation(
+        &mut self,
+        project: &ProjectRow,
+        action_id: ActionId,
+        action: Option<&Action>,
+        result: Option<&[u8]>,
+        at_ms: TimestampMs,
+    ) -> Result<()> {
+        let transaction = self.transaction()?;
+        insert_project(&transaction, project)?;
+        transaction
+            .execute(
+                "UPDATE operations SET state = ?2, ended_at_ms = ?3 WHERE action_id = ?1",
+                params![
+                    action_id.get().as_bytes().to_vec(),
+                    operation_state_text(OperationState::Completed),
+                    i64_of(at_ms.get()),
+                ],
+            )
+            .map_err(ProjectError::store)?;
+        if let (Some(action), Some(result)) = (action, result) {
+            settle_claim(&transaction, action, Some(result), None)?;
+        }
+        announce(
+            &transaction,
+            "project.created",
+            &project.project_repository_id.to_string(),
+            at_ms,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
+    }
+
+    /// Returns one repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the row cannot be read.
+    pub fn project(&self, id: ProjectRepositoryId) -> Result<Option<ProjectRow>> {
+        self.connection
+            .query_row(
+                &format!("SELECT {PROJECT_COLUMNS} FROM projects WHERE project_repository_id = ?1"),
+                params![id.get().as_bytes().to_vec()],
+                read_project,
+            )
+            .optional()
+            .map_err(ProjectError::store)
+    }
+
+    /// Returns every repository of one environment, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the rows cannot be read.
+    pub fn projects(&self, environment_id: EnvironmentId) -> Result<Vec<ProjectRow>> {
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "SELECT {PROJECT_COLUMNS} FROM projects WHERE environment_id = ?1 \
+                 ORDER BY created_at_ms, project_repository_id"
+            ))
+            .map_err(ProjectError::store)?;
+        let mapped = statement
+            .query_map(
+                params![environment_id.get().as_bytes().to_vec()],
+                read_project,
+            )
+            .map_err(ProjectError::store)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row.map_err(ProjectError::store)?);
+        }
+        Ok(rows)
+    }
+
+    /// Moves a repository record to a new state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn set_project_state(&self, id: ProjectRepositoryId, state: ProjectState) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE projects SET state = ?2 WHERE project_repository_id = ?1",
+                params![id.get().as_bytes().to_vec(), project_state_text(state)],
+            )
+            .map_err(ProjectError::store)?;
+        Ok(())
+    }
+
+    // ----- workspaces -----------------------------------------------------------------------
+
+    /// Writes a workspace row and claims its action, in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails, or
+    /// [`ProjectError::IdConflict`] when the action was already used for another request.
+    pub fn begin_workspace(&mut self, row: &WorkspaceRow, action: Option<&Action>) -> Result<()> {
+        let transaction = self.transaction()?;
+        if let Some(action) = action {
+            claim_action(&transaction, action, Some(row.workspace_id.get()))?;
+        }
+        insert_workspace(&transaction, row)?;
+        announce(
+            &transaction,
+            "workspace.created",
+            &row.workspace_id.to_string(),
+            row.created_at_ms,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
+    }
+
+    /// Moves a workspace to a new state, recording what a removal decided.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn set_workspace_state(
+        &self,
+        id: WorkspaceId,
+        state: WorkspaceState,
+        identity: Option<ObjectIdentity>,
+        retention: Option<RetentionPolicy>,
+        removed_at_ms: Option<TimestampMs>,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE workspaces
+                    SET state = ?2,
+                        tree_device = COALESCE(?3, tree_device),
+                        tree_file_id = COALESCE(?4, tree_file_id),
+                        retention = COALESCE(?5, retention),
+                        removed_at_ms = COALESCE(?6, removed_at_ms)
+                  WHERE workspace_id = ?1",
+                params![
+                    id.get().as_bytes().to_vec(),
+                    workspace_state_text(state),
+                    identity.map(|identity| i64_of(identity.device)),
+                    identity.map(|identity| i64_of(identity.file_id)),
+                    retention.map(retention_text),
+                    removed_at_ms.map(|stamp| i64_of(stamp.get())),
+                ],
+            )
+            .map_err(ProjectError::store)?;
+        Ok(())
+    }
+
+    /// Returns one workspace.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the row cannot be read.
+    pub fn workspace(&self, id: WorkspaceId) -> Result<Option<WorkspaceRow>> {
+        self.connection
+            .query_row(
+                &format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE workspace_id = ?1"),
+                params![id.get().as_bytes().to_vec()],
+                read_workspace,
+            )
+            .optional()
+            .map_err(ProjectError::store)
+    }
+
+    /// Returns the workspaces of one environment, or of one repository inside it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the rows cannot be read.
+    pub fn workspaces(
+        &self,
+        environment_id: EnvironmentId,
+        project: Option<ProjectRepositoryId>,
+    ) -> Result<Vec<WorkspaceRow>> {
+        let mut statement = self
+            .connection
+            .prepare(&format!(
+                "SELECT {WORKSPACE_COLUMNS} FROM workspaces
+                  WHERE environment_id = ?1
+                    AND (?2 IS NULL OR project_repository_id = ?2)
+                  ORDER BY created_at_ms, workspace_id"
+            ))
+            .map_err(ProjectError::store)?;
+        let mapped = statement
+            .query_map(
+                params![
+                    environment_id.get().as_bytes().to_vec(),
+                    project.map(|id| id.get().as_bytes().to_vec()),
+                ],
+                read_workspace,
+            )
+            .map_err(ProjectError::store)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row.map_err(ProjectError::store)?);
+        }
+        Ok(rows)
+    }
+
+    /// Binds a session to a workspace, or records that it has ended.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn bind_session(
+        &self,
+        workspace_id: WorkspaceId,
+        session_id: SessionId,
+        live: bool,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO workspace_sessions (workspace_id, session_id, live)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (workspace_id, session_id) DO UPDATE SET live = ?3",
+                params![
+                    workspace_id.get().as_bytes().to_vec(),
+                    session_id.get().as_bytes().to_vec(),
+                    live,
+                ],
+            )
+            .map_err(ProjectError::store)?;
+        Ok(())
+    }
+
+    /// Returns the sessions bound to a workspace that are still live.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the rows cannot be read.
+    pub fn live_sessions(&self, workspace_id: WorkspaceId) -> Result<Vec<SessionId>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT session_id FROM workspace_sessions
+                  WHERE workspace_id = ?1 AND live = 1 ORDER BY session_id",
+            )
+            .map_err(ProjectError::store)?;
+        let mapped = statement
+            .query_map(params![workspace_id.get().as_bytes().to_vec()], |row| {
+                let bytes: Vec<u8> = row.get(0)?;
+                Ok(uuid_of(&bytes).map(SessionId::new))
+            })
+            .map_err(ProjectError::store)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            if let Some(session) = row.map_err(ProjectError::store)? {
+                rows.push(session);
+            }
+        }
+        Ok(rows)
+    }
+
+    /// Records one thing a workspace holds that a removal has to account for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn retain(&self, workspace_id: WorkspaceId, item: &RetainedRow) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO workspace_retained (workspace_id, kind, detail, change_set_id)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (workspace_id, kind, detail) DO UPDATE SET change_set_id = ?4",
+                params![
+                    workspace_id.get().as_bytes().to_vec(),
+                    retained_kind_text(item.kind),
+                    item.detail,
+                    item.change_set_id.map(|id| id.get().as_bytes().to_vec()),
+                ],
+            )
+            .map_err(ProjectError::store)?;
+        Ok(())
+    }
+
+    /// Returns everything a workspace holds that a removal has to account for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the rows cannot be read.
+    pub fn retained(&self, workspace_id: WorkspaceId) -> Result<Vec<RetainedRow>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT kind, detail, change_set_id FROM workspace_retained
+                  WHERE workspace_id = ?1 ORDER BY kind, detail",
+            )
+            .map_err(ProjectError::store)?;
+        let mapped = statement
+            .query_map(params![workspace_id.get().as_bytes().to_vec()], |row| {
+                let kind: String = row.get(0)?;
+                let change_set: Option<Vec<u8>> = row.get(2)?;
+                Ok(RetainedRow {
+                    kind: retained_kind_of(&kind),
+                    detail: row.get(1)?,
+                    change_set_id: change_set
+                        .as_deref()
+                        .and_then(uuid_of)
+                        .map(ChangeSetId::new),
+                })
+            })
+            .map_err(ProjectError::store)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row.map_err(ProjectError::store)?);
+        }
+        Ok(rows)
+    }
+
+    /// Removes everything a workspace held, once the user approved it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn release_retained(&self, workspace_id: WorkspaceId) -> Result<usize> {
+        self.connection
+            .execute(
+                "DELETE FROM workspace_retained WHERE workspace_id = ?1",
+                params![workspace_id.get().as_bytes().to_vec()],
+            )
+            .map_err(ProjectError::store)
+    }
+
+    // ----- actions --------------------------------------------------------------------------
+
+    /// Returns one action's record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the row cannot be read.
+    pub fn retained_action(
+        &self,
+        actor_id: &ActorId,
+        action_id: Uuid,
+    ) -> Result<Option<RetainedAction>> {
+        self.connection
+            .query_row(
+                "SELECT actor_id, action_id, method, payload_digest, subject, result, error_code,
+                        error_detail, recorded_at_ms
+                   FROM actions WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id.as_str(), action_id.as_bytes().to_vec()],
+                |row| {
+                    let action: Vec<u8> = row.get(1)?;
+                    let digest: Vec<u8> = row.get(3)?;
+                    let subject: Option<Vec<u8>> = row.get(4)?;
+                    Ok(RetainedAction {
+                        actor_id: actor_column(row, 0)?,
+                        action_id: uuid_of(&action).unwrap_or_else(|| Uuid::from_bytes([0; 16])),
+                        method: row.get(2)?,
+                        payload_digest: digest_of(&digest),
+                        subject: subject.as_deref().and_then(uuid_of),
+                        result: row.get(5)?,
+                        error_code: row.get(6)?,
+                        error_detail: row.get(7)?,
+                        recorded_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(8)?)),
+                    })
+                },
+            )
+            .optional()
+            .map_err(ProjectError::store)
+    }
+
+    /// Records one action's outcome, leaving an existing row alone.
+    ///
+    /// Returns the record that was already there, when another copy of the action recorded first.
+    /// That record is the answer both callers get: one action, one receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails, or
+    /// [`ProjectError::IdConflict`] when the identifier was used for a different request.
+    pub fn record_action(
+        &self,
+        actor_id: &ActorId,
+        action_id: Uuid,
+        method: &str,
+        payload_digest: Digest256,
+        outcome: &RetainedOutcome,
+        at_ms: TimestampMs,
+    ) -> Result<Option<RetainedOutcome>> {
+        let (result, code, detail) = match outcome {
+            RetainedOutcome::Ok(result) => (Some(result.clone()), None, None),
+            RetainedOutcome::Error { code, detail } => {
+                (None, Some(code.as_str().to_owned()), Some(detail.clone()))
+            }
+        };
+        let inserted = self
+            .connection
+            .execute(
+                "INSERT INTO actions (actor_id, action_id, method, payload_digest, subject,
+                                      result, error_code, error_detail, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (actor_id, action_id) DO NOTHING",
+                params![
+                    actor_id.as_str(),
+                    action_id.as_bytes().to_vec(),
+                    method,
+                    payload_digest.as_bytes().to_vec(),
+                    result,
+                    code,
+                    detail,
+                    i64_of(at_ms.get()),
+                ],
+            )
+            .map_err(ProjectError::store)?;
+        if inserted == 1 {
+            return Ok(None);
+        }
+        let existing = self.retained_action(actor_id, action_id)?.ok_or_else(|| {
+            ProjectError::StoreUnavailable {
+                detail: "an action row that conflicted could not be read back".to_owned(),
+            }
+        })?;
+        if existing.method != method || existing.payload_digest != payload_digest {
+            return Err(ProjectError::IdConflict {
+                action: action_id.to_string(),
+                method: existing.method,
+            });
+        }
+        Ok(Some(outcome_of(&existing)))
+    }
+
+    /// Fills in the result of a claim whose effect has since settled.
+    ///
+    /// The update names the actor, the identifier, the method and the digest, so a completion
+    /// cannot fill a different request's claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn settle(
+        &self,
+        action: &Action,
+        result: Option<&[u8]>,
+        failure: Option<(ErrorCode, &str)>,
+    ) -> Result<usize> {
+        settle_claim_on(&self.connection, action, result, failure)
+    }
+
+    /// Returns the actions this store has claimed and not settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the rows cannot be read.
+    pub fn open_claims(&self) -> Result<Vec<RetainedAction>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT actor_id, action_id, method, payload_digest, subject, result, error_code,
+                        error_detail, recorded_at_ms
+                   FROM actions
+                  WHERE result IS NULL AND error_code IS NULL
+                  ORDER BY recorded_at_ms",
+            )
+            .map_err(ProjectError::store)?;
+        let mapped = statement
+            .query_map([], |row| {
+                let action: Vec<u8> = row.get(1)?;
+                let digest: Vec<u8> = row.get(3)?;
+                let subject: Option<Vec<u8>> = row.get(4)?;
+                Ok(RetainedAction {
+                    actor_id: actor_column(row, 0)?,
+                    action_id: uuid_of(&action).unwrap_or_else(|| Uuid::from_bytes([0; 16])),
+                    method: row.get(2)?,
+                    payload_digest: digest_of(&digest),
+                    subject: subject.as_deref().and_then(uuid_of),
+                    result: row.get(5)?,
+                    error_code: row.get(6)?,
+                    error_detail: row.get(7)?,
+                    recorded_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(8)?)),
+                })
+            })
+            .map_err(ProjectError::store)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row.map_err(ProjectError::store)?);
+        }
+        Ok(rows)
+    }
+
+    /// Records one event in the outbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn announce(&self, kind: &str, subject: &str, at_ms: TimestampMs) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO events (kind, subject, recorded_at_ms) VALUES (?1, ?2, ?3)",
+                params![kind, subject, i64_of(at_ms.get())],
+            )
+            .map_err(ProjectError::store)?;
+        Ok(())
+    }
+
+    /// Returns how many events the outbox holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the count cannot be read.
+    pub fn event_count(&self) -> Result<u64> {
+        let count: i64 = self
+            .connection
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .map_err(ProjectError::store)?;
+        Ok(u64_of(count))
+    }
+}
+
+/// Returns what one action's record says its outcome was.
+#[must_use]
+pub fn outcome_of(record: &RetainedAction) -> RetainedOutcome {
+    match (&record.result, &record.error_code) {
+        (Some(result), _) => RetainedOutcome::Ok(result.clone()),
+        (None, Some(code)) => RetainedOutcome::Error {
+            code: code.parse().unwrap_or(ErrorCode::OutcomeUnknown),
+            detail: record
+                .error_detail
+                .clone()
+                .unwrap_or_else(|| format!("action {} was recorded as {code}", record.action_id)),
+        },
+        (None, None) => RetainedOutcome::Error {
+            code: ErrorCode::OutcomeUnknown,
+            detail: format!(
+                "action {} claimed its effect and its result is not recorded yet",
+                record.action_id
+            ),
+        },
+    }
+}
+
+/// Claims one action inside a transaction that also writes the state it changes.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::IdConflict`] when the identifier was used for a different request, or
+/// [`ProjectError::StoreUnavailable`] when the write fails.
+pub fn claim_action(
+    transaction: &Transaction<'_>,
+    action: &Action,
+    subject: Option<Uuid>,
+) -> Result<()> {
+    let inserted = transaction
+        .execute(
+            "INSERT INTO actions (actor_id, action_id, method, payload_digest, subject,
+                                  result, error_code, error_detail, recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, ?6)
+             ON CONFLICT (actor_id, action_id) DO NOTHING",
+            params![
+                action.actor_id.as_str(),
+                action.action_id.as_bytes().to_vec(),
+                action.method,
+                action.payload_digest.as_bytes().to_vec(),
+                subject.map(|id| id.as_bytes().to_vec()),
+                i64_of(kr_ipc::now_ms().get()),
+            ],
+        )
+        .map_err(ProjectError::store)?;
+    if inserted == 1 {
+        return Ok(());
+    }
+    let existing: (String, Vec<u8>) = transaction
+        .query_row(
+            "SELECT method, payload_digest FROM actions WHERE actor_id = ?1 AND action_id = ?2",
+            params![
+                action.actor_id.as_str(),
+                action.action_id.as_bytes().to_vec()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map_err(ProjectError::store)?;
+    if existing.0 != action.method || digest_of(&existing.1) != action.payload_digest {
+        return Err(ProjectError::IdConflict {
+            action: action.action_id.to_string(),
+            method: existing.0,
+        });
+    }
+    // Another copy of this action claimed first. The caller reads the claim's record and answers
+    // from it rather than performing the effect a second time.
+    Err(ProjectError::OutcomeUnknown {
+        detail: format!(
+            "action {} is already claimed by another copy of this request",
+            action.action_id
+        ),
+    })
+}
+
+/// Fills in a claim's result inside a transaction.
+fn settle_claim(
+    transaction: &Transaction<'_>,
+    action: &Action,
+    result: Option<&[u8]>,
+    failure: Option<(ErrorCode, &str)>,
+) -> Result<usize> {
+    settle_claim_on(transaction, action, result, failure)
+}
+
+/// Fills in a claim's result.
+///
+/// The update names the actor, the identifier, the method and the digest, and requires the claim
+/// to be open, so a completion cannot fill a different request's claim or overwrite a settled one.
+fn settle_claim_on(
+    connection: &Connection,
+    action: &Action,
+    result: Option<&[u8]>,
+    failure: Option<(ErrorCode, &str)>,
+) -> Result<usize> {
+    connection
+        .execute(
+            "UPDATE actions
+                SET result = ?5, error_code = ?6, error_detail = ?7
+              WHERE actor_id = ?1
+                AND action_id = ?2
+                AND method = ?3
+                AND payload_digest = ?4
+                AND result IS NULL
+                AND error_code IS NULL",
+            params![
+                action.actor_id.as_str(),
+                action.action_id.as_bytes().to_vec(),
+                action.method,
+                action.payload_digest.as_bytes().to_vec(),
+                result.map(<[u8]>::to_vec),
+                failure.map(|(code, _)| code.as_str().to_owned()),
+                failure.map(|(_, detail)| detail.to_owned()),
+            ],
+        )
+        .map_err(ProjectError::store)
+}
+
+/// Writes one event in the outbox of a transaction.
+fn announce(
+    transaction: &Transaction<'_>,
+    kind: &str,
+    subject: &str,
+    at_ms: TimestampMs,
+) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO events (kind, subject, recorded_at_ms) VALUES (?1, ?2, ?3)",
+            params![kind, subject, i64_of(at_ms.get())],
+        )
+        .map_err(ProjectError::store)?;
+    Ok(())
+}
+
+/// The columns an operation row is read from.
+const OPERATION_COLUMNS: &str = "action_id, actor_id, environment_id, project_repository_id, \
+     method, state, remote_name, remote_transport, remote_url, remote_provider, remote_broker, \
+     flow, destination_state, parent_path, destination_name, staging_name, staged_device, \
+     staged_file_id, detail, started_at_ms, ended_at_ms";
+
+/// The columns a repository row is read from.
+const PROJECT_COLUMNS: &str = "project_repository_id, environment_id, label, origin, state, \
+     git_dir_device, git_dir_file_id, work_tree_device, work_tree_file_id, display_path, \
+     remote_name, remote_transport, remote_url, remote_provider, remote_broker, created_at_ms";
+
+/// The columns a workspace row is read from.
+const WORKSPACE_COLUMNS: &str = "workspace_id, project_repository_id, environment_id, label, \
+     kind, isolation, dirty_files, untracked_files, submodules, binary_files, \
+     generated_artefacts, state, base_revision, base_change_set_id, tree_device, tree_file_id, \
+     display_path, retention, created_at_ms, removed_at_ms";
+
+fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result<()> {
+    let remote = row.remote.as_ref();
+    transaction
+        .execute(
+            "INSERT INTO operations (action_id, actor_id, environment_id, project_repository_id,
+                                     method, state, remote_name, remote_transport, remote_url,
+                                     remote_provider, remote_broker, flow, destination_state,
+                                     parent_path, destination_name, staging_name, staged_device,
+                                     staged_file_id, detail, started_at_ms, ended_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18, ?19, ?20, ?21)",
+            params![
+                row.action_id.get().as_bytes().to_vec(),
+                row.actor_id.as_str(),
+                row.environment_id.get().as_bytes().to_vec(),
+                row.project_repository_id.get().as_bytes().to_vec(),
+                row.method,
+                operation_state_text(row.state),
+                remote.map(|remote| remote.remote_name.clone()),
+                remote.map(|remote| transport_text(remote.transport).to_owned()),
+                remote.map(|remote| remote.url.clone()),
+                remote.map(|remote| remote.provider.clone()),
+                remote.map(|remote| remote.credential_broker.clone()),
+                row.flow.map(adoption_flow_text),
+                destination_state_text(row.destination_state),
+                row.parent_path,
+                row.destination_name,
+                row.staging_name,
+                row.staged_identity.map(|id| i64_of(id.device)),
+                row.staged_identity.map(|id| i64_of(id.file_id)),
+                row.detail,
+                i64_of(row.started_at_ms.get()),
+                row.ended_at_ms.map(|stamp| i64_of(stamp.get())),
+            ],
+        )
+        .map_err(ProjectError::store)?;
+    Ok(())
+}
+
+fn read_operation(row: &rusqlite::Row<'_>) -> rusqlite::Result<OperationRow> {
+    let action: Vec<u8> = row.get(0)?;
+    let environment: Vec<u8> = row.get(2)?;
+    let project: Vec<u8> = row.get(3)?;
+    let state: String = row.get(5)?;
+    let transport: Option<String> = row.get(7)?;
+    let flow: Option<String> = row.get(11)?;
+    let destination_state: String = row.get(12)?;
+    let device: Option<i64> = row.get(16)?;
+    let file_id: Option<i64> = row.get(17)?;
+    let remote = match (row.get::<_, Option<String>>(6)?, transport) {
+        (Some(name), Some(transport)) => Some(RemoteSpecification {
+            remote_name: name,
+            transport: transport_of(&transport),
+            url: row.get::<_, Option<String>>(8)?.unwrap_or_default(),
+            provider: row.get::<_, Option<String>>(9)?.unwrap_or_default(),
+            credential_broker: row.get::<_, Option<String>>(10)?.unwrap_or_default(),
+        }),
+        _ => None,
+    };
+    Ok(OperationRow {
+        action_id: ActionId::new(uuid_of(&action).unwrap_or_else(|| Uuid::from_bytes([0; 16]))),
+        actor_id: actor_column(row, 1)?,
+        environment_id: EnvironmentId::new(
+            uuid_of(&environment).unwrap_or_else(|| Uuid::from_bytes([0; 16])),
+        ),
+        project_repository_id: ProjectRepositoryId::new(
+            uuid_of(&project).unwrap_or_else(|| Uuid::from_bytes([0; 16])),
+        ),
+        method: row.get(4)?,
+        state: operation_state_of(&state),
+        remote,
+        flow: flow.as_deref().map(adoption_flow_of),
+        destination_state: destination_state_of(&destination_state),
+        parent_path: row.get(13)?,
+        destination_name: row.get(14)?,
+        staging_name: row.get(15)?,
+        staged_identity: match (device, file_id) {
+            (Some(device), Some(file_id)) => Some(ObjectIdentity {
+                device: u64_of(device),
+                file_id: u64_of(file_id),
+            }),
+            _ => None,
+        },
+        detail: row.get(18)?,
+        started_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(19)?)),
+        ended_at_ms: row
+            .get::<_, Option<i64>>(20)?
+            .map(|stamp| TimestampMs::new(u64_of(stamp))),
+    })
+}
+
+fn insert_project(transaction: &Transaction<'_>, row: &ProjectRow) -> Result<()> {
+    let remote = row.remote.as_ref();
+    transaction
+        .execute(
+            "INSERT INTO projects (project_repository_id, environment_id, label, origin, state,
+                                   git_dir_device, git_dir_file_id, work_tree_device,
+                                   work_tree_file_id, display_path, remote_name, remote_transport,
+                                   remote_url, remote_provider, remote_broker, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                row.project_repository_id.get().as_bytes().to_vec(),
+                row.environment_id.get().as_bytes().to_vec(),
+                row.label,
+                origin_text(row.origin),
+                project_state_text(row.state),
+                i64_of(row.identity.git_dir.device),
+                i64_of(row.identity.git_dir.file_id),
+                i64_of(row.identity.work_tree.device),
+                i64_of(row.identity.work_tree.file_id),
+                row.display_path,
+                remote.map(|remote| remote.remote_name.clone()),
+                remote.map(|remote| transport_text(remote.transport).to_owned()),
+                remote.map(|remote| remote.url.clone()),
+                remote.map(|remote| remote.provider.clone()),
+                remote.map(|remote| remote.credential_broker.clone()),
+                i64_of(row.created_at_ms.get()),
+            ],
+        )
+        .map_err(ProjectError::store)?;
+    Ok(())
+}
+
+fn read_project(row: &rusqlite::Row<'_>) -> rusqlite::Result<ProjectRow> {
+    let project: Vec<u8> = row.get(0)?;
+    let environment: Vec<u8> = row.get(1)?;
+    let origin: String = row.get(3)?;
+    let state: String = row.get(4)?;
+    let transport: Option<String> = row.get(11)?;
+    let remote = match (row.get::<_, Option<String>>(10)?, transport) {
+        (Some(name), Some(transport)) => Some(RemoteSpecification {
+            remote_name: name,
+            transport: transport_of(&transport),
+            url: row.get::<_, Option<String>>(12)?.unwrap_or_default(),
+            provider: row.get::<_, Option<String>>(13)?.unwrap_or_default(),
+            credential_broker: row.get::<_, Option<String>>(14)?.unwrap_or_default(),
+        }),
+        _ => None,
+    };
+    Ok(ProjectRow {
+        project_repository_id: ProjectRepositoryId::new(
+            uuid_of(&project).unwrap_or_else(|| Uuid::from_bytes([0; 16])),
+        ),
+        environment_id: EnvironmentId::new(
+            uuid_of(&environment).unwrap_or_else(|| Uuid::from_bytes([0; 16])),
+        ),
+        label: row.get(2)?,
+        origin: origin_of(&origin),
+        state: project_state_of(&state),
+        identity: RepositoryIdentity {
+            git_dir: ObjectIdentity {
+                device: u64_of(row.get::<_, i64>(5)?),
+                file_id: u64_of(row.get::<_, i64>(6)?),
+            },
+            work_tree: ObjectIdentity {
+                device: u64_of(row.get::<_, i64>(7)?),
+                file_id: u64_of(row.get::<_, i64>(8)?),
+            },
+        },
+        display_path: row.get(9)?,
+        remote,
+        created_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(15)?)),
+    })
+}
+
+fn insert_workspace(transaction: &Transaction<'_>, row: &WorkspaceRow) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO workspaces (workspace_id, project_repository_id, environment_id, label,
+                                     kind, isolation, dirty_files, untracked_files, submodules,
+                                     binary_files, generated_artefacts, state, base_revision,
+                                     base_change_set_id, tree_device, tree_file_id, display_path,
+                                     retention, created_at_ms, removed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
+                     ?18, ?19, ?20)",
+            params![
+                row.workspace_id.get().as_bytes().to_vec(),
+                row.project_repository_id.get().as_bytes().to_vec(),
+                row.environment_id.get().as_bytes().to_vec(),
+                row.label,
+                workspace_kind_text(row.kind),
+                row.isolation.map(isolation_text),
+                choice_text(row.policy.dirty_files),
+                choice_text(row.policy.untracked_files),
+                choice_text(row.policy.submodules),
+                choice_text(row.policy.binary_files),
+                choice_text(row.policy.generated_artefacts),
+                workspace_state_text(row.state),
+                row.base_revision,
+                row.base_change_set_id
+                    .map(|id| id.get().as_bytes().to_vec()),
+                row.identity.map(|id| i64_of(id.device)),
+                row.identity.map(|id| i64_of(id.file_id)),
+                row.display_path,
+                row.retention.map(retention_text),
+                i64_of(row.created_at_ms.get()),
+                row.removed_at_ms.map(|stamp| i64_of(stamp.get())),
+            ],
+        )
+        .map_err(ProjectError::store)?;
+    Ok(())
+}
+
+fn read_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRow> {
+    let workspace: Vec<u8> = row.get(0)?;
+    let project: Vec<u8> = row.get(1)?;
+    let environment: Vec<u8> = row.get(2)?;
+    let kind: String = row.get(4)?;
+    let isolation: Option<String> = row.get(5)?;
+    let state: String = row.get(11)?;
+    let change_set: Option<Vec<u8>> = row.get(13)?;
+    let device: Option<i64> = row.get(14)?;
+    let file_id: Option<i64> = row.get(15)?;
+    let retention: Option<String> = row.get(17)?;
+    Ok(WorkspaceRow {
+        workspace_id: WorkspaceId::new(
+            uuid_of(&workspace).unwrap_or_else(|| Uuid::from_bytes([0; 16])),
+        ),
+        project_repository_id: ProjectRepositoryId::new(
+            uuid_of(&project).unwrap_or_else(|| Uuid::from_bytes([0; 16])),
+        ),
+        environment_id: EnvironmentId::new(
+            uuid_of(&environment).unwrap_or_else(|| Uuid::from_bytes([0; 16])),
+        ),
+        label: row.get(3)?,
+        kind: workspace_kind_of(&kind),
+        isolation: isolation.as_deref().map(isolation_of),
+        policy: InclusionPolicy {
+            dirty_files: choice_of(&row.get::<_, String>(6)?),
+            untracked_files: choice_of(&row.get::<_, String>(7)?),
+            submodules: choice_of(&row.get::<_, String>(8)?),
+            binary_files: choice_of(&row.get::<_, String>(9)?),
+            generated_artefacts: choice_of(&row.get::<_, String>(10)?),
+        },
+        state: workspace_state_of(&state),
+        base_revision: row.get(12)?,
+        base_change_set_id: change_set
+            .as_deref()
+            .and_then(uuid_of)
+            .map(ChangeSetId::new),
+        identity: match (device, file_id) {
+            (Some(device), Some(file_id)) => Some(ObjectIdentity {
+                device: u64_of(device),
+                file_id: u64_of(file_id),
+            }),
+            _ => None,
+        },
+        display_path: row.get(16)?,
+        retention: retention.as_deref().map(retention_of),
+        created_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(18)?)),
+        removed_at_ms: row
+            .get::<_, Option<i64>>(19)?
+            .map(|stamp| TimestampMs::new(u64_of(stamp))),
+    })
+}
+
+/// Reads a principal out of a stored row, reporting a row this build cannot read.
+fn actor_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<ActorId> {
+    let text: String = row.get(index)?;
+    ActorId::new(text).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                error.to_string(),
+            )),
+        )
+    })
+}
+
+/// Reads a 16-byte identifier out of a stored blob.
+fn uuid_of(bytes: &[u8]) -> Option<Uuid> {
+    <[u8; 16]>::try_from(bytes).ok().map(Uuid::from_bytes)
+}
+
+/// Reads a 32-byte digest out of a stored blob.
+fn digest_of(bytes: &[u8]) -> Digest256 {
+    Digest256::from_bytes(<[u8; 32]>::try_from(bytes).unwrap_or([0; 32]))
+}
+
+/// Stores an unsigned 64-bit value in SQLite's signed integer column.
+///
+/// A filesystem identity and a timestamp are both unsigned, and SQLite's integer is signed, so the
+/// bits are kept rather than the value clamped: what is read back is what was written.
+const fn i64_of(value: u64) -> i64 {
+    value as i64
+}
+
+/// Reads back what [`i64_of`] wrote.
+const fn u64_of(value: i64) -> u64 {
+    value as u64
+}
+
+macro_rules! text_enum {
+    ($to:ident, $from:ident, $type:ty, $fallback:expr, $($variant:ident => $text:literal),+ $(,)?) => {
+        /// Returns the stored text of one value.
+        #[must_use]
+        pub const fn $to(value: $type) -> &'static str {
+            match value {
+                $(<$type>::$variant => $text),+
+            }
+        }
+
+        /// Returns the value one stored text names.
+        #[must_use]
+        pub fn $from(text: &str) -> $type {
+            match text {
+                $($text => <$type>::$variant,)+
+                _ => $fallback,
+            }
+        }
+    };
+}
+
+text_enum!(
+    origin_text,
+    origin_of,
+    ProjectOrigin,
+    ProjectOrigin::Adopted,
+    Initialised => "initialised",
+    Cloned => "cloned",
+    Adopted => "adopted",
+);
+
+text_enum!(
+    project_state_text,
+    project_state_of,
+    ProjectState,
+    ProjectState::Detached,
+    Ready => "ready",
+    Creating => "creating",
+    Detached => "detached",
+);
+
+text_enum!(
+    operation_state_text,
+    operation_state_of,
+    OperationState,
+    OperationState::Unknown,
+    Staging => "staging",
+    Publishing => "publishing",
+    Completed => "completed",
+    Cancelled => "cancelled",
+    Failed => "failed",
+    Expired => "expired",
+    Unknown => "unknown",
+);
+
+text_enum!(
+    destination_state_text,
+    destination_state_of,
+    DestinationState,
+    DestinationState::Occupied,
+    Absent => "absent",
+    EmptyDirectory => "empty_directory",
+    NonEmptyDirectory => "non_empty_directory",
+    Occupied => "occupied",
+);
+
+text_enum!(
+    transport_text,
+    transport_of,
+    RemoteTransport,
+    RemoteTransport::LocalPath,
+    Https => "https",
+    Ssh => "ssh",
+    LocalPath => "local_path",
+);
+
+text_enum!(
+    adoption_flow_text,
+    adoption_flow_of,
+    AdoptionFlow,
+    AdoptionFlow::ExistingCheckout,
+    ExistingCheckout => "existing_checkout",
+);
+
+text_enum!(
+    workspace_kind_text,
+    workspace_kind_of,
+    WorkspaceKind,
+    WorkspaceKind::SharedExisting,
+    SharedExisting => "shared_existing",
+    Isolated => "isolated",
+);
+
+text_enum!(
+    isolation_text,
+    isolation_of,
+    IsolationMechanism,
+    IsolationMechanism::IndependentClone,
+    GitWorktree => "git_worktree",
+    IndependentClone => "independent_clone",
+);
+
+text_enum!(
+    workspace_state_text,
+    workspace_state_of,
+    WorkspaceState,
+    WorkspaceState::RemovalPending,
+    Ready => "ready",
+    Materialising => "materialising",
+    RemovalPending => "removal_pending",
+    Removed => "removed",
+);
+
+text_enum!(
+    retention_text,
+    retention_of,
+    RetentionPolicy,
+    RetentionPolicy::KeepEverything,
+    KeepEverything => "keep_everything",
+    KeepRetainedEvidence => "keep_retained_evidence",
+    RemoveRetained => "remove_retained",
+);
+
+text_enum!(
+    retained_kind_text,
+    retained_kind_of,
+    RetainedKind,
+    RetainedKind::DirtyContent,
+    DirtyContent => "dirty_content",
+    PinnedChangeSet => "pinned_change_set",
+    ReviewEvidence => "review_evidence",
+);
+
+text_enum!(
+    choice_text,
+    choice_of,
+    InclusionChoice,
+    InclusionChoice::Exclude,
+    Include => "include",
+    Exclude => "exclude",
+);
+
+/// Returns the wire form of a counter, for a caller building a summary.
+#[must_use]
+pub const fn count(value: u64) -> U64 {
+    U64::new(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn environment() -> EnvironmentId {
+        EnvironmentId::new(Uuid::from_bytes([7; 16]))
+    }
+
+    fn operation(action: u8, project: u8) -> OperationRow {
+        OperationRow {
+            action_id: ActionId::new(Uuid::from_bytes([action; 16])),
+            actor_id: ActorId::new("local:501").expect("a valid principal"),
+            environment_id: environment(),
+            project_repository_id: ProjectRepositoryId::new(Uuid::from_bytes([project; 16])),
+            method: "project.clone".to_owned(),
+            state: OperationState::Staging,
+            remote: Some(RemoteSpecification {
+                remote_name: "origin".to_owned(),
+                transport: RemoteTransport::Https,
+                url: "https://example.invalid/x.git".to_owned(),
+                provider: "example.invalid".to_owned(),
+                credential_broker: "os-secret-store".to_owned(),
+            }),
+            flow: None,
+            destination_state: DestinationState::Absent,
+            parent_path: "/tmp/parent".to_owned(),
+            destination_name: "x".to_owned(),
+            staging_name: Some(".kr-project-0123".to_owned()),
+            staged_identity: None,
+            detail: None,
+            started_at_ms: TimestampMs::new(1_000),
+            ended_at_ms: None,
+        }
+    }
+
+    fn action(id: u8, method: &str) -> Action {
+        Action {
+            actor_id: ActorId::new("local:501").expect("a valid principal"),
+            action_id: Uuid::from_bytes([id; 16]),
+            method: method.to_owned(),
+            payload_digest: Digest256::from_bytes([id; 32]),
+        }
+    }
+
+    #[test]
+    fn an_operation_row_survives_a_round_trip_with_every_field_it_carries() {
+        let mut store = Store::in_memory(environment()).expect("a store opens");
+        let row = operation(1, 2);
+        store
+            .begin_operation(&row, Some(&action(1, "project.clone")))
+            .expect("the row and its claim commit together");
+        let read = store
+            .operation(row.action_id)
+            .expect("it reads")
+            .expect("it is there");
+        assert_eq!(read, row);
+        // The row is the create token, and it exists before anything is on disk.
+        assert_eq!(read.state, OperationState::Staging);
+        // The state change and the identity that resolves a publication are recorded together.
+        let staged = ObjectIdentity {
+            device: 16_777_234,
+            file_id: 98_765,
+        };
+        store
+            .set_operation_state(
+                row.action_id,
+                OperationState::Publishing,
+                None,
+                None,
+                Some(staged),
+                None,
+            )
+            .expect("the state moves");
+        let read = store
+            .operation(row.action_id)
+            .expect("it reads")
+            .expect("it is there");
+        assert_eq!(read.state, OperationState::Publishing);
+        assert_eq!(read.staged_identity, Some(staged));
+        assert_eq!(
+            store
+                .operations_in(&[OperationState::Publishing])
+                .expect("the listing reads")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_second_copy_of_one_action_does_not_claim_it_twice() {
+        let mut store = Store::in_memory(environment()).expect("a store opens");
+        store
+            .begin_operation(&operation(3, 4), Some(&action(3, "project.clone")))
+            .expect("the first copy claims it");
+        // A second copy of the same action finds the claim and is told the outcome is not settled
+        // rather than starting a second clone.
+        let refusal = store
+            .begin_operation(&operation(3, 5), Some(&action(3, "project.clone")))
+            .expect_err("the second copy does not claim it");
+        assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
+        // And the first copy's row is the only one.
+        assert_eq!(
+            store
+                .operations_in(&[OperationState::Staging])
+                .expect("the listing reads")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn one_identifier_used_for_two_different_requests_is_a_conflict() {
+        let mut store = Store::in_memory(environment()).expect("a store opens");
+        store
+            .begin_operation(&operation(5, 6), Some(&action(5, "project.clone")))
+            .expect("the first request claims it");
+        let mut different = action(5, "project.init");
+        different.payload_digest = Digest256::from_bytes([9; 32]);
+        let refusal = store
+            .begin_operation(&operation(5, 7), Some(&different))
+            .expect_err("a different request under the same identifier is a conflict");
+        assert_eq!(refusal.code(), ErrorCode::IdConflict);
+    }
+
+    #[test]
+    fn a_claim_is_settled_only_by_the_request_that_made_it() {
+        let store = Store::in_memory(environment()).expect("a store opens");
+        let claimed = action(8, "project.clone");
+        {
+            let mut store = Store::in_memory(environment()).expect("a second store opens");
+            store
+                .begin_operation(&operation(8, 9), Some(&claimed))
+                .expect("it claims");
+            // Another method's result never fills this claim.
+            let other = Action {
+                method: "project.init".to_owned(),
+                ..claimed.clone()
+            };
+            assert_eq!(
+                store.settle(&other, Some(b"wrong"), None).expect("it runs"),
+                0
+            );
+            assert_eq!(
+                store
+                    .settle(&claimed, Some(b"right"), None)
+                    .expect("it runs"),
+                1
+            );
+            let record = store
+                .retained_action(&claimed.actor_id, claimed.action_id)
+                .expect("it reads")
+                .expect("it is there");
+            assert_eq!(record.result.as_deref(), Some(b"right".as_slice()));
+            // A settled claim is not settled again.
+            assert_eq!(
+                store
+                    .settle(&claimed, Some(b"again"), None)
+                    .expect("it runs"),
+                0
+            );
+        }
+        assert!(
+            store.open_claims().expect("it reads").is_empty(),
+            "a fresh store has no claims"
+        );
+    }
+
+    #[test]
+    fn a_workspace_keeps_its_policy_its_sessions_and_everything_it_holds() {
+        let mut store = Store::in_memory(environment()).expect("a store opens");
+        let workspace_id = WorkspaceId::new(Uuid::from_bytes([11; 16]));
+        let row = WorkspaceRow {
+            workspace_id,
+            project_repository_id: ProjectRepositoryId::new(Uuid::from_bytes([2; 16])),
+            environment_id: environment(),
+            label: "review".to_owned(),
+            kind: WorkspaceKind::Isolated,
+            isolation: Some(IsolationMechanism::GitWorktree),
+            policy: InclusionPolicy {
+                dirty_files: InclusionChoice::Include,
+                untracked_files: InclusionChoice::Exclude,
+                submodules: InclusionChoice::Exclude,
+                binary_files: InclusionChoice::Exclude,
+                generated_artefacts: InclusionChoice::Exclude,
+            },
+            state: WorkspaceState::Materialising,
+            base_revision: "a".repeat(40),
+            base_change_set_id: Some(ChangeSetId::new(Uuid::from_bytes([12; 16]))),
+            identity: None,
+            display_path: "/tmp/review".to_owned(),
+            retention: None,
+            created_at_ms: TimestampMs::new(2_000),
+            removed_at_ms: None,
+        };
+        store
+            .begin_workspace(&row, Some(&action(13, "workspace.create")))
+            .expect("the row and its claim commit together");
+        let read = store
+            .workspace(workspace_id)
+            .expect("it reads")
+            .expect("it is there");
+        assert_eq!(read, row);
+        let tree = ObjectIdentity {
+            device: 1,
+            file_id: 2,
+        };
+        store
+            .set_workspace_state(workspace_id, WorkspaceState::Ready, Some(tree), None, None)
+            .expect("the state moves");
+        let read = store
+            .workspace(workspace_id)
+            .expect("it reads")
+            .expect("it is there");
+        assert_eq!(read.state, WorkspaceState::Ready);
+        assert_eq!(read.identity, Some(tree));
+        // A bound session is what refuses a removal, and its end is recorded rather than deleted.
+        let session = SessionId::new(Uuid::from_bytes([14; 16]));
+        store
+            .bind_session(workspace_id, session, true)
+            .expect("it binds");
+        assert_eq!(
+            store.live_sessions(workspace_id).expect("it reads"),
+            vec![session]
+        );
+        store
+            .bind_session(workspace_id, session, false)
+            .expect("it ends");
+        assert!(
+            store
+                .live_sessions(workspace_id)
+                .expect("it reads")
+                .is_empty()
+        );
+        // Dirty content, a pin and review evidence are three rows and a removal accounts for all.
+        for item in [
+            RetainedRow {
+                kind: RetainedKind::DirtyContent,
+                detail: "two modified files".to_owned(),
+                change_set_id: None,
+            },
+            RetainedRow {
+                kind: RetainedKind::PinnedChangeSet,
+                detail: "version 3".to_owned(),
+                change_set_id: Some(ChangeSetId::new(Uuid::from_bytes([12; 16]))),
+            },
+            RetainedRow {
+                kind: RetainedKind::ReviewEvidence,
+                detail: "a review acknowledged version 3".to_owned(),
+                change_set_id: Some(ChangeSetId::new(Uuid::from_bytes([12; 16]))),
+            },
+        ] {
+            store.retain(workspace_id, &item).expect("it retains");
+        }
+        assert_eq!(store.retained(workspace_id).expect("it reads").len(), 3);
+        assert_eq!(store.release_retained(workspace_id).expect("it runs"), 3);
+        assert!(store.retained(workspace_id).expect("it reads").is_empty());
+    }
+
+    #[test]
+    fn a_store_from_a_later_build_is_refused_rather_than_read() {
+        let store = Store::in_memory(environment()).expect("a store opens");
+        store
+            .connection
+            .execute(
+                "UPDATE schema_version SET version = ?1",
+                params![SCHEMA_VERSION + 1],
+            )
+            .expect("the version moves");
+        let refusal = store.migrate().expect_err("a later schema is refused");
+        assert_eq!(refusal.code(), ErrorCode::StorageUnavailable);
+    }
+
+    #[test]
+    fn every_state_change_commits_with_the_event_that_announces_it() {
+        let mut store = Store::in_memory(environment()).expect("a store opens");
+        assert_eq!(store.event_count().expect("it reads"), 0);
+        store
+            .begin_operation(&operation(20, 21), Some(&action(20, "project.clone")))
+            .expect("it begins");
+        assert_eq!(store.event_count().expect("it reads"), 1);
+    }
+}

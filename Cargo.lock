@@ -3046,6 +3046,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-project"
+version = "0.1.0"
+dependencies = [
+ "cap-std",
+ "kr-cbor",
+ "kr-ipc",
+ "kr-protocol",
+ "kr-transfer",
+ "libc",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "url",
+ "uuid",
+]
+
+[[package]]
 name = "kr-protocol"
 version = "0.1.0"
 dependencies = [
