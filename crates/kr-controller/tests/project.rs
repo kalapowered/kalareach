@@ -1213,6 +1213,11 @@ fn start_daemon(program: &Path, host: &kr_ipc::testing::TempHost) -> Daemon {
         .open(&logs)
         .expect("opens the daemon's log");
     std::process::Command::new(program)
+        // The daemon starts in a directory on the internal disk rather than inheriting this test's
+        // own, which is inside the checkout. A copied binary is a new program as far as the
+        // operating system's privacy rules are concerned, and a new program whose working directory
+        // is on a removable volume is one the system stops to ask the user about.
+        .current_dir(host.root())
         .arg("--runtime-dir")
         .arg(host.root().join("r"))
         .arg("--state-dir")

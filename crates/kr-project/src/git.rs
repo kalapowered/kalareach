@@ -567,6 +567,12 @@ impl RestrictedProfile {
         check_arguments(request.arguments)?;
         let mut command = Command::new(&self.git.program);
         command.env_clear();
+        // The child starts in a directory this host owns and keeps empty, rather than wherever this
+        // process happens to be. Every path an invocation names is absolute or the one `-C` names,
+        // so nothing depends on the working directory; what this takes away is a child holding a
+        // directory nobody chose for it, and an inherited one is exactly how a subprocess reaches
+        // somewhere the host never meant it to.
+        command.current_dir(&self.home);
         for (name, value) in self.environment(request) {
             command.env(name, value);
         }
