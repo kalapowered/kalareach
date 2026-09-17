@@ -56,15 +56,17 @@ pub const GUARD_READY: u8 = b'A';
 /// is running and has not answered, and it is set above what starting one actually costs rather
 /// than above what the guard does after it has started.
 ///
-/// What it costs, measured from spawning a guard to reading its byte: a guard that has been run
-/// before answers in 3 to 5 milliseconds, and reached 3.1 seconds once in forty rounds on a loaded
-/// machine. The **first** run of a newly written copy answers in 0.3 to 10.4 seconds. The likeliest
-/// reading of that difference is the operating system checking a binary it has not seen before,
-/// once, and remembering it afterwards, which would make it every first attach after an install or
-/// an upgrade; the measurement establishes the cost, not the reason for it.
+/// What it costs, measured from the spawn returning to the byte arriving, which is the interval
+/// this bounds: a guard that has been run before answers in 3 to 5 milliseconds, and reached 3.1
+/// seconds once in forty rounds on a loaded machine. The **first** run of a newly written copy
+/// answers in 0.15 to 3.3 seconds. The likeliest reading of that difference is the operating system
+/// checking a binary it has not seen before, once, and remembering it afterwards, which would make
+/// it every first attach after an install or an upgrade; what is measured is the cost, not the
+/// reason for it.
 ///
-/// Two seconds sat inside all of those ranges. The bound is a minute: outside them, and still a
-/// bound, because a guard that is alive and silent for a minute is not going to answer.
+/// Two seconds sat inside both of those ranges. The bound is a minute: clear of every reading by
+/// more than an order of magnitude, and still a bound, because a guard that is alive and silent for
+/// a minute is not going to answer.
 pub const GUARD_ARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The out-of-process restoration guard.
@@ -100,7 +102,22 @@ impl RestorationGuard {
             .handle()
             .try_clone()
             .map_err(|error| CliError::Terminal(format!("duplicate the terminal: {error}")))?;
-        let mut guard = Self::start(program, handle, saved)?;
+        Self::arm_on_handle(program, handle, saved)
+    }
+
+    /// Arms a guard on an open terminal: starts it, waits for its readiness, and stops it when
+    /// there is none.
+    ///
+    /// All of arming is here rather than in [`RestorationGuard::arm`], which only opens the
+    /// terminal, because the order matters in a way a test has to be able to reach:
+    /// [`RestorationGuard::start`] must have returned, releasing this process's copy of the report
+    /// pipe's write end, before anything waits on that pipe.
+    fn arm_on_handle(
+        program: &std::path::Path,
+        terminal: std::fs::File,
+        saved: &SavedModes,
+    ) -> Result<Self> {
+        let mut guard = Self::start(program, terminal, saved)?;
         // The readiness byte. A guard that never sends it is stopped rather than trusted, because
         // the whole point of it is to be holding the state before the terminal changes.
         if let Err(silence) = guard.confirmed() {
@@ -520,8 +537,9 @@ mod tests {
     /// copy of the write end for as long as it is alive, and while that copy is open a guard that
     /// has already gone leaves a pipe that never reaches its end: the read waits out the whole
     /// bound and then calls that guard "still running". [`RestorationGuard::start`] owns the
-    /// `Command` and returns before anything waits, which is what closes it; this pins the
-    /// behaviour that depends on it, from the two calls [`RestorationGuard::arm`] makes.
+    /// `Command` and returns before anything waits, which is what closes it. This goes through the
+    /// whole of [`RestorationGuard::arm_on_handle`], which is everything `arm` does but opening the
+    /// terminal, so a change that put the waiting back beside the `Command` fails here.
     #[test]
     fn a_guard_that_leaves_without_answering_is_reported_without_waiting_out_the_bound() {
         let terminal = std::fs::File::create(
@@ -538,13 +556,14 @@ mod tests {
 
         // `false` takes the arguments it is given, ignores them and exits, which is a guard that
         // never reports readiness.
-        let mut guard =
-            RestorationGuard::start(std::path::Path::new("/usr/bin/false"), terminal, &saved)
-                .expect("starts something in the guard's place");
         let started = std::time::Instant::now();
-        let silence = guard
-            .confirmed()
-            .expect_err("it exits without answering, so there is nothing to confirm");
+        let refusal = RestorationGuard::arm_on_handle(
+            std::path::Path::new("/usr/bin/false"),
+            terminal,
+            &saved,
+        )
+        .expect_err("it exits without answering, so there is nothing to confirm")
+        .to_string();
 
         assert!(
             started.elapsed() < GUARD_ARM_TIMEOUT / 4,
@@ -552,12 +571,12 @@ mod tests {
             started.elapsed()
         );
         assert!(
-            silence.contains("ended without answering"),
-            "and the attach is told which of the four it was: {silence}"
+            refusal.contains("ended without answering"),
+            "and the attach is told which of the four it was: {refusal}"
         );
         assert!(
-            silence.contains("exit status"),
-            "with how the guard left: {silence}"
+            refusal.contains("exit status"),
+            "with how the guard left: {refusal}"
         );
     }
 }
