@@ -1022,10 +1022,12 @@ keeps no file; continuous integration sets it and retains the directory.
 A read is one lexical pass over its bytes, a policy decision for each event that pass produced, the
 grid work each event asks for, and a measurement of resident state. The cells a read reads are the
 cells of the bytes it carries and the cells of a screen, whatever the history behind that screen and
-however long the session has been printing. The exception is what the hyperlink objects cost, which
-has to be found wherever the objects sit and therefore reads every row of both buffers; that is
-taken on its own schedule rather than on every read, and it is the one part of a measurement that
-grows with the rows a session holds:
+however long the session has been printing. Two things about a measurement still grow with the rows
+a session holds. It steps over every retained row to find the rows that are showing, reading none of
+them, because the library offers no borrow of one row of a screen that is right for both halves of
+the deque its rows sit in. And what the hyperlink objects cost has to be found wherever the objects
+sit, which does read every row of both buffers; that one is taken on its own schedule rather than on
+every read:
 
 * the lexical pass appends a run of printable bytes in one step rather than a byte at a time, and
   reuses the buffer it collects a sequence in rather than handing it over, so a sequence no longer
@@ -1059,21 +1061,24 @@ the erasure covers that is not already empty.
 | --- | --- | --- | --- |
 | Apple M4 Pro, 12 processors | 11.9 to 12.4 MiB/s | 10.6 to 11.5 MiB/s | local runs of this revision |
 | AMD EPYC 7763 64-Core, 4 processors | 6.1 MiB/s | 5.9 MiB/s | `core-ci` runs 35165588315 and 35167627730 |
-| AMD EPYC 9V74 80-Core, 4 processors | 7.5 MiB/s | 7.7 MiB/s | `core-ci` run 35164400630 |
+| AMD EPYC 9V74 80-Core, 4 processors | 5.9 to 7.5 MiB/s | 6.1 to 7.7 MiB/s | `core-ci` runs 35168759717 and 35164400630 |
 | Intel Xeon Platinum 8573C, 4 processors | 8.0 MiB/s | 7.4 MiB/s | `core-ci` run 35163469612 |
 
 The slowest of those hosts is where the comparison is clearest. `core-ci` measured 3.79 MiB/s on the
 stream that scrolls, below the target, on an AMD EPYC 7763 twenty minutes before it measured
-5.86 MiB/s on one of the same class, and the two runs differ only in this engine.
+5.86 MiB/s on one of the same class. What differs between those two runs, in this repository, is
+this engine and nothing else; what the two hosts were doing otherwise is not something a hosted
+runner tells anybody.
 
 Each row is one host's sampled runs and not a fixed property of that processor. The platform names a
 class of processor rather than a machine, and one named class has answered a third apart on the
 plain stream across the runs behind this revision, so the rows above are not a ranking of
 processors. The runs named are `core-ci` runs of this revision's terminal engine, each one retaining
 the figures, the processor and the verdict it measured, so a row can be read back to the run it came
-from. The two four-processor rows measured at 7.4 MiB/s and above were taken a few commits before
-the last change to the output path, which only takes work off it; the rows for the slowest host are
-of the engine as it stands.
+from. The Xeon row, and the wider end of the EPYC 9V74 row, were taken a few commits before the
+last change to the output path, which only takes work off it; the rest are of the engine as it
+stands. The 9V74 row shows what a class of processor does not fix: its two runs of the same stream
+are a third apart.
 
 Section 27 asks a reference host for at least four CPU cores and 8 GiB, so four processors is the
 floor a host has to meet the target on, and every four-processor host above meets it on both

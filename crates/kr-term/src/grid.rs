@@ -269,8 +269,9 @@ pub(crate) struct Applied {
 
 /// What the rows of both buffers hold, apart from the hyperlink objects on them.
 ///
-/// Read from the rows that are showing and from how many rows there are, so what it costs to read
-/// is a property of the geometry rather than of how long the session has been printing.
+/// Read from the rows that are showing and from how many rows there are, so the cells it reads are
+/// a screen's cells whatever the history behind the screen. Finding those rows still steps over the
+/// retained ones, so the steps grow with the rows a session holds even though none of them is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ScreenBytes {
     /// What each buffer's rows that are showing hold beyond their cell slots, primary first.
