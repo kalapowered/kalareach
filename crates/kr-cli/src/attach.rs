@@ -110,43 +110,75 @@ impl RestorationGuard {
         };
         // The readiness byte. A guard that never sends it is stopped rather than trusted, because
         // the whole point of it is to be holding the state before the terminal changes.
-        if !guard.confirmed() {
+        if let Err(silence) = guard.confirmed() {
             let _ = guard.child.kill();
             let _ = guard.child.wait();
-            return Err(CliError::Terminal(
-                "the restoration guard did not report that it was holding the terminal".to_owned(),
-            ));
+            return Err(CliError::Terminal(format!(
+                "the restoration guard did not report that it was holding the terminal: {silence}"
+            )));
         }
         Ok(guard)
     }
 
-    /// Waits for the guard's next confirmation, for as long as arming is allowed to take.
+    /// Waits for the guard's next confirmation, and says what happened when there is not one.
     ///
-    /// The read happens on a thread because a guard that has died sends nothing at all, and a
-    /// blocking read for a byte that is not coming would outlast any deadline this could set.
-    fn confirmed(&mut self) -> bool {
+    /// The read happens on a thread because a blocking read for a byte that is not coming would
+    /// outlast any deadline this could set. A guard that has left needs no deadline at all: its end
+    /// of this pipe closes with it, so the read ends at once and the status says how it went.
+    ///
+    /// The four ways this can fail are four different faults - a guard that could not start, one
+    /// that died holding the terminal, one that is answering something else, and one that is merely
+    /// slow - and the caller reports whichever it was rather than one sentence for all of them.
+    fn confirmed(&mut self) -> std::result::Result<(), String> {
         let Some(reader) = self.confirmations.take() else {
-            return false;
+            return Err("its side of the report pipe is already closed".to_owned());
         };
         let answer = std::thread::spawn(move || {
             let mut byte = [0_u8; 1];
             let mut reader = reader;
-            let confirmed = matches!(reader.read(&mut byte), Ok(1) if byte[0] == GUARD_READY);
-            (reader, confirmed)
+            let read = reader.read(&mut byte);
+            (reader, read.map(|count| (count, byte[0])))
         });
-        let deadline = std::time::Instant::now() + GUARD_ARM_TIMEOUT;
+        let started = std::time::Instant::now();
+        let deadline = started + GUARD_ARM_TIMEOUT;
         while !answer.is_finished() {
             if std::time::Instant::now() >= deadline {
-                return false;
+                return Err(format!(
+                    "it was still running and had not answered after {:?}",
+                    started.elapsed()
+                ));
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        match answer.join() {
-            Ok((reader, confirmed)) => {
-                self.confirmations = Some(reader);
-                confirmed
-            }
-            Err(_) => false,
+        let Ok((reader, read)) = answer.join() else {
+            return Err("the thread reading its report failed".to_owned());
+        };
+        self.confirmations = Some(reader);
+        match read {
+            Ok((1, byte)) if byte == GUARD_READY => Ok(()),
+            Ok((1, byte)) => Err(format!(
+                "it answered {byte:#04x} rather than its readiness after {:?}",
+                started.elapsed()
+            )),
+            // No byte means its end of this pipe is closed, which means the process is gone.
+            Ok(_) => Err(format!(
+                "it ended without answering after {:?}{}",
+                started.elapsed(),
+                self.departure()
+            )),
+            Err(error) => Err(format!(
+                "reading its report failed after {:?}: {error}",
+                started.elapsed()
+            )),
+        }
+    }
+
+    /// How the guard went, for a report about a guard that is no longer answering.
+    fn departure(&mut self) -> String {
+        match self.child.try_wait() {
+            Ok(Some(status)) => format!(" ({status})"),
+            Ok(None) => String::new(),
+            Err(error) => format!(" (its status could not be read: {error})"),
         }
     }
 
@@ -171,14 +203,12 @@ impl RestorationGuard {
                 "the restoration guard could not be asked to hold the keyboard state".to_owned(),
             ));
         }
-        if self.confirmed() {
-            Ok(())
-        } else {
-            Err(CliError::Terminal(
-                "the restoration guard did not report that it was holding the keyboard state"
-                    .to_owned(),
+        self.confirmed().map_err(|silence| {
+            CliError::Terminal(format!(
+                "the restoration guard did not report that it was holding the keyboard state: \
+                 {silence}"
             ))
-        }
+        })
     }
 
     /// Tells the guard what keyboard protocols this terminal had before the attachment began.
