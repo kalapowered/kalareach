@@ -897,11 +897,10 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         .await
         .expect("the slow binding registers");
 
-    // Where the session had got to before the component was given anything to do. Everything
-    // asserted below has to be newer than this.
+    // Where the session had got to before the component was given anything to do.
     let before = collect(&mut terminal, Duration::from_millis(400)).await;
     let before = String::from_utf8_lossy(&before).into_owned();
-    let high_water = highest_line(&before).expect("the shell is producing numbered output");
+    highest_line(&before).expect("the shell is producing numbered output");
 
     // Enough observations to keep the binding's thread inside the component for the whole window
     // below. They are handed over by the path a worker's terminal loop uses, which waits for
@@ -947,6 +946,14 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     // Now, with the component running, the session has to keep producing and the host has to keep
     // answering the shell's questions. A shell that was not answered would stop at its `dd` and
     // produce no higher-numbered line at all.
+    // Everything the session had already produced is drained first, immediately before the window,
+    // so a higher line number inside the window is output the shell produced during it rather than
+    // output that was waiting in a buffer.
+    let drained = collect(&mut terminal, Duration::from_millis(150)).await;
+    let high_water = highest_line(&String::from_utf8_lossy(&drained))
+        .or_else(|| highest_line(&before))
+        .expect("the shell is producing numbered output");
+
     // Shorter than the work queued against the component, so the component is inside a call for
     // the whole of it rather than for part of it. The call count is what turns that from an
     // expectation into evidence: it counts calls the component finished, so a count that grew
@@ -958,6 +965,7 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         .component_calls;
     let window = std::time::Instant::now();
     let during = collect(&mut terminal, Duration::from_millis(800)).await;
+    let collected = window.elapsed();
     let after_calls = plugin
         .health()
         .await
@@ -967,6 +975,13 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
         after_calls > before_calls,
         "the component finished no calls during the window: {before_calls} before, {after_calls} \
          after, so the terminal's progress was measured around nothing"
+    );
+    // The two samples bracket the collection and little else: a component that finished calls
+    // between them finished them while the terminal was being collected from, not before or after
+    // some much longer stretch.
+    assert!(
+        collected < Duration::from_millis(1_500),
+        "the collection took {collected:?}, so the samples bracket more than it"
     );
     let during = String::from_utf8_lossy(&during).into_owned();
     let after = highest_line(&during).unwrap_or(0);

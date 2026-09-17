@@ -135,7 +135,17 @@ struct Transport {
     reader: tokio::task::AbortHandle,
     offers: tokio::task::AbortHandle,
     notices: NoticeSink,
+    /// The writer, so closing takes it and drops it. A client that had declared its connection over
+    /// and still held the socket's write half would leave a host waiting for the rest of a frame
+    /// that is never coming.
+    writer: Writer,
+    /// What offered events have reserved, so closing gives it all back: the queue they were in is
+    /// gone, and a charge for events nobody will send would make every later offer a refusal.
+    offered_bytes: Arc<AtomicU64>,
 }
+
+/// The one writer this connection has, until it is closed.
+type Writer = Arc<tokio::sync::Mutex<Option<FrameWriter>>>;
 
 /// The requests this client is waiting on, and whether its connection still exists.
 #[derive(Debug, Default)]
@@ -183,14 +193,27 @@ impl Pending {
         } else {
             self.closed.store(true, Ordering::Release);
         }
-        // And the transport goes with them: a reader still waiting on the socket, or a writer still
-        // sending events, would be this client carrying on with a connection it has declared over.
+        // And the transport goes with them: a reader still waiting on the socket, a writer still
+        // sending events, or a socket still half open would be this client carrying on with a
+        // connection it has declared over.
         if let Ok(mut transport) = self.transport.lock()
             && let Some(transport) = transport.take()
         {
             transport.reader.abort();
             transport.offers.abort();
             transport.notices.close();
+            transport.offered_bytes.store(0, Ordering::Release);
+            if let Ok(mut writer) = transport.writer.try_lock() {
+                let _closed = writer.take();
+            } else {
+                // Somebody is mid-write. They hold the only reference that matters and will find
+                // the connection closed when they look; taking it from under them is not something
+                // a lock is for.
+                let writer = Arc::clone(&transport.writer);
+                tokio::spawn(async move {
+                    let _closed = writer.lock().await.take();
+                });
+            }
         }
     }
 
@@ -200,6 +223,7 @@ impl Pending {
             transport.reader.abort();
             transport.offers.abort();
             transport.notices.close();
+            transport.offered_bytes.store(0, Ordering::Release);
             return;
         }
         if let Ok(mut slot) = self.transport.lock() {
@@ -254,7 +278,7 @@ impl Drop for Attempting<'_> {
 
 /// A worker's connection to the plugin host.
 pub struct PluginClient {
-    writer: Arc<tokio::sync::Mutex<FrameWriter>>,
+    writer: Writer,
     pending: Arc<Pending>,
     notices: NoticeStream,
     offered: tokio::sync::mpsc::Sender<Request>,
@@ -312,7 +336,7 @@ impl PluginClient {
     /// Returns the handshake or verification failure.
     pub async fn over(connection: Connection, descriptor: HostDescriptor) -> RuntimeResult<Self> {
         let (reader, writer) = split(connection, StreamKind::Control);
-        let writer = Arc::new(tokio::sync::Mutex::new(writer));
+        let writer: Writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
         let pending = Arc::new(Pending::default());
         let (sink, notices) = notices::channel();
         let reader_task = tokio::spawn(read_frames(reader, Arc::clone(&pending), sink.clone()));
@@ -332,6 +356,8 @@ impl PluginClient {
             reader: reader_task.abort_handle(),
             offers: offer_task.abort_handle(),
             notices: sink,
+            writer: Arc::clone(&writer),
+            offered_bytes: Arc::clone(&offered_bytes),
         });
 
         let client = Self {
@@ -423,6 +449,9 @@ impl PluginClient {
     /// writes it. A full queue is an immediate refusal the caller records as a gap, which is the
     /// same answer the host's own queue gives when it overflows and for the same reason.
     pub fn offer(&self, binding_id: BindingId, event: &ScopedSourceEvent) -> Handoff {
+        if self.pending.is_closed() {
+            return Handoff::Unavailable;
+        }
         let wire = wire_event(event);
         let cost = offered_cost(&wire);
         // An event a frame cannot carry is one nothing could deliver. Saying so here is what keeps
@@ -696,7 +725,12 @@ impl PluginClient {
 
         let exchange = async {
             {
-                let mut writer = self.writer.lock().await;
+                let mut held = self.writer.lock().await;
+                let Some(writer) = held.as_mut() else {
+                    return Err(RuntimeError::ServiceUnavailable {
+                        detail: "the plugin host closed the connection".to_owned(),
+                    });
+                };
                 // Armed once the writer is held, and not before: a caller whose deadline ran out
                 // while it was queueing for the writer has written nothing, and ending the
                 // connection over that would be a failure it did not cause. From here on, a frame
@@ -806,20 +840,27 @@ async fn read_frames(mut reader: FrameReader, pending: Arc<Pending>, notices: No
 /// Writes the events a caller handed over without waiting.
 async fn write_offered(
     mut offered: tokio::sync::mpsc::Receiver<Request>,
-    writer: Arc<tokio::sync::Mutex<FrameWriter>>,
+    writer: Writer,
     held: Arc<AtomicU64>,
     pending: Arc<Pending>,
 ) {
     while let Some(request) = offered.recv().await {
         let cost = offered_bytes_of(&request);
+        // Released before the write rather than after it: this task can be stopped at any await,
+        // and a charge released only on the far side of one would survive the queue it was for.
+        // What the charge bounds is how much is waiting to be written, and this one is no longer
+        // waiting.
+        release(&held, cost);
         // Bounded, the wait for the writer included: a host that stopped reading would otherwise
         // hold this task and the lock every request on this connection needs.
         let written = tokio::time::timeout(OFFER_WRITE_DEADLINE, async {
-            let mut writer = writer.lock().await;
-            writer.write_message(&request).await
+            let mut held = writer.lock().await;
+            match held.as_mut() {
+                Some(writer) => writer.write_message(&request).await,
+                None => Err(kr_ipc::IpcError::PeerClosed),
+            }
         })
         .await;
-        release(&held, cost);
         if !matches!(written, Ok(Ok(()))) {
             // A frame that failed or was never taken leaves the writer with a part-written frame,
             // and nothing after it could be delivered. The connection is over, and everything

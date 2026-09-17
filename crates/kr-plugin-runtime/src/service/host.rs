@@ -298,7 +298,8 @@ impl PluginHost {
         let _finished = served.work.acquire_many(all).await;
 
         if let Ok(mut held) = served.registered.lock() {
-            held.clear();
+            held.live.clear();
+            held.owed.clear();
         }
 
         // The worker is gone. Its bindings go with it: a binding exists to serve one worker's
@@ -490,7 +491,15 @@ impl PluginHost {
                 )
             }
             RequestBody::Unbind { binding_id } => {
-                // Removing a binding waits for its thread, so it happens off the executor.
+                // Removing a binding waits for its thread, so it happens off the executor. The
+                // handle is taken first so the record can be cleared by identity afterwards: the
+                // identifier may have been registered again by then, and that binding's place is
+                // not this removal's to take.
+                let removing = served
+                    .registered
+                    .lock()
+                    .ok()
+                    .and_then(|held| held.live.get(&binding_id).cloned());
                 let runtime = Arc::clone(&self.runtime);
                 let owner = served.owner;
                 let binding = BindingId::new(binding_id);
@@ -503,8 +512,10 @@ impl PluginHost {
                 if matches!(removed, Unbound::Stopped) {
                     served.bindings.give_back();
                 }
-                if let Ok(mut held) = served.registered.lock() {
-                    held.remove(&binding_id);
+                if let Some(removing) = removing
+                    && let Ok(mut held) = served.registered.lock()
+                {
+                    held.parted(binding_id, &removing);
                 }
                 Ok(ResponseBody::Unbound {
                     existed: removed.existed(),
@@ -515,7 +526,10 @@ impl PluginHost {
                 connection_bindings: served.bindings.taken() as u64,
                 binding_bound: MAX_BINDINGS_PER_CONNECTION as u64,
                 component_calls: served.registered.lock().map_or(0, |held| {
-                    held.values().map(|handle| handle.completed_calls()).sum()
+                    held.live
+                        .values()
+                        .map(|handle| handle.completed_calls())
+                        .sum()
                 }),
                 resident_components: self.runtime.cache().resident() as u64,
                 resident_bytes: self.runtime.cache().resident_bytes(),
@@ -626,7 +640,7 @@ impl PluginHost {
             .await
             .map_err(refusal)?;
         if let Ok(mut held) = served.registered.lock() {
-            held.insert(binding_id, bound);
+            held.joined(binding_id, bound);
         }
         admitted.keep();
         Ok(ResponseBody::Registered {
@@ -693,8 +707,55 @@ struct Served {
     registered: Registered,
 }
 
-/// The bindings one connection holds.
-type Registered = Arc<std::sync::Mutex<std::collections::HashMap<Uuid, Arc<BindingHandle>>>>;
+/// The bindings one connection holds, and what they owe.
+type Registered = Arc<std::sync::Mutex<Held>>;
+
+/// One connection's bindings, and the redraws they owe.
+#[derive(Debug, Default)]
+struct Held {
+    live: std::collections::HashMap<Uuid, Arc<BindingHandle>>,
+    /// Bindings that lost a document before this connection had their handle.
+    ///
+    /// What `bind` draws reaches the notice queue before the registration that started it has
+    /// returned, so a document lost in that moment has no handle to ask. The obligation is kept
+    /// here until there is one, rather than dropped for want of somewhere to put it.
+    owed: std::collections::HashSet<Uuid>,
+}
+
+impl Held {
+    /// Records a binding, and discharges any redraw it owed from before it existed.
+    fn joined(&mut self, binding_id: Uuid, handle: Arc<BindingHandle>) {
+        if self.owed.remove(&binding_id) {
+            handle.require_snapshot();
+        }
+        self.live.insert(binding_id, handle);
+    }
+
+    /// Asks one binding to draw again, or remembers that it owes a drawing.
+    fn redraw(&mut self, binding_id: Uuid) {
+        match self.live.get(&binding_id) {
+            Some(handle) => handle.require_snapshot(),
+            None => {
+                self.owed.insert(binding_id);
+            }
+        }
+    }
+
+    /// Removes one binding, if the one held is the one being removed.
+    ///
+    /// By identity rather than by name: an identifier can be unbound and registered again, and the
+    /// removal of the old binding must not take the new one's place in this record with it.
+    fn parted(&mut self, binding_id: Uuid, handle: &Arc<BindingHandle>) {
+        if self
+            .live
+            .get(&binding_id)
+            .is_some_and(|held| Arc::ptr_eq(held, handle))
+        {
+            self.live.remove(&binding_id);
+        }
+        self.owed.remove(&binding_id);
+    }
+}
 
 /// Whether one connection is still worth talking on.
 ///
@@ -818,14 +879,9 @@ async fn write_notices(
             ..
         } = &notice
             && *documents > 0
+            && let Ok(mut held) = registered.lock()
         {
-            let handle = registered
-                .lock()
-                .ok()
-                .and_then(|held| held.get(binding_id).cloned());
-            if let Some(handle) = handle {
-                handle.require_snapshot();
-            }
+            held.redraw(*binding_id);
         }
         let written = tokio::time::timeout(WRITE_DEADLINE, async {
             let mut writer = writer.lock().await;

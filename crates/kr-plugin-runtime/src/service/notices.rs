@@ -108,6 +108,14 @@ struct Queued {
     lost: HashMap<Uuid, Loss>,
     /// The order the losses are reported in, so the oldest loss is the first a reader hears about.
     lost_order: VecDeque<Uuid>,
+    /// The highest document number this queue has dropped, per binding.
+    ///
+    /// A document is dropped whole, and its later pieces have not all arrived yet: a component
+    /// draws a document in one call, but the pieces reach this queue one at a time. Remembering
+    /// which document went is what keeps a straggler from being queued after its own document was
+    /// dropped, which would show a reader a last piece of something it never received the rest of.
+    /// One number per binding is enough, because a binding's documents are numbered in order.
+    dropped_through: HashMap<Uuid, u64>,
     closed: bool,
     /// Set when what must arrive would not fit. The connection is over.
     overflowed: bool,
@@ -274,6 +282,21 @@ impl Queued {
             );
         }
 
+        // A piece of a document this queue has already dropped. Queueing it would leave a reader
+        // with part of a document and no way to tell; it belongs to the loss that took the rest.
+        if let Notice::Document {
+            binding_id,
+            document,
+            ..
+        } = &notice
+            && self
+                .dropped_through
+                .get(binding_id)
+                .is_some_and(|through| *document <= *through)
+        {
+            return Offered::Dropped;
+        }
+
         let cost = notice_bytes(&notice);
         let droppable = matches!(notice, Notice::Document { .. });
         while self.held + cost > MAX_NOTICE_BYTES && self.evict_oldest_document() {}
@@ -382,6 +405,11 @@ impl Queued {
             !theirs
         });
         self.held = self.held.saturating_sub(freed);
+        // Remembered, so the pieces of this document that have not arrived yet are dropped with
+        // the ones that had. A reader that received a document's last piece and not its first
+        // could not tell that it was missing anything.
+        let through = self.dropped_through.entry(binding_id).or_insert(document);
+        *through = (*through).max(document);
         // Counted here rather than through `absorb`, which would try to make room again while it
         // is making room.
         let one = Loss {
@@ -400,6 +428,10 @@ impl Queued {
             && let Some(loss) = self.lost.remove(&binding_id)
         {
             self.held = self.held.saturating_sub(NOTICE_OVERHEAD_BYTES);
+            // The reader has been told. Every piece of the dropped document was offered while it
+            // was being dropped -- a document's pieces are produced by one call and forwarded
+            // together -- so nothing more is coming that this record would have to catch.
+            self.dropped_through.remove(&binding_id);
             return Some(Notice::Gap {
                 binding_id,
                 events: loss.events,
@@ -602,6 +634,39 @@ mod tests {
             !pieces.contains_key(&1) || pieces[&1] == 3,
             "the three-piece document survived in pieces: {pieces:?}"
         );
+    }
+
+    #[test]
+    fn a_piece_of_a_dropped_document_is_dropped_with_it() {
+        let (sink, mut stream) = channel();
+        let big = 512 * 1024;
+        // The first piece of a document, then enough other documents to make room be needed, then
+        // the last piece of the first one. A reader that received that last piece and not the first
+        // would be told a document was complete when it never had its beginning.
+        let piece = |number: u64, last: bool, index: usize| Notice::Document {
+            binding_id: binding(1),
+            call: "snapshot".to_owned(),
+            document: number,
+            last,
+            nodes: vec![WireNode {
+                node_id: format!("n{index}"),
+                node_revision: 1,
+                body_json: "x".repeat(big),
+            }],
+        };
+        sink.send(piece(1, false, 0));
+        for number in 2..12 {
+            sink.send(piece(number, true, 0));
+        }
+        assert_eq!(sink.send(piece(1, true, 1)), Offered::Dropped);
+
+        let mut first = 0;
+        while let Some(notice) = stream.try_recv() {
+            if let Notice::Document { document: 1, .. } = notice {
+                first += 1;
+            }
+        }
+        assert_eq!(first, 0, "a piece of the dropped document was delivered");
     }
 
     #[test]

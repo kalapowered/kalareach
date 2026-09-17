@@ -675,23 +675,31 @@ impl HostReservation {
                     // Publishing and acknowledging are inside the deadline too: a host waiting to
                     // be told it was accepted is a host that is not serving, and a launcher that
                     // took an unbounded time over either would be holding it there.
-                    // Publishing writes a file, flushes it and renames it, none of which a timer
-                    // can interrupt, so it happens off the executor and its own wait is bounded.
-                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    // Publishing writes a file, flushes it and renames it. A timer cannot
+                    // interrupt any of that, so the deadline is checked *before* it starts and the
+                    // write is then waited for rather than abandoned: a publication given up on
+                    // would still finish, and could replace the descriptor a later launch had
+                    // successfully published. What the deadline bounds here is whether the
+                    // publication is started at all.
+                    if deadline
+                        .saturating_duration_since(tokio::time::Instant::now())
+                        .is_zero()
+                    {
+                        return Err(LaunchError::NoRendezvous { deadline_ms });
+                    }
                     let publishing = {
                         let paths = environment.clone();
                         let descriptor = descriptor.clone();
                         tokio::task::spawn_blocking(move || publish_descriptor(&paths, &descriptor))
                     };
-                    match tokio::time::timeout(left, publishing).await {
-                        Ok(Ok(Ok(()))) => {}
-                        Ok(Ok(Err(error))) => return Err(error),
-                        Ok(Err(error)) => {
+                    match publishing.await {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return Err(error),
+                        Err(error) => {
                             return Err(LaunchError::Refused {
                                 detail: format!("the descriptor could not be published: {error}"),
                             });
                         }
-                        Err(_elapsed) => return Err(LaunchError::NoRendezvous { deadline_ms }),
                     }
 
                     // The host does not serve workers until it has this. Publishing a descriptor

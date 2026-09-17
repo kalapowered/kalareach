@@ -185,11 +185,22 @@ of times before it is disabled. The binding's thread does wait for room to repor
 for two seconds and no longer; after that it disables the binding itself, which is what the notice it
 could not deliver would have asked for.
 
-The three queues are bounded in bytes, and the bound covers the record of what has already been
-dropped as well as what is waiting. Losses coalesce into one record per binding, so a reader that
-stopped reading cannot be given a backlog of gaps either. A fault and a disabling are never dropped;
-if even those will not fit once every document has gone, the connection is over, because a
-connection whose reliable news cannot be delivered is not one worth keeping open.
+The binding's own channel is bounded in places: 256 of them, of which the last eight are the
+must-arrive events' and presentation may not take them. The two the service keeps -- one in the host
+per connection, one in the worker's client -- are bounded in bytes, and that bound covers the record
+of what has already been dropped as well as what is waiting. In those two, losses coalesce into one
+record per binding, so a reader that stopped reading cannot be given a backlog of gaps either, and a
+document is dropped whole: every piece of it that is waiting goes together, and the pieces of it that
+have not arrived yet are dropped as they arrive. Half a document would tell a reader it had a whole
+one. A fault and a disabling are never dropped; if even those will not fit once every document has
+gone, the connection is over, because a connection whose reliable news cannot be delivered is not one
+worth keeping open.
+
+A document the host's queue dropped is one the component is asked to draw again, and the ask goes to
+the binding the lost document belonged to -- not always the binding whose document made room for
+another. A document the *worker's* queue dropped is reported to the worker as a gap; asking for a
+fresh one is then the worker's, because only the worker knows whether it still wants that binding's
+presentation.
 
 A binding also holds a bounded number of unanswered calls. A caller whose deadline ran out has
 stopped waiting, but its request is still on the binding's thread until that thread reaches it, and
@@ -411,7 +422,7 @@ blocks: it waits for the binding's thread so that a caller knows the instance ha
 drops what the instance was using, and the wait is bounded because the call the thread is finishing
 is bounded. The plugin host runs it off its executor for that reason.
 
-Dropping a handle signals the thread rather than waiting for it, which is what makes a handle safe
-to drop anywhere. It does not stop the binding: the runtime holds a handle of its own until the
-binding is unbound or its owner goes, and the thread ends when the last one is gone or `unbind` says
-so.
+Dropping the *last* handle signals the thread rather than waiting for it, which is what makes a
+handle safe to drop anywhere. Dropping one a caller holds stops nothing on its own: the runtime
+holds a handle of its own until the binding is unbound or its owner goes, and only the last one to
+go signals the thread.

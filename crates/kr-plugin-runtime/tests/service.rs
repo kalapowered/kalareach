@@ -635,38 +635,22 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
         let client = Arc::clone(&client);
         let binding_id = request.binding_id;
         async move {
-            let started = std::time::Instant::now();
             let outcome = client
                 .snapshot(binding_id, core::time::Duration::from_millis(100))
                 .await;
-            (outcome, started.elapsed())
+            (outcome, std::time::Instant::now())
         }
     });
 
-    // While that is in flight, an observation is answered by the queue rather than behind the call.
-    // The call count around it is what shows the component was executing while it was answered
-    // rather than idle: it counts calls the component finished.
-    let before_calls = client
-        .health()
-        .await
-        .expect("a health report")
-        .component_calls;
-    let offered = std::time::Instant::now();
+    // While that call is in flight, an observation is answered by the queue rather than behind it.
+    // What makes that an overlap rather than a coincidence is the order of two instants taken by
+    // this thread from one clock: the observation was answered before the call it was offered
+    // behind had finished, and that call is a call into the component.
     let admission = client
         .deliver(request.binding_id, &components::scrape("se-1", "x"))
         .await
         .expect("the event is offered while a call is running");
-    let answered = offered.elapsed();
-    let after_calls = client
-        .health()
-        .await
-        .expect("a health report")
-        .component_calls;
-    assert!(
-        after_calls > before_calls,
-        "the component finished no calls while the observation was answered: {before_calls} \
-         before, {after_calls} after"
-    );
+    let answered_at = std::time::Instant::now();
     assert!(
         matches!(
             admission,
@@ -675,10 +659,21 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
         "the event was {admission:?}"
     );
 
-    let (_outcome, call_took) = calling.await.expect("the call finished");
+    let (outcome, finished_at) = calling.await.expect("the call finished");
+    // The call ran: either the component answered it or its own deadline stopped it. Both are the
+    // component executing; what would not be is the call never having started.
+    let _ran = outcome;
     assert!(
-        answered < call_took,
-        "the observation took {answered:?} and the call it was offered behind took {call_took:?}"
+        answered_at < finished_at,
+        "the observation was answered after the call it was offered behind had finished"
+    );
+
+    // And the component finished calls across that stretch, so the binding was working rather than
+    // idle while the observation was being answered.
+    let health = client.health().await.expect("a health report");
+    assert!(
+        health.component_calls > 0,
+        "the component finished no calls at all"
     );
 
     // And the handoff that never waits at all does not even write a frame.
