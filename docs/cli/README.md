@@ -17,6 +17,7 @@ worker directly for what a session owns.
 | `kr skill [install/status/remove]` | — | Install the contact skill and its tool configuration for an agent |
 | `kr agent-tools --stdio` | — | Run the contact tools for the agent that launched this process |
 | `kr doctor` | — | Read-only diagnostics |
+| `kr host power` | — | Show or change whether this host stays awake for work it has admitted |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
 shell commands nor paths are assembled by interpolating text.
@@ -36,6 +37,28 @@ The presentation flags are mutually exclusive:
 | `--invisible` | Create a session with no local terminal attachment |
 
 Without a terminal and without a flag the command stops and asks for one, rather than choosing.
+
+Where the session runs is a separate choice, and these two are mutually exclusive as well:
+
+| Flag | What happens |
+| --- | --- |
+| `--desktop` | Run in this host's current desktop. The session closes with `desktop_lost` when that desktop's login ends |
+| `--headless` | Run in this host's headless user context, with no inherited graphical access |
+
+Neither is the default. Without one, the session runs where the host says it creates sessions: a
+desktop host uses its own desktop and an SSH-only or headless installation uses its configured
+headless context. The command prints the execution context and where the choice came from before it
+creates anything, and the receipt records the context the session actually got:
+
+```text
+execution context desktop_bound (this host's default)
+created session 1 (d6d64b2b-f6f1-4617-a07a-bb89a08cd3fd)
+execution context desktop_bound: desktop macos_security_session:uid=501:session=100019:generation=1788258227274902:boot=3239...
+```
+
+`--invisible` is about the terminal and nothing else. An invisible session in a desktop context
+keeps that desktop's access, so a command inside it can open a browser on the screen in front of
+you; it is not a headless mode and it does not survive a logout.
 
 `--environment`, `--cwd`, `--shell` and `--shell-mode` select execution properties. For `--attach`
 the creating terminal's size is registered before the shell starts, so the first prompt is drawn at
@@ -416,6 +439,32 @@ A `--json` failure carries the same information:
 { "ok": false, "code": "AMBIGUOUS_SESSION", "message": "...", "exit_code": 5 }
 ```
 
+## `kr host power`
+
+Automatic sleep is the machine's own policy, and `kr` changes it only when you ask:
+
+```sh
+kr host power                     # the setting, and what it is doing right now
+kr host power --set mains_only    # stay awake for admitted work, on mains power
+kr host power --set battery_too   # the same on battery, which is a separate choice
+kr host power --set off           # the default
+```
+
+The setting is per-user host configuration. Writing it installs no service, obtains no privilege
+and changes nothing else about the machine. With it on, the host holds the platform's own assertion
+against automatic sleep while it has verified foreground work or a request it has accepted and not
+answered, and releases it when that ends:
+
+```text
+sleep inhibited (mains_only): the host has requests it has not answered, held as a
+power-management assertion against idle system sleep, held on behalf of process 82035 on mains power
+```
+
+That line appears in `kr status` and `kr doctor` too. The process it names is the one the operating
+system's own listing shows, so `pmset -g assertions` on macOS can be compared with it directly.
+`docs/host/platforms.md` has the facility each platform uses and what an assertion does not
+promise.
+
 ## `--json` shapes
 
 `kr list --json` returns `{ "sessions": [ ... ] }`; `kr new --json` and `kr status --json` return one
@@ -433,8 +482,23 @@ session object:
   "dimensions": { "columns": 120, "rows": 40 },
   "attachments": 1,
   "worker_profile": "headless_user",
+  "desktop": { "desktop_session_id": null, "login_generation": null },
   "created_at_ms": 1789484611722,
   "closure": null
+}
+```
+
+A session in a desktop context names the desktop it is bound to, and `kr status --json` adds what
+the host's sleep setting is doing:
+
+```json
+{
+  "worker_profile": "desktop_bound",
+  "desktop": {
+    "desktop_session_id": "macos_security_session:uid=501:session=100019:generation=1788258227274902:boot=3239...",
+    "login_generation": 1788258227274902
+  },
+  "power": { "setting": "off", "active": false, "description": "sleep policy unchanged (off)" }
 }
 ```
 
@@ -452,4 +516,11 @@ A closed session carries its record instead of a null:
 ```
 
 `kr doctor --json` returns `{ "host": { ... }, "doctor": { "healthy": true, "checks": [ ... ] } }`.
-The command exits non-zero when a check did not pass.
+The command exits non-zero when a check did not pass. The host object carries
+`default_worker_profile` and the same `power` object, so a script can read which execution context
+new sessions get and what the host is keeping itself awake for.
+
+`kr host power --json` returns `{ "ok": true, "environment_id": "...", "power": { ... } }`. The
+power object holds the setting, whether an assertion is held, its reason, the facility holding it,
+the power source, the counts behind the decision, and either the holder or the reason nothing is
+held.

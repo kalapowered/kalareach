@@ -131,6 +131,19 @@ The service manager reports a process identifier as soon as it has spawned the p
 be before the kernel will describe it. The daemon retries briefly rather than refusing a worker
 that started perfectly well.
 
+Two of those platforms place a per-user job in the login session that started it, so a desktop-bound
+worker is in the graphical login by construction. Linux does not: a user service manager started at
+boot has no display, no compositor socket and no session message bus, because those belong to a
+graphical login that happened later. So a desktop-bound worker's transient unit is given the
+graphical session's own handles explicitly, read back from where the desktop session publishes them.
+A headless worker is given none of them, which is the profile working as intended rather than an
+omission.
+
+What a logout does to a worker of either profile is the platform's answer, and
+`docs/host/platforms.md` records it per platform along with the explicit setting that changes it on
+Linux. Nothing here enables that setting: creating a session never turns on a persistence option,
+and neither does installing the host.
+
 ### Privacy permissions
 
 A worker started by the service manager is not a child of the terminal that asked for it. On macOS
@@ -187,6 +200,52 @@ and the protocol.
 The create token is the request's action identifier. A retry with the same payload resolves to the
 same reservation; the same token with a different payload is refused rather than becoming a second
 session. A lost reply never causes a second launch.
+
+## The desktop a session runs on
+
+Where a session is shown and where its processes run are different questions. `kr new --invisible`
+answers the first. The execution profile answers the second, and it decides which display, which
+message bus and which operating-system permissions a command inside the session actually has.
+
+| Profile | What it is bound to | What ends it |
+| --- | --- | --- |
+| `desktop_bound` | the boot, the operating-system user, the platform's login-session identifier and the login-session generation | the graphical login ending, which closes the session with `desktop_lost`. Losing every attachment does not, and neither does this daemon restarting |
+| `headless_user` | the boot and the operating-system user | the platform's own answer, which this host reports rather than assumes |
+
+A desktop host creates sessions in its own desktop's context and an SSH-only or headless
+installation creates them in its configured headless context. `kr new` prints which one it is about
+to use before it creates anything, and the create receipt records the one it used. `--invisible`
+changes neither: an invisible session in a desktop context keeps that desktop's access, which is
+what lets an agent with no terminal window drive a browser on the screen in front of you.
+
+The identity is the whole of it. A login-session number that a platform hands out again after a
+logout is a different desktop, because the generation moved with it, so nothing is ever rebound to
+a new login: a session whose desktop ended is closed and you create another.
+`docs/host/platforms.md` has the per-platform detail, including what each platform does at logout
+and what it will not tell this host.
+
+A desktop is not a permission. Screen capture and input injection each need an operating-system
+permission that selecting a desktop does not carry, and `environment.capabilities` answers each of
+them separately, in the shared capability-evidence shape, saying what produced the answer and what
+makes it stale. There is no general desktop-control interface here: desktop automation means the
+user's own tools running in the selected context under the permissions they were actually granted.
+
+## Sleep
+
+This host does not change the machine's sleep policy unless the owner asks it to. The setting is
+off until then, `kr host power` shows and changes it, and the two choices are separate: mains power
+only, or battery as well.
+
+With it on, the host holds the platform's own assertion against automatic sleep while it has
+verified foreground work or a request it has accepted and not answered, and releases it when that
+ends. Host status, `kr status` and `kr doctor` each print what is held and why. The assertion is
+held by running the platform's facility as a child with a pipe on its input, so releasing it is
+closing the pipe and a daemon that dies releases everything it held.
+
+An assertion asks the operating system not to sleep on its own. It does not stop a closed lid, a
+forced sleep or a platform policy that overrides the request, and none of those need to be stopped:
+every deadline this host decides is measured on a clock that counts suspended time, so waking up
+never brings an expired action window, lease or grant back.
 
 ## The terminal
 
@@ -673,7 +732,7 @@ So every wait in a worker is on something that happens rather than on a clock.
 | room for the application's input | the same descriptor | nothing; a write with no room waits on it |
 | the root shell's exit | the child signal the kernel sends the worker | a thirty-second sweep, in case a signal is lost. Windows reports a process ending on its handle rather than by a signal, so there a hundred-millisecond check is the whole answer |
 | the processes the session owns | input the session accepted and output it produced, which is where a new process usually comes from | the same sweep, for everything that comes from neither |
-| the login a desktop-bound session is tied to | nothing this host can subscribe to | the same sweep |
+| the login a desktop-bound session is tied to | nothing this host can subscribe to, so it is asked on every wake: one kernel query about the process that owns the login session, at most once a second | the same sweep |
 | a held paste prefix | its own deadline, which exists only while a prefix is held | nothing |
 | an attached view | the frames its connection carries | one keepalive per connection every ten seconds, which section 23 requires of a local connection |
 
