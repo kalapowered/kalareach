@@ -267,6 +267,14 @@ fn has_desktop() -> bool {
     context.is_desktop() && context.graphic_access
 }
 
+/// The desktop this host has, where it has one.
+fn live_desktop() -> Option<desktop::Login> {
+    match desktop::current() {
+        desktop::Reading::Desktop(login) => Some(login),
+        desktop::Reading::None | desktop::Reading::Unavailable => None,
+    }
+}
+
 /// The profile a session is created with on this host.
 ///
 /// A host with no graphical login has no desktop to bind to, so the tests that are about a desktop
@@ -298,14 +306,40 @@ fn process_group(pid: u32) -> Option<u32> {
 #[test]
 fn the_desktop_identity_binds_the_user_the_platform_session_the_boot_and_the_generation() {
     let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
-    let context = desktop::context(WorkerProfile::DesktopBound, boot.clone());
-    if !context.is_desktop() {
-        // No graphical login session on this host. What the identity is made of is still fixed,
-        // and the unit tests beside the module establish it; there is nothing here to read.
-        assert_eq!(context.kind, DesktopSessionKind::None);
-        assert!(!context.graphic_access);
-        return;
-    }
+    let reading = desktop::current();
+    let live = match &reading {
+        desktop::Reading::Desktop(login) => login.clone(),
+        // The platform answered that there is no graphical login, or would not answer at all.
+        // Either way there is no identity on this host to read, and the identity's own rules are
+        // established by the assertions below on a reading taken from the platform's own shape.
+        desktop::Reading::None | desktop::Reading::Unavailable => {
+            let context = desktop::context(WorkerProfile::DesktopBound, boot);
+            assert!(!context.is_desktop());
+            assert_eq!(context.kind, DesktopSessionKind::None);
+            assert!(!context.graphic_access);
+            return;
+        }
+    };
+
+    // A reading that describes a login session describes all four parts of the identity, or it is
+    // not a desktop at all.
+    assert!(live.is_desktop(), "{live:?}");
+    assert!(
+        live.anchor.is_some(),
+        "the reading names the process that owns the login session: {live:?}"
+    );
+    assert_ne!(
+        live.generation_source,
+        kr_protocol::desktop::DesktopGenerationSource::Unavailable,
+        "and says what the generation was read from"
+    );
+    assert_eq!(
+        live.generation,
+        live.anchor.as_ref().map(|anchor| anchor.start_value.get()),
+        "the generation is that process's own start value"
+    );
+
+    let context = desktop::from_login(&live, WorkerProfile::DesktopBound, boot.clone());
     let name = context
         .desktop_session_id
         .as_ref()
@@ -313,6 +347,10 @@ fn the_desktop_identity_binds_the_user_the_platform_session_the_boot_and_the_gen
         .to_string();
     let uid = context.uid.as_ref().expect("a user").get();
     assert!(name.contains(&format!("uid={uid}")), "{name}");
+    assert!(
+        name.contains(&format!("user={}", context.os_user)),
+        "{name}"
+    );
     assert!(
         name.contains(
             context
@@ -323,7 +361,17 @@ fn the_desktop_identity_binds_the_user_the_platform_session_the_boot_and_the_gen
         "{name}"
     );
     assert!(name.contains("boot="), "{name}");
-    assert!(name.contains("generation="), "{name}");
+    assert!(
+        name.contains(&format!(
+            "generation={}",
+            context
+                .login_generation
+                .as_ref()
+                .expect("a generation")
+                .get()
+        )),
+        "{name}"
+    );
     assert_eq!(
         context.boot_identity, boot,
         "the boot is part of the identity"
@@ -331,7 +379,6 @@ fn the_desktop_identity_binds_the_user_the_platform_session_the_boot_and_the_gen
 
     // The same platform session number in a later login is a different desktop, because the
     // generation moved with it.
-    let live = desktop::current();
     let mut relogin = live.clone();
     relogin.generation = live.generation.map(|value| value.wrapping_add(1));
     let later = desktop::from_login(&relogin, WorkerProfile::DesktopBound, boot.clone());
@@ -346,6 +393,20 @@ fn the_desktop_identity_binds_the_user_the_platform_session_the_boot_and_the_gen
     other_boot.value = kr_protocol::scalars::Bytes::new(b"another boot".to_vec());
     let rebooted = desktop::from_login(&live, WorkerProfile::DesktopBound, other_boot);
     assert!(!rebooted.is_same_desktop(&context));
+
+    // A reading with no generation is not an identity at all, whatever else it carries.
+    let mut nameless = live;
+    nameless.generation = None;
+    nameless.anchor = None;
+    let incomplete = desktop::from_login(
+        &nameless,
+        WorkerProfile::DesktopBound,
+        context.boot_identity.clone(),
+    );
+    assert!(
+        !incomplete.is_desktop(),
+        "a platform session number without a generation is not a desktop"
+    );
 }
 
 /// KR-REQ-01.10, KR-REQ-03.19: an invisible session keeps the selected desktop's graphical access,
@@ -409,6 +470,17 @@ async fn a_desktop_bound_session_survives_no_attachments_and_a_daemon_restart() 
     let mut client = host.client().await;
     let created = create(&mut client, &host, Presentation::Invisible, profile_here()).await;
     let session_id = created.session.session_id;
+    if has_desktop() {
+        assert_eq!(
+            created.session.worker_profile,
+            WorkerProfile::DesktopBound,
+            "this host has a desktop, so this is the profile the test is about"
+        );
+        assert!(
+            created.session.desktop.desktop_session_id.is_present(),
+            "and the session is bound to it"
+        );
+    }
     assert_eq!(created.session.attachment_count.get(), 0, "no attachment");
     let root = created
         .session
@@ -616,7 +688,29 @@ fn a_graphical_job_torn_down_by_the_service_manager_ends_the_processes_in_it() {
 #[test]
 fn a_locked_or_unavailable_desktop_is_reported_separately_from_process_life() {
     let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
-    let mut login = desktop::current();
+    // What this host measured, where it has a desktop to measure. macOS and Linux each publish a
+    // lock state; a platform that publishes none says `unknown` rather than claiming the screen is
+    // there for the taking.
+    if let Some(live) = live_desktop() {
+        assert!(
+            matches!(
+                live.availability,
+                DesktopAvailability::Available
+                    | DesktopAvailability::Locked
+                    | DesktopAvailability::Background
+                    | DesktopAvailability::Unknown
+            ),
+            "{:?}",
+            live.availability
+        );
+        #[cfg(target_os = "macos")]
+        assert_ne!(
+            live.availability,
+            DesktopAvailability::Unknown,
+            "this platform publishes a lock state, so the reading is a measurement"
+        );
+    }
+    let mut login = live_desktop().unwrap_or_else(desktop::Login::none);
     if !login.is_desktop() {
         // Stand in a reading for a host that has no desktop of its own, so the distinction is
         // still established here.
@@ -677,6 +771,11 @@ fn a_locked_or_unavailable_desktop_is_reported_separately_from_process_life() {
 
 /// KR-REQ-03.23: a reboot ends the live executions of both profiles, and a boot identity that is
 /// not this one closes them on startup with the reason that says so.
+///
+/// The boot is changed where the host records it, in its own state directory, which is the record
+/// a real reboot leaves behind: a runtime directory and the descriptors in it are cleared with the
+/// boot they belonged to, so a daemon that compared those would find nothing to compare after
+/// exactly the event it was looking for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles() {
     let host = Host::create();
@@ -702,21 +801,27 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
     } else {
         None
     };
+    // The endpoints are kept so this test can end what it started: the workers themselves are
+    // still running afterwards, because this test moved a record rather than a machine.
+    let mut endpoints = Vec::new();
+    for entry in kr_ipc::descriptor::read_all(&host.paths()).expect("reads the descriptors") {
+        let descriptor = entry.descriptor.expect("a descriptor");
+        endpoints.push((descriptor.session_id, descriptor.endpoint.clone()));
+    }
+    assert!(!endpoints.is_empty(), "the sessions published descriptors");
     drop(client);
     first.stop().await;
 
-    // Every descriptor is republished naming a boot this host is not running. That is what a
-    // daemon starting after a reboot finds: a record of a session from before the machine
-    // restarted.
-    let mut endpoints = Vec::new();
-    for entry in kr_ipc::descriptor::read_all(&host.paths()).expect("reads the descriptors") {
-        let mut descriptor = entry.descriptor.expect("a descriptor");
-        endpoints.push((descriptor.session_id, descriptor.endpoint.clone()));
-        descriptor.boot_identity.value =
-            kr_protocol::scalars::Bytes::new(b"a boot this host is not running".to_vec());
-        kr_ipc::descriptor::publish(&host.paths(), &descriptor).expect("republishes");
-    }
-    assert!(!endpoints.is_empty(), "the sessions published descriptors");
+    let recorded = host
+        .paths()
+        .state_dir()
+        .join(kr_controller::service::BOOT_FILE);
+    assert!(
+        recorded.exists(),
+        "the daemon recorded the boot it was running in"
+    );
+    kr_ipc::paths::write_owner_only_file(&recorded, b"a boot this host is not running")
+        .expect("records another boot");
 
     let second = host.start().await;
     let mut client = host.client().await;
@@ -735,11 +840,15 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
             "the record says the host restarted"
         );
     }
+    // And the record now names this boot, so a second start closes nothing again.
+    let written = std::fs::read(&recorded).expect("reads the record");
+    assert_ne!(
+        written, b"a boot this host is not running",
+        "the daemon recorded the boot it is actually running in"
+    );
     drop(client);
     second.stop().await;
 
-    // The workers themselves are still running: this test moved a record, not a machine. Each one
-    // is asked to close, which is this test ending only what it started.
     for (session_id, endpoint) in endpoints {
         let Ok(endpoint) = kr_ipc::paths::Endpoint::from_path(&endpoint) else {
             continue;
@@ -824,9 +933,22 @@ async fn a_headless_session_inherits_no_graphical_access_and_logout_is_reported_
         );
     }
 
+    // The launch context, not only the variables. A headless worker that was started inside the
+    // graphical login would have that login's access however little of its environment it was
+    // given, so the supervisor this host would use says which context each profile gets.
+    let supervisor = kr_controller::supervision::detect().describe();
+    #[cfg(target_os = "macos")]
+    if has_desktop() {
+        assert!(
+            supervisor.contains("background") && supervisor.contains("graphical"),
+            "the service manager starts the two profiles in different login contexts: {supervisor}"
+        );
+    }
+    assert!(!supervisor.is_empty());
+
     // What logout does to each profile is this platform's answer, reported with the mechanism it
     // is about. A claim that a headless session survives logout has to name what makes it survive.
-    let reported = kr_controller::desktop::persistence("a test supervisor");
+    let reported = kr_controller::desktop::persistence(&supervisor);
     let headless = reported
         .iter()
         .find(|entry| entry.profile == WorkerProfile::HeadlessUser)
@@ -1053,11 +1175,27 @@ fn a_capability_record_per_desktop_says_what_produced_it_and_refuses_a_container
             !record.state.is_available(),
             "{name} was reported available on a desktop selection alone"
         );
-        assert_eq!(
-            record.evidence_source,
-            CapabilityEvidenceSource::NotProbed,
-            "{name} claims no probe it did not run"
+        // What produced the answer depends on the platform: a refusal the platform itself
+        // establishes is a platform query, and everything else is an answer nothing has run.
+        assert!(
+            matches!(
+                record.evidence_source,
+                CapabilityEvidenceSource::NotProbed | CapabilityEvidenceSource::PlatformQuery
+            ),
+            "{name} claims evidence nothing produced: {record:?}"
         );
+        if record.evidence_source == CapabilityEvidenceSource::PlatformQuery {
+            assert!(
+                matches!(
+                    record.state,
+                    CapabilityState::PermissionRequired
+                        | CapabilityState::MissingInstallation
+                        | CapabilityState::TemporarilyUnavailable
+                        | CapabilityState::Incompatible
+                ),
+                "a platform query can only refuse: {record:?}"
+            );
+        }
     }
     // The display server is its own answer, which on Linux distinguishes X11 from Wayland and
     // names the compositor beside it.
@@ -1219,6 +1357,12 @@ fn an_assertion_is_held_for_admitted_work_and_released_when_it_ends() {
         },
         PowerSource::Battery,
     );
+    // This platform has the facility, so an assertion is what the answer has to be.
+    #[cfg(target_os = "macos")]
+    assert!(
+        held.active,
+        "this platform holds power-management assertions: {held:?}"
+    );
     if !held.active {
         // A platform with no assertion facility says so rather than claiming one.
         assert!(held.withheld_reason.is_present());
@@ -1328,13 +1472,23 @@ fn per_user_startup_uses_the_platform_service_mechanism_and_changes_no_sleep_pol
         "{described}"
     );
 
-    // What logout does to that mechanism is reported rather than assumed.
+    // What logout does to that mechanism is reported rather than assumed, and a claim that a
+    // headless session survives logout names the configuration that makes it survive.
     let persistence = kr_controller::desktop::headless_persistence();
     assert!(!persistence.mechanism.is_empty());
-    assert_ne!(
+    assert!(!persistence.detail.is_empty());
+    if persistence.persistence == LogoutPersistence::SurvivesLogout {
+        assert!(
+            persistence.detail.to_ascii_lowercase().contains("linger"),
+            "{}",
+            persistence.detail
+        );
+    }
+    #[cfg(target_os = "macos")]
+    assert_eq!(
         persistence.persistence,
-        LogoutPersistence::SurvivesLogout,
-        "this host does not claim a logout-surviving service it was never configured for"
+        LogoutPersistence::EndsAtLogout,
+        "this platform ends a user's agents at logout"
     );
 
     // Starting a host, and asking it anything, never writes a power setting.

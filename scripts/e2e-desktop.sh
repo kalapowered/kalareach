@@ -314,15 +314,77 @@ require "$(read_json "$run_root/evidence/create-default.json" execution_context_
   "the execution context came from the host rather than the command"
 
 echo
-echo "6. closing the sessions this run created"
-for display in "$desktop_display" "$default_display"; do
+echo "6. a headless session is started outside the graphical login"
+cat >"$run_root/bin/headless-shell.sh" <<SCRIPT
+#!/bin/sh
+# The root shell of a headless session. It records the login context it was started in and any
+# desktop handles it was given, then waits.
+/bin/launchctl managername > "$run_root/evidence/headless-managername" 2>&1
+/usr/bin/printenv \
+  | /usr/bin/grep -E '^(DISPLAY|WAYLAND_DISPLAY|XAUTHORITY|DBUS_SESSION_BUS_ADDRESS|XDG_SESSION_ID)=' \
+  > "$run_root/evidence/headless-desktop-variables" || :
+exec cat
+SCRIPT
+chmod +x "$run_root/bin/headless-shell.sh"
+"$kr" new --invisible --headless --shell "$run_root/bin/headless-shell.sh" --json \
+  >"$run_root/evidence/create-headless.json"
+headless_display="$(read_json "$run_root/evidence/create-headless.json" display_number)"
+for _ in $(seq 1 100); do
+  [ -s "$run_root/evidence/headless-managername" ] && break
+  sleep 0.2
+done
+require "$(read_json "$run_root/evidence/create-headless.json" worker_profile)" "headless_user" \
+  "the session runs in the headless user context"
+require "$(read_json "$run_root/evidence/create-headless.json" desktop.desktop_session_id)" "" \
+  "and it is bound to no desktop"
+require "$(cat "$run_root/evidence/headless-managername" 2>/dev/null || true)" "Background" \
+  "the headless session's shell is outside the graphical login context"
+if [ -s "$run_root/evidence/headless-desktop-variables" ]; then
+  fail "a headless session inherits no desktop handles"
+  cat "$run_root/evidence/headless-desktop-variables"
+else
+  echo "  ok: a headless session inherits no desktop handles"
+fi
+
+echo
+echo "7. what this host says about itself"
+"$kr" doctor --json >"$run_root/evidence/doctor-final.json" || true
+require "$(read_json "$run_root/evidence/doctor-final.json" host.default_worker_profile)" \
+  "desktop_bound" "kr doctor reports the execution context new sessions get"
+/usr/bin/python3 -c '
+import json, sys
+document = json.load(open(sys.argv[1]))
+entries = document["environment"]["persistence"]
+for entry in entries:
+    print("  logout:", entry["profile"], entry["persistence"], "via", entry["mechanism"])
+records = document["environment"]["desktop"]["capabilities"]
+for record in records:
+    print("  capability:", record["capability"], record["state"], record["evidence_source"])
+' "$run_root/evidence/doctor-final.json"
+if /usr/bin/python3 -c '
+import json, sys
+document = json.load(open(sys.argv[1]))
+records = document["environment"]["desktop"]["capabilities"]
+bad = [r["capability"] for r in records
+       if r["capability"] in ("desktop.screen_capture", "desktop.input_injection")
+       and r["state"] == "qualified_available"]
+sys.exit(1 if bad else 0)
+' "$run_root/evidence/doctor-final.json"; then
+  echo "  ok: selecting a desktop reports neither capture nor injection as available"
+else
+  fail "selecting a desktop reported capture or injection as available"
+fi
+
+echo
+echo "8. closing the sessions this run created"
+for display in "$desktop_display" "$default_display" "$headless_display"; do
   "$kr" close "$display" --json >"$run_root/evidence/close-$display.json"
   require "$(read_json "$run_root/evidence/close-$display.json" state)" "closing" \
     "session $display was asked to close"
 done
 
 echo
-echo "7. a session whose login session has ended closes with desktop_lost"
+echo "9. a session whose login session has ended closes with desktop_lost"
 if CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}" cargo test -q -p kr-worker --test desktop \
   a_desktop_bound_session_closes_with_desktop_lost_when_its_login_ends \
   -- --exact --test-threads=1 >"$run_root/evidence/desktop-lost.log" 2>&1; then
