@@ -568,14 +568,18 @@ impl RemoteConnection {
         if let Err(error) = self.check_grant(named, entry, false) {
             return failure(request.request_id, error);
         }
+        // The daemon's own reads are served as this device, not as the daemon: a module that keeps
+        // its own subjects decides them against the actor that asked, and a read served under the
+        // host's own principal would be answered about the host's own objects.
+        let actor_id = self.device.principal();
         let answer = match entry.method {
             Method::HostInfo | Method::EnvironmentList | Method::HostDoctor => {
-                self.controller.read_method(request).await
+                self.controller.read_method(&actor_id, request).await
             }
             // The daemon answers these itself, and what it answers with is narrowed to the grant:
             // a list is every session this actor may observe, not every session this host runs.
             Method::SessionList | Method::SessionRead => {
-                let answer = self.controller.read_method(request).await;
+                let answer = self.controller.read_method(&actor_id, request).await;
                 self.narrow(answer)
             }
             Method::EventsSubscribe
