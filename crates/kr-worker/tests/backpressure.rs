@@ -165,14 +165,23 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     // its socket fills, the worker's queue for it fills behind that, and it is told to
     // resynchronise. Nothing is read from it until the end of this test, which is the whole point.
     //
-    // The client that *is* reading is watched through that same window, so what is asserted is the
-    // order of the two things rather than how quickly either of them happens. Three separate
-    // arrivals rather than one, because one could have been queued before the other client stopped.
+    // Two things are watched through that same window, and neither is a measurement of how fast
+    // this host is. The session's own output cursor is the read loop's position in the stream: if
+    // it advances, the pseudo-terminal was read while a client was not reading, which is exactly
+    // what section 9 promises. The other is the client that *is* reading, which shows the fan-out
+    // reaching somebody while one peer is silent.
+    let before = runtime.session().output_cursor();
     let advances = progress(&received, Duration::from_secs(10)).await;
+    let after = runtime.session().output_cursor();
     let counted = received.load(std::sync::atomic::Ordering::Relaxed);
     assert!(
-        advances >= 3,
-        "the client that kept reading went on receiving while the other was not reading: \
+        after > before,
+        "the pseudo-terminal was read while one client was not reading: the output cursor stood \
+         at {before} and is at {after}"
+    );
+    assert!(
+        counted > 0,
+        "the client that kept reading received output while the other was not reading: \
          {advances} arrivals and {counted} batches in ten seconds, on {}",
         finished(&draining)
     );
@@ -235,6 +244,9 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     // connection ended without a word, or a reader that panicked.
     if draining.is_finished() {
         match draining.await {
+            // It fell behind too, which happens on a host that cannot write to two peers as fast
+            // as one application produces. The same rule then applies to it, and its own queue is
+            // the reason: what it must never be is a client that was left with a hole.
             Ok(Drained::Resynchronised(reason)) => assert_eq!(
                 reason,
                 Some(kr_protocol::recovery::ResyncReason::SendQueueFull),
