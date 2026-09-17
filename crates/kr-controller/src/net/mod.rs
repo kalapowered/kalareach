@@ -378,12 +378,11 @@ pub struct NetworkHost {
     endpoint_id: EndpointKey,
     /// Expiry records this host owes its directory, and has not yet written.
     pending_expiry: Arc<devices::PendingExpiry>,
-    /// Set once this host's wall clock has been found to have gone backwards.
+    /// Whether this host may decide a grant's expiry from its own wall clock.
     ///
-    /// The durable record is the one a later run reads; this holds the decision for this run,
-    /// including when that write fails. Shared with the task that keeps the record, which is what
-    /// retries the write until it lands. Only an owner's approval clears either.
-    clock_distrusted: Arc<std::sync::atomic::AtomicBool>,
+    /// Shared with the task that keeps the record, which observes a rollback between connections
+    /// and retries the write until it lands. Every transition of it takes one boundary.
+    clock_trust: Arc<devices::ClockTrust>,
 }
 
 impl std::fmt::Debug for NetworkHost {
@@ -548,18 +547,15 @@ impl NetworkHost {
         boot_now: u64,
     ) -> Result<u64> {
         let controller = self.daemon()?;
-        let observed = self.devices.utc_at_least(kr_ipc::now_ms())?;
-        if observed.behind_ms > CLOCK_TOLERANCE_MS {
-            // The latch first, then the record. The latch is what holds the decision while this
-            // host runs, including when the write below fails; the record is what a later run
-            // reads. Neither one alone is enough.
-            self.distrust_clock(observed.now);
-        }
+        // One boundary for the sample, the mark, the decision and its record: everything this
+        // reads was written inside it, so an owner establishing the clock and an observation of a
+        // rollback cannot interleave halfway.
+        let observed = self.clock_trust.observe(&self.devices, kr_ipc::now_ms())?;
         // Distrust stands until something authenticates the clock again. Reaching a moment this
         // host had already written down is not that evidence: it proves neither what the time is
         // now nor how much of it passed while the host was not running. Only
         // [`NetworkHost::establish_clock`], which an owner's approval reaches, clears it.
-        if self.clock_untrusted()? {
+        if self.clock_trust.untrusted(&self.devices)? {
             return Err(ControllerError::ClockUntrusted {
                 detail: "this host's clock went backwards and has not been established again, so \
                          it cannot say whether this device's grant has run out"
@@ -692,36 +688,6 @@ impl NetworkHost {
         controller.announce_authority_revision().await
     }
 
-    /// Records that this host's wall clock cannot be trusted, in memory and durably.
-    ///
-    /// The latch holds the decision for this run whatever storage does; the record is what a later
-    /// run reads. A write that fails is retried by the host's own task, which is also what
-    /// observes a rollback between connections.
-    fn distrust_clock(&self, now_ms: kr_protocol::scalars::TimestampMs) {
-        self.clock_distrusted
-            .store(true, std::sync::atomic::Ordering::Release);
-        if let Err(error) = self.devices.note_clock_untrusted(now_ms) {
-            eprintln!(
-                "kr-controller: could not record that this host's clock went backwards: {error}"
-            );
-        }
-    }
-
-    /// Returns whether this host's clock is one it may decide an expiry against.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the record cannot be read. A host that cannot tell decides nothing.
-    fn clock_untrusted(&self) -> Result<bool> {
-        if self
-            .clock_distrusted
-            .load(std::sync::atomic::Ordering::Acquire)
-        {
-            return Ok(true);
-        }
-        self.devices.clock_untrusted()
-    }
-
     /// Establishes this host's clock again, on an owner's authority.
     ///
     /// Nothing a clock says about itself can do this, and neither can another decision the owner
@@ -740,12 +706,7 @@ impl NetworkHost {
             )
         })?;
         pairing.accept_clock(approval)?;
-        // The record first, then the latch: a latch cleared over a failed write would let this
-        // host decide expiries from a clock whose distrust the next run still reads.
-        self.devices.trust_clock(kr_ipc::now_ms())?;
-        self.clock_distrusted
-            .store(false, std::sync::atomic::Ordering::Release);
-        Ok(())
+        self.clock_trust.establish(&self.devices, kr_ipc::now_ms())
     }
 
     /// Returns the live connections this predicate selects, holding each one for the caller.
@@ -824,28 +785,19 @@ pub const CLOCK_MARK_INTERVAL: std::time::Duration = std::time::Duration::from_s
 async fn keep_the_record(
     devices: Arc<DeviceDirectory>,
     pending: Arc<devices::PendingExpiry>,
-    distrusted: Arc<std::sync::atomic::AtomicBool>,
+    clock: Arc<devices::ClockTrust>,
 ) {
     loop {
         tokio::time::sleep(CLOCK_MARK_INTERVAL).await;
-        match devices.utc_at_least(kr_ipc::now_ms()) {
-            // A clock stepped backwards is the same fact whoever sees it. This task sees it
-            // between connections, which is exactly when nothing else would, and the latch is set
-            // before anything is written: what storage does next cannot lose the observation.
-            Ok(observed) if observed.behind_ms > CLOCK_TOLERANCE_MS => {
-                distrusted.store(true, std::sync::atomic::Ordering::Release);
-            }
-            Ok(_) => {}
-            Err(error) => {
-                eprintln!("kr-controller: could not record the moment this host is at: {error}");
-            }
+        // A clock stepped backwards is the same fact whoever sees it. This task sees it between
+        // connections, which is exactly when nothing else would, and it observes through the same
+        // boundary every other reader and writer of that decision takes.
+        if let Err(error) = clock.observe(&devices, kr_ipc::now_ms()) {
+            eprintln!("kr-controller: could not record the moment this host is at: {error}");
         }
-        // Whatever the latch holds is written down until the write lands. A decision this host
+        // Whatever the decision holds is written down until the write lands. A decision this host
         // has made about its own clock has to survive its own restart.
-        if distrusted.load(std::sync::atomic::Ordering::Acquire)
-            && !devices.clock_untrusted().unwrap_or(false)
-            && let Err(error) = devices.note_clock_untrusted(kr_ipc::now_ms())
-        {
+        if let Err(error) = clock.settle(&devices) {
             eprintln!(
                 "kr-controller: could not record that this host's clock went backwards: {error}"
             );
@@ -853,13 +805,6 @@ async fn keep_the_record(
         pending.settle(&devices);
     }
 }
-
-/// How far behind its own recorded mark this host's wall clock may be and still decide an expiry.
-///
-/// A small step is ordinary: a clock corrected by a time service, or two reads either side of a
-/// write. A larger one says the wall clock is not currently a clock this host can measure a grant
-/// against, and section 9 does not let it guess in the device's favour.
-pub const CLOCK_TOLERANCE_MS: u64 = 5_000;
 
 /// What a remote close settled as.
 #[derive(Debug)]
@@ -1015,7 +960,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         live: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         endpoint_id,
         pending_expiry: Arc::new(devices::PendingExpiry::default()),
-        clock_distrusted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        clock_trust: Arc::new(devices::ClockTrust::default()),
     });
     // The record of the wall clock moves while this host runs, whether or not anything asks it a
     // question. A mark that only advanced when a device connected would stand still through a
@@ -1025,7 +970,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     let marking = tokio::spawn(keep_the_record(
         Arc::clone(&host.devices),
         Arc::clone(&host.pending_expiry),
-        Arc::clone(&host.clock_distrusted),
+        Arc::clone(&host.clock_trust),
     ));
     // The guard owns that task from here, so every way out of this function ends it: a duplicate
     // registration, an endpoint that will not bind, or a daemon that is dropped.
@@ -1196,6 +1141,10 @@ impl Controller {
             // Nothing is running under that identity. Either it has already closed, and the record
             // is the answer, or it never existed here.
             let closure = self.registry.lock().await.closure(session_id)?;
+            // Whatever comes back here comes from a record rather than from a close performed now,
+            // which is the same read the worker's own journal would have been. The caller decides
+            // whether this device may be told it.
+            *retained = true;
             return match closure {
                 Some(closure) => {
                     crate::service::encode(&kr_protocol::session::SessionCloseResult {
@@ -1225,10 +1174,8 @@ impl Controller {
             // This task outlives the connection that asked for the close, so it can be the one
             // that finds the grant's own deadline spent. Section 9 has that written down wherever
             // it is observed, and the observer here belongs to the device rather than to the
-            // connection. A window or a requested lifetime running out is not the grant's expiry.
-            if accepted.bound == kr_transport::window::DeadlineBound::AuthorityDeadline {
-                observer.grant_expired();
-            }
+            // connection. It records nothing unless the grant itself has run out.
+            observer.grant_expired();
             ControllerError::WindowExpired {
                 detail: "the deadline this close was admitted under has passed".to_owned(),
             }
@@ -1258,6 +1205,13 @@ impl Controller {
                 return Err(ControllerError::refused(&error));
             }
         };
+        if *retained {
+            // The close this answers happened, and whatever settled it settled then: the record
+            // was written and the closure watched by the submission that performed it. What comes
+            // back now is that action's retained answer, which may be its result or its receipt,
+            // and it is passed through as it is rather than read as a close result it need not be.
+            return Ok(value);
+        }
         let reply: kr_protocol::session::SessionCloseResult = value
             .to_typed()
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;

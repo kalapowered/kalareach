@@ -30,6 +30,96 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::error::{ControllerError, Result};
 
+/// Whether this host may decide an expiry from its own wall clock, and the transitions of that.
+///
+/// Four things move together: sampling the clock, moving the mark, setting or clearing the
+/// decision, and writing it down. Each of them reads what the others wrote, so they share one
+/// boundary: without it an observation taken before an owner established the clock could land
+/// after it, and a decision cleared between an observation and its write would be lost.
+#[derive(Debug, Default)]
+pub struct ClockTrust {
+    /// Held for the whole of every transition below.
+    ///
+    /// `true` once this host has found its clock going backwards, cleared only by an owner's
+    /// approval. The durable record is what a later run reads; this is what holds the decision
+    /// while a write is failing.
+    distrusted: std::sync::Mutex<bool>,
+}
+
+impl ClockTrust {
+    /// Samples the wall clock against this host's mark, and records a rollback as distrust.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the mark cannot be read or written.
+    pub fn observe(&self, devices: &DeviceDirectory, now_ms: TimestampMs) -> Result<ObservedUtc> {
+        let mut distrusted = self.held();
+        let observed = devices.utc_at_least(now_ms)?;
+        if observed.behind_ms > CLOCK_TOLERANCE_MS {
+            *distrusted = true;
+            // The decision is in memory before anything is written, and the write is attempted
+            // here and retried by whoever calls [`Self::settle`] until it lands.
+            let _ = devices.note_clock_untrusted(observed.now);
+        }
+        Ok(observed)
+    }
+
+    /// Returns whether this host's clock is one it may decide an expiry against.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be read. A host that cannot tell decides nothing.
+    pub fn untrusted(&self, devices: &DeviceDirectory) -> Result<bool> {
+        let distrusted = self.held();
+        if *distrusted {
+            return Ok(true);
+        }
+        devices.clock_untrusted()
+    }
+
+    /// Writes down a decision this host is holding, until the write lands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be read or written.
+    pub fn settle(&self, devices: &DeviceDirectory) -> Result<()> {
+        let distrusted = self.held();
+        if *distrusted && !devices.clock_untrusted()? {
+            devices.note_clock_untrusted(kr_ipc::now_ms())?;
+        }
+        Ok(())
+    }
+
+    /// Establishes the clock again, at the moment an owner authenticated.
+    ///
+    /// The mark moves to that moment and the decision is cleared, in one transition: an
+    /// observation taken against the old mark cannot land after it, because it would have to take
+    /// this boundary to be recorded at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record cannot be written. The decision stands if it cannot.
+    pub fn establish(&self, devices: &DeviceDirectory, now_ms: TimestampMs) -> Result<()> {
+        let mut distrusted = self.held();
+        devices.trust_clock(now_ms)?;
+        *distrusted = false;
+        Ok(())
+    }
+
+    fn held(&self) -> std::sync::MutexGuard<'_, bool> {
+        self.distrusted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// How far behind its own recorded mark this host's wall clock may be and still decide an expiry.
+///
+/// A small step is ordinary: a clock corrected by a time service, or two reads either side of a
+/// write. A larger one says the wall clock is not currently a clock this host can measure a grant
+/// against, and section 9 does not let it guess in the device's favour.
+pub const CLOCK_TOLERANCE_MS: u64 = 5_000;
+
 /// Expiry records this host owes its own directory.
 ///
 /// A grant's expiry is written down where it is observed, and a write can fail: a full disk, a

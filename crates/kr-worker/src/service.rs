@@ -1383,12 +1383,17 @@ impl WorkerService {
                 ),
             );
         };
+        // The marker travels to a proxy and nowhere else. A proxy forwards for somebody whose
+        // receipts are not its own, which is what makes passing a retained result on a read. The
+        // daemon's authority connection carries a local caller's own action, and that caller is
+        // answered the way it always was.
+        let proxied = state.controller_role == ControllerConnectionRole::Proxy;
         self.mutation(
             state,
             &forwarded.mutation,
             &Caller::forwarded(&forwarded.actor),
             Freshness::Vouched(deadline),
-            true,
+            proxied,
         )
     }
 

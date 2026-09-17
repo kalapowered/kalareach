@@ -137,9 +137,15 @@ pub struct RemoteOutput {
 pub struct ExpiryObserver(Arc<Authorisation>);
 
 impl ExpiryObserver {
-    /// Records that the grant behind the work this belongs to has run out.
+    /// Records this grant's expiry, when the grant has in fact run out.
+    ///
+    /// A deadline that could not be forwarded is not evidence about the grant: a lease that was
+    /// refused, an acknowledgement that never came, a window that ran out first. The grant's own
+    /// anchored deadline is the evidence, and it is the only thing consulted here.
     pub fn grant_expired(&self) {
-        self.0.expire();
+        if !self.0.has_time_left() {
+            self.0.note_expiry();
+        }
     }
 }
 
@@ -631,6 +637,13 @@ impl RemoteConnection {
             .retained(&actor_id, mutation, entry.method)
             .await
         {
+            // The daemon's own retained answer is a read of what an earlier submission produced,
+            // and a create's names the session it made. Section 23 wants present view authority
+            // over that subject before either half of a retained result goes back, and the subject
+            // is in the answer rather than in the request.
+            if let Err(error) = self.may_read_receipts(answered_session(&retained)) {
+                return failure(mutation.request_id, error);
+            }
             return retained;
         }
         // A worker holds the receipts of its own actions, and the route says which worker. Section
@@ -875,12 +888,10 @@ impl RemoteConnection {
         {
             Ok(deadline) => deadline,
             Err(error) => {
-                // Nothing left of a deadline the grant itself set is the grant having run out,
-                // and that is written down wherever it is seen. A window or a requested lifetime
-                // running out says nothing about the grant.
-                if accepted.bound == kr_transport::window::DeadlineBound::AuthorityDeadline {
-                    self.authority.expire();
-                }
+                // The grant may have run out while this waited, and wherever that is observed it
+                // is written down. What decides is the grant's own deadline: everything else this
+                // failure can mean says nothing about the grant.
+                self.expiry_observer().grant_expired();
                 return failure(mutation.request_id, error.to_protocol_error());
             }
         };
@@ -1567,6 +1578,24 @@ fn settled(request_id: RequestId, outcome: Effect) -> ControlFrame {
         }),
         Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
     }
+}
+
+/// Returns the session a retained answer is about, when it names one.
+///
+/// A create's result names the session it made, which is the subject the answer is a read of. An
+/// answer that names none leaves the selector nothing to check, and the grant's own scope decides.
+fn answered_session(answer: &ControlFrame) -> Option<SessionId> {
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Ok(value),
+        ..
+    }) = answer
+    else {
+        return None;
+    };
+    value
+        .to_typed::<kr_protocol::session::SessionCreateResult>()
+        .ok()
+        .map(|created| created.session.session_id)
 }
 
 fn outcome_unknown() -> ProtocolError {
