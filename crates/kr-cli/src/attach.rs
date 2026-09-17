@@ -51,10 +51,19 @@ pub const GUARD_READY: u8 = b'A';
 
 /// How long the attach process waits for its guard to report that it is armed.
 ///
-/// The guard does two things before it answers: it ignores the background-write signal and it
-/// decodes the state it was handed. A guard that has not answered by now is not going to, and
-/// entering raw mode without one would leave a terminal nothing could restore.
-pub const GUARD_ARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// A guard that is no longer there needs no deadline: its end of the report pipe closes with it, so
+/// the read ends at once and the status says how it went. This bounds the other case, a guard that
+/// is running and has not answered, and it is set above what starting one actually costs rather
+/// than above what the guard does after it has started.
+///
+/// What it costs, measured: a guard that has been run before answers in 3 to 5 milliseconds. The
+/// **first** run of a newly written copy of it answers in 0.3 to 10.4 seconds, because the
+/// operating system checks a binary it has not seen before, once, and then remembers it; that is
+/// every first attach after an install or an upgrade. An ordinary run reached 3.1 seconds once in
+/// forty on a loaded machine. Two seconds sat inside all three of those ranges and turned a first
+/// attach into a failure, so the bound is a minute: far outside them, and still a bound, because a
+/// guard that is alive and silent for a minute is not going to answer.
+pub const GUARD_ARM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The out-of-process restoration guard.
 ///
