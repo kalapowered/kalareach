@@ -224,7 +224,7 @@ mod tests {
             SETUP_DEADLINE_MS,
             crate::runtime::compile::COMPILE_DEADLINE_MS
         );
-        assert!(SETUP_DEADLINE_MS > SNAPSHOT_DEADLINE_MS);
+        const { assert!(SETUP_DEADLINE_MS > SNAPSHOT_DEADLINE_MS) }
         // And its work allowance is the setup one, whatever the call fuel rate is. A host that
         // tightened the call rate would otherwise find it could no longer instantiate anything.
         assert_eq!(CallBudget::of(CallKind::Bind).fuel, SETUP_FUEL);
