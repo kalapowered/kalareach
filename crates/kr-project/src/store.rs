@@ -677,7 +677,11 @@ impl Store {
         let transaction = self.transaction()?;
         transaction
             .execute(
-                "DELETE FROM operation_paths WHERE action_id = ?1 AND path = ?2",
+                // A row that says this host removed the directory is history rather than
+                // occupancy: an earlier recovery removed it and the operation never closed. That
+                // record stays, and only a stale "still there" row goes.
+                "DELETE FROM operation_paths
+                  WHERE action_id = ?1 AND path = ?2 AND removed = 0",
                 params![action_id.get().as_bytes().to_vec(), path],
             )
             .map_err(ProjectError::store)?;

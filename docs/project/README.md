@@ -132,7 +132,7 @@ A network operation names three things and carries no fourth.
    `?access_token=` is the other place a credential reaches remote state. An `ssh` remote keeps its
    user, because ssh needs it and an ssh user name is not a secret.
 
-   No refusal repeats the URL it refused. A URL this host could not parse is one it could not redact
+   No refusal repeats the URL it refused. A URL this host could not parse is one it could not vouch for
    either, and a malformed authority is exactly where a credential sits, so a refusal names what is
    wrong instead. Where a diagnostic from Git itself carries a URL, the whole user information is
    removed unless the scheme is `ssh` and it holds no colon.
@@ -371,8 +371,13 @@ is what a subsection is not. A subsection that holds none of `:`, `@`, `?`, `#`,
 control character is repeated as it is, because naming the remote or the driver is the whole use of
 the message. Anything else is replaced by its length and a fingerprint of its bytes: a person can
 still find the key in the file and tell two keys apart, and nothing the repository chose is echoed.
-Git's own standard error is a message rather than a key, and a URL in it goes through the URL
-redaction, which removes user information, a query and a fragment.
+Git's own standard error is a message rather than a key, and it can hold either: Git prints the
+configuration key it objected to. So a message is not scanned for the shape of a URL either. A word
+in it that holds `://` is repeated only when a URL parser says it is a URL, of a scheme this service
+uses, with no password, no query, no fragment, no user name beyond a bare `ssh` login and nothing
+in its path a credential could sit in. `https://github.com/user/repo.git` therefore still reads,
+quoted or not; a configuration key with a URL inside it does not, because `diff.https` is not a
+scheme this service uses. Anything replaced carries its length and a fingerprint of its bytes.
 
 Nothing here rewrites the user's Git configuration. The overrides live on one child process's
 command line and in its environment. A terminal command under broad shell access keeps normal Git

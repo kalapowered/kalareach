@@ -1489,111 +1489,93 @@ fn names_of(key: &str) -> &'static str {
         .map_or("a program", |rule| rule.names)
 }
 
-/// Removes any credential a URL carries from text that is about to be shown or stored.
+/// Removes anything a message says that this host cannot vouch for.
 ///
-/// Credential-bearing URLs are refused before anything runs, so this is the second bar rather than
-/// the first: what it covers is a URL that reached Git's own diagnostics by another route.
+/// Git's own standard error reaches a caller and a journal, and it can hold a URL, a configuration
+/// key, or a configuration key that holds a URL:
+/// `bad boolean config value 'invalid' for 'diff.https://host/x?token=….binary'`. Scanning that
+/// text for the shape of a URL is what the first ten reviews of this service tried, and each of
+/// them found one more shape the scan read wrongly: a token in a query, a nested URL, a second URL
+/// after a comma, an apostrophe, a quote. The shapes are not the problem. Guessing is.
+///
+/// So this does not guess. A word that holds `://` is kept **only** when a URL parser says it is a
+/// URL and that URL carries nothing a credential travels in: no user name, no password, no query,
+/// no fragment. `https://github.com/user/repo.git` survives, quoted or not, because that is what a
+/// person needs to read. Everything else — a URL with user information, a URL with a query, a
+/// configuration key with a URL inside it, anything a parser cannot make sense of — is replaced by
+/// its length and a fingerprint of its bytes. A person can still tell two messages apart and count
+/// the characters; nothing this host cannot vouch for is repeated.
 #[must_use]
 pub fn redact(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(marker) = rest.find("://") {
-        let (head, after) = rest.split_at(marker + 3);
-        out.push_str(head);
-        // The authority ends at the first of these; user information ends at an `@` before it.
-        // It also ends where the *next* URL's scheme begins, because the first `/` after this
-        // authority can belong to the next URL rather than to this one: in
-        // `https://host,https://user:token@other/x` the first slash is the one in the second
-        // URL's `://`, and reading it as the end of this authority would leave the rest of the
-        // message, credential and all, copied verbatim.
-        let end = after
-            .find(AUTHORITY_ENDS_AT)
-            .unwrap_or(after.len())
-            .min(next_scheme(after));
-        let (authority, tail) = after.split_at(end);
-        // The scheme decides whether a bare user name is a secret. A token is often the *user* of
-        // an https URL (`https://TOKEN:x-oauth-basic@host`, and `https://TOKEN@host`), so the whole
-        // user information goes. An ssh user name is not a secret and is diagnostic, so it stays
-        // unless it carries a colon.
-        let ssh = head.ends_with("ssh://");
-        match authority.rsplit_once('@') {
-            Some((user, host)) if user.contains(':') || !ssh => {
-                let _ = user;
-                out.push_str("<credential removed>@");
-                out.push_str(host);
-            }
-            _ => out.push_str(authority),
+    let mut first = true;
+    for word in text.split_inclusive(char::is_whitespace) {
+        let _ = first;
+        first = false;
+        if !word.contains("://") {
+            out.push_str(word);
+            continue;
         }
-        // A token travels in a query as often as in user information
-        // (`https://host/path?access_token=...`), and a fragment is no safer, so everything from
-        // the first `?` or `#` goes too.
-        //
-        // How far it goes is the whole of this decision, and it is decided in two steps.
-        //
-        // First, where *this* URL ends: the earlier of a delimiter (whitespace or a quote) and the
-        // start of the next URL's own scheme. A message can hold two URLs with nothing but a comma
-        // between them, and reading the second as part of the first's path would carry its
-        // credential past this loop unredacted.
-        //
-        // Then, whether this URL has a query of its own. If it has, the removal runs from the `?`
-        // or `#` all the way to the delimiter rather than to the end of this URL: a query can hold
-        // another URL (`?next=https://elsewhere/&access_token=...`), and stopping at that nested
-        // URL would leave what followed it, which is where the token was. Text after a query in
-        // the same word goes with it, because a query's own terminator cannot be told from a
-        // token's content, and losing the tail of a diagnostic is the safe direction.
-        let delimiter = tail.find(URL_ENDS_AT).unwrap_or(tail.len());
-        let ends_at = delimiter.min(next_scheme(tail));
-        match tail[..ends_at].find(['?', '#']) {
-            Some(query) => {
-                out.push_str(&tail[..query]);
-                out.push_str("<query removed>");
-                rest = &tail[delimiter..];
-            }
-            None => {
-                out.push_str(&tail[..ends_at]);
-                rest = &tail[ends_at..];
-            }
+        // The word as the message wrote it, and what is left after the punctuation a message wraps
+        // a URL in. Git quotes a URL in single quotes and a person may have put it in brackets.
+        let trailing = word.len() - word.trim_end().len();
+        let (body, space) = word.split_at(word.len() - trailing);
+        let stripped = body.trim_matches(|character: char| {
+            matches!(
+                character,
+                '\'' | '"' | '(' | ')' | '[' | ']' | '<' | '>' | ',' | ';' | '.'
+            )
+        });
+        if vouched_for(stripped) {
+            out.push_str(body);
+        } else {
+            out.push_str(&replacement(body));
         }
+        out.push_str(space);
     }
-    out.push_str(rest);
     out
 }
 
-/// The characters one URL's authority ends at.
+/// Returns whether one word is a URL this host is willing to repeat.
 ///
-/// The path, query and fragment separators, and the characters a URL cannot contain at all. An
-/// apostrophe is deliberately absent, for the reason [`URL_ENDS_AT`] gives.
-const AUTHORITY_ENDS_AT: [char; 8] = ['/', '?', '#', ' ', '\t', '\n', '\r', '"'];
+/// Every condition here is one a credential can travel in, and the word has to fail all of them.
+/// One `://`, so a word is one URL rather than a key with a URL inside it or two URLs run
+/// together. A scheme this service actually uses, which is what tells a URL from a configuration
+/// key that happens to parse as one (`diff.https://…` has scheme `diff.https`). No password, no
+/// query, no fragment. No user name, except a bare one on an `ssh` URL, which is a login name
+/// rather than a secret and is the most useful thing in the message. And nothing in the path that
+/// a credential could sit in, because a non-special scheme puts everything after the first `/` in
+/// the path.
+fn vouched_for(word: &str) -> bool {
+    if word.matches("://").count() != 1 {
+        return false;
+    }
+    let Ok(parsed) = url::Url::parse(word) else {
+        return false;
+    };
+    if !matches!(parsed.scheme(), "https" | "http" | "ssh" | "git" | "file") {
+        return false;
+    }
+    if parsed.password().is_some() || parsed.query().is_some() || parsed.fragment().is_some() {
+        return false;
+    }
+    if !parsed.username().is_empty() && parsed.scheme() != "ssh" {
+        return false;
+    }
+    !parsed.path().contains(['@', ':'])
+}
 
-/// The characters a URL in a message cannot contain, and therefore ends at.
-///
-/// Whitespace and a double quote, and nothing else. What is *not* here matters more than what is:
-/// an apostrophe is a legal sub-delimiter, so `https://o'brien:token@host/` is one URL and a scan
-/// that stopped at the apostrophe would never reach the `@` that says where the credential ends.
-/// The same goes for a query: `?token=a'b` is one query. A URL this host has to quote in a message
-/// is quoted with `"`, and anything a URL legitimately holds must be percent-encoded, so these
-/// three are the whole of the set.
-const URL_ENDS_AT: [char; 5] = [' ', '\t', '\n', '\r', '"'];
-
-/// Returns where the next URL's scheme begins, or the length of the text when there is none.
-///
-/// A scheme is the run of scheme characters immediately before a `://`, so what this returns is
-/// that run's start rather than the `://` itself. The answer is always a character boundary: the
-/// character *after* the last one that cannot be part of a scheme, which is found by its own
-/// length rather than by adding one to its offset.
-fn next_scheme(text: &str) -> usize {
-    text.find("://").map_or(text.len(), |marker| {
-        let head = &text[..marker];
-        head.char_indices()
-            .rev()
-            .find(|(_, character)| {
-                !(character.is_ascii_alphanumeric()
-                    || *character == '+'
-                    || *character == '-'
-                    || *character == '.')
-            })
-            .map_or(0, |(offset, character)| offset + character.len_utf8())
-    })
+/// Returns the stand-in for one piece of text this host will not repeat.
+fn replacement(text: &str) -> String {
+    let digest = kr_cbor::sha256(text.as_bytes());
+    let mut fingerprint = String::with_capacity(16);
+    for byte in &digest[..8] {
+        fingerprint.push_str(&format!("{byte:02x}"));
+    }
+    format!(
+        "<a value of {} characters this host does not repeat, {fingerprint}>",
+        text.chars().count()
+    )
 }
 
 /// What a bounded read produced.
@@ -1762,72 +1744,55 @@ fn parse_version(reported: &str) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_second_url_in_one_message_is_redacted_as_well_as_the_first() {
-        // The scan for the next URL starts where this one ends, and a message can hold two with
-        // nothing but a comma between them. Treating the second as part of the first's path would
-        // leave its credential in the message.
-        let redacted =
-            super::redact("url.https://a.invalid/p,https://user:VERYSECRET@b.invalid/x.insteadof");
-        assert!(
-            !redacted.contains("VERYSECRET"),
-            "the second URL's credential goes too: {redacted}"
-        );
-        assert!(
-            redacted.contains("a.invalid/p"),
-            "and the first URL is still legible: {redacted}"
-        );
-        // A query goes with everything after it, because a query's own terminator cannot be told
-        // from a token's content.
-        let redacted = super::redact("https://a.invalid/p?access_token=VERYSECRET");
-        assert!(!redacted.contains("VERYSECRET"), "{redacted}");
-        assert!(redacted.contains("<query removed>"), "{redacted}");
-        // A query can hold another URL, and what followed it was the token. A query therefore
-        // goes all the way to the end of the word rather than to the nested URL.
-        let redacted = super::redact(
-            "https://a.invalid/p?next=https://b.invalid/x&access_token=VERYSECRET after",
-        );
-        assert!(!redacted.contains("VERYSECRET"), "{redacted}");
-        assert!(redacted.ends_with(" after"), "{redacted}");
-        // A boundary that falls inside a multi-byte character is not a boundary. This used to
-        // split one.
-        let redacted =
-            super::redact("https://a.invalid/p,\u{e9}https://user:VERYSECRET@b.invalid/x");
-        assert!(!redacted.contains("VERYSECRET"), "{redacted}");
-        // A query belongs to the URL it is part of. One URL's query must not decide how the
-        // *next* URL is read, or the next URL's credential travels in the part that is copied
-        // verbatim.
-        let redacted =
-            super::redact("url.https://a.invalid/p,https://user:VERYSECRET@b.invalid/x?q=1");
-        assert!(
-            !redacted.contains("VERYSECRET"),
-            "a second URL with a query of its own is still redacted: {redacted}"
-        );
-        // A first URL with no path at all: the first slash in the text belongs to the *second*
-        // URL's own `://`, so the authority scan has to stop before it.
-        let redacted = super::redact("https://a.invalid,https://user:VERYSECRET@b.invalid/x?q=1");
-        assert!(
-            !redacted.contains("VERYSECRET"),
-            "a second URL is found even when the first has no path: {redacted}"
-        );
-        assert!(redacted.contains("a.invalid"), "{redacted}");
-        // An apostrophe is a legal sub-delimiter, in user information and in a query alike, so a
-        // scan that stopped at one would never reach the `@` that ends the credential.
-        let redacted = super::redact("https://o'brien:VERYSECRET@b.invalid/x");
-        assert!(
-            !redacted.contains("VERYSECRET"),
-            "an apostrophe in user information is part of the URL: {redacted}"
-        );
-        let redacted = super::redact("https://b.invalid/x?access_token=prefix'VERYSECRET");
-        assert!(
-            !redacted.contains("VERYSECRET"),
-            "and part of a query: {redacted}"
-        );
-        // Text that holds no URL is returned as it is.
-        assert_eq!(super::redact("no url here"), "no url here");
-    }
-
     use super::*;
+
+    #[test]
+    fn nothing_a_parser_cannot_vouch_for_survives_a_message() {
+        // Ten reviews of this service each found one more shape a URL scan read wrongly. What
+        // replaced the scan is a decision: a word holding `://` is repeated only when a parser
+        // says it is a URL and that URL carries nothing a credential travels in.
+        let shapes = [
+            "url.https://a.invalid/p,https://user:VERYSECRET@b.invalid/x.insteadof",
+            "https://a.invalid/p?access_token=VERYSECRET",
+            "https://a.invalid/p?next=https://b.invalid/x&access_token=VERYSECRET after",
+            "https://a.invalid/p,\u{e9}https://user:VERYSECRET@b.invalid/x",
+            "https://a.invalid,https://user:VERYSECRET@b.invalid/x?q=1",
+            "https://o'brien:VERYSECRET@b.invalid/x",
+            "https://b.invalid/x?access_token=prefix'VERYSECRET",
+            "fatal: bad boolean config value 'invalid' for \
+             'diff.https://b.invalid/x?next=\"quoted\"&access_token=VERYSECRET.binary'",
+            "ssh://user:VERYSECRET@b.invalid/x",
+            "https://VERYSECRET@b.invalid/x",
+            "https://VERYSECRET:x-oauth-basic@b.invalid/x",
+        ];
+        for shape in shapes {
+            let redacted = super::redact(shape);
+            assert!(
+                !redacted.contains("VERYSECRET"),
+                "nothing a parser cannot vouch for survives: {shape} became {redacted}"
+            );
+            assert!(
+                redacted.contains("this host does not repeat"),
+                "and what it replaced is named: {shape} became {redacted}"
+            );
+        }
+        // What a person needs to read survives, quoted or not: a URL with no user information, no
+        // query and no fragment is a URL this host will repeat.
+        for plain in [
+            "https://github.com/user/repo.git",
+            "fatal: repository 'https://github.com/user/repo.git' not found",
+            "ssh://git@github.com/user/repo.git",
+        ] {
+            let redacted = super::redact(plain);
+            assert_eq!(
+                redacted, plain,
+                "a URL with nothing in it to hide is repeated"
+            );
+        }
+        // Text that holds no URL is returned as it is, whitespace and all.
+        assert_eq!(super::redact("no url here"), "no url here");
+        assert_eq!(super::redact("  spaced\tout\n"), "  spaced\tout\n");
+    }
 
     #[test]
     fn a_version_is_read_from_what_git_prints_on_every_platform() {
@@ -2103,34 +2068,39 @@ mod tests {
 
     #[test]
     fn a_credential_in_a_diagnostic_is_removed_rather_than_shown() {
-        assert_eq!(
-            redact("fatal: could not read https://user:secret@example.invalid/x.git"),
-            "fatal: could not read https://<credential removed>@example.invalid/x.git"
+        // What a message may repeat is what a parser can vouch for. Everything else is replaced
+        // whole, so the shape it was in does not matter.
+        for carrying in [
+            "fatal: could not read https://user:secret@example.invalid/x.git",
+            // A token is often the *user* of an https URL, so user information goes whether or not
+            // it has a password half.
+            "fatal: https://ghp_TOKEN:x-oauth-basic@example.invalid/x.git",
+            "fatal: https://ghp_TOKEN@example.invalid/x.git",
+            // An ssh user name that carries a secret.
+            "ssh://git:secret@example.invalid/x.git",
+        ] {
+            let redacted = redact(carrying);
+            for secret in ["secret", "ghp_TOKEN"] {
+                assert!(!redacted.contains(secret), "{carrying} became {redacted}");
+            }
+            assert!(redacted.contains("this host does not repeat"), "{redacted}");
+            assert!(
+                redacted.starts_with("fatal") || redacted.starts_with('<'),
+                "the rest of the message is still there: {redacted}"
+            );
+        }
+        // Two credentials on one line are both covered, and the words between them are not.
+        let redacted = redact(
+            "first https://one:SECRETA@one.invalid/x then https://two:SECRETB@two.invalid/y",
         );
-        // A token is often the *user* of an https URL, so the whole user information goes rather
-        // than the password half of it.
-        assert_eq!(
-            redact("fatal: https://ghp_TOKEN:x-oauth-basic@example.invalid/x.git"),
-            "fatal: https://<credential removed>@example.invalid/x.git"
-        );
-        assert_eq!(
-            redact("fatal: https://ghp_TOKEN@example.invalid/x.git"),
-            "fatal: https://<credential removed>@example.invalid/x.git"
-        );
-        // Two URLs on one line are both covered.
-        assert_eq!(
-            redact("https://a:b@one.invalid/x https://c:d@two.invalid/y"),
-            "https://<credential removed>@one.invalid/x https://<credential removed>@two.invalid/y"
-        );
+        assert!(!redacted.contains("SECRETA"), "{redacted}");
+        assert!(!redacted.contains("SECRETB"), "{redacted}");
+        assert!(redacted.starts_with("first "), "{redacted}");
+        assert!(redacted.contains(" then "), "{redacted}");
         // An ssh user name is not a secret and is diagnostic, so it stays.
         assert_eq!(
             redact("ssh://git@example.invalid/x.git"),
             "ssh://git@example.invalid/x.git"
-        );
-        // Unless it carries one.
-        assert_eq!(
-            redact("ssh://git:secret@example.invalid/x.git"),
-            "ssh://<credential removed>@example.invalid/x.git"
         );
         assert_eq!(redact("nothing to redact"), "nothing to redact");
     }

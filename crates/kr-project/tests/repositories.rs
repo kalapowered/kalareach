@@ -919,6 +919,44 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
         "nor claim it removed one: {:?}",
         operation.removed_staging_paths
     );
+    // And a record that says this host *did* remove a directory is history rather than occupancy:
+    // an earlier recovery removed it and the operation never closed. Forgetting an absence must
+    // not take that away.
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE operations SET state = 'staging', ended_at_ms = NULL WHERE action_id = ?1",
+            rusqlite::params![cloned.operation.action_id.get().as_bytes().to_vec()],
+        )
+        .expect("the row is unfinished again");
+    journal
+        .execute(
+            "INSERT INTO operation_paths (action_id, path, removed) VALUES (?1, ?2, 1)
+             ON CONFLICT (action_id, path) DO UPDATE SET removed = 1",
+            rusqlite::params![
+                cloned.operation.action_id.get().as_bytes().to_vec(),
+                fixture.work().join(&absent).display().to_string(),
+            ],
+        )
+        .expect("an earlier recovery's removal is recorded");
+    drop(journal);
+    let replacement = fixture.reopen();
+    replacement.recover().expect("recovery runs again");
+    let operation = replacement
+        .read_operation(cloned.operation.action_id)
+        .expect("the operation reads");
+    assert!(
+        operation
+            .removed_staging_paths
+            .iter()
+            .any(|path| path.ends_with(&absent)),
+        "a removal this host did make is still on the record: {:?}",
+        operation.removed_staging_paths
+    );
     assert!(
         operation
             .detail

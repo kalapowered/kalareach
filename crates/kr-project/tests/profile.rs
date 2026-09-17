@@ -697,6 +697,34 @@ fn a_configuration_key_that_carries_a_credential_is_not_repeated_in_a_diagnostic
         limitations.contains(".insteadof"),
         "and the leaf still says which key it was: {limitations}"
     );
+    // The fingerprint is what tells two replaced names apart, so it has to be there and the two
+    // url keys' replacements have to differ.
+    let fingerprints: Vec<&str> = limitations
+        .split("does not repeat, ")
+        .skip(1)
+        .filter_map(|tail| tail.split('>').next())
+        .collect();
+    assert!(
+        fingerprints.len() >= 3,
+        "every replaced name carries one: {limitations}"
+    );
+    for fingerprint in &fingerprints {
+        assert_eq!(fingerprint.len(), 16, "of a fixed length: {fingerprint}");
+        assert!(
+            fingerprint
+                .chars()
+                .all(|character| character.is_ascii_hexdigit()),
+            "of the digest's own bytes: {fingerprint}"
+        );
+    }
+    let mut distinct = fingerprints.clone();
+    distinct.sort_unstable();
+    distinct.dedup();
+    assert_eq!(
+        distinct.len(),
+        fingerprints.len(),
+        "and two different names are two different fingerprints: {fingerprints:?}"
+    );
     assert!(
         limitations.contains("the filter driver <a name of"),
         "a driver's own name is a subsection too: {limitations}"
