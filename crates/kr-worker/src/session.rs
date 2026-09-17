@@ -273,7 +273,7 @@ impl Session {
     ///
     /// Returns an error when the terminal cannot be created. A journal that cannot be opened is
     /// recorded rather than fatal: an authorised stop must still work without one.
-    pub fn open(config: SessionConfig) -> Result<Self> {
+    pub fn open(mut config: SessionConfig) -> Result<Self> {
         // The creation geometry is admitted here rather than only inside the terminal, so a
         // request that breaks more than one of section 8's three constraints is told about all of
         // them at once instead of one refusal at a time.
@@ -357,6 +357,13 @@ impl Session {
                 }
             }
         }
+        let watch = crate::desktop::Watch::bind(config.worker_profile, &config.desktop);
+        // What the watch settled on is what the session reports. A record that named no desktop
+        // while the watch was bound to one would have the closure, the status read and the watch
+        // disagreeing about which desktop this session belongs to.
+        if let Some(bound) = watch.bound_binding() {
+            config.desktop = bound;
+        }
         Ok(Self {
             attachments: AttachmentTable::new(config.dimensions),
             state: SessionState::Creating,
@@ -378,10 +385,11 @@ impl Session {
             owned: None,
             root_exit: None,
             content_scopes: std::collections::BTreeMap::new(),
-            // Bound before the shell starts, from the desktop the create request recorded. A
-            // desktop that has already gone by now is a session that never had one, and the watch
-            // says so from the first question rather than from a change it would never see.
-            desktop: crate::desktop::Watch::bind(config.worker_profile, &config.desktop),
+            // Bound before the shell starts, from the desktop the create request recorded, or
+            // from the login session this worker is in where the request recorded none. A desktop
+            // that has already gone by now is a session that never had one, and the watch says so
+            // from the first question rather than from a change it would never see.
+            desktop: watch,
             engine,
             restoration_losses: crate::render::Carried::default(),
             forwarding_held: std::collections::BTreeMap::new(),

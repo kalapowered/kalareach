@@ -313,13 +313,47 @@ impl Watch {
         if profile != WorkerProfile::DesktopBound {
             return Self::none();
         }
+        let live = current();
         if !recorded.desktop_session_id.is_present() && !recorded.login_generation.is_present() {
-            // Nothing was recorded, so this session is bound to no desktop and cannot lose one.
-            return Self::none();
+            // The record names no desktop, and a desktop-bound session is still in one: the login
+            // session its worker was started in, read here. A session that watched nothing because
+            // a reading failed a moment earlier would be a desktop-bound session that could not
+            // lose its desktop.
+            return match live {
+                Reading::Desktop(live) => Self {
+                    bound: Some(Bound {
+                        recorded: binding_of(&live),
+                        anchor: live.anchor,
+                    }),
+                    lost: false,
+                    asked: None,
+                },
+                // The platform says there is no graphical login, and this session was created for
+                // one.
+                Reading::None => Self {
+                    bound: None,
+                    lost: true,
+                    asked: None,
+                },
+                // Nothing to bind to yet and nothing established. The next question asks again.
+                Reading::Unavailable => Self {
+                    bound: Some(Bound {
+                        recorded: DesktopBinding::none(),
+                        anchor: None,
+                    }),
+                    lost: false,
+                    asked: None,
+                },
+            };
         }
-        let (anchor, lost) = match current() {
-            Reading::Desktop(live) if describes(&live, recorded) => (live.anchor, false),
-            Reading::Desktop(_) | Reading::None => (None, true),
+        let (anchor, lost) = match live {
+            Reading::Desktop(live) => match describes(&live, recorded) {
+                Some(true) => (live.anchor, false),
+                Some(false) => (None, true),
+                // A reading this host cannot compare with the record establishes nothing.
+                None => (None, false),
+            },
+            Reading::None => (None, true),
             Reading::Unavailable => (None, false),
         };
         Self {
@@ -330,6 +364,19 @@ impl Watch {
             lost,
             asked: None,
         }
+    }
+
+    /// Returns the desktop this watch is bound to, as a session record carries it.
+    ///
+    /// A session whose create request recorded no desktop is bound to the one its worker was
+    /// started in, and this is what it reports, so the record, the closure and `kr status` all
+    /// name the same desktop.
+    #[must_use]
+    pub fn bound_binding(&self) -> Option<DesktopBinding> {
+        self.bound
+            .as_ref()
+            .map(|bound| bound.recorded.clone())
+            .filter(|recorded| recorded.desktop_session_id.is_present())
     }
 
     /// Returns whether the desktop this session was bound to has gone.
@@ -345,6 +392,30 @@ impl Watch {
         let Some(bound) = self.bound.as_ref() else {
             return false;
         };
+        // A watch with nothing to compare against yet takes the first reading it can get, on the
+        // slower cadence, because taking it costs a conversation with the platform.
+        if !bound.recorded.desktop_session_id.is_present()
+            && !bound.recorded.login_generation.is_present()
+        {
+            if self
+                .asked
+                .is_some_and(|asked| now.saturating_duration_since(asked) < REREAD_INTERVAL)
+            {
+                return false;
+            }
+            self.asked = Some(now);
+            match current() {
+                Reading::Desktop(live) => {
+                    if let Some(bound) = self.bound.as_mut() {
+                        bound.recorded = binding_of(&live);
+                        bound.anchor = live.anchor;
+                    }
+                }
+                Reading::None => self.lost = true,
+                Reading::Unavailable => {}
+            }
+            return self.lost;
+        }
         let interval = if bound.anchor.is_some() {
             RECHECK_INTERVAL
         } else {
@@ -366,12 +437,16 @@ impl Watch {
             // desktop, or none at all, is a desktop that has ended; one the platform would not
             // give leaves the answer where it was.
             Presence::Unknown => match current() {
-                Reading::Desktop(live) if describes(&live, &bound.recorded) => {
-                    if let Some(bound) = self.bound.as_mut() {
-                        bound.anchor = live.anchor;
+                Reading::Desktop(live) => match describes(&live, &bound.recorded) {
+                    Some(true) => {
+                        if let Some(bound) = self.bound.as_mut() {
+                            bound.anchor = live.anchor;
+                        }
                     }
-                }
-                Reading::Desktop(_) | Reading::None => self.lost = true,
+                    Some(false) => self.lost = true,
+                    None => {}
+                },
+                Reading::None => self.lost = true,
                 Reading::Unavailable => {}
             },
         }
@@ -387,22 +462,34 @@ impl Watch {
     }
 }
 
-/// Returns whether a live reading describes the desktop a create request recorded.
+/// Returns whether a live reading describes the desktop a record names.
 ///
 /// The name is the whole identity, so where one was recorded the name decides. A record that
 /// carries only a generation, which a host whose boot identity would not fit in a name produces,
 /// is compared on the generation, and a generation that has moved is a different login.
-fn describes(live: &Login, recorded: &DesktopBinding) -> bool {
+///
+/// `None` means this host could not tell: without the boot it is running in there is no name to
+/// compare, and a comparison that guessed would either close a live session or go on watching a
+/// desktop that had gone.
+#[must_use]
+pub fn describes(live: &Login, recorded: &DesktopBinding) -> Option<bool> {
     if let Some(name) = recorded.desktop_session_id.as_ref() {
-        let live_name = kr_ipc::identity::boot_identity()
-            .ok()
-            .and_then(|boot| derive_name(live, kr_ipc::paths::current_uid(), &os_user(), &boot));
-        return live_name.as_ref() == Some(name);
+        let boot = kr_ipc::identity::boot_identity().ok()?;
+        let live_name = derive_name(live, kr_ipc::paths::current_uid(), &os_user(), &boot);
+        return Some(live_name.as_ref() == Some(name));
     }
     match recorded.login_generation.as_ref() {
-        Some(generation) => live.generation == Some(generation.get()),
-        None => true,
+        Some(generation) => Some(live.generation == Some(generation.get())),
+        None => Some(true),
     }
+}
+
+/// Returns the binding one live reading would be recorded as.
+fn binding_of(live: &Login) -> DesktopBinding {
+    let Ok(boot) = kr_ipc::identity::boot_identity() else {
+        return DesktopBinding::none();
+    };
+    binding(&from_login(live, WorkerProfile::DesktopBound, boot))
 }
 
 #[cfg(test)]
@@ -531,10 +618,32 @@ mod tests {
     }
 
     #[test]
-    fn a_session_bound_to_no_desktop_cannot_lose_one() {
+    fn a_record_that_names_no_desktop_binds_to_the_one_the_worker_is_in() {
         let mut watch = Watch::bind(WorkerProfile::DesktopBound, &DesktopBinding::none());
-        assert!(!watch.lost(Instant::now()));
-        assert!(watch.bound_name().is_none());
+        let now = Instant::now();
+        match current() {
+            // This host has a desktop, so that is the one to watch: a desktop-bound session with
+            // nothing recorded is still in a login session, and one that watched nothing could
+            // never report losing it.
+            Reading::Desktop(_) => {
+                assert!(!watch.lost(now));
+                assert!(
+                    watch.bound_name().is_some(),
+                    "the watch adopted the desktop this worker is in"
+                );
+                assert!(
+                    watch
+                        .bound_binding()
+                        .is_some_and(|binding| binding.desktop_session_id.is_present()
+                            && binding.login_generation.is_present()),
+                    "and reports it as a session record carries it"
+                );
+            }
+            // The platform says there is no graphical login, and this session was created for one.
+            Reading::None => assert!(watch.lost(now)),
+            // Nothing established either way.
+            Reading::Unavailable => assert!(!watch.lost(now)),
+        }
     }
 
     #[test]

@@ -166,6 +166,23 @@ pub fn answer(capability: &str, desktop: &DesktopContext) -> Answer {
         };
     }
     let tool = facility(capability, desktop.display_server);
+    // Starting an application on a desktop this context is in needs no permission on any of these
+    // platforms, so a present launcher settles it wherever the desktop is.
+    if capability == capabilities::APPLICATION_LAUNCH {
+        return match tool {
+            Some(tool) => Answer {
+                state: CapabilityState::QualifiedAvailable,
+                evidence: CapabilityEvidenceSource::PlatformQuery,
+                reason: None,
+                tool: Some(tool),
+            },
+            None => Answer::refused(
+                CapabilityState::MissingInstallation,
+                CapabilityEvidenceSource::PlatformQuery,
+                "no installed launcher on this host starts an application on this desktop",
+            ),
+        };
+    }
     match desktop.display_server {
         DisplayServer::X11 | DisplayServer::Wayland | DisplayServer::Unknown => {
             decide_unix(capability, desktop, tool)
@@ -195,6 +212,20 @@ fn context_refusal(capability: &str, desktop: &DesktopContext) -> Option<Answer>
         ));
     }
     if !desktop.is_desktop() || !desktop.graphic_access {
+        // What a headless context means differs by platform, and the record says which one this
+        // is. Where the platform puts every one of a user's processes in that user's own
+        // interactive session, a headless profile supplies no desktop handles and promises nothing
+        // about the desktop, and it would be untrue to say the session cannot reach one.
+        #[cfg(windows)]
+        return Some(Answer::refused(
+            CapabilityState::NotTested,
+            CapabilityEvidenceSource::PlatformQuery,
+            "this session is in the headless user profile, which supplies no desktop handles and \
+             promises nothing about a desktop. This platform runs every one of a user's processes \
+             in that user's own interactive session, so nothing here establishes that the desktop \
+             cannot be reached either",
+        ));
+        #[cfg(not(windows))]
         return Some(Answer::refused(
             CapabilityState::TemporarilyUnavailable,
             CapabilityEvidenceSource::PlatformQuery,
@@ -347,29 +378,57 @@ pub fn decide_unix(capability: &str, desktop: &DesktopContext, tool: Option<Stri
             ),
         },
         DisplayServer::Wayland => match tool {
-            Some(tool) if wlroots(&compositor) => Answer {
-                state: CapabilityState::NotTested,
-                evidence: CapabilityEvidenceSource::NotProbed,
-                reason: Some(format!(
-                    "{named_compositor} implements the protocols {tool} uses for \
-                     {}, so no per-use permission stands in the way. Nothing here has run it, and \
-                     a tool can still be refused by a device permission or a missing service of \
-                     its own",
-                    wayland_route(capability)
-                )),
-                tool: Some(tool),
-            },
-            Some(tool) => Answer {
-                state: CapabilityState::PermissionRequired,
-                evidence: CapabilityEvidenceSource::PlatformQuery,
-                reason: Some(format!(
-                    "on Wayland {} goes through the compositor rather than the display server, \
-                     and {named_compositor} asks the user for it each time rather than granting \
-                     it to a tool",
-                    wayland_route(capability)
-                )),
-                tool: Some(tool),
-            },
+            Some(tool) => {
+                let route = wayland_route(capability);
+                match wayland_path(capability, &tool, &compositor) {
+                    // The compositor implements the protocol this tool uses, so nothing stands in
+                    // the way that a permission could remove. What is left is whether it works.
+                    WaylandPath::Protocol => Answer {
+                        state: CapabilityState::NotTested,
+                        evidence: CapabilityEvidenceSource::NotProbed,
+                        reason: Some(format!(
+                            "{named_compositor} implements the protocol {tool} uses for {route}, \
+                             so no per-use permission stands in the way. Nothing here has run it"
+                        )),
+                        tool: Some(tool),
+                    },
+                    // The tool asks the compositor's own portal, which asks the user each time.
+                    // That is a permission the platform itself establishes.
+                    WaylandPath::Portal => Answer {
+                        state: CapabilityState::PermissionRequired,
+                        evidence: CapabilityEvidenceSource::PlatformQuery,
+                        reason: Some(format!(
+                            "on Wayland {route} goes through the compositor rather than the \
+                             display server, and {tool} asks {named_compositor} for it through \
+                             the portal, which asks the user each time rather than granting it to \
+                             a tool"
+                        )),
+                        tool: Some(tool),
+                    },
+                    // The tool does not go through the compositor at all.
+                    WaylandPath::Device => Answer {
+                        state: CapabilityState::NotTested,
+                        evidence: CapabilityEvidenceSource::NotProbed,
+                        reason: Some(format!(
+                            "{tool} does not ask the compositor for {route}: it goes through its \
+                             own service and the input devices, which need their own permission. \
+                             Nothing here has run it"
+                        )),
+                        tool: Some(tool),
+                    },
+                    // A tool built for protocols this compositor family does not implement.
+                    WaylandPath::Unqualified => Answer {
+                        state: CapabilityState::NotTested,
+                        evidence: CapabilityEvidenceSource::NotProbed,
+                        reason: Some(format!(
+                            "{tool} uses a protocol for {route} that {named_compositor} may not \
+                             implement, and nothing here has run it, so this is not established \
+                             either way"
+                        )),
+                        tool: Some(tool),
+                    },
+                }
+            }
             None => Answer::refused(
                 CapabilityState::MissingInstallation,
                 CapabilityEvidenceSource::PlatformQuery,
@@ -406,11 +465,55 @@ fn wayland_route(capability: &str) -> &'static str {
     }
 }
 
-/// Returns whether a compositor is one of the family whose protocols the tools below use.
+/// How one tool reaches one capability on a Wayland desktop.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WaylandPath {
+    /// A Wayland protocol this compositor implements.
+    Protocol,
+    /// The desktop portal, which asks the user each time.
+    Portal,
+    /// The tool's own service and the input devices, rather than the compositor.
+    Device,
+    /// A protocol the compositor may not implement. Nothing here establishes which.
+    Unqualified,
+}
+
+/// Returns how one tool would reach one capability on this compositor.
+///
+/// The three routes a Wayland desktop offers are genuinely different, and which one a tool takes
+/// is a property of the tool rather than of the capability: a permission prompt cannot supply a
+/// protocol a compositor does not implement, and a tool that goes through the input devices is not
+/// asking the compositor for anything at all.
+fn wayland_path(capability: &str, tool: &str, compositor: &str) -> WaylandPath {
+    let tool = tool.rsplit('/').next().unwrap_or(tool);
+    if DEVICE_TOOLS.iter().any(|known| tool.contains(known)) {
+        return WaylandPath::Device;
+    }
+    if PORTAL_TOOLS.iter().any(|known| tool.contains(known)) {
+        return WaylandPath::Portal;
+    }
+    if !wlroots(compositor) {
+        return WaylandPath::Unqualified;
+    }
+    if capability == capabilities::ACCESSIBILITY {
+        // The accessibility bus is not a Wayland protocol, so a compositor family says nothing
+        // about it.
+        return WaylandPath::Unqualified;
+    }
+    WaylandPath::Protocol
+}
+
+/// Tools that reach the input devices through their own service rather than the compositor.
+const DEVICE_TOOLS: &[&str] = &["ydotool", "dotool"];
+
+/// Tools that ask the desktop portal, which asks the user each time.
+const PORTAL_TOOLS: &[&str] = &["gnome-screenshot", "spectacle", "xdg-desktop-portal"];
+
+/// Returns whether a compositor is one of the family whose protocols the tools above use.
 ///
 /// These compositors implement the screen-copy and virtual-input protocols directly, so a tool
-/// built for them needs no per-use permission. The list is a qualification rather than a guess:
-/// a compositor that is not on it is reported as needing the user's own permission.
+/// built for them is not waiting on a permission. The list is a qualification rather than a guess:
+/// a compositor that is not on it leaves the answer unestablished rather than claimed either way.
 fn wlroots(compositor: &str) -> bool {
     ["sway", "river", "hyprland", "wayfire", "labwc", "niri"]
         .iter()
@@ -496,19 +599,35 @@ fn runnable(path: &std::path::Path) -> bool {
     }
 }
 
-/// Returns the exact identity of an installed facility.
+/// Returns the identity of the file an answer was established about.
 ///
-/// Section 11 requires the record to name the exact thing the answer was established about, so
-/// that an installed upgrade invalidates it rather than silently changing what the record is
-/// about. The size and the modification time are what a replacement at the same path changes.
+/// Section 11 requires the record to name the exact thing the answer was about, so that an
+/// installed upgrade invalidates it rather than silently changing what the record describes. This
+/// is the file itself as the filesystem describes it: which file it is, how long it is and when it
+/// last changed, to the nanosecond the platform records. A replacement that matched all three
+/// would be indistinguishable from the original here, and this host says that this is what it
+/// compared rather than claiming to have read the contents.
 fn facility_identity(tool: Option<&String>) -> Option<String> {
     let metadata = std::fs::metadata(tool?).ok()?;
     let modified = metadata
         .modified()
         .ok()
         .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or_else(|| "unknown".to_owned(), |since| since.as_secs().to_string());
-    Some(format!("{} bytes, modified {modified}", metadata.len()))
+        .map_or_else(
+            || "an unknown time".to_owned(),
+            |since| format!("{}.{:09}", since.as_secs(), since.subsec_nanos()),
+        );
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::MetadataExt as _;
+        format!("file {}:{}, ", metadata.dev(), metadata.ino())
+    };
+    #[cfg(not(unix))]
+    let file = String::new();
+    Some(format!(
+        "{file}{} bytes, modified {modified}",
+        metadata.len()
+    ))
 }
 
 #[cfg(test)]

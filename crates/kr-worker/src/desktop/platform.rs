@@ -142,7 +142,20 @@ pub fn presence(anchor: Option<&ProcessStartIdentity>) -> Presence {
     };
     match kr_ipc::identity::process_state(anchor) {
         kr_ipc::identity::ProcessState::Running => Presence::Present,
-        kr_ipc::identity::ProcessState::Ended => Presence::Ended,
+        // A process the platform describes with no start value at all is a process it would not
+        // describe, and a comparison against that is not a death. This is the only place that can
+        // tell the two apart, because by the time the answer is "ended" the reason is gone.
+        kr_ipc::identity::ProcessState::Ended => {
+            let unreadable = u32::try_from(anchor.pid.get()).ok().is_some_and(|pid| {
+                kr_ipc::identity::process_start_identity(pid)
+                    .is_ok_and(|identity| identity.start_value.get() == 0)
+            });
+            if unreadable {
+                Presence::Unknown
+            } else {
+                Presence::Ended
+            }
+        }
         kr_ipc::identity::ProcessState::Unknown { .. } => Presence::Unknown,
     }
 }
@@ -158,17 +171,22 @@ pub fn read_login(uid: u32) -> Reading {
 enum Printed {
     /// It ran and succeeded.
     Output(String),
-    /// It ran and reported a failure, which is the platform answering.
-    Failed,
+    /// It ran and reported a failure, with what it said about it.
+    ///
+    /// A failure is an answer only when the platform said which failure it was. A facility that
+    /// could not reach its own service, or that refused for a reason of its own, has not
+    /// established that a login session is gone, and treating it as though it had would close a
+    /// live session.
+    Failed(String),
     /// It could not be run at all, so the platform was never asked.
     NotRun,
 }
 
 /// Runs a platform command and says what came of it.
 ///
-/// The difference between a command that failed and one that never ran is the whole of the
-/// distinction [`Reading`] exists for. Nothing here interpolates text into a command line: the
-/// argument vector is a vector.
+/// The difference between a command that failed and one that never ran is part of the distinction
+/// [`Reading`] exists for; the other part is what a failure said. Nothing here interpolates text
+/// into a command line: the argument vector is a vector.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn run(program: &str, arguments: &[&str]) -> Printed {
     let Ok(output) = std::process::Command::new(program)
@@ -181,8 +199,20 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
     if output.status.success() {
         Printed::Output(String::from_utf8_lossy(&output.stdout).into_owned())
     } else {
-        Printed::Failed
+        let mut said = String::from_utf8_lossy(&output.stderr).into_owned();
+        said.push_str(&String::from_utf8_lossy(&output.stdout));
+        Printed::Failed(said.to_ascii_lowercase())
     }
+}
+
+/// Returns whether a platform's own words say the thing asked about is not there.
+///
+/// Only these answers are absence. Everything else a facility can fail with — a service it could
+/// not reach, a permission it did not have, a version that does not know the question — leaves the
+/// question open.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn says_absent(said: &str, absent: &[&str]) -> bool {
+    absent.iter().any(|phrase| said.contains(phrase))
 }
 
 /// Reads the start identity of a login session's owning process.
@@ -220,8 +250,15 @@ mod implementation {
     pub(super) fn read_login(uid: u32) -> Reading {
         let printed = match run("/bin/launchctl", &["print", &format!("gui/{uid}")]) {
             Printed::Output(printed) => printed,
-            // The domain is not there, which is what a graphical logout leaves behind.
-            Printed::Failed => return Reading::None,
+            // The domain is not there, which is what a graphical logout leaves behind. Any other
+            // failure is this host not finding out.
+            Printed::Failed(said) => {
+                return if super::says_absent(&said, DOMAIN_ABSENT) {
+                    Reading::None
+                } else {
+                    Reading::Unavailable
+                };
+            }
             Printed::NotRun => return Reading::Unavailable,
         };
         let fields = super::domain_header(&printed);
@@ -271,8 +308,13 @@ mod implementation {
     ///
     /// The window server publishes the lock state in the device registry while the screen is
     /// locked and publishes nothing while it is not, so an absent key is an answer rather than a
-    /// failure. A registry this host cannot read at all is what `unknown` is for.
+    /// failure. What it publishes is about the console session, so it is an answer about this
+    /// session only while this session is the one at the console: with another user switched in,
+    /// the reading describes their screen and this host says it does not know.
     fn availability() -> DesktopAvailability {
+        if !at_the_console() {
+            return DesktopAvailability::Unknown;
+        }
         match run("/usr/sbin/ioreg", &["-n", "Root", "-d1", "-k", LOCK_KEY]) {
             Printed::Output(printed) => {
                 if printed
@@ -284,12 +326,31 @@ mod implementation {
                     DesktopAvailability::Available
                 }
             }
-            Printed::Failed | Printed::NotRun => DesktopAvailability::Unknown,
+            Printed::Failed(_) | Printed::NotRun => DesktopAvailability::Unknown,
         }
+    }
+
+    /// Returns whether this user is the one at the console.
+    ///
+    /// The console device belongs to the user whose session is at the machine's own screen, which
+    /// is the session the registry's lock state is about.
+    fn at_the_console() -> bool {
+        let Ok(metadata) = std::fs::metadata("/dev/console") else {
+            return false;
+        };
+        use std::os::unix::fs::MetadataExt as _;
+        metadata.uid() == kr_ipc::paths::current_uid()
     }
 
     /// The device-registry key the window server publishes while the screen is locked.
     const LOCK_KEY: &str = "CGSSessionScreenIsLocked";
+
+    /// What the service manager says when a graphical domain is not there.
+    const DOMAIN_ABSENT: &[&str] = &[
+        "could not find domain",
+        "no such process",
+        "domain does not",
+    ];
 }
 
 #[cfg(target_os = "linux")]
@@ -329,7 +390,14 @@ mod implementation {
         ) {
             Printed::Output(printed) => printed,
             // The manager answered that it has no such session, which is what a logout leaves.
-            Printed::Failed => return Reading::None,
+            // A manager that could not answer at all has established nothing.
+            Printed::Failed(said) => {
+                return if super::says_absent(&said, SESSION_ABSENT) {
+                    Reading::None
+                } else {
+                    Reading::Unavailable
+                };
+            }
             Printed::NotRun => return Reading::Unavailable,
         };
         let fields = super::key_values(&printed);
@@ -391,11 +459,27 @@ mod implementation {
                 .find(|(key, _)| key == "Display")
                 .map(|(_, value)| value)
                 .filter(|value| !value.is_empty())),
-            // The manager has no record of this user, so the user has no session.
-            Printed::Failed => Ok(None),
+            // The manager has no record of this user, so the user has no session. Anything else
+            // it failed with leaves the question open.
+            Printed::Failed(said) => {
+                if super::says_absent(&said, SESSION_ABSENT) {
+                    Ok(None)
+                } else {
+                    Err(())
+                }
+            }
             Printed::NotRun => Err(()),
         }
     }
+
+    /// What the login manager says when a user or a session is not there.
+    const SESSION_ABSENT: &[&str] = &[
+        "no such session",
+        "no session",
+        "no such user",
+        "no such device or address",
+        "not been found",
+    ];
 }
 
 #[cfg(windows)]
@@ -467,7 +551,7 @@ mod implementation {
             Printed::Output(printed) => Ok(super::task_rows(&printed)
                 .into_iter()
                 .find_map(|row| row.session)),
-            Printed::Failed | Printed::NotRun => Err(()),
+            Printed::Failed(_) | Printed::NotRun => Err(()),
         }
     }
 
@@ -487,7 +571,7 @@ mod implementation {
                 .into_iter()
                 .find(|row| row.session == Some(session))
                 .and_then(|row| row.pid)),
-            Printed::Failed | Printed::NotRun => Err(()),
+            Printed::Failed(_) | Printed::NotRun => Err(()),
         }
     }
 }
