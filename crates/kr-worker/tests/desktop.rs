@@ -988,28 +988,63 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
     }
     // What says a worker has gone is the kernel's answer about the process the descriptor recorded,
     // not an endpoint that stopped answering: a worker that dropped its socket and stayed would
-    // pass that. This run started these processes, so it waits for each of them and says which
-    // ones are left if they outlast the bound.
+    // pass that. Only an ended process is gone. A query the operating system would not answer
+    // establishes nothing either way, so it keeps waiting and is named with what it said if the
+    // bound passes.
     let deadline = std::time::Instant::now() + WORKER_EXIT_DEADLINE;
-    let mut running: Vec<String> = Vec::new();
+    let mut waiting: Vec<String> = Vec::new();
     loop {
-        running.clear();
+        waiting.clear();
         for (session_id, _, process) in &workers {
-            if kr_ipc::identity::process_state(process) == kr_ipc::identity::ProcessState::Running {
-                running.push(format!("{session_id} as {}", process.pid.get()));
+            let pid = process.pid.get();
+            match kr_ipc::identity::process_state(process) {
+                kr_ipc::identity::ProcessState::Ended => {}
+                kr_ipc::identity::ProcessState::Running => {
+                    if !has_exited_unreaped(process) {
+                        waiting.push(format!("{session_id} as {pid}, still running"));
+                    }
+                }
+                kr_ipc::identity::ProcessState::Unknown { detail } => {
+                    waiting.push(format!("{session_id} as {pid}, unanswered: {detail}"));
+                }
             }
         }
-        if running.is_empty() || std::time::Instant::now() >= deadline {
+        if waiting.is_empty() || std::time::Instant::now() >= deadline {
             break;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(
-        running.is_empty(),
-        "workers this test started were still running {WORKER_EXIT_DEADLINE:?} after they were \
-         asked to close: {}",
-        running.join(", ")
+        waiting.is_empty(),
+        "workers this test started had not ended {WORKER_EXIT_DEADLINE:?} after they were asked \
+         to close: {}",
+        waiting.join(", ")
     );
+}
+
+/// Returns whether a process has run to its end and is only waiting to be collected.
+///
+/// A worker is started by the supervision as a child of whatever process runs the daemon, which
+/// here is this test, and nothing collects it. On Linux such a process keeps its entry, and with it
+/// the start value it was recorded under, until its parent goes, so the recorded identity still
+/// matches and the kernel still describes it. Its own state is what separates that from a worker
+/// that is still working. No other platform this suite runs on describes a process that has ended.
+#[cfg(target_os = "linux")]
+fn has_exited_unreaped(process: &kr_protocol::identity::ProcessStartIdentity) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", process.pid.get())) else {
+        return false;
+    };
+    // The command is free text in brackets and can hold brackets and spaces of its own, so the
+    // state is the first field after the last bracket rather than the third field of the line.
+    let Some((_, after_command)) = stat.rsplit_once(')') else {
+        return false;
+    };
+    after_command.split_whitespace().next() == Some("Z")
+}
+
+#[cfg(not(target_os = "linux"))]
+const fn has_exited_unreaped(_process: &kr_protocol::identity::ProcessStartIdentity) -> bool {
+    false
 }
 
 /// How long a worker this test closed is given to end.
