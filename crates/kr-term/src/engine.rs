@@ -1360,8 +1360,30 @@ impl Engine {
     ///
     /// Any held text tail is released first, so the snapshot describes a settled screen.
     pub fn snapshot(&mut self, viewport: Viewport, now_ms: u64) -> (Snapshot, FeedOutcome) {
+        let (mut snapshot, settled) = self.snapshot_without_rows(viewport, now_ms);
+        snapshot.rows = self.grid.visible_rows();
+        snapshot.inactive_rows = self.grid.inactive_rows();
+        snapshot.hyperlinks = hyperlinks_of(&snapshot.rows);
+        (snapshot, settled)
+    }
+
+    /// Takes a snapshot for `viewport` with its row vectors left empty.
+    ///
+    /// Everything a screen is apart from its rows: the cursor, the modes, the palette, the titles
+    /// and the retention of both buffers. [`Self::snapshot`] fills the rows in, and this exists for
+    /// the caller that converts them into something else. Both screens together are as large as the
+    /// session budget allows a screen to be, so a caller that took the whole snapshot and then
+    /// built wire pages from it would hold the session twice at once; it reads the rows through
+    /// [`Self::rows_within`] a bounded run at a time instead.
+    ///
+    /// `hyperlinks` is empty here for the same reason: it is read from the rows.
+    pub fn snapshot_without_rows(
+        &mut self,
+        viewport: Viewport,
+        now_ms: u64,
+    ) -> (Snapshot, FeedOutcome) {
         let settled = self.quiesce(now_ms);
-        let rows = self.grid.visible_rows();
+        let rows = Vec::new();
         let (oldest, _) = self.grid.stable_range();
         // The other buffer's own retention, because a client is sent both buffers' rows and each
         // buffer gives up rows on its own terms.
@@ -1405,17 +1427,36 @@ impl Engine {
                 window: self.titles.window().to_owned(),
             },
             title_stack: self.titles.entries().to_vec(),
-            hyperlinks: hyperlinks_of(&rows),
+            hyperlinks: Vec::new(),
             hyperlink: self.grid.pen_hyperlink(),
             palette: self.palette_snapshot(),
             rows,
-            inactive_rows: self.grid.inactive_rows(),
+            inactive_rows: Vec::new(),
             oldest_retained_row: oldest,
             evicted: oldest > 0,
             inactive_oldest_retained_row: inactive_oldest,
             inactive_evicted: inactive_oldest > 0,
         };
         (snapshot, settled)
+    }
+
+    /// A bounded run of one buffer's visible rows, starting at the `first` visible row.
+    ///
+    /// The buffer is named by identity rather than by whether it is showing, because a client is
+    /// sent both and each page says which one it carries. An empty answer means the buffer has no
+    /// row at or after `first`, which is how a caller reading run after run knows it has them all.
+    #[must_use]
+    pub fn rows_within(
+        &self,
+        buffer: ActiveBuffer,
+        first: usize,
+        max_rows: usize,
+    ) -> Vec<crate::grid::GridRow> {
+        if buffer == self.active_buffer() {
+            self.grid.visible_rows_within(first, max_rows)
+        } else {
+            self.grid.inactive_rows_within(first, max_rows)
+        }
     }
 
     /// The cursor each buffer has saved, primary first.

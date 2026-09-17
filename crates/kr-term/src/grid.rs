@@ -1492,14 +1492,47 @@ impl CanonicalGrid {
         self.rows_of(self.terminal.inactive_screen())
     }
 
+    /// A bounded run of the active buffer's visible rows, starting at the `first` visible row.
+    ///
+    /// The whole page is a copy of everything the screen holds, which is as much as a screen is
+    /// allowed to hold. A caller that converts the rows into something else - wire pages, a
+    /// rendering - would then hold the screen twice at once, so it reads the rows a run at a time
+    /// instead and gives each run back as soon as it has converted it. An empty answer means there
+    /// are no rows at or after `first`.
+    #[must_use]
+    pub fn visible_rows_within(&self, first: usize, max_rows: usize) -> Vec<GridRow> {
+        self.rows_within(self.terminal.screen(), first, max_rows)
+    }
+
+    /// A bounded run of the inactive buffer's visible rows, starting at the `first` visible row.
+    #[must_use]
+    pub fn inactive_rows_within(&self, first: usize, max_rows: usize) -> Vec<GridRow> {
+        self.rows_within(self.terminal.inactive_screen(), first, max_rows)
+    }
+
     fn rows_of(&self, screen: &wezterm_term::screen::Screen) -> Vec<GridRow> {
+        self.rows_within(screen, 0, self.size.rows as usize)
+    }
+
+    fn rows_within(
+        &self,
+        screen: &wezterm_term::screen::Screen,
+        first: usize,
+        max_rows: usize,
+    ) -> Vec<GridRow> {
         let rows = i64::from(self.size.rows);
-        let lines = screen.lines_in_phys_range(screen.phys_range(&(0..rows)));
+        let start = i64::try_from(first).unwrap_or(rows).min(rows);
+        let end =
+            i64::try_from(max_rows).map_or(rows, |wanted| start.saturating_add(wanted).min(rows));
+        if start >= end {
+            return Vec::new();
+        }
+        let lines = screen.lines_in_phys_range(screen.phys_range(&(start..end)));
         lines
             .iter()
             .enumerate()
             .map(|(index, line)| {
-                let visible = i64::try_from(index).unwrap_or(0);
+                let visible = start.saturating_add(i64::try_from(index).unwrap_or(0));
                 let stable = screen.visible_row_to_stable_row(visible);
                 let (runs, truncated) = runs_of(line, self.config.row_bytes);
                 GridRow {

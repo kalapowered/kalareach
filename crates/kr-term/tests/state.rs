@@ -291,6 +291,55 @@ fn a_snapshot_carries_the_buffer_that_is_not_showing() {
     assert!(first_inactive < first_active);
 }
 
+/// The rows of either buffer can be read a bounded run at a time, and the runs are the screen.
+///
+/// A caller converting a screen into something else reads it this way rather than taking every row
+/// at once, so that the session is never held twice over. What it gets that way has to be exactly
+/// what the whole screen is: the same rows, in the same order, with the same identifiers.
+#[test]
+fn a_buffers_rows_can_be_read_a_run_at_a_time() {
+    let mut engine = Engine::new(EngineConfig {
+        size: GridSize::new(12, 6),
+        ..EngineConfig::DEFAULT
+    })
+    .expect("engine");
+    let view = viewport(&engine);
+    engine.feed(b"one\r\ntwo\r\nthree\r\nfour\r\nfive", 0);
+    engine.feed(b"\x1b[?1049h\x1b[2J\x1b[Hediting\r\nhere", 0);
+    let (snapshot, _) = engine.snapshot(view, 0);
+
+    for (buffer, whole) in [
+        (ActiveBuffer::Alternate, &snapshot.rows),
+        (ActiveBuffer::Primary, &snapshot.inactive_rows),
+    ] {
+        let mut walked = Vec::new();
+        let mut first = 0;
+        loop {
+            let run = engine.rows_within(buffer, first, 4);
+            if run.is_empty() {
+                break;
+            }
+            assert!(run.len() <= 4, "a run is bounded by what was asked for");
+            first += run.len();
+            walked.extend(run);
+        }
+        assert_eq!(
+            text_of(&walked),
+            text_of(whole),
+            "{buffer:?} read a run at a time is the buffer read whole"
+        );
+        assert_eq!(
+            walked.iter().map(|row| row.stable_id).collect::<Vec<_>>(),
+            whole.iter().map(|row| row.stable_id).collect::<Vec<_>>(),
+            "and every row keeps the identifier it has on the screen"
+        );
+    }
+    assert!(
+        engine.rows_within(ActiveBuffer::Primary, 6, 4).is_empty(),
+        "a run past the last row is empty, which is how a caller knows it has them all"
+    );
+}
+
 /// A row that scrolls keeps the columns the pinned width model gave it, including for scalars the
 /// grid library's own clustering would fold into one cell.
 #[test]
