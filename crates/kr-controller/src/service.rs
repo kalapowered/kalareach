@@ -104,7 +104,10 @@ pub const DESKTOP_REREAD_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// How often the sleep setting is looked at while it is on.
 ///
 /// This runs only while the owner has enabled the setting, so a host that has not is not paying
-/// for it. It is also the bound on how long after work ends an assertion can still be held.
+/// for it. It is how often the question is asked rather than a bound on the answer: one review
+/// asks as many of its sessions as its own budget allows and the rest keep what they last said,
+/// a worker that stops answering keeps its last answer until the kernel says its process has
+/// gone, and a closure counts until this host has recorded it.
 pub const POWER_REVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Whether an evaluation of the sleep setting may take over reviewing it.
@@ -3350,7 +3353,12 @@ impl Controller {
                     return Ok(value);
                 };
                 match reply.closure.as_ref() {
-                    Some(record) => self.retire(record).await?,
+                    // The worker's own account of how its session ended, which is the best one
+                    // there is, written through the same boundary as every other closure so that
+                    // nothing this daemon writes afterwards can replace it.
+                    Some(record) => {
+                        self.record_closure_once(record).await?;
+                    }
                     // The worker has accepted the close and is stopping its processes. Something
                     // has to notice when that finishes, so the tombstone is written and the
                     // descriptor removed rather than left pointing at a process that has gone.
@@ -3485,13 +3493,32 @@ impl Controller {
             .map(|summary| summary.desktop)
     }
 
+    /// Records a closure a worker handed over, unless one is already recorded.
+    ///
+    /// This and [`Self::record_final`] are the only two writers, and both hold the same lock for
+    /// the whole of their check and their write. A worker's own account of how its session ended
+    /// carries the root's result and what it stopped, and a record written from outside knows
+    /// neither, so one must never be able to replace the other.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read or written.
+    async fn record_closure_once(&self, record: &ClosureRecord) -> Result<ClosureRecord> {
+        let _finalising = self.finalising.lock().await;
+        if let Some(existing) = self.registry.lock().await.closure(record.session_id)? {
+            return Ok(existing);
+        }
+        self.retire(record).await?;
+        Ok(record.clone())
+    }
+
     /// Records how a session ended, once.
     ///
     /// The whole of it is one transaction: the closure already recorded is the answer where there
-    /// is one, and where there is not, the record written here is the only one written. Two
-    /// callers reach this for the same session, because the closure watcher and this daemon's own
-    /// reconciliation both act on a worker they find gone, and a second record would replace the
-    /// first rather than adding to it.
+    /// is one, and where there is not, the record written here is the only one written. Three
+    /// callers reach this point for the same session, because the closure watcher, this daemon's
+    /// own reconciliation and a worker handing over its own account all write one, and a second
+    /// record would replace the first rather than adding to it.
     async fn record_final(
         &self,
         session_id: SessionId,
