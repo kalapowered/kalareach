@@ -329,6 +329,9 @@ pub const fn discards_the_screen(refusal: Refusal) -> bool {
 mod tests {
     use super::*;
 
+    /// One named loss, and the one field of a comparison that holds it.
+    type Loss = (&'static str, fn(&mut Comparison));
+
     /// KR-ACC-023: a projection that could not carry something says what, in words, always.
     #[test]
     fn every_loss_a_comparison_can_hold_has_a_phrase() {
@@ -344,7 +347,7 @@ mod tests {
         );
         // One field at a time, because the interesting failure is a field nothing describes: the
         // report would be an empty sentence, which says that something is wrong and not what.
-        let each: [(&str, fn(&mut Comparison)); 10] = [
+        let each: [Loss; 10] = [
             ("cells_clipped", |losses| losses.cells_clipped = 3),
             ("clusters_replaced", |losses| losses.clusters_replaced = 1),
             ("runs_replaced", |losses| losses.runs_replaced = 2),
@@ -371,15 +374,11 @@ mod tests {
         // Two fields are counts of something else's loss rather than losses of their own: a row is
         // only clipped when cells of it were, and a cell is only outside when its row is. They
         // travel with the field that reports them, so neither makes a frame incomplete by itself.
-        for (name, set) in [
-            (
-                "rows_clipped",
-                (|losses: &mut Comparison| losses.rows_clipped = 1) as fn(&mut _),
-            ),
-            ("cells_outside", |losses: &mut Comparison| {
-                losses.cells_outside = 40;
-            }),
-        ] {
+        let derived: [Loss; 2] = [
+            ("rows_clipped", |losses| losses.rows_clipped = 1),
+            ("cells_outside", |losses| losses.cells_outside = 40),
+        ];
+        for (name, set) in derived {
             let mut losses = Comparison::default();
             set(&mut losses);
             assert!(
