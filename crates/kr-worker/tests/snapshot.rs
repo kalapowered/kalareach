@@ -227,6 +227,67 @@ async fn attach(host: &Host, dimensions: Dimensions, profile: Option<&str>) -> A
     }
 }
 
+/// Attaches a client that claims the session's size, which is how a live resize happens.
+///
+/// A resize is not a client's own window changing: it is the *session's* geometry moving, which
+/// every other attachment then sees. Only the owner can move it, so a test that wants a live resize
+/// has to take the geometry first.
+async fn attach_claiming(host: &Host, dimensions: Dimensions) -> Attached {
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    // The claim needs the right as well as the flag: a terminal that asked to own the size and was
+    // not granted the capability is not an owner, which is the rule this helper has to satisfy to
+    // move the session's geometry at all.
+    requested.insert(AttachmentCapability::Geometry);
+    let attached: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(host),
+            &SessionAttachParams {
+                session_id: host.session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: true,
+                dimensions: Nullable::some(dimensions),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the attach succeeds")
+        .to_typed()
+        .expect("decodes");
+    let presentation = attached.attachment.presentation.as_ref().copied();
+    let attachment_id = attached.attachment.attachment_id;
+    let mut streams = CanonicalSet::new();
+    streams.insert(EventStream::Output);
+    let subscribed: EventsSubscribeResult = client
+        .request(
+            Method::EventsSubscribe,
+            &EventsSubscribeParams {
+                session_id: host.session_id,
+                attachment_id,
+                streams,
+                from_cursor: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the subscription succeeds")
+        .to_typed()
+        .expect("decodes");
+    Attached {
+        client,
+        attachment_id,
+        presentation,
+        subscribed,
+    }
+}
+
 /// One thing a projected client received, decoded.
 #[derive(Debug)]
 enum Event {
@@ -409,8 +470,24 @@ fn text_of(page: &ProjectionRowPage) -> Vec<String> {
 /// KR-REQ-08.78 and KR-REQ-08.83: a snapshot carries the whole of what a screen is, then its rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_snapshot_carries_the_state_of_a_screen_and_then_its_rows_in_pages() {
-    let host = host("printf 'hello from the session\\r\\n'; sleep 20").await;
-    tokio::time::sleep(Duration::from_millis(400)).await;
+    // A screen in a state of its own, so that what the snapshot carries is the session's answer
+    // rather than the defaults agreeing with the defaults: a window title and one pushed onto the
+    // stack, a saved cursor, a scroll region, a mode the application turned on, a tab stop it set,
+    // and the alternate character set designated as G1.
+    let host = host(
+        "printf 'hello from the session\\r\\n'; \
+         printf '\\033]2;a session with a title\\033\\\\'; \
+         printf '\\033[22;2t'; \
+         printf '\\033]2;the title on top\\033\\\\'; \
+         printf '\\0337'; \
+         printf '\\033[3;18r'; \
+         printf '\\033[?1000h'; \
+         printf '\\033[5;1H\\033H'; \
+         printf '\\033)0'; \
+         sleep 20",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
     let mut attached = attach(
         &host,
         Dimensions::new(SMALLER.0, SMALLER.1),
@@ -469,6 +546,53 @@ async fn a_snapshot_carries_the_state_of_a_screen_and_then_its_rows_in_pages() {
     assert!(
         header.cursor.column.get() <= CANONICAL.0,
         "the cursor is a canonical position"
+    );
+    // And every other field the requirement names, against a session that set each of them. A
+    // snapshot that carried the defaults would pass an assertion that only checked a field was
+    // present.
+    assert_eq!(
+        header.title.window, "the title on top",
+        "the title the application set is the title the snapshot carries"
+    );
+    assert!(
+        header
+            .title_stack
+            .iter()
+            .any(|entry| entry.window.0.as_deref() == Some("a session with a title")),
+        "and the stack it pushed one onto, which a restoration cannot rebuild from the screen: \
+         {:?}",
+        header.title_stack
+    );
+    assert_eq!(
+        (header.margins.top.get(), header.margins.bottom.get()),
+        (2, 17),
+        "the scroll region is the one the application set, zero-based"
+    );
+    assert!(
+        header
+            .saved_cursors
+            .iter()
+            .any(|saved| saved.buffer == ProjectedBuffer::Primary),
+        "the cursor this session saved is carried, because nothing on the screen says where it \
+         was: {:?}",
+        header.saved_cursors
+    );
+    assert!(
+        header
+            .modes
+            .iter()
+            .any(|mode| mode.mode.get() == 1000 && mode.enabled),
+        "a mode the application turned on is carried as on: {:?}",
+        header.modes
+    );
+    assert!(
+        header.tab_stops.iter().any(|stop| stop.get() == 0),
+        "the tab stop it set is among them: {:?}",
+        header.tab_stops
+    );
+    assert_eq!(
+        header.charsets.g1, "DecLineDrawing",
+        "and the character set it designated, which decides what its next output means"
     );
 
     let pages: Vec<&ProjectionRowPage> = events
@@ -664,6 +788,32 @@ async fn subscribing_returns_the_state_at_a_cursor_and_queues_what_follows() {
             .any(|row| row.contains("before anybody attached")),
         "the screen it is given is the screen as it is, not the bytes that made it: {drawn:?}"
     );
+    // And what followed the cursor arrived as rows, not merely as a delta with the right base: a
+    // subscription that named the state at a cursor and then delivered nothing of what came after
+    // it would satisfy every assertion above.
+    let updated: Vec<String> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Delta(delta) => Some(
+                delta
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        row.runs
+                            .iter()
+                            .map(|run| run.text.as_str())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<String>>(),
+            ),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    assert!(
+        updated.iter().any(|row| row.contains("after")),
+        "the output that followed the cursor was delivered as the rows it changed: {updated:?}"
+    );
 }
 
 /// KR-REQ-08.83: a buffer switch replaces the screen, so it sends an explicit projection reset.
@@ -825,7 +975,7 @@ async fn a_hyperlink_survives_a_reconnection_and_a_resize() {
     assert_eq!(ranges[0].3, "https://example.invalid/guide");
     drop(first);
 
-    // A different size, on a new connection: the reconnection and the resize at once.
+    // A different size, on a new connection: the reconnection.
     let mut second = attach(&host, Dimensions::new(30, 8), Some("xterm-256color")).await;
     let after = collect_until_installed(&mut second.client, Duration::from_secs(5)).await;
     let again = link_of(&after);
@@ -833,6 +983,37 @@ async fn a_hyperlink_survives_a_reconnection_and_a_resize() {
         again, ranges,
         "the same range over the same cells of the same row, which is what an activation needs"
     );
+
+    // And a live resize: the *session's* geometry moves under a client that is already watching.
+    // Wider and taller, so nothing rewraps and the cells the link covers are the cells it covered:
+    // a link that moved with a reflow would be a different question from a link that survived.
+    let owner = attach_claiming(&host, Dimensions::new(CANONICAL.0 + 10, CANONICAL.1 + 4)).await;
+    let resized = collect_until_installed(&mut second.client, Duration::from_secs(5)).await;
+    assert!(
+        resized
+            .iter()
+            .any(|event| matches!(event, Event::Reset(reset)
+                if reset.reason == ProjectionResetReason::Geometry)),
+        "the watching client is told the geometry moved, rather than left to infer it: {resized:?}"
+    );
+    let header = resized
+        .iter()
+        .find_map(|event| match event {
+            Event::Snapshot(header) => Some(header.as_ref()),
+            _ => None,
+        })
+        .expect("a fresh screen follows the reset");
+    assert_eq!(
+        header.dimensions,
+        Dimensions::new(CANONICAL.0 + 10, CANONICAL.1 + 4),
+        "the screen it is given is the session's new size"
+    );
+    let after_resize = link_of(&resized);
+    assert_eq!(
+        after_resize, ranges,
+        "and the link is over the same cells of the same row afterwards"
+    );
+    let _ = owner;
 }
 
 /// KR-REQ-08.44: the palette's provenance is recorded at creation and succession never moves it.
