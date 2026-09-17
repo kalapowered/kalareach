@@ -555,6 +555,109 @@ mod tests {
     }
 
     #[test]
+    fn a_document_is_dropped_whole_or_not_at_all() {
+        let (sink, mut stream) = channel();
+        // One document in three pieces, then enough others to make room be needed. Half a document
+        // would be worse than none: a reader that received the last piece would be told the
+        // document was complete when it was not.
+        let big = 512 * 1024;
+        for piece in 0..3 {
+            sink.send(Notice::Document {
+                binding_id: binding(1),
+                call: "snapshot".to_owned(),
+                document: 1,
+                last: piece == 2,
+                nodes: vec![WireNode {
+                    node_id: format!("n{piece}"),
+                    node_revision: 1,
+                    body_json: "x".repeat(big),
+                }],
+            });
+        }
+        for number in 2..12 {
+            sink.send(Notice::Document {
+                binding_id: binding(1),
+                call: "observe".to_owned(),
+                document: number,
+                last: true,
+                nodes: vec![WireNode {
+                    node_id: "n0".to_owned(),
+                    node_revision: 1,
+                    body_json: "y".repeat(big),
+                }],
+            });
+        }
+
+        let mut pieces: std::collections::BTreeMap<u64, usize> = std::collections::BTreeMap::new();
+        let mut lost = 0;
+        while let Some(notice) = stream.try_recv() {
+            match notice {
+                Notice::Document { document, .. } => *pieces.entry(document).or_insert(0) += 1,
+                Notice::Gap { documents, .. } => lost += documents,
+                Notice::Fault { .. } | Notice::Disabled { .. } => {}
+            }
+        }
+        assert!(lost > 0, "nothing was dropped, so nothing is under test");
+        assert!(
+            !pieces.contains_key(&1) || pieces[&1] == 3,
+            "the three-piece document survived in pieces: {pieces:?}"
+        );
+    }
+
+    #[test]
+    fn a_gap_that_arrives_while_room_is_made_is_counted_once() {
+        let (sink, mut stream) = channel();
+        // Fill the queue, then offer that binding a gap. Making room creates the binding's loss
+        // record; the gap has to find that record rather than replace it.
+        for number in 0..16 {
+            sink.send(Notice::Document {
+                binding_id: binding(1),
+                call: "observe".to_owned(),
+                document: number,
+                last: true,
+                nodes: vec![WireNode {
+                    node_id: "n0".to_owned(),
+                    node_revision: 1,
+                    body_json: "x".repeat(512 * 1024),
+                }],
+            });
+        }
+        sink.send(Notice::Gap {
+            binding_id: binding(1),
+            events: 7,
+            bytes: 99,
+            documents: 0,
+        });
+
+        let mut gaps = 0;
+        let mut events = 0;
+        let mut documents = 0;
+        while let Some(notice) = stream.try_recv() {
+            if let Notice::Gap {
+                events: lost,
+                documents: drawn,
+                ..
+            } = notice
+            {
+                gaps += 1;
+                events += lost;
+                documents += drawn;
+            }
+        }
+        assert_eq!(gaps, 1, "one binding's losses became {gaps} gaps");
+        assert_eq!(events, 7, "the observations the gap named were lost");
+        assert!(
+            documents > 0,
+            "the documents that made room were not counted"
+        );
+        assert_eq!(
+            stream.held_bytes(),
+            0,
+            "the queue kept a charge for nothing"
+        );
+    }
+
+    #[test]
     fn a_loss_is_reported_against_the_binding_it_belonged_to() {
         let (sink, mut stream) = channel();
         for _ in 0..32 {

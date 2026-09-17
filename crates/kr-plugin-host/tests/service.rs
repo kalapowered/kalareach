@@ -948,9 +948,26 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
     // answering the shell's questions. A shell that was not answered would stop at its `dd` and
     // produce no higher-numbered line at all.
     // Shorter than the work queued against the component, so the component is inside a call for
-    // the whole of it rather than for part of it.
+    // the whole of it rather than for part of it. The call count is what turns that from an
+    // expectation into evidence: it counts calls the component finished, so a count that grew
+    // across the window is a component that was executing inside it.
+    let before_calls = plugin
+        .health()
+        .await
+        .expect("a health report")
+        .component_calls;
     let window = std::time::Instant::now();
     let during = collect(&mut terminal, Duration::from_millis(800)).await;
+    let after_calls = plugin
+        .health()
+        .await
+        .expect("a health report")
+        .component_calls;
+    assert!(
+        after_calls > before_calls,
+        "the component finished no calls during the window: {before_calls} before, {after_calls} \
+         after, so the terminal's progress was measured around nothing"
+    );
     let during = String::from_utf8_lossy(&during).into_owned();
     let after = highest_line(&during).unwrap_or(0);
     assert!(

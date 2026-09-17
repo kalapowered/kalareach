@@ -644,12 +644,29 @@ async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection
     });
 
     // While that is in flight, an observation is answered by the queue rather than behind the call.
+    // The call count around it is what shows the component was executing while it was answered
+    // rather than idle: it counts calls the component finished.
+    let before_calls = client
+        .health()
+        .await
+        .expect("a health report")
+        .component_calls;
     let offered = std::time::Instant::now();
     let admission = client
         .deliver(request.binding_id, &components::scrape("se-1", "x"))
         .await
         .expect("the event is offered while a call is running");
     let answered = offered.elapsed();
+    let after_calls = client
+        .health()
+        .await
+        .expect("a health report")
+        .component_calls;
+    assert!(
+        after_calls > before_calls,
+        "the component finished no calls while the observation was answered: {before_calls} \
+         before, {after_calls} after"
+    );
     assert!(
         matches!(
             admission,
