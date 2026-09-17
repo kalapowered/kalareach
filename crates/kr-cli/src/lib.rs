@@ -14,6 +14,7 @@
 //! | [`skill`] | Installing the contact skill and its tool configuration for an agent |
 //! | [`attach`] | Attaching a terminal, forwarding bytes, and the restoration guard |
 //! | [`session`] | Driving one attachment's input, output and connection in a single loop |
+//! | [`render`] | Drawing a projected session into this terminal, at canonical cell positions |
 //! | [`terminal`] | Raw mode, terminal size and the saved state the guard holds |
 //! | [`platform`] | The one place this crate calls the operating system directly |
 //! | [`report`] | Text for people and the `--json` shapes |
@@ -25,6 +26,7 @@ pub mod contact;
 pub mod error;
 pub mod platform;
 pub mod question;
+pub mod render;
 pub mod report;
 pub mod resolve;
 pub mod session;

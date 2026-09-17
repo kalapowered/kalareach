@@ -207,9 +207,11 @@ mod console {
         ///
         /// # Errors
         ///
-        /// Never fails; the result matches the shape the other platform's answer has.
-        pub const fn probe(&self) -> Result<Probe> {
-            Ok(Probe::unasked())
+        /// Returns [`crate::CliError::TerminalProbeFailed`] on a stream a previous probe
+        /// contaminated, which is the same refusal the other platform gives: a console that was
+        /// never asked anything is still a console whose input may hold a late reply.
+        pub fn probe(&self, context: kr_term::probe::InputContext) -> Result<Probe> {
+            Probe::unasked(context)
         }
     }
 

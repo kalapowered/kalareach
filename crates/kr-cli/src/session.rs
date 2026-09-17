@@ -109,23 +109,27 @@ pub async fn run(
         &crate::terminal::SavedModes::from_state(&saved),
     )?;
     // Section 8's bounded synchronous handshake, before any application input. It asks the terminal
-    // what keyboard protocols it has negotiated, so that what is put back afterwards is this
-    // terminal's own state rather than nothing at all, and it ends with the device-attributes
-    // terminator. A terminal that does not finish it fails this attach rather than forwarding live
-    // input on a stream that may still receive a late reply. `--no-probe` asks nothing, and then
-    // there is nothing to put back and the clearing stands.
+    // what it is and what keyboard protocols it has negotiated, so that what is put back afterwards
+    // is this terminal's own state rather than nothing at all, and it ends with the
+    // device-attributes terminator. A terminal that does not finish it fails this attach rather
+    // than forwarding live input on a stream that may still receive a late reply.
+    //
+    // This process has written nothing to the terminal yet, so the stream is clean. `--no-probe` is
+    // chosen here, before any probe: choosing it afterwards would not unsend the questions.
+    let context = kr_term::probe::InputContext::Clean;
     let probe = if options.no_probe {
-        crate::terminal::Probe::unasked()
+        crate::terminal::Probe::unasked(context)
     } else {
-        match terminal.probe() {
-            Ok(probe) => probe,
-            Err(error) => {
-                // Nothing has begun forwarding, so the outer terminal's own keyboard negotiation is
-                // not this attachment's to clear.
-                let _ = terminal.restore(&saved, None);
-                guard.release();
-                return Err(error);
-            }
+        terminal.probe(context)
+    };
+    let probe = match probe {
+        Ok(probe) => probe,
+        Err(error) => {
+            // Nothing has begun forwarding, so the outer terminal's own keyboard negotiation is
+            // not this attachment's to clear. Its modes are put back and the failure is reported.
+            let _ = terminal.restore(&saved, None);
+            guard.release();
+            return Err(error);
         }
     };
     let keyboard = probe.keyboard;
@@ -295,6 +299,9 @@ async fn drive(
     let mut outstanding: std::collections::BTreeMap<kr_protocol::ids::RequestId, Outstanding> =
         std::collections::BTreeMap::new();
     let mut next_request = 1_u64;
+    // What this terminal is showing, for as long as it is being projected. A direct attachment
+    // never installs one: it is sent the application's own bytes and draws nothing of its own.
+    let mut display = crate::render::ProjectedDisplay::new();
 
     // What the person typed while the host was asking the terminal what it was. It was buffered
     // rather than discarded, and it is the first thing the application receives, in the order it
@@ -339,6 +346,46 @@ async fn drive(
                                 return AttachOutcome::Disconnected;
                             }
                             let _ = handle.flush();
+                        }
+                        // A projected attachment is sent the canonical grid as state and draws it
+                        // itself. The renderer is shared with the client library, so this terminal
+                        // and the companion application put a canonical cell in the same place.
+                        if crate::render::is_projection_event(notification.event_type.as_str()) {
+                            let Some(event) =
+                                crate::render::decode(
+                                    notification.event_type.as_str(),
+                                    &notification.payload,
+                                )
+                            else {
+                                // A payload this build cannot decode is not drawn and not guessed
+                                // at. The screen is asked for again, which is what any update this
+                                // terminal cannot apply leads to.
+                                let request_id = kr_protocol::ids::RequestId::new(next_request);
+                                next_request += 1;
+                                if !resubscribe(client, descriptor, request_id, attachment_id).await
+                                {
+                                    return AttachOutcome::Disconnected;
+                                }
+                                outstanding.insert(request_id, Outstanding::Resubscribe);
+                                continue;
+                            };
+                            let drawn = display.apply(event);
+                            if !drawn.bytes.is_empty() {
+                                let mut handle = output.as_ref();
+                                if handle.write_all(&drawn.bytes).is_err() {
+                                    return AttachOutcome::Disconnected;
+                                }
+                                let _ = handle.flush();
+                            }
+                            if drawn.resubscribe {
+                                let request_id = kr_protocol::ids::RequestId::new(next_request);
+                                next_request += 1;
+                                if !resubscribe(client, descriptor, request_id, attachment_id).await
+                                {
+                                    return AttachOutcome::Disconnected;
+                                }
+                                outstanding.insert(request_id, Outstanding::Resubscribe);
+                            }
                         }
                         // A resynchronisation marker means this terminal's view of the session is
                         // no longer continuous: its size changed, its presentation changed, or it

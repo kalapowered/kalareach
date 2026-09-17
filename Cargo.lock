@@ -3167,9 +3167,11 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "kr-cbor",
+ "kr-client",
  "kr-crypto",
  "kr-ipc",
  "kr-protocol",
+ "kr-term",
  "kr-worker",
  "libc",
  "portable-pty",

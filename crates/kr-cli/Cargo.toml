@@ -19,8 +19,10 @@ path = "src/bin/kr-attach-guard.rs"
 [dependencies]
 clap.workspace = true
 kr-cbor.workspace = true
+kr-client.workspace = true
 kr-ipc.workspace = true
 kr-protocol.workspace = true
+kr-term.workspace = true
 rmcp.workspace = true
 schemars.workspace = true
 rustix = { workspace = true, features = ["stdio", "termios"] }
