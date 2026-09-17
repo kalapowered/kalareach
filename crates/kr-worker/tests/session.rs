@@ -104,7 +104,11 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
     );
     let mut stream = session.subscribe(attachment_id).expect("subscribes");
 
-    let runtime = SessionRuntime::start(session).expect("starts");
+    let runtime = SessionRuntime::start(
+        session,
+        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+    )
+    .expect("starts");
     let seen = collect(&mut stream, b"kr-session-marker").await;
     assert!(
         seen.windows(17)
@@ -125,6 +129,7 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
                 epoch,
                 0,
                 b"kr-input-marker\n",
+                None,
                 std::time::Instant::now(),
             )
             .expect("writes");
@@ -169,7 +174,13 @@ async fn a_session_runs_a_shell_and_its_output_reaches_an_attachment() {
 async fn a_root_shell_that_exits_closes_the_session_and_nothing_restarts_it() {
     let host = kr_ipc::testing::TempHost::create();
     let config = configuration(&host, "printf 'bye\\n'; exit 7");
-    let runtime = std::sync::Arc::new(kr_worker::runtime::start(config).expect("starts a session"));
+    let runtime = std::sync::Arc::new(
+        kr_worker::runtime::start(
+            config,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts a session"),
+    );
     let record = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed())
         .await
         .expect("the session closes on its own");
@@ -205,14 +216,24 @@ async fn a_closed_session_refuses_input_and_a_second_close_joins_the_first() {
         .expect("takes the lease");
     let epoch = session.lease().epoch.get();
 
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     let (first, gate) = runtime.close(ClosureReason::CloseRequested);
     assert!(first.initiated);
     // Input is rejected from the moment the state changed, before anything was signalled.
-    let refused =
-        runtime
-            .session()
-            .write_input(attachment_id, epoch, 0, b"x", std::time::Instant::now());
+    let refused = runtime.session().write_input(
+        attachment_id,
+        epoch,
+        0,
+        b"x",
+        None,
+        std::time::Instant::now(),
+    );
     assert!(refused.is_err(), "a closing session rejects input");
     // A second request joins the closure already under way rather than starting another.
     let (second, second_gate) = runtime.close(ClosureReason::CloseRequested);
@@ -255,7 +276,11 @@ async fn a_slow_attachment_is_resynchronised_and_the_others_keep_receiving() {
     // session's own bound, so one client's queue cannot affect another's.
     let mut slow = session.subscribe_within(slow_id, 1024).expect("subscribes");
 
-    let runtime = SessionRuntime::start(session).expect("starts");
+    let runtime = SessionRuntime::start(
+        session,
+        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+    )
+    .expect("starts");
     // The quick subscriber drains; the slow one is left alone until afterwards.
     let seen = collect(&mut quick, b"kr-bulk-end").await;
     assert!(
@@ -316,11 +341,18 @@ async fn mid_paste(
             epoch,
             0,
             b"\x1b[200~pasted",
+            None,
             std::time::Instant::now(),
         )
         .expect("writes the start of a paste");
     assert!(session.paste_open(), "the application is inside a paste");
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.flush_input();
     (runtime, attachment_id, epoch)
 }
@@ -365,6 +397,7 @@ async fn a_root_shell_that_exits_mid_paste_publishes_the_fence_and_closes_the_pa
                 epoch,
                 1,
                 b"\n\x04\x04",
+                None,
                 std::time::Instant::now(),
             )
             .expect("writes end of transmission");
@@ -499,7 +532,13 @@ async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
         .acquire_input(attachment_id, ConnectionId::new(kr_ipc::new_uuid()), None)
         .expect("takes the lease");
     let epoch = session.lease().epoch.get();
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
 
     // The protocol's own frame limit, written again and again by a lease holder that is within its
     // rights on every single frame. The lines are what make the terminal stop taking them: a line
@@ -516,6 +555,7 @@ async fn input_beyond_the_session_budget_is_refused_rather_than_acknowledged() {
                 epoch,
                 sequence,
                 &frame,
+                None,
                 std::time::Instant::now(),
             );
             if outcome.is_ok() {
@@ -604,7 +644,13 @@ async fn takeover_mid_paste(one_frame: bool) {
         .acquire_input(first, ConnectionId::new(kr_ipc::new_uuid()), None)
         .expect("takes the lease");
     let epoch = session.lease().epoch.get();
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     // Nothing is written until the application has set those modes. Bracketed paste is the
     // application's own, read from the canonical grid rather than asserted here, because that is
     // where the framer reads it from in production.
@@ -630,11 +676,18 @@ async fn takeover_mid_paste(one_frame: bool) {
     {
         let mut session = runtime.session();
         session
-            .write_input(first, epoch, 0, &start, std::time::Instant::now())
+            .write_input(first, epoch, 0, &start, None, std::time::Instant::now())
             .expect("writes the start of the paste");
         if !one_frame {
             session
-                .write_input(first, epoch, 1, b"\x1b[201~", std::time::Instant::now())
+                .write_input(
+                    first,
+                    epoch,
+                    1,
+                    b"\x1b[201~",
+                    None,
+                    std::time::Instant::now(),
+                )
                 .expect("writes the terminator");
         }
         runtime.flush_locked(&mut session);
@@ -682,6 +735,7 @@ async fn takeover_mid_paste(one_frame: bool) {
                 next_epoch,
                 0,
                 b"kr-new-lease\n",
+                None,
                 std::time::Instant::now(),
             )
             .expect("the new lease writes");
@@ -738,7 +792,13 @@ async fn a_takeover_publishes_the_fence_before_it_counts_what_the_old_lease_left
         .acquire_input(first, ConnectionId::new(kr_ipc::new_uuid()), None)
         .expect("takes the lease");
     let epoch = session.lease().epoch.get();
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
 
     // More than the terminal of an application that never reads will take, so the writer is still
     // holding some of it when the lease changes.
@@ -746,7 +806,7 @@ async fn a_takeover_publishes_the_fence_before_it_counts_what_the_old_lease_left
     {
         let mut session = runtime.session();
         session
-            .write_input(first, epoch, 0, &batch, std::time::Instant::now())
+            .write_input(first, epoch, 0, &batch, None, std::time::Instant::now())
             .expect("writes");
         runtime.flush_locked(&mut session);
     }
@@ -834,7 +894,13 @@ async fn a_geometry_the_session_budget_cannot_admit_is_refused_before_anything_m
         (before.dimensions, before.epoch),
         "and the terminal the application is looking at did not move"
     );
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -869,7 +935,13 @@ async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
         .acquire_input(first, ConnectionId::new(kr_ipc::new_uuid()), None)
         .expect("takes the lease");
     let epoch = session.lease().epoch.get();
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     // Nothing in this test's own markers is an `a`, because `a` is what the counting is about.
     let ready = retained_within(&runtime, b"kr-up", Duration::from_secs(30)).await;
     assert!(
@@ -883,7 +955,7 @@ async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
     {
         let mut session = runtime.session();
         session
-            .write_input(first, epoch, 0, &batch, std::time::Instant::now())
+            .write_input(first, epoch, 0, &batch, None, std::time::Instant::now())
             .expect("writes");
         runtime.flush_locked(&mut session);
     }
@@ -924,7 +996,14 @@ async fn a_takeover_reports_exactly_the_bytes_the_application_never_received() {
     {
         let mut session = runtime.session();
         session
-            .write_input(second, next_epoch, 0, b"kr-next", std::time::Instant::now())
+            .write_input(
+                second,
+                next_epoch,
+                0,
+                b"kr-next",
+                None,
+                std::time::Instant::now(),
+            )
             .expect("the new lease writes");
         runtime.flush_locked(&mut session);
     }
@@ -997,7 +1076,13 @@ async fn a_succession_the_budget_refuses_leaves_the_size_unowned_rather_than_wit
         before.epoch.get(),
         after.epoch.get()
     );
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -1076,7 +1161,13 @@ async fn a_withdrawn_claim_the_budget_refuses_leaves_the_size_unowned_rather_tha
         "and it is refused as not the owner: {refused}"
     );
 
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -1102,7 +1193,14 @@ async fn input_for_a_terminal_that_has_gone_is_refused_rather_than_acknowledged(
         .expect("takes the keys");
     let epoch = held.lease.epoch.get();
     session
-        .write_input(attachment, epoch, 0, b"before", std::time::Instant::now())
+        .write_input(
+            attachment,
+            epoch,
+            0,
+            b"before",
+            None,
+            std::time::Instant::now(),
+        )
         .expect("an ordinary write while the terminal is there");
 
     session
@@ -1110,7 +1208,14 @@ async fn input_for_a_terminal_that_has_gone_is_refused_rather_than_acknowledged(
         .store(true, std::sync::atomic::Ordering::Release);
 
     let refused = session
-        .write_input(attachment, epoch, 1, b"after", std::time::Instant::now())
+        .write_input(
+            attachment,
+            epoch,
+            1,
+            b"after",
+            None,
+            std::time::Instant::now(),
+        )
         .expect_err("the terminal takes nothing more");
     assert_eq!(
         refused.to_protocol_error().code,
@@ -1123,7 +1228,13 @@ async fn input_for_a_terminal_that_has_gone_is_refused_rather_than_acknowledged(
         "the session itself is still open; what happened to the shell is the monitor's question"
     );
 
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -1197,7 +1308,13 @@ async fn a_controller_whose_keys_cannot_be_established_is_refused_the_keys() {
         .acquire_input(declared, ConnectionId::new(kr_ipc::new_uuid()), None)
         .expect("the one whose terminal the host may put into the protocol takes the keys");
 
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -1224,7 +1341,13 @@ async fn a_root_shell_that_exits_at_once_is_noticed_before_the_first_wait() {
     let host = kr_ipc::testing::TempHost::create();
     let config = configuration(&host, "printf 'kr-leaving\\n'; exit 7");
     let started = tokio::time::Instant::now();
-    let runtime = std::sync::Arc::new(kr_worker::runtime::start(config).expect("starts a session"));
+    let runtime = std::sync::Arc::new(
+        kr_worker::runtime::start(
+            config,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts a session"),
+    );
     let record = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed())
         .await
         .expect("the session closes on its own");
@@ -1251,7 +1374,13 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
     let host = kr_ipc::testing::TempHost::create();
     let config = configuration(&host, "sleep 30 & printf 'kr-settling\\n'; sleep 3; exit 7");
     let started = tokio::time::Instant::now();
-    let runtime = std::sync::Arc::new(kr_worker::runtime::start(config).expect("starts a session"));
+    let runtime = std::sync::Arc::new(
+        kr_worker::runtime::start(
+            config,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts a session"),
+    );
     let record = tokio::time::timeout(Duration::from_secs(45), runtime.wait_closed())
         .await
         .expect("the session closes on its own");
@@ -1294,7 +1423,13 @@ async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
         .attach(&terminal_attachment(session_id), requested, attachment_id)
         .expect("attaches");
     let mut stream = session.subscribe(attachment_id).expect("subscribes");
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
 
     let seen = collect(&mut stream, b"kr-reaped").await;
     let job = marked_number(&seen, b"kr-job ").unwrap_or_else(|| {

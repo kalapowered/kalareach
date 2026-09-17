@@ -179,7 +179,12 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let listener = Listener::bind(&endpoint)?;
 
     let config = session_config(&specification, &environment, display_number, &endpoint);
-    let runtime = match start_or_record(config) {
+    // The machine's own continuous clock, which is the clock the daemon expresses a forwarded
+    // authority deadline on. Every boundary in this process that decides whether authority has
+    // run out reads it.
+    let shared_clock: std::sync::Arc<dyn kr_ipc::clock::SharedClock> =
+        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock);
+    let runtime = match start_or_record(config, std::sync::Arc::clone(&shared_clock)) {
         Ok(runtime) => runtime,
         Err(failure) => {
             let error = ProtocolError::new(failure.error.code(), failure.error.to_string());

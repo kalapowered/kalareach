@@ -209,6 +209,10 @@ impl WorkerService {
     ) -> Result<Self> {
         let boot_epoch = kr_ipc::identity::boot_epoch(&binding.boot_identity)?;
         let clock = Arc::new(SystemContinuousClock::new());
+        // The session's own, not a second one: the check this service makes before a batch is
+        // accepted and the fence the writer applies before it is written have to be reading the
+        // same clock for the second to be a continuation of the first.
+        let shared_clock = runtime.shared_clock();
         Ok(Self {
             runtime,
             identity,
@@ -218,7 +222,7 @@ impl WorkerService {
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
             clock,
-            shared_clock: Arc::new(kr_ipc::clock::SystemSharedClock),
+            shared_clock,
             controller_public_key: binding.controller_public_key,
             authority: Mutex::new(Authority {
                 accepted_generation: Some(binding.controller_generation),
@@ -2233,6 +2237,9 @@ impl WorkerService {
                 params.epoch.get(),
                 params.sequence.get(),
                 params.bytes.as_slice(),
+                // The deadline travels with the bytes. This check is the host's, taken now; the
+                // writer's is its own, taken when the terminal actually takes them.
+                caller.authority_deadline_boot_ms,
                 std::time::Instant::now(),
             )?;
             // Handed to the writer while the session is still held, so two writers cannot

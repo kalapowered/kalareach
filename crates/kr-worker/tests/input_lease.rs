@@ -10,7 +10,7 @@
 //! discipline repeated back as they arrived, which is the only way to tell the two apart.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
@@ -223,7 +223,13 @@ async fn the_keys_go_only_to_a_controller_that_produces_the_negotiated_protocol(
         .acquire_input(typed, connection(), None)
         .expect("and so does a controller that builds its keys from the logical key");
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -255,7 +261,13 @@ async fn a_modifier_encoding_is_compared_at_the_level_the_application_asked_for(
         .acquire_input(xterm, connection(), None)
         .expect("xterm does, at this level");
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -296,11 +308,17 @@ async fn turning_an_enhanced_protocol_on_takes_the_keys_from_a_terminal_that_can
     );
     // The previous holder learns on its next write, which is the whole of what it is told.
     let refused = session
-        .write_input(xterm, epoch, 0, b"x", std::time::Instant::now())
+        .write_input(xterm, epoch, 0, b"x", None, std::time::Instant::now())
         .expect_err("its epoch went with the lease");
     assert_eq!(refused.to_protocol_error().code, ErrorCode::LeaseLost);
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -331,7 +349,13 @@ async fn turning_it_off_again_lets_that_terminal_take_the_keys_back() {
         .expect("the ordinary encoding is one it produces");
     assert_eq!(regained.lease.holder.as_ref(), Some(&xterm));
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -369,7 +393,13 @@ async fn a_controller_that_produces_both_keeps_the_keys_across_the_change() {
         );
     }
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -402,7 +432,7 @@ async fn a_takeover_is_immediate_and_the_previous_epoch_is_invalid_at_once() {
         "one lease, one monotonic epoch"
     );
     let refused = session
-        .write_input(first, before, 0, b"x", std::time::Instant::now())
+        .write_input(first, before, 0, b"x", None, std::time::Instant::now())
         .expect_err("the previous epoch is already gone");
     assert_eq!(refused.to_protocol_error().code, ErrorCode::LeaseLost);
     // A conditional acquire at a stale epoch is refused rather than taking the lease anyway.
@@ -416,7 +446,13 @@ async fn a_takeover_is_immediate_and_the_previous_epoch_is_invalid_at_once() {
         "and a refused acquire leaves the lease where it was"
     );
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -565,7 +601,7 @@ async fn a_write_without_the_lease_is_refused_and_never_acquires_it() {
 
     // Nobody holds it yet. A write does not take it.
     let refused = session
-        .write_input(other, 0, 0, b"x", std::time::Instant::now())
+        .write_input(other, 0, 0, b"x", None, std::time::Instant::now())
         .expect_err("no lease, no write");
     assert_eq!(refused.to_protocol_error().code, ErrorCode::LeaseLost);
     assert!(
@@ -579,12 +615,18 @@ async fn a_write_without_the_lease_is_refused_and_never_acquires_it() {
     let epoch = held.lease.epoch.get();
     // Somebody else's write, at the epoch actually in force, is still refused.
     let refused = session
-        .write_input(other, epoch, 0, b"x", std::time::Instant::now())
+        .write_input(other, epoch, 0, b"x", None, std::time::Instant::now())
         .expect_err("the epoch is right and the actor is not");
     assert_eq!(refused.to_protocol_error().code, ErrorCode::LeaseLost);
     assert_eq!(session.lease().holder.as_ref(), Some(&holder));
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -784,17 +826,30 @@ async fn a_lease_the_host_ends_reports_its_interrupted_input_to_the_next_holder(
         .acquire_input(xterm, connection(), None)
         .expect("the keys");
     let epoch = held.lease.epoch.get();
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
 
     {
         let mut session = runtime.session();
         // A paste is opened and a delimiter prefix is left half-arrived.
         session
-            .write_input(xterm, epoch, 0, b"\x1b[200~half", std::time::Instant::now())
+            .write_input(
+                xterm,
+                epoch,
+                0,
+                b"\x1b[200~half",
+                None,
+                std::time::Instant::now(),
+            )
             .expect("the start and part of the body");
         session
-            .write_input(xterm, epoch, 1, b"\x1b[20", std::time::Instant::now())
+            .write_input(xterm, epoch, 1, b"\x1b[20", None, std::time::Instant::now())
             .expect("four bytes of a delimiter");
         assert!(session.paste_open());
         // Now the application turns on a protocol this terminal cannot produce. Nobody asked for
@@ -856,13 +911,19 @@ async fn a_plain_escape_reaches_the_application_with_no_paste_prefix_hold() {
         .acquire_input(id, connection(), None)
         .expect("the keys");
     let epoch = held.lease.epoch.get();
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
 
     let accepted = {
         let mut session = runtime.session();
         session
-            .write_input(id, epoch, 0, b"\x1b", std::time::Instant::now())
+            .write_input(id, epoch, 0, b"\x1b", None, std::time::Instant::now())
             .expect("accepted")
     };
     assert_eq!(
@@ -896,14 +957,20 @@ async fn a_delimiter_split_across_frames_reaches_the_application_once_with_its_p
         .acquire_input(id, connection(), None)
         .expect("the keys");
     let epoch = held.lease.epoch.get();
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
 
     // Four bytes of the start delimiter, then the rest with its payload behind it.
     {
         let mut session = runtime.session();
         let first = session
-            .write_input(id, epoch, 0, b"\x1b[20", std::time::Instant::now())
+            .write_input(id, epoch, 0, b"\x1b[20", None, std::time::Instant::now())
             .expect("accepted");
         assert_eq!(first.forwarded_bytes, 0, "an incomplete delimiter is held");
         assert_eq!(first.held_prefix_bytes, 4);
@@ -913,6 +980,7 @@ async fn a_delimiter_split_across_frames_reaches_the_application_once_with_its_p
                 epoch,
                 1,
                 b"0~pasted\x1b[201~",
+                None,
                 std::time::Instant::now(),
             )
             .expect("accepted");
@@ -954,13 +1022,26 @@ async fn a_paste_open_when_the_mode_was_turned_off_is_still_closed_before_the_ne
         .acquire_input(first, connection(), None)
         .expect("the keys");
     let epoch = held.lease.epoch.get();
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
 
     {
         let mut session = runtime.session();
         session
-            .write_input(first, epoch, 0, b"\x1b[200~half", std::time::Instant::now())
+            .write_input(
+                first,
+                epoch,
+                0,
+                b"\x1b[200~half",
+                None,
+                std::time::Instant::now(),
+            )
             .expect("the start and part of the body");
         assert!(session.paste_open(), "the paste is open");
         // The application turns canonical paste mode off with a paste still open.
@@ -992,6 +1073,7 @@ async fn a_paste_open_when_the_mode_was_turned_off_is_still_closed_before_the_ne
                 taken.lease.epoch.get(),
                 0,
                 b"kr-after.",
+                None,
                 std::time::Instant::now(),
             )
             .expect("the new lease's first bytes");
@@ -1041,7 +1123,13 @@ async fn an_incomplete_delimiter_is_discarded_on_source_loss_and_counted() {
         .acquire_input(leaving, connection(), None)
         .expect("the keys");
     let epoch = held.lease.epoch.get();
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
 
     {
@@ -1049,10 +1137,24 @@ async fn an_incomplete_delimiter_is_discarded_on_source_loss_and_counted() {
         // An ordinary byte, which the application echoes, and then four bytes of a delimiter,
         // which it does not see.
         session
-            .write_input(leaving, epoch, 0, b"kr-typed.", std::time::Instant::now())
+            .write_input(
+                leaving,
+                epoch,
+                0,
+                b"kr-typed.",
+                None,
+                std::time::Instant::now(),
+            )
             .expect("ordinary bytes");
         let accepted = session
-            .write_input(leaving, epoch, 1, b"\x1b[20", std::time::Instant::now())
+            .write_input(
+                leaving,
+                epoch,
+                1,
+                b"\x1b[20",
+                None,
+                std::time::Instant::now(),
+            )
             .expect("the first four bytes of a delimiter");
         assert_eq!(accepted.held_prefix_bytes, 4);
     }
@@ -1125,7 +1227,13 @@ async fn focus_scrollback_replies_and_an_idle_window_never_seize_the_lease() {
         .acquire_input(holder, connection(), None)
         .expect("the keys");
     let epoch = held.lease.epoch.get();
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
 
     // An idle window opens. It observes and it takes nothing.
@@ -1146,13 +1254,13 @@ async fn focus_scrollback_replies_and_an_idle_window_never_seize_the_lease() {
         let mut session = runtime.session();
         // A focus event from the holder, which is an ordinary input byte sequence.
         session
-            .write_input(holder, epoch, 0, b"\x1b[I", std::time::Instant::now())
+            .write_input(holder, epoch, 0, b"\x1b[I", None, std::time::Instant::now())
             .expect("the holder's focus event is forwarded");
         assert_eq!(session.lease().epoch.get(), epoch, "and moves nothing");
         // The idle window's focus event is refused: only the holder changes the application's
         // focus state.
         let refused = session
-            .write_input(idle, epoch, 0, b"\x1b[I", std::time::Instant::now())
+            .write_input(idle, epoch, 0, b"\x1b[I", None, std::time::Instant::now())
             .expect_err("another view cannot change the application's focus state");
         assert_eq!(refused.to_protocol_error().code, ErrorCode::LeaseLost);
         // Passive scrollback: reading the retained history takes nothing either.
@@ -1349,7 +1457,13 @@ async fn wired(script: &str) -> Wired {
 
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts the runtime"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts the runtime"),
+    );
 
     let endpoint = environment
         .worker_endpoint(DisplayNumber::new(1))
@@ -1831,4 +1945,103 @@ async fn an_idle_connection_that_never_acquires_leaves_the_lease_where_it_was() 
         .close(ClosureReason::CloseRequested)
         .1
         .release();
+}
+
+// ---------------------------------------------------------------------------------------------
+// The writer's own expiry fence: authority that ends while a batch waits for the terminal.
+// ---------------------------------------------------------------------------------------------
+
+/// KR-REQ-08.62, KR-REQ-08.63, KR-REQ-09.10, KR-REQ-09.20.
+///
+/// The host checks a forwarded batch's authority deadline when it accepts it. That answer goes
+/// stale: an accepted batch waits for the writer, and the writer waits for an application that
+/// may not be reading. The deadline therefore travels with the bytes and is asked again at the
+/// boundary that actually hands them over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
+    let host = kr_ipc::testing::TempHost::create();
+    // Raw mode with the echo off: what comes back is what the application received, not what the
+    // line discipline repeated.
+    let config = configuration(&host, "stty raw -echo; printf 'kr-ready.'; exec cat");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let id = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let held = session
+        .acquire_input(id, connection(), None)
+        .expect("the keys");
+    let epoch = held.lease.epoch.get();
+
+    // The machine's own continuous clock, driven by hand: a grant that runs out between the
+    // moment a batch is accepted and the moment the terminal takes it is not something the real
+    // clock can be asked to arrange.
+    let clock = kr_ipc::clock::ManualSharedClock::new();
+    let runtime = Arc::new(
+        SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
+    );
+    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    let deadline = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 1_000;
+
+    // Inside the deadline, and delivered.
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(id, epoch, 0, b"kr-inside", Some(deadline), Instant::now())
+            .expect("accepted");
+        runtime.flush_locked(&mut session);
+    }
+    let seen = retained_within(&runtime, b"kr-inside", Duration::from_secs(10)).await;
+    assert!(
+        contains(&seen, b"kr-inside"),
+        "a batch written under authority that still stands reaches the application: {seen:?}"
+    );
+
+    // Accepted while the grant still stood, handed to the writer after it had run out.
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(id, epoch, 1, b"kr-expired", Some(deadline), Instant::now())
+            .expect("accepted");
+        clock.advance(Duration::from_secs(5));
+        runtime.flush_locked(&mut session);
+    }
+    // A batch behind it under authority that has not run out. The writer is serial, so once this
+    // one has arrived the one in front of it has either arrived or was never written.
+    {
+        let mut session = runtime.session();
+        let later = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 60_000;
+        session
+            .write_input(id, epoch, 2, b"kr-after", Some(later), Instant::now())
+            .expect("accepted");
+        runtime.flush_locked(&mut session);
+    }
+    let seen = retained_within(&runtime, b"kr-after", Duration::from_secs(10)).await;
+    assert!(
+        contains(&seen, b"kr-after"),
+        "the writer is still delivering what its authority admits: {seen:?}"
+    );
+    assert!(
+        !contains(&seen, b"kr-expired"),
+        "nothing written after the deadline reaches the pseudo-terminal: {seen:?}"
+    );
+
+    // The dropped batch is not still owed against the session's input budget, and neither is it
+    // still counted against the lease that queued it: an application that stopped reading would
+    // otherwise be blamed for bytes nothing is going to write.
+    let session = runtime.session();
+    assert_eq!(
+        session
+            .queued_input_bytes()
+            .load(std::sync::atomic::Ordering::Acquire),
+        0,
+        "the budget the dropped batch held is given back"
+    );
+    assert_eq!(
+        session.queued_lease_bytes().load(),
+        0,
+        "and so is the lease's share of it"
+    );
+    drop(session);
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
 }

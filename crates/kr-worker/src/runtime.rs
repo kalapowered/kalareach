@@ -407,6 +407,10 @@ fn wait_for_room(
 #[derive(Debug)]
 pub struct SessionRuntime {
     session: Arc<Mutex<Session>>,
+    /// The machine's own continuous clock, shared with the writer and with whatever else in this
+    /// process decides whether a forwarded deadline has passed. One reading of one clock answers
+    /// the same question at both boundaries.
+    shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
     input: mpsc::UnboundedSender<InputBatch>,
     wake: Arc<Notify>,
     closed: Arc<Notify>,
@@ -418,10 +422,19 @@ pub struct SessionRuntime {
 impl SessionRuntime {
     /// Starts the reader, the writer and the timers around an already launched session.
     ///
+    /// `shared_clock` is the machine's own continuous clock, which is the clock a forwarded
+    /// authority deadline is expressed on. The writer holds it because the writer is the last
+    /// boundary before the application: a batch waiting there for a terminal to take it has to be
+    /// measured against the authority that admitted it, not against the authority that held when
+    /// it was queued.
+    ///
     /// # Errors
     ///
     /// Returns an error when the terminal's reader or writer cannot be taken.
-    pub fn start(session: Session) -> Result<Self> {
+    pub fn start(
+        session: Session,
+        shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
+    ) -> Result<Self> {
         let reader = session.output_reader()?;
         let mut writer = session.input_writer()?;
         // What the host owes the application is bounded by what has been *written*, not by what is
@@ -545,6 +558,7 @@ impl SessionRuntime {
         let writer_paste_open = Arc::clone(&delivered_paste_open);
         let writer_lease_change = Arc::clone(&lease_change_queued);
         let writer_gone = Arc::clone(&terminal_gone);
+        let writer_clock = Arc::clone(&shared_clock);
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
 
@@ -580,15 +594,27 @@ impl SessionRuntime {
                         break;
                     }
                 }
-                let (epoch, bytes, transition) = match &batch {
+                let (epoch, bytes, transition, authority_deadline) = match &batch {
                     InputBatch::Lease {
                         epoch,
                         bytes,
                         paste,
-                    } => (Some(*epoch), bytes.as_slice(), paste.clone()),
-                    InputBatch::Reply { bytes } => {
-                        (None, bytes.as_slice(), PasteTransition::default())
-                    }
+                        authority_deadline_boot_ms,
+                    } => (
+                        Some(*epoch),
+                        bytes.as_slice(),
+                        paste.clone(),
+                        *authority_deadline_boot_ms,
+                    ),
+                    InputBatch::Reply { bytes } => (
+                        None,
+                        bytes.as_slice(),
+                        PasteTransition::default(),
+                        // The host's own answer to a question the application asked belongs to the
+                        // application, not to any caller's grant, so no grant's expiry withholds
+                        // it.
+                        None,
+                    ),
                     InputBatch::LeaseChanged => continue,
                 };
                 // Stale keystrokes are dropped here rather than written. A takeover that only
@@ -602,6 +628,22 @@ impl SessionRuntime {
                     continue;
                 }
                 let lease_epoch = epoch.unwrap_or_default();
+                // A second fence, independent of the lease's. The lease says who may write; this
+                // says how long what they wrote stays admissible. A batch the session accepted a
+                // moment before its caller's grant ran out can wait here — for the terminal, for
+                // an application that is not reading — and the grant can end while it waits.
+                // Nothing written after the deadline reaches the application.
+                let expired = |clock: &dyn kr_ipc::clock::SharedClock| {
+                    authority_deadline.is_some_and(|deadline| clock.boot_elapsed_ms() >= deadline)
+                };
+                if expired(writer_clock.as_ref()) {
+                    // Only a lease batch carries an authority deadline, and the lease itself has
+                    // not moved: its share of the queue is still counted against it, so it comes
+                    // back here with the whole budget.
+                    release(&writer_queued, bytes.len());
+                    writer_lease.release(lease_epoch, bytes.len());
+                    continue;
+                }
                 // Written in pieces, with the fence looked at before each one, so that a
                 // takeover reaches this writer between pieces rather than behind a whole batch.
                 let mut delivered_so_far = 0_usize;
@@ -613,7 +655,10 @@ impl SessionRuntime {
                     bytes,
                     &transition,
                     &writer_gate,
-                    &mut || epoch.is_some_and(|epoch| epoch < writer_fence.load(Ordering::Acquire)),
+                    &mut || {
+                        epoch.is_some_and(|epoch| epoch < writer_fence.load(Ordering::Acquire))
+                            || expired(writer_clock.as_ref())
+                    },
                     &mut |written| {
                         // Released only once the application has it. Until then it is owed.
                         release(&writer_queued, written);
@@ -660,16 +705,24 @@ impl SessionRuntime {
                     );
                 }
                 if delivery == Delivery::Abandoned {
-                    // The rest of the batch belongs to a lease that has ended, so it is not
-                    // written. What was delivered is what the application has, and the takeover
-                    // reports the remainder as discarded.
-                    release(&writer_queued, bytes.len().saturating_sub(delivered));
+                    // The rest of the batch belongs to a lease that has ended, or to authority
+                    // that has run out, so it is not written. What was delivered is what the
+                    // application has, and a takeover reports the remainder as discarded.
+                    let remainder = bytes.len().saturating_sub(delivered);
+                    release(&writer_queued, remainder);
+                    // The lease's own share comes back only while the lease is still the one that
+                    // queued these bytes: a lease change has already taken its count, and the
+                    // count names the epoch it belongs to, so this subtracts nothing after one.
+                    if epoch.is_some() {
+                        writer_lease.release(lease_epoch, remainder);
+                    }
                 }
             }
         });
 
         let runtime = Self {
             session: Arc::clone(&session),
+            shared_clock: Arc::clone(&shared_clock),
             input: input_sender.clone(),
             wake: Arc::clone(&wake),
             closed: Arc::clone(&closed),
@@ -724,6 +777,7 @@ impl SessionRuntime {
         let monitor_wake = Arc::clone(&wake);
         let monitor_fence = Arc::clone(&fence);
         let monitor_activity = Arc::clone(&activity);
+        let monitor_clock = Arc::clone(&shared_clock);
         tokio::spawn(async move {
             // The monitor holds a runtime of its own so a closure it begins publishes its fence and
             // its paste terminator the same way a requested one does. Building it only once the
@@ -732,6 +786,7 @@ impl SessionRuntime {
             // nothing else is going to.
             let runtime = Arc::new(SessionRuntime {
                 session: Arc::clone(&monitor_session),
+                shared_clock: monitor_clock,
                 input: monitor_input.clone(),
                 wake: Arc::clone(&monitor_wake),
                 closed: Arc::clone(&monitor_closed),
@@ -823,6 +878,12 @@ impl SessionRuntime {
         });
 
         Ok(runtime)
+    }
+
+    /// Returns the machine's own continuous clock this session's boundaries read.
+    #[must_use]
+    pub fn shared_clock(&self) -> Arc<dyn kr_ipc::clock::SharedClock> {
+        Arc::clone(&self.shared_clock)
     }
 
     /// Locks the session for one operation.
@@ -1056,10 +1117,13 @@ enum ReadEvent {
 /// # Errors
 ///
 /// Returns an error when the terminal cannot be created or the shell cannot be launched.
-pub fn start(config: crate::session::SessionConfig) -> Result<Arc<SessionRuntime>> {
+pub fn start(
+    config: crate::session::SessionConfig,
+    shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
+) -> Result<Arc<SessionRuntime>> {
     let mut session = Session::open(config)?;
     session.launch()?;
-    SessionRuntime::start(session).map(Arc::new)
+    SessionRuntime::start(session, shared_clock).map(Arc::new)
 }
 
 /// Why a session could not be started, and the record it left behind.
@@ -1079,6 +1143,7 @@ pub struct LaunchFailure {
 /// with `root_launch_failed`, so a failed creation leaves a record rather than a stuck `creating`.
 pub fn start_or_record(
     config: crate::session::SessionConfig,
+    shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
 ) -> std::result::Result<Arc<SessionRuntime>, Box<LaunchFailure>> {
     let mut session = match Session::open(config) {
         Ok(session) => session,
@@ -1093,7 +1158,7 @@ pub fn start_or_record(
         let closure = session.closure().cloned();
         return Err(Box::new(LaunchFailure { error, closure }));
     }
-    SessionRuntime::start(session)
+    SessionRuntime::start(session, shared_clock)
         .map(Arc::new)
         .map_err(|error| {
             Box::new(LaunchFailure {

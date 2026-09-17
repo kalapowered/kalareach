@@ -238,7 +238,13 @@ async fn the_first_eligible_claim_owns_the_size_and_a_conversation_view_never_cl
         "the oldest remaining eligible claim succeeds, not the newest attachment"
     );
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -302,7 +308,13 @@ async fn a_claim_is_added_or_withdrawn_without_displacing_the_owner() {
         "and supplies its own dimensions"
     );
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -324,7 +336,13 @@ async fn only_the_owners_resize_moves_the_pseudo_terminal() {
         &terminal(session_id, Dimensions::new(60, 20), false),
     );
     let epoch = session.geometry().epoch.get();
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
 
     // The watcher reports the size it is looking at. It is a report, not an insistence.
@@ -444,7 +462,13 @@ async fn all_three_dimension_limits_apply_at_once_and_a_refusal_changes_nothing(
         "and an unchecked multiplication of a request like that would have wrapped"
     );
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -502,7 +526,13 @@ async fn the_invisible_default_and_every_page_bound_are_what_section_eight_state
         "with more to come after it"
     );
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -527,7 +557,13 @@ async fn the_oldest_remaining_claim_succeeds_and_the_application_is_resized_to_i
         &mut session,
         &terminal(session_id, Dimensions::new(60, 20), true),
     );
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
 
     {
@@ -688,7 +724,13 @@ async fn a_keyboard_takeover_leaves_the_size_exactly_where_it_was() {
         "and its epoch did not move either"
     );
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -773,6 +815,7 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
                 lease.lease.epoch.get(),
                 0,
                 b"go\n",
+                None,
                 std::time::Instant::now(),
             )
             .expect("lets the application proceed");
@@ -1339,7 +1382,13 @@ async fn a_claim_the_session_budget_cannot_admit_is_refused_at_attach_and_owns_n
         "a change that never happened did not advance an epoch"
     );
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
@@ -1393,7 +1442,13 @@ async fn wired(script: &str, dimensions: Dimensions) -> Wired {
 
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts the runtime"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts the runtime"),
+    );
 
     let endpoint = environment
         .worker_endpoint(DisplayNumber::new(1))

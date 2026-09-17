@@ -188,6 +188,14 @@ pub struct Session {
     /// acknowledgement must not mean. The writer ends only for a terminal that has actually gone:
     /// it waits out an application that has merely paused.
     terminal_gone: Arc<std::sync::atomic::AtomicBool>,
+    /// When the authority behind the bytes the recogniser is still holding runs out.
+    ///
+    /// A held delimiter prefix is queued later than the write that produced it — by its own
+    /// deadline, by the paste mode being turned off, or by the next write completing it — and it
+    /// is still that write's authority that admitted it. The tightest deadline of the writes whose
+    /// bytes are in the prefix is what it carries, so a prefix that outlived the grant behind it
+    /// is fenced with everything else that grant sent.
+    held_input_deadline: Option<u64>,
     /// The lease epoch the writer compares every queued batch against.
     ///
     /// The session publishes it the moment the lease changes, which is what lets the count of what
@@ -272,6 +280,7 @@ impl Session {
             queued_lease_bytes: Arc::new(crate::runtime::LeaseBytes::new()),
             input_gate: Arc::new(std::sync::Mutex::new(())),
             terminal_gone: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            held_input_deadline: None,
             input_fence: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             delivered_paste_open: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             lease_change_queued: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1038,6 +1047,7 @@ impl Session {
         epoch: u64,
         sequence: u64,
         bytes: &[u8],
+        authority_deadline_boot_ms: Option<u64>,
         now: Instant,
     ) -> Result<InputAccepted> {
         if !self.state.accepts_input() {
@@ -1080,6 +1090,11 @@ impl Session {
             });
         }
         let outcome = self.framer.push(bytes, now);
+        // The recogniser can hold bytes back, so what this push forwards may carry bytes an
+        // earlier write handed over. Whichever authority ends first is the one that decides: an
+        // earlier write's deadline never gets extended by a later write, and a later write's
+        // never gets extended by an earlier one.
+        let admitted = tightest(self.held_input_deadline, authority_deadline_boot_ms);
         if !outcome.forward.is_empty() {
             // The framer's own state after the push is what these bytes leave the application in,
             // because `forward` carries every delimiter the push completed and no part of one it
@@ -1092,8 +1107,12 @@ impl Session {
                 epoch,
                 bytes: outcome.forward.clone(),
                 paste,
+                authority_deadline_boot_ms: admitted,
             });
         }
+        // What is still held belongs to whichever authority ends first among the writes that put
+        // bytes there; nothing held means nothing to fence later.
+        self.held_input_deadline = (outcome.held > 0).then_some(admitted).flatten();
         // A paste that has just closed, or a frame that has just completed, opens the gate the
         // response lane was waiting on. An application that asked a question during one of those
         // and then sat still would otherwise wait for its answer until the next byte of output.
@@ -1121,7 +1140,9 @@ impl Session {
                     epoch,
                     bytes,
                     paste: PasteTransition::default(),
+                    authority_deadline_boot_ms: self.held_input_deadline,
                 });
+                self.held_input_deadline = None;
                 len
             }
             _ => 0,
@@ -1157,13 +1178,16 @@ impl Session {
         if self.lease.holder().is_none() {
             // Nothing holds the keys, so these bytes belong to a lease that has ended and went
             // with it. Writing them now would put an ended actor's input in front of the next one.
+            self.held_input_deadline = None;
             return;
         }
         self.queue_input(InputBatch::Lease {
             epoch: self.lease.epoch(),
             bytes: released,
             paste: PasteTransition::default(),
+            authority_deadline_boot_ms: self.held_input_deadline,
         });
+        self.held_input_deadline = None;
         // The held prefix has gone, so a frame that was open is closed and the response lane's
         // gate is open again.
         self.pump_replies();
@@ -1926,6 +1950,18 @@ impl Session {
     }
 }
 
+/// Returns whichever of two authority deadlines ends first.
+///
+/// A null deadline is authority that does not expire, so it never shortens the other one and never
+/// replaces one that does expire.
+const fn tightest(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(if left < right { left } else { right }),
+        (Some(only), None) | (None, Some(only)) => Some(only),
+        (None, None) => None,
+    }
+}
+
 /// One ordered batch of input on its way to the pseudo-terminal.
 ///
 /// The variants are fenced differently, which is the whole reason the distinction exists. A
@@ -1943,6 +1979,13 @@ pub enum InputBatch {
         bytes: Vec<u8>,
         /// What they do to the bracketed paste the application is inside.
         paste: PasteTransition,
+        /// When the authority that accepted these bytes runs out, on the machine's own
+        /// continuous clock. Null when that authority does not expire.
+        ///
+        /// It travels with the bytes because the writer is the last boundary before the
+        /// application, and a batch can wait there: the grant behind it can end between the
+        /// moment the host accepted it and the moment the terminal takes it.
+        authority_deadline_boot_ms: Option<u64>,
     },
     /// The host answering the application, on the response lane.
     Reply {

@@ -88,7 +88,13 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     };
     let mut session = Session::open(config).expect("opens the session");
     session.launch().expect("launches the shell");
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts the runtime"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts the runtime"),
+    );
 
     let endpoint = environment.worker_endpoint(display).expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
