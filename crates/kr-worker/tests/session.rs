@@ -799,20 +799,44 @@ async fn takeover_mid_paste(one_frame: bool) {
         "the paste was closed before the new lease's input reached the application"
     );
     // And the rest of the old lease's batch never arrived: the writer abandoned it at the takeover
-    // rather than finishing it once the application started reading. What the application is short
-    // of is what the takeover said it discarded, which is the property; how much of the batch the
-    // terminal had already taken before that is the host's own buffer size and differs between
-    // platforms, so it is not what this compares. The count is of what the batch actually held
-    // rather than its length in bytes, because the line endings are not `a`, and the tail is
-    // `a`-and-newline in the same proportion as the whole.
-    let sent = start.iter().filter(|byte| **byte == b'a').count();
-    let body = seen.iter().filter(|byte| **byte == b'a').count();
-    let missing = sent.saturating_sub(body);
+    // rather than finishing it once the application started reading. What is compared is the tail
+    // the takeover itself reported discarding against what the application is short of, byte for
+    // byte: how much of the batch the terminal had already taken before that is the host's own
+    // buffer size and differs between platforms, so it is not what this is about. Both counts are
+    // of `a` bytes, because the line endings are not `a` and the paste delimiters are not either.
+    let written = {
+        let mut written = start.clone();
+        if !one_frame {
+            written.extend_from_slice(b"\x1b[201~");
+        }
+        written
+    };
     let discarded = usize::try_from(taken.discarded_bytes.get()).expect("a count of bytes");
     assert!(
-        missing * 2 >= discarded,
-        "a partly written batch of an ended lease is abandoned, not completed: the application \
-         received {body} of {sent}, and the takeover discarded {discarded} bytes"
+        discarded <= written.len(),
+        "the takeover discarded a tail of what the old lease queued: {discarded} of {}",
+        written.len()
+    );
+    let abandoned = written[written.len() - discarded..]
+        .iter()
+        .filter(|byte| **byte == b'a')
+        .count();
+    // The body the application was given, taken from between the delimiters rather than from the
+    // whole of what the session retained, so that the markers this test prints cannot be counted.
+    let opened = text
+        .find("\u{1b}[200~")
+        .expect("the application was given the start of the paste")
+        + "\u{1b}[200~".len();
+    let given = seen[opened..terminator]
+        .iter()
+        .filter(|byte| **byte == b'a')
+        .count();
+    let sent = start.iter().filter(|byte| **byte == b'a').count();
+    assert!(
+        sent.saturating_sub(given) >= abandoned,
+        "a partly written batch of an ended lease is abandoned, not completed: the application was \
+         given {given} of the {sent} bytes the body held, and the {abandoned} of them in the tail \
+         the takeover discarded were never among them"
     );
     let runtime = std::sync::Arc::clone(&runtime);
     runtime.close(ClosureReason::CloseRequested).1.release();

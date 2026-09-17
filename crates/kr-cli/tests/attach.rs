@@ -32,6 +32,7 @@ struct Hosted {
     session_id: SessionId,
     display: DisplayNumber,
     descriptor: WorkerDescriptor,
+    runtime: Arc<SessionRuntime>,
     _service: Arc<WorkerService>,
 }
 
@@ -131,7 +132,45 @@ async fn hosted(script: &str) -> Hosted {
         session_id,
         display,
         descriptor,
+        runtime,
         _service: service,
+    }
+}
+
+/// Waits for the session itself to have produced `marker`, and fails with how long it waited.
+///
+/// A terminal echoes what a person types, so what the *application* was given can only be read from
+/// what its session retained. This is the difference between input that was forwarded and input the
+/// outer terminal simply showed back.
+async fn session_retained(hosted: &Hosted, marker: &[u8], within: Duration) -> Vec<u8> {
+    let started = Instant::now();
+    let deadline = started + within;
+    loop {
+        let mut seen = Vec::new();
+        let mut cursor = 0_u64;
+        loop {
+            let page = hosted
+                .runtime
+                .session()
+                .history_page(cursor, 1024 * 1024)
+                .expect("reads what the session retained");
+            if page.bytes.as_slice().is_empty() {
+                break;
+            }
+            seen.extend_from_slice(page.bytes.as_slice());
+            cursor = page.next_cursor.get();
+        }
+        if seen.windows(marker.len()).any(|window| window == marker) {
+            return seen;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "waited {:?} for {:?} in what the session retained: {}",
+            started.elapsed(),
+            String::from_utf8_lossy(marker),
+            String::from_utf8_lossy(&seen).escape_debug()
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -364,8 +403,10 @@ fn answer_keyboard_queries(
     let output = output.clone();
     std::thread::spawn(move || {
         output.expect_within(b"\x1b[?u", LIVENESS_DEADLINE, QUERY_EXPECTED);
-        let _ = writer.write_all(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
-        let _ = writer.flush();
+        writer
+            .write_all(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c")
+            .expect("answers the queries");
+        writer.flush().expect("and the answer reaches the command");
     })
 }
 
@@ -404,8 +445,10 @@ fn answer_and_type(
         let mut answer = Vec::from(b"\x1b[?5u".as_slice());
         answer.extend_from_slice(typed);
         answer.extend_from_slice(b"\x1b[>4;2m\x1b[?62;22c");
-        let _ = writer.write_all(&answer);
-        let _ = writer.flush();
+        writer
+            .write_all(&answer)
+            .expect("answers the queries and types in the middle of the exchange");
+        writer.flush().expect("and the answer reaches the command");
     })
 }
 
@@ -829,10 +872,14 @@ async fn what_was_typed_during_the_handshake_reaches_the_application() {
         pty.master.take_writer().expect("a writer"),
         b"kr-typed-early\n",
     );
+    // The session is what is asked, because the outer terminal would show these bytes back whether
+    // they were forwarded or not: a handshake that failed restores echo, and echo alone would
+    // satisfy a terminal-side assertion while the application had never been given anything.
+    session_retained(&hosted, b"kr-typed-early", LIVENESS_DEADLINE).await;
     output.expect_within(
         b"kr-typed-early",
         LIVENESS_DEADLINE,
-        "the bytes typed during the handshake reached the application",
+        "the bytes typed during the handshake reached the application and came back",
     );
     answered(queries);
     let _ = shell.kill();
@@ -885,9 +932,12 @@ async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_a
 
     output.expect_within(b"attach-finished-", LIVENESS_DEADLINE, "the attach ended");
     answered(queries);
+    // The code, not merely "not zero": 3 is a host this command could not reach, and 6 is a
+    // terminal that never answered. Accepting any failure would let a handshake that timed out
+    // satisfy every assertion below, which is the opposite of what this test is about.
     assert!(
-        !output.contains(b"attach-finished-0"),
-        "and it ended as a failure, because nothing was listening: {}",
+        output.contains(b"attach-finished-3"),
+        "and it ended because nothing was listening rather than because the handshake failed: {}",
         output.text().escape_debug()
     );
     assert!(
