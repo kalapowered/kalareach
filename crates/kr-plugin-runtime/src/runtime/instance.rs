@@ -104,6 +104,13 @@ impl<T> CallOutcome<T> {
     }
 }
 
+/// What one member of a returned collection costs before its own contents are counted.
+///
+/// The same reasoning as a document node's fixed cost: a list of ten thousand empty strings is ten
+/// thousand things the host holds and the protocol carries, and a budget that counted only their
+/// contents would find it free.
+const ELEMENT_OVERHEAD_BYTES: usize = 32;
+
 /// What a returned value costs of the call's output budget.
 ///
 /// Implemented for every type an export returns, so one budget covers the document and the value
@@ -133,9 +140,33 @@ impl OutputSize for EncodedResponse {
 
 impl OutputSize for DecodedRequest {
     fn output_size(&self) -> u64 {
-        let decisions: usize = self.decisions.iter().map(String::len).sum();
-        let presentation: usize = self.presentation.iter().map(String::len).sum();
+        let decisions: usize = self
+            .decisions
+            .iter()
+            .map(|decision| ELEMENT_OVERHEAD_BYTES + decision.len())
+            .sum();
+        let presentation: usize = self
+            .presentation
+            .iter()
+            .map(|node| ELEMENT_OVERHEAD_BYTES + node.len())
+            .sum();
         (self.request_id.len() + self.summary.len() + decisions + presentation) as u64
+    }
+}
+
+impl OutputSize for Fault {
+    /// A declared fault carries text, and that text is output like any other.
+    ///
+    /// A component that returned a mebibyte of refusal would otherwise return a mebibyte for
+    /// nothing: the host holds it, the protocol carries it, and a person reads it.
+    fn output_size(&self) -> u64 {
+        let detail = match self {
+            Self::Unreadable(detail)
+            | Self::Refused(detail)
+            | Self::NotPermitted(detail)
+            | Self::Exhausted(detail) => detail.len(),
+        };
+        (ELEMENT_OVERHEAD_BYTES + detail) as u64
     }
 }
 
@@ -163,14 +194,18 @@ impl OutputSize for EffectPlan {
                         .fields
                         .iter()
                         .map(|field| {
-                            field
-                                .path
-                                .iter()
-                                .map(|segment| match segment {
-                                    FieldSegment::Member(name) => name.len(),
-                                    FieldSegment::Index(_) => 8,
-                                })
-                                .sum::<usize>()
+                            ELEMENT_OVERHEAD_BYTES
+                                + field
+                                    .path
+                                    .iter()
+                                    .map(|segment| {
+                                        ELEMENT_OVERHEAD_BYTES
+                                            + match segment {
+                                                FieldSegment::Member(name) => name.len(),
+                                                FieldSegment::Index(_) => 8,
+                                            }
+                                    })
+                                    .sum::<usize>()
                                 + argument_size(&field.value)
                         })
                         .sum::<usize>()
@@ -179,7 +214,9 @@ impl OutputSize for EffectPlan {
         let arguments: usize = self
             .arguments
             .iter()
-            .map(|argument| argument.name.len() + argument_size(&argument.value))
+            .map(|argument| {
+                ELEMENT_OVERHEAD_BYTES + argument.name.len() + argument_size(&argument.value)
+            })
             .sum();
         (self.action_id.len() + operation + arguments) as u64
     }
@@ -504,10 +541,19 @@ impl Instance {
 
         let remaining = self.store.get_fuel().unwrap_or(0);
         let fuel_used = budget.fuel.saturating_sub(remaining);
-        // The value the call returned is output too, and it is charged against the same budget as
-        // the document before the document is taken.
-        if let Ok(Ok(value)) = &called {
-            let size = value.output_size();
+        // What the call returned is output too, whether it was a value or a declared fault, and it
+        // is charged against the same budget as the document before the document is taken. A value
+        // is also bounded at what one frame can carry, because a value the protocol cannot deliver
+        // is not one this host should have accepted.
+        let mut oversized = None;
+        if let Ok(answer) = &called {
+            let size = match answer {
+                Ok(value) => value.output_size(),
+                Err(fault) => fault.output_size(),
+            };
+            if size > crate::runtime::host::MAX_NODE_BYTES {
+                oversized = Some(size);
+            }
             // The refusal is recorded in the sink, which is what `overran` reads below.
             let _within_budget = self.store.data_mut().document_mut().charge(size);
         }
@@ -524,7 +570,12 @@ impl Instance {
                 // A component that tried to emit or return past its output budget has broken a
                 // stated bound, whatever else it did. The nodes it produced travel with this
                 // outcome; the call is a fault.
-                if overran {
+                if let Some(bytes) = oversized {
+                    Err(RuntimeError::NodeTooLarge {
+                        bytes,
+                        limit: crate::runtime::host::MAX_NODE_BYTES,
+                    })
+                } else if overran {
                     Err(RuntimeError::OutputBudget {
                         call: kind.as_str(),
                         limit: kr_plugin_sdk::limits::OUTPUT_BYTES_PER_CALL,
@@ -647,7 +698,30 @@ mod tests {
             decisions: vec!["allow".to_owned(), "deny".to_owned()],
             presentation: vec!["{}".to_owned()],
         };
-        assert_eq!(decoded.output_size(), 5 + 4 + 5 + 4 + 2);
+        let members = 3 * ELEMENT_OVERHEAD_BYTES as u64;
+        assert_eq!(decoded.output_size(), 5 + 4 + 5 + 4 + 2 + members);
+    }
+
+    #[test]
+    fn a_declared_fault_is_output_like_anything_else() {
+        assert_eq!(
+            Fault::Refused("no".to_owned()).output_size(),
+            ELEMENT_OVERHEAD_BYTES as u64 + 2
+        );
+        let long = Fault::Unreadable("x".repeat(4096));
+        assert_eq!(long.output_size(), ELEMENT_OVERHEAD_BYTES as u64 + 4096);
+    }
+
+    #[test]
+    fn a_collection_of_empty_members_is_not_free() {
+        let empty = DecodedRequest {
+            request_id: String::new(),
+            class: crate::runtime::bindings::MethodClass::Observation,
+            summary: String::new(),
+            decisions: (0..1_000).map(|_| String::new()).collect(),
+            presentation: Vec::new(),
+        };
+        assert_eq!(empty.output_size(), 1_000 * ELEMENT_OVERHEAD_BYTES as u64);
     }
 
     #[test]
@@ -668,7 +742,10 @@ mod tests {
                 value: Argument::Text("run the tests".to_owned()),
             }],
         };
-        assert_eq!(plan.output_size(), 4 + 13 + 6 + 13);
+        assert_eq!(
+            plan.output_size(),
+            4 + 13 + 6 + 13 + ELEMENT_OVERHEAD_BYTES as u64
+        );
 
         let present = EffectPlan {
             action_id: "redraw".to_owned(),
