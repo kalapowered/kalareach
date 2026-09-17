@@ -1064,6 +1064,7 @@ the erasure covers that is not already empty.
 | AMD EPYC 9V74 80-Core, 4 processors | 5.9 to 7.5 MiB/s | 6.1 to 7.7 MiB/s | `core-ci` runs 35168759717 and 35164400630 |
 | Intel Xeon Platinum 8573C, 4 processors | 8.0 to 8.1 MiB/s | 7.4 to 7.6 MiB/s | `core-ci` runs 35163469612 and 35172122622 |
 | Intel Xeon Platinum 8370C, 4 processors | 7.0 MiB/s | 6.4 MiB/s | `core-ci` run 35174246084 |
+| Intel Xeon 6973P-C, 4 processors | 9.7 MiB/s | 9.3 MiB/s | `core-ci` run 35175248504 |
 
 The slowest of those hosts is where the comparison is clearest. `core-ci` measured 3.79 MiB/s on the
 stream that scrolls, below the target, on an AMD EPYC 7763 twenty minutes before it measured
