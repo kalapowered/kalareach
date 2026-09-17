@@ -437,7 +437,6 @@ impl Engine {
         self.lexer.flush_tail(&mut events);
         let mut outcome = self.consume(&events, now_ms);
         self.scratch = events;
-        self.measure_now = false;
         self.measure_now_unconditionally(now_ms);
         outcome.resident_pressure = self.resident_pressure();
         outcome
@@ -826,13 +825,14 @@ impl Engine {
     /// session's worth of them and a bound that is only checked afterwards is not a bound. What is
     /// charged is at or above what the object turns out to hold, and a row that is dropped gives
     /// nothing back until the objects on it are measured again, so the charged figure drifts above
-    /// the truth while a session prints. A refusal on that figure would refuse a link the session
-    /// has room for, so the truth is read before anything is refused, and only then.
+    /// the truth while a session prints. A refusal against the envelope on that figure would refuse
+    /// a link the session has room for, so the truth is read first. Only then: a link whose charge
+    /// fits the drifted figure fits the truth as well, and reading for it would buy nothing.
     ///
-    /// It is read here, before anything is charged, and `bytes` is the whole of what this link will
-    /// cost: the object and the table entry together. A measurement replaces the account with what
+    /// `bytes` is the whole of what this link will cost, the object and the table entry together,
+    /// and the reading happens before either is charged. A reading replaces the account with what
     /// the grid is holding, and the object this link is being admitted for is not on a row yet, so
-    /// a measurement taken between two charges would erase the first of them.
+    /// one taken between the two charges would erase the first of them.
     fn read_links_if_the_charge_would_not_fit(&mut self, bytes: u64) {
         if !self.budget.links_fit(bytes) {
             self.measure_links();
@@ -921,7 +921,8 @@ impl Engine {
     /// objects cost has to be found wherever the objects sit, which means reading every retained
     /// row, so it is read periodically and whenever something asked. Between two of those readings
     /// every hyperlink is charged what it will cost where it arrives, so the figure the envelope is
-    /// checked against is at or above the truth and a link is never admitted on a stale reading.
+    /// checked against is at or above the truth, and a link is admitted only where its whole charge
+    /// fits that figure.
     ///
     /// While the alternate buffer is active the primary buffer's history is not reachable and is
     /// not changing either, so the last measurement of it stands rather than being replaced by the
