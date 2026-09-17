@@ -325,21 +325,21 @@ fn a_gif_frame_larger_than_its_screen_is_refused() {
 /// KR-REQ-14.13: a WebP publishes without a preview, and says so, rather than reaching a decoder
 /// whose allocation this host cannot bound.
 ///
-/// The bytes below are a lossless WebP whose metadata would ask the pinned decoder for sixty-five
-/// thousand Huffman groups — tables of hundreds of megabytes from a file of a few dozen bytes. No
-/// decoder runs: the format is not compiled in, and the refusal comes from the twelve-byte
-/// container signature.
+/// The bytes below are a *small* lossless WebP: a sixteen-by-sixteen canvas, well inside the pixel
+/// charge, and forty-odd bytes, well inside the encoded-input limit. Neither of those bounds would
+/// have stopped it. What makes it dangerous is the field after the header, which says the number of
+/// Huffman groups comes from the entropy image rather than from the canvas, and that is the
+/// allocation no bound on pixels can reach. Nothing decodes it: the decoder is not compiled in, and
+/// the refusal comes from the twelve-byte container signature before any decoder is built.
 #[test]
 fn a_webp_publishes_without_a_preview_and_says_why() {
     let harness = Harness::create();
-    // A RIFF container with a `VP8L` chunk: the signature byte, a small canvas, and a metadata
-    // prefix that sets the "has more than one Huffman group" bit with a large group count.
+    // The VP8L bitstream, least significant bit first: the 0x2f signature, width - 1 and height - 1
+    // in fourteen bits each (sixteen by sixteen), no alpha, version 0, no transform, no colour
+    // cache, the meta-Huffman bit set, and the largest `huffman_bits` the field holds.
+    let lossless = [0x2f, 0x0f, 0xc0, 0x03, 0x00, 0x3c];
     let mut payload = Vec::new();
     payload.extend_from_slice(b"VP8L");
-    let lossless = [
-        0x2f, 0xff, 0xff, 0xff, 0xff, 0x0f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-        0xff,
-    ];
     payload.extend_from_slice(&(lossless.len() as u32).to_le_bytes());
     payload.extend_from_slice(&lossless);
     let mut bytes = Vec::new();
@@ -347,6 +347,10 @@ fn a_webp_publishes_without_a_preview_and_says_why() {
     bytes.extend_from_slice(&((payload.len() + 4) as u32).to_le_bytes());
     bytes.extend_from_slice(b"WEBP");
     bytes.extend_from_slice(&payload);
+    assert!(
+        bytes.len() < 64,
+        "the file is small enough that no size bound would refuse it"
+    );
 
     let refusal =
         kr_transfer::preview::generate(&mut std::io::Cursor::new(bytes.clone()), "image/webp")

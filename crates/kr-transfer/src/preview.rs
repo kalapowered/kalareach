@@ -15,8 +15,8 @@
 //! Three properties matter more than the decode itself.
 //!
 //! * The format comes from the bytes, not from the client. A declared media type is a claim and a
-//!   filename extension is metadata; `image`'s own sniffing decides what decoder runs, and the four
-//!   formats above are the only ones this crate compiles in.
+//!   filename extension is metadata; `image`'s own sniffing decides what decoder runs, and PNG,
+//!   JPEG and GIF are the only decoders this crate compiles in.
 //! * A refusal is a refusal, never a substitute. When a decode fails, is too large, or is a format
 //!   this decoder does not handle, the attachment publishes with no preview and the original file
 //!   is untouched. Nothing invents a placeholder image.
@@ -52,8 +52,8 @@ const NEVER_DECODED: &[&str] = &[
 /// four formats compiled in here:
 ///
 /// * a PNG decoded to sixteen-bit RGBA is eight bytes per pixel of output;
-/// * an animated WebP holds the output, the frame it decoded and the canvas it composites onto,
-///   which is three four-byte buffers at once;
+/// * a decoder that composites, as an animated WebP would, holds the output, the frame it decoded
+///   and the canvas it draws onto, which is three four-byte buffers at once;
 /// * a GIF holds its frame buffer and the image it crops into.
 ///
 /// Sixteen covers each of those with room left, so an image whose estimate fits the budget cannot
