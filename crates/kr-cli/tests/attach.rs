@@ -35,6 +35,44 @@ struct Hosted {
     runtime: Arc<SessionRuntime>,
     _service: Arc<WorkerService>,
 }
+/// The command binaries, on the internal disk.
+///
+/// The build directory is on the external volume this workspace lives on, and a process a test
+/// launches is its own privacy identity to the operating system: a binary run from there makes
+/// macOS ask whether it may read that volume, and the launch waits on the answer. Nothing a test
+/// waits for arrives while that is on screen. So the binaries are copied once per test process to a
+/// directory the operating system does not guard, and every test launches them from there. Both are
+/// copied together and keep their names, because `kr` looks for its restoration guard beside
+/// itself.
+fn command_binaries() -> &'static std::path::Path {
+    static COPIED: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    COPIED.get_or_init(|| {
+        let root = std::env::temp_dir().join(format!(
+            "kalareach-command-tests-{}-{}",
+            env!("CARGO_CRATE_NAME"),
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("a directory for the command binaries");
+        for source in [
+            std::path::Path::new(env!("CARGO_BIN_EXE_kr")),
+            std::path::Path::new(env!("CARGO_BIN_EXE_kr-attach-guard")),
+        ] {
+            let name = source.file_name().expect("the binary has a name");
+            std::fs::copy(source, root.join(name)).expect("copies a command binary");
+        }
+        root
+    })
+}
+
+/// The `kr` this test launches.
+fn kr() -> std::path::PathBuf {
+    command_binaries().join("kr")
+}
+
+/// The restoration guard this test's `kr` launches, which is beside it.
+fn kr_attach_guard() -> std::path::PathBuf {
+    command_binaries().join("kr-attach-guard")
+}
 
 async fn hosted(script: &str) -> Hosted {
     let temp = kr_ipc::testing::TempHost::create();
@@ -232,7 +270,7 @@ fn attach_process(shell: u32) -> u32 {
                 .expect("names the process");
             if String::from_utf8_lossy(&named.stdout)
                 .trim_start()
-                .starts_with(env!("CARGO_BIN_EXE_kr"))
+                .starts_with(&kr().display().to_string())
             {
                 return pid;
             }
@@ -313,7 +351,7 @@ fn guards_of(attach: u32) -> usize {
                 .expect("names the process");
             String::from_utf8_lossy(&named.stdout)
                 .trim_start()
-                .starts_with(env!("CARGO_BIN_EXE_kr-attach-guard"))
+                .starts_with(&kr_attach_guard().display().to_string())
         })
         .count()
 }
@@ -518,7 +556,7 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
             &hosted,
             &format!(
                 "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr")
+                kr().display()
             ),
         ))
         .expect("starts the shell");
@@ -620,7 +658,7 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
             &hosted,
             &format!(
                 "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr")
+                kr().display()
             ),
         ))
         .expect("starts the shell");
@@ -636,7 +674,7 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
     // A second command, in another window, ends this attachment. It names no attachment, so the
     // session is asked which one it has.
     let session = hosted.session_id.to_string();
-    let detach = std::process::Command::new(env!("CARGO_BIN_EXE_kr"))
+    let detach = std::process::Command::new(kr())
         .args(["detach", &session])
         // Never this test's own directory: the build tree can be on a removable volume, and
         // nothing this suite starts is given a working directory there.
@@ -719,7 +757,7 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
             &hosted,
             &format!(
                 "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr")
+                kr().display()
             ),
         ))
         .expect("starts the shell");
@@ -733,7 +771,7 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
     answered(queries);
 
     let session = hosted.session_id.to_string();
-    let detach = std::process::Command::new(env!("CARGO_BIN_EXE_kr"))
+    let detach = std::process::Command::new(kr())
         .args(["detach", &session])
         // Never this test's own directory: the build tree can be on a removable volume, and
         // nothing this suite starts is given a working directory there.
@@ -819,7 +857,7 @@ async fn a_terminal_that_does_not_finish_the_handshake_fails_the_attach_and_keep
             &hosted,
             &format!(
                 "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr")
+                kr().display()
             ),
         ))
         .expect("starts the shell");
@@ -866,7 +904,7 @@ async fn what_was_typed_during_the_handshake_reaches_the_application() {
             &hosted,
             &format!(
                 "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr")
+                kr().display()
             ),
         ))
         .expect("starts the shell");
@@ -926,7 +964,7 @@ async fn an_attach_that_fails_before_it_forwards_leaves_the_keyboard_protocols_a
             &hosted,
             &format!(
                 "{} attach {}; printf 'attach-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr"),
+                kr().display(),
                 unreachable.get()
             ),
         ))
@@ -993,7 +1031,7 @@ async fn an_attachment_that_asked_nothing_leaves_the_keyboard_exactly_as_it_foun
             &hosted,
             &format!(
                 "{} attach {display} --no-probe; printf 'attach-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr")
+                kr().display()
             ),
         ))
         .expect("starts the shell");

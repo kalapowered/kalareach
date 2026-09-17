@@ -40,6 +40,39 @@ struct Hosted {
     runtime: Arc<SessionRuntime>,
     _service: Arc<WorkerService>,
 }
+/// The command binaries, on the internal disk.
+///
+/// The build directory is on the external volume this workspace lives on, and a process a test
+/// launches is its own privacy identity to the operating system: a binary run from there makes
+/// macOS ask whether it may read that volume, and the launch waits on the answer. Nothing a test
+/// waits for arrives while that is on screen. So the binaries are copied once per test process to a
+/// directory the operating system does not guard, and every test launches them from there. Both are
+/// copied together and keep their names, because `kr` looks for its restoration guard beside
+/// itself.
+fn command_binaries() -> &'static std::path::Path {
+    static COPIED: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    COPIED.get_or_init(|| {
+        let root = std::env::temp_dir().join(format!(
+            "kalareach-command-tests-{}-{}",
+            env!("CARGO_CRATE_NAME"),
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("a directory for the command binaries");
+        for source in [
+            std::path::Path::new(env!("CARGO_BIN_EXE_kr")),
+            std::path::Path::new(env!("CARGO_BIN_EXE_kr-attach-guard")),
+        ] {
+            let name = source.file_name().expect("the binary has a name");
+            std::fs::copy(source, root.join(name)).expect("copies a command binary");
+        }
+        root
+    })
+}
+
+/// The `kr` this test launches.
+fn kr() -> std::path::PathBuf {
+    command_binaries().join("kr")
+}
 
 async fn hosted(script: &str) -> Hosted {
     let temp = kr_ipc::testing::TempHost::create();
@@ -434,7 +467,7 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
             &hosted,
             &format!(
                 "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr")
+                kr().display()
             ),
         ))
         .expect("starts the shell");
@@ -531,7 +564,7 @@ async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
             &hosted,
             &format!(
                 "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr")
+                kr().display()
             ),
         ))
         .expect("starts the shell");
@@ -614,7 +647,7 @@ async fn mouse_reports_pass_through_and_a_wheel_event_is_never_an_arrow_key() {
             &hosted,
             &format!(
                 "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr")
+                kr().display()
             ),
         ))
         .expect("starts the shell");
@@ -700,7 +733,7 @@ async fn a_view_without_the_lease_cannot_change_the_applications_focus_state() {
             &hosted,
             &format!(
                 "{} attach --no-probe {display}; printf 'attach-finished-%s\\n' \"$?\"",
-                env!("CARGO_BIN_EXE_kr")
+                kr().display()
             ),
         ))
         .expect("starts the shell");
