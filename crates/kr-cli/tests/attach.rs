@@ -66,6 +66,7 @@ fn command_binaries() -> &'static std::path::Path {
             // wait would be measuring the check.
             let _ = std::process::Command::new(&destination)
                 .arg("--version")
+                .current_dir(&root)
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
