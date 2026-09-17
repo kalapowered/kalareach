@@ -102,7 +102,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     detach_from_the_launcher();
     let session_id = SessionId::new(arguments.session);
     let environment_id = EnvironmentId::new(arguments.environment);
-    let paths = HostPaths::new(&arguments.runtime_dir, &arguments.state_dir);
+    let paths = HostPaths::new(&arguments.runtime_dir, &arguments.state_dir)?;
     let environment = paths.environment(environment_id);
     environment.create()?;
 

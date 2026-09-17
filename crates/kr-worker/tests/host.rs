@@ -356,6 +356,65 @@ async fn a_daemon_restart_keeps_the_session_and_its_shell() {
     second.stop().await;
 }
 
+/// A worker that reports it could not start resolves its own reservation, and the directory the
+/// host prepared for it goes back.
+///
+/// Managed shell mode is the one thing a worker can be asked for and refuse before it has a
+/// session: it needs a qualified shell package, and this host launches the stock shell. So the
+/// worker starts, claims its reservation, says it cannot go on, and exits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_reports_it_could_not_start_leaves_no_directory() {
+    let host = Host::create();
+    let _controller = host.start().await;
+    let mut client = host.client().await;
+    let mut params = create_params(host.environment_id, host.temp.root());
+    params.shell_mode = ShellMode::Managed;
+
+    let refused = client
+        .mutate(
+            Method::SessionCreate,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &params,
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("a worker that cannot serve managed mode says so");
+    // The daemon reports that it could not start a worker, and carries the worker's own words.
+    assert_eq!(refused.code, ErrorCode::ResourceUnavailable);
+    assert!(
+        refused.message.contains("SHELL_INTEGRATION_UNSUPPORTED"),
+        "the worker's own words reach the caller: {refused}"
+    );
+    // The reservation the report resolved stops occupying the environment, and what was prepared
+    // for that worker is given back with it.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let left = worker_dirs(&host);
+        if left.is_empty() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the directory prepared for a worker that never started is still there: {left:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Returns the sessions that still have a directory under this environment's workers folder.
+fn worker_dirs(host: &Host) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(host.paths().workers_dir()) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
+        .collect();
+    names.sort();
+    names
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_environment_limit_refuses_before_anything_is_spawned() {
     let host = Host::create();

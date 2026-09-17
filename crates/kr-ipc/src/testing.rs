@@ -34,7 +34,7 @@ impl TempHost {
         let suffix = crate::new_uuid().to_string();
         let root = std::env::temp_dir().join(format!("kr-{}", &suffix[..8]));
         crate::paths::create_private_tree(&root, &root).expect("owner-only temporary root");
-        let paths = HostPaths::new(root.join("r"), root.join("s"));
+        let paths = HostPaths::new(root.join("r"), root.join("s")).expect("absolute roots");
         let environment_id = paths.open_environment_id().expect("environment identity");
         paths
             .environment(environment_id)

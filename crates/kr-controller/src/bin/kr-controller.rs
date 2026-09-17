@@ -62,13 +62,13 @@ fn main() -> ExitCode {
 
 async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     let paths = match (arguments.runtime_dir, arguments.state_dir) {
-        (Some(runtime), Some(state)) => HostPaths::new(runtime, state),
+        (Some(runtime), Some(state)) => HostPaths::new(runtime, state)?,
         (runtime, state) => {
             let discovered = HostPaths::discover()?;
             HostPaths::new(
                 runtime.unwrap_or_else(|| discovered.runtime_root().to_path_buf()),
                 state.unwrap_or_else(|| discovered.state_root().to_path_buf()),
-            )
+            )?
         }
     };
     let environment_id = paths.open_environment_id()?;

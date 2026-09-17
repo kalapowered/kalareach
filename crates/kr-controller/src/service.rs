@@ -208,7 +208,10 @@ impl Controller {
             network: std::sync::OnceLock::new(),
             supervisor: setup.supervisor,
             transfer,
-            worker_program: setup.worker_program,
+            // The executable the daemon was told to start, resolved here rather than at the
+            // launch: a worker runs in a directory of its own, so a relative name would be looked
+            // for beneath that instead of beneath the directory this daemon was started in.
+            worker_program: kr_ipc::paths::resolve_here(setup.worker_program)?,
             build_id: setup.build_id,
             release: setup.release,
             started_at_ms: kr_ipc::now_ms(),
@@ -2768,6 +2771,16 @@ mod a_create_that_launches_nothing {
         Arc<Mutex<Vec<WorkerLaunch>>>,
     ) {
         let temp = kr_ipc::testing::TempHost::create();
+        let program = temp.root().join("kr-worker");
+        let (controller, asked) = daemon_running(&temp, program).await;
+        (temp, controller, asked)
+    }
+
+    /// Starts a daemon told to launch `program`, which may be a relative name.
+    async fn daemon_running(
+        temp: &kr_ipc::testing::TempHost,
+        program: std::path::PathBuf,
+    ) -> (Arc<Controller>, Arc<Mutex<Vec<WorkerLaunch>>>) {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
         let asked = Arc::new(Mutex::new(Vec::new()));
@@ -2786,13 +2799,13 @@ mod a_create_that_launches_nothing {
             supervisor: Box::new(RecordingSupervisor {
                 asked: Arc::clone(&asked),
             }),
-            worker_program: temp.root().join("kr-worker"),
+            worker_program: program,
             build_id: BuildId::new("kr-test/0").expect("a build identifier"),
             release: "0".to_owned(),
         })
         .await
         .expect("the daemon starts");
-        (temp, controller, asked)
+        (controller, asked)
     }
 
     /// Registers one connection, the way a caller's handshake does.
@@ -3137,6 +3150,61 @@ mod a_create_that_launches_nothing {
             worker_dirs(&temp),
             vec![reserved.to_string()],
             "a reservation nothing has settled keeps its directory; a session nobody knows does not"
+        );
+    }
+
+    /// Every path a launch carries is one the worker can use from a directory of its own.
+    ///
+    /// The worker is started somewhere this daemon chose, so a name this daemon was given
+    /// relatively would be looked for beneath that instead. This one is told to launch a relative
+    /// name on purpose.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_launch_carries_paths_the_worker_can_use_from_its_own_directory() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let (controller, asked) =
+            daemon_running(&temp, std::path::PathBuf::from("kr-worker-relative")).await;
+        let environment_id = temp.environment_id();
+        let (connection_id, actor_id) = admitted(&controller).await;
+        let accepted = AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_secs(30))
+                .expect("a deadline half a minute out"),
+            bound: DeadlineBound::RequestedTtl,
+        };
+        controller
+            .session_create(
+                &actor_id,
+                &create_request(environment_id),
+                connection_id,
+                accepted,
+            )
+            .await
+            .expect_err("this supervisor starts nothing");
+
+        let asked = asked.lock().expect("the record is not poisoned");
+        let launch = asked.first().expect("the supervisor was asked to launch");
+        for (what, path) in [
+            ("the executable", &launch.program),
+            ("the rendezvous endpoint", &launch.rendezvous),
+            ("the runtime root", &launch.runtime_directory),
+            ("the state root", &launch.state_directory),
+            ("the jobs directory", &launch.jobs_directory),
+            ("the working directory", &launch.working_directory),
+        ] {
+            assert!(
+                path.is_absolute(),
+                "{what} is a path the worker can use from anywhere: {}",
+                path.display()
+            );
+        }
+        assert_eq!(
+            launch.program,
+            std::env::current_dir()
+                .expect("this process has a directory")
+                .join("kr-worker-relative"),
+            "the relative name is resolved where the daemon was started, not where the worker runs"
         );
     }
 }

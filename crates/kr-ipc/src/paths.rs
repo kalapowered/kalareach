@@ -56,18 +56,23 @@ pub struct HostPaths {
 impl HostPaths {
     /// Builds the roots from explicit paths.
     ///
-    /// A relative root is resolved against the directory this process was started in, once, here.
-    /// Every path an installation has is derived from these two, and some of them are given to a
-    /// process that runs somewhere else: a worker is started in a directory of its own, and a
-    /// relative root would mean a different place to it. Resolving them at the top is what keeps
-    /// one installation's paths naming the same directories in every process that holds them, and
-    /// what lets an endpoint one process signs be the endpoint another compares it with.
-    #[must_use]
-    pub fn new(runtime_root: impl Into<PathBuf>, state_root: impl Into<PathBuf>) -> Self {
-        Self {
-            runtime_root: resolved(runtime_root.into()),
-            state_root: resolved(state_root.into()),
-        }
+    /// A relative root is resolved against the current directory, once, here. Every path an
+    /// installation has is derived from these two, and some of them are given to a process that
+    /// runs somewhere else: a worker is started in a directory of its own, and a relative root
+    /// would mean a different place to it. Resolving them at the top is what keeps one
+    /// installation's paths naming the same directories in every process that holds them, and what
+    /// lets an endpoint one process signs be the endpoint another compares it with.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IpcError::Io`] when a root cannot be resolved: an empty path, or a current
+    /// directory the operating system will not report. An installation whose roots cannot be
+    /// resolved is refused here rather than handing a relative one to another process.
+    pub fn new(runtime_root: impl Into<PathBuf>, state_root: impl Into<PathBuf>) -> Result<Self> {
+        Ok(Self {
+            runtime_root: resolve_here(runtime_root.into())?,
+            state_root: resolve_here(state_root.into())?,
+        })
     }
 
     /// Resolves the roots for the current user.
@@ -89,7 +94,7 @@ impl HostPaths {
             Some(value) => PathBuf::from(value),
             None => default_state_root()?,
         };
-        Ok(Self::new(runtime_root, state_root))
+        Self::new(runtime_root, state_root)
     }
 
     /// Returns the runtime root.
@@ -483,12 +488,13 @@ impl core::fmt::Display for Endpoint {
     }
 }
 
-/// Returns `path` against the directory this process was started in.
+/// Returns `path` against the current directory.
 ///
-/// It is left as it is when it cannot be resolved, which means a current directory the operating
-/// system will not report: nothing is gained by refusing a path that may still work.
-fn resolved(path: PathBuf) -> PathBuf {
-    std::path::absolute(&path).unwrap_or(path)
+/// # Errors
+///
+/// Returns [`IpcError::Io`] when the path is empty or the current directory cannot be read.
+pub fn resolve_here(path: PathBuf) -> Result<PathBuf> {
+    std::path::absolute(&path).map_err(|error| IpcError::io("resolve", path, error))
 }
 
 /// The file that records which environment owns a directory whose name is only a prefix.
@@ -1034,7 +1040,7 @@ mod tests {
     #[test]
     fn an_environment_identity_is_allocated_once_and_then_read() {
         let root = temporary_root("identity");
-        let paths = HostPaths::new(root.join("run"), root.join("state"));
+        let paths = HostPaths::new(root.join("run"), root.join("state")).expect("roots");
         let first = paths.open_environment_id().expect("allocates");
         let second = paths.open_environment_id().expect("reads");
         assert_eq!(first, second);
@@ -1048,7 +1054,7 @@ mod tests {
     /// them travels with them, including the endpoint one process signs and another compares.
     #[test]
     fn a_relative_root_is_resolved_where_the_host_is_built() {
-        let paths = HostPaths::new("kr-relative-runtime", "kr-relative-state");
+        let paths = HostPaths::new("kr-relative-runtime", "kr-relative-state").expect("roots");
         let here = std::env::current_dir().expect("this process has a directory");
         assert_eq!(paths.runtime_root(), here.join("kr-relative-runtime"));
         assert_eq!(paths.state_root(), here.join("kr-relative-state"));
@@ -1088,7 +1094,7 @@ mod tests {
     #[test]
     fn one_caller_wins_the_environment_identity() {
         let root = temporary_root("race");
-        let paths = HostPaths::new(root.join("r"), root.join("s"));
+        let paths = HostPaths::new(root.join("r"), root.join("s")).expect("roots");
         let first = paths.open_environment_id().expect("allocates");
         // A second caller that would have generated its own identity must read the winner's.
         let second = paths.open_environment_id().expect("reads");
@@ -1107,7 +1113,7 @@ mod tests {
     #[test]
     fn a_prefix_collision_is_refused_rather_than_shared() {
         let root = temporary_root("collision");
-        let paths = HostPaths::new(root.join("r"), root.join("s"));
+        let paths = HostPaths::new(root.join("r"), root.join("s")).expect("roots");
         let mut first_bytes = [7_u8; 16];
         first_bytes[15] = 1;
         let mut second_bytes = first_bytes;
@@ -1124,7 +1130,7 @@ mod tests {
     #[test]
     fn endpoint_names_stay_inside_the_platform_limit() {
         let root = temporary_root("endpoints");
-        let paths = HostPaths::new(root.join("run"), root.join("state"));
+        let paths = HostPaths::new(root.join("run"), root.join("state")).expect("roots");
         let environment = paths.environment(EnvironmentId::new(Uuid::NIL));
         environment.create().expect("directories");
         environment.controller_endpoint().expect("fits");

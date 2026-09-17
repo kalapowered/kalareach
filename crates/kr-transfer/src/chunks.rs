@@ -266,6 +266,7 @@ mod tests {
         let root = tempfile::tempdir().expect("a temporary directory");
         let paths =
             kr_ipc::paths::HostPaths::new(root.path().join("run"), root.path().join("state"))
+                .expect("absolute roots")
                 .environment(kr_protocol::ids::EnvironmentId::new(
                     kr_protocol::scalars::Uuid::from_bytes([2; 16]),
                 ));
