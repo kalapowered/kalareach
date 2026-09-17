@@ -911,6 +911,9 @@ impl Session {
         self.pump_replies();
         self.hub.detached(attachment_id);
         self.projections.forget(attachment_id);
+        // The handoff this attachment was waiting on goes with it. An attachment that left while a
+        // sequence was still arriving would otherwise leave an entry nothing ever visits again.
+        self.forwarding_held.remove(&attachment_id);
         let previous = self.attachments.geometry();
         let change = self.attachments.detach(attachment_id)?;
         if change.resize_required
@@ -1468,8 +1471,14 @@ impl Session {
                 // size, its profile, its stream or the screen it was given. There is no handoff.
                 continue;
             }
-            if self.hub.presentation_of(id) == Some(crate::output::Presentation::Direct) {
-                // Already forwarding. The boundary rule is about the moment forwarding begins.
+            if self.hub.presentation_of(id) == Some(crate::output::Presentation::Direct)
+                && !self.hub.is_resynchronising(id)
+            {
+                // Already forwarding, and continuing: the boundary rule is about the moment
+                // forwarding *begins*, and this stream has not stopped. A subscriber that has been
+                // told to resynchronise is a different case: it is waiting for a fresh screen, so
+                // the screen it gets and the bytes after it have to meet at a boundary like any
+                // other transition, and the exemption does not apply to it.
                 self.forwarding_held.remove(&id);
                 self.attachments.hold_forwarding(id, false);
                 continue;

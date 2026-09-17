@@ -134,6 +134,11 @@ pub struct TerminalEngine {
     tail: Vec<u8>,
     /// The raw cursor `tail` starts at.
     tail_cursor: u64,
+    /// Whether the session's initial palette has been chosen.
+    ///
+    /// Once, at creation. A second choice is a change to the session's palette, which is a terminal
+    /// mutation with an authority of its own and not something a creation-time seam may make.
+    palette_chosen: bool,
 }
 
 impl std::fmt::Debug for TerminalEngine {
@@ -165,6 +170,7 @@ impl TerminalEngine {
             projection_required: false,
             tail: Vec::new(),
             tail_cursor: 0,
+            palette_chosen: false,
         })
     }
 
@@ -370,7 +376,11 @@ impl TerminalEngine {
     /// palette chosen then would be a change to a screen somebody is already looking at rather
     /// than the provenance of the one it started with.
     pub fn set_initial_palette(&mut self, choice: crate::snapshot::PaletteChoice) -> Result<()> {
-        if self.engine.output_cursor() > 0 {
+        // What the engine has *read*, not what it has committed. A session whose first read was an
+        // incomplete escape sequence, or whose first character is still held for a combining mark,
+        // has produced output whose committed cursor is still zero; a palette chosen then would be
+        // a change to a screen rather than the provenance of the one it started with.
+        if self.engine.read_offset() > 0 || self.palette_chosen {
             return Err(WorkerError::InvalidArgument(
                 "the session's palette is fixed at creation and this session has already produced \
                  output"
@@ -378,6 +388,7 @@ impl TerminalEngine {
             ));
         }
         self.engine.adopt_palette(choice.palette());
+        self.palette_chosen = true;
         Ok(())
     }
 
