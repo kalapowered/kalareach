@@ -169,6 +169,9 @@ export type ControlFrame =
       generation_challenge: GenerationChallenge
     }
   | {
+      controller_role: ControllerConnectionRole
+    }
+  | {
       generation_token: ControllerGenerationToken
     }
   | {
@@ -182,6 +185,12 @@ export type ControlFrame =
     }
   | {
       forwarded: ForwardedMutation
+    }
+  | {
+      forwarded_read: ForwardedRequest
+    }
+  | {
+      retained_response: Response
     }
   | {
       acceptance_delivered: ActionId
@@ -206,6 +215,19 @@ export type ControlEvent =
       action_window_renewed: ActionWindow
     }
   | 'keepalive'
+/**
+ * What one of the control daemon's connections to a worker is for.
+ *
+ * A daemon needs more than one connection to a worker, because a worker's attachments,
+ * subscriptions and input lane belong to the connection that created them: a device's attachment
+ * cannot share a connection with the daemon's own housekeeping. Only one of those connections
+ * carries the environment's authority, and a connection says which it is *before* it presents a
+ * generation token, so the worker never has to guess and a proxy never displaces the authority.
+ *
+ * It confers nothing on its own. Every one of these connections still proves which generation it
+ * speaks for, and only the holder of the environment's signing key can produce that proof.
+ */
+export type ControllerConnectionRole = 'authority' | 'proxy'
 /**
  * One submitted intent and its receipt, generated as a UUIDv4.
  */
@@ -608,6 +630,40 @@ export type ResourceSelectorKind =
  */
 export type ClientVersion = string
 /**
+ * The parameters of `pair.redeem`.
+ */
+export type PairRedeemParams =
+  | {
+      challenge: {
+        /**
+         * The invitation the candidate scanned.
+         */
+        invitation_id: string
+      }
+    }
+  | {
+      direct: DirectRedeemProof
+    }
+/**
+ * The result of `pair.redeem`.
+ */
+export type PairRedeemResult =
+  | {
+      challenge: DirectChallenge
+    }
+  | {
+      locked: {
+        /**
+         * The attempt the host locked to this candidate.
+         */
+        attempt_id: string
+        /**
+         * The eight hexadecimal characters both devices display.
+         */
+        verification_value: string
+      }
+    }
+/**
  * What `pair.status` reports.
  *
  * It never reveals secret material, and the host returns it only to the candidate's authenticated
@@ -879,6 +935,7 @@ export interface KalaReachProtocol {
   closure_record?: ClosureRecord
   connect_reply?: ConnectReply
   control_frame?: ControlFrame
+  controller_connection_role?: ControllerConnectionRole
   controller_generation_token?: ControllerGenerationToken
   desktop_capability_report?: DesktopCapabilityReport
   desktop_context?: DesktopContext1
@@ -903,6 +960,7 @@ export interface KalaReachProtocol {
   events_subscribe_params?: EventsSubscribeParams
   events_subscribe_result?: EventsSubscribeResult
   forwarded_mutation?: ForwardedMutation
+  forwarded_request?: ForwardedRequest
   generation_accepted?: GenerationAccepted
   generation_challenge?: GenerationChallenge
   generation_checkpoint?: GenerationCheckpoint
@@ -1023,7 +1081,11 @@ export interface KalaReachProtocol {
   owner_confirmation_proof?: OwnerConfirmationProof
   owner_confirmation_request?: OwnerConfirmationRequest1
   pair_finish_request?: PairFinishRequest
+  pair_redeem_params?: PairRedeemParams
+  pair_redeem_result?: PairRedeemResult
   pair_status?: PairStatus
+  pair_status_params?: PairStatusParams
+  pair_status_result?: PairStatusResult
   policy_authority?: PolicyAuthority
   preview_entry?: PreviewEntry
   project_adopt_params?: ProjectAdoptParams
@@ -3357,6 +3419,92 @@ export interface MutationRequest1 {
    */
   requested_ttl_ms: string
   target: ActionTarget
+}
+/**
+ * A read the host admitted for a caller, passed to the component that owns its subject.
+ *
+ * A read needs forwarding for the same reason a mutation does, and for one reason more. The
+ * subject is the worker's, and the daemon owns admission; but a read is also *attributed*: the
+ * de-duplication key of a retained receipt is the verified actor and the action together, so a
+ * read that asks about an action has to ask as the caller rather than as the proxy. A plain
+ * request carries no actor, and serving one on the proxy's own principal would answer about the
+ * proxy's actions instead of the caller's.
+ *
+ * What travels beside the request is the actor the host verified, including the ingress it
+ * arrived on. The worker checks the method against *that* ingress, so a method the registry keeps
+ * to private IPC stays unreachable for a paired device even though the frame arrived on a socket.
+ */
+export interface ForwardedRequest {
+  actor: ActorEnvelope2
+  /**
+   * When the authority behind this request runs out, on the machine's own continuous clock.
+   *
+   * A read is not a mutation and carries no accepted deadline, but the authority behind it
+   * still ends: a grant expires while the request is in the worker's queue, and raw input is a
+   * request. The worker compares this inside the boundary that decides what reaches the
+   * application, so bytes admitted a moment before an expiry are not written after it. Null
+   * when the caller's authority is not something that expires, which is what a locally
+   * authenticated caller's operating-system identity is.
+   */
+  authority_deadline_boot_ms: U64 | null
+  request: Request1
+}
+/**
+ * The actor the host verified, with the ingress it arrived on.
+ */
+export interface ActorEnvelope2 {
+  /**
+   * The stable host-issued principal for this actor.
+   */
+  actor_id: string
+  /**
+   * The connection the request arrived on. Closing the control stream revokes every associated
+   * data stream.
+   */
+  connection_id: string
+  /**
+   * The controller generation that admitted the connection. Remote dispatch is fenced when this
+   * generation is replaced.
+   */
+  controller_generation: string
+  /**
+   * The paired device, when the ingress is a device.
+   */
+  device_id: DeviceId | null
+  /**
+   * The grant the request is being checked against, when one applies.
+   */
+  grant_id: GrantId | null
+  /**
+   * The authority revision the grant was validated at.
+   */
+  grant_revision: AuthorityRevision | null
+  /**
+   * Where the request entered the host.
+   */
+  ingress:
+    'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
+}
+/**
+ * A read request.
+ */
+export interface Request1 {
+  /**
+   * The method name. A name that is not in the registry is denied.
+   */
+  method: string
+  /**
+   * The method version. Schemas are closed for the negotiated version.
+   */
+  method_version: number
+  /**
+   * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
+   */
+  params: unknown
+  /**
+   * Correlates the response. Unique for the lifetime of one connection.
+   */
+  request_id: string
 }
 /**
  * Every capability record for one desktop, with the context they are about.
@@ -6004,6 +6152,88 @@ export interface PairFinishRequest {
    * The transcript both devices confirmed.
    */
   transcript: string
+}
+/**
+ * The parameters of `pair.status`.
+ *
+ * The invitation is named; the candidate is not, and cannot be. The host answers about the
+ * attempt the *authenticated endpoint* of this connection is party to, so a caller cannot ask
+ * about another candidate's attempt by naming it.
+ */
+export interface PairStatusParams {
+  /**
+   * The invitation the candidate is party to.
+   */
+  invitation_id: string
+}
+/**
+ * The result of `pair.status`.
+ */
+export interface PairStatusResult {
+  /**
+   * What the invitation is doing.
+   */
+  status:
+    | {
+        open: {
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+          /**
+           * Remaining failed-confirmation allowance on the host.
+           */
+          remaining_confirmations: number
+        }
+      }
+    | {
+        locked: {
+          /**
+           * The candidate that holds it.
+           */
+          attempt_id: string
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+        }
+      }
+    | {
+        awaiting_approval: {
+          /**
+           * The candidate's attempt.
+           */
+          attempt_id: string
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+          /**
+           * The verification value shown on both devices.
+           */
+          verification_value: string
+        }
+      }
+    | {
+        committed: {
+          /**
+           * One paired device.
+           */
+          device_id: string
+          /**
+           * One host-issued authority object.
+           */
+          grant_id: string
+        }
+      }
+    | {
+        consumed: {
+          /**
+           * Why it was consumed.
+           */
+          reason: 'denied' | 'expired' | 'cancelled' | 'attempts_exhausted' | 'host_restarted'
+        }
+      }
 }
 /**
  * An organisation's policy-signing authority as it is published.
