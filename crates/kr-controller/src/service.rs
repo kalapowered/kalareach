@@ -2196,6 +2196,11 @@ impl Controller {
         kr_ipc::descriptor::retire(&self.paths, record.session_id)?;
         self.directory.lock().await.remove(record.session_id);
         self.connections.lock().await.remove(&record.session_id);
+        // The directory the worker ran in goes with the session. It holds nothing the closure
+        // record needs, and one per session that nothing removes would outlive every session this
+        // host has ever run. A worker still on its way out may be holding it; on the platforms
+        // where that refuses the removal, the next start writes the directory again.
+        let _ = std::fs::remove_dir_all(self.paths.worker_dir(record.session_id));
         Ok(())
     }
 
