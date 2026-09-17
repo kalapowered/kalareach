@@ -1011,16 +1011,44 @@ fn a_git_invocation_names_an_absolute_directory_and_leaves_the_profiles_own_one_
     let profile = fixture.service().profile();
     let arguments: [&OsStr; 2] = [OsStr::new("rev-parse"), OsStr::new("--show-toplevel")];
 
-    let refusal = profile
-        .run(&GitRequest::read(std::path::Path::new("."), &arguments))
-        .expect_err("a relative directory is refused");
+    // A read and a write are refused alike, and the type has no way to leave the directory out:
+    // `GitRequest` takes one, so an invocation cannot quietly run in the directory the child starts
+    // in. `git init` is the one that would have left something there.
+    let relative = std::path::Path::new(".");
+    let creation: [&OsStr; 1] = [OsStr::new("init")];
+    for request in [
+        GitRequest::read(relative, &arguments),
+        GitRequest::write(relative, &creation),
+    ] {
+        let refusal = profile
+            .run(&request)
+            .expect_err("a relative directory is refused");
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::InvalidArgument
+        );
+        assert!(
+            refusal.to_string().contains("absolute directory"),
+            "and says why: {refusal}"
+        );
+    }
+    // The profile's own root is under the same rule, for the same reason.
+    let root_refusal = kr_project::git::RestrictedProfile::prepare(relative)
+        .expect_err("a relative profile root is refused");
     assert_eq!(
-        refusal.code(),
-        kr_protocol::error::ErrorCode::InvalidArgument
+        root_refusal.code(),
+        kr_protocol::error::ErrorCode::StorageUnavailable
     );
     assert!(
-        refusal.to_string().contains("absolute directory"),
-        "and says why: {refusal}"
+        root_refusal.to_string().contains("absolute directory"),
+        "and says why: {root_refusal}"
+    );
+    assert!(
+        std::fs::read_dir(profile.home_directory())
+            .expect("the child's own directory reads")
+            .next()
+            .is_none(),
+        "a refusal leaves the directory every Git child starts in empty"
     );
 
     // The same invocation against the repository's own absolute path runs, and nothing lands in

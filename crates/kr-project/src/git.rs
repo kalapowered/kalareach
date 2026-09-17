@@ -603,16 +603,14 @@ impl RestrictedProfile {
         // place a subprocess is started.
         check_arguments(request.arguments)?;
         // The child starts in a directory this host owns rather than in this process's own, so a
-        // relative directory would name something other than what the caller meant by it. A caller
-        // that has a relative path resolves it against the directory it means, which is a decision
-        // this host cannot make for it.
-        if let Some(directory) = request.directory
-            && !directory.is_absolute()
-        {
+        // relative directory would name something other than what the caller meant by it, and a
+        // directory the type could leave out would name the host's own. The type requires one; this
+        // requires it to be absolute.
+        if !request.directory.is_absolute() {
             return Err(ProjectError::InvalidArgument(
                 format!(
                     "a Git invocation names an absolute directory, and {} is not one",
-                    redact(&directory.display().to_string())
+                    redact(&request.directory.display().to_string())
                 )
                 .into(),
             ));
@@ -739,10 +737,8 @@ impl RestrictedProfile {
     #[must_use]
     pub fn argument_vector(&self, request: &GitRequest<'_>) -> Vec<OsString> {
         let mut argv: Vec<OsString> = vec![OsString::from("--no-pager")];
-        if let Some(directory) = request.directory {
-            argv.push(OsString::from("-C"));
-            argv.push(directory.as_os_str().to_owned());
-        }
+        argv.push(OsString::from("-C"));
+        argv.push(request.directory.as_os_str().to_owned());
         if request.read_only {
             // No index write, no reference-log rewrite, no optional lock: a read leaves the
             // repository exactly as it found it.
@@ -1068,7 +1064,12 @@ fn inherited_platform_environment(_home: &Path) -> Vec<(OsString, OsString)> {
 #[derive(Clone, Debug)]
 pub struct GitRequest<'a> {
     /// The directory Git runs in, passed as `-C`.
-    pub directory: Option<&'a Path>,
+    ///
+    /// It is absolute and it is always given. The child starts in a directory this host owns rather
+    /// than in the caller's, so an invocation with no directory would run there and a relative one
+    /// would name something under it; a caller that has a relative path resolves it against the
+    /// directory it means, which is a decision this host cannot make for it.
+    pub directory: &'a Path,
     /// The arguments after the overrides.
     pub arguments: &'a [&'a OsStr],
     /// True when the invocation must leave the repository exactly as it found it.
@@ -1094,7 +1095,7 @@ impl<'a> GitRequest<'a> {
     #[must_use]
     pub fn read(directory: &'a Path, arguments: &'a [&'a OsStr]) -> Self {
         Self {
-            directory: Some(directory),
+            directory,
             arguments,
             read_only: true,
             transport: None,
