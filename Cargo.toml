@@ -66,6 +66,7 @@ kr-plugin-runtime = { path = "crates/kr-plugin-runtime", version = "=0.1.0" }
 kr-plugin-sdk = { path = "crates/kr-plugin-sdk", version = "=0.1.0" }
 kr-project = { path = "crates/kr-project", version = "=0.1.0" }
 kr-protocol = { path = "crates/kr-protocol", version = "=0.1.0" }
+kr-shell-integration = { path = "crates/kr-shell-integration", version = "=0.1.0" }
 kr-term = { path = "crates/kr-term", version = "=0.1.0" }
 kr-transfer = { path = "crates/kr-transfer", version = "=0.1.0" }
 kr-transport = { path = "crates/kr-transport", version = "=0.1.0" }

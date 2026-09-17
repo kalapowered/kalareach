@@ -17,6 +17,7 @@
 //! | [`contract::fence`] | The pure state machine over `outside`, `unfenced`, `fenced`, `launch_reserved` and `closing` |
 //! | [`contract::qualification`] | Which mechanisms qualify each package, which can never stand in for a delivery fence, the exact detach condition and the phases a session passes through |
 //! | [`contract::fixtures`] | The cross-shell scenarios under `fixtures/shell-bridge/`, which every package replays |
+//! | [`host`] | The worker's side: the owner-only endpoint, the handshake, the phase gate, the shell packages and the guarded startup entries |
 //!
 //! # What it does not do
 //!
@@ -60,3 +61,4 @@
 //! ```
 
 pub mod contract;
+pub mod host;
