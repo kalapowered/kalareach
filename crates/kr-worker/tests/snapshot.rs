@@ -1006,6 +1006,68 @@ async fn reported_presentation(
         .and_then(|summary| summary.presentation.as_ref().copied())
 }
 
+/// KR-REQ-08.81: asking for a screen is beginning again, and beginning again meets a boundary.
+///
+/// An attachment that is already forwarding and subscribes afresh is not a continuous stream: what
+/// it is given is a screen and a cursor, and those two have to name the same boundary however it
+/// was being served a moment before. Without that, the one case the rule exists for - the middle
+/// of a control sequence - reaches a terminal through the back door.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribing_again_while_the_parser_is_mid_sequence_is_served_a_projection() {
+    // Complete output first, so the attachment is forwarded the stream, and then a sequence that
+    // stays open while this test subscribes again.
+    let host = host(
+        "printf 'settled\\r\\n'; sleep 1.2; printf 'open\\033[1'; sleep 4; \
+         printf 'm-closed\\r\\n'; sleep 20",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let mut attached = attach(
+        &host,
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        Some("xterm-256color"),
+    )
+    .await;
+    assert_eq!(
+        attached.presentation,
+        Some(TerminalPresentationMode::Direct),
+        "a terminal of the session's own size on a settled stream is handed the stream"
+    );
+
+    // The application leaves the parser inside a sequence. This attachment is still forwarding.
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let mut reader = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    // It asks for a screen, the way a client does after a decode failure of its own. What it is
+    // given cannot be the middle of that sequence.
+    let again = resubscribe(&host, &mut attached, 0).await;
+    assert!(
+        again.from_cursor.get() > 0,
+        "the subscription starts where the session is"
+    );
+    assert_eq!(
+        reported_presentation(&host, &mut reader, attached.attachment_id).await,
+        Some(TerminalPresentationMode::Viewport),
+        "and it is served a projection until the parser reaches ground"
+    );
+    let events = collect(&mut attached.client, Duration::from_millis(400)).await;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Snapshot(_) | Event::Rows(_) | Event::Delta(_))),
+        "the screen it is given is the canonical grid: {events:?}"
+    );
+
+    // The sequence completes, and the attachment may forward again.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    assert_eq!(
+        reported_presentation(&host, &mut reader, attached.attachment_id).await,
+        Some(TerminalPresentationMode::Direct),
+        "once the parser is on ground it takes the stream back"
+    );
+}
+
 /// KR-REQ-08.81: forwarding begins at a parser-ground boundary and nowhere else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() {

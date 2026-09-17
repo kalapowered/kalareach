@@ -661,12 +661,15 @@ async fn attach(host: &Host, owned: &mut Owned) -> Result<Duration, String> {
     println!("KR-PERF-004 measurement");
     println!(
         "  conditions: a local attachment to a live session at 120x40, a release build, measured \
-         from the connection to the moment the host has delivered the screen: the connection, the \
-         worker's proof, the attachment, the input lease, the subscription, and the screen itself \
-         arriving and decoding. A terminal of the session's own size reaches that when the bytes \
-         that put it into the session's state arrive; a projected one reaches it when the last row \
-         page of its snapshot does, because a client holding part of a screen is not holding a \
-         screen. Drawing it is the client's own work and is not in these numbers."
+         from the connection to the moment a person could look at the screen: the connection, the \
+         worker's proof, the attachment, the subscription, and the screen itself arriving, \
+         decoding and being made ready to look at. A terminal of the session's own size reaches \
+         that when bytes arrive that place the cursor, which is how a restoration ends; a \
+         projected one reaches it when the last row page of its snapshot arrives, the client \
+         library installs the screen and paints it, because a client holding part of a screen is \
+         holding no screen and a screen nobody has drawn is not one anybody can look at. Writing \
+         those bytes to a physical terminal, and that terminal's own render, are outside this \
+         figure: there is no terminal here."
     );
     println!(
         "  direct, a terminal of the session's own size: {}",
@@ -914,7 +917,7 @@ fn report(samples: &[Duration]) -> String {
         .join(", ")
 }
 
-/// Times five attachments of one size, from the connection to the screen.
+/// Times five attachments of one size, from the connection to a screen somebody could look at.
 async fn attach_samples(
     host: &Host,
     created: &SessionCreateResult,
@@ -927,8 +930,9 @@ async fn attach_samples(
     for _ in 0..5 {
         let started = Instant::now();
         // A usable screen is the whole sequence a person waits for: the connection, the worker's
-        // proof, the attachment, the input lease, the subscription, and the screen arriving. A
-        // measurement that stopped at the first byte would be measuring the transport.
+        // proof, the attachment, the subscription, the screen arriving, and the client making it
+        // ready to look at. A measurement that stopped at the first byte would be measuring the
+        // transport.
         let Ok(mut client) = LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await
         else {
             // A sample that could not be taken is the absence of one. It is reported that way
@@ -987,8 +991,10 @@ async fn attach_samples(
         // The screen itself. This is what the person sees, and it is where the clock stops. The
         // two presentations reach it by different routes: a terminal of the session's own size is
         // sent the bytes that put it into the session's state, and a projected client is sent the
-        // canonical grid as state and draws it itself, which is complete when the last row page of
-        // its snapshot arrives.
+        // canonical grid as state and draws it itself. Both are held to the same standard, which
+        // is a screen somebody could look at: bytes that place the cursor, or a whole snapshot the
+        // client library has installed and painted.
+        let mut projection = kr_client::projection::Projection::new();
         let screen = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 let Ok(frame) = client.recv().await else {
@@ -997,33 +1003,41 @@ async fn attach_samples(
                 let kr_protocol::envelope::ControlFrame::Notification(notification) = frame else {
                     continue;
                 };
-                match notification.event_type.as_str() {
-                    "session.output" => {
-                        if let Ok(event) = notification
-                            .payload
-                            .to_typed::<kr_protocol::recovery::OutputEvent>()
-                        {
-                            // A screen a terminal can draw, not merely a frame that arrived: the
-                            // payload decodes and it places the cursor, which every restoration
-                            // ends by doing.
-                            return event.bytes.as_slice().windows(4).any(|window| {
-                                window == b"\x1b[?25" || window.starts_with(b"\x1b[")
-                            });
-                        }
+                if notification.event_type.as_str() == "session.output" {
+                    if let Ok(event) = notification
+                        .payload
+                        .to_typed::<kr_protocol::recovery::OutputEvent>()
+                    {
+                        // A screen a terminal can draw, not merely a frame that arrived: the
+                        // payload decodes and it places the cursor, which every restoration ends
+                        // by doing.
+                        return places_the_cursor(event.bytes.as_slice());
                     }
-                    "session.projection.rows" => {
-                        if let Ok(page) = notification
-                            .payload
-                            .to_typed::<kr_protocol::projection::ProjectionRowPage>()
-                            && !page.more
-                        {
-                            // The whole screen has arrived. A client that had only some of it would
-                            // be mixing an incomplete repaint with live output, which section 8
-                            // forbids, so this is the moment it becomes usable.
-                            return true;
-                        }
-                    }
-                    _ => {}
+                    continue;
+                }
+                let Some(event) = kr_client::projection::decode(
+                    notification.event_type.as_str(),
+                    &notification.payload,
+                ) else {
+                    continue;
+                };
+                // Applied as the client applies it, which is the only thing that can say whether
+                // the client is holding a screen: a page belonging to another snapshot, or an
+                // update against a base it does not hold, leaves it holding nothing.
+                let applied = projection.apply(event);
+                if matches!(applied, kr_client::projection::Applied::Installed) {
+                    let Some(held) = projection.screen() else {
+                        return false;
+                    };
+                    // And drawn. A client holding a screen nobody has drawn is not a screen a
+                    // person can look at, and drawing it is the client's own work, so it is inside
+                    // the figure rather than outside it.
+                    let painted = kr_client::projection::paint::install(
+                        held,
+                        kr_client::projection::paint::Window::of(held),
+                        kr_client::projection::paint::Keyboard::Withhold,
+                    );
+                    return !painted.bytes.is_empty();
                 }
             }
         })
@@ -1037,6 +1051,35 @@ async fn attach_samples(
         samples.push(started.elapsed());
     }
     samples
+}
+
+/// Whether a restoration's bytes place the cursor, which is how one ends.
+///
+/// Not "contains an escape sequence": a frame carrying half a screen also does. A cursor address
+/// is `CSI row ; column H`, and the restoration writes one last of all, so finding one is finding
+/// the end of a screen a terminal can draw.
+fn places_the_cursor(bytes: &[u8]) -> bool {
+    let mut index = 0;
+    while let Some(position) = bytes[index..]
+        .windows(2)
+        .position(|window| window == b"\x1b[")
+    {
+        let mut at = index + position + 2;
+        while bytes
+            .get(at)
+            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b';')
+        {
+            at += 1;
+        }
+        if matches!(bytes.get(at), Some(b'H') | Some(b'f')) {
+            return true;
+        }
+        index = index + position + 2;
+        if index >= bytes.len() {
+            break;
+        }
+    }
+    false
 }
 
 /// Attaches an observing view and subscribes it to output.

@@ -44,6 +44,10 @@ sysinfo.workspace = true
 
 [dev-dependencies]
 kr-cbor.workspace = true
+# The performance measurement stops its clock when a *client* is holding a screen and has drawn
+# it, which is what the section-27 figure means by usable. That is the client library's own work,
+# so the measurement uses the client library rather than a second opinion about it.
+kr-client.workspace = true
 # The host tests start a real control daemon beside a real worker. The dependency is only in
 # tests, so the two crates do not depend on each other at build time.
 kr-controller.workspace = true
