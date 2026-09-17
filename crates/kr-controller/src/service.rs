@@ -71,6 +71,15 @@ pub mod net;
 /// How long a closing worker is watched before the controller stops waiting for it to end.
 pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The file this environment's capability revision is recorded in.
+///
+/// It is durable because a revision must never repeat: an action binds to one, and a revision that
+/// came round again would make a stale binding look current.
+pub const CAPABILITY_REVISION_FILE: &str = "capabilities";
+
+/// The longest capability-revision record this host reads.
+const CAPABILITY_REVISION_LIMIT: u64 = 64;
+
 /// The file this environment's current boot identity is recorded in.
 ///
 /// It lives in the state directory rather than the runtime one because it has to outlive the boot
@@ -97,8 +106,31 @@ pub const DESKTOP_REREAD_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// for it. It is also the bound on how long after work ends an assertion can still be held.
 pub const POWER_REVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Whether an evaluation of the sleep setting may take over reviewing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Claim {
+    /// This evaluation starts a review when one is wanted and none is running.
+    Take,
+    /// This evaluation is the review, and it gives the mark up when nothing wants it.
+    Hold,
+}
+
+/// What an evaluation of the sleep setting decided about reviewing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Review {
+    /// A review is wanted and this evaluation took it on.
+    Start,
+    /// Whoever is reviewing keeps doing so.
+    Continue,
+    /// Nothing wants a review, and the mark has been given up.
+    Stop,
+}
+
 /// How long one worker is given to say what it has outstanding.
 pub const DEMAND_PATIENCE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// How long the whole scan of what this host has outstanding may take.
+pub const DEMAND_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How long the rendezvous waits for the launcher to report the worker's identity.
 pub const LAUNCH_IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -276,6 +308,7 @@ impl Controller {
         let identity = (setup.identity)()?;
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
         let boot = setup.boot_identity.clone();
+        let paths = setup.paths.clone();
         let started_at_ms = kr_ipc::now_ms();
         let clock = Arc::new(SystemContinuousClock::new());
         let authority_revision = registry.authority_revision()?;
@@ -311,7 +344,7 @@ impl Controller {
             started_at_ms,
             desktop: Mutex::new(DesktopReading {
                 context: crate::desktop::current(boot.clone()),
-                revision: CapabilityRevision::new(started_at_ms.get()),
+                revision: capability_revision(&paths),
                 records: Vec::new(),
                 read_at: std::time::Instant::now(),
             }),
@@ -334,6 +367,10 @@ impl Controller {
         // directory that no session claims is nothing's.
         controller.sweep_worker_dirs().await?;
         crate::transfer::serve(&controller)?;
+        // The owner's setting is the owner's setting across a restart. A daemon that waited for a
+        // client to ask before it looked would leave an enabled setting doing nothing until
+        // somebody happened to run a command.
+        let _ = controller.power_state().await;
         // The network comes up last. A paired device must not reach a daemon that has not yet
         // recovered its reservations and rebuilt its worker directory, because it would be told
         // that sessions this host is running do not exist.
@@ -2231,15 +2268,29 @@ impl Controller {
         let (context, revision) = self.desktop().await;
         let mut report =
             crate::desktop::capabilities(self.paths.environment_id(), context, revision);
+        // The comparison and the revision it decides are one hold of this lock. Two reports
+        // running at once would otherwise both see the old evidence, one would commit the new
+        // revision, and the other would hand out records stamped with a revision that no longer
+        // describes them.
         let mut reading = self.desktop.lock().await;
-        if comparable(&report.records) != comparable(&reading.records) {
+        let revision = if comparable(&report.records) == comparable(&reading.records) {
+            reading.revision
+        } else {
             let advanced = CapabilityRevision::new(reading.revision.get().saturating_add(1));
             reading.revision = advanced;
-            for record in &mut report.records {
-                record.revision = advanced;
-            }
             reading.records = report.records.clone();
+            // The revision outlives this daemon, so a replacement never hands out one it has used
+            // before. A revision that could go backwards would make an action's stale binding look
+            // current.
+            let path = self.paths.state_dir().join(CAPABILITY_REVISION_FILE);
+            let _ =
+                kr_ipc::paths::write_owner_only_file(&path, advanced.get().to_string().as_bytes());
+            advanced
+        };
+        for record in &mut report.records {
+            record.revision = revision;
         }
+        drop(reading);
         report
     }
 
@@ -2254,8 +2305,10 @@ impl Controller {
     /// the work rather than a clock. A review keeps asking while the setting is on, because
     /// neither the start nor the end of a shell's own job is something this daemon is told about.
     pub async fn power_state(self: &Arc<Self>) -> SleepInhibitionState {
-        let state = self.evaluate_power().await;
-        self.review_power(&state);
+        let (state, review) = self.evaluate_power(Claim::Take).await;
+        if review == Review::Start {
+            self.review_power();
+        }
         state
     }
 
@@ -2270,25 +2323,50 @@ impl Controller {
         });
     }
 
-    /// Takes or releases the assertion for what this host currently has outstanding.
-    async fn evaluate_power(&self) -> SleepInhibitionState {
+    /// Takes or releases the assertion for what this host currently has outstanding, and settles
+    /// who is reviewing it.
+    ///
+    /// The evaluation and the review decision happen in one hold of the inhibitor's lock. Two
+    /// holds would let a review that has just decided to stop clear the mark while another caller
+    /// is taking an assertion, and that assertion would then have nothing watching it.
+    async fn evaluate_power(&self, claim: Claim) -> (SleepInhibitionState, Review) {
         let setting = power::read(&self.paths);
-        if setting == kr_protocol::desktop::SleepInhibitionSetting::Off {
-            // Nothing is read and nothing is asked: a host whose owner has not chosen this pays
-            // nothing for it, and an assertion held under a setting that has since been turned off
-            // is released here.
-            return self.inhibitor.lock().await.evaluate(
-                setting,
-                Demand::default(),
-                kr_protocol::desktop::PowerSource::Unknown,
-            );
-        }
-        let demand = self.demand().await;
-        let source = power::power_source();
-        self.inhibitor
-            .lock()
-            .await
-            .evaluate(setting, demand, source)
+        let off = setting == kr_protocol::desktop::SleepInhibitionSetting::Off;
+        // A host whose owner has not chosen this pays nothing for it: no worker is asked and no
+        // power source is read. An assertion held under a setting that has since been turned off
+        // is released by the evaluation below.
+        let demand = if off {
+            Demand::default()
+        } else {
+            self.demand().await
+        };
+        let source = if off {
+            kr_protocol::desktop::PowerSource::Unknown
+        } else {
+            power::power_source()
+        };
+        let mut inhibitor = self.inhibitor.lock().await;
+        let state = inhibitor.evaluate(setting, demand, source);
+        let wanted = state.active || !off;
+        let review = match claim {
+            Claim::Take => {
+                if wanted && !inhibitor.reviewing() {
+                    inhibitor.set_reviewing(true);
+                    Review::Start
+                } else {
+                    Review::Continue
+                }
+            }
+            Claim::Hold => {
+                if wanted {
+                    Review::Continue
+                } else {
+                    inhibitor.set_reviewing(false);
+                    Review::Stop
+                }
+            }
+        };
+        (state, review)
     }
 
     /// Keeps looking at the setting while it can still change what is held.
@@ -2297,43 +2375,16 @@ impl Controller {
     /// being told: a shell starts a job, an agent finishes a turn, a closure drains its output. It
     /// runs while the setting is on, and stops when the setting is off and nothing is held, so a
     /// host whose owner has not chosen this runs no timer at all.
-    ///
-    /// The mark that says a review is running is taken and cleared inside the inhibitor's own
-    /// lock, together with the assertion it is reviewing. A mark kept outside that lock could be
-    /// cleared by a review that had just finished while another caller was taking an assertion,
-    /// leaving that assertion with nothing watching it.
-    fn review_power(self: &Arc<Self>, state: &SleepInhibitionState) {
-        if !Self::review_wanted(state) {
-            return;
-        }
+    fn review_power(self: &Arc<Self>) {
         let controller = Arc::clone(self);
         tokio::spawn(async move {
-            {
-                let mut inhibitor = controller.inhibitor.lock().await;
-                if inhibitor.reviewing() {
-                    return;
-                }
-                inhibitor.set_reviewing(true);
-            }
             loop {
                 tokio::time::sleep(POWER_REVIEW_INTERVAL).await;
-                let state = controller.evaluate_power().await;
-                let mut inhibitor = controller.inhibitor.lock().await;
-                if !Self::review_wanted(&state) {
-                    inhibitor.set_reviewing(false);
+                if controller.evaluate_power(Claim::Hold).await.1 == Review::Stop {
                     return;
                 }
             }
         });
-    }
-
-    /// Returns whether the setting can still change what is held.
-    const fn review_wanted(state: &SleepInhibitionState) -> bool {
-        state.active
-            || !matches!(
-                state.setting,
-                kr_protocol::desktop::SleepInhibitionSetting::Off
-            )
     }
 
     /// Returns what this host has outstanding that justifies keeping it awake.
@@ -2351,11 +2402,18 @@ impl Controller {
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         let mut sessions_with_work = 0;
         let mut outstanding = 0;
+        let spent = std::time::Instant::now();
         for worker in workers {
-            let summary = tokio::time::timeout(DEMAND_PATIENCE, self.read_from_worker(&worker))
+            // The scan as a whole is bounded, not only each worker in it. A host with many
+            // sessions must still decide within the interval its own review runs on, or the time
+            // an assertion can outlive its work would grow with the number of sessions.
+            if spent.elapsed() >= DEMAND_BUDGET {
+                break;
+            }
+            let summary = self
+                .read_from_worker_within(&worker, Some(DEMAND_PATIENCE))
                 .await
-                .ok()
-                .and_then(std::result::Result::ok);
+                .ok();
             let Some(summary) = summary else {
                 continue;
             };
@@ -3327,16 +3385,47 @@ impl Controller {
     }
 
     async fn read_from_worker(&self, worker: &KnownWorker) -> Result<SessionSummary> {
-        let mut held = self.worker_client(worker).await?;
+        self.read_from_worker_within(worker, None).await
+    }
+
+    /// Reads a session from its worker, optionally giving the worker a bounded moment to answer.
+    ///
+    /// The bound belongs here rather than around the call. A request abandoned from outside would
+    /// leave this connection with an answer nobody read, and the next caller to use it would take
+    /// that answer for its own; ending the connection is the only way to abandon a request on it,
+    /// and that can only be done from inside, while its guard is still held.
+    async fn read_from_worker_within(
+        &self,
+        worker: &KnownWorker,
+        patience: Option<std::time::Duration>,
+    ) -> Result<SessionSummary> {
+        let mut held = match patience {
+            Some(patience) => tokio::time::timeout(patience, self.worker_client(worker))
+                .await
+                .map_err(|_| {
+                    ControllerError::supervision("the worker's connection was busy for too long")
+                })??,
+            None => self.worker_client(worker).await?,
+        };
         let client = held.as_mut().expect("the connection is open");
-        let result = client
-            .request(
-                Method::SessionRead,
-                &SessionReadParams {
-                    session_id: worker.descriptor.session_id,
-                },
-            )
-            .await;
+        let params = SessionReadParams {
+            session_id: worker.descriptor.session_id,
+        };
+        let asked = client.request(Method::SessionRead, &params);
+        let result = match patience {
+            Some(patience) => match tokio::time::timeout(patience, asked).await {
+                Ok(result) => result,
+                Err(_) => {
+                    // The request was abandoned, so this connection has an answer nobody will
+                    // read. It ends here; the next call opens a new one.
+                    *held = None;
+                    return Err(ControllerError::supervision(
+                        "the worker did not answer in time",
+                    ));
+                }
+            },
+            None => asked.await,
+        };
         let result = match result {
             Ok(result) => result,
             Err(error) => {
@@ -3545,6 +3634,21 @@ const fn forwarded_to_worker(method: Method) -> bool {
 }
 
 /// Returns the sentence a caller is given when a window cannot first-admit a request.
+/// Returns the capability revision this environment has already handed out.
+///
+/// A record this host cannot read leaves the revision where a fresh environment starts, which is
+/// the one case where nothing has been handed out yet.
+fn capability_revision(paths: &EnvironmentPaths) -> CapabilityRevision {
+    let path = paths.state_dir().join(CAPABILITY_REVISION_FILE);
+    let recorded = kr_ipc::paths::read_owner_only_file(&path, CAPABILITY_REVISION_LIMIT)
+        .ok()
+        .flatten()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    CapabilityRevision::new(recorded)
+}
+
 /// Returns capability records in the form two reports are compared in.
 ///
 /// The revision is what the comparison decides, so it cannot be part of it, and the moment each

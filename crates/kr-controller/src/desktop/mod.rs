@@ -106,19 +106,24 @@ pub fn headless_persistence() -> ProfilePersistence {
 mod platform {
     use kr_protocol::desktop::LogoutPersistence;
 
-    /// macOS ends a user's agents when the user logs out.
+    /// macOS keeps a user's background domain for as long as that user has a session.
     ///
-    /// A job in the graphical domain goes with the login session. A job in the background domain
-    /// runs from the moment the user is logged in until they log out, and neither survives it: only
-    /// a system-level daemon does, and a system daemon is not a per-user execution context.
+    /// A job in the graphical domain goes with the graphical login. A job in the background domain
+    /// outlives that login and goes with the user's last session, whatever kind it was. Outliving
+    /// that needs a service loaded into the system's own domain, which is a different execution
+    /// context and an installation step this host does not take.
+    ///
+    /// What this host reports is what it configured. It does not read whether something else has
+    /// arranged for this user's domain to stay loaded, so the answer names the mechanism it is
+    /// about and says what it covers.
     pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, String) {
         (
             LogoutPersistence::EndsAtLogout,
-            "launchd, per-user agent",
-            "macOS ends a user's agents at logout, including one loaded into the background \
-             domain, so a headless session on this platform does not outlive the user logging \
-             out. Nothing in KalaReach can change that, and nothing here asks for the system-wide \
-             privileges that would."
+            "launchd, a per-user job in the background domain",
+            "A headless session's job is loaded into this user's background domain, which outlives \
+             the graphical login and goes with the user's last session. A session that must outlive \
+             that needs a service in the system's own domain, which is a separate execution \
+             context and an installation step this host does not take."
                 .to_owned(),
         )
     }

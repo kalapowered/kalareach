@@ -502,6 +502,9 @@ async fn run(cli: Cli) -> Result<Completion> {
                     info.default_worker_profile.as_str()
                 );
                 println!("{}", report::desktop_summary_line(&capabilities.desktop));
+                for line in report::capability_lines(&capabilities.desktop) {
+                    println!("{line}");
+                }
                 for line in report::persistence_lines(&capabilities.persistence) {
                     println!("{line}");
                 }

@@ -259,6 +259,30 @@ pub fn persistence_lines(persistence: &[kr_protocol::desktop::ProfilePersistence
         .collect()
 }
 
+/// Renders each capability of one desktop as a line for a person.
+#[must_use]
+pub fn capability_lines(report: &DesktopCapabilityReport) -> Vec<String> {
+    report
+        .records
+        .iter()
+        .map(|record| {
+            let detail = record.disabled_reason.as_ref().cloned().unwrap_or_else(|| {
+                record
+                    .identity
+                    .binary
+                    .as_ref()
+                    .cloned()
+                    .unwrap_or_else(|| "no facility named".to_owned())
+            });
+            format!(
+                "  {:<26} {:<24} {detail}",
+                record.capability.to_string(),
+                record.state.as_str()
+            )
+        })
+        .collect()
+}
+
 /// Renders the desktop a session runs on as a line for a person.
 #[must_use]
 pub fn desktop_line(summary: &SessionSummary) -> String {

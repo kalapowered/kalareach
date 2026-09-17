@@ -524,12 +524,20 @@ mod platform {
     use kr_protocol::desktop::PowerSource;
 
     /// The per-user host agent's execution-state request, held for as long as its input is open.
+    ///
+    /// Every value is an explicit unsigned 32-bit one. The continuous flag is `0x80000000`, which
+    /// a signed literal cannot carry, and a conversion that failed would leave a process waiting
+    /// on its input with no assertion behind it. The request stops on any error, and treats a zero
+    /// result from the call as the failure it is.
     const REQUEST: &str = "\
-        $signature = '[DllImport(\"kernel32.dll\")] public static extern uint \
+        $ErrorActionPreference = 'Stop'; \
+        $signature = '[DllImport(\"kernel32.dll\", SetLastError=true)] public static extern uint \
         SetThreadExecutionState(uint flags);'; \
         $api = Add-Type -MemberDefinition $signature -Name Power -Namespace KalaReach -PassThru; \
-        $continuous = 0x80000000; $system = 0x00000001; \
-        [void]$api::SetThreadExecutionState($continuous -bor $system); \
+        $continuous = [uint32]2147483648; \
+        $system = [uint32]1; \
+        $flags = [uint32]($continuous -bor $system); \
+        if ($api::SetThreadExecutionState($flags) -eq 0) { exit 1 }; \
         while ($null -ne [Console]::In.ReadLine()) { }; \
         [void]$api::SetThreadExecutionState($continuous)";
 
