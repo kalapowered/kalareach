@@ -348,6 +348,9 @@ async fn a_daemon_restart_keeps_the_session_and_its_shell() {
             .any(|summary| summary.session_id == session_id && summary.state == SessionState::Live),
         "the replacement daemon found the session again and proved its worker"
     );
+    // And the directory that worker is running in is still there. A replacement daemon sweeps
+    // what no session claims, and an adopted session claims its own.
+    runs_where_the_host_put_it(&host, session_id);
 
     close(&mut client, &host, session_id).await;
     second.stop().await;

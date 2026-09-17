@@ -424,3 +424,67 @@ fn a_registry_written_by_the_previous_schema_is_brought_forward() {
     );
     assert_eq!(carried.claimed_key, None);
 }
+
+/// A worker's own failure report resolves the claim it made, and a fenced reservation's claim is
+/// not its to resolve.
+///
+/// What the daemon does with that answer is give the directory it prepared for that worker back.
+/// A reservation somebody fenced while the report was in flight is still a question waiting for an
+/// answer, so the report settles nothing about it and it keeps what it was given.
+#[test]
+fn only_the_reservation_a_failure_report_claimed_is_resolved_by_it() {
+    let (_host, mut registry) = registry();
+    let reservation = registry
+        .reserve(
+            &actor("local:501"),
+            kr_ipc::new_uuid(),
+            digest(1),
+            &intent(),
+            TimestampMs::new(1),
+        )
+        .expect("reserves")
+        .reservation;
+    let key = kr_protocol::scalars::AuthorisationKey::from_bytes([9_u8; 32]);
+    registry
+        .set_phase(reservation.reservation_id, LaunchPhase::Spawned)
+        .expect("moves to spawned");
+    registry
+        .claim_rendezvous(reservation.reservation_id, key)
+        .expect("the worker claims its reservation");
+    assert!(
+        registry
+            .resolve_claim(reservation.reservation_id, LaunchPhase::Failed)
+            .expect("resolves"),
+        "the report resolves the claim the worker made"
+    );
+    assert!(
+        !registry
+            .resolve_claim(reservation.reservation_id, LaunchPhase::Failed)
+            .expect("resolves nothing twice"),
+        "and says so only once"
+    );
+
+    let fenced = registry
+        .reserve(
+            &actor("local:501"),
+            kr_ipc::new_uuid(),
+            digest(2),
+            &intent(),
+            TimestampMs::new(2),
+        )
+        .expect("reserves")
+        .reservation;
+    registry
+        .set_phase(fenced.reservation_id, LaunchPhase::Spawned)
+        .expect("moves to spawned");
+    registry
+        .claim_rendezvous(fenced.reservation_id, key)
+        .expect("the worker claims its reservation");
+    registry.fence(fenced.reservation_id).expect("fences it");
+    assert!(
+        !registry
+            .resolve_claim(fenced.reservation_id, LaunchPhase::Failed)
+            .expect("resolves"),
+        "a fenced reservation is not the report's to resolve"
+    );
+}
