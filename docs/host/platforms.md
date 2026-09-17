@@ -19,7 +19,7 @@ logins are told apart even when the platform hands out the same session number. 
 logon process owns the interactive session, and this host does not establish that a new one is
 started for each authenticated sign-in: where a session number and its logon process both outlive a
 sign-out, this host would read the next sign-in as the same desktop. Telling those apart needs a
-per-user agent in the session itself, which this build does not install, so the Windows answer is
+per-user agent inside the session itself, which this host does not install, so the Windows answer is
 weaker than the other two and the tables below say where that shows.
 
 | | macOS | Linux | Windows |
@@ -144,15 +144,22 @@ decision to be answered. An idle shell is not work, however much output it has p
 
 Work begins and ends without the host being told, so while the setting is on the host looks at the
 question every fifteen seconds, as well as whenever a session is created or closed and whenever it
-is asked. How long after work ends an assertion can still be held is that interval plus the bounded
-steps of one review: two seconds to ask its sessions, two for the platform's own power-source
-query, and two for the facility to let go of the assertion. Taking one is bounded at two seconds as
-well. Nothing on the path is unbounded, and while the setting is off nothing looks at anything.
+is asked. Every step of one review is bounded: two seconds to ask its sessions, two for the
+platform's own power-source query, and two for the facility to let go of the assertion. Taking one
+is bounded at two seconds as well, and while the setting is off nothing looks at anything.
 
-Of the four things that count, two have a producer in this build: a create the host has accepted and
-not finished, and a closure that is still stopping processes. Agent work and a decision waiting for
-an answer are read from what a session's worker reports about itself, and no worker reports either
-state yet, so they activate nothing until the component that runs agents does.
+One review is not one answer about every session, though. A review asks as many of its sessions as
+it can inside its two seconds and starts the next one where it stopped, so a host with more sessions
+than that allows counts the rest as they last answered and asks them in the following review. The
+time an assertion can outlive the work it was taken for therefore grows with the number of sessions,
+in steps of the review interval. A worker that stops answering keeps its last answer until the
+kernel says its process has gone or its session leaves the host's list of workers.
+
+Four things count and the host reads each of them rather than guessing. Two come from its own
+bookkeeping: a create it has accepted and not finished, and a closure that is still stopping
+processes and draining their output. The other two come from what a session's worker reports about
+itself: an agent at work, and a decision waiting to be answered. A session whose worker reports
+neither contributes neither.
 
 | Platform | The facility | What it asks for |
 | --- | --- | --- |
@@ -161,8 +168,11 @@ state yet, so they activate nothing until the component that runs agents does.
 | Windows | an execution-state request, made by a command this host runs | the same, for the session that command runs in |
 
 Each facility ties the assertion to the life of a process, and the host runs that process as a
-child with a pipe on its input. Releasing it is closing the pipe. Nothing is signalled, and a
-control daemon that dies releases everything it held, because the pipe dies with the process.
+child with a pipe on its input. Releasing it is closing the pipe, and a control daemon that dies
+releases everything it held, because the pipe dies with the process. Two endings are less graceful
+and both are bounded: a facility whose acquisition the platform did not confirm is stopped, and so
+is one that has not exited two seconds after its input ended, because an assertion held by a
+process that hung would be a machine that stopped sleeping for good.
 
 The assertion asks the operating system not to sleep on its own. It does not stop somebody closing
 the lid, an administrator forcing sleep, or a platform policy overriding the request. KalaReach

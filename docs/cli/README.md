@@ -462,12 +462,12 @@ sleep inhibited (mains_only): the host has requests it has not answered, held as
 power-management assertion against idle system sleep, held on behalf of process 82035 on mains power
 ```
 
-Two kinds of work count, and only one of them has a producer today. A request the host has accepted
-and not answered does: a create it is still starting a worker for, and a closure that is still
-stopping processes and draining their output. Foreground agent work and a decision waiting for an
-answer are read from the state a session's worker reports, and nothing in this build reports either
-of them yet, so they activate nothing until the component that runs agents does. An idle shell is
-not work, however much output it has produced.
+Two kinds of work count. The host knows the first from its own bookkeeping: a request it has
+accepted and not answered, which is a create it is still starting a worker for or a closure that is
+still stopping processes and draining their output. The second is what a session's worker reports
+about itself: an agent at work, or a decision waiting to be answered. A session whose worker reports
+neither of those contributes neither, and an idle shell is not work however much output it has
+produced.
 
 That line appears in `kr status` and `kr doctor` too. The process it names is the one the operating
 system's own listing shows, so `pmset -g assertions` on macOS can be compared with it directly.
