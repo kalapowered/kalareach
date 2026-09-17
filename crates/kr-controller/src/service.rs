@@ -3026,12 +3026,18 @@ mod a_create_that_launches_nothing {
     }
 
     /// Returns the sessions that still have a directory under this environment's workers folder.
+    ///
+    /// A directory that cannot be read is a failure rather than an empty answer: an assertion that
+    /// treated it as empty would pass for the wrong reason.
     fn worker_dirs(temp: &kr_ipc::testing::TempHost) -> Vec<String> {
-        let Ok(entries) = std::fs::read_dir(temp.environment().workers_dir()) else {
-            return Vec::new();
-        };
-        let mut names: Vec<String> = entries
-            .flatten()
+        let directory = temp.environment().workers_dir();
+        let mut names: Vec<String> = std::fs::read_dir(&directory)
+            .unwrap_or_else(|error| panic!("reads {}: {error}", directory.display()))
+            .map(|entry| {
+                entry.unwrap_or_else(|error| {
+                    panic!("reads an entry of {}: {error}", directory.display())
+                })
+            })
             .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
             .collect();
         names.sort();
@@ -3187,7 +3193,6 @@ mod a_create_that_launches_nothing {
         let launch = asked.first().expect("the supervisor was asked to launch");
         for (what, path) in [
             ("the executable", &launch.program),
-            ("the rendezvous endpoint", &launch.rendezvous),
             ("the runtime root", &launch.runtime_directory),
             ("the state root", &launch.state_directory),
             ("the jobs directory", &launch.jobs_directory),
@@ -3199,6 +3204,23 @@ mod a_create_that_launches_nothing {
                 path.display()
             );
         }
+        // The rendezvous endpoint is a socket path on Unix and a pipe name on Windows. What the
+        // launch carries is whatever names the endpoint this daemon bound, unchanged.
+        assert_eq!(
+            launch.rendezvous,
+            controller
+                .paths
+                .rendezvous_endpoint()
+                .expect("an endpoint")
+                .as_path(),
+            "the launch names the endpoint this daemon bound"
+        );
+        #[cfg(unix)]
+        assert!(
+            launch.rendezvous.is_absolute(),
+            "and where that is a path, it is one the worker can use from anywhere: {}",
+            launch.rendezvous.display()
+        );
         assert_eq!(
             launch.program,
             std::env::current_dir()

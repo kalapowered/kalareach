@@ -403,12 +403,18 @@ async fn a_worker_that_reports_it_could_not_start_leaves_no_directory() {
 }
 
 /// Returns the sessions that still have a directory under this environment's workers folder.
+///
+/// A directory that cannot be read is a failure rather than an empty answer: an assertion that
+/// treated it as empty would pass for the wrong reason.
 fn worker_dirs(host: &Host) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(host.paths().workers_dir()) else {
-        return Vec::new();
-    };
-    let mut names: Vec<String> = entries
-        .flatten()
+    let directory = host.paths().workers_dir();
+    let mut names: Vec<String> = std::fs::read_dir(&directory)
+        .unwrap_or_else(|error| panic!("reads {}: {error}", directory.display()))
+        .map(|entry| {
+            entry.unwrap_or_else(|error| {
+                panic!("reads an entry of {}: {error}", directory.display())
+            })
+        })
         .filter_map(|entry| entry.file_name().to_str().map(str::to_owned))
         .collect();
     names.sort();
