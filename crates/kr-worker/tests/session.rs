@@ -1472,3 +1472,72 @@ async fn a_job_that_ends_before_the_session_does_is_still_in_its_record() {
         record.terminated
     );
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shell_that_has_already_ended_is_a_closed_session_rather_than_a_failed_launch() {
+    // A shell can be gone before the host has read its start identity: a startup file that says
+    // `exit`, a program that cannot open what it needs, a command that is not the shell it was
+    // declared to be. On macOS the kernel then refuses to describe the process at all, and a host
+    // that took that for a launch failure would report a shell that ran as a shell that never
+    // started, and lose its status with the error. This session ran, so it closes.
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "exit 3");
+    let runtime = std::sync::Arc::new(
+        kr_worker::runtime::start(config).expect("the shell ran, so the session was created"),
+    );
+    let record = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed())
+        .await
+        .expect("the session closes on the root shell's exit");
+
+    assert_eq!(record.reason, ClosureReason::RootExit);
+    assert_eq!(
+        record.root_exit_code.0.map(kr_protocol::scalars::U64::get),
+        Some(3),
+        "with the status the shell left, read from the child rather than guessed"
+    );
+    assert!(
+        record
+            .terminated
+            .iter()
+            .any(|process| process.name.0.as_deref() == Some("the session's root shell")),
+        "and the record names the shell it stopped: {:?}",
+        record.terminated
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shell_the_host_described_keeps_the_identity_the_kernel_gave_it() {
+    // The other side of the same path. This shell is alive while the host reads it, so what the
+    // closure record carries is the kernel's own start value rather than the reserved one that says
+    // nobody could take a reading. The exit is collected by the supervision, on the child signal.
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(&host, "printf 'kr-alive\\n'; sleep 1; exit 5");
+    let runtime = std::sync::Arc::new(kr_worker::runtime::start(config).expect("starts a session"));
+    let described = runtime
+        .session()
+        .root_identity()
+        .expect("the host read the shell it started");
+    assert_ne!(
+        described.start_value.get(),
+        kr_ipc::identity::START_VALUE_UNREAD,
+        "the kernel described this shell, so its identity is a reading"
+    );
+
+    let record = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed())
+        .await
+        .expect("the session closes on the root shell's exit");
+
+    assert_eq!(record.reason, ClosureReason::RootExit);
+    assert_eq!(
+        record.root_exit_code.0.map(kr_protocol::scalars::U64::get),
+        Some(5)
+    );
+    assert!(
+        record
+            .terminated
+            .iter()
+            .any(|process| process.identity == described),
+        "and the record carries that same identity: {:?}",
+        record.terminated
+    );
+}
