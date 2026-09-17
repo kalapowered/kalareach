@@ -594,7 +594,7 @@ impl Session {
         // A resize advances the engine's projection: every client's screen is at the old size and
         // nothing continues from it. They are told, here, rather than on the next byte the
         // application happens to write, which for an idle session may be never.
-        self.require_resync_of_every_subscriber();
+        self.reinstall_every_subscriber(ProjectionResetReason::Geometry);
         Ok(())
     }
 
@@ -603,6 +603,30 @@ impl Session {
         let next = self.history.next_cursor();
         let oldest = self.history.oldest_retained_cursor();
         for attachment_id in self.hub.subscribers() {
+            self.hub
+                .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
+        }
+    }
+
+    /// Installs a fresh screen for every subscriber, naming why the last one does not continue.
+    ///
+    /// A projected subscriber is installed again *in band*, with the reason: the projection
+    /// protocol has a reset of its own, and a client that has been sent one followed by a fresh
+    /// snapshot needs no round trip to ask for what it has already been given. A direct subscriber
+    /// has no such event, so it is told to resynchronise and asks for a screen itself.
+    fn reinstall_every_subscriber(&mut self, reason: ProjectionResetReason) {
+        let next = self.history.next_cursor();
+        let oldest = self.history.oldest_retained_cursor();
+        for attachment_id in self.hub.subscribers() {
+            if self.presentation_of(attachment_id) == crate::output::Presentation::Projected {
+                let Ok(dimensions) = self.attachment_dimensions(attachment_id) else {
+                    continue;
+                };
+                // Forgetting its base is what makes this an install rather than a continuation.
+                self.projections.forget(attachment_id);
+                let _ = self.publish_projection(attachment_id, dimensions, Some(reason), oldest);
+                continue;
+            }
             self.hub
                 .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
         }
