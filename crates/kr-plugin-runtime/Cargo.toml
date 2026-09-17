@@ -1,0 +1,40 @@
+[package]
+name = "kr-plugin-runtime"
+description = "KalaReach component hosting: the Wasmtime engine, per-instance limits, the compiled-code cache, the binding lifecycle and the plugin-host service client"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kr-cbor.workspace = true
+kr-crypto.workspace = true
+kr-ipc.workspace = true
+kr-plugin-sdk.workspace = true
+kr-protocol.workspace = true
+schemars.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+thread-priority.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt", "rt-multi-thread", "sync", "time"] }
+wasmtime.workspace = true
+
+[dev-dependencies]
+kr-ipc = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+
+# The workspace forbids unsafe code, which a crate that reads a compiled artefact back cannot
+# honour: `wasmtime::component::Component::deserialize_file` is an unsafe function. This crate
+# denies it instead and allows it in exactly one module, `runtime::cache`, which owns that single
+# call and verifies the file's own manifest before it makes it. Nothing else in this crate may
+# relax the rule.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

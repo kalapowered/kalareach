@@ -8,6 +8,7 @@ members = [
     "crates/kr-crypto",
     "crates/kr-ipc",
     "crates/kr-pairing",
+    "crates/kr-plugin-runtime",
     "crates/kr-plugin-sdk",
     "crates/kr-project",
     "crates/kr-protocol",
@@ -55,6 +56,8 @@ kr-controller = { path = "crates/kr-controller", version = "=0.1.0" }
 kr-crypto = { path = "crates/kr-crypto", version = "=0.1.0" }
 kr-ipc = { path = "crates/kr-ipc", version = "=0.1.0" }
 kr-pairing = { path = "crates/kr-pairing", version = "=0.1.0" }
+kr-plugin-runtime = { path = "crates/kr-plugin-runtime", version = "=0.1.0" }
+kr-plugin-sdk = { path = "crates/kr-plugin-sdk", version = "=0.1.0" }
 kr-project = { path = "crates/kr-project", version = "=0.1.0" }
 kr-protocol = { path = "crates/kr-protocol", version = "=0.1.0" }
 kr-term = { path = "crates/kr-term", version = "=0.1.0" }
@@ -83,11 +86,15 @@ sysctl = "=0.6.0"
 sysinfo = "=0.33.1"
 tempfile = "=3.27.0"
 thiserror = "=2.0.20"
+thread-priority = "=3.1.1"
 tokio = { version = "=1.53.1", features = ["macros", "rt", "rt-multi-thread", "sync", "time"] }
 tracing = "=0.1.44"
 url = "=2.5.8"
 uuid = { version = "=1.26.1", features = ["v4"] }
 vtparse = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
+# The component engine, pinned to one exact release. A compiled-code cache entry is only valid for
+# the version that produced it, so the pin is part of the cache key rather than a convenience.
+wasmtime = { version = "=48.0.2", default-features = false, features = ["addr2line", "component-model", "cranelift", "demangle", "gc", "gc-drc", "gc-null", "runtime", "std"] }
 wezterm-escape-parser = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb", features = ["std"] }
 wezterm-surface = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
 wezterm-term = { git = "https://github.com/kalapowered/wezterm", rev = "9a9015119497fd5803c35a10ea4ffc503f2a7dfb" }
