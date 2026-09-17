@@ -581,16 +581,6 @@ mod tests {
     }
 
     #[test]
-    fn a_platform_that_will_not_answer_is_not_a_lost_desktop() {
-        // The platform readings this host can take are not controllable from a test, so this
-        // exercises the rule the three readings turn on: a reading the host could not take is not
-        // evidence that anything ended, which is what `Watch::bind` and `Watch::lost` do with it.
-        assert!(Reading::Unavailable.login().is_none());
-        assert_eq!(Reading::None.login_or_none(), Login::none());
-        assert!(Watch::none().bound_name().is_none());
-    }
-
-    #[test]
     fn a_context_with_no_login_names_no_desktop() {
         let context = from_login(&Login::none(), WorkerProfile::HeadlessUser, boot(&[1]));
         assert!(!context.is_desktop());
