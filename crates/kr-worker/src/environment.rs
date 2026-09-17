@@ -149,8 +149,8 @@ impl ExecutionContext {
 /// The binding is the desktop's derived name and the generation it was taken at. Both come from
 /// [`crate::desktop`], which asks the platform about the login session rather than reading a
 /// variable out of this process's own environment: a variable cannot say whether the login it
-/// names is still the one that is there, and the generation is what makes a reused session number
-/// a different desktop.
+/// names is still the one that is there, and the generation is what tells a reused session number
+/// apart from the login that held it before, as far as the platform's own answer goes.
 ///
 /// A host with no boot identity to bind to, or no graphical login session, records no binding.
 /// That is not the end of the question for a desktop-bound session: a reading that failed a moment

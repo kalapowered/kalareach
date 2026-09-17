@@ -19,11 +19,12 @@
 //! | the login-session generation | a platform that reuses session numbers needs it |
 //!
 //! [`DesktopContext::desktop_session_id`] is the derived name of that whole context, which is why
-//! a reused platform session number is not by itself the same desktop: the generation, or the
-//! boot, has moved with it. How completely the generation separates one login from the next is the
-//! platform's own answer, and [`DesktopGenerationSource`] names which platform gave it. Nothing
-//! rebinds a session to a new login. A session whose desktop ends is closed with `desktop_lost`,
-//! and the user creates a new one.
+//! a reused platform session number is a different desktop wherever the generation or the boot
+//! moved with it. How completely the generation separates one login from the next is the
+//! platform's own answer, and [`DesktopGenerationSource`] names which platform gave it: where a
+//! platform's generation does not move with a new login, a reused number reads as the desktop that
+//! had it before. Nothing rebinds a session to a new login. A session whose desktop ends is closed
+//! with `desktop_lost`, and the user creates a new one.
 //!
 //! # Capability evidence
 //!
