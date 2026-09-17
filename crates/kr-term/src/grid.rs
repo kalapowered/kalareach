@@ -1448,6 +1448,20 @@ impl CanonicalGrid {
         (oldest, oldest.saturating_add(rows))
     }
 
+    /// The stable identifier range the buffer that is *not* showing holds.
+    ///
+    /// Retention belongs to a buffer, not to a session. The primary buffer keeps a scrollback and
+    /// gives up its oldest rows at the cache bound; the alternate buffer keeps none and numbers its
+    /// rows from its own beginning. A client told the showing buffer's cutoff for the other one
+    /// would give up rows that are the whole of that screen, or keep rows that are gone.
+    #[must_use]
+    pub fn inactive_stable_range(&self) -> (i64, i64) {
+        let screen = self.terminal.inactive_screen();
+        let rows = i64::try_from(screen.scrollback_rows()).unwrap_or(0);
+        let oldest = i64::try_from(screen.phys_to_stable_row_index(0)).unwrap_or(0);
+        (oldest, oldest.saturating_add(rows))
+    }
+
     /// The stable identifier of the first row of the visible page.
     ///
     /// A client holding rows by their stable identifiers needs to be told which of them the page

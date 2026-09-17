@@ -1363,6 +1363,9 @@ impl Engine {
         let settled = self.quiesce(now_ms);
         let rows = self.grid.visible_rows();
         let (oldest, _) = self.grid.stable_range();
+        // The other buffer's own retention, because a client is sent both buffers' rows and each
+        // buffer gives up rows on its own terms.
+        let (inactive_oldest, _) = self.grid.inactive_stable_range();
         let (col, row) = self.grid.cursor();
         let (top, bottom) = self.grid.margins_vertical();
         let (left, right) = self.grid.margins_horizontal();
@@ -1409,6 +1412,8 @@ impl Engine {
             inactive_rows: self.grid.inactive_rows(),
             oldest_retained_row: oldest,
             evicted: oldest > 0,
+            inactive_oldest_retained_row: inactive_oldest,
+            inactive_evicted: inactive_oldest > 0,
         };
         (snapshot, settled)
     }

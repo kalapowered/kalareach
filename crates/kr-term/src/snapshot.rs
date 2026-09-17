@@ -261,6 +261,13 @@ pub struct Snapshot {
     pub oldest_retained_row: i64,
     /// Whether rows have been evicted since the session started.
     pub evicted: bool,
+    /// The oldest row the buffer that is not showing still holds.
+    ///
+    /// Its own, because retention belongs to a buffer: the primary keeps a scrollback and the
+    /// alternate keeps none, so one cutoff cannot describe both.
+    pub inactive_oldest_retained_row: i64,
+    /// Whether rows below [`Self::inactive_oldest_retained_row`] were evicted.
+    pub inactive_evicted: bool,
 }
 
 /// An update against a known base cursor.
