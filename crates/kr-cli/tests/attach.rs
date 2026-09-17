@@ -456,6 +456,10 @@ fn answer_and_type(
 const KEYBOARD_RESTORED: &[u8] = b"\x1b[=5;1u";
 
 /// The `modifyOtherKeys` level this test's terminal reported, as the restoration writes it.
+///
+/// The restoration writes this straight after [`KEYBOARD_RESTORED`], but a terminal delivers what
+/// it is given in whatever reads it likes, so this is waited for in its own right rather than
+/// checked once the sequence before it has arrived.
 const MODIFY_OTHER_KEYS_RESTORED: &[u8] = b"\x1b[>4;2m";
 
 /// Counts the Kitty keyboard stack operations in what reached a terminal.
@@ -574,10 +578,10 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
         LIVENESS_DEADLINE,
         "the guard put the terminal's own keyboard protocol back",
     );
-    assert!(
-        output.contains(MODIFY_OTHER_KEYS_RESTORED),
-        "and its modifyOtherKeys level: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        MODIFY_OTHER_KEYS_RESTORED,
+        LIVENESS_DEADLINE,
+        "and its modifyOtherKeys level",
     );
     // The control characters too. A terminal whose modes look right and whose interrupt key does
     // nothing has not been restored.
@@ -673,10 +677,10 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
         LIVENESS_DEADLINE,
         "and so did the keyboard protocol it had negotiated for itself",
     );
-    assert!(
-        output.contains(MODIFY_OTHER_KEYS_RESTORED),
-        "and its modifyOtherKeys level: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        MODIFY_OTHER_KEYS_RESTORED,
+        LIVENESS_DEADLINE,
+        "and its modifyOtherKeys level",
     );
     // And the terminal's own keyboard stack was never operated: what this attachment put back is
     // the state the terminal reported, so an application inside the session that emptied the stack
@@ -761,10 +765,10 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
         LIVENESS_DEADLINE,
         "the terminal's own keyboard protocol was put back",
     );
-    assert!(
-        output.contains(MODIFY_OTHER_KEYS_RESTORED),
-        "and its modifyOtherKeys level: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        MODIFY_OTHER_KEYS_RESTORED,
+        LIVENESS_DEADLINE,
+        "and its modifyOtherKeys level",
     );
 
     // Whatever stack operations reached this terminal are the application's own. None of them is

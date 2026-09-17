@@ -539,14 +539,13 @@ async fn a_takeover_ends_the_other_lease_and_the_approval_executes_once() {
     .await
     .expect("the holder's answer reaches the application");
 
-    let seen = retained_within(&wired.runtime, b"kr-granted:1:", LIVENESS_DEADLINE).await;
+    // The whole report, answer and terminator, rather than the label in front of it: the
+    // application writes the line in one go but the session retains what has arrived, so a wait for
+    // the label alone can return before the answer is in it.
+    retained_within(&wired.runtime, b"kr-granted:1:n.", LIVENESS_DEADLINE).await;
     // Given a moment in which a second execution could have been reported, it was not.
     tokio::time::sleep(Duration::from_millis(500)).await;
-    let seen = if contains(&seen, b"kr-granted:1:") {
-        retained(&wired.runtime.session())
-    } else {
-        seen
-    };
+    let seen = retained(&wired.runtime.session());
     assert_eq!(
         count(&seen, b"kr-granted:"),
         1,
@@ -581,7 +580,7 @@ async fn a_takeover_ends_the_other_lease_and_the_approval_executes_once() {
     )
     .await
     .expect("the next prompt's answer");
-    let seen = retained_within(&wired.runtime, b"kr-granted:2:", LIVENESS_DEADLINE).await;
+    let seen = retained_within(&wired.runtime, b"kr-granted:2:y.", LIVENESS_DEADLINE).await;
     assert!(
         contains(&seen, b"kr-granted:2:y."),
         "a second approval is reportable, and reports the answer it was given: {}",
