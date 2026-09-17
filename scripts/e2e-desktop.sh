@@ -282,8 +282,13 @@ else
   echo "  ok: an assertion is held: $held"
   echo "  reason: $(read_json "$run_root/evidence/power-held.json" power.reason)"
   # The operating system's own listing, which is the only thing that settles whether sleep is
-  # actually inhibited. The assertion names the process this host holds it on behalf of.
-  holder_pid="$(printf '%s' "$held" | awk '{print $NF}')"
+  # actually inhibited. The assertion names the process this host holds it on behalf of, and the
+  # number after that word is what the listing is searched for.
+  holder_pid="$(printf '%s' "$held" | sed -n 's/.*process \([0-9][0-9]*\).*/\1/p')"
+  if [ -z "$holder_pid" ]; then
+    fail "the assertion names the process it is held on behalf of"
+    holder_pid="none"
+  fi
   /usr/bin/pmset -g assertions >"$run_root/evidence/pmset-held.txt"
   if grep -q "pid $holder_pid)" "$run_root/evidence/pmset-held.txt"; then
     echo "  ok: the operating system lists the assertion against process $holder_pid"
