@@ -217,7 +217,20 @@ pub struct Runtime {
     cache: CompiledCache,
     pool: CompilePool,
     config: RuntimeConfig,
-    bindings: Mutex<HashMap<BindingId, Arc<BindingHandle>>>,
+    bindings: Mutex<HashMap<BindingId, Registration>>,
+}
+
+/// One entry in the registry.
+///
+/// A binding is reserved before anything is started and becomes live when its instance exists.
+/// Reserving first is what makes two registrations of one identifier a refusal rather than a race:
+/// without it both could pass a "is it live" check before either had finished starting.
+#[derive(Debug)]
+enum Registration {
+    /// Somebody is preparing this binding.
+    Reserved,
+    /// The binding is live.
+    Live(Arc<BindingHandle>),
 }
 
 impl Runtime {
@@ -267,7 +280,12 @@ impl Runtime {
     /// stays at zero.
     #[must_use]
     pub fn live_bindings(&self) -> usize {
-        self.bindings.lock().map_or(0, |bindings| bindings.len())
+        self.bindings.lock().map_or(0, |bindings| {
+            bindings
+                .values()
+                .filter(|entry| matches!(entry, Registration::Live(_)))
+                .count()
+        })
     }
 
     /// Returns a live binding.
@@ -276,7 +294,39 @@ impl Runtime {
         self.bindings
             .lock()
             .ok()
-            .and_then(|bindings| bindings.get(&binding_id).cloned())
+            .and_then(|bindings| match bindings.get(&binding_id) {
+                Some(Registration::Live(handle)) => Some(Arc::clone(handle)),
+                Some(Registration::Reserved) | None => None,
+            })
+    }
+
+    /// Reserves an identifier, or says it is taken.
+    ///
+    /// Taken under the lock and before anything is started, so two registrations of one identifier
+    /// cannot both get past it.
+    fn reserve(&self, binding_id: BindingId) -> RuntimeResult<()> {
+        let mut bindings = self
+            .bindings
+            .lock()
+            .map_err(|_| RuntimeError::Instantiation {
+                detail: "the binding registry is poisoned".to_owned(),
+            })?;
+        if bindings.contains_key(&binding_id) {
+            return Err(RuntimeError::Instantiation {
+                detail: format!("binding {binding_id} is already live"),
+            });
+        }
+        bindings.insert(binding_id, Registration::Reserved);
+        Ok(())
+    }
+
+    /// Gives up a reservation that did not become a binding.
+    fn release(&self, binding_id: BindingId) {
+        if let Ok(mut bindings) = self.bindings.lock()
+            && matches!(bindings.get(&binding_id), Some(Registration::Reserved))
+        {
+            bindings.remove(&binding_id);
+        }
     }
 
     /// Submits a component for compilation, lazily and at background priority.
@@ -317,12 +367,9 @@ impl Runtime {
     ) -> RuntimeResult<Arc<BindingHandle>> {
         let binding_id = request.binding_id;
         // One binding, one instance. Replacing a live binding silently would leave an instance
-        // running that nothing could reach and nothing would stop.
-        if self.binding(binding_id).is_some() {
-            return Err(RuntimeError::Instantiation {
-                detail: format!("binding {binding_id} is already live"),
-            });
-        }
+        // running that nothing could reach and nothing would stop, so the identifier is taken
+        // before anything is started rather than checked before anything is awaited.
+        self.reserve(binding_id)?;
 
         let handle = BindingHandle::start(
             request,
@@ -331,17 +378,22 @@ impl Runtime {
             self.config.fuel_rate,
             FaultCounter::new(Arc::clone(&self.config.clock)),
             events,
-        )?;
+        )
+        .inspect_err(|_| self.release(binding_id))?;
         let handle = Arc::new(handle);
         match handle.ready(within).await {
             Ok(()) => {}
             Err(error) => {
-                handle.stop();
+                // Signalled rather than joined: this is an asynchronous caller whose deadline has
+                // run out, and joining here would hold its thread for as long as the instantiation
+                // it gave up on.
+                handle.signal_stop();
+                self.release(binding_id);
                 return Err(error);
             }
         }
         if let Ok(mut bindings) = self.bindings.lock() {
-            bindings.insert(binding_id, Arc::clone(&handle));
+            bindings.insert(binding_id, Registration::Live(Arc::clone(&handle)));
         }
         Ok(handle)
     }
@@ -367,12 +419,7 @@ impl Runtime {
         let started = std::time::Instant::now();
         let compilation = self.compile(wasm)?;
         let compiled = compilation.wait(deadline).await?;
-        let remaining =
-            deadline
-                .checked_sub(started.elapsed())
-                .ok_or(RuntimeError::CallerDeadline {
-                    deadline_ms: millis(deadline),
-                })?;
+        let remaining = remaining_of(started, deadline)?;
         self.instantiate(request, &compiled, events, remaining)
             .await
     }
@@ -383,16 +430,19 @@ impl Runtime {
     /// this returns. The component's own state goes with it; nothing a decision depends on was in
     /// there, because pending and dispatch state is the worker broker's.
     pub fn unbind(&self, binding_id: BindingId) -> bool {
-        let handle = self
+        let entry = self
             .bindings
             .lock()
             .ok()
             .and_then(|mut bindings| bindings.remove(&binding_id));
-        match handle {
-            Some(handle) => {
+        match entry {
+            Some(Registration::Live(handle)) => {
                 handle.stop();
                 true
             }
+            // A reservation somebody is still preparing. Removing it is the whole of the removal:
+            // the preparation will find its reservation gone and give the handle up.
+            Some(Registration::Reserved) => true,
             None => false,
         }
     }
@@ -402,7 +452,15 @@ impl Runtime {
         let handles: Vec<Arc<BindingHandle>> = self
             .bindings
             .lock()
-            .map(|mut bindings| bindings.drain().map(|(_id, handle)| handle).collect())
+            .map(|mut bindings| {
+                bindings
+                    .drain()
+                    .filter_map(|(_id, entry)| match entry {
+                        Registration::Live(handle) => Some(handle),
+                        Registration::Reserved => None,
+                    })
+                    .collect()
+            })
             .unwrap_or_default();
         for handle in handles {
             handle.stop();
@@ -779,14 +837,23 @@ impl BindingHandle {
     /// the channel rather than after them: a caller that is closing a binding is not waiting for
     /// its backlog. A call already inside the component finishes first, and every call is bounded.
     pub fn stop(&self) {
-        self.stopping.store(true, Ordering::Release);
-        // The command is what wakes a thread that is blocked waiting for one.
-        let _ = self.commands.send(Command::Stop);
+        self.signal_stop();
         if let Ok(mut slot) = self.thread.lock()
             && let Some(thread) = slot.take()
         {
             let _ = thread.join();
         }
+    }
+
+    /// Tells the binding's thread to stop, without waiting for it.
+    ///
+    /// For the paths that must not block: an asynchronous caller whose deadline ran out, and the
+    /// drop of a handle that may be happening on an executor's thread. The thread ends on its own,
+    /// after at most one bounded call, and drops the instance with it.
+    pub fn signal_stop(&self) {
+        self.stopping.store(true, Ordering::Release);
+        // The command is what wakes a thread that is blocked waiting for one.
+        let _ = self.commands.send(Command::Stop);
     }
 
     async fn dispatch<T, F>(
@@ -820,8 +887,13 @@ impl BindingHandle {
 }
 
 impl Drop for BindingHandle {
+    /// Signals rather than joins.
+    ///
+    /// A handle can be dropped on an asynchronous executor's thread, and joining there would block
+    /// it for as long as the component's current call. [`BindingHandle::stop`] is the joining form,
+    /// and [`Runtime::unbind`] is where a caller that wants the instance definitely gone uses it.
     fn drop(&mut self) {
-        self.stop();
+        self.signal_stop();
     }
 }
 
@@ -1171,6 +1243,27 @@ impl BindingWorker {
 
 fn millis(duration: core::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Returns what is left of `deadline` after the time since `started`.
+///
+/// One deadline across a preparation rather than a fresh one per stage: a caller that allowed
+/// thirty seconds meant thirty seconds, not thirty for the compile and thirty more for what
+/// follows it.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError::CallerDeadline`] when nothing is left.
+pub fn remaining_of(
+    started: std::time::Instant,
+    deadline: core::time::Duration,
+) -> RuntimeResult<core::time::Duration> {
+    deadline
+        .checked_sub(started.elapsed())
+        .filter(|left| !left.is_zero())
+        .ok_or(RuntimeError::CallerDeadline {
+            deadline_ms: millis(deadline),
+        })
 }
 
 /// Renders a component-declared fault as the text a host records.
