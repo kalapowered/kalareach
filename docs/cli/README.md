@@ -213,13 +213,14 @@ have changed them.
 does not answer. The session's own keyboard modes are still cleared when the attachment ends, since
 the session could have set them, but nothing comes back afterwards: that is what never asking costs.
 
-A projection installs the session's Kitty keyboard flags only on a terminal that reported its own.
-That follows from the same rule: what a cleanup writes back is what the terminal *said*, and the
-Kitty protocol has no sequence that returns a terminal to what it had, so flags installed on a
-terminal nobody asked could not be put back. The `modifyOtherKeys` level is different: `CSI > 4 m`
-returns a terminal to its own initial value whether or not anybody read it first, and the host
-advertises that encoding for an `xterm`-named terminal whatever the probe asked, so the session's
-level is installed on any terminal and taken back off on the way out.
+A projection decides the two keyboard protocols separately, because they cannot be put back the
+same way. The Kitty flags are installed only on a terminal that reported its own: that protocol has
+no sequence returning a terminal to what it had, and its stack cannot be read, so flags installed on
+a terminal nobody asked could not be taken off again. The `modifyOtherKeys` level is installed
+whenever the person at this terminal can type, because that is the encoding the host advertises for
+them and `CSI > 4 m` returns any terminal to the level it started with; a terminal the host will not
+let type is left alone entirely, since installing a level there would change a terminal nobody asked
+about for no one's benefit.
 
 The choice is made before the first byte goes out, which is the only time it can be made honestly.
 After a failed handshake the stream is not clean any more: a late reply could still arrive on it, so
