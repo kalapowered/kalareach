@@ -87,6 +87,8 @@ pub struct Sweep {
     pub removed_payloads: usize,
     /// Payloads that still could not be removed. Their bytes stay charged.
     pub unremovable_payloads: usize,
+    /// Action claims whose effect had settled and whose result is now recorded.
+    pub resolved_claims: usize,
     /// De-duplication records older than the protocol's retention.
     pub forgotten_actions: usize,
 }
@@ -175,6 +177,56 @@ impl Action {
             recorded_at_ms,
         }
     }
+}
+
+/// Reads one action's record through a journal lock the caller already holds.
+///
+/// The same three answers as [`TransferService::recorded`], for the callers that have to decide
+/// under the lock their mutation holds rather than before it.
+fn recorded_with<T: serde::de::DeserializeOwned + serde::Serialize>(
+    store: &Store,
+    action: Option<&Action>,
+) -> Result<Recorded<T>> {
+    let Some(action) = action else {
+        return Ok(Recorded::Absent);
+    };
+    let Some(record) = store.retained_action(&action.actor_id, action.action_id)? else {
+        return Ok(Recorded::Absent);
+    };
+    if record.method != action.method || record.payload_digest != action.payload_digest {
+        return Err(TransferError::IdConflict {
+            action: action.action_id.to_string(),
+            method: record.method,
+        });
+    }
+    match (record.result, record.error_code) {
+        (Some(result), _) => Ok(Recorded::Answered(
+            kr_cbor::from_canonical_slice(&result, &kr_cbor::Limits::DEFAULT)
+                .map_err(TransferError::store)?,
+        )),
+        // The failure this action produced, under the code it produced. A repeat is owed what
+        // happened, not a fresh refusal in a different category.
+        (None, Some(code)) => Err(TransferError::Retained {
+            code: code.parse().unwrap_or(ErrorCode::OutcomeUnknown),
+            detail: record
+                .error_detail
+                .unwrap_or_else(|| format!("action {} was recorded as {code}", action.action_id)),
+        }),
+        (None, None) => Ok(Recorded::Claimed),
+    }
+}
+
+/// The method name `upload.finish` is retained under.
+const UPLOAD_FINISH: &str = "upload.finish";
+/// The method name `upload.cancel` is retained under.
+const UPLOAD_CANCEL: &str = "upload.cancel";
+
+/// What a claim's outcome turned out to be.
+enum Settled {
+    /// The effect produced this encoded result.
+    Result(Vec<u8>),
+    /// The effect ended as this refusal.
+    Failure(ErrorCode, String),
 }
 
 /// What this actor's record of one action says.
@@ -595,6 +647,13 @@ impl TransferService {
                 "chunk {index} does not match the digest it declares"
             )));
         }
+        // Read again, under the lock this mutation holds. The read before the lock keeps an
+        // ordinary repeat from reaching this far; this one is what makes the decision atomic with
+        // the write, so two copies that both saw nothing cannot both act.
+        match recorded_with(&store, action)? {
+            Recorded::Answered(answered) => return Ok(answered),
+            Recorded::Claimed | Recorded::Absent => {}
+        }
         let mut duplicate = false;
         if let Some(recorded) = store.chunk(params.transfer_id, index)? {
             if recorded.digest == digest && recorded.byte_len == params.chunk.byte_len {
@@ -762,6 +821,13 @@ impl TransferService {
         let row = {
             let mut store = self.locked()?;
             let row = upload_of(&store, params.transfer_id, actor)?;
+            // Another copy of this action can have published it while this one was reading the
+            // state above. Under the lock, the record decides before the state does: a copy is
+            // owed the answer its action produced, not a refusal for a state its own action
+            // reached.
+            if let Recorded::Answered(answered) = recorded_with(&store, action)? {
+                return Ok(answered);
+            }
             self.check_live(&mut store, &row, "it cannot be finished")?;
             check_declaration(&row, params)?;
             let layout = ChunkLayout::for_length(row.declared_byte_len);
@@ -788,7 +854,17 @@ impl TransferService {
         // The whole-file verification and the preview happen without the store lock: they read the
         // payload, which for a large file takes long enough that holding the journal would stop
         // every other transfer in this environment.
-        let mut file = self.open_incomplete(&row)?;
+        let mut file = match self.open_incomplete(&row) {
+            Ok(file) => file,
+            // Another copy of this action can have moved the payload between the checks above and
+            // this open. Its answer is this call's answer; anything else is the failure it is.
+            Err(error) => {
+                return match self.recorded(action)? {
+                    Recorded::Answered(answered) => Ok(answered),
+                    _ => Err(error),
+                };
+            }
+        };
         let payload_identity = file.identity();
         let (digest, byte_len) = digest_of(&mut file)?;
         if byte_len != row.declared_byte_len || digest != row.declared_digest {
@@ -1733,11 +1809,7 @@ impl TransferService {
                 _ => recovery.unresolved_publications += 1,
             }
         }
-        // A publication claims its action with the first of its two commits, so an interrupted one
-        // can leave a claim with no result. The repeat that arrives after this completes it from
-        // the row, and so does the sweep that expires it; what this adds is that a caller which
-        // never comes back does not leave a claim unanswered for the deduplication window.
-        recovery.resolved_claims = self.resolve_claims()?;
+        // Nothing here yet: claims are resolved below, after the cleanup they depend on.
         // A snapshot whose construction was interrupted is a reservation with no caller behind
         // it: nothing will ever open it, and its bytes and its transfer slot stay charged until
         // something closes it. Nothing is being staged yet at this point, so every reserving row
@@ -1758,6 +1830,11 @@ impl TransferService {
         recovery.removed_payloads = removed;
         recovery.unremovable_payloads = unremovable;
         recovery.orphans_removed = self.reconcile_orphans()?;
+        // After the cleanup, because a cancellation's answer is true only once its payload is gone.
+        // A claim with no result is a two-commit effect that was interrupted between its commits;
+        // a repeat completes it from the row too, and this is what settles one whose caller never
+        // comes back.
+        recovery.resolved_claims = self.resolve_claims()?;
         drop(payloads);
         Ok(recovery)
     }
@@ -1777,30 +1854,68 @@ impl TransferService {
             let Some(row) = self.locked()?.upload(transfer_id)? else {
                 continue;
             };
-            let encoded = match row.state {
-                UploadState::Published => {
+            // The method decides the shape of the answer. A claim made for a finish is never
+            // completed with a cancellation's result, whatever became of the transfer, because a
+            // caller decodes the reply as the shape its own method returns.
+            let settled = match (claim.method.as_str(), row.state) {
+                (UPLOAD_FINISH, UploadState::Published) => {
                     let result = UploadFinishResult {
                         handle: handle_of(&row)?,
-                        already_published: true,
+                        // This claim is what published it, which is what the live paths record.
+                        already_published: false,
                         preview_unavailable: Nullable(row.preview_unavailable.clone()),
                     };
-                    kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?
+                    Settled::Result(
+                        kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
+                    )
                 }
-                UploadState::Cancelled => {
+                // A publication that ended in neither of those ways ended as a refusal, and the
+                // repeat is owed that refusal rather than a handle that names nothing.
+                (UPLOAD_FINISH, UploadState::Invalidated | UploadState::Expired) => {
+                    Settled::Failure(
+                        ErrorCode::AttachmentIntegrity,
+                        row.invalid_reason.clone().unwrap_or_else(|| {
+                            "this upload ended without being published".to_owned()
+                        }),
+                    )
+                }
+                // Cancelled *and* released: the bytes are only back in the budget once the payload
+                // is gone, and a result that said otherwise would be wrong. A row still marked for
+                // cleanup is left to the next pass, which runs after the retry that removes it.
+                (UPLOAD_CANCEL, UploadState::Cancelled) if !row.cleanup_pending => {
                     let result = UploadCancelResult {
                         transfer_id,
                         state: row.state,
-                        released_byte_len: U64::new(row.reserved_byte_len),
+                        // The reservation this upload made, not the field the release zeroed.
+                        released_byte_len: U64::new(row.declared_byte_len),
                     };
-                    kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?
+                    Settled::Result(
+                        kr_cbor::to_canonical_vec(&result).map_err(TransferError::store)?,
+                    )
                 }
                 // Still in flight, or ended in a way this claim's method does not describe. The
                 // record stays open and the next pass looks again.
                 _ => continue,
             };
-            self.locked()?
-                .complete_action(&claim.actor_id, claim.action_id, &encoded)?;
-            resolved += 1;
+            let wrote = match settled {
+                Settled::Result(encoded) => self.locked()?.complete_action(
+                    &claim.actor_id,
+                    claim.action_id,
+                    &claim.method,
+                    claim.payload_digest,
+                    &encoded,
+                )?,
+                Settled::Failure(code, detail) => self.locked()?.fail_action(
+                    &claim.actor_id,
+                    claim.action_id,
+                    &claim.method,
+                    code.as_str(),
+                    &detail,
+                )?,
+            };
+            if wrote {
+                resolved += 1;
+            }
         }
         Ok(resolved)
     }
@@ -1985,6 +2100,8 @@ impl TransferService {
         let (removed, unremovable) = self.retry_cleanup()?;
         sweep.removed_payloads = removed;
         sweep.unremovable_payloads = unremovable;
+        // A cleanup that succeeded here may be what a claim was waiting for.
+        sweep.resolved_claims = self.resolve_claims()?;
         let horizon = TimestampMs::new(
             now.get()
                 .saturating_sub(kr_protocol::limits::DEDUPLICATION_RETENTION.get()),
@@ -2019,17 +2136,18 @@ impl TransferService {
                 method: record.method,
             });
         }
-        Ok(Some(match (record.result, record.error_code) {
-            (Some(result), _) => RetainedOutcome::Ok(result),
-            (None, Some(code)) => RetainedOutcome::Error {
+        Ok(match (record.result, record.error_code) {
+            (Some(result), _) => Some(RetainedOutcome::Ok(result)),
+            (None, Some(code)) => Some(RetainedOutcome::Error {
                 code: code.parse().unwrap_or(ErrorCode::OutcomeUnknown),
                 detail: record.error_detail.unwrap_or_default(),
-            },
-            (None, None) => RetainedOutcome::Error {
-                code: ErrorCode::OutcomeUnknown,
-                detail: "this action was recorded without an outcome".to_owned(),
-            },
-        }))
+            }),
+            // Claimed and not settled. This is *not* an answer: the request goes through to the
+            // service, which finishes the effect its claim started and records what it produced.
+            // Answering `OUTCOME_UNKNOWN` here would leave a caller with no way to learn the
+            // outcome of an action this host can still complete.
+            (None, None) => None,
+        })
     }
 
     /// Retains one mutation outcome so an exact repeat is answered rather than performed again.
@@ -2092,31 +2210,8 @@ impl TransferService {
         &self,
         action: Option<&Action>,
     ) -> Result<Recorded<T>> {
-        let Some(action) = action else {
-            return Ok(Recorded::Absent);
-        };
-        let Some(record) = self
-            .locked()?
-            .retained_action(&action.actor_id, action.action_id)?
-        else {
-            return Ok(Recorded::Absent);
-        };
-        if record.method != action.method || record.payload_digest != action.payload_digest {
-            return Err(TransferError::IdConflict {
-                action: action.action_id.to_string(),
-                method: record.method,
-            });
-        }
-        match (record.result, record.error_code) {
-            (Some(result), _) => Ok(Recorded::Answered(
-                kr_cbor::from_canonical_slice(&result, &kr_cbor::Limits::DEFAULT)
-                    .map_err(TransferError::store)?,
-            )),
-            (None, Some(code)) => Err(TransferError::PermissionDenied {
-                detail: format!("action {} already failed with {code}", action.action_id),
-            }),
-            (None, None) => Ok(Recorded::Claimed),
-        }
+        let store = self.locked()?;
+        recorded_with(&store, action)
     }
 
     /// Records the result of an action that was claimed without one.
@@ -2132,8 +2227,19 @@ impl TransferService {
             return Ok(());
         };
         let encoded = kr_cbor::to_canonical_vec(result).map_err(TransferError::store)?;
+        // The completion names the claim it completes: the identifier alone is not enough, because
+        // an identifier can be claimed by a different request between reading the record and
+        // writing to it. A completion that matches nothing changes nothing, which is the right
+        // answer for a caller whose claim is no longer there.
         self.locked()?
-            .complete_action(&action.actor_id, action.action_id, &encoded)
+            .complete_action(
+                &action.actor_id,
+                action.action_id,
+                &action.method,
+                action.payload_digest,
+                &encoded,
+            )
+            .map(|_| ())
     }
 
     /// Answers a refusal from the retained record when this action has already been performed.

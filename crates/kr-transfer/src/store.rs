@@ -35,7 +35,7 @@ use crate::authority::ObjectIdentity;
 use crate::error::{Result, TransferError};
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The configurable resource limits of one environment.
 ///
@@ -364,6 +364,8 @@ pub struct OpenClaim {
     pub action_id: Uuid,
     /// The method it was claimed for.
     pub method: String,
+    /// The digest of the payload it was claimed with.
+    pub payload_digest: Digest256,
     /// The transfer it acts on, where it names one.
     pub transfer: Option<TransferId>,
 }
@@ -602,6 +604,22 @@ impl Store {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .optional()
             .map_err(TransferError::store)?;
+        // Forward-only, one step at a time, and each step leaves the journal readable by the
+        // version it moves to. `CREATE TABLE IF NOT EXISTS` above does nothing to a table that
+        // already exists, so a column added after a release is added here.
+        if recorded == Some(1) {
+            self.add_action_subject()?;
+            self.connection
+                .execute(
+                    "UPDATE schema_version SET version = ?1",
+                    params![SCHEMA_VERSION],
+                )
+                .map_err(TransferError::store)?;
+        }
+        let recorded = match recorded {
+            Some(1) => Some(SCHEMA_VERSION),
+            other => other,
+        };
         match recorded {
             None => {
                 self.connection
@@ -620,6 +638,28 @@ impl Store {
                     ),
                 });
             }
+        }
+        Ok(())
+    }
+
+    /// Adds the column that says which transfer an action claim acts on.
+    ///
+    /// Version 1 recorded an action's result or its failure and nothing else, because a claim
+    /// always carried its result. A two-commit effect claims first and records later, and a claim
+    /// with no result is resolvable only from the object it was for.
+    fn add_action_subject(&self) -> Result<()> {
+        let present: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('actions') WHERE name = 'subject'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(TransferError::store)?;
+        if present == 0 {
+            self.connection
+                .execute("ALTER TABLE actions ADD COLUMN subject BLOB", [])
+                .map_err(TransferError::store)?;
         }
         Ok(())
     }
@@ -2040,7 +2080,7 @@ impl Store {
         let mut statement = self
             .connection
             .prepare(
-                "SELECT actor_id, action_id, method, subject FROM actions
+                "SELECT actor_id, action_id, method, payload_digest, subject FROM actions
                  WHERE result IS NULL AND error_code IS NULL",
             )
             .map_err(TransferError::store)?;
@@ -2052,7 +2092,8 @@ impl Store {
                     }),
                     action_id: uuid_column(row, 1)?,
                     method: row.get(2)?,
-                    transfer: optional_uuid(row, 3)?.map(TransferId::new),
+                    payload_digest: digest_column(row, 3)?,
+                    transfer: optional_uuid(row, 4)?.map(TransferId::new),
                 })
             })
             .map_err(TransferError::store)?;
@@ -2075,16 +2116,54 @@ impl Store {
         &self,
         actor_id: &ActorId,
         action_id: Uuid,
+        method: &str,
+        payload_digest: Digest256,
         result: &[u8],
-    ) -> Result<()> {
-        self.connection
+    ) -> Result<bool> {
+        // The method and the payload are part of the condition, not just the identifier. An
+        // identifier can be claimed by a different request between a caller reading the record and
+        // completing it, and that claim's result is not this caller's to write.
+        let changed = self
+            .connection
             .execute(
-                "UPDATE actions SET result = ?3
-                 WHERE actor_id = ?1 AND action_id = ?2 AND result IS NULL",
-                params![actor_id.as_str(), uuid_sql(action_id), result],
+                "UPDATE actions SET result = ?5
+                 WHERE actor_id = ?1 AND action_id = ?2 AND method = ?3 AND payload_digest = ?4
+                   AND result IS NULL AND error_code IS NULL",
+                params![
+                    actor_id.as_str(),
+                    uuid_sql(action_id),
+                    method,
+                    payload_digest.as_bytes().as_slice(),
+                    result,
+                ],
             )
             .map_err(TransferError::store)?;
-        Ok(())
+        Ok(changed == 1)
+    }
+
+    /// Records the failure of an action that was claimed and never finished.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TransferError::StoreUnavailable`] when the write fails.
+    pub fn fail_action(
+        &self,
+        actor_id: &ActorId,
+        action_id: Uuid,
+        method: &str,
+        code: &str,
+        detail: &str,
+    ) -> Result<bool> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE actions SET error_code = ?4, error_detail = ?5
+                 WHERE actor_id = ?1 AND action_id = ?2 AND method = ?3
+                   AND result IS NULL AND error_code IS NULL",
+                params![actor_id.as_str(), uuid_sql(action_id), method, code, detail,],
+            )
+            .map_err(TransferError::store)?;
+        Ok(changed == 1)
     }
 
     /// Removes de-duplication records older than the protocol's retention.
@@ -2530,6 +2609,44 @@ mod tests {
             published_at_ms: None,
             submitted_at_ms: None,
         }
+    }
+
+    #[test]
+    fn a_version_one_journal_gains_the_column_a_claim_needs() {
+        // A journal written by the version that retained only finished actions: the same table
+        // without `subject`, and the version row that says so.
+        let connection = rusqlite::Connection::open_in_memory().expect("opens");
+        connection
+            .execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES (1);
+                 CREATE TABLE actions (
+                     actor_id       TEXT NOT NULL,
+                     action_id      BLOB NOT NULL,
+                     method         TEXT NOT NULL,
+                     payload_digest BLOB NOT NULL,
+                     result         BLOB,
+                     error_code     TEXT,
+                     error_detail   TEXT,
+                     recorded_at_ms INTEGER NOT NULL,
+                     PRIMARY KEY (actor_id, action_id)
+                 );",
+            )
+            .expect("writes a version-one journal");
+        let store = Store::prepare(connection, environment()).expect("migrates and opens");
+
+        // The version moved, the column is there, and the reader that needs it works.
+        let version: i64 = store
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("reads the version");
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(
+            store
+                .unfinished_claims()
+                .expect("reads the claims")
+                .is_empty()
+        );
     }
 
     #[test]

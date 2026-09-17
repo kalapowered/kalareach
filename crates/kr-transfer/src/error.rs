@@ -101,6 +101,17 @@ pub enum TransferError {
         /// The method it was first used for.
         method: String,
     },
+    /// The failure this action was recorded as, returned to a repeat of it.
+    ///
+    /// One action, one answer: a repeat of an action that failed is owed the failure it produced,
+    /// under the code it produced, not a new decision made now.
+    #[error("{detail}")]
+    Retained {
+        /// The code the failure was recorded under.
+        code: ErrorCode,
+        /// What it said.
+        detail: String,
+    },
     /// An action was claimed and its outcome is not recorded yet.
     ///
     /// A two-commit effect claims its action with the first commit and records its result with the
@@ -190,6 +201,7 @@ impl TransferError {
             Self::DraftConflict { .. } => ErrorCode::DraftConflict,
             Self::IdConflict { .. } => ErrorCode::IdConflict,
             Self::OutcomeUnknown { .. } => ErrorCode::OutcomeUnknown,
+            Self::Retained { code, .. } => *code,
             Self::Ipc(error) => error.code(),
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
         }
