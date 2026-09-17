@@ -260,7 +260,8 @@ pub fn check_arguments(arguments: &[&OsStr]) -> Result<()> {
     let subcommand = subcommand.to_string_lossy();
     if !PERMITTED_SUBCOMMANDS.contains(&subcommand.as_ref()) {
         return Err(ProjectError::InvalidArgument(format!(
-            "git {subcommand} is not a subcommand this service runs; it runs {}",
+            "git {} is not a subcommand this service runs; it runs {}",
+            redact(&subcommand),
             PERMITTED_SUBCOMMANDS.join(", ")
         )));
     }

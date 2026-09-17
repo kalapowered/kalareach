@@ -11,8 +11,8 @@ use kr_protocol::error::{ErrorCode, ProtocolError};
 /// host's own words legible. [`fmt::Display`] is the bar underneath that: a failure becomes text
 /// in exactly one place, and the whole of it goes through the rule there. So a Rust caller, a log
 /// line, the daemon's standard error and the wire all read the same protected message, and a
-/// producer nobody thought about cannot reach any of them with something else.
-#[derive(Debug)]
+/// producer nobody thought about cannot reach any of them with something else. [`fmt::Debug`] goes
+/// the same way, because a debug rendering is how most of a message reaches a log.
 #[non_exhaustive]
 pub enum ProjectError {
     /// The project store could not be read or written.
@@ -140,6 +140,22 @@ pub enum ProjectError {
     InvalidArgument(String),
 }
 
+impl fmt::Debug for ProjectError {
+    /// Writes the variant, the code it is reported under and the protected sentence.
+    ///
+    /// The derived rendering would print the fields as they are, and a debug rendering is what a
+    /// log line, a `Result::expect` and a failing test all use. So it goes through the same
+    /// sentence [`fmt::Display`] writes, and what it adds is the variant's own name, which is this
+    /// host's word rather than anything a caller or a repository chose.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct(self.name())
+            .field("code", &self.code())
+            .field("message", &self.to_string())
+            .finish()
+    }
+}
+
 impl fmt::Display for ProjectError {
     /// Writes the failure as one protected sentence.
     ///
@@ -155,6 +171,34 @@ impl fmt::Display for ProjectError {
 impl std::error::Error for ProjectError {}
 
 impl ProjectError {
+    /// Returns the variant's own name.
+    const fn name(&self) -> &'static str {
+        match self {
+            Self::StoreUnavailable { .. } => "StoreUnavailable",
+            Self::StagingUnavailable { .. } => "StagingUnavailable",
+            Self::WrongEnvironment { .. } => "WrongEnvironment",
+            Self::UnknownProject { .. } => "UnknownProject",
+            Self::UnknownWorkspace { .. } => "UnknownWorkspace",
+            Self::UnknownOperation { .. } => "UnknownOperation",
+            Self::Destination { .. } => "Destination",
+            Self::AdoptionRequired { .. } => "AdoptionRequired",
+            Self::IdentityChanged { .. } => "IdentityChanged",
+            Self::RemoteRejected { .. } => "RemoteRejected",
+            Self::ConfigurationRejected { .. } => "ConfigurationRejected",
+            Self::GitUnavailable { .. } => "GitUnavailable",
+            Self::GitFailed { .. } => "GitFailed",
+            Self::WrongState { .. } => "WrongState",
+            Self::StillBound { .. } => "StillBound",
+            Self::PermissionDenied { .. } => "PermissionDenied",
+            Self::IdConflict { .. } => "IdConflict",
+            Self::OutcomeUnknown { .. } => "OutcomeUnknown",
+            Self::Retained { .. } => "Retained",
+            Self::Cancelled { .. } => "Cancelled",
+            Self::QuotaExceeded { .. } => "QuotaExceeded",
+            Self::InvalidArgument(_) => "InvalidArgument",
+        }
+    }
+
     /// Returns the sentence this host composed for the failure, before the rule.
     fn compose(&self) -> String {
         match self {
@@ -355,10 +399,46 @@ mod tests {
                 !said.contains("BOUNDARYSECRET"),
                 "a Rust caller is told no more than the wire is: {said}"
             );
+            // A debug rendering is what a log line, a `Result::expect` and a failing test use, so
+            // it is under the same bar. Both spellings, because `{:#?}` is its own formatter.
+            let debugged = format!("{failure:?}");
+            let expanded = format!("{failure:#?}");
+            for rendering in [&debugged, &expanded] {
+                assert!(
+                    !rendering.contains("BOUNDARYSECRET"),
+                    "and a debug rendering no more than either: {rendering}"
+                );
+            }
+            assert!(
+                debugged.starts_with(failure.name()),
+                "while still saying which failure it is: {debugged}"
+            );
             let wire: ProtocolError = failure.into();
             assert_eq!(wire.message, said, "and both are told the same thing");
             assert_eq!(wire.code, code, "under the code the service decided");
         }
+    }
+
+    #[test]
+    fn a_refused_subcommand_is_named_through_the_rule_in_every_rendering() {
+        // The one producer the boundary above cannot answer for on its own: a refusal composed out
+        // of the caller's own word. The fragment goes through the rule where the sentence is built,
+        // so the sentence survives, and every rendering of the failure carries the same thing.
+        let refusal =
+            crate::git::check_arguments(&[std::ffi::OsStr::new("access_token=SUBCOMMANDSECRET")])
+                .expect_err("a subcommand this service does not run is refused");
+        let said = refusal.to_string();
+        let debugged = format!("{refusal:?}");
+        for rendering in [&said, &debugged, &format!("{refusal:#?}")] {
+            assert!(
+                !rendering.contains("SUBCOMMANDSECRET"),
+                "no rendering repeats what the caller named: {rendering}"
+            );
+        }
+        assert!(
+            said.contains("is not a subcommand this service runs"),
+            "and this host's own words survive: {said}"
+        );
     }
 
     #[test]
