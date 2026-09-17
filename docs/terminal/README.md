@@ -1062,7 +1062,7 @@ the erasure covers that is not already empty.
 | Apple M4 Pro, 12 processors | 11.9 to 12.4 MiB/s | 10.6 to 11.5 MiB/s | local runs of this revision |
 | AMD EPYC 7763 64-Core, 4 processors | 6.1 to 6.2 MiB/s | 5.9 MiB/s | `core-ci` runs 35165588315, 35167627730 and 35169947110 |
 | AMD EPYC 9V74 80-Core, 4 processors | 5.9 to 7.5 MiB/s | 6.1 to 7.7 MiB/s | `core-ci` runs 35168759717 and 35164400630 |
-| Intel Xeon Platinum 8573C, 4 processors | 8.0 MiB/s | 7.4 MiB/s | `core-ci` run 35163469612 |
+| Intel Xeon Platinum 8573C, 4 processors | 8.0 to 8.1 MiB/s | 7.4 to 7.6 MiB/s | `core-ci` runs 35163469612 and 35172122622 |
 
 The slowest of those hosts is where the comparison is clearest. `core-ci` measured 3.79 MiB/s on the
 stream that scrolls, below the target, on an AMD EPYC 7763 twenty minutes before it measured
@@ -1076,9 +1076,9 @@ plain stream across the runs behind this revision, so the rows above are not a r
 processors. The runs named are `core-ci` runs of this revision's terminal engine, each one retaining
 the figures, the processor and the verdict it measured, so a row can be read back to the run it came
 from. Two of the EPYC 9V74 runs are 27% apart on the plain stream and 26% apart on the one that
-scrolls. The Xeon row, and the wider end of the EPYC 9V74 row, were taken a few commits before the
-last change to the output path, which only takes work off it; the rest are of the engine as it
-stands.
+scrolls. The wider end of the EPYC 9V74 row, and the narrower end of the Xeon row, were taken a few
+commits before the last change to the output path, which only takes work off it; the rest are of the
+engine as it stands.
 
 Section 27 asks a reference host for at least four CPU cores and 8 GiB, so four processors is the
 floor a host has to meet the target on, and every four-processor host above meets it on both
