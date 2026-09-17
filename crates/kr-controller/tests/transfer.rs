@@ -81,30 +81,21 @@ async fn host() -> Host {
     host_on(kr_ipc::testing::TempHost::create()).await
 }
 
+/// How long a replacement daemon is given to take the environment over.
+///
+/// A daemon in this suite ends in the process that started it, and the environment's lock is
+/// released when the last reference to the controller goes. The tasks that served it hold one
+/// each, and the runtime drops those some time after an aborted task has been awaited, so a
+/// replacement starting at once can still find the environment held. That is a liveness condition:
+/// what these tests assert is that the replacement takes the environment over, not how soon the
+/// runtime gets round to the drop.
+const ENVIRONMENT_HANDOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Starts a daemon on an environment that may already hold a transfer journal.
 async fn host_on(temp: kr_ipc::testing::TempHost) -> Host {
     let environment = temp.environment();
     let environment_id = temp.environment_id();
-    let secrets = environment.secrets_dir();
-    let controller = Controller::start(ControllerSetup {
-        paths: environment.clone(),
-        environment_id,
-        identity: Box::new(move || {
-            let store = open_store(CONTROLLER_SECRET_SERVICE, &secrets)
-                .expect("a secret store for the test environment");
-            Ok(
-                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                    .expect("an identity"),
-            )
-        }),
-        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-        supervisor: Box::new(RefusingSupervisor),
-        worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
-        build_id: build(),
-        release: "0".to_owned(),
-    })
-    .await
-    .expect("the daemon starts");
+    let controller = start_controller(&environment, environment_id).await;
     let endpoint = environment.controller_endpoint().expect("an endpoint");
     let listener = Listener::bind(&endpoint).expect("binds the endpoint");
     let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
@@ -125,6 +116,48 @@ async fn host_on(temp: kr_ipc::testing::TempHost) -> Host {
         chunks,
         clients,
         chunk_task,
+    }
+}
+
+/// Starts the controller, waiting for a daemon this one replaces to let go of the environment.
+///
+/// Anything other than the environment still being held fails at once, with what it said and how
+/// long the start had been going.
+async fn start_controller(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    environment_id: EnvironmentId,
+) -> Arc<Controller> {
+    let started = std::time::Instant::now();
+    loop {
+        let secrets = environment.secrets_dir();
+        let outcome = Controller::start(ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                let store = open_store(CONTROLLER_SECRET_SERVICE, &secrets)
+                    .expect("a secret store for the test environment");
+                Ok(
+                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                        .expect("an identity"),
+                )
+            }),
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(RefusingSupervisor),
+            worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+            build_id: build(),
+            release: "0".to_owned(),
+        })
+        .await;
+        match outcome {
+            Ok(controller) => return controller,
+            Err(kr_controller::error::ControllerError::AlreadyRunning { .. })
+                if started.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
+            Err(error) => panic!(
+                "the daemon did not start in {:.1?}: {error}",
+                started.elapsed()
+            ),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
 }
 
