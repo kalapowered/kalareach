@@ -12,12 +12,22 @@
 //! | [`phase`] | The integration phase, what each phase permits, and which methods are root methods |
 //! | [`link`] | One bridge connection, with the direction of every frame enforced |
 //! | [`scripted`] | The reference bridge: the client half of the endpoint, driven frame by frame by its caller |
+//! | [`package`] | Which qualified shell package a session launches, with its executable, flags and module tree |
+//! | [`startup`] | The marked, guarded startup entries: where they go, what they contain and how they are removed |
+//! | [`quoting`] | Per-shell quoting of a launch, without `eval` and without interpolation |
+//! | [`terminal`] | The terminal application a presented session opens, in the order section 7 fixes |
+//! | [`command`] | Opt-in command integration, and the command blocks the private hooks report |
 
+pub mod command;
 pub mod endpoint;
 pub mod error;
 pub mod handshake;
 pub mod link;
+pub mod package;
 pub mod phase;
+pub mod quoting;
 pub mod scripted;
+pub mod startup;
+pub mod terminal;
 
 pub use crate::host::error::{HostError, Result};

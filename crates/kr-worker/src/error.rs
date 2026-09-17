@@ -119,6 +119,23 @@ pub enum WorkerError {
         /// What was refused, and why.
         detail: String,
     },
+    /// This session does not implement the managed root-editor contract.
+    #[error("{detail}")]
+    ShellIntegrationUnsupported {
+        /// Which part of the contract is missing.
+        detail: String,
+    },
+    /// The reader did not install the launch, and this is the reason it named.
+    ///
+    /// The code is the contract's own, so a caller reads the difference between an editor that was
+    /// busy, a buffer that had moved under it and an outcome nothing can establish.
+    #[error("the launch was not installed: {reason}")]
+    LaunchRefused {
+        /// The contract's reason.
+        reason: &'static str,
+        /// The code the caller receives.
+        code: ErrorCode,
+    },
     /// The request is not valid.
     #[error("{0}")]
     InvalidArgument(String),
@@ -168,6 +185,8 @@ impl WorkerError {
             Self::QuotaExceeded { .. } => ErrorCode::QuotaExceeded,
             Self::ClockUntrusted { .. } => ErrorCode::ClockUntrusted,
             Self::PreconditionFailed { .. } => ErrorCode::DraftConflict,
+            Self::ShellIntegrationUnsupported { .. } => ErrorCode::ShellIntegrationUnsupported,
+            Self::LaunchRefused { code, .. } => *code,
             Self::StaleTarget { .. } => ErrorCode::StaleSession,
             Self::Ipc(error) => error.code(),
             Self::Verification(_) => ErrorCode::PermissionDenied,

@@ -32,6 +32,11 @@ use kr_protocol::local::{LocalClientKind, LocalHello};
 use kr_protocol::scalars::Uuid;
 use kr_protocol::session::{DisplayNumber, Presentation, SessionCreateParams, ShellMode};
 use kr_protocol::worker::{ReservationId, WorkerLaunchSpec, WorkerReady};
+use kr_shell_integration::host::HostError;
+use kr_shell_integration::host::endpoint::HostEndpoint;
+use kr_shell_integration::host::package::{
+    PackageFault, PackageSet, ShellPackage, default_package_root,
+};
 use kr_worker::environment::{ExecutionContext, build as build_environment};
 use kr_worker::history::DEFAULT_RESIDENT_BYTES;
 use kr_worker::output::DEFAULT_SEND_QUEUE_BYTES;
@@ -160,25 +165,45 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         return Err("the launch specification does not match the reservation".into());
     }
-    // Managed mode needs a KalaReach-qualified shell package with its reader mailbox and pre-EOF
-    // hook. This worker launches the selected stock shell, which cannot claim that contract, so an
-    // unsupported mode is named rather than silently substituted.
-    if specification.create.shell_mode != ShellMode::NativeCompat {
-        let error = ProtocolError::new(
-            ErrorCode::ShellIntegrationUnsupported,
-            "this host implements the explicitly selected native_compat shell mode; managed mode needs a qualified shell package",
-        );
-        writer
-            .write_message(&ControlFrame::WorkerFailed(error))
-            .await?;
-        return Err("managed shell mode is not available on this host".into());
-    }
+    // Managed mode launches a KalaReach-qualified package: the exact binary its reader patch was
+    // built into, with the flags that package declares. A shell no package qualifies is named
+    // rather than silently substituted.
+    let package = match managed_package(&specification) {
+        Ok(package) => package,
+        Err(fault) => {
+            writer
+                .write_message(&ControlFrame::WorkerFailed(fault.to_protocol_error()))
+                .await?;
+            return Err(Box::new(fault));
+        }
+    };
 
     let display_number = DisplayNumber::new(arguments.display);
     let endpoint = environment.worker_endpoint(display_number)?;
     let listener = Listener::bind(&endpoint)?;
 
-    let config = session_config(&specification, &environment, display_number, &endpoint);
+    // The bridge endpoint is bound before the shell starts: its address and one-time secret travel
+    // to the shell in its own environment, and a shell that started first would have neither.
+    let bridge = match package.as_ref().map(|package| {
+        bridge_endpoint(&environment, specification.session_id).map(|endpoint| (package, endpoint))
+    }) {
+        Some(Ok(bound)) => Some(bound),
+        Some(Err(error)) => {
+            writer
+                .write_message(&ControlFrame::WorkerFailed(error.to_protocol_error()))
+                .await?;
+            return Err(Box::new(error));
+        }
+        None => None,
+    };
+
+    let config = session_config(
+        &specification,
+        &environment,
+        display_number,
+        package.as_ref(),
+        bridge.as_ref().map(|(_, endpoint)| endpoint),
+    );
     // The machine's own continuous clock, which is the clock the daemon expresses a forwarded
     // authority deadline on. Every boundary in this process that decides whether authority has
     // run out reads it.
@@ -197,6 +222,42 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             return Err(Box::new(failure.error));
         }
     };
+
+    // The driver and the endpoint go in together, before the ready report: the first thing the
+    // reader says about itself must have somewhere to go.
+    let bridge_server = bridge.map(|(package, endpoint)| {
+        let (expectation, driver) = {
+            let session = runtime.session();
+            let root_process = session
+                .root_identity()
+                .expect("a live session has a root process");
+            let lease = kr_shell_integration::contract::fence::LeaseView::unheld(
+                kr_protocol::ids::InputLeaseEpoch::new(0),
+            );
+            let driver = kr_worker::fence::FenceDriver::new(
+                specification.session_id,
+                lease,
+                Arc::new(kr_transport::clock::SystemContinuousClock::new()),
+            );
+            let identity = package.identity();
+            let expectation = kr_shell_integration::contract::transport::WorkerExpectation {
+                session_id: specification.session_id,
+                root_process,
+                supported_editor_abis: vec![identity.editor_abi.clone()],
+                supported_integration_versions: vec![identity.integration_version.clone()],
+                already_registered: false,
+                gesture: kr_shell_integration::contract::events::EofGesture::default(),
+            };
+            (expectation, driver)
+        };
+        runtime.session().install_fence(driver);
+        let server = kr_worker::fence::bridge::BridgeServer::new(
+            Arc::clone(&runtime),
+            endpoint,
+            expectation,
+        );
+        tokio::spawn(server.serve())
+    });
 
     let ready = {
         let session = runtime.session();
@@ -250,24 +311,61 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     // the process ends; nothing here restarts a shell.
     let _record = runtime.wait_closed().await;
     serving.abort();
+    if let Some(server) = bridge_server {
+        server.abort();
+    }
     Ok(())
+}
+
+/// Resolves the qualified package a managed session launches.
+///
+/// A `native_compat` session resolves none: it runs the selected stock shell, which cannot claim
+/// the managed contract and does not pretend to.
+fn managed_package(specification: &WorkerLaunchSpec) -> Result<Option<ShellPackage>, PackageFault> {
+    if specification.create.shell_mode != ShellMode::Managed {
+        return Ok(None);
+    }
+    let installed = PackageSet::installed(&default_package_root())?;
+    installed
+        .select(specification.create.shell.0.as_deref())
+        .cloned()
+        .map(Some)
+}
+
+/// Binds this session's root-integration endpoint inside its own owner-only directory.
+fn bridge_endpoint(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    session_id: SessionId,
+) -> Result<HostEndpoint, HostError> {
+    // Inside the session's own runtime directory, which is already owner-only and on the internal
+    // disk: the socket lives beside the descriptors rather than anywhere a shell chose.
+    let directory = environment.descriptors_dir().join(session_id.to_string());
+    kr_ipc::paths::create_private_tree(environment.runtime_root(), &directory)?;
+    HostEndpoint::open(session_id, &directory)
 }
 
 fn session_config(
     specification: &WorkerLaunchSpec,
     environment: &kr_ipc::paths::EnvironmentPaths,
     display_number: DisplayNumber,
-    _endpoint: &Endpoint,
+    package: Option<&ShellPackage>,
+    bridge: Option<&HostEndpoint>,
 ) -> SessionConfig {
     let create: &SessionCreateParams = &specification.create;
-    // The shell the request named, or the one this host is configured to use, or the platform's
-    // own. Nothing is substituted silently: the session reports the executable it launched.
-    let shell_path = create
-        .shell
-        .as_ref()
-        .cloned()
-        .or_else(configured_shell)
-        .unwrap_or_else(default_shell);
+    // A managed session launches the package's own binary. Everything else launches the shell the
+    // request named, or the one this host is configured to use, or the platform's own. Nothing is
+    // substituted silently: the session reports the executable it launched.
+    let shell_path = package.map_or_else(
+        || {
+            create
+                .shell
+                .as_ref()
+                .cloned()
+                .or_else(configured_shell)
+                .unwrap_or_else(default_shell)
+        },
+        |package| package.executable().display().to_string(),
+    );
     // The context a worker of this profile runs in, resolved from the login session the service
     // manager placed it in. A headless worker takes none of it, because it must outlive that
     // login session.
@@ -283,6 +381,21 @@ fn session_config(
         &specification.release,
         specification.session_id,
     );
+    let mut environment_pairs = launch_environment.to_pairs();
+    if let Some(bridge) = bridge {
+        // The two reserved bootstrap values, and the only two. They come from the worker, they name
+        // this session's own endpoint, and the integration removes them from the exported
+        // environment as soon as the handshake succeeds, so nothing a child process starts
+        // inherits them.
+        environment_pairs.extend(
+            bridge
+                .bootstrap()
+                .exported_variables()
+                .into_iter()
+                .map(|(name, value)| (name.to_owned(), value)),
+        );
+        environment_pairs.sort();
+    }
     let dimensions = create
         .dimensions
         .as_ref()
@@ -299,10 +412,15 @@ fn session_config(
         environment_id: specification.environment_id,
         display_number,
         shell: ShellCommand {
-            arguments: interactive_arguments(&shell_path, create.presentation),
+            // A package declares the flags its interactive root shell is launched with, because
+            // they belong to that build rather than to the platform.
+            arguments: package.map_or_else(
+                || interactive_arguments(&shell_path, create.presentation),
+                ShellPackage::interactive_flags,
+            ),
             program: shell_path,
             cwd,
-            environment: launch_environment.to_pairs(),
+            environment: environment_pairs,
         },
         shell_mode: create.shell_mode,
         worker_profile: create.worker_profile,

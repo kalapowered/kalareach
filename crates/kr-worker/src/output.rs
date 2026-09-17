@@ -56,6 +56,11 @@ pub enum OutputDelivery {
         /// What it costs this subscriber's queue.
         bytes: usize,
     },
+    /// The editor could not be fenced, and this subscriber's input waited for it.
+    ///
+    /// It carries no output, so it costs the subscriber's queue nothing: what it reports is the
+    /// lease change that stands and the bytes that were released in their original order.
+    EditorBusy(Box<kr_protocol::root::EditorBusyEvent>),
     /// The subscriber must discard its partial state and install a fresh snapshot.
     Resync(ResyncRequired),
     /// The attachment was detached. Nothing more will arrive on this stream.
@@ -69,7 +74,7 @@ impl OutputDelivery {
         match self {
             Self::Bytes { bytes, .. } | Self::Screen { bytes, .. } => bytes.len(),
             Self::Projection { bytes, .. } => *bytes,
-            Self::Resync(_) | Self::Detached => 0,
+            Self::EditorBusy(_) | Self::Resync(_) | Self::Detached => 0,
         }
     }
 
@@ -336,6 +341,18 @@ impl OutputHub {
         oldest_retained_cursor: u64,
     ) -> bool {
         self.deliver_one(attachment_id, cursor, bytes, oldest_retained_cursor, false)
+    }
+
+    /// Delivers one attachment event to the subscriber it is about.
+    ///
+    /// It carries no bytes, so it is not charged against that subscriber's queue and never makes
+    /// one resynchronise. A subscriber that has gone is not an error: the event was about input it
+    /// sent, and there is nobody left to tell.
+    pub fn publish_event(&mut self, attachment_id: AttachmentId, delivery: OutputDelivery) {
+        let Some(subscriber) = self.subscribers.get_mut(&attachment_id) else {
+            return;
+        };
+        let _ = subscriber.sender.send(delivery);
     }
 
     /// Delivers a rendering of the canonical screen to one subscriber.

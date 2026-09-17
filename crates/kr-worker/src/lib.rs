@@ -11,6 +11,7 @@
 //! | [`attachments`] | Attachments, geometry ownership and succession |
 //! | [`desktop`] | The desktop a session runs on, whether it is still there, and what may be done on it |
 //! | [`environment`] | The root shell's environment: what is inherited, what is replaced, what is refused |
+//! | [`fence`] | The root editor's fence and detach machine, driven against the real clock and the real bridge |
 //! | [`history`] | Retained output: a resident window, an indexed spool and explicit gaps |
 //! | [`input`] | The single input lease, its epochs and paste-delimiter framing |
 //! | [`journal`] | The private receipt journal: acceptance, dispatch markers, de-duplication and retention |
@@ -33,6 +34,7 @@ pub mod conpty;
 pub mod desktop;
 pub mod environment;
 pub mod error;
+pub mod fence;
 pub mod history;
 pub mod input;
 pub mod journal;

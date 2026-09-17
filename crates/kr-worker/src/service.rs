@@ -682,6 +682,29 @@ impl WorkerService {
                                 )
                                 .await
                             }
+                            // An attachment event about this attachment's own input. It carries
+                            // no output, so it neither advances the output stream nor waits behind
+                            // one: the fence the client's keystrokes waited for is not a question
+                            // about the screen.
+                            OutputDelivery::EditorBusy(event) => {
+                                let Some(notification) = notification(
+                                    &stream_id,
+                                    sequence,
+                                    kr_protocol::root::EDITOR_BUSY_EVENT,
+                                    &*event,
+                                ) else {
+                                    continue;
+                                };
+                                sequence += 1;
+                                write_frame(
+                                    &delivery_writable,
+                                    &sender,
+                                    &notification,
+                                    &delivery_withdrawn,
+                                    true,
+                                )
+                                .await
+                            }
                             OutputDelivery::Resync(marker) => {
                                 let Some(notification) =
                                     notification(&stream_id, sequence, "session.resync", &marker)
@@ -828,15 +851,18 @@ impl WorkerService {
             }
             ControlFrame::Mutation(mutation) => {
                 let caller = Caller::local(state.actor_id.clone());
-                Some(self.mutation(
-                    state,
-                    &mutation,
-                    &caller,
-                    Freshness::Window(self.clock.now()),
-                    false,
-                ))
+                Some(
+                    self.mutation(
+                        state,
+                        &mutation,
+                        &caller,
+                        Freshness::Window(self.clock.now()),
+                        false,
+                    )
+                    .await,
+                )
             }
-            ControlFrame::Forwarded(forwarded) => Some(self.forwarded(state, &forwarded)),
+            ControlFrame::Forwarded(forwarded) => Some(self.forwarded(state, &forwarded).await),
             ControlFrame::ForwardedRead(forwarded) => Some(self.forwarded_read(state, &forwarded)),
             _ => Some(failure(
                 RequestId::new(0),
@@ -1728,7 +1754,7 @@ impl WorkerService {
     /// it is. A proxy is told when the answer came from a retained action instead of from this
     /// worker performing one, because passing a retained result on is a read of a receipt and the
     /// daemon has an authority check to make before it does that.
-    fn mutation(
+    async fn mutation(
         &self,
         state: &mut ConnectionState,
         mutation: &MutationRequest,
@@ -1748,7 +1774,44 @@ impl WorkerService {
         let Some(entry) = Self::entry(method, mutation.method_version, caller.ingress) else {
             return failure(mutation.request_id, &unlisted());
         };
-        match self.receipted(state, mutation, method, entry, caller, freshness) {
+        let dispatched = self.receipted(state, mutation, method, entry, caller, freshness);
+        let answered = match dispatched {
+            Ok(Answered::Launch {
+                transaction,
+                receiver,
+            }) => {
+                // The boundary is over and the barrier is released: a 250 ms transaction holds the
+                // input this session accepted, not every other mutation on this worker. What is
+                // awaited is the reader's own word, which the machine's timer bounds; a receiver
+                // that ends without one means the session went, and the caller is owed the outcome
+                // it cannot establish rather than a claim that nothing happened.
+                let answer = receiver.await.unwrap_or(
+                    crate::fence::driver::LaunchAnswer::Refused {
+                        reason:
+                            kr_shell_integration::contract::requests::LaunchRejectionReason::ConfirmationLost,
+                        code: ErrorCode::OutcomeUnknown,
+                    },
+                );
+                self.runtime.forget_launch(transaction);
+                let outcome = match answer {
+                    crate::fence::driver::LaunchAnswer::Installed(result) => encode(&result),
+                    crate::fence::driver::LaunchAnswer::Refused { reason, code } => {
+                        Err(WorkerError::LaunchRefused {
+                            reason: reason.as_str(),
+                            code,
+                        })
+                    }
+                };
+                // A launch's outcome is settled here rather than inside the boundary, because
+                // inside it nobody knew what it would be. The dispatch marker was committed before
+                // the request reached the reader, so a crash in between leaves the receipt
+                // `unknown`, which is exactly what a command that may be in the editor is.
+                self.settle(&caller.actor_id, mutation.action_id, outcome.as_ref());
+                outcome.map(Answered::Performed)
+            }
+            other => other,
+        };
+        match answered {
             Ok(Answered::Performed(value)) => ControlFrame::Response(Response {
                 request_id: mutation.request_id,
                 outcome: Outcome::Ok(value),
@@ -1764,7 +1827,53 @@ impl WorkerService {
                     ControlFrame::Response(response)
                 }
             }
+            // A launch that has already been awaited above cannot appear here.
+            Ok(Answered::Launch { .. }) => failure(
+                mutation.request_id,
+                &ProtocolError::new(
+                    ErrorCode::ResourceUnavailable,
+                    "the launch transaction was not resolved",
+                ),
+            ),
             Err(error) => failure(mutation.request_id, &error.to_protocol_error()),
+        }
+    }
+
+    /// Records the outcome of a mutation that was settled outside the session boundary.
+    fn settle(
+        &self,
+        actor_id: &ActorId,
+        action_id: kr_protocol::ids::ActionId,
+        outcome: std::result::Result<&ParamsValue, &WorkerError>,
+    ) {
+        let now = kr_ipc::now_ms();
+        let mut session = self.runtime.session();
+        let Some(journal) = session.journal_mut() else {
+            return;
+        };
+        let settled = match outcome {
+            Ok(value) => {
+                let bytes = kr_cbor::encode(value.as_value());
+                journal.settle(
+                    actor_id.clone(),
+                    action_id,
+                    kr_protocol::receipt::ReceiptState::Applied,
+                    Some(&bytes),
+                    None,
+                    now,
+                )
+            }
+            Err(error) => journal.settle(
+                actor_id.clone(),
+                action_id,
+                kr_protocol::receipt::ReceiptState::Unknown,
+                None,
+                Some(error.to_protocol_error()),
+                now,
+            ),
+        };
+        if let Err(failure) = settled {
+            session.note_journal_failure(&failure);
         }
     }
 
@@ -1774,7 +1883,7 @@ impl WorkerService {
     /// caller's own principal rather than the daemon's: a retry that reaches this worker by either
     /// route finds the same action. What the daemon vouches for is the part the worker cannot
     /// check — who the caller was, and the deadline the daemon accepted.
-    fn forwarded(
+    async fn forwarded(
         &self,
         state: &mut ConnectionState,
         forwarded: &kr_protocol::local::ForwardedMutation,
@@ -1844,6 +1953,7 @@ impl WorkerService {
             Freshness::Vouched(deadline),
             proxied,
         )
+        .await
     }
 
     /// Serves a read the control daemon admitted for somebody else.
@@ -2088,8 +2198,12 @@ impl WorkerService {
         }
 
         let outcome = self.apply(&mut session, state, mutation, method, caller);
+        // A launch that reached the reader has no outcome yet, so none is recorded: it is settled
+        // when the reader answers, outside this boundary.
+        let pending = matches!(outcome, Ok((_, AfterEffect::Launch { .. })));
         let now = kr_ipc::now_ms();
         match (&outcome, session.journal_mut()) {
+            _ if pending => {}
             (Ok((value, _)), Some(journal)) => {
                 // The result, the receipt revision and the event record are one commit. A crash
                 // between them would leave a receipt that claims an outcome beside a result no
@@ -2146,6 +2260,15 @@ impl WorkerService {
         match after {
             AfterEffect::None => {}
             AfterEffect::Close(gate) => state.close_gate = Some((mutation.action_id, gate)),
+            AfterEffect::Launch {
+                transaction,
+                receiver,
+            } => {
+                return Ok(Answered::Launch {
+                    transaction,
+                    receiver,
+                });
+            }
         }
         Ok(Answered::Performed(value))
     }
@@ -2560,6 +2683,25 @@ impl WorkerService {
                 Self::check_attachment(state, params.attachment_id)?;
                 Self::check_capability(session, params.attachment_id, AttachmentCapability::Input)
             }
+            Method::ShellLaunch => {
+                let params: kr_protocol::root::ShellLaunchParams = parse(&mutation.params)?;
+                Self::check_session(session, params.session_id)?;
+                // Section 23's row for this method: the terminal-input right, the *current* input
+                // lease, a qualified root editor, an empty prompt behind a fence, the recorded
+                // working-directory revision and the session's launch profile. The first three are
+                // here; the rest are the machine's, because they are facts about the reader.
+                let attachment_id = Self::launching_attachment(session, state)?;
+                Self::check_capability(session, attachment_id, AttachmentCapability::Input)?;
+                if !session.config().shell_mode.claims_managed_editor() {
+                    return Err(WorkerError::ShellIntegrationUnsupported {
+                        detail:
+                            "this session runs a stock shell, so a launch installs no command in \
+                             its editor"
+                                .to_owned(),
+                    });
+                }
+                Ok(())
+            }
             Method::AttachmentViewport => {
                 let params: AttachmentViewportParams = parse(&mutation.params)?;
                 Self::check_attachment(state, params.attachment_id)
@@ -2852,6 +2994,19 @@ impl WorkerService {
     ///
     /// An attachment identifier is not permission. A connection acts on the attachments it
     /// created, and nothing else.
+    /// Returns the attachment a launch is attributed to.
+    ///
+    /// The current lease holder, and it has to be one of this connection's own. A line the reader
+    /// accepts because of this launch belongs to the client that asked for it, so a caller that
+    /// does not hold the keys cannot put one there under somebody else's name.
+    fn launching_attachment(session: &Session, state: &ConnectionState) -> Result<AttachmentId> {
+        let holder = session.lease().holder.0.ok_or(WorkerError::LeaseLost)?;
+        if !state.holds_attachment(holder) {
+            return Err(WorkerError::LeaseLost);
+        }
+        Ok(holder)
+    }
+
     fn check_attachment(state: &ConnectionState, attachment_id: AttachmentId) -> Result<()> {
         if state.holds_attachment(attachment_id) {
             Ok(())
@@ -3260,6 +3415,50 @@ impl WorkerService {
                     AfterEffect::None,
                 ))
             }
+            Method::ShellLaunch => {
+                let params: kr_protocol::root::ShellLaunchParams = parse(params)?;
+                let attachment_id = Self::launching_attachment(session, state)?;
+                let transaction =
+                    kr_shell_integration::contract::requests::LaunchTransactionId::new(
+                        kr_ipc::new_uuid(),
+                    );
+                // Registered before the machine is asked, so an answer that arrives from the
+                // bridge's own task the instant the reservation is sent has somewhere to go.
+                let receiver = self.runtime.register_launch(transaction);
+                let driver = session.fence_mut().ok_or_else(|| {
+                    WorkerError::ShellIntegrationUnsupported {
+                        detail: "this session has no managed root editor to install into"
+                            .to_owned(),
+                    }
+                })?;
+                let effects = driver.launch_requested(params, attachment_id, transaction);
+                let outcome = session.apply_fence_effects(effects);
+                // A refusal the machine could take on its own arrives here: nothing was sent to the
+                // reader, so there is nothing to wait for.
+                if let Some((_, answer)) = outcome.launch_answers.into_iter().next() {
+                    self.runtime.forget_launch(transaction);
+                    return match answer {
+                        crate::fence::driver::LaunchAnswer::Installed(result) => {
+                            Ok((encode(&result)?, AfterEffect::None))
+                        }
+                        crate::fence::driver::LaunchAnswer::Refused { reason, code } => {
+                            Err(WorkerError::LaunchRefused {
+                                reason: reason.as_str(),
+                                code,
+                            })
+                        }
+                    };
+                }
+                // The request is with the reader. The caller's answer is the reader's word, and it
+                // is written when it arrives; this placeholder never reaches anybody.
+                Ok((
+                    ParamsValue::empty(),
+                    AfterEffect::Launch {
+                        transaction,
+                        receiver,
+                    },
+                ))
+            }
             Method::AttachmentViewport => {
                 let params: AttachmentViewportParams = parse(params)?;
                 let (presentation, top_row) =
@@ -3386,6 +3585,17 @@ enum Answered {
     Performed(ParamsValue),
     /// The journal already held this action's result.
     Retained(ParamsValue),
+    /// A launch the reader is deciding.
+    ///
+    /// Every method but this one is finished when the boundary ends. A launch's effect is the
+    /// reservation and the request in the reader's mailbox; its outcome is what the reader did,
+    /// and only the reader knows that.
+    Launch {
+        /// The transaction.
+        transaction: kr_shell_integration::contract::requests::LaunchTransactionId,
+        /// Where the reader's word arrives.
+        receiver: tokio::sync::oneshot::Receiver<crate::fence::driver::LaunchAnswer>,
+    },
 }
 /// by, the grant it was checked against and the authority revision it was checked at.
 #[derive(Clone, Debug)]
@@ -4053,6 +4263,18 @@ pub enum AfterEffect {
     None,
     /// A termination sequence to start once the acceptance has reached the requester.
     Close(crate::runtime::CloseGate),
+    /// A launch the reader is deciding, whose answer the caller is owed.
+    ///
+    /// The mutation's effect is the reservation and the request in the reader's mailbox; its
+    /// *outcome* is what the reader did, and only the reader knows that. So the boundary ends here
+    /// and the answer is awaited outside it, which is also what keeps a 250 ms transaction from
+    /// holding every other mutation on this worker behind it.
+    Launch {
+        /// The transaction.
+        transaction: kr_shell_integration::contract::requests::LaunchTransactionId,
+        /// Where the reader's word arrives.
+        receiver: tokio::sync::oneshot::Receiver<crate::fence::driver::LaunchAnswer>,
+    },
 }
 fn not_negotiated() -> ProtocolError {
     ProtocolError::new(

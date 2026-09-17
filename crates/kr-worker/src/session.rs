@@ -180,6 +180,14 @@ pub struct Session {
     desktop: crate::desktop::Watch,
     /// The canonical grid. Every byte the terminal produces passes through it.
     engine: crate::projection::TerminalEngine,
+    /// The root editor's fence and detach machine, for a managed session.
+    ///
+    /// `None` is a session that claims none of that contract: a `native_compat` shell, where input
+    /// forwards like any application's, Ctrl-D is the shell's own and nothing is ever installed in
+    /// an editor.
+    fence: Option<crate::fence::FenceDriver>,
+    /// What the registered root integration is, recorded whole for diagnostics.
+    root_integration: Option<kr_shell_integration::host::handshake::Registration>,
     /// What the renderings this session has produced could not carry.
     restoration_losses: crate::render::Carried,
     /// How much of the screen each attachment's caller may be shown.
@@ -391,6 +399,8 @@ impl Session {
             // from the first question rather than from a change it would never see.
             desktop: watch,
             engine,
+            fence: None,
+            root_integration: None,
             restoration_losses: crate::render::Carried::default(),
             forwarding_held: std::collections::BTreeMap::new(),
             projections: crate::snapshot::Bases::new(),
@@ -449,10 +459,132 @@ impl Session {
         }
     }
 
+    /// Installs the root-editor driver this session was created with.
+    ///
+    /// It goes in before the reader can report anything, so the first boundary the shell reaches
+    /// has somewhere to go. A `native_compat` session installs none, which is what makes its input
+    /// forward like any application's.
+    pub fn install_fence(&mut self, driver: crate::fence::FenceDriver) {
+        self.fence = Some(driver);
+    }
+
+    /// Returns the root-editor driver, for a managed session.
+    #[must_use]
+    pub const fn fence(&self) -> Option<&crate::fence::FenceDriver> {
+        self.fence.as_ref()
+    }
+
+    /// Returns the root-editor driver for a stimulus.
+    pub const fn fence_mut(&mut self) -> Option<&mut crate::fence::FenceDriver> {
+        self.fence.as_mut()
+    }
+
+    /// Records what registered as this session's root integration.
+    pub fn record_root_integration(
+        &mut self,
+        registration: kr_shell_integration::host::handshake::Registration,
+    ) {
+        self.root_integration = Some(registration);
+    }
+
+    /// Returns the registered root integration, for diagnostics and session status.
+    #[must_use]
+    pub const fn root_integration(
+        &self,
+    ) -> Option<&kr_shell_integration::host::handshake::Registration> {
+        self.root_integration.as_ref()
+    }
+
+    /// Carries out what one fence stimulus left for the session to do.
+    ///
+    /// The order is the machine's: released input reaches the writer before the event that explains
+    /// why it waited, and an attachment is removed after the fence that named it has gone.
+    pub fn apply_fence_effects(&mut self, effects: crate::fence::Effects) -> FenceOutcome {
+        for batch in effects.write {
+            self.queue_input(batch);
+        }
+        if effects.discarded_bytes > 0 && effects.lease_acknowledged.is_none() {
+            // Input this session accepted and never delivered, with no answer to report it in. It
+            // is carried until an acquire has somewhere to put it. A lease change *does* have an
+            // answer, and its own acknowledgement carries the total, so it is not counted twice.
+            self.interrupted.bytes = self
+                .interrupted
+                .bytes
+                .saturating_add(effects.discarded_bytes);
+        }
+        for event in &effects.editor_busy {
+            self.hub.publish_event(
+                event.attachment_id,
+                crate::output::OutputDelivery::EditorBusy(Box::new(event.clone())),
+            );
+        }
+        for attachment_id in effects.remove_attachments {
+            // A detach the reader asked for removes exactly the attachment the fence named.
+            let _ = self.detach(attachment_id);
+        }
+        if effects.interrupt.is_some() {
+            let _ = self.interrupt_foreground();
+        }
+        self.pump_replies();
+        FenceOutcome {
+            launch_answers: effects.launch_answers,
+            receipts: effects.receipts,
+            acceptance: effects.acceptance,
+            lease_acknowledged: effects.lease_acknowledged,
+            close_session: effects.close_session,
+        }
+    }
+
+    /// Sends the terminal's configured interrupt to the foreground process group.
+    fn interrupt_foreground(&mut self) -> Result<()> {
+        if self.pty.interrupt_foreground().is_ok() {
+            return Ok(());
+        }
+        let shell = self.shell.as_mut().ok_or(WorkerError::SessionClosed)?;
+        shell.interrupt()
+    }
+
+    /// Tells the root editor's machine that the lease has moved.
+    ///
+    /// The change has already happened; what this decides is what becomes of the input the previous
+    /// holder had sent and whether a fence exchange starts. A session with no managed editor has
+    /// nothing to tell.
+    fn note_lease_change(&mut self, discarded_bytes: u64) -> u64 {
+        let lease = self.lease_view();
+        let Some(driver) = self.fence.as_mut() else {
+            return discarded_bytes;
+        };
+        let effects = driver.lease_changed(
+            lease,
+            discarded_bytes,
+            kr_protocol::root::FenceId::new(kr_ipc::new_uuid()),
+        );
+        let outcome = self.apply_fence_effects(effects);
+        outcome
+            .lease_acknowledged
+            .map_or(discarded_bytes, |acknowledgement| {
+                acknowledgement.discarded_bytes.get()
+            })
+    }
+
+    /// Returns the lease as the root-editor machine reads it.
+    fn lease_view(&self) -> kr_shell_integration::contract::fence::LeaseView {
+        kr_shell_integration::contract::fence::LeaseView {
+            epoch: kr_protocol::ids::InputLeaseEpoch::new(self.lease.epoch()),
+            holder: self.lease.holder(),
+        }
+    }
+
     /// Returns the session's identity.
     #[must_use]
     pub const fn id(&self) -> SessionId {
         self.config.session_id
+    }
+
+    /// Returns what this session was created as.
+    #[must_use]
+    pub const fn config(&self) -> &SessionConfig {
+        &self.config
     }
 
     /// Returns the lifecycle state.
@@ -1074,6 +1206,16 @@ impl Session {
         } else {
             self.note_lease_holder();
         }
+        // The machine discards whatever it was holding for this attachment, invalidates a fence
+        // that named it, and ends the reader's wait for a key that can never arrive.
+        if let Some(driver) = self.fence.as_mut() {
+            let effects = driver.attachment_removed(attachment_id);
+            let _ = self.apply_fence_effects(effects);
+        }
+        if held {
+            let carried = self.note_lease_change(0);
+            self.interrupted.bytes = self.interrupted.bytes.saturating_add(carried);
+        }
         self.pump_replies();
         self.hub.detached(attachment_id);
         self.projections.forget(attachment_id);
@@ -1307,6 +1449,10 @@ impl Session {
         let carried = std::mem::take(&mut self.interrupted);
         discarded = discarded.saturating_add(carried.bytes);
         closed_open_paste |= carried.closed_open_paste;
+        // The root editor's machine is told the lease has moved. It adds whatever it was holding
+        // for the previous epoch to the count, cancels an incomplete reader operation and starts
+        // the fence exchange; the takeover itself stands whatever the reader says about it.
+        discarded = self.note_lease_change(discarded);
         // Nothing is queued for the terminator here. The writer closes a paste the application is
         // actually inside, before anything from the new lease reaches it; queueing a correction
         // under the old lease is what let one be discarded with it.
@@ -1352,6 +1498,10 @@ impl Session {
             .saturating_add(framing.discarded_prefix.len() as u64);
         self.interrupted.closed_open_paste |=
             framing.terminator.is_some() || Self::delivered_paste_was_ours(&ended, ending_epoch);
+        // Nobody is being told about this one, so what the machine was holding is carried with the
+        // rest until an acquire has an answer to report it in.
+        let held = self.note_lease_change(0);
+        self.interrupted.bytes = self.interrupted.bytes.saturating_add(held);
         self.pump_replies();
         Ok(self.lease.to_wire())
     }
@@ -1427,12 +1577,30 @@ impl Session {
             let paste = PasteTransition {
                 delimiters: outcome.delimiters.clone(),
             };
-            self.queue_input(InputBatch::Lease {
+            let batch = InputBatch::Lease {
                 epoch,
                 bytes: outcome.forward.clone(),
                 paste,
                 authority_deadline_boot_ms: admitted,
-            });
+            };
+            // A managed session asks the root editor's machine what becomes of this batch. It is
+            // written now, held for at most 250 ms while a reader transition resolves, or dropped
+            // because its lease has moved; none of those three is decided here.
+            match self.fence.as_mut() {
+                Some(driver) => {
+                    let effects = driver.input_arrived(
+                        attachment_id,
+                        kr_protocol::ids::InputLeaseEpoch::new(epoch),
+                        batch,
+                    );
+                    if let Some(refusal) = effects.input_refused {
+                        let _ = refusal;
+                        return Err(WorkerError::SessionClosed);
+                    }
+                    let _ = self.apply_fence_effects(effects);
+                }
+                None => self.queue_input(batch),
+            }
         }
         // What is still held is a suffix of the prefix that was held and the bytes this write
         // added. Longer than this write means it still carries bytes an earlier one handed over,
@@ -1541,16 +1709,41 @@ impl Session {
     ///
     /// Returns [`WorkerError::LeaseLost`] when the caller does not hold the lease.
     pub fn interrupt(&mut self, attachment_id: AttachmentId, epoch: u64) -> Result<()> {
+        // In a managed session the machine decides it: the current epoch and holder, the configured
+        // native action and nothing else, and it bypasses the reader-transition hold because a held
+        // interrupt would be no interrupt at all.
+        if let Some(driver) = self.fence.as_mut() {
+            let effects = driver.interrupt_requested(
+                attachment_id,
+                kr_protocol::ids::InputLeaseEpoch::new(epoch),
+                kr_protocol::input::InterruptAction::NativeInterrupt,
+            );
+            let refused = effects.interrupt_refused;
+            let interrupt = effects.interrupt;
+            let _ = self.apply_fence_effects(effects);
+            if let Some(fault) = refused {
+                return Err(match fault {
+                    kr_shell_integration::contract::fence::LeaseFault::SessionClosing => {
+                        WorkerError::SessionClosed
+                    }
+                    kr_shell_integration::contract::fence::LeaseFault::LeaseLost
+                    | kr_shell_integration::contract::fence::LeaseFault::NotHolder => {
+                        WorkerError::LeaseLost
+                    }
+                });
+            }
+            return if interrupt.is_some() {
+                Ok(())
+            } else {
+                Err(WorkerError::LeaseLost)
+            };
+        }
         if self.lease.holder() != Some(attachment_id) || self.lease.epoch() != epoch {
             return Err(WorkerError::LeaseLost);
         }
         // The terminal's own foreground group first, because that is what the interrupt key
         // reaches. The root shell's group is the fallback for a terminal that will not say.
-        if self.pty.interrupt_foreground().is_ok() {
-            return Ok(());
-        }
-        let shell = self.shell.as_mut().ok_or(WorkerError::SessionClosed)?;
-        shell.interrupt()
+        self.interrupt_foreground()
     }
 
     /// Takes the batches waiting to be written to the pseudo-terminal.
@@ -1790,6 +1983,8 @@ impl Session {
             .saturating_add(framing.discarded_prefix.len() as u64);
         self.interrupted.closed_open_paste |=
             framing.terminator.is_some() || Self::delivered_paste_was_ours(&ended, ending_epoch);
+        let carried = self.note_lease_change(0);
+        self.interrupted.bytes = self.interrupted.bytes.saturating_add(carried);
         self.pump_replies();
         true
     }
@@ -2514,6 +2709,13 @@ impl Session {
                 }
                 self.close_framing_for_takeover();
                 let _ = self.end_lease().left;
+                // The root editor's machine hears it too: a fence is invalidated, a launch the
+                // reader is still deciding is revoked and its caller answered, and whatever is held
+                // is discarded rather than typed into a shell that is being stopped.
+                if let Some(driver) = self.fence.as_mut() {
+                    let effects = driver.session_closing();
+                    let _ = self.apply_fence_effects(effects);
+                }
                 CloseAcceptance {
                     state: SessionState::Closing,
                     durability: self.durability(),
@@ -2763,6 +2965,28 @@ const fn tightest(left: Option<u64>, right: Option<u64>) -> Option<u64> {
         (Some(only), None) | (None, Some(only)) => Some(only),
         (None, None) => None,
     }
+}
+
+/// What the session could not carry out itself, handed back to the caller.
+///
+/// Three of them belong to somebody else: a launch answer belongs to the client that asked, a
+/// takeover receipt belongs to the lease that ended, and a loss that closes the creating session is
+/// the runtime's to act on rather than the session's own.
+#[derive(Debug, Default)]
+pub struct FenceOutcome {
+    /// The launch answers that became final, with the caller each belongs to.
+    pub launch_answers: Vec<(
+        kr_shell_integration::contract::requests::LaunchTransactionId,
+        crate::fence::driver::LaunchAnswer,
+    )>,
+    /// The takeover receipts this stimulus completed.
+    pub receipts: Vec<crate::fence::TakeoverReceipt>,
+    /// The origin recorded for an accepted line.
+    pub acceptance: Option<kr_protocol::root::AcceptedOrigin>,
+    /// What the machine acknowledged a lease change with, when the stimulus was one.
+    pub lease_acknowledged: Option<kr_shell_integration::contract::fence::LeaseAcknowledgement>,
+    /// The loss that closes the creating session, when one does.
+    pub close_session: Option<kr_shell_integration::contract::qualification::IntegrationLoss>,
 }
 
 /// One ordered batch of input on its way to the pseudo-terminal.

@@ -3481,6 +3481,7 @@ dependencies = [
  "kr-crypto",
  "kr-ipc",
  "kr-protocol",
+ "kr-shell-integration",
  "kr-term",
  "kr-transport",
  "libc",
