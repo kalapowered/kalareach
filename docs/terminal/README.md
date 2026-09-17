@@ -1071,14 +1071,14 @@ this engine and nothing else; what the two hosts were doing otherwise is not som
 runner tells anybody.
 
 Each row is one host's sampled runs and not a fixed property of that processor. The platform names a
-class of processor rather than a machine, and one named class has answered a third apart on the
+class of processor rather than a machine, and one named class has answered a quarter apart on the
 plain stream across the runs behind this revision, so the rows above are not a ranking of
 processors. The runs named are `core-ci` runs of this revision's terminal engine, each one retaining
 the figures, the processor and the verdict it measured, so a row can be read back to the run it came
-from. The Xeon row, and the wider end of the EPYC 9V74 row, were taken a few commits before the
+from. Two of the EPYC 9V74 runs of the same stream are 26% apart on the plain one and 26% apart on
+the one that scrolls. The Xeon row, and the wider end of the EPYC 9V74 row, were taken a few commits before the
 last change to the output path, which only takes work off it; the rest are of the engine as it
-stands. The 9V74 row shows what a class of processor does not fix: its two runs of the same stream
-are a third apart.
+stands.
 
 Section 27 asks a reference host for at least four CPU cores and 8 GiB, so four processors is the
 floor a host has to meet the target on, and every four-processor host above meets it on both
