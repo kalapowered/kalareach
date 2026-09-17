@@ -61,26 +61,42 @@ impl Host {
     async fn start(&self) -> RunningDaemon {
         let environment = self.paths();
         let environment_id = self.environment_id;
-        let secrets = environment.secrets_dir();
-        let controller = Controller::start(ControllerSetup {
-            paths: environment.clone(),
-            environment_id,
-            identity: Box::new(move || {
-                let store =
-                    open_store(CONTROLLER_SECRET_SERVICE, &secrets).expect("a secret store");
-                Ok(
-                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                        .expect("an identity"),
-                )
-            }),
-            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-            supervisor: Box::new(DetachedSupervisor::new()),
-            worker_program: self.worker.clone(),
-            build_id: build(),
-            release: "0".to_owned(),
-        })
-        .await
-        .expect("the daemon starts");
+        let started = std::time::Instant::now();
+        let controller = loop {
+            let secrets = environment.secrets_dir();
+            let outcome = Controller::start(ControllerSetup {
+                paths: environment.clone(),
+                environment_id,
+                identity: Box::new(move || {
+                    let store =
+                        open_store(CONTROLLER_SECRET_SERVICE, &secrets).expect("a secret store");
+                    Ok(
+                        ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                            .expect("an identity"),
+                    )
+                }),
+                boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+                supervisor: Box::new(DetachedSupervisor::new()),
+                worker_program: self.worker.clone(),
+                build_id: build(),
+                release: "0".to_owned(),
+            })
+            .await;
+            match outcome {
+                Ok(controller) => break controller,
+                // The daemon this one replaces has not let go of the environment yet. Waiting for
+                // it is a liveness condition: what a restart test asserts is that the replacement
+                // takes the environment over, not how soon the runtime drops the last reference to
+                // the one before it. Anything else fails at once.
+                Err(kr_controller::ControllerError::AlreadyRunning { .. })
+                    if started.elapsed() < ENVIRONMENT_HANDOVER_DEADLINE => {}
+                Err(error) => panic!(
+                    "the daemon did not start in {:.1?}: {error}",
+                    started.elapsed()
+                ),
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
         let rendezvous = Listener::bind(&environment.rendezvous_endpoint().expect("an endpoint"))
             .expect("binds the rendezvous");
         let clients = Listener::bind(&environment.controller_endpoint().expect("an endpoint"))
@@ -108,6 +124,13 @@ impl Host {
     }
 }
 
+/// How long a replacement daemon is given to take the environment over.
+///
+/// The environment's singleton lock is released when the last reference to the controller goes,
+/// which is after the serving tasks have been dropped, so a replacement starting at once can find
+/// the environment still held. A bound this generous fails only when the handover never happens.
+const ENVIRONMENT_HANDOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// A control daemon that is running, and the tasks that are serving for it.
 ///
 /// Stopping one in a test is the same thing as the process exiting: the tasks end, the last
@@ -128,9 +151,9 @@ impl RunningDaemon {
             let _ = task.await;
         }
         drop(self.controller);
-        // The lock is released when the last reference goes. Giving the runtime a moment to drop
-        // the aborted tasks' own references is what makes the next start deterministic.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // The lock is released when the last reference goes, and references the runtime still has
+        // to drop, or a task this test never awaited, can keep it a moment longer. The next start
+        // waits for it rather than assuming a fixed delay is enough.
     }
 }
 

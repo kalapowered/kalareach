@@ -84,11 +84,11 @@ async fn host() -> Host {
 /// How long a replacement daemon is given to take the environment over.
 ///
 /// A daemon in this suite ends in the process that started it, and the environment's lock is
-/// released when the last reference to the controller goes. The tasks that served it hold one
-/// each, and the runtime drops those some time after an aborted task has been awaited, so a
-/// replacement starting at once can still find the environment held. That is a liveness condition:
-/// what these tests assert is that the replacement takes the environment over, not how soon the
-/// runtime gets round to the drop.
+/// released when the last reference to the controller goes. Awaiting the two listener tasks does
+/// not account for every reference: a connection task the daemon spawned of its own, or a sweep
+/// still running, holds one too. So a replacement starting at once can find the environment held.
+/// That is a liveness condition: what these tests assert is that the replacement takes the
+/// environment over, not how soon the last reference goes.
 const ENVIRONMENT_HANDOVER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// Starts a daemon on an environment that may already hold a transfer journal.
@@ -1456,18 +1456,24 @@ const DAEMON_START_DEADLINE: std::time::Duration = std::time::Duration::from_sec
 async fn wait_for_daemon(endpoint: &kr_ipc::paths::Endpoint) {
     let started = std::time::Instant::now();
     loop {
-        if LocalClient::connect(endpoint, LocalClientKind::Cli, build())
-            .await
-            .is_ok()
+        let remaining = DAEMON_START_DEADLINE.saturating_sub(started.elapsed());
+        assert!(
+            !remaining.is_zero(),
+            "the daemon did not answer on {} in {:.1?}",
+            endpoint.as_text(),
+            started.elapsed()
+        );
+        // Bounded by what is left of the deadline. The handshake has no timeout of its own, so a
+        // daemon that binds its endpoint and then stops answering would hold this wait open for
+        // ever rather than reaching the check above.
+        if let Ok(Ok(_answered)) = tokio::time::timeout(
+            remaining,
+            LocalClient::connect(endpoint, LocalClientKind::Cli, build()),
+        )
+        .await
         {
             return;
         }
-        let waited = started.elapsed();
-        assert!(
-            waited < DAEMON_START_DEADLINE,
-            "the daemon did not answer on {} in {waited:.1?}",
-            endpoint.as_text()
-        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
