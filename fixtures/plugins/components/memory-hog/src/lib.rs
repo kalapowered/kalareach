@@ -35,8 +35,11 @@ use kalareach::plugin::types::ActionToken;
 fn consume() -> ! {
     let mut held: Vec<Vec<u8>> = Vec::new();
     loop {
+        // Sixteen mebibytes at a time, so the bound is reached in four steps rather than sixteen.
+        // What is under test is the bound, not how many loop iterations a busy machine can run
+        // inside a hundred-millisecond deadline.
         let mut block = Vec::new();
-        block.resize(4 * 1024 * 1024, 0_u8);
+        block.resize(16 * 1024 * 1024, 0_u8);
         for index in (0..block.len()).step_by(4096) {
             block[index] = 1;
         }

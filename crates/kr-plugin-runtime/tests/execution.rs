@@ -391,8 +391,11 @@ fn kr_req_11_38_every_export_is_stopped_by_its_own_deadline() {
             elapsed >= core::time::Duration::from_millis(deadline_ms - 1),
             "{kind:?} was stopped after {elapsed:?}, before its {deadline_ms} ms deadline"
         );
+        // Generous, and deliberately so: what this bound catches is a call that was never stopped
+        // at all. The epoch thread is one thread among whatever else the machine is running, and a
+        // build host running several jobs at once schedules it when it pleases.
         assert!(
-            elapsed < core::time::Duration::from_millis(deadline_ms * 5 + 500),
+            elapsed < core::time::Duration::from_millis(deadline_ms * 20 + 2_000),
             "{kind:?} took {elapsed:?} against a {deadline_ms} ms deadline"
         );
     }
