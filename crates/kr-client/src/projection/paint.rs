@@ -1039,10 +1039,11 @@ fn clusters(text: &str) -> Vec<Cluster<'_>> {
     let mut out: Vec<Cluster<'_>> = Vec::new();
     let mut start = 0_usize;
     let mut index = 0_usize;
-    // Whether the bytes collected so far already hold a scalar with a width of its own. Until they
-    // do, everything collected is zero-width and belongs to the cell that follows it: a run opening
-    // with a combining mark has nothing behind it to join, so the mark travels with the first cell
-    // rather than becoming a cluster of no cells that the clipping would drop without saying so.
+    // Whether the bytes collected so far already hold a scalar with a width of its own. Zero-width
+    // scalars before the first one are marks with no base in this run: they belong to a cell this
+    // run does not carry, and writing them at this run's first column would attach them to whatever
+    // is in the cell before it, which belongs to another run. They become a cluster of no cells,
+    // which the caller counts and does not draw.
     let mut has_cell = false;
     for scalar in text.chars() {
         let width = scalar.len_utf8();
@@ -1050,11 +1051,15 @@ fn clusters(text: &str) -> Vec<Cluster<'_>> {
             index += width;
             continue;
         }
-        if has_cell {
+        if index > start {
             let piece = &text[start..index];
             out.push(Cluster {
                 text: piece,
-                cells: unicode::cells_for(piece) as u64,
+                cells: if has_cell {
+                    unicode::cells_for(piece) as u64
+                } else {
+                    0
+                },
             });
             start = index;
         }
@@ -1120,6 +1125,20 @@ mod tests {
         assert_eq!(pieces[0].text, "a\u{301}");
         assert_eq!(pieces[0].cells, 1);
         assert_eq!(pieces[1].text, "b");
+    }
+
+    /// KR-REQ-08.40: a mark with no base in this run is its own piece, of no cells.
+    #[test]
+    fn a_mark_with_no_base_of_its_own_is_a_cluster_of_no_cells() {
+        let pieces = clusters("\u{301}ab");
+        assert_eq!(pieces.len(), 3, "the mark is its own piece: {pieces:?}");
+        assert_eq!(pieces[0].text, "\u{301}");
+        assert_eq!(
+            pieces[0].cells, 0,
+            "a mark belongs to a cell this run does not carry, so it occupies none of them"
+        );
+        assert_eq!(pieces[1].text, "a");
+        assert_eq!(pieces[2].text, "b");
     }
 
     #[test]
@@ -1892,6 +1911,39 @@ mod fixtures {
         assert_eq!(
             both.rows_unreachable, 26,
             "two frames of the same window are not twice as many rows"
+        );
+    }
+
+    /// KR-REQ-08.40 and KR-ACC-023: a mark with no base is counted rather than drawn into a cell
+    /// that belongs to another run.
+    #[test]
+    fn a_mark_with_no_base_never_reaches_the_destination() {
+        let case = serde_json::json!({
+            "window": {"top_row": 0, "left_column": 0, "rows": 1, "columns": 8},
+            "rows": [{"row": 0, "soft_wrapped": false, "runs": [
+                {"column": 0, "cells": 2, "text": "xy"},
+                {"column": 4, "cells": 2, "text": "\u{301}ab"}
+            ]}],
+            "cursor": {"column": 0, "row": 0, "visible": true, "style": 1, "pending_wrap": false}
+        });
+        let (screen, window) = screen_of(&case);
+        let painted = install(&screen, window, Keyboard::Withhold);
+        assert_eq!(
+            painted.comparison.clusters_replaced, 1,
+            "the mark is reported as a cluster this frame could not carry"
+        );
+        assert!(
+            !String::from_utf8_lossy(&painted.bytes).contains('\u{301}'),
+            "and it never reached the destination, where it would have landed on the cell before \
+             this run: {}",
+            String::from_utf8_lossy(&painted.bytes).escape_debug()
+        );
+        let mut destination = Destination::new(1, 8);
+        destination.feed(&painted.bytes);
+        assert_eq!(
+            destination.cells[0],
+            ["x", "y", " ", " ", "a", "b", " ", " "],
+            "the cells either side of it are the canonical ones"
         );
     }
 
