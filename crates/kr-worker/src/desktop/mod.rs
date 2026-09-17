@@ -33,8 +33,10 @@
 //!
 //! * **A headless session is never lost.** Outliving a logout is what that profile is for, so a
 //!   `headless_user` worker holds a watch that answers no.
-//! * **A desktop that was never recorded cannot be lost.** A create request with no desktop in it
-//!   binds to nothing, and nothing is what the watch reports.
+//! * **A desktop-bound session always watches a desktop.** Where the create request recorded one,
+//!   that is the one. Where it recorded none, the watch takes the login session the worker was
+//!   started in, because a desktop-bound session is in one whether the record named it or not,
+//!   and a session watching nothing could never report losing anything.
 //! * **A lost desktop is never regained.** The answer is sticky. A new login is a different
 //!   desktop, and section 3 is explicit that a session is never rebound to one: the person creates
 //!   a new session instead.
@@ -661,19 +663,29 @@ mod tests {
     }
 
     #[test]
-    fn a_container_context_reaches_no_desktop() {
-        let inside = Login {
-            ..login("100019", Some(1))
-        };
-        let context = from_login(&inside, WorkerProfile::DesktopBound, boot(&[1]));
-        // This test runs on the host, so the context it builds is a desktop. What it establishes
-        // is the rule the container case relies on: the container answer decides, and the
-        // capability records below quote it.
-        assert_eq!(context.container, ContainerEnvironment::Host);
+    fn a_context_reaches_a_desktop_only_where_it_is_the_machine_itself() {
+        // Whatever this host is, the rule is the same and the context agrees with it: a container
+        // and a distribution reach no desktop of the machine hosting them, and a host reaches its
+        // own. The test states the rule rather than assuming which of the three it is running in.
         assert!(ContainerEnvironment::Host.reaches_parent_desktop());
         assert!(!ContainerEnvironment::Container.reaches_parent_desktop());
         assert!(!ContainerEnvironment::Wsl.reaches_parent_desktop());
-        assert!(context.is_desktop());
+
+        let context = from_login(
+            &login("100019", Some(1)),
+            WorkerProfile::DesktopBound,
+            boot(&[1]),
+        );
+        assert_eq!(
+            context.container,
+            container_environment(),
+            "the context reports what this host is"
+        );
+        assert_eq!(
+            context.is_desktop(),
+            context.container.reaches_parent_desktop(),
+            "and a reading of a login session is a desktop only where this context reaches one"
+        );
     }
 
     #[test]

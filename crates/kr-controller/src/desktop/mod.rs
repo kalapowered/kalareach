@@ -106,23 +106,26 @@ pub fn headless_persistence() -> ProfilePersistence {
 mod platform {
     use kr_protocol::desktop::LogoutPersistence;
 
-    /// macOS keeps a user's background domain for as long as that user has a session.
+    /// macOS puts a headless worker in the user's background domain, and does not say how long
+    /// that domain lasts.
     ///
-    /// A job in the graphical domain goes with the graphical login. A job in the background domain
-    /// outlives that login and goes with the user's last session, whatever kind it was. Outliving
-    /// that needs a service loaded into the system's own domain, which is a different execution
-    /// context and an installation step this host does not take.
+    /// A job in the graphical domain goes with the graphical login: that much this host arranges
+    /// and observes. The background domain outlives that login, and how long it lasts after the
+    /// user's last session is the platform's own business: a user domain can be loaded without a
+    /// logged-in user at all, and nothing this host can read says which applies here.
     ///
-    /// What this host reports is what it configured. It does not read whether something else has
-    /// arranged for this user's domain to stay loaded, so the answer names the mechanism it is
-    /// about and says what it covers.
+    /// So the answer names the mechanism and says the lifetime is not established. A definite
+    /// answer this host has not established would be worse than none, because somebody would plan
+    /// around it.
     pub(super) fn headless_persistence() -> (LogoutPersistence, &'static str, String) {
         (
-            LogoutPersistence::EndsAtLogout,
+            LogoutPersistence::NotEstablished,
             "launchd, a per-user job in the background domain",
             "A headless session's job is loaded into this user's background domain, which outlives \
-             the graphical login and goes with the user's last session. A session that must outlive \
-             that needs a service in the system's own domain, which is a separate execution \
+             the graphical login. How long that domain lasts after the user's last session is the \
+             platform's own behaviour and this host does not read it, so what a logout does to a \
+             headless session here is not established. Work that must outlive a logout with \
+             certainty needs a service in the system's own domain, which is a separate execution \
              context and an installation step this host does not take."
                 .to_owned(),
         )

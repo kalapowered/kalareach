@@ -494,7 +494,17 @@ impl Session {
     /// gone the answer stays: a new login is a different desktop and nothing is ever rebound to
     /// it.
     pub fn desktop_lost(&mut self) -> bool {
-        self.desktop.lost(std::time::Instant::now())
+        let lost = self.desktop.lost(std::time::Instant::now());
+        // A watch that had nothing to bind to when the shell started adopts the desktop as soon as
+        // the platform answers. What it adopted is what this session reports from then on, so the
+        // record, the closure and a status read never name a different desktop from the one being
+        // watched.
+        if !self.config.desktop.desktop_session_id.is_present()
+            && let Some(bound) = self.desktop.bound_binding()
+        {
+            self.config.desktop = bound;
+        }
+        lost
     }
 
     /// Returns what the session owns, once its shell has started.

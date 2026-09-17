@@ -41,16 +41,25 @@ pub const DESKTOP_VARIABLES: &[&str] = kr_worker::environment::DESKTOP_VARIABLES
 
 /// Returns the desktop environment a worker of this profile is started with.
 ///
+/// The selected session is the one this host read its desktop identity from, and it is passed in
+/// rather than looked up again: a host where the same user is logged in twice has two graphical
+/// sessions, and collecting the environment of the other one would start the worker on a desktop
+/// this host did not select and does not describe.
+///
 /// A headless worker is started with none of it. That is not an omission: the profile exists to
 /// outlive the graphical login, and a session carrying a display, a message bus and a runtime
 /// directory belonging to a login it is not in would fail at the first tool that used one.
 #[must_use]
-pub fn environment(profile: WorkerProfile) -> Vec<(String, String)> {
+pub fn environment(profile: WorkerProfile, selected: Option<&str>) -> Vec<(String, String)> {
     if profile != WorkerProfile::DesktopBound {
         return Vec::new();
     }
+    let Some(selected) = selected else {
+        // No session was selected, so there is none to collect the environment of.
+        return Vec::new();
+    };
     let mut variables = BTreeMap::new();
-    for (name, value) in platform::desktop_environment() {
+    for (name, value) in platform::desktop_environment(selected) {
         if DESKTOP_VARIABLES.contains(&name.as_str()) && !value.is_empty() {
             variables.insert(name, value);
         }
@@ -92,12 +101,9 @@ mod platform {
     /// one environment for the user rather than one per session, so what it offers is accepted
     /// only when it names the selected session or names none at all: on a host where the same user
     /// is logged in twice, the manager can be describing the other login.
-    pub(super) fn desktop_environment() -> Vec<(String, String)> {
-        let Some(session) = display_session() else {
-            return Vec::new();
-        };
+    pub(super) fn desktop_environment(session: &str) -> Vec<(String, String)> {
         let mut collected = Vec::new();
-        if let Some(leader) = session_leader(&session)
+        if let Some(leader) = session_leader(session)
             && let Ok(block) = std::fs::read_to_string(format!("/proc/{leader}/environ"))
         {
             collected.extend(super::environ_pairs(&block));
@@ -106,18 +112,18 @@ mod platform {
             .iter()
             .any(|(name, _)| name == "DISPLAY" || name == "WAYLAND_DISPLAY")
         {
-            return with_session(collected, &session);
+            return with_session(collected, session);
         }
         if let Some(printed) = output("systemctl", &["--user", "show-environment"]) {
             let offered = super::key_values(&printed);
             let names_another = offered.iter().any(|(name, value)| {
-                name == "XDG_SESSION_ID" && !value.is_empty() && value != &session
+                name == "XDG_SESSION_ID" && !value.is_empty() && value != session
             });
             if !names_another {
                 collected.extend(offered);
             }
         }
-        with_session(collected, &session)
+        with_session(collected, session)
     }
 
     /// Returns the collected environment with the selected session named in it.
@@ -141,20 +147,6 @@ mod platform {
                 .iter()
                 .any(|(key, value)| key == "Linger" && value == "yes")
         })
-    }
-
-    /// Returns this user's graphical session, as the login manager names it.
-    fn display_session() -> Option<String> {
-        let uid = kr_ipc::paths::current_uid();
-        let printed = output(
-            "loginctl",
-            &["show-user", &uid.to_string(), "--property=Display"],
-        )?;
-        super::key_values(&printed)
-            .into_iter()
-            .find(|(key, _)| key == "Display")
-            .map(|(_, value)| value)
-            .filter(|value| !value.is_empty())
     }
 
     /// Returns the leader of one session.
@@ -184,7 +176,7 @@ mod platform {
 mod platform {
     /// macOS and Windows place a per-user job in the login session that started it, so there is
     /// nothing to carry across.
-    pub(super) const fn desktop_environment() -> Vec<(String, String)> {
+    pub(super) const fn desktop_environment(_session: &str) -> Vec<(String, String)> {
         Vec::new()
     }
 
@@ -202,14 +194,22 @@ mod tests {
     #[test]
     fn a_headless_worker_inherits_no_desktop_variable() {
         assert!(
-            environment(WorkerProfile::HeadlessUser).is_empty(),
+            environment(WorkerProfile::HeadlessUser, Some("1")).is_empty(),
             "outliving the graphical login is what the profile is for"
         );
     }
 
     #[test]
+    fn a_worker_with_no_selected_session_inherits_nothing_either() {
+        assert!(
+            environment(WorkerProfile::DesktopBound, None).is_empty(),
+            "there is no session to collect the environment of"
+        );
+    }
+
+    #[test]
     fn only_the_desktop_variables_are_carried() {
-        for (name, _) in environment(WorkerProfile::DesktopBound) {
+        for (name, _) in environment(WorkerProfile::DesktopBound, Some("1")) {
             assert!(
                 DESKTOP_VARIABLES.contains(&name.as_str()),
                 "{name} is not one of the login session's handles"

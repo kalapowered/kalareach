@@ -60,6 +60,16 @@ pub const RELEASE_PATIENCE: std::time::Duration = std::time::Duration::from_secs
 /// How often the releasing facility is asked whether it has exited.
 const RELEASE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
+/// How long a platform query is given to answer.
+///
+/// Every query this module makes is a subprocess, and a subprocess that never returns would be a
+/// host that never released its assertion. Nothing here waits longer than this, and a query that
+/// reaches it is ended and reads as no answer.
+pub const QUERY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often a bounded query is asked whether it has finished.
+const QUERY_POLL: std::time::Duration = std::time::Duration::from_millis(20);
+
 /// How long a facility is given to hold its assertion before it is believed.
 ///
 /// A process that exits immediately did not take an assertion, whatever it was asked for. This is
@@ -306,13 +316,40 @@ impl Inhibitor {
                 std::thread::sleep(ACQUIRE_SETTLE);
                 match facility.try_wait() {
                     Ok(None) => {
-                        self.held = Some(Held {
-                            facility,
-                            reason,
-                            since_ms: kr_ipc::now_ms(),
-                            holder,
-                        });
-                        self.withheld = None;
+                        // A running facility is not an assertion. Where the platform lists what it
+                        // is holding, that listing is what settles it, and a facility the platform
+                        // does not name holds nothing whatever it is doing.
+                        match platform::acknowledged(facility.id()) {
+                            Some(false) => {
+                                let _ = facility.kill();
+                                let _ = facility.wait();
+                                self.withheld = Some(
+                                    "this host asked for a sleep assertion and the operating \
+                                     system does not list one, so its sleep policy is unchanged"
+                                        .to_owned(),
+                                );
+                            }
+                            acknowledged => {
+                                self.held = Some(Held {
+                                    facility,
+                                    reason,
+                                    since_ms: kr_ipc::now_ms(),
+                                    holder: match acknowledged {
+                                        Some(true) => format!(
+                                            "{holder}, which the operating system's own listing \
+                                             names"
+                                        ),
+                                        // A platform that publishes no listing an ordinary user
+                                        // can read leaves the facility's own life as the evidence,
+                                        // and the record says which it is.
+                                        _ => format!(
+                                            "{holder}, which this platform publishes no listing of"
+                                        ),
+                                    },
+                                });
+                                self.withheld = None;
+                            }
+                        }
                     }
                     Ok(Some(status)) => {
                         self.withheld = Some(format!(
@@ -431,23 +468,21 @@ mod platform {
         Some((facility, holder))
     }
 
+    /// Asks the platform whether it has the assertion this host asked for.
+    ///
+    /// The operating system's own listing is the only thing that settles it, and it names the
+    /// process the assertion is held on behalf of, which is the facility this host started.
+    pub(super) fn acknowledged(facility: u32) -> Option<bool> {
+        let printed = super::bounded_output("/usr/bin/pmset", &["-g", "assertions"])?;
+        Some(printed.contains(&format!("(pid {facility})")))
+    }
+
     /// Reads whether this host is running on mains power.
     pub(super) fn power_source() -> PowerSource {
-        let Ok(output) = Command::new("/usr/bin/pmset")
-            .args(["-g", "batt"])
-            .stdin(Stdio::null())
-            .output()
-        else {
+        let Some(printed) = super::bounded_output("/usr/bin/pmset", &["-g", "batt"]) else {
             return PowerSource::Unknown;
         };
-        if !output.status.success() {
-            return PowerSource::Unknown;
-        }
-        super::power_source_of(
-            &String::from_utf8_lossy(&output.stdout),
-            "ac power",
-            "battery",
-        )
+        super::power_source_of(&printed, "ac power", "battery")
     }
 }
 
@@ -483,6 +518,15 @@ mod platform {
             facility.id()
         );
         Some((facility, holder))
+    }
+
+    /// Asks the login manager whether it has the inhibitor this host asked for.
+    ///
+    /// The manager lists what it is holding and who asked for it, and this host asks under its own
+    /// name.
+    pub(super) fn acknowledged(_facility: u32) -> Option<bool> {
+        let printed = super::bounded_output(FACILITY, &["--list", "--no-legend"])?;
+        Some(printed.contains("KalaReach"))
     }
 
     /// Reads whether this host is running on mains power.
@@ -557,6 +601,11 @@ mod platform {
         Some((facility, holder))
     }
 
+    /// This platform publishes no listing of execution-state requests an ordinary user can read.
+    pub(super) const fn acknowledged(_facility: u32) -> Option<bool> {
+        None
+    }
+
     /// Reads whether this host is running on mains power.
     ///
     /// A machine that has no battery is on mains, and a query that failed says nothing at all.
@@ -601,10 +650,54 @@ mod platform {
         None
     }
 
+    /// A platform with no facility has nothing to acknowledge.
+    pub(super) const fn acknowledged(_facility: u32) -> Option<bool> {
+        None
+    }
+
     /// A platform this host cannot read the power source of answers so.
     pub(super) const fn power_source() -> PowerSource {
         PowerSource::Unknown
     }
+}
+
+/// Runs a platform query with a bound and returns what it printed.
+///
+/// The output is read after the query has finished, so a query that filled its pipe would stall;
+/// every query here prints a few kilobytes at most, and one that stalls is ended at the deadline
+/// like any other that does not answer.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn bounded_output(program: &str, arguments: &[&str]) -> Option<String> {
+    use std::io::Read as _;
+
+    let mut query = Command::new(program)
+        .args(arguments)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + QUERY_PATIENCE;
+    loop {
+        match query.try_wait() {
+            Ok(Some(status)) if status.success() => break,
+            Ok(Some(_)) | Err(_) => return None,
+            Ok(None) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = query.kill();
+            let _ = query.wait();
+            return None;
+        }
+        std::thread::sleep(QUERY_POLL);
+    }
+    let mut printed = String::new();
+    query
+        .stdout
+        .take()?
+        .read_to_string(&mut printed)
+        .ok()
+        .map(|_| printed)
 }
 
 /// Returns the power source a platform's own wording describes.

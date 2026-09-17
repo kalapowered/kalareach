@@ -142,18 +142,23 @@ pub fn presence(anchor: Option<&ProcessStartIdentity>) -> Presence {
     };
     match kr_ipc::identity::process_state(anchor) {
         kr_ipc::identity::ProcessState::Running => Presence::Present,
-        // A process the platform describes with no start value at all is a process it would not
-        // describe, and a comparison against that is not a death. This is the only place that can
-        // tell the two apart, because by the time the answer is "ended" the reason is gone.
+        // "Ended" from a comparison can mean two things: the process is gone or has been
+        // replaced, or the platform described it with no start value at all, which is what a
+        // reader that could not open the process returns. The second is not a death, so the
+        // process is read again here and the whole identity compared.
         kr_ipc::identity::ProcessState::Ended => {
-            let unreadable = u32::try_from(anchor.pid.get()).ok().is_some_and(|pid| {
-                kr_ipc::identity::process_start_identity(pid)
-                    .is_ok_and(|identity| identity.start_value.get() == 0)
-            });
-            if unreadable {
-                Presence::Unknown
-            } else {
-                Presence::Ended
+            let Ok(pid) = u32::try_from(anchor.pid.get()) else {
+                return Presence::Ended;
+            };
+            match kr_ipc::identity::process_start_identity(pid) {
+                // The same process after all: the first comparison was against a reading the
+                // platform would not give.
+                Ok(again) if &again == anchor => Presence::Present,
+                // A reading with no start value is a process the platform would not describe.
+                Ok(again) if again.start_value.get() == 0 => Presence::Unknown,
+                Ok(_) => Presence::Ended,
+                // The kernel answered once and not twice. Neither answer is established.
+                Err(_) => Presence::Unknown,
             }
         }
         kr_ipc::identity::ProcessState::Unknown { .. } => Presence::Unknown,

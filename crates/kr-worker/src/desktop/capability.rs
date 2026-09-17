@@ -380,53 +380,31 @@ pub fn decide_unix(capability: &str, desktop: &DesktopContext, tool: Option<Stri
         DisplayServer::Wayland => match tool {
             Some(tool) => {
                 let route = wayland_route(capability);
-                match wayland_path(capability, &tool, &compositor) {
+                let reason = match wayland_path(capability, &tool, &compositor) {
                     // The compositor implements the protocol this tool uses, so nothing stands in
                     // the way that a permission could remove. What is left is whether it works.
-                    WaylandPath::Protocol => Answer {
-                        state: CapabilityState::NotTested,
-                        evidence: CapabilityEvidenceSource::NotProbed,
-                        reason: Some(format!(
-                            "{named_compositor} implements the protocol {tool} uses for {route}, \
-                             so no per-use permission stands in the way. Nothing here has run it"
-                        )),
-                        tool: Some(tool),
-                    },
-                    // The tool asks the compositor's own portal, which asks the user each time.
-                    // That is a permission the platform itself establishes.
-                    WaylandPath::Portal => Answer {
-                        state: CapabilityState::PermissionRequired,
-                        evidence: CapabilityEvidenceSource::PlatformQuery,
-                        reason: Some(format!(
-                            "on Wayland {route} goes through the compositor rather than the \
-                             display server, and {tool} asks {named_compositor} for it through \
-                             the portal, which asks the user each time rather than granting it to \
-                             a tool"
-                        )),
-                        tool: Some(tool),
-                    },
+                    WaylandPath::Protocol => format!(
+                        "{named_compositor} implements the protocol {tool} uses for {route}, so no \
+                         per-use permission stands in the way. Nothing here has run it"
+                    ),
                     // The tool does not go through the compositor at all.
-                    WaylandPath::Device => Answer {
-                        state: CapabilityState::NotTested,
-                        evidence: CapabilityEvidenceSource::NotProbed,
-                        reason: Some(format!(
-                            "{tool} does not ask the compositor for {route}: it goes through its \
-                             own service and the input devices, which need their own permission. \
-                             Nothing here has run it"
-                        )),
-                        tool: Some(tool),
-                    },
-                    // A tool built for protocols this compositor family does not implement.
-                    WaylandPath::Unqualified => Answer {
-                        state: CapabilityState::NotTested,
-                        evidence: CapabilityEvidenceSource::NotProbed,
-                        reason: Some(format!(
-                            "{tool} uses a protocol for {route} that {named_compositor} may not \
-                             implement, and nothing here has run it, so this is not established \
-                             either way"
-                        )),
-                        tool: Some(tool),
-                    },
+                    WaylandPath::Device => format!(
+                        "{tool} does not ask the compositor for {route}: it goes through its own \
+                         service and the input devices, which need their own permission. Nothing \
+                         here has run it"
+                    ),
+                    // Which route the pair takes is not something a name settles.
+                    WaylandPath::Unqualified => format!(
+                        "on Wayland {route} goes through the compositor rather than the display \
+                         server, and whether {named_compositor} grants it to {tool} or asks the \
+                         user for it each time is not established here"
+                    ),
+                };
+                Answer {
+                    state: CapabilityState::NotTested,
+                    evidence: CapabilityEvidenceSource::NotProbed,
+                    reason: Some(reason),
+                    tool: Some(tool),
                 }
             }
             None => Answer::refused(
@@ -470,27 +448,27 @@ fn wayland_route(capability: &str) -> &'static str {
 enum WaylandPath {
     /// A Wayland protocol this compositor implements.
     Protocol,
-    /// The desktop portal, which asks the user each time.
-    Portal,
     /// The tool's own service and the input devices, rather than the compositor.
     Device,
-    /// A protocol the compositor may not implement. Nothing here establishes which.
+    /// Something this host cannot name from the compositor and the tool alone.
     Unqualified,
 }
 
 /// Returns how one tool would reach one capability on this compositor.
 ///
-/// The three routes a Wayland desktop offers are genuinely different, and which one a tool takes
-/// is a property of the tool rather than of the capability: a permission prompt cannot supply a
+/// The routes a Wayland desktop offers are genuinely different, and which one a tool takes is a
+/// property of the tool rather than of the capability: a permission prompt cannot supply a
 /// protocol a compositor does not implement, and a tool that goes through the input devices is not
 /// asking the compositor for anything at all.
+///
+/// What this cannot do from a name is establish that a tool needs the user's permission each time.
+/// A desktop's own capture service and its portal are different routes with the same command in
+/// front of them, so the answer says the route is not established rather than blaming a
+/// permission.
 fn wayland_path(capability: &str, tool: &str, compositor: &str) -> WaylandPath {
     let tool = tool.rsplit('/').next().unwrap_or(tool);
     if DEVICE_TOOLS.iter().any(|known| tool.contains(known)) {
         return WaylandPath::Device;
-    }
-    if PORTAL_TOOLS.iter().any(|known| tool.contains(known)) {
-        return WaylandPath::Portal;
     }
     if !wlroots(compositor) {
         return WaylandPath::Unqualified;
@@ -505,9 +483,6 @@ fn wayland_path(capability: &str, tool: &str, compositor: &str) -> WaylandPath {
 
 /// Tools that reach the input devices through their own service rather than the compositor.
 const DEVICE_TOOLS: &[&str] = &["ydotool", "dotool"];
-
-/// Tools that ask the desktop portal, which asks the user each time.
-const PORTAL_TOOLS: &[&str] = &["gnome-screenshot", "spectacle", "xdg-desktop-portal"];
 
 /// Returns whether a compositor is one of the family whose protocols the tools above use.
 ///
@@ -603,32 +578,44 @@ fn runnable(path: &std::path::Path) -> bool {
 ///
 /// Section 11 requires the record to name the exact thing the answer was about, so that an
 /// installed upgrade invalidates it rather than silently changing what the record describes. This
-/// is the file itself as the filesystem describes it: which file it is, how long it is and when it
-/// last changed, to the nanosecond the platform records. A replacement that matched all three
-/// would be indistinguishable from the original here, and this host says that this is what it
-/// compared rather than claiming to have read the contents.
+/// is the file's own contents, digested, together with its length: a replacement at the same path
+/// is a different file here even when it kept the path, the length and the timestamps.
+///
+/// The digest is for noticing a change rather than for proving one: a capability record is
+/// evidence about what is feasible, never authority, and nothing here signs it. A file too large
+/// to read in a diagnostic is named by its length and its modification time instead, and says so.
 fn facility_identity(tool: Option<&String>) -> Option<String> {
-    let metadata = std::fs::metadata(tool?).ok()?;
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map_or_else(
-            || "an unknown time".to_owned(),
-            |since| format!("{}.{:09}", since.as_secs(), since.subsec_nanos()),
-        );
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::MetadataExt as _;
-        format!("file {}:{}, ", metadata.dev(), metadata.ino())
-    };
-    #[cfg(not(unix))]
-    let file = String::new();
+    let path = tool?;
+    let metadata = std::fs::metadata(path).ok()?;
+    if metadata.len() > MAX_DIGESTED {
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or_else(
+                || "an unknown time".to_owned(),
+                |since| format!("{}.{:09}", since.as_secs(), since.subsec_nanos()),
+            );
+        return Some(format!(
+            "{} bytes, modified {modified}, too large to digest",
+            metadata.len()
+        ));
+    }
+    let contents = std::fs::read(path).ok()?;
+    let mut hasher = std::hash::DefaultHasher::new();
+    std::hash::Hasher::write(&mut hasher, &contents);
     Some(format!(
-        "{file}{} bytes, modified {modified}",
-        metadata.len()
+        "{} bytes, digest {:016x}",
+        metadata.len(),
+        std::hash::Hasher::finish(&hasher)
     ))
 }
+
+/// The largest facility this host digests to identify it.
+///
+/// Reading a file is what a diagnostic can afford; reading an arbitrarily large one is not. Every
+/// facility in the table above is a few megabytes at most.
+const MAX_DIGESTED: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -702,11 +689,22 @@ mod tests {
             .record(capabilities::DISPLAY_SERVER)
             .expect("the display server is a capability of its own");
         assert!(server.state.is_available());
+        // Launching an application on a desktop needs no permission on any of these platforms, so
+        // the answer depends only on whether a launcher is installed, which differs between them.
+        let launch = report
+            .record(capabilities::APPLICATION_LAUNCH)
+            .expect("a record");
         assert!(
-            report
-                .record(capabilities::APPLICATION_LAUNCH)
-                .is_some_and(|record| record.state.is_available()),
-            "launching an application on a macOS desktop needs no privacy permission"
+            matches!(
+                launch.state,
+                CapabilityState::QualifiedAvailable | CapabilityState::MissingInstallation
+            ),
+            "{launch:?}"
+        );
+        assert_eq!(
+            launch.state.is_available(),
+            launch.identity.binary.is_present(),
+            "a launcher that was found is the whole of that answer"
         );
     }
 
@@ -747,7 +745,19 @@ mod tests {
         );
         for record in &report.records {
             assert!(!record.state.is_available(), "{}", record.capability);
-            assert_eq!(record.state, CapabilityState::TemporarilyUnavailable);
+            // What a headless context means differs by platform: on one that keeps every one of a
+            // user's processes in that user's own session, nothing establishes that the desktop
+            // cannot be reached either, and the record says so instead of claiming it cannot.
+            assert!(
+                matches!(
+                    record.state,
+                    CapabilityState::TemporarilyUnavailable | CapabilityState::NotTested
+                ),
+                "{}: {:?}",
+                record.capability,
+                record.state
+            );
+            assert!(record.disabled_reason.is_present());
         }
     }
 
@@ -790,7 +800,7 @@ mod tests {
             &desktop(DisplayServer::Wayland, Some("sway")),
             Some("/usr/bin/wtype".to_owned()),
         );
-        // The same operation on a compositor that asks the user for it each time instead.
+        // The same operation on a compositor whose route for it this host cannot name.
         let portal = decide_unix(
             capabilities::SCREEN_CAPTURE,
             &desktop(DisplayServer::Wayland, Some("GNOME")),
@@ -812,13 +822,16 @@ mod tests {
             assert!(answer.reason.is_some(), "{answer:?}");
         }
         // And each of the four says something different about why.
-        assert_eq!(portal.state, CapabilityState::PermissionRequired);
+        assert_eq!(portal.state, CapabilityState::NotTested);
         assert!(
             portal
                 .reason
                 .as_ref()
-                .is_some_and(|reason| reason.contains("gnome") && reason.contains("screen image")),
-            "the answer names the compositor and the operation it is about: {portal:?}"
+                .is_some_and(|reason| reason.contains("gnome")
+                    && reason.contains("screen image")
+                    && reason.contains("not established")),
+            "an answer a tool's name cannot settle names the compositor, the tool and the \
+             operation, and says it is not established: {portal:?}"
         );
         assert_eq!(bare.state, CapabilityState::MissingInstallation);
         assert!(

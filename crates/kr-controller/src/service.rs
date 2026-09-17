@@ -251,6 +251,8 @@ pub struct Controller {
     /// The sleep assertion this daemon holds, where it holds one, and whether a review of it is
     /// running.
     inhibitor: Mutex<Inhibitor>,
+    /// How far into its sessions the last look at what this host has outstanding got.
+    demand_cursor: Mutex<usize>,
     _lock: SingletonLock,
 }
 
@@ -269,6 +271,12 @@ struct DesktopReading {
     /// It starts at the moment this daemon began serving rather than at one, so a daemon that
     /// restarts does not hand out a revision it has used before.
     revision: CapabilityRevision,
+    /// Whether the revision can be kept across a restart.
+    ///
+    /// A record this host could not read leaves this false, and then the revision stays at zero:
+    /// zero claims nothing, where advancing from it would hand out a number this environment may
+    /// already have used.
+    durable_revision: bool,
     /// The records that revision was established for, so a change to any of them can be seen.
     records: Vec<kr_protocol::desktop::CapabilityRecord>,
     /// When the platform was last asked.
@@ -309,6 +317,7 @@ impl Controller {
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
         let boot = setup.boot_identity.clone();
         let paths = setup.paths.clone();
+        let recorded_revision = capability_revision(&paths);
         let started_at_ms = kr_ipc::now_ms();
         let clock = Arc::new(SystemContinuousClock::new());
         let authority_revision = registry.authority_revision()?;
@@ -344,11 +353,13 @@ impl Controller {
             started_at_ms,
             desktop: Mutex::new(DesktopReading {
                 context: crate::desktop::current(boot.clone()),
-                revision: capability_revision(&paths),
+                revision: recorded_revision.unwrap_or_else(|| CapabilityRevision::new(0)),
+                durable_revision: recorded_revision.is_some(),
                 records: Vec::new(),
                 read_at: std::time::Instant::now(),
             }),
             inhibitor: Mutex::new(Inhibitor::new()),
+            demand_cursor: Mutex::new(0),
             _lock: lock,
         });
         // Reconnecting is not only verifying. A replacement daemon has to present the generation it
@@ -2273,19 +2284,29 @@ impl Controller {
         // revision, and the other would hand out records stamped with a revision that no longer
         // describes them.
         let mut reading = self.desktop.lock().await;
-        let revision = if comparable(&report.records) == comparable(&reading.records) {
+        let unchanged = comparable(&report.records) == comparable(&reading.records);
+        let revision = if unchanged || !reading.durable_revision {
+            // Evidence that has not changed keeps its revision. An environment whose record this
+            // host could not read keeps revision zero, which claims nothing: advancing from it
+            // would hand out a number this environment may already have used.
             reading.revision
         } else {
             let advanced = CapabilityRevision::new(reading.revision.get().saturating_add(1));
-            reading.revision = advanced;
-            reading.records = report.records.clone();
             // The revision outlives this daemon, so a replacement never hands out one it has used
-            // before. A revision that could go backwards would make an action's stale binding look
-            // current.
+            // before, and a revision that came round again would make an action's stale binding
+            // look current. It is therefore published only once it is stored.
             let path = self.paths.state_dir().join(CAPABILITY_REVISION_FILE);
-            let _ =
-                kr_ipc::paths::write_owner_only_file(&path, advanced.get().to_string().as_bytes());
-            advanced
+            match kr_ipc::paths::write_owner_only_file(&path, advanced.get().to_string().as_bytes())
+            {
+                Ok(()) => {
+                    reading.revision = advanced;
+                    reading.records = report.records.clone();
+                    advanced
+                }
+                // Nothing was recorded, so nothing is published: the records keep the revision the
+                // last stored one described, and the next report tries again.
+                Err(_) => reading.revision,
+            }
         };
         for record in &mut report.records {
             record.revision = revision;
@@ -2376,10 +2397,16 @@ impl Controller {
     /// runs while the setting is on, and stops when the setting is off and nothing is held, so a
     /// host whose owner has not chosen this runs no timer at all.
     fn review_power(self: &Arc<Self>) {
-        let controller = Arc::clone(self);
+        // A weak reference: a daemon that has been dropped everywhere else is dropped, and its
+        // singleton lock goes with it. A review that held the daemon open would keep the
+        // environment locked for as long as its own interval.
+        let controller = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(POWER_REVIEW_INTERVAL).await;
+                let Some(controller) = controller.upgrade() else {
+                    return;
+                };
                 if controller.evaluate_power(Claim::Hold).await.1 == Review::Stop {
                     return;
                 }
@@ -2399,19 +2426,29 @@ impl Controller {
     /// and stops answering must not be able to keep this host awake for good, and it must not be
     /// able to delay the answer another session is waiting for either.
     async fn demand(&self) -> Demand {
-        let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
+        let mut workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
+        // Where the last scan stopped. A scan that always began at the same end of the same
+        // ordered set would ask the same workers every time, and one that never got past a few
+        // slow ones would never see what the rest had outstanding.
+        let mut cursor = self.demand_cursor.lock().await;
+        let count = workers.len();
+        if count > 0 {
+            workers.rotate_left(*cursor % count);
+        }
         let mut sessions_with_work = 0;
         let mut outstanding = 0;
         let spent = std::time::Instant::now();
+        let mut asked = 0;
         for worker in workers {
             // The scan as a whole is bounded, not only each worker in it. A host with many
             // sessions must still decide within the interval its own review runs on, or the time
             // an assertion can outlive its work would grow with the number of sessions.
-            if spent.elapsed() >= DEMAND_BUDGET {
+            let Some(left) = DEMAND_BUDGET.checked_sub(spent.elapsed()) else {
                 break;
-            }
+            };
+            asked += 1;
             let summary = self
-                .read_from_worker_within(&worker, Some(DEMAND_PATIENCE))
+                .read_from_worker_within(&worker, Some(DEMAND_PATIENCE.min(left)))
                 .await
                 .ok();
             let Some(summary) = summary else {
@@ -2433,6 +2470,8 @@ impl Controller {
                 outstanding += 1;
             }
         }
+        *cursor = cursor.wrapping_add(asked);
+        drop(cursor);
         Demand {
             sessions_with_work,
             pending_requests: outstanding + self.pending.lock().await.len() as u64,
@@ -2479,10 +2518,19 @@ impl Controller {
         let path = self.paths.state_dir().join(BOOT_FILE);
         let current = kr_cbor::to_canonical_vec(&self.boot_identity)
             .map_err(|error| ControllerError::registry(error.to_string()))?;
-        let recorded = kr_ipc::paths::read_owner_only_file(&path, BOOT_FILE_LIMIT)?;
+        let bytes = kr_ipc::paths::read_owner_only_file(&path, BOOT_FILE_LIMIT)?;
         // A host with no record has not run here before, so there is nothing of an earlier boot to
-        // close. A record this daemon cannot read is not evidence of a reboot either.
-        if recorded.as_ref().is_some_and(|bytes| bytes != &current) {
+        // close. A record that is there and does not decode is a damaged file rather than a boot,
+        // and closing live sessions on the strength of one would be closing them for no reason.
+        // Either way the record is written again below.
+        let recorded = bytes.as_deref().and_then(|bytes| {
+            kr_cbor::from_canonical_slice::<kr_protocol::identity::BootIdentity>(
+                bytes,
+                &kr_cbor::Limits::DEFAULT,
+            )
+            .ok()
+        });
+        if recorded.is_some_and(|recorded| recorded != self.boot_identity) {
             let rows = {
                 let registry = self.registry.lock().await;
                 registry.workers()?
@@ -2497,7 +2545,7 @@ impl Controller {
                 .await?;
             }
         }
-        if recorded.as_deref() != Some(current.as_slice()) {
+        if bytes.as_deref() != Some(current.as_slice()) {
             kr_ipc::paths::write_owner_only_file(&path, &current)?;
         }
         Ok(())
@@ -2756,7 +2804,12 @@ impl Controller {
                     NO_DESKTOP_TO_BIND.to_owned(),
                 ));
             }
-            crate::desktop::agent::environment(create.worker_profile)
+            // The session this host just read its desktop from, so the worker is started on the
+            // desktop this host describes rather than on another login of the same user.
+            crate::desktop::agent::environment(
+                create.worker_profile,
+                desktop.platform_session.as_ref().map(String::as_str),
+            )
         } else {
             Vec::new()
         };
@@ -3263,24 +3316,66 @@ impl Controller {
         let identity = row.process_identity;
         match kr_ipc::identity::process_state(&identity) {
             kr_ipc::identity::ProcessState::Ended => {
-                // Why the worker is gone, where this host can tell. A desktop-bound worker on a
-                // host that no longer has a graphical login went with that login: the platform
-                // ended the job with the domain it was in, which is what a logout does, and the
-                // worker had no chance to write its own record. Anything else is a worker that
-                // ended for reasons this host does not know.
-                let reason = if row.profile == WorkerProfile::DesktopBound
-                    && !self.desktop().await.0.is_desktop()
-                {
-                    ClosureReason::DesktopLost
-                } else {
-                    ClosureReason::WorkerCrash
-                };
+                let reason = self.why_a_worker_is_gone(session_id, row.profile);
                 self.record_final(session_id, reason, &identity)
                     .await
                     .map(Some)
             }
             _ => Ok(None),
         }
+    }
+
+    /// Returns the reason a worker that is confirmed gone ended, where this host can establish
+    /// one.
+    ///
+    /// A desktop-bound worker whose desktop has gone went with it: the platform ended the job with
+    /// the login session it was in, which is what a logout does, and the worker had no chance to
+    /// write its own record. The desktop the session was created on is in the worker's own
+    /// journal, which outlives the worker, so this is an answer rather than a guess even after the
+    /// person has logged in again and the host has a desktop once more.
+    ///
+    /// Everything else is a worker that ended for reasons this host does not know, including a
+    /// desktop it could not read: an unreadable platform is not a logout.
+    fn why_a_worker_is_gone(&self, session_id: SessionId, profile: WorkerProfile) -> ClosureReason {
+        if profile != WorkerProfile::DesktopBound {
+            return ClosureReason::WorkerCrash;
+        }
+        let Some(recorded) = self.recorded_desktop(session_id) else {
+            return ClosureReason::WorkerCrash;
+        };
+        if !recorded.desktop_session_id.is_present() && !recorded.login_generation.is_present() {
+            return ClosureReason::WorkerCrash;
+        }
+        match kr_worker::desktop::current() {
+            kr_worker::desktop::Reading::Desktop(live) => {
+                match kr_worker::desktop::describes(&live, &recorded) {
+                    // The login session this session was created on is not the one that is there.
+                    Some(false) => ClosureReason::DesktopLost,
+                    Some(true) | None => ClosureReason::WorkerCrash,
+                }
+            }
+            // The platform says this user has no graphical login at all, and this session was
+            // created on one.
+            kr_worker::desktop::Reading::None => ClosureReason::DesktopLost,
+            kr_worker::desktop::Reading::Unavailable => ClosureReason::WorkerCrash,
+        }
+    }
+
+    /// Returns the desktop a session was created on, from its own journal.
+    ///
+    /// The journal is in the environment's state directory and outlives the worker that wrote it,
+    /// which is what makes this readable after the worker has gone.
+    fn recorded_desktop(
+        &self,
+        session_id: SessionId,
+    ) -> Option<kr_protocol::identity::DesktopBinding> {
+        let path = self.paths.journal_database(session_id);
+        let journal = kr_worker::journal::Journal::open_read_only(path).ok()?;
+        journal
+            .read_session(session_id)
+            .ok()
+            .flatten()
+            .map(|summary| summary.desktop)
     }
 
     async fn record_final(
@@ -3636,17 +3731,21 @@ const fn forwarded_to_worker(method: Method) -> bool {
 /// Returns the sentence a caller is given when a window cannot first-admit a request.
 /// Returns the capability revision this environment has already handed out.
 ///
-/// A record this host cannot read leaves the revision where a fresh environment starts, which is
-/// the one case where nothing has been handed out yet.
-fn capability_revision(paths: &EnvironmentPaths) -> CapabilityRevision {
+/// Three answers, and the difference matters. An environment with no record has handed out
+/// nothing and starts at zero. A record that reads as a number says what it has handed out. A
+/// record that is there and cannot be read says nothing at all, and `None` is that: this host then
+/// serves revision zero, which claims nothing, rather than starting again from one and handing out
+/// a revision it may already have used.
+fn capability_revision(paths: &EnvironmentPaths) -> Option<CapabilityRevision> {
     let path = paths.state_dir().join(CAPABILITY_REVISION_FILE);
-    let recorded = kr_ipc::paths::read_owner_only_file(&path, CAPABILITY_REVISION_LIMIT)
-        .ok()
-        .flatten()
-        .and_then(|bytes| String::from_utf8(bytes).ok())
-        .and_then(|text| text.trim().parse::<u64>().ok())
-        .unwrap_or(0);
-    CapabilityRevision::new(recorded)
+    match kr_ipc::paths::read_owner_only_file(&path, CAPABILITY_REVISION_LIMIT) {
+        Ok(None) => Some(CapabilityRevision::new(0)),
+        Ok(Some(bytes)) => String::from_utf8(bytes)
+            .ok()
+            .and_then(|text| text.trim().parse::<u64>().ok())
+            .map(CapabilityRevision::new),
+        Err(_) => None,
+    }
 }
 
 /// Returns capability records in the form two reports are compared in.
