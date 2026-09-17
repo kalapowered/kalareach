@@ -26,7 +26,13 @@
 //! | --- | --- | --- |
 //! | macOS | `caffeinate -i`, which takes a power-management assertion | the system does not sleep because nobody is using it |
 //! | Linux | `systemd-inhibit --what=sleep:idle --mode=block`, which holds the login manager's own inhibitor descriptor | the same, through the login manager |
-//! | Windows | the per-user host agent's execution-state request | the same, for the calling session |
+//! | Windows | an execution-state request, made by the command this host runs | the same, for the session that command runs in |
+//!
+//! An assertion is reported only once the platform has confirmed this acquisition: macOS and Linux
+//! both publish a listing that names the holding process, and where a platform publishes none the
+//! request itself reports that its call succeeded. A facility that is merely running holds
+//! nothing, and a host that reported one would be promising a machine that stays awake when it
+//! does not.
 //!
 //! Releasing is closing the pipe, so nothing is ever signalled: the facility sees its input end,
 //! exits, and the assertion goes with it. That also means a control daemon that dies releases
@@ -70,12 +76,15 @@ pub const QUERY_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2
 /// How often a bounded query is asked whether it has finished.
 const QUERY_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// How long a facility is given to hold its assertion before it is believed.
+/// How long an acquisition is given to be confirmed.
 ///
-/// A process that exits immediately did not take an assertion, whatever it was asked for. This is
-/// the only wait on the acquisition path, and it happens once per assertion rather than once per
-/// query.
-const ACQUIRE_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+/// A running facility is not an assertion: the platform has to say it holds one. This is the whole
+/// of the acquisition wait, it happens once per assertion rather than once per query, and a
+/// confirmation that arrives sooner ends it sooner.
+pub const ACQUIRE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often an acquisition is asked whether it has been confirmed.
+const ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// What the host currently has outstanding.
 ///
@@ -309,61 +318,34 @@ impl Inhibitor {
         }
         match platform::hold() {
             Some((mut facility, holder)) => {
-                // A facility that has already exited holds nothing. Its assertion lasts exactly as
-                // long as the process does, so a process that is gone is an assertion that was
-                // never taken, and reporting one would be reporting a machine that will not sleep
-                // when it will.
-                std::thread::sleep(ACQUIRE_SETTLE);
-                match facility.try_wait() {
-                    Ok(None) => {
-                        // A running facility is not an assertion. Where the platform lists what it
-                        // is holding, that listing is what settles it, and a facility the platform
-                        // does not name holds nothing whatever it is doing.
-                        match platform::acknowledged(facility.id()) {
-                            Some(false) => {
-                                let _ = facility.kill();
-                                let _ = facility.wait();
-                                self.withheld = Some(
-                                    "this host asked for a sleep assertion and the operating \
-                                     system does not list one, so its sleep policy is unchanged"
-                                        .to_owned(),
-                                );
-                            }
-                            acknowledged => {
-                                self.held = Some(Held {
-                                    facility,
-                                    reason,
-                                    since_ms: kr_ipc::now_ms(),
-                                    holder: match acknowledged {
-                                        Some(true) => format!(
-                                            "{holder}, which the operating system's own listing \
-                                             names"
-                                        ),
-                                        // A platform that publishes no listing an ordinary user
-                                        // can read leaves the facility's own life as the evidence,
-                                        // and the record says which it is.
-                                        _ => format!(
-                                            "{holder}, which this platform publishes no listing of"
-                                        ),
-                                    },
-                                });
-                                self.withheld = None;
-                            }
-                        }
+                // A running facility is not an assertion, and neither is a facility that has
+                // already exited: its assertion lasts exactly as long as the process does. What
+                // settles it is the platform confirming this acquisition, either by naming it in
+                // its own listing or by the facility reporting that the call succeeded. Nothing
+                // else is reported as an assertion, because a host that claimed one it does not
+                // hold would be a host that says the machine will stay awake when it will not.
+                match platform::acknowledged(&mut facility) {
+                    Some(confirmation) => {
+                        self.held = Some(Held {
+                            facility,
+                            reason,
+                            since_ms: kr_ipc::now_ms(),
+                            holder: format!("{holder}, {confirmation}"),
+                        });
+                        self.withheld = None;
                     }
-                    Ok(Some(status)) => {
-                        self.withheld = Some(format!(
-                            "this host's sleep-assertion facility ended at once ({status}), so \
-                             its sleep policy is unchanged"
-                        ));
-                    }
-                    Err(error) => {
+                    None => {
+                        self.withheld = Some(match facility.try_wait() {
+                            Ok(Some(status)) => format!(
+                                "this host's sleep-assertion facility ended at once ({status}), \
+                                 so its sleep policy is unchanged"
+                            ),
+                            _ => "this host asked for a sleep assertion and the operating system \
+                                  did not confirm one, so its sleep policy is unchanged"
+                                .to_owned(),
+                        });
                         let _ = facility.kill();
                         let _ = facility.wait();
-                        self.withheld = Some(format!(
-                            "this host could not tell whether its sleep-assertion facility \
-                             started ({error}), so its sleep policy is unchanged"
-                        ));
                     }
                 }
             }
@@ -468,18 +450,25 @@ mod platform {
         Some((facility, holder))
     }
 
-    /// Asks the platform whether it has the assertion this host asked for.
+    /// Waits for the platform to name this acquisition's assertion in its own listing.
     ///
-    /// The operating system's own listing is the only thing that settles it, and it names the
-    /// process the assertion is held on behalf of, which is the facility this host started.
-    pub(super) fn acknowledged(facility: u32) -> Option<bool> {
-        let printed = super::bounded_output("/usr/bin/pmset", &["-g", "assertions"])?;
-        Some(printed.contains(&format!("(pid {facility})")))
+    /// The listing names the process each assertion is held on behalf of, and the process this
+    /// host compares it with is the facility it just started. An assertion under another
+    /// process, including another environment's, is not this one.
+    pub(super) fn acknowledged(facility: &mut Child) -> Option<String> {
+        let wanted = format!("(pid {})", facility.id());
+        super::confirmed_within(facility, |patience| {
+            super::bounded_output("/usr/bin/pmset", &["-g", "assertions"], patience)
+                .is_some_and(|printed| printed.contains(&wanted))
+        })
+        .then(|| "which the operating system's own assertion listing names".to_owned())
     }
 
     /// Reads whether this host is running on mains power.
     pub(super) fn power_source() -> PowerSource {
-        let Some(printed) = super::bounded_output("/usr/bin/pmset", &["-g", "batt"]) else {
+        let Some(printed) =
+            super::bounded_output("/usr/bin/pmset", &["-g", "batt"], super::QUERY_PATIENCE)
+        else {
             return PowerSource::Unknown;
         };
         super::power_source_of(&printed, "ac power", "battery")
@@ -493,6 +482,17 @@ mod platform {
 
     /// The facility the login manager holds a sleep inhibitor with.
     const FACILITY: &str = "systemd-inhibit";
+
+    /// The name this host asks for its inhibitor under.
+    const WHO: &str = "KalaReach";
+
+    /// Which whitespace-separated field of an inhibitor listing holds the asking process.
+    ///
+    /// The listing is one inhibitor per line: who asked, its user identifier, that user's name,
+    /// the process, the process's command, what it holds, why, and its mode. The reason is the
+    /// only field with spaces in it and it comes after the process, so counting from the left is
+    /// exact.
+    const PROCESS_FIELD: usize = 3;
 
     /// Takes the login manager's own sleep inhibitor.
     ///
@@ -520,13 +520,49 @@ mod platform {
         Some((facility, holder))
     }
 
-    /// Asks the login manager whether it has the inhibitor this host asked for.
+    /// Waits for the login manager to name this acquisition's inhibitor in its own listing.
     ///
-    /// The manager lists what it is holding and who asked for it, and this host asks under its own
-    /// name.
-    pub(super) fn acknowledged(_facility: u32) -> Option<bool> {
-        let printed = super::bounded_output(FACILITY, &["--list", "--no-legend"])?;
-        Some(printed.contains("KalaReach"))
+    /// The manager lists what it is holding, who asked for it and which process asked. Both the
+    /// name and the process must match: every environment asks under the same name, so the name
+    /// alone would let one host's inhibitor acknowledge another's.
+    pub(super) fn acknowledged(facility: &mut Child) -> Option<String> {
+        let process = facility.id().to_string();
+        super::confirmed_within(facility, |patience| {
+            super::bounded_output(FACILITY, &["--list", "--no-legend"], patience)
+                .is_some_and(|printed| names(&printed, &process))
+        })
+        .then(|| "which the login manager's own inhibitor listing names".to_owned())
+    }
+
+    /// Returns whether an inhibitor listing names this host's inhibitor, held by this process.
+    fn names(printed: &str, process: &str) -> bool {
+        printed.lines().any(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            fields.first() == Some(&WHO) && fields.get(PROCESS_FIELD) == Some(&process)
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::names;
+
+        #[test]
+        fn only_this_process_s_own_inhibitor_acknowledges_it() {
+            let printed = "KalaReach 1000 someone 4242 systemd-inhibit sleep:idle KalaReach has \
+                           admitted work that is still running block\n\
+                           KalaReach 1000 someone 99 systemd-inhibit sleep:idle KalaReach has \
+                           admitted work that is still running block\n";
+            assert!(names(printed, "4242"));
+            assert!(names(printed, "99"));
+            assert!(
+                !names(printed, "4243"),
+                "another environment's inhibitor is not this one"
+            );
+            assert!(
+                !names("PowerDevil 1000 someone 4242 kded5 sleep block\n", "4242"),
+                "another program's inhibitor is not this one"
+            );
+        }
     }
 
     /// Reads whether this host is running on mains power.
@@ -567,7 +603,14 @@ mod platform {
     use super::{Child, Command, Stdio};
     use kr_protocol::desktop::PowerSource;
 
-    /// The per-user host agent's execution-state request, held for as long as its input is open.
+    /// What the request prints once the platform has accepted it.
+    ///
+    /// This platform publishes no listing of execution-state requests an ordinary user can read,
+    /// so the request itself is what says the call succeeded. It prints this after the call and
+    /// before it waits, which is the acknowledgement this acquisition is believed on.
+    const ACCEPTED: &str = "kalareach-execution-state-held";
+
+    /// The execution-state request, held for as long as its input is open.
     ///
     /// Every value is an explicit unsigned 32-bit one. The continuous flag is `0x80000000`, which
     /// a signed literal cannot carry, and a conversion that failed would leave a process waiting
@@ -582,6 +625,8 @@ mod platform {
         $system = [uint32]1; \
         $flags = [uint32]($continuous -bor $system); \
         if ($api::SetThreadExecutionState($flags) -eq 0) { exit 1 }; \
+        [Console]::Out.WriteLine('kalareach-execution-state-held'); \
+        [Console]::Out.Flush(); \
         while ($null -ne [Console]::In.ReadLine()) { }; \
         [void]$api::SetThreadExecutionState($continuous)";
 
@@ -590,7 +635,7 @@ mod platform {
         let facility = Command::new("powershell.exe")
             .args(["-NoProfile", "-NonInteractive", "-Command", REQUEST])
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
             .ok()?;
@@ -601,9 +646,23 @@ mod platform {
         Some((facility, holder))
     }
 
-    /// This platform publishes no listing of execution-state requests an ordinary user can read.
-    pub(super) const fn acknowledged(_facility: u32) -> Option<bool> {
-        None
+    /// Waits for the request to report that the platform accepted it.
+    ///
+    /// The read is on a thread of its own, and the wait on it is bounded: a request that never
+    /// answers must not stall the daemon that asked for it. The thread ends with the pipe, which
+    /// the caller closes when it stops a request it could not believe.
+    pub(super) fn acknowledged(facility: &mut Child) -> Option<String> {
+        use std::io::{BufRead as _, BufReader};
+
+        let printed = facility.stdout.take()?;
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = BufReader::new(printed).read_line(&mut line);
+            let _ = sender.send(line);
+        });
+        let line = receiver.recv_timeout(super::ACQUIRE_PATIENCE).ok()?;
+        (line.trim() == ACCEPTED).then(|| "which the request itself reports taking".to_owned())
     }
 
     /// Reads whether this host is running on mains power.
@@ -612,8 +671,9 @@ mod platform {
     /// Those are different answers: collapsing them would let a `mains_only` setting hold an
     /// assertion on a laptop whose battery this host could not read.
     pub(super) fn power_source() -> PowerSource {
-        let Ok(output) = Command::new("powershell.exe")
-            .args([
+        let Some(printed) = super::bounded_output(
+            "powershell.exe",
+            &[
                 "-NoProfile",
                 "-NonInteractive",
                 "-Command",
@@ -623,20 +683,12 @@ mod platform {
                    if ($null -eq $status) { 'ac power' } \
                    elseif ($status.PowerOnline) { 'ac power' } else { 'battery' } \
                  } catch { 'unknown' }",
-            ])
-            .stdin(Stdio::null())
-            .output()
-        else {
+            ],
+            super::QUERY_PATIENCE,
+        ) else {
             return PowerSource::Unknown;
         };
-        if !output.status.success() {
-            return PowerSource::Unknown;
-        }
-        super::power_source_of(
-            &String::from_utf8_lossy(&output.stdout),
-            "ac power",
-            "battery",
-        )
+        super::power_source_of(&printed, "ac power", "battery")
     }
 }
 
@@ -651,7 +703,7 @@ mod platform {
     }
 
     /// A platform with no facility has nothing to acknowledge.
-    pub(super) const fn acknowledged(_facility: u32) -> Option<bool> {
+    pub(super) const fn acknowledged(_facility: &mut Child) -> Option<String> {
         None
     }
 
@@ -661,13 +713,44 @@ mod platform {
     }
 }
 
+/// Asks a platform for the confirmation that an acquisition holds an assertion, until it arrives
+/// or the acquisition's deadline passes.
+///
+/// A facility that exits while this waits took nothing, so the wait ends with it. Each ask is
+/// given what is left of the deadline rather than a bound of its own, so the whole acquisition
+/// costs at most [`ACQUIRE_PATIENCE`] however many times the platform is asked.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn confirmed_within(
+    facility: &mut Child,
+    mut ask: impl FnMut(std::time::Duration) -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + ACQUIRE_PATIENCE;
+    loop {
+        if matches!(facility.try_wait(), Ok(Some(_)) | Err(_)) {
+            return false;
+        }
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        if ask(left) {
+            return true;
+        }
+        std::thread::sleep(ACQUIRE_POLL);
+    }
+}
+
 /// Runs a platform query with a bound and returns what it printed.
 ///
 /// The output is read after the query has finished, so a query that filled its pipe would stall;
 /// every query here prints a few kilobytes at most, and one that stalls is ended at the deadline
 /// like any other that does not answer.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-fn bounded_output(program: &str, arguments: &[&str]) -> Option<String> {
+fn bounded_output(
+    program: &str,
+    arguments: &[&str],
+    patience: std::time::Duration,
+) -> Option<String> {
     use std::io::Read as _;
 
     let mut query = Command::new(program)
@@ -677,7 +760,7 @@ fn bounded_output(program: &str, arguments: &[&str]) -> Option<String> {
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let deadline = std::time::Instant::now() + QUERY_PATIENCE;
+    let deadline = std::time::Instant::now() + patience;
     loop {
         match query.try_wait() {
             Ok(Some(status)) if status.success() => break,
@@ -849,6 +932,12 @@ mod tests {
                 .as_ref()
                 .is_some_and(|holder| holder.contains("process")),
             "the assertion names itself so a person can find it: {held:?}"
+        );
+        assert!(
+            held.holder.as_ref().is_some_and(|holder| {
+                holder.contains("listing names") || holder.contains("reports taking")
+            }),
+            "an assertion is reported only once the platform has confirmed it: {held:?}"
         );
         assert!(held.describe().contains("sleep inhibited"));
 
