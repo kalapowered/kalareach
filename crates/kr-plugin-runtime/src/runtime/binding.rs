@@ -49,7 +49,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
@@ -86,6 +86,23 @@ const PUMP_BATCH: usize = 16;
 /// overflow drops the presentation, says so, and asks the component to rebuild its document: the
 /// same answer a lost observation gets, for the same reason.
 pub const DEFAULT_EVENT_QUEUE: usize = 256;
+
+/// How many unanswered calls one binding will hold at once.
+///
+/// A caller that stopped waiting did not take its request back: the request is still on the
+/// binding's thread, holding whatever it carries, until the thread reaches it. Without a bound, a
+/// caller that retried every time its deadline ran out would grow that backlog without limit. The
+/// figure is generous for a binding a person is interacting with and small enough that the memory
+/// a stalled component can hold stays a number.
+const MAX_OUTSTANDING_CALLS: usize = 64;
+
+/// How much of a failure is carried in a fault notice.
+///
+/// A fault detail is text a person reads and a host records, and a component can put a mebibyte of
+/// its own words into a declared fault. Three faults disable a binding, so an unbounded detail
+/// would put three mebibytes per binding into a queue that must always have room for the notices
+/// nothing else can replace. Four kibibytes is more than any failure needs to be legible.
+const MAX_FAULT_DETAIL_BYTES: usize = 4 * 1024;
 
 /// How long the binding's thread waits for room to report a fault.
 ///
@@ -585,6 +602,7 @@ pub struct BindingHandle {
     stopping: Arc<AtomicBool>,
     pump_pending: Arc<AtomicBool>,
     pending: Arc<PendingUpdates>,
+    outstanding: Arc<AtomicUsize>,
     ready: Mutex<Option<tokio::sync::oneshot::Receiver<RuntimeResult<()>>>>,
     thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
@@ -616,6 +634,7 @@ impl BindingHandle {
         let stopping = Arc::new(AtomicBool::new(false));
         let pump_pending = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(PendingUpdates::default());
+        let outstanding = Arc::new(AtomicUsize::new(0));
 
         let target = WireBinding {
             plugin_id: request.identity.plugin_id.as_str().to_owned(),
@@ -639,6 +658,7 @@ impl BindingHandle {
             stopping: Arc::clone(&stopping),
             pump_pending: Arc::clone(&pump_pending),
             pending: Arc::clone(&pending),
+            outstanding: Arc::clone(&outstanding),
             commands: commands.clone(),
             identity: request.identity.clone(),
         };
@@ -658,6 +678,7 @@ impl BindingHandle {
             stopping,
             pump_pending,
             pending,
+            outstanding,
             ready: Mutex::new(Some(readiness)),
             thread: Mutex::new(Some(thread)),
         })
@@ -887,6 +908,25 @@ impl BindingHandle {
         let _ = self.commands.send(Command::Stop);
     }
 
+    /// Takes one place in the binding's backlog, or says the backlog is full.
+    fn admit(&self) -> RuntimeResult<()> {
+        self.outstanding
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held < MAX_OUTSTANDING_CALLS).then_some(held + 1)
+            })
+            .map(|_held| ())
+            .map_err(|held| RuntimeError::CallBacklog {
+                outstanding: held,
+                limit: MAX_OUTSTANDING_CALLS,
+            })
+    }
+
+    /// Returns how many calls are waiting for the binding's thread.
+    #[must_use]
+    pub fn outstanding_calls(&self) -> usize {
+        self.outstanding.load(Ordering::Acquire)
+    }
+
     async fn dispatch<T, F>(
         &self,
         deadline: core::time::Duration,
@@ -898,12 +938,17 @@ impl BindingHandle {
         if let Some(reason) = self.disabled_reason() {
             return Err(RuntimeError::Disabled { reason });
         }
+        // Admitted against the backlog before anything is built, because what bounds the backlog
+        // is what is allowed into it: a caller whose deadline ran out leaves its request on the
+        // thread, and the thread is the only thing that takes one off.
+        self.admit()?;
         let (answer, reply) = tokio::sync::oneshot::channel();
-        self.commands
-            .send(build(answer))
-            .map_err(|_| RuntimeError::NoSuchBinding {
+        if self.commands.send(build(answer)).is_err() {
+            self.outstanding.fetch_sub(1, Ordering::AcqRel);
+            return Err(RuntimeError::NoSuchBinding {
                 binding: self.request.binding_id.to_string(),
-            })?;
+            });
+        }
         match tokio::time::timeout(deadline, reply).await {
             Ok(Ok(outcome)) => outcome,
             // The thread dropped the answer, which happens when it stops mid-queue.
@@ -947,6 +992,7 @@ struct BindingWorker {
     stopping: Arc<AtomicBool>,
     pump_pending: Arc<AtomicBool>,
     pending: Arc<PendingUpdates>,
+    outstanding: Arc<AtomicUsize>,
     commands: mpsc::Sender<Command>,
     identity: PluginIdentity,
 }
@@ -1006,6 +1052,9 @@ impl BindingWorker {
             match command {
                 Command::Pump => self.pump(),
                 Command::Snapshot(answer) => {
+                    if self.abandoned(&answer) {
+                        continue;
+                    }
                     let owed = self.snapshot_owed();
                     let outcome = self.run_call(CallKind::Snapshot, Instance::snapshot);
                     self.discharge(&outcome, owed);
@@ -1016,12 +1065,18 @@ impl BindingWorker {
                     arguments,
                     answer,
                 } => {
+                    if self.abandoned(&answer) {
+                        continue;
+                    }
                     let outcome = self.run_call(CallKind::PrepareAction, move |instance| {
                         instance.prepare_action(token, arguments)
                     });
                     let _ = answer.send(outcome);
                 }
                 Command::DecodeRequest { event, answer } => {
+                    if self.abandoned(&answer) {
+                        continue;
+                    }
                     let outcome = self.run_call(CallKind::DecodeRequest, move |instance| {
                         instance.decode_request(event)
                     });
@@ -1033,16 +1088,25 @@ impl BindingWorker {
                     event,
                     answer,
                 } => {
+                    if self.abandoned(&answer) {
+                        continue;
+                    }
                     let outcome = self.run_call(CallKind::EncodeResponse, move |instance| {
                         instance.encode_response(*request, decision, event)
                     });
                     let _ = answer.send(outcome);
                 }
                 Command::Checkpoint(answer) => {
+                    if self.abandoned(&answer) {
+                        continue;
+                    }
                     let outcome = self.run_call(CallKind::Checkpoint, Instance::checkpoint);
                     let _ = answer.send(outcome);
                 }
                 Command::Restore { state, answer } => {
+                    if self.abandoned(&answer) {
+                        continue;
+                    }
                     let outcome =
                         self.run_call(CallKind::Restore, move |instance| instance.restore(state));
                     let _ = answer.send(outcome);
@@ -1050,6 +1114,16 @@ impl BindingWorker {
                 Command::Stop => return,
             }
         }
+    }
+
+    /// Releases one call's place in the backlog and says whether its caller is still waiting.
+    ///
+    /// A caller whose deadline ran out has dropped its receiver. Running the component for it would
+    /// spend a call's fuel and elapsed budget on an answer nobody will read, and would put the call
+    /// a live caller is waiting for behind it.
+    fn abandoned<T>(&self, answer: &Answer<T>) -> bool {
+        self.outstanding.fetch_sub(1, Ordering::AcqRel);
+        answer.is_closed()
     }
 
     fn pump(&mut self) {
@@ -1245,7 +1319,7 @@ impl BindingWorker {
         if !error.counts_as_fault() {
             return;
         }
-        let detail = error.to_string();
+        let detail = clipped(error.to_string(), MAX_FAULT_DETAIL_BYTES);
         match self.faults.record(&detail) {
             FaultVerdict::Continue { faults_in_window } => {
                 // The binding survives, and the instance behind it does not: a trap is terminal
@@ -1261,7 +1335,10 @@ impl BindingWorker {
                 });
             }
             FaultVerdict::Disabled { reason } => {
-                let reason = format!("{} is disabled: {reason}", self.identity.plugin_id);
+                let reason = clipped(
+                    format!("{} is disabled: {reason}", self.identity.plugin_id),
+                    MAX_FAULT_DETAIL_BYTES,
+                );
                 if let Ok(mut slot) = self.disabled.lock() {
                     *slot = Some(reason.clone());
                 }
@@ -1344,6 +1421,21 @@ impl BindingWorker {
 
 fn millis(duration: core::time::Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+/// Returns `text`, or as much of it as `limit` bytes hold, said plainly.
+///
+/// Cut at a character boundary, so what a person is shown is still text. The tail is what goes,
+/// because the first words of a failure are the ones that say what happened.
+fn clipped(text: String, limit: usize) -> String {
+    if text.len() <= limit {
+        return text;
+    }
+    let mut end = limit;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} (and {} more bytes)", &text[..end], text.len() - end)
 }
 
 /// Returns what is left of `deadline` after the time since `started`.
@@ -1465,5 +1557,33 @@ mod tests {
     fn the_compilation_origin_distinguishes_a_compile_from_a_cache_load() {
         use crate::runtime::compile::CompileOrigin;
         assert_ne!(CompileOrigin::Compiled, CompileOrigin::Cached);
+    }
+
+    #[test]
+    fn a_fault_detail_a_component_wrote_is_clipped_to_what_a_person_reads() {
+        let short = "the component trapped".to_owned();
+        assert_eq!(clipped(short.clone(), MAX_FAULT_DETAIL_BYTES), short);
+
+        let long = "x".repeat(MAX_FAULT_DETAIL_BYTES * 4);
+        let cut = clipped(long, MAX_FAULT_DETAIL_BYTES);
+        assert!(cut.starts_with(&"x".repeat(MAX_FAULT_DETAIL_BYTES)));
+        assert!(cut.ends_with("more bytes)"));
+
+        // Cut at a character boundary, so the result is still text.
+        let wide = "\u{2014}".repeat(MAX_FAULT_DETAIL_BYTES);
+        let cut = clipped(wide, MAX_FAULT_DETAIL_BYTES);
+        assert!(cut.chars().count() > 0);
+    }
+
+    #[test]
+    fn a_preparation_deadline_is_one_deadline_across_its_stages() {
+        let started = std::time::Instant::now() - core::time::Duration::from_millis(400);
+        let left = remaining_of(started, core::time::Duration::from_millis(1_000))
+            .expect("some of the deadline is left");
+        assert!(left <= core::time::Duration::from_millis(600));
+        // And a stage that overran the whole deadline leaves nothing for the next one.
+        let error = remaining_of(started, core::time::Duration::from_millis(100))
+            .expect_err("the deadline is spent");
+        assert!(matches!(error, RuntimeError::CallerDeadline { .. }));
     }
 }

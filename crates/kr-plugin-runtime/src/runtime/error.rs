@@ -215,6 +215,18 @@ pub enum RuntimeError {
         /// The deadline the caller set.
         deadline_ms: u64,
     },
+    /// The binding already holds as many unanswered calls as it will hold.
+    ///
+    /// A caller whose deadline ran out stops waiting; its request is still on the binding's thread
+    /// until that thread reaches it. Bounding how many can be waiting is what keeps the memory a
+    /// slow component can hold a number rather than a function of how often callers gave up.
+    #[error("the binding already holds {outstanding} of the {limit} calls it will hold at once")]
+    CallBacklog {
+        /// How many calls are waiting.
+        outstanding: usize,
+        /// The bound.
+        limit: usize,
+    },
 }
 
 impl RuntimeError {
