@@ -1970,13 +1970,18 @@ async fn a_listing_names_only_the_sessions_a_grant_admits() {
     daemon.stop().await;
 }
 
-/// KR-REQ-23.25, KR-REQ-23.34, KR-REQ-23.48.
+/// KR-REQ-23.25, KR-REQ-23.34, in part.
 ///
 /// One answer, two doors. What the host does to a method's result before it leaves belongs to the
 /// method, not to the ingress the request arrived on: the grant decides what a device may ask
 /// about, and once it has admitted the subject the device is given the answer the owner's own
 /// socket is given. A second filter on one path and not the other would make the two ingresses
 /// disagree about what the same method means.
+///
+/// What this demonstrates is that parity, for the four reads this daemon answers itself. It is not
+/// evidence about diagnostic redaction or about `session.describe`'s own filtering, and the two
+/// callers are what they are: the environment's owner on one side and a paired device on the
+/// other, because no actor reaches this host through both doors.
 // Ignored by default: this suite starts real processes, and the binary it launches is built by
 // `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
 // silently when that binary was absent would report a pass for something it never ran.
