@@ -189,11 +189,14 @@ pub enum Keyboard {
     /// anything touched it and can therefore be put back exactly.
     #[default]
     Install,
-    /// Nothing about the keyboard is changed, because nobody was allowed to ask this destination
-    /// what it had and nothing else can put back what an install would take away.
+    /// The Kitty keyboard flags are left alone, because nobody was allowed to ask this destination
+    /// what it had and nothing else can put back what an install would take away. The
+    /// `modifyOtherKeys` level is still installed, because `CSI > 4 m` returns a terminal to its
+    /// own initial value whether or not anybody read it first, and the host advertises that
+    /// encoding for an `xterm`-named terminal whatever the probe asked.
     ///
     /// This is what an attachment that asked its terminal nothing is served: the conservative
-    /// profile is one that does not touch what it cannot restore.
+    /// profile is one that does not touch what it cannot put back.
     Withhold,
 }
 
