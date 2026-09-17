@@ -182,6 +182,14 @@ impl ProbeSession {
                 reason: ProbeFailure::DeadlinePassed,
             });
         }
+        if self.complete {
+            // The exchange is over. Everything after the terminator is the person's, whole bytes
+            // and half sequences alike, and it is kept as it arrived rather than run through a
+            // lexer that would hold the incomplete tail of a key they are part way through
+            // pressing.
+            self.typed.extend_from_slice(bytes);
+            return Ok(ProbeProgress::Complete);
+        }
         self.buffered += bytes.len();
         if self.buffered > MAX_REPLY_BYTES {
             return Err(TermError::ProbeFailed {
@@ -213,6 +221,11 @@ impl ProbeSession {
                 self.complete = true;
             }
         }
+        // Whatever the lexer is still holding is the beginning of something the person is part way
+        // through typing. It belongs to them, so the exchange gives it back rather than dropping
+        // it with the lexer: a key half pressed is still a key pressed.
+        self.typed
+            .extend_from_slice(self.lexer.take_pending().as_ref());
         Ok(if self.complete {
             ProbeProgress::Complete
         } else {
@@ -228,6 +241,9 @@ impl ProbeSession {
     /// answer is in flight, and when any question the probe asked went unanswered.
     pub fn finish(self, now_ms: u64) -> Result<ProbeOutcome> {
         if !self.complete {
+            // The typing is still readable through [`ProbeSession::typed`] on the session the
+            // caller still holds, because a failed exchange does not make somebody's keystrokes
+            // nobody's.
             return Err(TermError::ProbeFailed {
                 reason: if now_ms > self.deadline_ms {
                     ProbeFailure::DeadlinePassed

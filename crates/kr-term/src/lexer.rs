@@ -257,6 +257,21 @@ impl Lexer {
         self.pending_len
     }
 
+    /// Takes the incomplete bytes the lexer is holding, leaving it on ground.
+    ///
+    /// For a caller whose stream is not the session's: the probe reads a person's own typing off
+    /// the terminal, and a key they are part way through pressing is still theirs. A session's
+    /// stream never uses this, because there the held bytes are the beginning of a sequence the
+    /// next read completes.
+    pub fn take_pending(&mut self) -> Vec<u8> {
+        let held = core::mem::take(&mut self.pending);
+        self.pending_len = 0;
+        self.pending_truncated = false;
+        self.pending_controls.clear();
+        self.reset_to_ground();
+        held
+    }
+
     /// Offset of the first byte that has not yet been delivered as an event.
     ///
     /// This is the cursor a snapshot, a checkpoint and a live-forwarding handoff all refer to. It
