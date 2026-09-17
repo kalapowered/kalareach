@@ -508,6 +508,39 @@ left between its two commits, so a handle never names a file this host has not f
 
 `docs/transfer/` has the protocol, the limits, the storage layout and the authority model.
 
+## The project service
+
+The daemon also hosts the environment's project service, which owns `projects.sqlite`, the
+repositories the user works in, the working copies selected on them, and every Git invocation this
+host makes. The daemon owns two things about it: admission, and the sessions a workspace is bound to.
+
+Admission is the ordinary path. A project read is checked against current authority before and after
+it runs. A project mutation carries an action window, is checked against the method registry, and
+runs on a task a dropped connection cannot cancel part way. The admission is checked once more
+immediately before the write, for the same reason it is for a transfer: everything in between can
+wait for a blocking thread or for the journal's lock, and an action whose accepted deadline passed
+while it queued does not go on to write. A project acts on neither a session nor a foreground
+application, so an envelope that names one is refused before anything runs.
+
+Some of these calls are long. A clone reaches the network and a materialisation copies files, so
+they run on blocking tasks and the journal's lock is never held across a subprocess. A cancellation
+therefore cannot reach inside a running clone: it sets the operation's flag, and the invocation that
+holds the child process ends the child *it* started, by the handle this process owns.
+
+At startup the service resolves whatever an earlier daemon left unfinished, before anything is
+served. A publication that landed is completed; one that did not is either finished or cleaned up;
+one this host cannot decide is recorded as unresolved with its staging path named rather than
+removed. The question it asks is never whether a name exists but which name holds the object that
+was staged, because the operation row carries that object's filesystem identity and the row's key is
+the caller's own action identifier.
+
+The service cannot know which sessions are bound to a workspace and still live, so the daemon
+answers for that: a workspace with a live bound session refuses removal whatever retention policy
+the request carries.
+
+`docs/project/` has the ten methods, the identity model, the staged publication, the credential rule
+and the restricted Git execution profile.
+
 ## Closure
 
 `session.close` is a state, not a request to exit.

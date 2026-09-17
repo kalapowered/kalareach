@@ -79,6 +79,7 @@ suites=(
   "kr-worker:session|a real shell, its closure, and the input lease"
   "kr-controller:contracts|the two contracts the transport names: a revocable registration and a durable commit that outlives its caller"
   "kr-controller:envelope|what the daemon accepts on its client endpoint"
+  "kr-controller:project|real repositories through the daemon: a clone, an adoption, a workspace with its inclusion preview, a verified download into it, and a daemon killed mid-clone whose destination is untouched"
   "kr-cli:attach|a killed attachment restoring its terminal, and a detach from another window"
   "kr-controller:network|a device pairing over iroh and over a relay, attaching, subscribing from a cursor, typing under the input lease, reconnecting, being revoked mid-connection, and losing its path without taking the session with it"
 )

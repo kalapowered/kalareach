@@ -2957,6 +2957,7 @@ dependencies = [
  "kr-crypto",
  "kr-ipc",
  "kr-pairing",
+ "kr-project",
  "kr-protocol",
  "kr-transfer",
  "kr-transport",
@@ -2965,6 +2966,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
 ]

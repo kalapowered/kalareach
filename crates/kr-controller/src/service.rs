@@ -148,6 +148,8 @@ pub struct Controller {
     supervisor: Box<dyn WorkerSupervisor>,
     /// The environment's transfer service, whose methods this daemon admits and dispatches.
     transfer: Arc<crate::transfer::TransferModule>,
+    /// The environment's project service, whose methods this daemon admits and dispatches.
+    project: Arc<crate::project::ProjectModule>,
     worker_program: PathBuf,
     build_id: BuildId,
     release: String,
@@ -190,6 +192,7 @@ impl Controller {
         let clock = Arc::new(SystemContinuousClock::new());
         let authority_revision = registry.authority_revision()?;
         let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths).await?);
+        let project = Arc::new(crate::project::ProjectModule::open(&setup.paths).await?);
         let controller = Arc::new(Self {
             registry: Mutex::new(registry),
             directory: Mutex::new(Directory::default()),
@@ -208,6 +211,7 @@ impl Controller {
             network: std::sync::OnceLock::new(),
             supervisor: setup.supervisor,
             transfer,
+            project,
             // The executable the daemon was told to start, resolved here rather than at the
             // launch: a worker runs in a directory of its own, so a relative name would be looked
             // for beneath that instead of beneath the directory this daemon was started in.
@@ -751,6 +755,12 @@ impl Controller {
         &self.transfer
     }
 
+    /// Returns the environment's project service.
+    #[must_use]
+    pub const fn project(&self) -> &Arc<crate::project::ProjectModule> {
+        &self.project
+    }
+
     /// Returns the registry, for a module that needs to read the environment's own records.
     pub(crate) const fn registry_handle(&self) -> &Mutex<Registry> {
         &self.registry
@@ -1158,6 +1168,9 @@ impl Controller {
             _ if crate::transfer::TransferModule::serves(method) => {
                 crate::transfer::TransferModule::check_subject(method, mutation)?;
             }
+            _ if crate::project::ProjectModule::serves(method) => {
+                crate::project::ProjectModule::check_subject(method, mutation)?;
+            }
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
                     "{} is not a mutation this daemon serves",
@@ -1416,6 +1429,11 @@ impl Controller {
         {
             return retained;
         }
+        if crate::project::ProjectModule::serves(method)
+            && let Some(retained) = self.project.retained(actor_id, &mutation, method).await
+        {
+            return retained;
+        }
         let accepted = match self.check_envelope(connection_id, &mutation, method) {
             Ok(accepted) => accepted,
             Err(error) => {
@@ -1452,6 +1470,9 @@ impl Controller {
         };
         if crate::transfer::TransferModule::serves(method) {
             return self.transfer.read_frame(actor_id, request).await;
+        }
+        if crate::project::ProjectModule::serves(method) {
+            return self.project.read_frame(request).await;
         }
         let outcome = match method {
             Method::HostInfo => self.host_info().await,
@@ -1511,6 +1532,29 @@ impl Controller {
                 );
             }
             return self.transfer.write_frame(actor_id, mutation, method).await;
+        }
+        if crate::project::ProjectModule::serves(method) {
+            // Everything between the envelope check and this point can wait: for this task to be
+            // scheduled and for a blocking thread. An action whose accepted deadline passed while
+            // it queued does not go on to write, and neither does one whose connection lost its
+            // authority in the meantime.
+            if self.clock.now() >= accepted.deadline {
+                return respond(
+                    mutation.request_id,
+                    Err(ControllerError::WindowExpired {
+                        detail: "the deadline this action was admitted under passed before it                                  could run"
+                            .to_owned(),
+                    }),
+                );
+            }
+            if let Err(error) = self.authorised(connection_id).await {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    error.to_string(),
+                );
+            }
+            return self.project.write_frame(actor_id, mutation, method).await;
         }
         let outcome = match method {
             Method::SessionCreate => {

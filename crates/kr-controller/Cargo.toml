@@ -20,6 +20,7 @@ kr-crypto.workspace = true
 kr-ipc.workspace = true
 kr-pairing.workspace = true
 kr-protocol.workspace = true
+kr-project.workspace = true
 kr-transfer.workspace = true
 kr-transport.workspace = true
 kr-worker.workspace = true
@@ -38,6 +39,7 @@ kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 kr-transfer.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
+tempfile.workspace = true
 
 [lints]
 workspace = true

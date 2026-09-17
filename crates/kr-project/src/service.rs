@@ -251,6 +251,10 @@ impl ProjectService {
                 }
             }
         }
+        // A sibling is created before the row that names it is updated, so a daemon that died in
+        // that window leaves one nothing accounts for. Recovery runs before anything is served, so
+        // no operation is in flight and a sibling no row names is one of those.
+        recovery.staging_removed += self.sweep_unaccounted_staging()?;
         // A workspace whose materialisation did not finish is left as it is rather than removed:
         // its working files are the user's, and this host does not know which of them are.
         let unfinished = self
@@ -261,6 +265,55 @@ impl ProjectService {
             .count();
         recovery.materialisations_unfinished = u64::try_from(unfinished).unwrap_or(u64::MAX);
         Ok(recovery)
+    }
+
+    /// Removes every staging sibling no operation row names, in the parents this host has used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the journal cannot be read.
+    fn sweep_unaccounted_staging(&self) -> Result<u64> {
+        let rows = self.locked()?.operations_in(&[
+            OperationState::Staging,
+            OperationState::Publishing,
+            OperationState::Completed,
+            OperationState::Cancelled,
+            OperationState::Failed,
+            OperationState::Expired,
+            OperationState::Unknown,
+        ])?;
+        let accounted: std::collections::BTreeSet<&str> = rows
+            .iter()
+            .filter_map(|row| row.staging_name.as_deref())
+            .collect();
+        let parents: std::collections::BTreeSet<&str> =
+            rows.iter().map(|row| row.parent_path.as_str()).collect();
+        let mut removed = 0_u64;
+        for parent in parents {
+            let Ok(directory) =
+                kr_transfer::AuthorisedDirectory::open_root(self.environment_id, Path::new(parent))
+            else {
+                continue;
+            };
+            let Ok(entries) = directory.handle().entries() else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if !name.starts_with(crate::operation::STAGING_PREFIX)
+                    || accounted.contains(name.as_str())
+                {
+                    continue;
+                }
+                if directory.handle().remove_dir_all(&name).is_ok() {
+                    removed += 1;
+                }
+            }
+            let _ = directory.sync();
+        }
+        Ok(removed)
     }
 
     fn resolve_operation(&self, row: &OperationRow) -> Result<ResolvedStep> {
@@ -407,6 +460,24 @@ impl ProjectService {
                 .record_staging_path(row.action_id, &path.display().to_string(), true)?;
         }
         Ok(())
+    }
+
+    /// Records the staging sibling on the operation row and among its paths.
+    ///
+    /// The name goes on to the row as soon as the directory exists, because a replacement daemon
+    /// finds the directory through the row: a name recorded only when the publication began would
+    /// leave a sibling nothing accounts for if the daemon died before then.
+    fn record_staging(&self, row: &OperationRow, staging: &StagingSibling) -> Result<()> {
+        let store = self.locked()?;
+        store.set_operation_state(
+            row.action_id,
+            OperationState::Staging,
+            None,
+            None,
+            None,
+            Some(staging.name()),
+        )?;
+        store.record_staging_path(row.action_id, &staging.path().display().to_string(), false)
     }
 
     /// Returns the digest the claim of one operation's action was recorded with.
@@ -705,11 +776,7 @@ impl ProjectService {
             }
             CreatePlan::Initialise { initial_branch } => {
                 let staging = StagingSibling::create(destination)?;
-                self.locked()?.record_staging_path(
-                    row.action_id,
-                    &staging.path().display().to_string(),
-                    false,
-                )?;
+                self.record_staging(row, &staging)?;
                 stage_init(&self.profile, &staging, initial_branch.as_deref(), cancel)?;
                 let staged = staging.staged_identity()?;
                 self.locked()?.set_operation_state(
@@ -725,11 +792,7 @@ impl ProjectService {
             }
             CreatePlan::Clone { remote } => {
                 let staging = StagingSibling::create(destination)?;
-                self.locked()?.record_staging_path(
-                    row.action_id,
-                    &staging.path().display().to_string(),
-                    false,
-                )?;
+                self.record_staging(row, &staging)?;
                 stage_clone(&self.profile, &staging, remote, cancel)?;
                 let staged = staging.staged_identity()?;
                 self.locked()?.set_operation_state(

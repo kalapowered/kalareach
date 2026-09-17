@@ -17,10 +17,12 @@
 //! | [`directory`] | The verified directory of workers, rebuilt by challenge after a restart |
 //! | [`service`] | Admission, the rendezvous and the local endpoint |
 //! | [`transfer`] | The environment's transfer service, its attachment-chunk endpoint and its sweep |
+//! | [`project`] | The environment's project service: repositories, workspaces and the restricted Git profile |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
 pub mod directory;
 pub mod error;
+pub mod project;
 pub mod registry;
 pub mod service;
 pub mod singleton;
