@@ -309,7 +309,10 @@ impl Supervision {
 
 #[cfg(test)]
 mod tests {
-    use super::{Activity, IDLE_SWEEP_INTERVAL, OBSERVE_INTERVAL, Supervision, Sweep, Wake};
+    use super::{
+        Activity, CHILD_POLL_INTERVAL, ChildExits, IDLE_SWEEP_INTERVAL, OBSERVE_INTERVAL,
+        Supervision, Sweep, Wake,
+    };
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -396,6 +399,20 @@ mod tests {
                 return Instant::now();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_host_with_no_child_signal_asks_the_shell_itself_rather_than_waiting_for_the_sweep() {
+        // What a host without a child signal falls back to, which is the one thing that decides how
+        // long an exit can go unnoticed there. It is the short poll, not the sweep: Windows reports
+        // a process ending on a handle this module cannot wait on, and a session whose shell had
+        // left would otherwise stay live for half a minute.
+        assert_eq!(ChildExits(None).patience(), CHILD_POLL_INTERVAL);
+        assert_eq!(
+            ChildExits::open().patience(),
+            IDLE_SWEEP_INTERVAL,
+            "and where the signal is there, the clock is only the backstop behind it"
+        );
     }
 
     #[tokio::test]

@@ -246,33 +246,80 @@ mod platform {
     /// Where this platform's start value comes from.
     pub(super) const START_IDENTITY_SOURCE: ProcessStartSource = ProcessStartSource::LinuxProcStat;
 
+    /// The number of threads the thread group still has, field 20 of the line.
+    const STAT_THREADS: usize = 17;
+
     /// Returns whether a process whose identity still matches is running or waiting to be collected.
     ///
     /// Linux keeps the `/proc` entry of a process that has exited until its parent collects its
-    /// status, and the state character says so: `Z` is a process that has ended and whose exit
-    /// status nobody has taken. Reporting it as running would put it in a closure record as a
-    /// surviving resource, and it is not surviving; it is waiting.
+    /// status, and the state character says so: `Z` is a thread-group leader that has ended and
+    /// whose exit status nobody has taken. Reporting it as running would put it in a closure record
+    /// as a surviving resource, and it is not surviving; it is waiting.
     ///
-    /// The state and the start value are taken from one reading of one line, so the answer is about
-    /// one process. Reading them separately would leave room for the identifier to be collected and
-    /// given to something else in between, and the state of that something else is not an answer
-    /// about this process.
+    /// `Z` alone is not the whole answer, because a leader that calls `pthread_exit` is `Z` while
+    /// the rest of its threads carry on running: the kernel keeps the leader as a zombie so the
+    /// identifier stays valid for the group. Such a process is running, and signalling it still
+    /// reaches the threads that are. So the thread count goes with the state, and only a zombie
+    /// leader whose group has nothing left is reported as ended.
+    ///
+    /// Everything this needs comes from one reading of one line, so the answer is about one
+    /// process. Reading the state and the start value separately would leave room for the
+    /// identifier to be collected and given to something else in between, and the state of that
+    /// something else is not an answer about this process.
     pub(super) fn liveness(pid: u32, start_value: u64) -> super::ProcessState {
         let path = format!("/proc/{pid}/stat");
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            // It left between the reading that matched and this one.
-            return super::ProcessState::Ended;
+        match std::fs::read_to_string(&path) {
+            Ok(text) => decide(&text, start_value),
+            // A missing entry is a process that has gone. Every other failure - a descriptor limit,
+            // a permission, a kernel that would not answer - proves nothing, and answering "ended"
+            // to it would retire a live worker or leave a survivor out of a closure record.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                super::ProcessState::Ended
+            }
+            Err(error) => super::ProcessState::Unknown {
+                detail: format!("{path}: {error}"),
+            },
+        }
+    }
+
+    /// Reads one `/proc/<pid>/stat` line and says what it says about the process that was recorded.
+    fn decide(text: &str, start_value: u64) -> super::ProcessState {
+        let Some(start) = parse_start_ticks(text) else {
+            return super::ProcessState::Unknown {
+                detail: "a /proc stat line without a start time".to_owned(),
+            };
         };
-        if parse_start_ticks(&text) != Some(start_value) {
+        if start != start_value {
             // The identifier belongs to something else now, which means the process that was
             // recorded has gone.
             return super::ProcessState::Ended;
         }
-        match state_character(&text) {
-            Some('Z') => super::ProcessState::Ended,
-            // A state this reader does not recognise is not a death. The entry is there and the
-            // identity matched, so the process is the one that was recorded.
-            _ => super::ProcessState::Running,
+        let Some(state) = state_character(text) else {
+            return super::ProcessState::Unknown {
+                detail: "a /proc stat line without a state".to_owned(),
+            };
+        };
+        match state {
+            // A zombie leader is the group's only remaining thread or it is not. One is a process
+            // waiting to be collected; the other is a process still running under a leader that
+            // has left.
+            'Z' => match stat_field(text, STAT_THREADS) {
+                Some(1) => super::ProcessState::Ended,
+                Some(_) => super::ProcessState::Running,
+                None => super::ProcessState::Unknown {
+                    detail: "a /proc stat line without a thread count".to_owned(),
+                },
+            },
+            // The kernel prints these for a process that has been reaped, which is a state no
+            // reader of `/proc` should meet; it is not a live process either way.
+            'X' | 'x' => super::ProcessState::Ended,
+            // Running, sleeping, waiting on disk, stopped, traced or idle: all of them are a
+            // process that is there. A letter this reader has never heard of is not a death, but it
+            // is not something to claim either.
+            'R' | 'S' | 'D' | 'T' | 't' | 'W' | 'P' | 'I' | 'K' => super::ProcessState::Running,
+            other => super::ProcessState::Unknown {
+                detail: format!("a /proc stat line whose state is `{other}`"),
+            },
         }
     }
 
@@ -398,7 +445,19 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
-        use super::parse_start_ticks;
+        use super::{decide, parse_start_ticks};
+        use crate::identity::ProcessState;
+
+        /// Builds a `/proc/<pid>/stat` line with the state, thread count and start time given.
+        ///
+        /// The fields between them are a real line's, so the indices this module counts are the
+        /// indices the kernel writes.
+        fn line(state: &str, threads: u32, start: u64) -> String {
+            format!(
+                "42 (od d) ne) {state} 1 42 42 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 {threads} 0 \
+                 {start} 0 0 0 0 0"
+            )
+        }
 
         #[test]
         fn a_name_containing_spaces_and_parentheses_does_not_shift_the_fields() {
@@ -406,6 +465,68 @@ mod platform {
                 String::from("42 (od d) ne) S 1 42 42 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 1 0 ");
             line.push_str("987654 0 0 0 0 0");
             assert_eq!(parse_start_ticks(&line), Some(987_654));
+        }
+
+        #[test]
+        fn a_sleeping_process_is_running_and_a_collected_one_is_not() {
+            assert_eq!(
+                decide(&line("S", 1, 987_654), 987_654),
+                ProcessState::Running
+            );
+            assert_eq!(
+                decide(&line("R", 8, 987_654), 987_654),
+                ProcessState::Running
+            );
+            assert_eq!(decide(&line("X", 1, 987_654), 987_654), ProcessState::Ended);
+        }
+
+        #[test]
+        fn a_zombie_leader_is_ended_only_when_its_group_has_nothing_left() {
+            assert_eq!(
+                decide(&line("Z", 1, 987_654), 987_654),
+                ProcessState::Ended,
+                "a process waiting to be collected has ended"
+            );
+            assert_eq!(
+                decide(&line("Z", 4, 987_654), 987_654),
+                ProcessState::Running,
+                "a leader that left its threads running has not: the process is still executing, \
+                 and signalling it still reaches them"
+            );
+        }
+
+        #[test]
+        fn an_identifier_that_now_belongs_to_something_else_has_ended() {
+            assert_eq!(
+                decide(&line("R", 1, 987_655), 987_654),
+                ProcessState::Ended,
+                "the start time is not the one that was recorded"
+            );
+        }
+
+        #[test]
+        fn a_line_this_reader_cannot_account_for_is_not_a_death() {
+            // Each of these is a reading that establishes nothing, and nothing must never be
+            // reported as ended: a recovery path that took it for death would retire a live worker,
+            // and a closure record would leave out a process it should have listed.
+            let unaccountable = [
+                ("no start time", "42 (sh) S 1 42".to_owned()),
+                ("no state", "42 (sh)".to_owned()),
+                ("an unknown state", line("Q", 1, 987_654)),
+                (
+                    "a thread count that is not a number",
+                    format!(
+                        "42 (sh) Z 1 42 42 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 many 0 987654 0 0 0 \
+                         0 0"
+                    ),
+                ),
+            ];
+            for (what, text) in unaccountable {
+                assert!(
+                    matches!(decide(&text, 987_654), ProcessState::Unknown { .. }),
+                    "{what} says nothing, so the answer is that nothing is known"
+                );
+            }
         }
     }
 }
@@ -623,6 +744,38 @@ mod tests {
         assert_eq!(process_state(&altered), ProcessState::Ended);
     }
 
+    /// Waits until a child has ended without collecting its status, using the platform's own view
+    /// of it rather than the reading under test.
+    ///
+    /// On Linux the state character of `/proc/<pid>/stat` becomes `Z`; on macOS the kernel stops
+    /// describing the process, which `libproc` reports as "No such process". Collecting the status
+    /// is what would remove the case, so nothing here does.
+    #[cfg(unix)]
+    fn wait_until_it_has_ended(pid: u32) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            #[cfg(target_os = "linux")]
+            let ended = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|text| {
+                    let tail = text.rfind(')').map(|end| text[end + 1..].to_owned())?;
+                    tail.split_whitespace().next()?.chars().next()
+                })
+                .is_some_and(|state| state == 'Z');
+            #[cfg(not(target_os = "linux"))]
+            let ended = process_start_identity(pid).is_err();
+            if ended {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a shell told to exit does so"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_process_that_has_ended_is_named_rather_than_left_unavailable() {
         // The case a host meets when what it started leaves at once, and the state each platform
@@ -639,19 +792,28 @@ mod tests {
             .spawn()
             .expect("spawns a child that leaves at once");
         let pid = child.id();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let named = loop {
-            let named = started_process_identity(pid).expect("the host names what it started");
-            assert_eq!(named.pid.get(), u64::from(pid));
-            if process_state(&named) == ProcessState::Ended {
-                break named;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "a shell told to exit does so"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        };
+        wait_until_it_has_ended(pid);
+
+        let named = started_process_identity(pid).expect("the host names what it started");
+        assert_eq!(named.pid.get(), u64::from(pid));
+        #[cfg(target_os = "linux")]
+        assert_ne!(
+            named.start_value.get(),
+            START_VALUE_UNREAD,
+            "this platform still describes a process whose status nobody has collected, so the \
+             reading is the kernel's own"
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(
+            named.start_value.get(),
+            START_VALUE_UNREAD,
+            "this platform stops describing a process at its exit, so there was no reading to take"
+        );
+        assert_eq!(
+            process_state(&named),
+            ProcessState::Ended,
+            "either way the answer is that the process has ended"
+        );
 
         // The status is still there to collect, which is what makes the reading above a reading of
         // an uncollected process rather than of one that had already been reaped.

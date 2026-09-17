@@ -1495,13 +1495,34 @@ async fn a_shell_that_has_already_ended_is_a_closed_session_rather_than_a_failed
         Some(3),
         "with the status the shell left, read from the child rather than guessed"
     );
+    let root = record
+        .terminated
+        .iter()
+        .find(|process| process.name.0.as_deref() == Some("the session's root shell"))
+        .unwrap_or_else(|| {
+            panic!(
+                "the record names the shell it stopped: {:?}",
+                record.terminated
+            )
+        });
+    assert_eq!(
+        Some(&root.identity),
+        runtime.session().root_identity().as_ref(),
+        "and the identity in the record is the one the host held for the shell"
+    );
     assert!(
-        record
-            .terminated
-            .iter()
-            .any(|process| process.name.0.as_deref() == Some("the session's root shell")),
-        "and the record names the shell it stopped: {:?}",
-        record.terminated
+        !root.forced,
+        "a shell that had already left was not forced to: {root:?}"
+    );
+    assert_eq!(
+        record.ownership_coverage,
+        OwnershipCoverage::Incomplete,
+        "the boundary is a terminal process group, which never claims complete coverage"
+    );
+    assert!(
+        record.surviving.is_empty(),
+        "and nothing is left behind: {:?}",
+        record.surviving
     );
 }
 
