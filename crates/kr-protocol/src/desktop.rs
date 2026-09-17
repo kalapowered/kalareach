@@ -262,7 +262,8 @@ pub struct DesktopContext {
     /// Whether this context has the login session's graphical access.
     ///
     /// An invisible session keeps it: presentation does not decide it. A headless user context
-    /// does not have it, because it is not in a graphical login at all.
+    /// reports `false`, because it takes no login session; that says none of a desktop reached it
+    /// and not that the platform has put a desktop beyond its reach.
     pub graphic_access: bool,
     /// Whether the login session is a remote one, such as a Windows RDP session.
     pub remote: bool,

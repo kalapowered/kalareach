@@ -2696,7 +2696,7 @@
           "description": "What the generation was read from."
         },
         "graphic_access": {
-          "description": "Whether this context has the login session's graphical access.\n\nAn invisible session keeps it: presentation does not decide it. A headless user context\ndoes not have it, because it is not in a graphical login at all.",
+          "description": "Whether this context has the login session's graphical access.\n\nAn invisible session keeps it: presentation does not decide it. A headless user context\nreports `false`, because it takes no login session; that says none of a desktop reached it\nand not that the platform has put a desktop beyond its reach.",
           "type": "boolean"
         },
         "kind": {

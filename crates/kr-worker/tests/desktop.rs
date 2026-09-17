@@ -1034,8 +1034,9 @@ async fn the_desktop_a_session_was_created_on_is_readable_after_its_worker_has_g
     daemon.stop().await;
 }
 
-/// KR-REQ-03.24, KR-REQ-07.59: a headless session has no inherited graphical access, and this host
-/// reports whether its configured per-user service survives logout rather than assuming it.
+/// KR-REQ-03.24, KR-REQ-07.59: a headless session is bound to no desktop and inherits none of a
+/// desktop's handles, and this host reports whether its configured per-user service survives
+/// logout rather than assuming it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_headless_session_inherits_no_graphical_access_and_logout_is_reported_per_platform() {
     let host = Host::create();

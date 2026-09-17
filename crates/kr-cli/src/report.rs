@@ -293,7 +293,7 @@ pub fn desktop_line(summary: &SessionSummary) -> String {
             summary.worker_profile.as_str()
         ),
         None => format!(
-            "execution context {}: no desktop, so no inherited graphical access",
+            "execution context {}: no desktop, and none of a desktop's handles",
             summary.worker_profile.as_str()
         ),
     }

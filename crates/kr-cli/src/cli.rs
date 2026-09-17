@@ -90,7 +90,8 @@ pub struct Execution {
     /// Run in this host's current desktop. The session closes when that desktop's login ends.
     #[arg(long)]
     pub desktop: bool,
-    /// Run in this host's headless user context, with no inherited graphical access.
+    /// Run in this host's headless user context, which is bound to no desktop and is given none
+    /// of a desktop's handles.
     #[arg(long)]
     pub headless: bool,
 }
