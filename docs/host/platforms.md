@@ -22,8 +22,15 @@ hands out the same number.
 | The login session | the Aqua security session behind the user's graphical launchd domain | the login manager's session for the user's graphical login | the interactive logon session |
 | Read through | `launchctl print gui/<uid>`, whose handle is the security session and whose creator is the process below | `loginctl show-session`, for the session the login manager reports as the user's display | the task listing, for the session the worker's own process runs in |
 | The owning process | `loginwindow` | the session leader | that session's `winlogon` |
-| Also reported | whether the domain is the graphical one | the session type (X11 or Wayland), its desktop environment, its state and its locked hint | whether the session is a remote desktop one |
-| Not read | the screen's lock state: macOS does not publish one this host can read without involving the person at the machine, so a locked Aqua session reads as present, which is the answer a bound session needs: its session and its processes keep running | | container membership |
+| Also reported | whether the domain is the graphical one, and whether the screen is locked (the window server publishes that while it is, and nothing while it is not) | the session type (X11 or Wayland), its desktop environment, its state and its locked hint | whether the session is a remote desktop one |
+| Not read | | | whether the session is attended, locked or disconnected, so its availability reads as unknown rather than as a screen that is there for the taking |
+
+A reading that names a login session but not its generation is not a desktop. The platform session
+number alone cannot tell one login from the next one given that number, so a context built on it
+would say a session created in one login belongs to another. Such a reading is treated as this host
+not having found out, which is a third answer and not the same as there being no desktop: a
+desktop-bound session closes when the platform says its login has gone, and not when the platform
+declines to answer.
 
 A session records that identity when it is created, and `kr status` prints it. A worker asks one
 question afterwards, on every wake of its supervision: is the process that owns my login session
@@ -38,13 +45,18 @@ session ends, the session closes with `desktop_lost` and you create a new one.
 
 | Platform | `desktop_bound` | `headless_user` |
 | --- | --- | --- |
-| macOS | ends with the graphical login. A job in the graphical domain is torn down with the domain, which is what a logout does to it | ends with the logout as well. macOS ends a user's agents when the user logs out, including one loaded into the background domain; only a system-level daemon survives, and that is not a per-user execution context |
+| macOS | ends with the graphical login. The worker's job is bootstrapped into the user's graphical domain, and a logout tears that domain down | ends with the logout as well, and it is started outside the graphical login: its job goes into the background domain, so it has no Aqua access to inherit in the first place. macOS still ends a user's agents when the user logs out, including a background one; only a system-level daemon survives, and that is not a per-user execution context |
 | Linux | ends with the graphical login session | survives logout only while lingering is enabled for the user, which keeps the user's service manager running. It is off unless somebody enables it |
 | Windows | ends with the sign-out of the interactive session | ends with the sign-out. A per-user task runs in the user's own session and stops with it; work that must outlive a sign-out needs a service under an account granted the right to log on as a service |
 
 `kr doctor` and `environment.capabilities` report the answer for the host you are on rather than
 the one this table says you probably have. The answer names the service mechanism it is about, and
 a claim that a headless session survives logout also names what makes it survive.
+
+On a host with no per-user service manager the fallback is a detached process in its own process
+group, reparented to the system's first process. A worker started that way is in whatever login
+context the control daemon is in, so a headless session there has the desktop's variables stripped
+rather than a login context of its own. `kr doctor` reports that as what it is.
 
 ### Enabling persistence on Linux
 
@@ -63,9 +75,15 @@ session still running then ends with the next logout.
 ## What a reboot does
 
 A reboot ends the live executions of both profiles: a desktop-bound worker went with its login
-session and a headless one went with the machine. Sessions published in an earlier boot are closed
-as the control daemon starts, before it tries to recover anything, and their records say the host
-restarted rather than describing a worker that vanished.
+session and a headless one went with the machine. Every session recorded in an earlier boot is
+closed as the control daemon starts, before it tries to recover anything, and their records say the
+host restarted rather than describing a worker that vanished.
+
+The boot each environment last ran in is kept in a `boot` file in its own state directory, beside
+the registry. That is the only place that survives what a reboot removes: on most hosts the runtime
+directory is cleared with the boot it belonged to, taking the published descriptors with it, so a
+daemon that compared descriptors would find nothing to compare after exactly the event it was
+looking for.
 
 ## Containers and Windows Subsystem for Linux
 
@@ -91,11 +109,29 @@ kr host power --set battery_too      # the same on battery, which is a separate 
 kr host power --set off              # the default
 ```
 
+The setting is per-user host configuration, kept in `power.json` in the environment's own state
+directory, which `kr doctor` prints the path of. The document carries its own version, and a
+document whose version this build does not know is left alone and read as off rather than guessed
+at. Writing it installs no service, obtains no privilege and changes nothing else about the
+machine.
+
+```json
+{
+  "version": 1,
+  "sleep_inhibition": "mains_only"
+}
+```
+
 With the setting on, an assertion is held while the host has verified foreground work or a request
 it has accepted and not answered: an agent working, a decision waiting for an answer, or a closure
 still stopping processes and draining their output. An idle shell is not work, however much output
 it has produced. The assertion is released when that ends, and `kr status`, `kr doctor` and
 `kr host power` all print what is held and why.
+
+Work begins and ends without the host being told, so while the setting is on the host looks at the
+question every fifteen seconds as well as whenever a session is created or closed. That interval is
+the bound on how long after work ends an assertion can still be held. While the setting is off
+nothing looks at anything.
 
 | Platform | The facility | What it asks for |
 | --- | --- | --- |
@@ -127,12 +163,22 @@ reports the same process, so the two can be compared.
 Selecting a desktop is not evidence that anything may be done on it. `environment.capabilities`
 answers each capability separately, says what produced the answer, and says what makes it stale.
 
-| Platform | Established without asking the person for anything | Left as `not_tested` |
-| --- | --- | --- |
-| macOS | the display server, and launching an application, which needs no privacy permission | a screen image, synthetic input and the accessibility tree. Each needs a permission granted per signed application, and the check that would establish it is the operation itself, so performing it is what asks the person at the machine. The setup assistant runs those checks with them present |
-| Linux, X11 | all of them, where a tool for them is installed: a client holding the display and its authority needs no further permission | nothing, unless this host could not name the display server |
-| Linux, Wayland | a screen image and synthetic input where the compositor implements the protocols the installed tool uses, which `sway`, `river`, `hyprland`, `wayfire`, `labwc` and `niri` do | the same two on a compositor that asks the user for them each time instead, such as GNOME's screen-sharing portal. The answer names the compositor and the tool it is about |
-| Windows | the display server, and launching an application in the interactive session | a screen image, synthetic input and the accessibility tree, which are checks that belong with the person present, because an unattended probe would act on whatever is on the screen |
+Nothing here performs the operation a capability is, and nothing here changes a screen, a clipboard
+or an input queue. What a platform query can do is refuse a capability, and what it cannot do is
+establish one: on every platform the operation itself is the check. So each record says which of
+those happened.
+
+| Platform | Established | Refused, with the reason | Left as `not_tested` |
+| --- | --- | --- | --- |
+| macOS | the display server, and launching an application, which needs no privacy permission | a capability whose facility is not installed | a screen image, synthetic input and the accessibility tree. Each needs a permission granted per signed application; this host neither performs the operation nor reads the permission, so it says so |
+| Linux, X11 | the display server and launching an application | a context with no display or authority, which cannot reach the X server at all; a capability with no tool installed | a screen image and synthetic input where a tool is installed and this context holds the display. X11 grants those to any client that holds it, and nothing here has opened it |
+| Linux, Wayland | the display server and launching an application | a compositor that asks the user for the operation each time, such as GNOME's screen-sharing portal, which is a permission the user grants rather than one a tool holds; a capability with no tool installed | a screen image or synthetic input on a compositor that implements the protocols the installed tool uses, which `sway`, `river`, `hyprland`, `wayfire`, `labwc` and `niri` do. The answer names the compositor, the tool and the operation |
+| Windows | the display server, and launching an application in the interactive session | a capability whose facility is not installed | a screen image, synthetic input and the accessibility tree, which act on whatever is on the screen |
+
+Each record also names the exact facility it is about, by path and by that file's size and
+modification time, so a tool replaced at the same path invalidates the answer rather than silently
+changing what the answer was about. The revision every record carries advances whenever any of this
+changes, which is what an action binding to an answer rechecks.
 
 A locked desktop refuses the screen and keeps the session: the capability says
 `temporarily_unavailable` and the session and its processes are unaffected. A session with no

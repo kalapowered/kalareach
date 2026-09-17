@@ -131,13 +131,21 @@ The service manager reports a process identifier as soon as it has spawned the p
 be before the kernel will describe it. The daemon retries briefly rather than refusing a worker
 that started perfectly well.
 
-Two of those platforms place a per-user job in the login session that started it, so a desktop-bound
-worker is in the graphical login by construction. Linux does not: a user service manager started at
-boot has no display, no compositor socket and no session message bus, because those belong to a
-graphical login that happened later. So a desktop-bound worker's transient unit is given the
-graphical session's own handles explicitly, read back from where the desktop session publishes them.
-A headless worker is given none of them, which is the profile working as intended rather than an
-omission.
+The profile decides which login context a worker is started in, not only which variables it is
+given. On macOS a desktop-bound worker's job goes into the user's graphical domain and a headless
+one's into the background domain, because a headless worker inside the graphical login would have
+that login's access however little of its environment it was given. Windows starts a worker in the
+session its per-user agent runs in.
+
+Linux places a job in no login session at all: a user service manager started at boot has no
+display, no compositor socket and no session message bus, because those belong to a graphical login
+that happened later. So a desktop-bound worker's transient unit is given the graphical session's own
+handles explicitly, read back from where the desktop session publishes them. A headless worker is
+given none of them.
+
+The fallback supervisor, which a host with no service manager uses, has no domains to choose
+between: a worker it starts is in whatever login context this daemon is in, and a headless worker
+there has the desktop's variables stripped rather than a login context of its own.
 
 What a logout does to a worker of either profile is the platform's answer, and
 `docs/host/platforms.md` records it per platform along with the explicit setting that changes it on
@@ -227,8 +235,10 @@ and what it will not tell this host.
 A desktop is not a permission. Screen capture and input injection each need an operating-system
 permission that selecting a desktop does not carry, and `environment.capabilities` answers each of
 them separately, in the shared capability-evidence shape, saying what produced the answer and what
-makes it stale. There is no general desktop-control interface here: desktop automation means the
-user's own tools running in the selected context under the permissions they were actually granted.
+makes it stale. Nothing there performs the operation a capability is: a platform query can refuse a
+capability and cannot establish one, so an answer nothing has run says exactly that. There is no
+general desktop-control interface here either: desktop automation means the user's own tools
+running in the selected context under the permissions they were actually granted.
 
 ## Sleep
 
@@ -238,9 +248,15 @@ only, or battery as well.
 
 With it on, the host holds the platform's own assertion against automatic sleep while it has
 verified foreground work or a request it has accepted and not answered, and releases it when that
-ends. Host status, `kr status` and `kr doctor` each print what is held and why. The assertion is
-held by running the platform's facility as a child with a pipe on its input, so releasing it is
-closing the pipe and a daemon that dies releases everything it held.
+ends. Work begins and ends without this daemon being told, so while the setting is on it looks at
+the question every fifteen seconds as well as whenever a session is created or closed; while the
+setting is off nothing looks at anything. Host status, `kr status` and `kr doctor` each print what
+is held and why.
+
+The assertion is held by running the platform's facility as a child with a pipe on its input, so
+releasing it is closing the pipe and a daemon that dies releases everything it held. A facility
+that has already exited holds nothing, so one that does is reported as an assertion this host does
+not have rather than as one it does.
 
 An assertion asks the operating system not to sleep on its own. It does not stop a closed lid, a
 forced sleep or a platform policy that overrides the request, and none of those need to be stopped:

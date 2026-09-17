@@ -515,10 +515,13 @@ A closed session carries its record instead of a null:
 }
 ```
 
-`kr doctor --json` returns `{ "host": { ... }, "doctor": { "healthy": true, "checks": [ ... ] } }`.
-The command exits non-zero when a check did not pass. The host object carries
-`default_worker_profile` and the same `power` object, so a script can read which execution context
-new sessions get and what the host is keeping itself awake for.
+`kr doctor --json` returns
+`{ "host": { ... }, "doctor": { ... }, "environment": { ... } }`, and exits non-zero when a check
+did not pass. The host object carries `default_worker_profile` and the same `power` object. The
+environment object is what `environment.capabilities` answers: the desktop and one record per
+capability, the profile new sessions get, what a logout does to each profile on this platform, and
+the power state. In text form those become a line for the desktop, a line per profile and the same
+inhibition line.
 
 `kr host power --json` returns `{ "ok": true, "environment_id": "...", "power": { ... } }`. The
 power object holds the setting, whether an assertion is held, its reason, the facility holding it,
