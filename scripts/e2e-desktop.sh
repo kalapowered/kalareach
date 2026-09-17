@@ -130,21 +130,24 @@ echo "starting the control daemon"
   --worker "$run_root/bin/kr-worker" \
   >"$run_root/evidence/controller.log" 2>&1 &
 started_pids+=("$!")
-# A minute, because this is a real daemon on a real machine: it opens its registry, builds or
-# reads its signing identity through the platform's credential store, and publishes its socket,
-# and a machine with something else running takes longer over all three. How long it took is
-# printed, so a start that is merely slow reads as slow rather than as broken.
-daemon_waited=0
-for _ in $(seq 1 300); do
+# A minute of asking, because this is a real daemon on a real machine: it opens its registry,
+# builds or reads its signing identity through the platform's credential store, and publishes its
+# socket, and a machine with something else running takes longer over all three. The wall clock is
+# what is reported, not the waiting, so a start that is merely slow reads as slow rather than as
+# broken. It is an allowance rather than a deadline: the last question is answered or refused
+# however long it takes.
+daemon_started_at="$(date +%s)"
+daemon_deadline=$((daemon_started_at + 60))
+while [ "$(date +%s)" -lt "$daemon_deadline" ]; do
   if "$kr" doctor --json >/dev/null 2>&1; then
     break
   fi
-  daemon_waited=$((daemon_waited + 1))
   sleep 0.2
 done
+daemon_waited=$(( $(date +%s) - daemon_started_at ))
 if ! "$kr" doctor --json >"$run_root/evidence/doctor.json" 2>&1; then
   fail "the control daemon did not start"
-  echo "waited $((daemon_waited / 5)) seconds for it"
+  echo "waited $daemon_waited seconds for it"
   echo "--- what the daemon printed ---"
   tail -20 "$run_root/evidence/controller.log" || true
   echo "--- what kr said ---"
@@ -159,7 +162,7 @@ if ! "$kr" doctor --json >"$run_root/evidence/doctor.json" 2>&1; then
   exit 1
 fi
 
-echo "the control daemon answered after $((daemon_waited / 5)) seconds"
+echo "the control daemon answered after $daemon_waited seconds"
 
 # One reader for every document this script inspects, so a shape that changed is a failure here
 # rather than a silently empty string somewhere later.
