@@ -46,19 +46,21 @@ const NEVER_DECODED: &[&str] = &[
 
 /// How many bytes of working memory a decode is charged per pixel of the image.
 ///
-/// This is the number that makes the 256 MiB budget something this crate enforces rather than
-/// something it hopes for: `image` documents its own allocation limit as advisory, and its
-/// decoders hold more than the output buffer while they work. Sixteen is the worst case among the
-/// four formats compiled in here:
+/// This is the number that bounds the pixel buffers of a decode, which is the part image
+/// dimensions decide. `image` documents its own allocation limit as advisory and its decoders hold
+/// more than the output buffer while they work, so the limit is set on the decoder *and* the decode
+/// is refused in advance on this charge. Sixteen is the worst case among the decoders compiled in
+/// here:
 ///
 /// * a PNG decoded to sixteen-bit RGBA is eight bytes per pixel of output;
 /// * a decoder that composites, as an animated WebP would, holds the output, the frame it decoded
 ///   and the canvas it draws onto, which is three four-byte buffers at once;
 /// * a GIF holds its frame buffer and the image it crops into.
 ///
-/// Sixteen covers each of those with room left, so an image whose estimate fits the budget cannot
-/// make the pinned decoders exceed it. The number belongs to the pins in the manifest: it is
-/// re-derived when `image` or one of its codecs moves.
+/// Sixteen covers each of those with room left. What it does not bound is a structure a codec
+/// allocates from its own metadata rather than from its dimensions; the answer to a decoder that
+/// does that is not to compile it in, which is why WebP is withheld. The number belongs to the pins
+/// in the manifest: it is re-derived when `image` or one of its codecs moves.
 const DECODE_BYTES_PER_PIXEL: u64 = 16;
 
 /// Why no preview was produced.
