@@ -85,10 +85,6 @@ export type CapabilityInvalidation =
  */
 export type DesktopSessionId = string
 /**
- * One KalaReach terminal session.
- */
-export type SessionId = string
-/**
  * A versioned capability name. Capabilities describe feasibility, never authority.
  */
 export type CapabilityId = string
