@@ -686,6 +686,39 @@ fn answer_and_type(
     })
 }
 
+/// Answers the keyboard queries and the mode reports, as a terminal with a state of its own would.
+///
+/// The three modes whose answer here is the opposite of the documented default are the point:
+/// mouse click reporting on, the cursor hidden and bracketed paste on. What the restoration writes
+/// afterwards then says which of the two it put back, this terminal's own state or a terminal
+/// nobody had touched.
+fn answer_keyboard_and_mode_queries(
+    output: &TerminalOutput,
+    mut writer: Box<dyn std::io::Write + Send>,
+) {
+    let output = output.clone();
+    std::thread::spawn(move || {
+        if !output.wait_for(b"\x1b[c", Duration::from_secs(20)) {
+            return;
+        }
+        // DECRPM: one is set, two is reset.
+        let _ = writer.write_all(
+            b"\x1b[?5u\x1b[>4;2m\x1b[?25;2$y\x1b[?1000;1$y\x1b[?1002;2$y\x1b[?1003;2$y\x1b[?1006;2$y\x1b[?2004;1$y\x1b[?62;22c",
+        );
+        let _ = writer.flush();
+    });
+}
+
+/// What the terminal above reported, and therefore what it is owed back.
+const REPORTED_MODES: &[(&str, bool)] = &[
+    ("?25", false),
+    ("?1000", true),
+    ("?1002", false),
+    ("?1003", false),
+    ("?1006", false),
+    ("?2004", true),
+];
+
 /// The sequences that put this test's terminal back into the state it reported.
 const KEYBOARD_RESTORED: &[u8] = b"\x1b[=5;1u";
 
@@ -939,6 +972,85 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
     let _ = shell.wait();
 }
 
+/// KR-REQ-08.84: a terminal that reports its own modes is put back into them, guard included.
+///
+/// Section 8 asks a detach to restore "the outer terminal's input modes, mouse modes, cursor
+/// visibility". Termios carries the first; the other two are read from the terminal before anything
+/// changes them, carried to the guard, and written back over the documented defaults. The attach
+/// process is killed outright here, so the only thing that can put them back is the guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill() {
+    let hosted = hosted("while true; do echo ready; sleep 1; done").await;
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("opens a terminal");
+    let display = hosted.display.get().to_string();
+    let mut shell = pty
+        .slave
+        .spawn_command(shell_running(
+            &hosted,
+            &format!(
+                "{} attach {display}; printf 'attach-finished-%s\\n' \"$?\"",
+                env!("CARGO_BIN_EXE_kr")
+            ),
+        ))
+        .expect("starts the shell");
+    let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
+    answer_keyboard_and_mode_queries(&output, pty.master.take_writer().expect("a writer"));
+    assert!(
+        output.wait_for(b"ready", Duration::from_secs(30)),
+        "the session's output reached the terminal: {}",
+        output.text()
+    );
+
+    let attach = attach_process(shell.process_id().expect("the shell has an identifier"))
+        .expect("the shell started the attach command");
+    assert_eq!(
+        guards_of(attach),
+        1,
+        "the attachment armed a restoration guard"
+    );
+    let killed = std::process::Command::new("kill")
+        .args(["-KILL", &attach.to_string()])
+        .status()
+        .expect("sends the signal");
+    assert!(killed.success(), "the attach process was killed");
+
+    // The guard writes the reset block and then this terminal's own values over it. Waiting for the
+    // cursor's own value is waiting for the whole of that, because it is written in one go.
+    assert!(
+        output.wait_for(b"\x1b[?25l", Duration::from_secs(20)),
+        "the guard hid the cursor again, because that is how it found it: {}",
+        output.text().escape_debug()
+    );
+    let modes = final_modes(&output.bytes());
+    for (mode, expected) in REPORTED_MODES {
+        assert_eq!(
+            modes.get(*mode).copied(),
+            Some(*expected),
+            "mode {mode} was put back to what this terminal reported rather than to the \
+             documented default: {modes:?}"
+        );
+    }
+    // The reset block still ran: a mode the terminal said nothing about is still cleared, and the
+    // ones it did answer for are written after it rather than instead of it.
+    let reset = last_index(&output.bytes(), kr_cli::terminal::RESET_SEQUENCES)
+        .expect("the guard wrote the whole reset block");
+    let restored = last_index(&output.bytes(), b"\x1b[?1000h")
+        .expect("and the terminal's own mouse reporting after it");
+    assert!(
+        restored > reset,
+        "the values the terminal reported are written over the defaults, not before them"
+    );
+    let _ = shell.kill();
+    let _ = shell.wait();
+}
+
 /// KR-REQ-08.84: the same modes come back on an ordinary detach, which is the path that runs in
 /// this process rather than in the guard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1034,6 +1146,25 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
     );
     // And everything else the emulator holds and termios does not describe.
     assert_the_terminal_was_left_its_own(&output.bytes());
+    // This terminal answered the keyboard queries and no mode report at all, so the mouse modes,
+    // the cursor and bracketed paste went back to their documented defaults rather than to values
+    // anybody read. That is a smaller promise than a terminal that answers gets, and the attachment
+    // says which promise it made rather than leaving it to be assumed.
+    assert!(
+        output.wait_for(
+            b"put back to the documented default",
+            Duration::from_secs(10)
+        ),
+        "the attachment reported the modes it had to default: {}",
+        output.text().escape_debug()
+    );
+    for mode in ["25", "1000", "1002", "1003", "1006", "2004"] {
+        assert!(
+            output.contains(format!("mode {mode}").as_bytes()),
+            "and named {mode} among them: {}",
+            output.text().escape_debug()
+        );
+    }
     let _ = shell.kill();
     let _ = shell.wait();
 }

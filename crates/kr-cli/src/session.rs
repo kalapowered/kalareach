@@ -136,12 +136,17 @@ pub async fn run(
             // not this attachment's to clear. Its modes are put back and the failure is reported.
             // The record that makes the next attempt require a fresh terminal was written before
             // the first question went out, and an exchange that did not finish leaves it there.
-            let _ = terminal.restore(&saved, None);
+            // Nothing was read, so nothing but the documented defaults can be put back.
+            let _ = terminal.restore(&saved, None, &crate::terminal::ScreenModes::UNASKED);
             guard.release();
             return Err(error);
         }
     };
     let keyboard = probe.keyboard;
+    // The mouse modes, the cursor visibility and the bracketed-paste state this terminal had before
+    // anything of this attachment's changed them. Held here because the rest of the probe is handed
+    // to the loop, and the restoration at the end of this function needs them.
+    let modes = probe.modes;
 
     let mut client = crate::resolve::open_worker(descriptor, crate::build_id()).await?;
     // A terminal attachment claims the session's size. Section 8 makes that the default: a
@@ -204,6 +209,7 @@ pub async fn run(
     // on its way here told it nothing.
     if !options.no_probe {
         guard.learn_keyboard(&keyboard);
+        guard.learn_modes(&modes);
         guard.begin_keyboard()?;
     }
     let raw_replaced = terminal.enter_raw_mode()?;
@@ -253,7 +259,7 @@ pub async fn run(
     // once it has.
     // The modes are this process's to put back; the keyboard protocols are the guard's, and it
     // writes them back as it is released, which is what keeps the two halves in order.
-    terminal.restore(&raw_replaced, None)?;
+    terminal.restore(&raw_replaced, None, &modes)?;
     guard.release();
     // Said after the terminal is its own again, never during the attachment: a sentence written
     // into a terminal that is showing a projection would wrap, overwrite cells and scroll the
@@ -263,6 +269,16 @@ pub async fn run(
             "kr: this terminal was showing a projection of the session, and it did not carry all \
              of it: {detail}"
         );
+    }
+    // And what this attachment could not establish about the terminal itself: the modes it had to
+    // put back to their documented default because nothing could be read for them. That is the
+    // attachment making a smaller promise than a terminal that answers gets, and it is said out
+    // loud rather than assumed either way.
+    let qualification = crate::render::Qualification {
+        defaulted_modes: modes.unanswered(),
+    };
+    if let Some(detail) = qualification.report() {
+        eprintln!("kr: not everything about this terminal could be established: {detail}");
     }
     Ok((outcome, descriptor.session_id))
 }

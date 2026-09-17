@@ -209,6 +209,19 @@ chosen for itself. A cleanup that runs before the attachment began forwarding, b
 or the process was killed during it, leaves those protocols alone: nothing that had happened could
 have changed them.
 
+Those sequences are the documented defaults, and for the modes the attachment itself changes they
+are not the last word. The handshake asks a terminal declaring one of xterm's names what it has set
+for the cursor's visibility, the three mouse tracking modes, the SGR mouse encoding and bracketed
+paste, before anything changes any of them. What it reports is written back over the defaults, so a
+person whose mouse reporting was already on gets it back rather than a terminal nobody had touched.
+Those values travel to the restoration guard as well, so an attach process killed outright still
+leaves the terminal as its owner had it.
+
+A mode report is the one question whose silence is an answer. Every one of these modes has a
+documented default, which is the state a restoration used before any of them were asked, so a
+terminal that answers none of them is attached to, restored to those defaults, and told so: the
+command ends by naming each mode it had to default rather than read.
+
 `--no-probe` asks the terminal nothing at all, which is what makes it the choice for a terminal that
 does not answer. The session's own keyboard modes are still cleared when the attachment ends, since
 the session could have set them, but nothing comes back afterwards: that is what never asking costs.

@@ -606,6 +606,77 @@ fn a_probe_completes_on_its_terminator() {
     );
 }
 
+/// KR-REQ-08.84: a mode report is read where a terminal gives one and defaulted where it does not.
+///
+/// Every question a probe asks must be answered, because the attachment acts on the answer. A mode
+/// report is the one question that is not like that: the mode already has a documented default, and
+/// that default is what a restoration used before anything was asked. So a terminal that answers is
+/// restored to what it reported, one that stays silent is restored to the default, and neither is a
+/// failed handshake.
+#[test]
+fn a_mode_report_is_read_where_it_is_given_and_defaulted_where_it_is_not() {
+    use kr_term::probe::{ProbeAnswer, SavedMode};
+
+    let asked: Vec<ProbeItem> = SavedMode::ALL
+        .iter()
+        .copied()
+        .map(ProbeItem::Mode)
+        .chain([ProbeItem::DeviceAttributes])
+        .collect();
+    let (mut session, request) =
+        ProbeSession::start(0, InputContext::Clean, &asked).expect("clean stream");
+    assert!(request.ends_with(b"\x1b[c"), "the terminator is asked last");
+    for mode in SavedMode::ALL {
+        let question = format!("\x1b[?{}$p", mode.number());
+        assert!(
+            request
+                .windows(question.len())
+                .any(|window| window == question.as_bytes()),
+            "each mode is asked about: {:?}",
+            String::from_utf8_lossy(&request)
+        );
+    }
+
+    // Two of the six answer; the terminator ends the exchange for all of them.
+    session
+        .observe(b"\x1b[?1000;1$y\x1b[?25;2$y\x1b[?62;22c", 10)
+        .expect("the answers are well formed");
+    let outcome = session
+        .finish(20)
+        .expect("silence on a mode report is not a failed exchange");
+    assert_eq!(
+        outcome.answer(ProbeItem::Mode(SavedMode::MouseClicks)),
+        Some(&ProbeAnswer::ModeStatus(1)),
+        "what the terminal reported is what was recorded"
+    );
+    assert_eq!(
+        outcome.answer(ProbeItem::Mode(SavedMode::CursorVisible)),
+        Some(&ProbeAnswer::ModeStatus(2))
+    );
+    assert!(
+        outcome
+            .answer(ProbeItem::Mode(SavedMode::BracketedPaste))
+            .is_none(),
+        "and a mode it said nothing about is one nothing was recorded for"
+    );
+
+    // The rule the mode reports are an exception to still holds for everything else: a capability
+    // question this exchange asked and did not get an answer to fails the attach.
+    let (mut session, _) = ProbeSession::start(
+        0,
+        InputContext::Clean,
+        &[ProbeItem::KittyKeyboard, ProbeItem::DeviceAttributes],
+    )
+    .expect("clean stream");
+    session
+        .observe(b"\x1b[?62;22c", 10)
+        .expect("the terminator is well formed");
+    assert!(
+        session.finish(20).is_err(),
+        "a capability the attachment would act on is still required"
+    );
+}
+
 /// KR-REQ-08.42: a terminal is free to answer across two reads, and the answer still counts.
 #[test]
 fn an_answer_split_across_two_reads_is_still_an_answer() {

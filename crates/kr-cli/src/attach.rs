@@ -37,6 +37,14 @@ pub const GUARD_RELEASE: u8 = b'R';
 /// the terminal, and nothing may change the terminal before something is holding what it had.
 pub const GUARD_KEYBOARD: u8 = b'K';
 
+/// The byte that introduces the mouse, cursor and paste modes the guard is to restore.
+///
+/// It arrives with the keyboard state and for the same reason: the values are read by asking the
+/// terminal, which is itself a change to it, so nothing can be handed over before the guard is
+/// armed. A guard that never hears them puts each mode into its documented default, which is what a
+/// terminal that answered nothing is owed.
+pub const GUARD_MODES: u8 = b'M';
+
 /// The byte that tells the guard this attachment is about to begin forwarding.
 ///
 /// From that moment the session can change the terminal's keyboard protocols, so the guard owes
@@ -271,11 +279,26 @@ impl RestorationGuard {
     /// guard writes on its way out, as a state rather than as a stack operation. A guard that never
     /// hears it writes nothing of it, which is what a terminal that was never asked gets.
     pub fn learn_keyboard(&mut self, keyboard: &KeyboardState) {
+        self.tell(GUARD_KEYBOARD, &keyboard.encode());
+    }
+
+    /// Tells the guard which mouse modes, cursor visibility and paste state this terminal had.
+    ///
+    /// The same moment and the same reason as [`Self::learn_keyboard`]: reading them is a change to
+    /// the terminal, so the guard is armed first and told afterwards. What it writes on its way out
+    /// is these values over the documented defaults, so a person whose mouse reporting was on when
+    /// the attachment arrived has it back even if this process is killed outright.
+    pub fn learn_modes(&mut self, modes: &crate::terminal::ScreenModes) {
+        self.tell(GUARD_MODES, &modes.encode());
+    }
+
+    /// Sends the guard one line of state.
+    fn tell(&mut self, kind: u8, state: &str) {
         use std::io::Write as _;
 
         if let Some(writer) = self.release.as_mut() {
-            let mut line = vec![GUARD_KEYBOARD];
-            line.extend_from_slice(keyboard.encode().as_bytes());
+            let mut line = vec![kind];
+            line.extend_from_slice(state.as_bytes());
             line.push(b'\n');
             let _ = writer.write_all(&line);
             let _ = writer.flush();

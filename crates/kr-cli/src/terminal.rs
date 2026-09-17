@@ -66,12 +66,13 @@ pub use unix::{ControllingTerminal, SavedModes};
 /// application overrode, so the last thing a cleanup does is hand each of those back to the
 /// terminal's own configuration.
 ///
-/// What this cannot do is give back a state the terminal had *before* the attachment and never
-/// reported. Nothing asks a terminal whether its mouse reporting was on or its cursor was hidden:
-/// there is no reply every qualified profile promises, and a question whose answer is optional is
-/// not one this command may ask. So these put each of those modes into its documented default,
-/// which is the state a terminal is in when nothing has changed it, and the keyboard protocols -
-/// the one part a terminal does report - are put back to what it reported.
+/// These are the documented *defaults*: the state a terminal is in when nothing has changed it.
+/// They are not the last word. A terminal that answers for its mouse modes, its cursor visibility
+/// and its bracketed paste is asked about them before anything changes them, and
+/// [`ScreenModes::restore_sequences`] writes those values over these afterwards, so a person whose
+/// mouse reporting was already on gets it back rather than getting the default. A terminal that
+/// answers for none of them is left with these, and the attachment says so rather than implying it
+/// restored something it never read.
 pub const RESET_SEQUENCES: &[u8] = b"\x1b[?1049l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1004l\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1016l\x1b[?2004l\x1b[?2026l\x1b[?7h\x1b[?25h\x1b[?1l\x1b>\x1b[0m\x1b[?69l\x1b[r\x1b[?6l\x1b[4l\x1b[0 q\x1b(B\x1b)B\x0f\x1b]104\x1b\\\x1b]110\x1b\\\x1b]111\x1b\\\x1b]112\x1b\\\x1b]113\x1b\\\x1b]114\x1b\\\x1b]117\x1b\\\x1b]119\x1b\\";
 
 /// The sequence that puts `modifyOtherKeys` back to the value the terminal itself starts with.
@@ -111,9 +112,17 @@ pub const PROBE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(1
 /// else is asked, because nothing else can be required of a terminal calling itself
 /// `xterm-256color`: Terminal.app answers neither colour query, and requiring one would fail every
 /// attach there.
+///
+/// The mode reports are the exception the rule allows for, and they are asked of the profiles that
+/// document an answer to [`DECRQM`](kr_term::probe::SavedMode). They are the modes this attachment
+/// is about to change, so reading them is what lets a detach put back the terminal a person had
+/// rather than a terminal nobody has touched. An answer to one of them is not something the
+/// attachment depends on - every one has a documented default, which is what a restoration used
+/// before any of this was asked - so silence is not a failed handshake. What it is is a smaller
+/// promise, and the attachment says which promise it made.
 #[must_use]
 pub fn profile_questions(profile: Option<&str>) -> Vec<kr_term::probe::ProbeItem> {
-    use kr_term::probe::ProbeItem;
+    use kr_term::probe::{ProbeItem, SavedMode};
 
     let mut asked = Vec::new();
     if let Some(name) = profile {
@@ -124,9 +133,166 @@ pub fn profile_questions(profile: Option<&str>) -> Vec<kr_term::probe::ProbeItem
         if name.contains("xterm-kitty") || name == "xterm" {
             asked.push(ProbeItem::ModifyOtherKeys);
         }
+        if answers_mode_reports(&name) {
+            asked.extend(SavedMode::ALL.iter().copied().map(ProbeItem::Mode));
+        }
     }
     asked.push(ProbeItem::DeviceAttributes);
     asked
+}
+
+/// Whether a declared profile documents an answer to a DEC mode report.
+///
+/// The families that document `DECRQM`: xterm itself and everything that declares one of its
+/// terminfo names, and the emulators that implement its control sequences and say so. A terminal
+/// outside this list is not asked, because a question nothing documents an answer to is a question
+/// this command has no business writing into somebody's stream.
+fn answers_mode_reports(name: &str) -> bool {
+    const FAMILIES: &[&str] = &[
+        "xterm",
+        "kitty",
+        "ghostty",
+        "wezterm",
+        "iterm",
+        "alacritty",
+        "foot",
+        "contour",
+        "rio",
+    ];
+    FAMILIES.iter().any(|family| name.contains(family))
+}
+
+/// The modes an attachment reads before it changes them, and puts back on its way out.
+///
+/// Section 8 asks a detach to restore "the outer terminal's input modes, mouse modes, cursor
+/// visibility and applicable keyboard modes". Termios carries the input modes and
+/// [`KeyboardState`] carries the keyboard; these are the rest, and none of them can be inferred: a
+/// terminal whose mouse reporting was on before the attachment arrived is owed it back, and one
+/// whose cursor was hidden is owed that.
+///
+/// `None` for a mode this terminal was not asked about, or did not answer. That is not a failure,
+/// because a mode report has a documented default and that default is what [`RESET_SEQUENCES`] puts
+/// the terminal into. It is a fact about what the restoration could promise, so it is reported
+/// rather than passed over.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScreenModes {
+    /// Each mode of [`kr_term::probe::SavedMode::ALL`], in that order.
+    modes: [Option<bool>; 6],
+}
+
+impl ScreenModes {
+    /// A terminal that was asked about none of them.
+    pub const UNASKED: Self = Self { modes: [None; 6] };
+
+    /// What a completed exchange found.
+    #[must_use]
+    pub fn from_outcome(outcome: &kr_term::probe::ProbeOutcome) -> Self {
+        use kr_term::probe::{ProbeAnswer, ProbeItem, SavedMode};
+
+        let mut modes = [None; 6];
+        for (slot, mode) in modes.iter_mut().zip(SavedMode::ALL) {
+            // DECRPM statuses one and three are "set"; two and four are "reset". Zero is the
+            // terminal saying it does not recognise the mode, which is not a value to put back.
+            *slot = match outcome.answer(ProbeItem::Mode(*mode)) {
+                Some(ProbeAnswer::ModeStatus(1 | 3)) => Some(true),
+                Some(ProbeAnswer::ModeStatus(2 | 4)) => Some(false),
+                _ => None,
+            };
+        }
+        Self { modes }
+    }
+
+    /// What the terminal reported for one mode, if it reported anything.
+    #[must_use]
+    pub fn get(&self, mode: kr_term::probe::SavedMode) -> Option<bool> {
+        let index = kr_term::probe::SavedMode::ALL
+            .iter()
+            .position(|known| *known == mode)?;
+        self.modes.get(index).copied().flatten()
+    }
+
+    /// The modes nothing could be read for, which are the ones a restoration defaults.
+    #[must_use]
+    pub fn unanswered(&self) -> Vec<kr_term::probe::SavedMode> {
+        kr_term::probe::SavedMode::ALL
+            .iter()
+            .zip(self.modes.iter())
+            .filter_map(|(mode, held)| held.is_none().then_some(*mode))
+            .collect()
+    }
+
+    /// Whether anything at all was read.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.modes.iter().all(Option::is_none)
+    }
+
+    /// The sequences that put the terminal back into the state it reported.
+    ///
+    /// Written *after* [`RESET_SEQUENCES`], which puts every one of these into its documented
+    /// default: what follows is the value this terminal actually had, for each mode it answered
+    /// for. A mode it did not answer for keeps the default, because a value nobody read is not one
+    /// anything can restore.
+    #[must_use]
+    pub fn restore_sequences(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        for (mode, held) in kr_term::probe::SavedMode::ALL.iter().zip(self.modes.iter()) {
+            let Some(set) = held else {
+                continue;
+            };
+            let number = mode.number();
+            let action = if *set { 'h' } else { 'l' };
+            out.extend_from_slice(format!("\x1b[?{number}{action}").as_bytes());
+        }
+        out
+    }
+
+    /// Renders the state as one argument for the guard.
+    #[must_use]
+    pub fn encode(&self) -> String {
+        self.modes
+            .iter()
+            .map(|held| match held {
+                Some(true) => "1",
+                Some(false) => "0",
+                None => "-",
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// Parses the state back.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the text is not one field per mode, each set, reset or unread.
+    pub fn decode(text: &str) -> crate::error::Result<Self> {
+        let mut modes = [None; 6];
+        let mut fields = text.split(',');
+        for slot in &mut modes {
+            let field = fields.next().ok_or_else(|| {
+                crate::error::CliError::Terminal(
+                    "the saved mode state is missing a mode".to_owned(),
+                )
+            })?;
+            *slot = match field {
+                "1" => Some(true),
+                "0" => Some(false),
+                "-" => None,
+                _ => {
+                    return Err(crate::error::CliError::Terminal(
+                        "the saved mode state has a field that is not a mode".to_owned(),
+                    ));
+                }
+            };
+        }
+        if fields.next().is_some() {
+            return Err(crate::error::CliError::Terminal(
+                "the saved mode state has more fields than expected".to_owned(),
+            ));
+        }
+        Ok(Self { modes })
+    }
 }
 
 /// What a bounded probe of the outer terminal established.
@@ -134,6 +300,8 @@ pub fn profile_questions(profile: Option<&str>) -> Vec<kr_term::probe::ProbeItem
 pub struct Probe {
     /// The keyboard protocols the terminal reported.
     pub keyboard: KeyboardState,
+    /// The modes this attachment will change, as the terminal had them before it began.
+    pub modes: ScreenModes,
     /// The bytes that were not part of any answer: what the person typed while the host was asking.
     ///
     /// Section 8 keeps these separate rather than discarding them or letting them pass for replies,
@@ -175,6 +343,9 @@ impl Probe {
         }
         Ok(Self {
             keyboard: KeyboardState::EMPTY,
+            // Nothing was asked, so nothing was read: the restoration puts every one of these into
+            // its documented default, and the attachment says that is what it did.
+            modes: ScreenModes::UNASKED,
             typed: Vec::new(),
             palette: None,
             version: None,
@@ -223,6 +394,7 @@ impl Probe {
         );
         Self {
             keyboard,
+            modes: ScreenModes::from_outcome(outcome),
             typed: outcome.typed().to_vec(),
             palette,
             version,
@@ -530,10 +702,20 @@ mod unix {
         /// passes `None` and leaves them alone, because nothing that had happened could have
         /// changed them.
         ///
+        /// `screen` carries the mouse modes, the cursor visibility and the bracketed-paste state
+        /// this terminal reported before the attachment changed them. It is written after the reset
+        /// block, which is the documented default for each of those, so a terminal that answered
+        /// gets its own values back and one that did not keeps the default.
+        ///
         /// # Errors
         ///
         /// Returns an error when the modes cannot be set.
-        pub fn restore(&self, saved: &Termios, keyboard: Option<&KeyboardState>) -> Result<()> {
+        pub fn restore(
+            &self,
+            saved: &Termios,
+            keyboard: Option<&KeyboardState>,
+            screen: &super::ScreenModes,
+        ) -> Result<()> {
             use std::io::Write as _;
 
             rustix::termios::tcsetattr(&self.handle, OptionalActions::Flush, saved).map_err(
@@ -541,6 +723,7 @@ mod unix {
             )?;
             let mut handle = &self.handle;
             let _ = handle.write_all(RESET_SEQUENCES);
+            let _ = handle.write_all(&screen.restore_sequences());
             if let Some(keyboard) = keyboard {
                 let _ = handle.write_all(&keyboard.cleanup_sequences());
             }
@@ -966,6 +1149,12 @@ mod tests {
             vec![
                 kr_term::probe::ProbeItem::KittyKeyboard,
                 kr_term::probe::ProbeItem::ModifyOtherKeys,
+                kr_term::probe::ProbeItem::Mode(kr_term::probe::SavedMode::CursorVisible),
+                kr_term::probe::ProbeItem::Mode(kr_term::probe::SavedMode::MouseClicks),
+                kr_term::probe::ProbeItem::Mode(kr_term::probe::SavedMode::MouseDrag),
+                kr_term::probe::ProbeItem::Mode(kr_term::probe::SavedMode::MouseMotion),
+                kr_term::probe::ProbeItem::Mode(kr_term::probe::SavedMode::SgrMouse),
+                kr_term::probe::ProbeItem::Mode(kr_term::probe::SavedMode::BracketedPaste),
                 kr_term::probe::ProbeItem::DeviceAttributes
             ]
         );
@@ -976,15 +1165,33 @@ mod tests {
             "the device-attributes terminator is written last: {:?}",
             String::from_utf8_lossy(&request)
         );
-        // And a terminal that promises nothing beyond the terminator is asked nothing beyond it: a
-        // question whose answer may not arrive is a question this command may not ask.
+        // And a terminal that promises nothing beyond the terminator is asked for no *capability*
+        // beyond it: a question whose answer decides what this attachment does, and may not arrive,
+        // is a question this command may not ask. The mode reports are not that. They are the state
+        // this attachment is about to change, every one of them has a documented default, and a
+        // terminal declaring one of xterm's names documents an answer to them.
+        let declared = profile_questions(Some("xterm-256color"));
         assert_eq!(
-            profile_questions(Some("xterm-256color")),
-            vec![kr_term::probe::ProbeItem::DeviceAttributes]
+            declared.last(),
+            Some(&kr_term::probe::ProbeItem::DeviceAttributes),
+            "the terminator is still last: {declared:?}"
+        );
+        assert!(
+            declared
+                .iter()
+                .all(|item| matches!(item, kr_term::probe::ProbeItem::Mode(_))
+                    || *item == kr_term::probe::ProbeItem::DeviceAttributes),
+            "and nothing it does not promise is asked of it: {declared:?}"
+        );
+        assert_eq!(
+            declared.len(),
+            kr_term::probe::SavedMode::ALL.len() + 1,
+            "which is the modes it will change, and the terminator: {declared:?}"
         );
         assert_eq!(
             profile_questions(None),
-            vec![kr_term::probe::ProbeItem::DeviceAttributes]
+            vec![kr_term::probe::ProbeItem::DeviceAttributes],
+            "a terminal that did not say what it is is asked for the terminator alone"
         );
 
         // Both keyboard protocols, and somebody typing through the middle of the exchange.
@@ -1006,6 +1213,132 @@ mod tests {
             "and the person's own bytes are theirs, in the order they typed them"
         );
         assert!(probe.no_probe.is_none(), "this attachment did ask");
+    }
+
+    /// KR-REQ-08.84: the modes an attachment changes are read first and put back afterwards.
+    ///
+    /// Section 8 asks a detach to restore the outer terminal's mouse modes and cursor visibility.
+    /// A terminal whose mouse reporting was already on when the attachment arrived is owed it back,
+    /// and the only way to know is to have asked before anything changed it.
+    #[test]
+    fn the_modes_a_terminal_reports_are_what_it_gets_back() {
+        use kr_term::probe::{InputContext, ProbeSession, SavedMode};
+
+        let asked = profile_questions(Some("xterm-256color"));
+        let (mut session, request) =
+            ProbeSession::start(0, InputContext::Clean, &asked).expect("a clean stream");
+        for mode in SavedMode::ALL {
+            let number = mode.number();
+            let question = format!("\x1b[?{number}$p");
+            assert!(
+                request
+                    .windows(question.len())
+                    .any(|window| window == question.as_bytes()),
+                "mode {number} is asked about before it is changed: {:?}",
+                String::from_utf8_lossy(&request)
+            );
+        }
+
+        // A terminal with the mouse already on, its cursor hidden and bracketed paste on. One and
+        // two are DECRPM's "set" and "reset"; three is "permanently set".
+        session
+            .observe(
+                b"\x1b[?25;2$y\x1b[?1000;1$y\x1b[?1002;2$y\x1b[?1003;2$y\x1b[?1006;3$y\x1b[?2004;1$y\x1b[?62;22c",
+                5,
+            )
+            .expect("the answers are well formed");
+        let outcome = session.finish(6).expect("the terminator arrived");
+        let probe = Probe::from_outcome(&outcome);
+        assert_eq!(probe.modes.get(SavedMode::CursorVisible), Some(false));
+        assert_eq!(probe.modes.get(SavedMode::MouseClicks), Some(true));
+        assert_eq!(probe.modes.get(SavedMode::MouseDrag), Some(false));
+        assert_eq!(probe.modes.get(SavedMode::SgrMouse), Some(true));
+        assert_eq!(probe.modes.get(SavedMode::BracketedPaste), Some(true));
+        assert!(
+            probe.modes.unanswered().is_empty(),
+            "every mode was answered for, so none of them is defaulted"
+        );
+        assert_eq!(
+            probe.modes.restore_sequences(),
+            b"\x1b[?25l\x1b[?1000h\x1b[?1002l\x1b[?1003l\x1b[?1006h\x1b[?2004h".to_vec(),
+            "and each goes back to the value the terminal itself reported"
+        );
+    }
+
+    /// KR-REQ-08.84: a terminal that answers no mode report is defaulted, and the attach stands.
+    ///
+    /// The mode reports are the questions whose silence is an answer: every one of them has a
+    /// documented default, which is the state [`RESET_SEQUENCES`] puts the terminal into and the
+    /// state every attachment used before any of this was asked. So a terminal that says nothing is
+    /// attached to, restored to those defaults, and reported as the smaller promise it is.
+    #[test]
+    fn a_terminal_that_answers_no_mode_report_is_defaulted_rather_than_refused() {
+        use kr_term::probe::{InputContext, ProbeSession, SavedMode};
+
+        let (mut session, _) = ProbeSession::start(
+            0,
+            InputContext::Clean,
+            &profile_questions(Some("xterm-256color")),
+        )
+        .expect("a clean stream");
+        // The terminator and nothing else, which is Terminal.app: it is asked, because it declares
+        // one of xterm's names, and it answers none of them.
+        session
+            .observe(b"\x1b[?62;22c", 5)
+            .expect("the answer is well formed");
+        let outcome = session
+            .finish(6)
+            .expect("a silent mode report does not fail the attach");
+        let probe = Probe::from_outcome(&outcome);
+        assert!(
+            probe.modes.is_empty(),
+            "nothing was read, so nothing is claimed to be known"
+        );
+        assert_eq!(
+            probe.modes.unanswered(),
+            SavedMode::ALL.to_vec(),
+            "and every one of them is reported as defaulted"
+        );
+        assert!(
+            probe.modes.restore_sequences().is_empty(),
+            "a value nobody read is not a value anything writes back: the reset block's own \
+             defaults stand"
+        );
+    }
+
+    #[test]
+    fn the_mode_state_round_trips_through_its_argument_form() {
+        use kr_term::probe::{InputContext, ProbeSession};
+
+        for text in ["-,-,-,-,-,-", "1,0,1,0,-,1", "0,0,0,0,0,0"] {
+            let decoded = ScreenModes::decode(text).expect("decodes");
+            assert_eq!(decoded.encode(), text, "the guard is handed what was read");
+        }
+        assert!(ScreenModes::decode("1,0,1").is_err(), "a mode is missing");
+        assert!(
+            ScreenModes::decode("1,0,1,0,-,1,1").is_err(),
+            "and a seventh field is not one of these modes"
+        );
+        assert!(ScreenModes::decode("1,0,1,0,-,y").is_err());
+
+        // What the guard restores after a kill is what the probe read, byte for byte.
+        let (mut session, _) = ProbeSession::start(
+            0,
+            InputContext::Clean,
+            &profile_questions(Some("xterm-256color")),
+        )
+        .expect("a clean stream");
+        session
+            .observe(b"\x1b[?25;2$y\x1b[?1000;1$y\x1b[?62;22c", 5)
+            .expect("the answers are well formed");
+        let outcome = session.finish(6).expect("the terminator arrived");
+        let read = Probe::from_outcome(&outcome).modes;
+        let carried = ScreenModes::decode(&read.encode()).expect("decodes");
+        assert_eq!(
+            carried.restore_sequences(),
+            read.restore_sequences(),
+            "the guard writes back exactly what this process would have"
+        );
     }
 
     /// KR-REQ-08.42: a terminal that never finishes the exchange fails the attach.

@@ -59,7 +59,7 @@ mod console {
     use std::fs::File;
 
     use crate::error::{CliError, Result};
-    use crate::terminal::{KeyboardState, Probe, RESET_SEQUENCES, TerminalSize};
+    use crate::terminal::{KeyboardState, Probe, RESET_SEQUENCES, ScreenModes, TerminalSize};
 
     /// A handle on this process's console.
     ///
@@ -179,18 +179,26 @@ mod console {
         /// Restores saved modes and undoes the modes an application may have left enabled.
         ///
         /// `keyboard` is what this console had negotiated before the attachment began, written
-        /// back as the state it is.
+        /// back as the state it is, and `screen` is the mouse, cursor and paste state it reported.
+        /// A console answers for neither, so both are usually empty here and the reset block is the
+        /// whole restoration.
         ///
         /// # Errors
         ///
         /// Returns an error when the modes cannot be set.
-        pub fn restore(&self, saved: &SavedModes, keyboard: Option<&KeyboardState>) -> Result<()> {
+        pub fn restore(
+            &self,
+            saved: &SavedModes,
+            keyboard: Option<&KeyboardState>,
+            screen: &ScreenModes,
+        ) -> Result<()> {
             use std::io::Write as _;
 
             set_console_mode(&self.input, saved.input)?;
             set_console_mode(&self.output, saved.output)?;
             let mut handle = &self.output;
             let _ = handle.write_all(RESET_SEQUENCES);
+            let _ = handle.write_all(&screen.restore_sequences());
             if let Some(keyboard) = keyboard {
                 let _ = handle.write_all(&keyboard.cleanup_sequences());
             }

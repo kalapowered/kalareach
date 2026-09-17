@@ -193,6 +193,47 @@ impl ProjectedDisplay {
     }
 }
 
+/// What an attachment could not establish about the terminal it borrowed.
+///
+/// The modes this attachment changes and then owes back are read rather than assumed, and they can
+/// come back unread. That does not stop an attachment, because every one of them has a documented
+/// default, but it is a smaller promise than the one a terminal that answers gets, and a person is
+/// told which promise was made rather than left to assume the larger one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Qualification {
+    /// The modes nothing could be read for, which are the ones a detach puts back to their default.
+    pub defaulted_modes: Vec<kr_term::probe::SavedMode>,
+}
+
+impl Qualification {
+    /// The sentence a person is shown, or `None` when everything was established.
+    #[must_use]
+    pub fn report(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if !self.defaulted_modes.is_empty() {
+            let named: Vec<String> = self
+                .defaulted_modes
+                .iter()
+                .map(|mode| format!("{} (mode {})", mode.description(), mode.number()))
+                .collect();
+            let (subject, verb) = if named.len() == 1 {
+                ("", "was")
+            } else {
+                ("each of ", "were")
+            };
+            parts.push(format!(
+                "{subject}{} {verb} put back to the documented default rather than to the value \
+                 this terminal had, because it never reported one",
+                named.join(", ")
+            ));
+        }
+        if parts.is_empty() {
+            return None;
+        }
+        Some(parts.join("; "))
+    }
+}
+
 /// The sentence one comparison deserves, if any.
 ///
 /// Every field of a comparison has a phrase here. A comparison that is not complete and produces

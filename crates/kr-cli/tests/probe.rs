@@ -240,11 +240,11 @@ impl TerminalOutput {
     }
 }
 
-/// Every query the command could write, whichever profile a terminal declares.
+/// Every capability query the command could write, whichever profile a terminal declares.
 ///
 /// The set it actually writes follows the profile, because section 8 requires every question asked
-/// to be answered: a terminal calling itself `xterm-256color` is asked the terminator and nothing
-/// else. These are all of them, so a test can prove that a question was *not* asked.
+/// to be answered: a terminal calling itself `xterm-256color` is asked for no capability beyond the
+/// terminator. These are all of them, so a test can prove that a question was *not* asked.
 const QUERIES: &[&[u8]] = &[
     b"\x1b[>0q",
     b"\x1b]10;?",
@@ -253,6 +253,20 @@ const QUERIES: &[&[u8]] = &[
     b"\x1b[?4m",
     b"\x1b[?2026$p",
     b"\x1b[c",
+];
+
+/// The mode reports, which are asked of a terminal declaring one of xterm's names.
+///
+/// They are not capability questions. Each is the state of a mode this attachment is about to
+/// change, every one has a documented default, and a terminal that does not answer is restored to
+/// that default rather than refused.
+const MODE_QUERIES: &[&[u8]] = &[
+    b"\x1b[?25$p",
+    b"\x1b[?1000$p",
+    b"\x1b[?1002$p",
+    b"\x1b[?1003$p",
+    b"\x1b[?1006$p",
+    b"\x1b[?2004$p",
 ];
 
 /// The one query a terminal that promises nothing beyond the terminator is asked.
@@ -341,12 +355,27 @@ async fn the_exchange_ends_with_the_terminator_and_no_reply_reaches_the_applicat
         }
         assert!(
             offset_of(&asked, query).is_none(),
-            "nothing else was asked of a terminal that promises nothing else: {:?} in {}",
+            "no capability was asked of a terminal that promises none: {:?} in {}",
             String::from_utf8_lossy(query),
             String::from_utf8_lossy(&asked).escape_debug()
         );
     }
-    let _ = terminator;
+    // The modes this attachment is about to change are asked about, and asked about first: what
+    // comes back is what a detach puts the terminal into, and a value read after the change would
+    // be the session's rather than the person's.
+    for query in MODE_QUERIES {
+        let at = offset_of(&asked, query).unwrap_or_else(|| {
+            panic!(
+                "the mode this attachment will change is read first: {:?} in {}",
+                String::from_utf8_lossy(query),
+                String::from_utf8_lossy(&asked).escape_debug()
+            )
+        });
+        assert!(
+            at < terminator,
+            "and before the terminator, which is what proves nothing else is coming"
+        );
+    }
     writer
         .write_all(b"\x1b[?5u\x1b]10;rgb:ff/ff/ff\x1b\\typed-during\x1b[>4;2m\x1b[?62;22c")
         .expect("answers");
@@ -476,7 +505,7 @@ async fn no_probe_asks_the_terminal_nothing() {
         "the session's screen reached the terminal: {}",
         output.text().escape_debug()
     );
-    for query in QUERIES {
+    for query in QUERIES.iter().chain(MODE_QUERIES) {
         assert!(
             !output.contains(query),
             "no question was asked: {:?} reached the terminal in {}",

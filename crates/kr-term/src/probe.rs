@@ -23,6 +23,90 @@ use crate::event::{Event, EventKind};
 use crate::lexer::Lexer;
 use crate::palette::{Palette, PaletteSource, Rgb};
 
+/// A mode of the outer terminal that an attachment changes and therefore owes back.
+///
+/// Section 8 asks a detach to restore the outer terminal's input modes, mouse modes and cursor
+/// visibility. None of those is described by termios and none of them can be inferred: a terminal
+/// whose mouse reporting was already on before the attachment began is owed it back, and one whose
+/// cursor was hidden is owed that. So they are *read* where a terminal answers for them, and where
+/// one does not the documented default is used and the attachment says so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SavedMode {
+    /// DEC mode 25, cursor visibility.
+    CursorVisible,
+    /// DEC mode 1000, mouse click reporting.
+    MouseClicks,
+    /// DEC mode 1002, button-event mouse reporting.
+    MouseDrag,
+    /// DEC mode 1003, any-event mouse reporting.
+    MouseMotion,
+    /// DEC mode 1006, the SGR mouse encoding.
+    SgrMouse,
+    /// DEC mode 2004, bracketed paste.
+    BracketedPaste,
+}
+
+impl SavedMode {
+    /// Every mode an attachment reads and restores, in the order they are asked about.
+    pub const ALL: &'static [Self] = &[
+        Self::CursorVisible,
+        Self::MouseClicks,
+        Self::MouseDrag,
+        Self::MouseMotion,
+        Self::SgrMouse,
+        Self::BracketedPaste,
+    ];
+
+    /// The DEC private mode number.
+    #[must_use]
+    pub const fn number(self) -> u16 {
+        match self {
+            Self::CursorVisible => 25,
+            Self::MouseClicks => 1000,
+            Self::MouseDrag => 1002,
+            Self::MouseMotion => 1003,
+            Self::SgrMouse => 1006,
+            Self::BracketedPaste => 2004,
+        }
+    }
+
+    /// The state a terminal is in when nothing has changed it.
+    ///
+    /// What a restoration falls back to for a terminal that does not answer for the mode: the
+    /// cursor is shown and everything else is off, which is a terminal nobody has touched.
+    #[must_use]
+    pub const fn documented_default(self) -> bool {
+        matches!(self, Self::CursorVisible)
+    }
+
+    /// What the mode is, in words, for a report a person reads.
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::CursorVisible => "whether the cursor is shown",
+            Self::MouseClicks => "mouse click reporting",
+            Self::MouseDrag => "button-event mouse reporting",
+            Self::MouseMotion => "any-event mouse reporting",
+            Self::SgrMouse => "the SGR mouse encoding",
+            Self::BracketedPaste => "bracketed paste",
+        }
+    }
+
+    /// The mode this number names, for a reply that arrived.
+    #[must_use]
+    pub const fn from_number(number: u16) -> Option<Self> {
+        match number {
+            25 => Some(Self::CursorVisible),
+            1000 => Some(Self::MouseClicks),
+            1002 => Some(Self::MouseDrag),
+            1003 => Some(Self::MouseMotion),
+            1006 => Some(Self::SgrMouse),
+            2004 => Some(Self::BracketedPaste),
+            _ => None,
+        }
+    }
+}
+
 /// One question a probe may ask.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ProbeItem {
@@ -38,6 +122,8 @@ pub enum ProbeItem {
     ModifyOtherKeys,
     /// Whether the terminal reports synchronised output.
     SynchronisedOutput,
+    /// What one of the modes this attachment will change is set to now.
+    Mode(SavedMode),
     /// Primary device attributes, which is always asked last and always terminates the exchange.
     DeviceAttributes,
 }
@@ -53,8 +139,36 @@ impl ProbeItem {
             Self::KittyKeyboard => b"\x1b[?u",
             Self::ModifyOtherKeys => b"\x1b[?4m",
             Self::SynchronisedOutput => b"\x1b[?2026$p",
+            Self::Mode(SavedMode::CursorVisible) => b"\x1b[?25$p",
+            Self::Mode(SavedMode::MouseClicks) => b"\x1b[?1000$p",
+            Self::Mode(SavedMode::MouseDrag) => b"\x1b[?1002$p",
+            Self::Mode(SavedMode::MouseMotion) => b"\x1b[?1003$p",
+            Self::Mode(SavedMode::SgrMouse) => b"\x1b[?1006$p",
+            Self::Mode(SavedMode::BracketedPaste) => b"\x1b[?2004$p",
             Self::DeviceAttributes => b"\x1b[c",
         }
+    }
+
+    /// Whether an exchange that asked this question fails when the terminal does not answer it.
+    ///
+    /// Section 8 ends the handshake with the device-attributes terminator "after collecting every
+    /// requested reply", and a missing reply fails that attach attempt. That is what this is: a
+    /// question whose answer decides what the attachment *does* must be answered, and a question a
+    /// terminal might not answer must not be asked.
+    ///
+    /// A report of a mode this attachment restores is the one kind of question that is neither. Its
+    /// answer is a state the mode already has a documented default for, so a terminal that stays
+    /// silent has not left the attachment without an answer - it has left it with the default, which
+    /// is what every attachment used before any of these were asked. The terminator still proves
+    /// that the silence is final rather than late. So a terminal is asked about the modes this
+    /// attachment is going to change, is restored to whatever it reported, and is never refused an
+    /// attach for saying nothing.
+    ///
+    /// Synchronised output is not one of them: it is a capability the session is told about rather
+    /// than a state the attachment puts back, so a profile that promises it owes the answer.
+    #[must_use]
+    pub const fn answer_is_required(self) -> bool {
+        !matches!(self, Self::Mode(_))
     }
 }
 
@@ -260,7 +374,7 @@ impl ProbeSession {
             .asked
             .iter()
             .copied()
-            .filter(|item| !self.answers.contains_key(item))
+            .filter(|item| item.answer_is_required() && !self.answers.contains_key(item))
             .collect();
         if !missing.is_empty() {
             return Err(TermError::ProbeFailed {
@@ -481,9 +595,12 @@ fn interpret(event: &Event) -> Option<(ProbeItem, ProbeAnswer)> {
                 }
                 // A DECRQM reply is DECRPM: `CSI ? mode ; status $ y`.
                 (Some(b'?'), b'y') if csi.intermediates == *b"$" => {
-                    if csi.number(0) != Some(i64::from(crate::classify::MODE_SYNCHRONISED_OUTPUT)) {
-                        return None;
-                    }
+                    let mode = u16::try_from(csi.number(0)?).ok()?;
+                    let item = if mode == crate::classify::MODE_SYNCHRONISED_OUTPUT {
+                        ProbeItem::SynchronisedOutput
+                    } else {
+                        ProbeItem::Mode(SavedMode::from_number(mode)?)
+                    };
                     // DECRPM has five defined statuses. Anything else is not a status this
                     // profile can record as a capability.
                     let status = csi.number(1)?;
@@ -491,7 +608,7 @@ fn interpret(event: &Event) -> Option<(ProbeItem, ProbeAnswer)> {
                         return None;
                     }
                     Some((
-                        ProbeItem::SynchronisedOutput,
+                        item,
                         ProbeAnswer::ModeStatus(u16::try_from(status).unwrap_or(0)),
                     ))
                 }

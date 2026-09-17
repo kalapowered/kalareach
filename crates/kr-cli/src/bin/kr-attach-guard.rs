@@ -23,10 +23,10 @@ use std::io::{Read as _, Write as _};
 use std::process::ExitCode;
 
 use clap::Parser;
-use kr_cli::attach::{GUARD_BEGIN, GUARD_KEYBOARD, GUARD_READY, GUARD_RELEASE};
+use kr_cli::attach::{GUARD_BEGIN, GUARD_KEYBOARD, GUARD_MODES, GUARD_READY, GUARD_RELEASE};
 #[cfg(unix)]
 use kr_cli::terminal::RESET_SEQUENCES;
-use kr_cli::terminal::{KeyboardState, SavedModes};
+use kr_cli::terminal::{KeyboardState, SavedModes, ScreenModes};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -63,10 +63,12 @@ fn main() -> ExitCode {
     }
 
     // What the attach process has to say, until it says it is done or it is gone. It sends the
-    // keyboard protocols this terminal had once it has read them, which it cannot do before this
-    // guard is holding the terminal's modes; it asks for the keyboard entry to be opened when it
-    // is about to forward; and then it sends either the release byte or nothing at all.
+    // keyboard protocols and the screen modes this terminal had once it has read them, which it
+    // cannot do before this guard is holding the terminal's modes; it asks for the keyboard entry
+    // to be opened when it is about to forward; and then it sends either the release byte or
+    // nothing at all.
     let mut keyboard = None;
+    let mut screen = ScreenModes::UNASKED;
     let mut began = false;
     let mut line = Vec::new();
     let mut byte = [0_u8; 1];
@@ -90,6 +92,13 @@ fn main() -> ExitCode {
                         .and_then(|text| KeyboardState::decode(text).ok())
                     {
                         keyboard = Some(state);
+                    }
+                    if let Some(state) = line
+                        .strip_prefix(&[GUARD_MODES])
+                        .and_then(|rest| std::str::from_utf8(rest).ok())
+                        .and_then(|text| ScreenModes::decode(text).ok())
+                    {
+                        screen = state;
                     }
                     // The attachment is about to forward, so from here on the session can change
                     // this terminal's keyboard protocols and this guard owes them back. It is
@@ -116,7 +125,12 @@ fn main() -> ExitCode {
     let restored = if released {
         !began || give_back_the_keyboard(keyboard.as_ref())
     } else {
-        restore(&saved, began.then_some(keyboard.as_ref()).flatten(), began)
+        restore(
+            &saved,
+            began.then_some(keyboard.as_ref()).flatten(),
+            &screen,
+            began,
+        )
     };
     if restored {
         ExitCode::SUCCESS
@@ -143,7 +157,12 @@ fn give_back_the_keyboard(keyboard: Option<&KeyboardState>) -> bool {
 }
 
 #[cfg(unix)]
-fn restore(saved: &SavedModes, keyboard: Option<&KeyboardState>, began: bool) -> bool {
+fn restore(
+    saved: &SavedModes,
+    keyboard: Option<&KeyboardState>,
+    screen: &ScreenModes,
+    began: bool,
+) -> bool {
     use rustix::termios::OptionalActions;
 
     let terminal = std::io::stdout();
@@ -156,6 +175,11 @@ fn restore(saved: &SavedModes, keyboard: Option<&KeyboardState>, began: bool) ->
             Ok(()) => {
                 let mut handle = terminal.lock();
                 let _ = handle.write_all(RESET_SEQUENCES);
+                // The reset block is the documented default for every mode; what follows is what
+                // this terminal itself reported for the ones it answered about, so a person whose
+                // mouse reporting was on or whose cursor was hidden gets that back rather than a
+                // terminal nobody has touched.
+                let _ = handle.write_all(&screen.restore_sequences());
                 // Whatever the terminal itself reported before the attachment began. A guard
                 // for an attachment that never began forwarding leaves the keyboard protocols
                 // alone: nothing it is cleaning up had begun to change them.
@@ -176,10 +200,15 @@ fn restore(saved: &SavedModes, keyboard: Option<&KeyboardState>, began: bool) ->
 }
 
 #[cfg(not(unix))]
-fn restore(saved: &SavedModes, keyboard: Option<&KeyboardState>, began: bool) -> bool {
+fn restore(
+    saved: &SavedModes,
+    keyboard: Option<&KeyboardState>,
+    screen: &ScreenModes,
+    began: bool,
+) -> bool {
     let Ok(terminal) = kr_cli::terminal::ControllingTerminal::open() else {
         return false;
     };
     let keyboard = began.then(|| keyboard.copied().unwrap_or(KeyboardState::EMPTY));
-    terminal.restore(saved, keyboard.as_ref()).is_ok()
+    terminal.restore(saved, keyboard.as_ref(), screen).is_ok()
 }
