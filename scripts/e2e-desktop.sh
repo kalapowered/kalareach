@@ -130,14 +130,21 @@ echo "starting the control daemon"
   --worker "$run_root/bin/kr-worker" \
   >"$run_root/evidence/controller.log" 2>&1 &
 started_pids+=("$!")
-for _ in $(seq 1 100); do
+# A minute, because this is a real daemon on a real machine: it opens its registry, builds or
+# reads its signing identity through the platform's credential store, and publishes its socket,
+# and a machine with something else running takes longer over all three. How long it took is
+# printed, so a start that is merely slow reads as slow rather than as broken.
+daemon_waited=0
+for _ in $(seq 1 300); do
   if "$kr" doctor --json >/dev/null 2>&1; then
     break
   fi
+  daemon_waited=$((daemon_waited + 1))
   sleep 0.2
 done
 if ! "$kr" doctor --json >"$run_root/evidence/doctor.json" 2>&1; then
   fail "the control daemon did not start"
+  echo "waited $((daemon_waited / 5)) seconds for it"
   echo "--- what the daemon printed ---"
   tail -20 "$run_root/evidence/controller.log" || true
   echo "--- what kr said ---"
@@ -151,6 +158,8 @@ if ! "$kr" doctor --json >"$run_root/evidence/doctor.json" 2>&1; then
   fi
   exit 1
 fi
+
+echo "the control daemon answered after $((daemon_waited / 5)) seconds"
 
 # One reader for every document this script inspects, so a shape that changed is a failure here
 # rather than a silently empty string somewhere later.
