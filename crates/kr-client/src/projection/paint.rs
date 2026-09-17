@@ -2035,6 +2035,76 @@ mod fixtures {
             destination.cells[1][9], "z",
             "and a widened glyph at the end of a row does not push its neighbour off it"
         );
+
+        // The last column is where the bound is at its widest: a canonically one-cell glyph in it,
+        // drawn two cells wide, has nowhere for its second cell to go. What the frame guarantees is
+        // that this cannot wrap or scroll - autowrap is off before the first cell of every frame -
+        // and the destination discards what will not fit. The glyph itself is what is lost, and it
+        // is lost inside its own cell.
+        let edge = serde_json::json!({
+            "window": {"top_row": 0, "left_column": 0, "rows": 1, "columns": 4},
+            "rows": [{"row": 0, "soft_wrapped": false, "runs": [
+                {"column": 0, "cells": 4, "text": "abc\u{3b1}"}
+            ]}],
+            "cursor": {"column": 0, "row": 0, "visible": true, "style": 1, "pending_wrap": false}
+        });
+        let (screen, window) = screen_of(&edge);
+        let painted = install(&screen, window, Keyboard::NOTHING);
+        let mut destination = Destination::new(1, 4);
+        destination.width = Width::Widening;
+        destination.feed(&painted.bytes);
+        assert!(
+            !destination.scrolled,
+            "a glyph this destination draws wider than the last column can hold does not scroll it"
+        );
+        assert!(
+            destination.autowrap,
+            "and the session's own autowrap is back afterwards, having been off throughout"
+        );
+        assert_eq!(
+            destination.cells[0][..3],
+            ["a", "b", "c"],
+            "the cells before it are its own"
+        );
+        assert!(
+            destination.overflowed,
+            "what this destination could not fit it discarded, which is the glyph's own cell and \
+             nothing else: a frame draws with autowrap off precisely so that this is a lost glyph \
+             rather than a wrapped line"
+        );
+
+        // And the one case where the bound is two cells rather than one: a cell the session holds
+        // *blank*. A row is cleared before it is drawn and a blank cell has no run, so nothing is
+        // written over the second half of a glyph this destination drew wide. The person sees the
+        // glyph reaching into the space beside it. That is the whole of the damage, and it is
+        // stated here rather than discovered.
+        let beside = serde_json::json!({
+            "window": {"top_row": 0, "left_column": 0, "rows": 1, "columns": 6},
+            "rows": [{"row": 0, "soft_wrapped": false, "runs": [
+                {"column": 0, "cells": 1, "text": "\u{3b1}"},
+                {"column": 3, "cells": 3, "text": "end"}
+            ]}],
+            "cursor": {"column": 0, "row": 0, "visible": true, "style": 1, "pending_wrap": false}
+        });
+        let (screen, window) = screen_of(&beside);
+        let painted = install(&screen, window, Keyboard::NOTHING);
+        let mut destination = Destination::new(1, 6);
+        destination.width = Width::Widening;
+        destination.feed(&painted.bytes);
+        assert!(!destination.scrolled, "still nothing scrolls");
+        assert_eq!(
+            destination.cells[0][0], "\u{3b1}",
+            "the glyph is in its own cell"
+        );
+        assert_eq!(
+            destination.cells[0][1], "",
+            "the blank cell beside it is where the wide drawing went, and no run rewrote it"
+        );
+        assert_eq!(
+            destination.cells[0][3..],
+            ["e", "n", "d"],
+            "and the run after the blank is on its own columns, because it was addressed"
+        );
     }
 
     /// KR-REQ-08.40: a panned window places the cursor on the line that holds its row.

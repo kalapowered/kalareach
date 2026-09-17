@@ -324,13 +324,32 @@ pub fn install(
         (inactive_buffer, &snapshot.inactive_rows),
         (wire::buffer(snapshot.active_buffer), &snapshot.rows),
     ];
+    // Converted one row at a time, and each row cut as it is converted rather than after the whole
+    // screen has been built. Two bounds apply: what one page can carry, and this subscriber's own
+    // share of its send queue. The second is rough here - it ignores what the pages themselves
+    // cost, which the passes below settle - and it is a ceiling rather than a target, so an
+    // ordinary screen on an ordinary queue passes through it untouched. What it buys is the peak: a
+    // sixty-four mebibyte screen converted whole and then thrown away is sixty-four mebibytes this
+    // session had to find first.
+    let held: usize = carried.iter().map(|(_, rows)| rows.len()).sum();
+    let ceiling = budget
+        .checked_div(held)
+        .map_or(PAGE_BYTES, |share| share.max(1));
     let mut converted: Vec<(ProjectedBuffer, Vec<ProjectedRow>)> = Vec::new();
+    // Whether this subscriber's queue - rather than a page bound or the engine's own limits - is
+    // why some of the session is missing from this screen. It is what the header says out loud.
+    let mut cut = false;
     for (buffer, rows) in core::mem::take(&mut carried) {
-        let mut rows = wire::rows(rows)?;
-        for row in &mut rows {
-            truncate_row(row);
+        let mut kept: Vec<ProjectedRow> = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut row = wire::row(row)?;
+            truncate_row(&mut row);
+            let runs = row.runs.len();
+            truncate_row_to(&mut row, ceiling, PAGE_ITEMS);
+            cut |= row.runs.len() != runs;
+            kept.push(row);
         }
-        converted.push((buffer, rows));
+        converted.push((buffer, kept));
     }
     // A screen has to arrive whole or not at all: a client that holds some of the pages holds no
     // screen and draws nothing. So the whole installation is measured against this subscriber's own
@@ -347,7 +366,6 @@ pub fn install(
         oldest,
         inactive_oldest,
     );
-    let mut cut = false;
     let mut margin = 0_usize;
     for _ in 0..PAGE_FITTING_ATTEMPTS {
         let carried: usize = pages

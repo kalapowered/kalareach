@@ -586,6 +586,20 @@ mod unix {
                 .map_err(|error| CliError::TerminalProbeFailed(error.to_string()))?;
 
             let saved = self.modes()?;
+            // Before the terminal is touched at all, and before a single question goes out. From
+            // here until the terminator this terminal's stream is one a late reply can arrive on,
+            // and a process that dies in between runs no cleanup: this record is then the only
+            // thing that knows, and section 8 requires a clean input context before a retry rather
+            // than a hope that the last attempt finished. A host that cannot write the record
+            // cannot make that promise, so the exchange is refused instead of sent.
+            if !super::mark_contaminated(self) {
+                return Err(CliError::TerminalProbeFailed(
+                    "this host cannot record that this terminal has been asked, so a handshake \
+                     here could not be retried safely; attach with --no-probe, or make the \
+                     runtime directory writable"
+                        .to_owned(),
+                ));
+            }
             let mut asking = saved.clone();
             asking.make_raw();
             // A read that returns what has arrived and waits for nothing: no line, and not a
@@ -597,9 +611,6 @@ mod unix {
             rustix::termios::tcsetattr(&self.handle, OptionalActions::Now, &asking).map_err(
                 |error| CliError::Terminal(format!("set the terminal's modes: {error}")),
             )?;
-            // Before the first byte of the first question. From here until the terminator this
-            // terminal's stream is one a late reply can arrive on, and a process that dies in
-            // between leaves this record as the only thing that knows.
             let read = self.ask(&mut session, &request, started);
             // `Now` again, for the same reason: the exchange ends at the terminator, and anything
             // the person typed after it is still in the terminal's queue and is still theirs.

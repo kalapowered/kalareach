@@ -1063,9 +1063,12 @@ fn ends_a_restoration(bytes: &[u8]) -> bool {
     places_the_cursor(bytes) && sets_cursor_visibility(bytes)
 }
 
-/// Whether the bytes set the cursor's visibility, which a restoration does last of all.
+/// Whether the bytes *end* by setting the cursor's visibility, which is how a restoration ends.
+///
+/// Not "contains": a restoration sets mode 25 among the modes it installs, before it paints a
+/// single row. What only its end has is this sequence with nothing after it.
 fn sets_cursor_visibility(bytes: &[u8]) -> bool {
-    bytes.windows(5).any(|window| window == b"\x1b[?25")
+    bytes.ends_with(b"\x1b[?25h") || bytes.ends_with(b"\x1b[?25l")
 }
 
 /// Whether the bytes address the cursor.
