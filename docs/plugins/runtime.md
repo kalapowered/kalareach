@@ -185,6 +185,12 @@ of times before it is disabled. The binding's thread does wait for room to repor
 for two seconds and no longer; after that it disables the binding itself, which is what the notice it
 could not deliver would have asked for.
 
+The three queues are bounded in bytes, and the bound covers the record of what has already been
+dropped as well as what is waiting. Losses coalesce into one record per binding, so a reader that
+stopped reading cannot be given a backlog of gaps either. A fault and a disabling are never dropped;
+if even those will not fit once every document has gone, the connection is over, because a
+connection whose reliable news cannot be delivered is not one worth keeping open.
+
 A binding also holds a bounded number of unanswered calls. A caller whose deadline ran out has
 stopped waiting, but its request is still on the binding's thread until that thread reaches it, and
 the thread skips the ones whose callers have gone rather than spending a call's budget on an answer
@@ -314,15 +320,19 @@ nothing that is not that process can answer for it even with full access to the 
 The launcher records the process identity the service manager reported *before* the host connects,
 and compares it with the connecting peer as the kernel names it, with what the claim says, and with
 the boot this launcher is running in. A peer the kernel will not name is refused rather than taken on
-the strength of a signature. Exactly one rendezvous per reservation succeeds: the second claim for a
-reservation is refused by a record the launcher keeps and is counted, so two processes claiming one
-reservation is something a host can see rather than infer. Each launch also has a rendezvous address
-of its own, named after its reservation, so a claim can never arrive on an address two launches meant.
+the strength of a signature. Each launch also has a rendezvous address of its own, named after its
+reservation, so a claim can never arrive on an address two launches meant.
 
-The deadline covers receiving and checking the claim, not merely accepting a connection. A peer that
-connects and then says nothing does not hold a startup open, and a refused claim does not end the
-wait: the launcher keeps listening until its deadline and reports the last refusal if nothing better
-arrives.
+The deadline covers receiving and checking the claim, publishing the descriptor and acknowledging
+it -- not merely accepting a connection. A peer that connects and then says nothing does not hold a
+startup open, and a refused claim does not end the wait: the launcher keeps listening until its
+deadline and reports the last refusal if nothing better arrives.
+
+One reservation is one host, and the launcher keeps it that way by holding the reservation's own
+endpoint for as long as the host it started is running. A second claim reaches that and nothing
+else: it is accepted, dropped without a word, and counted, so two processes claiming one reservation
+is something a host can see rather than infer. Giving the fence up is what a launcher does when the
+host is gone, and the address becomes available again for the next launch.
 
 The host binds the endpoint workers will use *before* it reports itself and holds that listener until
 it serves. A bind, a release and a second bind would let another launch win the endpoint between
@@ -352,7 +362,7 @@ a frame without one is news.
 | `checkpoint` | take the component's own resumable state |
 | `restore` | restore it |
 | `unbind` | remove the binding and its instance |
-| `health` | ask what the host is doing |
+| `health` | ask what the host is doing: live bindings, this connection's own and its bound, the compiled components the cache holds and what they cost, the notice bytes waiting and the documents dropped |
 
 A binding belongs to the connection that registered it. Another connection that has the identifier
 finds no binding, which is the same answer it would get for one nobody ever registered, and a
@@ -392,5 +402,9 @@ Offering an event never waits at all. Every call carries the caller's own deadli
 it runs out, so nothing on the terminal path can end up behind a component. `unbind` is the one that
 blocks: it waits for the binding's thread so that a caller knows the instance has stopped before it
 drops what the instance was using, and the wait is bounded because the call the thread is finishing
-is bounded. A caller that must not block drops its handle instead, which signals the thread without
-waiting for it.
+is bounded. The plugin host runs it off its executor for that reason.
+
+Dropping a handle signals the thread rather than waiting for it, which is what makes a handle safe
+to drop anywhere. It does not stop the binding: the runtime holds a handle of its own until the
+binding is unbound or its owner goes, and the thread ends when the last one is gone or `unbind` says
+so.

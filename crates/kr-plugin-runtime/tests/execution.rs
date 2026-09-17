@@ -1388,3 +1388,53 @@ fn a_slow_component_spends_its_call_and_still_answers() {
         "eight calls took {total:?} between them"
     );
 }
+
+// A document the caller never received leaves a stale view, and the answer is the one a lost
+// observation gets: the component draws again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_document_nobody_received_asks_the_component_to_draw_again() {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let host = host();
+    let (events, mut received) = events();
+    let handle = host
+        .runtime
+        .prepare(
+            host.owner,
+            components::request("well-behaved", 11),
+            Arc::clone(&wasm),
+            COMPILE_WAIT,
+            events,
+        )
+        .await
+        .expect("the component binds");
+
+    // Nothing is owed yet: the component has just drawn what `bind` produced.
+    assert!(!handle.snapshot_required());
+
+    // Whoever was to read that document did not. Saying so is what puts the obligation back, and
+    // the pump discharges it with a fresh snapshot without anybody asking for one.
+    handle.require_snapshot();
+    assert!(handle.snapshot_required());
+
+    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+    let mut drew = false;
+    while !drew && std::time::Instant::now() < deadline {
+        match next_event(&mut received, core::time::Duration::from_millis(200)).await {
+            Some(BindingEvent::Document { call, nodes }) => {
+                if call == CallKind::Snapshot {
+                    assert!(!nodes.is_empty());
+                    drew = true;
+                }
+            }
+            Some(BindingEvent::Fault { detail, .. }) => panic!("the component faulted: {detail}"),
+            Some(_) | None => {}
+        }
+    }
+    assert!(drew, "the component was never asked to draw again");
+    assert!(
+        !handle.snapshot_required(),
+        "the obligation was not cleared"
+    );
+}

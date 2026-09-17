@@ -269,6 +269,17 @@ async fn kr_req_06_06_a_worker_registers_delivers_and_calls_over_the_protocol() 
         .expect("the restore runs");
     assert!(restored.answered());
 
+    // A connection accounts for the bindings it holds, and gives a place back exactly once: a
+    // place given back twice would let it hold more bindings than it may.
+    assert_eq!(
+        client
+            .health()
+            .await
+            .expect("a health report")
+            .connection_bindings,
+        1
+    );
+
     // Unbinding removes the instance, and a second unbind says there was nothing to remove.
     assert!(client.unbind(binding_id).await.expect("the unbind runs"));
     assert!(!client.unbind(binding_id).await.expect("the unbind runs"));
@@ -293,6 +304,16 @@ async fn kr_req_06_06_a_worker_registers_delivers_and_calls_over_the_protocol() 
         "the cache reports no bytes for the components it holds"
     );
     assert!(health.queued_notice_bytes <= 4 * 1024 * 1024);
+
+    assert_eq!(
+        client
+            .health()
+            .await
+            .expect("a health report")
+            .connection_bindings,
+        0,
+        "the binding's place was not given back"
+    );
 
     // A second registration of the same component finds the artefact rather than compiling again.
     let again = client
