@@ -1075,8 +1075,8 @@ class of processor rather than a machine, and one named class has answered a qua
 plain stream across the runs behind this revision, so the rows above are not a ranking of
 processors. The runs named are `core-ci` runs of this revision's terminal engine, each one retaining
 the figures, the processor and the verdict it measured, so a row can be read back to the run it came
-from. Two of the EPYC 9V74 runs of the same stream are 26% apart on the plain one and 26% apart on
-the one that scrolls. The Xeon row, and the wider end of the EPYC 9V74 row, were taken a few commits before the
+from. Two of the EPYC 9V74 runs are 27% apart on the plain stream and 26% apart on the one that
+scrolls. The Xeon row, and the wider end of the EPYC 9V74 row, were taken a few commits before the
 last change to the output path, which only takes work off it; the rest are of the engine as it
 stands.
 
