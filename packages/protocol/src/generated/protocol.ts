@@ -1056,6 +1056,7 @@ export interface KalaReachProtocol {
   pair_status_params?: PairStatusParams
   pair_status_result?: PairStatusResult
   policy_authority?: PolicyAuthority
+  preview_entry?: PreviewEntry
   project_adopt_params?: ProjectAdoptParams
   project_adopt_result?: ProjectAdoptResult
   project_clone_params?: ProjectCloneParams
@@ -4629,7 +4630,15 @@ export interface InclusionPreview {
    */
   counts: PreviewCount[]
   /**
-   * A bounded sample of the paths, longest-first by class in [`InclusionClass::EVERY`] order.
+   * True when every count above is the whole of its class.
+   *
+   * False when a bound was reached: an ignored directory deeper or larger than the walk
+   * covers, or a directory this host could not list. Then each count is a lower bound and the
+   * limitations say which bound was reached.
+   */
+  counts_complete: boolean
+  /**
+   * A bounded sample of the paths, grouped by class in [`InclusionClass::EVERY`] order.
    */
   entries: PreviewEntry[]
   /**
@@ -4657,6 +4666,10 @@ export interface InclusionPreview {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   taken_at_ms: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  unknown_content: string
 }
 /**
  * One class's counts in a preview.
@@ -4684,21 +4697,24 @@ export interface PreviewCount {
  */
 export interface PreviewEntry {
   /**
-   * Whether its content is binary.
-   *
-   * This cuts across the other classes rather than replacing them: a dirty file may be binary,
-   * and a policy that includes dirty files and excludes binaries leaves this one out. The test
-   * is Git's own, a NUL byte in the first eight thousand bytes of content as it is stored.
-   */
-  binary: boolean
-  /**
    * Its size in bytes, when the host could read one.
    */
   byte_len: U64 | null
   /**
+   * What change the working tree holds for it.
+   */
+  change: 'present' | 'deleted' | 'unmerged'
+  /**
    * Which class it belongs to: where in the working tree it came from.
    */
   class: 'dirty_file' | 'untracked_file' | 'submodule' | 'binary_file' | 'generated_artefact'
+  /**
+   * What its content is.
+   *
+   * This cuts across the other classes rather than replacing them: a dirty file may be binary,
+   * and a policy that includes dirty files and excludes binaries leaves this one out.
+   */
+  content: 'text' | 'binary' | 'unknown'
   /**
    * Whether the policy in force would copy it into the new workspace.
    */
@@ -6496,6 +6512,14 @@ export interface WorkspaceSummary {
    */
   base_revision: string
   /**
+   * The automation runs bound to it that are still live.
+   *
+   * Section 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace
+   * between two sessions or after its last one ended, so it is recorded separately and refuses
+   * a removal in the same way.
+   */
+  bound_runs: WorkflowRunId[]
+  /**
    * The sessions bound to it that are still live.
    *
    * A removal is refused while this is not empty, whatever retention policy it carries.
@@ -6506,6 +6530,10 @@ export interface WorkspaceSummary {
    */
   created_at_ms: string
   /**
+   * Why it is in the state it is in, when it ended up there for a reason.
+   */
+  detail: string | null
+  /**
    * The path it was created at, for a person to read.
    */
   display_path: string
@@ -6513,7 +6541,14 @@ export interface WorkspaceSummary {
    * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
-  filesystem_identity: FilesystemIdentity1
+  /**
+   * The stable filesystem identity of its working tree, once this host has one.
+   *
+   * Absent while the workspace is being materialised, and absent afterwards only when the
+   * materialisation did not get as far as creating the tree. An absent identity is what refuses
+   * a removal: this host does not delete a directory it cannot prove it created.
+   */
+  filesystem_identity: FilesystemIdentity1 | null
   /**
    * How an isolated workspace is separated, when it is one.
    */
@@ -6545,7 +6580,11 @@ export interface WorkspaceSummary {
   workspace_id: string
 }
 /**
- * The stable filesystem identity of its working tree.
+ * A repository's stable environment-local identity, as a client may show it.
+ *
+ * The two numbers are the device and the object number of the Git directory: the inode on Unix
+ * and the file index on Windows. They are metadata a client can display and compare; they are
+ * never an authority, because authority is the opened handle the host holds.
  */
 export interface FilesystemIdentity1 {
   /**
@@ -10132,6 +10171,14 @@ export interface InclusionPolicy2 {
 export interface WorkspaceCreateResult {
   preview: InclusionPreview1
   /**
+   * The paths the policy included that this host could not carry into the workspace.
+   *
+   * A symbolic link, a device, a submodule's own working tree, and a path whose destination
+   * this host could not replace. The workspace exists and is usable; what it does not hold is
+   * named here rather than left for a reviewer to notice.
+   */
+  unapplied: string[]
+  /**
    * The workspace, or nothing when this was a preview.
    */
   workspace: WorkspaceSummary | null
@@ -10157,7 +10204,15 @@ export interface InclusionPreview1 {
    */
   counts: PreviewCount[]
   /**
-   * A bounded sample of the paths, longest-first by class in [`InclusionClass::EVERY`] order.
+   * True when every count above is the whole of its class.
+   *
+   * False when a bound was reached: an ignored directory deeper or larger than the walk
+   * covers, or a directory this host could not list. Then each count is a lower bound and the
+   * limitations say which bound was reached.
+   */
+  counts_complete: boolean
+  /**
+   * A bounded sample of the paths, grouped by class in [`InclusionClass::EVERY`] order.
    */
   entries: PreviewEntry[]
   /**
@@ -10185,6 +10240,10 @@ export interface InclusionPreview1 {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   taken_at_ms: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  unknown_content: string
 }
 /**
  * Parameters of `workspace.list`.
@@ -10236,6 +10295,14 @@ export interface WorkspaceSummary1 {
    */
   base_revision: string
   /**
+   * The automation runs bound to it that are still live.
+   *
+   * Section 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace
+   * between two sessions or after its last one ended, so it is recorded separately and refuses
+   * a removal in the same way.
+   */
+  bound_runs: WorkflowRunId[]
+  /**
    * The sessions bound to it that are still live.
    *
    * A removal is refused while this is not empty, whatever retention policy it carries.
@@ -10246,6 +10313,10 @@ export interface WorkspaceSummary1 {
    */
   created_at_ms: string
   /**
+   * Why it is in the state it is in, when it ended up there for a reason.
+   */
+  detail: string | null
+  /**
    * The path it was created at, for a person to read.
    */
   display_path: string
@@ -10253,7 +10324,14 @@ export interface WorkspaceSummary1 {
    * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
-  filesystem_identity: FilesystemIdentity1
+  /**
+   * The stable filesystem identity of its working tree, once this host has one.
+   *
+   * Absent while the workspace is being materialised, and absent afterwards only when the
+   * materialisation did not get as far as creating the tree. An absent identity is what refuses
+   * a removal: this host does not delete a directory it cannot prove it created.
+   */
+  filesystem_identity: FilesystemIdentity1 | null
   /**
    * How an isolated workspace is separated, when it is one.
    */
@@ -10291,7 +10369,7 @@ export interface WorkspaceRemoveParams {
   /**
    * What the removal does with what the workspace holds.
    */
-  retention: 'keep_everything' | 'keep_retained_evidence' | 'remove_retained'
+  retention: 'keep_everything' | 'remove_retained'
   /**
    * The workspace to remove.
    */
@@ -10306,7 +10384,11 @@ export interface WorkspaceRemoveResult {
    */
   retained: RetainedItem[]
   /**
-   * True when the working files are gone.
+   * True when this workspace's own working files are gone.
+   *
+   * Always false for a shared workspace: that tree is the user's own, and removing the selection
+   * removes no file. For an isolated one it means the tree is not there any more, whether this
+   * call removed it or found it already gone.
    */
   working_files_removed: boolean
   workspace: WorkspaceSummary2
@@ -10324,6 +10406,14 @@ export interface WorkspaceSummary2 {
    */
   base_revision: string
   /**
+   * The automation runs bound to it that are still live.
+   *
+   * Section 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace
+   * between two sessions or after its last one ended, so it is recorded separately and refuses
+   * a removal in the same way.
+   */
+  bound_runs: WorkflowRunId[]
+  /**
    * The sessions bound to it that are still live.
    *
    * A removal is refused while this is not empty, whatever retention policy it carries.
@@ -10334,6 +10424,10 @@ export interface WorkspaceSummary2 {
    */
   created_at_ms: string
   /**
+   * Why it is in the state it is in, when it ended up there for a reason.
+   */
+  detail: string | null
+  /**
    * The path it was created at, for a person to read.
    */
   display_path: string
@@ -10341,7 +10435,14 @@ export interface WorkspaceSummary2 {
    * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
-  filesystem_identity: FilesystemIdentity1
+  /**
+   * The stable filesystem identity of its working tree, once this host has one.
+   *
+   * Absent while the workspace is being materialised, and absent afterwards only when the
+   * materialisation did not get as far as creating the tree. An absent identity is what refuses
+   * a removal: this host does not delete a directory it cannot prove it created.
+   */
+  filesystem_identity: FilesystemIdentity1 | null
   /**
    * How an isolated workspace is separated, when it is one.
    */

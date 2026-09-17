@@ -26,7 +26,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{
-    ActionId, ChangeSetId, EnvironmentId, ProjectRepositoryId, SessionId, WorkspaceId,
+    ActionId, ChangeSetId, EnvironmentId, ProjectRepositoryId, SessionId, WorkflowRunId,
+    WorkspaceId,
 };
 use crate::scalars::{DurationMs, Nullable, TimestampMs, U64};
 
@@ -382,16 +383,50 @@ pub struct PreviewEntry {
     pub path: String,
     /// Which class it belongs to: where in the working tree it came from.
     pub class: InclusionClass,
-    /// Whether its content is binary.
+    /// What change the working tree holds for it.
+    pub change: ChangeKind,
+    /// What its content is.
     ///
     /// This cuts across the other classes rather than replacing them: a dirty file may be binary,
-    /// and a policy that includes dirty files and excludes binaries leaves this one out. The test
-    /// is Git's own, a NUL byte in the first eight thousand bytes of content as it is stored.
-    pub binary: bool,
+    /// and a policy that includes dirty files and excludes binaries leaves this one out.
+    pub content: ContentClass,
     /// Its size in bytes, when the host could read one.
     pub byte_len: Nullable<U64>,
     /// Whether the policy in force would copy it into the new workspace.
     pub included: bool,
+}
+
+/// What the working tree holds for one path.
+///
+/// A copy is not the only way to carry an inclusion: a deletion is carried by removing the path
+/// from the new workspace, and a path this host cannot read is carried by neither.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ChangeKind {
+    /// The content differs from the base, or the path is new.
+    Present,
+    /// The path is gone from the working tree and the base still has it.
+    Deleted,
+    /// The path has an unresolved merge.
+    Unmerged,
+}
+
+/// What one path's content is, as far as this host read it.
+///
+/// The test for binary is Git's own: a null byte in the first eight thousand bytes of content as it
+/// is stored. [`Self::Unknown`] is the honest third answer, for a path this host did not read
+/// because the preview's scan bound was reached, or could not read at all. An unknown path is
+/// treated as binary by an exclusion, because excluding what might be binary is the direction that
+/// honours the request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ContentClass {
+    /// Read, and no null byte in the first eight thousand bytes.
+    Text,
+    /// Read, and a null byte in the first eight thousand bytes.
+    Binary,
+    /// Not read, so neither.
+    Unknown,
 }
 
 /// One class's counts in a preview.
@@ -430,10 +465,22 @@ pub struct InclusionPreview {
     pub base_change_set_id: Nullable<ChangeSetId>,
     /// One row per class, with exact counts.
     pub counts: Vec<PreviewCount>,
-    /// A bounded sample of the paths, longest-first by class in [`InclusionClass::EVERY`] order.
+    /// A bounded sample of the paths, grouped by class in [`InclusionClass::EVERY`] order.
     pub entries: Vec<PreviewEntry>,
-    /// How many paths the sample left out.
+    /// How many paths the sample left out. The counts still cover them.
     pub omitted_entries: U64,
+    /// How many paths this host could not classify as text or binary.
+    ///
+    /// Reading every path's first bytes costs an open each, and a working tree with a build
+    /// directory in it holds hundreds of thousands. Above [`MAX_BINARY_SCAN_ENTRIES`] the host
+    /// stops reading and says how many it did not read rather than calling them text.
+    pub unknown_content: U64,
+    /// True when every count above is the whole of its class.
+    ///
+    /// False when a bound was reached: an ignored directory deeper or larger than the walk
+    /// covers, or a directory this host could not list. Then each count is a lower bound and the
+    /// limitations say which bound was reached.
+    pub counts_complete: bool,
     /// What this preview cannot promise, in the host's own words.
     ///
     /// A shared workspace is not a sandbox; a worktree shares repository metadata; a working tree
@@ -466,17 +513,23 @@ pub enum WorkspaceState {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum RetentionPolicy {
-    /// Keep everything. The workspace is removed only when nothing is retained.
+    /// Keep everything. The workspace is removed only when it holds nothing.
     ///
-    /// The default a client should offer, because it is the only one that cannot lose work.
+    /// The one a client offers first, because it is the only one that cannot lose work. What the
+    /// workspace holds is measured rather than assumed: its own uncommitted work as well as the
+    /// pins and the review evidence recorded against it. When it holds something, nothing is
+    /// removed and the result lists what.
     KeepEverything,
-    /// Remove the working files and keep dirty content, pinned change sets and review evidence.
-    KeepRetainedEvidence,
-    /// Remove everything, including what is retained.
+    /// Remove everything, including what is held.
     ///
     /// Section 14 keeps dirty content, pinned change sets and review evidence until the user
-    /// approves their removal, so this policy is the approval: a request that carries it names
-    /// exactly what it is removing and the result lists what went.
+    /// approves their removal, so this policy *is* the approval: it follows a
+    /// [`Self::KeepEverything`] request that listed what is held, and the result lists what went.
+    ///
+    /// There is deliberately no third policy that removes the working files while keeping the
+    /// dirty content in them. Keeping content means capturing it, and capturing an immutable
+    /// version of a workspace is the change-set service's; a policy that claimed to keep what it
+    /// had just deleted would be a lie.
     RemoveRetained,
 }
 
@@ -528,14 +581,26 @@ pub struct WorkspaceSummary {
     pub base_revision: String,
     /// The change-set version it materialised, when it named one.
     pub base_change_set_id: Nullable<ChangeSetId>,
-    /// The stable filesystem identity of its working tree.
-    pub filesystem_identity: FilesystemIdentity,
+    /// The stable filesystem identity of its working tree, once this host has one.
+    ///
+    /// Absent while the workspace is being materialised, and absent afterwards only when the
+    /// materialisation did not get as far as creating the tree. An absent identity is what refuses
+    /// a removal: this host does not delete a directory it cannot prove it created.
+    pub filesystem_identity: Nullable<FilesystemIdentity>,
     /// The path it was created at, for a person to read.
     pub display_path: String,
+    /// Why it is in the state it is in, when it ended up there for a reason.
+    pub detail: Nullable<String>,
     /// The sessions bound to it that are still live.
     ///
     /// A removal is refused while this is not empty, whatever retention policy it carries.
     pub bound_sessions: Vec<SessionId>,
+    /// The automation runs bound to it that are still live.
+    ///
+    /// Section 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace
+    /// between two sessions or after its last one ended, so it is recorded separately and refuses
+    /// a removal in the same way.
+    pub bound_runs: Vec<WorkflowRunId>,
     /// What it holds that a removal would have to account for.
     pub retained: Vec<RetainedItem>,
     /// When it was created.
@@ -799,6 +864,12 @@ pub struct WorkspaceCreateResult {
     pub workspace: Nullable<WorkspaceSummary>,
     /// What a reviewer would see, always.
     pub preview: InclusionPreview,
+    /// The paths the policy included that this host could not carry into the workspace.
+    ///
+    /// A symbolic link, a device, a submodule's own working tree, and a path whose destination
+    /// this host could not replace. The workspace exists and is usable; what it does not hold is
+    /// named here rather than left for a reviewer to notice.
+    pub unapplied: Vec<String>,
 }
 
 /// Parameters of `workspace.read`.
@@ -833,7 +904,11 @@ pub struct WorkspaceRemoveParams {
 pub struct WorkspaceRemoveResult {
     /// The workspace, in the state the removal left it.
     pub workspace: WorkspaceSummary,
-    /// True when the working files are gone.
+    /// True when this workspace's own working files are gone.
+    ///
+    /// Always false for a shared workspace: that tree is the user's own, and removing the selection
+    /// removes no file. For an isolated one it means the tree is not there any more, whether this
+    /// call removed it or found it already gone.
     pub working_files_removed: bool,
     /// What is still held, and is waiting for the user's approval.
     pub retained: Vec<RetainedItem>,

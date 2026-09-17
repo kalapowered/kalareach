@@ -23,8 +23,9 @@ use std::io::{Read as _, Write as _};
 
 use kr_protocol::ids::{ChangeSetId, ProjectRepositoryId};
 use kr_protocol::project::{
-    InclusionChoice, InclusionClass, InclusionPolicy, InclusionPreview, IsolationMechanism,
-    MAX_BINARY_SCAN_ENTRIES, MAX_PREVIEW_ENTRIES, PreviewCount, PreviewEntry, WorkspaceKind,
+    ChangeKind, ContentClass, InclusionChoice, InclusionClass, InclusionPolicy, InclusionPreview,
+    IsolationMechanism, MAX_BINARY_SCAN_ENTRIES, MAX_PREVIEW_ENTRIES, PreviewCount, PreviewEntry,
+    WorkspaceKind,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 use kr_transfer::{AuthorisedDirectory, ObjectPolicy, RelativeName};
@@ -53,6 +54,12 @@ pub struct StatusEntry {
     pub path: String,
     /// Which class it belongs to.
     pub class: InclusionClass,
+    /// What change the working tree holds for it.
+    ///
+    /// A copy is not the only way to carry an inclusion. A deletion is carried by removing the
+    /// path from the new workspace, which is why the status's own operation is kept rather than
+    /// reduced to a class.
+    pub change: ChangeKind,
 }
 
 /// One entry of the working tree, with the decision the policy made about it.
@@ -62,11 +69,13 @@ pub struct SurveyEntry {
     pub path: String,
     /// Which class it belongs to.
     pub class: InclusionClass,
-    /// Whether Git's own test calls its content binary.
-    pub binary: bool,
+    /// What change the working tree holds for it.
+    pub change: ChangeKind,
+    /// What its content is, as far as this host read it.
+    pub content: ContentClass,
     /// Its size, when the host could read one.
     pub byte_len: Option<u64>,
-    /// Whether the policy in force copies it into the new workspace.
+    /// Whether the policy in force carries it into the new workspace.
     pub included: bool,
 }
 
@@ -94,8 +103,13 @@ pub struct Survey {
 /// Returns [`ProjectError::GitFailed`] when a record is not one this format defines.
 pub fn parse_status(text: &str) -> Result<Vec<StatusEntry>> {
     let mut entries = Vec::new();
+    let mut skip_next = false;
     for record in text.split('\0') {
         if record.is_empty() {
+            continue;
+        }
+        if skip_next {
+            skip_next = false;
             continue;
         }
         let (marker, rest) = record.split_at(1);
@@ -106,10 +120,12 @@ pub fn parse_status(text: &str) -> Result<Vec<StatusEntry>> {
             "?" => entries.push(StatusEntry {
                 path: rest.to_owned(),
                 class: InclusionClass::UntrackedFile,
+                change: ChangeKind::Present,
             }),
             "!" => entries.push(StatusEntry {
                 path: rest.to_owned(),
                 class: InclusionClass::GeneratedArtefact,
+                change: ChangeKind::Present,
             }),
             // The field counts are the format's: eight fields for an ordinary entry, nine for a
             // renamed one and ten for an unmerged one, with the path last in each.
@@ -123,19 +139,35 @@ pub fn parse_status(text: &str) -> Result<Vec<StatusEntry>> {
                 if parts.len() < fields {
                     return Err(malformed(record));
                 }
+                let states = parts[0];
                 let submodule = parts[1];
                 let path = parts[fields - 1];
                 if path.is_empty() {
                     return Err(malformed(record));
                 }
+                // The two state characters are the index's and the working tree's. A `D` in the
+                // working-tree position is a path the tree no longer holds, and carrying that
+                // inclusion means removing the path rather than copying it.
+                let worktree = states.chars().nth(1).unwrap_or('.');
                 entries.push(StatusEntry {
                     class: if submodule.starts_with('S') {
                         InclusionClass::Submodule
                     } else {
                         InclusionClass::DirtyFile
                     },
+                    change: match (marker, worktree) {
+                        ("u", _) => ChangeKind::Unmerged,
+                        (_, 'D') => ChangeKind::Deleted,
+                        _ => ChangeKind::Present,
+                    },
                     path: path.to_owned(),
                 });
+                // A renamed entry is followed by its original path as a record of its own, which
+                // is not a status record. `survey` asks for `--no-renames`, so this is the
+                // parser's completeness rather than a path it meets.
+                if marker == "2" {
+                    skip_next = true;
+                }
             }
             _ => return Err(malformed(record)),
         }
@@ -244,6 +276,7 @@ pub fn survey(
         .map(|path| StatusEntry {
             path,
             class: InclusionClass::Submodule,
+            change: ChangeKind::Present,
         })
         .collect();
     for entry in parse_status(&reported)? {
@@ -271,21 +304,33 @@ pub fn survey(
         .collect();
     let mut entries: Vec<SurveyEntry> = Vec::with_capacity(status.len());
     let mut scanned = 0_usize;
-    let mut unscanned = 0_u64;
+    let mut unknown = 0_u64;
     let shared = matches!(request.kind, WorkspaceKind::SharedExisting);
     for entry in status {
-        let measured = measure(repository.work_tree(), &entry.path, &mut scanned);
-        if measured.binary_unscanned {
-            unscanned += 1;
+        let measured = measure(
+            repository.work_tree(),
+            &entry.path,
+            entry.change,
+            &mut scanned,
+        );
+        if matches!(measured.content, ContentClass::Unknown) {
+            unknown += 1;
         }
         // A shared workspace keeps the user's state where it is, so a reviewer of one sees
-        // everything that is there whatever the policy says.
+        // everything that is there whatever the policy says. Otherwise the origin class decides
+        // first and the content decides second: a path this host could not read counts as binary
+        // for an exclusion, because excluding what might be binary is the direction that honours
+        // the request.
+        let excluded_by_content = !matches!(request.policy.binary_files, InclusionChoice::Include)
+            && matches!(
+                measured.content,
+                ContentClass::Binary | ContentClass::Unknown
+            );
         let included = shared
             || (matches!(request.policy.choice(entry.class), InclusionChoice::Include)
-                && (!measured.binary
-                    || matches!(request.policy.binary_files, InclusionChoice::Include)));
+                && !excluded_by_content);
         bump(&mut counts, entry.class, measured.byte_len, included);
-        if measured.binary {
+        if matches!(measured.content, ContentClass::Binary) {
             bump(
                 &mut counts,
                 InclusionClass::BinaryFile,
@@ -296,7 +341,8 @@ pub fn survey(
         entries.push(SurveyEntry {
             path: entry.path,
             class: entry.class,
-            binary: measured.binary,
+            change: entry.change,
+            content: measured.content,
             byte_len: measured.byte_len,
             included,
         });
@@ -315,7 +361,8 @@ pub fn survey(
         .map(|entry| PreviewEntry {
             path: entry.path.clone(),
             class: entry.class,
-            binary: entry.binary,
+            change: entry.change,
+            content: entry.content,
             byte_len: Nullable(entry.byte_len.map(U64::new)),
             included: entry.included,
         })
@@ -332,10 +379,12 @@ pub fn survey(
          copied"
             .to_owned(),
     );
-    if unscanned > 0 {
+    if unknown > 0 {
         limitations.push(format!(
-            "{unscanned} paths beyond the first {MAX_BINARY_SCAN_ENTRIES} were not read, so they \
-             are counted in their own class and not among the binary files"
+            "{unknown} paths were not read, because the preview reads at most \
+             {MAX_BINARY_SCAN_ENTRIES} of them or because this host could not open them. Each is \
+             counted in its own class, is not counted among the binary files, and is left out by \
+             an exclusion of binary files rather than treated as text"
         ));
     }
     if truncated > 0 {
@@ -362,6 +411,8 @@ pub fn survey(
             counts,
             entries: sample,
             omitted_entries: U64::new(omitted),
+            unknown_content: U64::new(unknown),
+            counts_complete: truncated == 0,
             limitations,
             taken_at_ms: request.at_ms,
         },
@@ -401,6 +452,7 @@ fn expand(
         out.push(StatusEntry {
             path: prefix.to_owned(),
             class,
+            change: ChangeKind::Present,
         });
         return;
     };
@@ -423,7 +475,11 @@ fn expand(
                     return;
                 }
                 *budget -= 1;
-                out.push(StatusEntry { path: child, class });
+                out.push(StatusEntry {
+                    path: child,
+                    class,
+                    change: ChangeKind::Present,
+                });
             }
             // A link, a socket or a device is not content this host copies.
             _ => {}
@@ -432,11 +488,21 @@ fn expand(
 }
 
 /// What reading one entry established.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug)]
 struct Measured {
     byte_len: Option<u64>,
-    binary: bool,
-    binary_unscanned: bool,
+    content: ContentClass,
+}
+
+impl Default for Measured {
+    fn default() -> Self {
+        Self {
+            byte_len: None,
+            // A path this host did not read is not a text path. Everything that decides from this
+            // treats an unknown as it treats a binary.
+            content: ContentClass::Unknown,
+        }
+    }
 }
 
 /// Reads one entry's size, and whether Git's own test calls it binary.
@@ -445,7 +511,20 @@ struct Measured {
 /// is refused rather than followed. A path the host cannot read is reported with no size and as
 /// text, because a preview that refused to be taken would be less useful than one that says what
 /// it could not measure.
-fn measure(tree: &AuthorisedDirectory, path: &str, scanned: &mut usize) -> Measured {
+fn measure(
+    tree: &AuthorisedDirectory,
+    path: &str,
+    change: ChangeKind,
+    scanned: &mut usize,
+) -> Measured {
+    if matches!(change, ChangeKind::Deleted) {
+        // There is nothing there to read, and nothing this host would copy. A deletion is carried
+        // by removing the path from the new workspace.
+        return Measured {
+            byte_len: None,
+            content: ContentClass::Text,
+        };
+    }
     let Ok(name) = RelativeName::parse(path) else {
         return Measured::default();
     };
@@ -456,8 +535,7 @@ fn measure(tree: &AuthorisedDirectory, path: &str, scanned: &mut usize) -> Measu
     if *scanned >= MAX_BINARY_SCAN_ENTRIES {
         return Measured {
             byte_len: Some(byte_len),
-            binary: false,
-            binary_unscanned: true,
+            content: ContentClass::Unknown,
         };
     }
     *scanned += 1;
@@ -475,8 +553,11 @@ fn measure(tree: &AuthorisedDirectory, path: &str, scanned: &mut usize) -> Measu
     }
     Measured {
         byte_len: Some(byte_len),
-        binary: head[..read].contains(&0),
-        binary_unscanned: false,
+        content: if head[..read].contains(&0) {
+            ContentClass::Binary
+        } else {
+            ContentClass::Text
+        },
     }
 }
 
@@ -582,7 +663,13 @@ pub fn check_choice(
 pub struct CopyReport {
     /// The paths that were copied.
     pub copied: Vec<String>,
-    /// The paths that could not be read or written, each named rather than hidden.
+    /// The paths that were removed, because the user's working tree does not hold them.
+    pub removed: Vec<String>,
+    /// The paths the policy included that this host could not carry, each named rather than
+    /// hidden.
+    ///
+    /// A symbolic link, a device, a submodule's own working tree, and a path whose destination
+    /// this host could not replace. The caller reports these; it does not treat them as copied.
     pub skipped: Vec<String>,
     /// How many bytes were copied.
     pub byte_len: u64,
@@ -605,16 +692,30 @@ pub fn copy_included(
 ) -> Result<CopyReport> {
     let mut report = CopyReport::default();
     for entry in entries {
+        if !entry.included {
+            continue;
+        }
         // A submodule is its own repository with its own configuration, and copying its working
-        // tree would be copying a repository this host has not opened. Including one records the
-        // decision and the materialisation is the submodule task's.
-        if !entry.included || matches!(entry.class, InclusionClass::Submodule) {
+        // tree would be copying a repository this host has not opened and cannot audit. Including
+        // one is recorded as unapplied rather than half done.
+        if matches!(entry.class, InclusionClass::Submodule) {
+            report.skipped.push(entry.path.clone());
             continue;
         }
         let Ok(name) = RelativeName::parse(&entry.path) else {
             report.skipped.push(entry.path.clone());
             continue;
         };
+        // A deletion is carried by removing the path from the new workspace. The checkout put the
+        // base's content there, and what the user has is its absence.
+        if matches!(entry.change, ChangeKind::Deleted) {
+            if remove_one(destination, &name) {
+                report.removed.push(entry.path.clone());
+            } else {
+                report.skipped.push(entry.path.clone());
+            }
+            continue;
+        }
         if copy_one(source, destination, &name, &mut report.byte_len)? {
             report.copied.push(entry.path.clone());
         } else {
@@ -622,6 +723,31 @@ pub fn copy_included(
         }
     }
     Ok(report)
+}
+
+/// Removes one path from the new workspace, carrying a deletion the user has.
+fn remove_one(destination: &AuthorisedDirectory, name: &RelativeName) -> bool {
+    let components = name.components();
+    let Some((leaf, parents)) = components.split_last() else {
+        return false;
+    };
+    let mut here: Option<AuthorisedDirectory> = None;
+    for component in parents {
+        let Ok(component) = RelativeName::parse(component) else {
+            return false;
+        };
+        let above = here.as_ref().unwrap_or(destination);
+        match above.subdirectory(&component) {
+            Ok(next) => here = Some(next),
+            // The directory is not there, so neither is the path: the deletion is already carried.
+            Err(_) => return true,
+        }
+    }
+    let target = here.as_ref().unwrap_or(destination);
+    let Ok(leaf) = RelativeName::parse(leaf) else {
+        return false;
+    };
+    target.remove(&leaf).is_ok() && target.sync().is_ok()
 }
 
 fn copy_one(
@@ -660,11 +786,18 @@ fn copy_one(
     let target = here.as_ref().unwrap_or(destination);
     let leaf = RelativeName::parse(leaf)?;
     let mut handle = file.into_handle();
-    // The checkout may already have put the base's content at this name, and the user's own
-    // content is what an inclusion means, so an existing name is written rather than refused.
+    // The checkout may already have put the base's content at this name. Writing over it would
+    // leave the base's tail behind whenever the user's file is shorter, so the name is removed and
+    // created again: what the workspace holds is the user's file and nothing of the base's.
+    let existing = target.remove(&leaf).is_ok();
     let mut written = match target.create_new(&leaf) {
         Ok(created) => created,
-        Err(_) => target.open_write(&leaf)?,
+        // Something this host could not replace is still there: a directory where the source has
+        // a file, or a name the platform would not remove. It is named rather than written over.
+        Err(_) => {
+            let _ = existing;
+            return Ok(false);
+        }
     };
     let mut buffer = vec![0_u8; 256 * 1024];
     loop {
@@ -700,6 +833,7 @@ mod tests {
             "1 .M N... 100644 100644 100644 aaaa bbbb src/changed.rs\0",
             "1 M. N... 100644 100644 100644 aaaa bbbb src/staged.rs\0",
             "1 .M S.M. 160000 160000 160000 cccc dddd vendor/library\0",
+            "1 .D N... 100644 100644 000000 aaaa bbbb src/gone.rs\0",
             "u UU N... 100644 100644 100644 100644 eeee ffff 0000 src/conflicted.rs\0",
             "? new-file.txt\0",
             "! target/debug/binary\0",
@@ -710,27 +844,38 @@ mod tests {
             vec![
                 StatusEntry {
                     path: "src/changed.rs".to_owned(),
-                    class: InclusionClass::DirtyFile
+                    class: InclusionClass::DirtyFile,
+                    change: ChangeKind::Present,
                 },
                 StatusEntry {
                     path: "src/staged.rs".to_owned(),
-                    class: InclusionClass::DirtyFile
+                    class: InclusionClass::DirtyFile,
+                    change: ChangeKind::Present,
                 },
                 StatusEntry {
                     path: "vendor/library".to_owned(),
-                    class: InclusionClass::Submodule
+                    class: InclusionClass::Submodule,
+                    change: ChangeKind::Present,
+                },
+                StatusEntry {
+                    path: "src/gone.rs".to_owned(),
+                    class: InclusionClass::DirtyFile,
+                    change: ChangeKind::Deleted,
                 },
                 StatusEntry {
                     path: "src/conflicted.rs".to_owned(),
-                    class: InclusionClass::DirtyFile
+                    class: InclusionClass::DirtyFile,
+                    change: ChangeKind::Unmerged,
                 },
                 StatusEntry {
                     path: "new-file.txt".to_owned(),
-                    class: InclusionClass::UntrackedFile
+                    class: InclusionClass::UntrackedFile,
+                    change: ChangeKind::Present,
                 },
                 StatusEntry {
                     path: "target/debug/binary".to_owned(),
-                    class: InclusionClass::GeneratedArtefact
+                    class: InclusionClass::GeneratedArtefact,
+                    change: ChangeKind::Present,
                 },
             ]
         );

@@ -180,11 +180,24 @@ Five classes, five decisions:
 files and excludes binaries leaves a binary dirty file out. The test for binary is Git's own, a null
 byte in the first eight thousand bytes of content as it is stored.
 
-The counts are exact for every class. The list of paths is bounded, because a reply travels in one
-control frame and a working tree can hold a million ignored files; what it leaves out it counts, and
-says so among its limitations. A wholly ignored directory is one entry in Git's own status output,
-so this host walks it to keep the counts exact and to copy what an inclusion covers; a directory
-deeper or larger than the walk's bound is reported rather than silently left out.
+Content has a third answer. A path this host did not read — because the preview reads at most
+twenty thousand of them, or because it could not open it at all — is `unknown` rather than text. An
+exclusion of binary files leaves an unknown path out, because excluding what might be binary is the
+direction that honours the request, and the preview says how many it could not classify.
+
+Each entry also carries what the working tree holds for it: `present`, `deleted` or `unmerged`. A
+copy is not the only way to carry an inclusion. A deletion the user has is carried by *removing* the
+path from the new workspace, because the checkout put the base's copy there.
+
+The counts cover every path the status reported, including the ones the bounded list leaves out; the
+list says how many those are. `counts_complete` says whether the counts are the whole of their
+classes: a wholly ignored directory is one entry in Git's own status output, so this host walks it to
+count and copy what an inclusion covers, and a directory deeper or larger than the walk's bound
+makes every count a lower bound with the reason among the limitations.
+
+A submodule is counted from the index and never entered, so what a submodule holds is neither
+measured nor copied. Including one records the decision and names the path among the creation's
+`unapplied` list.
 
 The preview also carries what a workspace of that kind cannot promise, in the host's own words: that
 a worktree is not a sandbox, that a working tree can change between the preview and the copy, and
@@ -193,8 +206,15 @@ user.
 
 ### Nothing is cleaned, stashed or discarded
 
-An exclusion means the new workspace starts without that file. It never means the original is
-touched. The service reads the source tree and writes only into the new one.
+An exclusion means the new workspace starts without that file, or with the base's version of it
+where the base has one. It never means the original is touched. The service reads the source tree
+and writes only into the new one.
+
+An inclusion replaces the destination rather than writing over it: the name is removed and created
+again, so a file the user has shortened does not keep the base's tail. What the host could not
+carry it names rather than hides: a symbolic link, a device, a submodule's own working tree and a
+path whose destination could not be replaced all appear in the creation's `unapplied` list, and the
+workspace is still returned because it is usable and what it does not hold is stated.
 
 That rule is enforced from underneath as well as stated: the restricted profile's subcommand
 allowlist does not contain `clean`, `stash`, `reset`, `restore`, `commit`, `push`, `revert`,
@@ -209,16 +229,38 @@ nor marking a review complete removes anything: what closure does is record that
 
 | Policy | What it removes |
 | --- | --- |
-| `keep_everything` | Nothing, while anything is retained. The result lists what is held. |
-| `keep_retained_evidence` | The working files. Dirty content, pinned change sets and review evidence stay. |
-| `remove_retained` | Everything, including what is held. Carrying this policy *is* the user's approval. |
+| `keep_everything` | Nothing, while the workspace holds anything. The result lists what. |
+| `remove_retained` | Everything, including what is held. Carrying this policy *is* the user's approval of the list the first request returned. |
+
+There is deliberately no third policy that removes the working files while keeping the dirty content
+in them. Keeping content means capturing it, and capturing an immutable version of a workspace is
+the change-set service's; a policy that claimed to keep what it had just deleted would be a lie.
+
+**What a workspace holds is measured, not assumed.** An empty retention table does not establish a
+clean tree: a workspace created from its base alone holds nothing, and then somebody edits a file in
+it. So every removal reads the workspace's own status first and records what it found, and
+`keep_everything` then keeps the workspace because of that as readily as because of a pin.
+
+**Cleanup waits for every session and every run.** Both are recorded bindings and either refuses a
+removal while it is live, whatever policy the request carries. A run can hold a workspace between
+two sessions or after its last one ended, which is why it is its own binding rather than inferred
+from a session.
+
+**The reservation and the checks are one transaction.** The action is claimed, the holders are
+counted and the workspace moves to `removal_pending` together, and nothing new may hold a workspace
+from that moment. Otherwise a session bound between the check and the deletion would be a live
+holder of a tree that was already going, and two copies of one removal action would both delete
+before either was told it lost.
 
 A **shared** workspace is the user's own working tree, so removing it removes the selection and no
 file. No retention policy deletes a tree the user is working in.
 
 A workspace record survives its removal, so a later read says what happened rather than nothing. An
-isolated workspace's identity is checked before anything is removed: a record whose object has been
-replaced does not authorise removing whatever now holds its path.
+isolated workspace's identity is what authorises the removal: it is recorded before anything is
+written into the tree, it is checked before anything is removed, and a workspace whose
+materialisation never recorded one is **refused** rather than removed. This host does not delete a
+directory it cannot prove it created; the directory is left for a person to look at, and the reason
+is on the record.
 
 ## The restricted Git execution profile
 
@@ -292,7 +334,7 @@ what Git would run it during, and how this host stops it. The tests build a real
 each entry as a program that writes a sentinel file when it runs, and then take a status, a review
 refresh, a clone and an adoption against it. No sentinel may appear.
 
-### Three limits the host states rather than hides
+### Four limits the host states rather than hides
 
 **The publication's no-replace guarantee is the platform's.** On Linux and Apple platforms it is one
 system call: `renameat2` with `RENAME_NOREPLACE`, and `renameatx_np` with `RENAME_EXCL`. On Windows
@@ -309,6 +351,13 @@ through Git's own interface, so what this host does is notice. After every read 
 path, compares both filesystem identities, re-reads the configuration and compares its digest; a
 result produced against something else is refused rather than returned. What remains is a change
 made and undone inside one invocation, which two readings cannot distinguish from no change at all.
+
+**Partial progress survives, and is not called finished.** A workspace whose materialisation this
+host did not finish keeps every file in its directory: the files may be the user's, and this host
+does not know which of them it wrote. What it does not do is call that workspace ready. The row
+moves out of the states anything may hold, the reason is recorded, and a person decides. Per-path
+apply progress is the diff service's contract, not this one's; what this service records is which
+tree it created and what it carried into it.
 
 **A cancellation contains a process group on Unix and a single process elsewhere.** Every Git child
 this service starts leads its own process group, so a cancellation ends the helper, the ssh process
@@ -344,12 +393,29 @@ change commits with the outbox row that announces it.
 | `projects` | One row per repository, with both filesystem identities |
 | `workspaces` | One row per working copy, with its policy, its base and its tree's identity |
 | `workspace_sessions` | Which sessions are bound to a workspace, and which are still live |
+| `workspace_runs` | Which automation runs are bound to it, and which are still live |
 | `workspace_retained` | Dirty content, pinned change sets and review evidence |
 | `actions` | One row per claimed action: the claim, and its result when there is one |
 | `events`, `cursors` | The outbox and its consumers |
 
 The journal's lock is never held across a subprocess. A clone can take minutes; each transaction
-takes the lock and releases it, and every Git invocation runs with none held.
+takes the lock and releases it, and every Git invocation runs with none held. A guard is always
+bound to a local first, never taken in the head of a condition or a loop: a temporary guard there
+lives for the whole body, and a helper that takes the same lock would wait for itself.
+
+Every state change commits with the outbox row that announces it, in one transaction. That covers
+the state setters, the session and run bindings and the retention changes as well as the two calls
+that begin an operation and a workspace, because a change a consumer cannot replay is a change that
+happened here and never happened anywhere downstream.
+
+### What recovery resolves
+
+| What an earlier daemon left | What a replacement does |
+| --- | --- |
+| An operation in `staging` or `publishing` | Reconciles it against the create token, as the table above says |
+| A staging sibling a row names, whose operation has ended | Removes it. Nothing is removed because of its name alone: a repository a user called `.kr-project-something` is not this host's |
+| A workspace in `materialising` | Removes the staged sibling it recorded, leaves every file in the directory alone, and moves the row to `removal_pending` with the reason. The files may be the user's, and this host does not know which of them it wrote; what it does know is that the workspace is not what its creation asked for, so nothing new may hold it and no read calls it ready |
+| An action claim with no result | Settles it. A claim is opened with the state it changes and filled in when the effect settles, so a daemon that died between the two leaves one open — and an open claim is not an answer: a repeat would be told the outcome is unknown for ever. Where the durable state answers the action, that is the answer; where it does not, the claim settles as an unknown outcome naming the object it acted on |
 
 ## Errors
 

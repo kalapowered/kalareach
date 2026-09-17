@@ -119,7 +119,7 @@ fn a_preview_names_what_a_reviewer_would_see_and_creates_nothing() {
     let binary: Vec<&str> = preview
         .entries
         .iter()
-        .filter(|entry| entry.binary)
+        .filter(|entry| entry.content == kr_protocol::project::ContentClass::Binary)
         .map(|entry| entry.path.as_str())
         .collect();
     assert_eq!(binary, vec!["image.bin"]);
@@ -242,16 +242,20 @@ fn an_isolated_workspace_copies_what_the_policy_includes_and_the_source_keeps_ev
             workspace_id: workspace.workspace_id,
         })
         .expect("the workspace reads");
+    let repository_identity = fixture
+        .service()
+        .project_read(&kr_protocol::project::ProjectReadParams {
+            project_repository_id: project,
+        })
+        .expect("the repository reads")
+        .project
+        .filesystem_identity;
     assert_ne!(
-        read.workspace.filesystem_identity,
-        fixture
-            .service()
-            .project_read(&kr_protocol::project::ProjectReadParams {
-                project_repository_id: project,
-            })
-            .expect("the repository reads")
-            .project
+        read.workspace
             .filesystem_identity
+            .0
+            .expect("a ready workspace has one"),
+        repository_identity
     );
     // What was copied in is uncommitted work the workspace now holds, so a removal accounts for it.
     assert!(
@@ -564,23 +568,8 @@ fn a_removal_keeps_dirty_content_a_pin_and_review_evidence_until_the_user_approv
     assert!(kinds.contains(&RetainedKind::ReviewEvidence));
     assert!(tree.join("README.md").is_file(), "nothing was removed");
 
-    // Keeping the evidence removes the working files and leaves the record waiting.
-    let answer = fixture
-        .service()
-        .workspace_remove(
-            &WorkspaceRemoveParams {
-                workspace_id,
-                retention: RetentionPolicy::KeepRetainedEvidence,
-            },
-            Some(&action("workspace.remove", 15)),
-        )
-        .expect("the working files go and the evidence stays");
-    assert!(answer.working_files_removed);
-    assert_eq!(answer.workspace.state, WorkspaceState::RemovalPending);
-    assert_eq!(answer.retained.len(), 3);
-    assert!(!tree.exists());
-
-    // The user's approval is the policy that names what it removes.
+    // The user's approval is the policy that names what it removes. There is no third policy that
+    // removes the working files while claiming to keep the dirty content in them.
     let answer = fixture
         .service()
         .workspace_remove(
@@ -593,6 +582,8 @@ fn a_removal_keeps_dirty_content_a_pin_and_review_evidence_until_the_user_approv
         .expect("the approval removes what was held");
     assert_eq!(answer.workspace.state, WorkspaceState::Removed);
     assert!(answer.retained.is_empty());
+    assert!(answer.working_files_removed);
+    assert!(!tree.exists());
     // And the record survives, so a later read says what happened rather than nothing.
     let read = fixture
         .service()
@@ -875,10 +866,501 @@ fn a_workspace_row_holds_every_field_a_replacement_needs() {
             file_id: 2,
         }),
         display_path: "/tmp/review".to_owned(),
+        staging_name: None,
+        detail: None,
         retention: Some(RetentionPolicy::KeepEverything),
         created_at_ms: kr_protocol::scalars::TimestampMs::new(1),
         removed_at_ms: None,
     };
     assert_eq!(row.base_revision.len(), 40);
     assert_eq!(row.policy, InclusionPolicy::base_only());
+}
+
+#[test]
+fn a_shorter_dirty_file_keeps_none_of_the_bases_bytes() {
+    // The checkout puts the base's content at the name, so a copy that wrote over it would leave
+    // the base's tail behind whenever the user's file is shorter.
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "truncating");
+    write(&path, "long.txt", "abcdefghijklmnop\n");
+    write(&path, "empty.txt", "not empty yet\n");
+    support::git_raw(&path, ["add", "-A"]);
+    support::git_raw(&path, ["commit", "-m", "the long versions"]);
+    write(&path, "long.txt", "x\n");
+    write(&path, "empty.txt", "");
+    let project = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "truncating"),
+                label: "truncating".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 30)),
+        )
+        .expect("it is adopted")
+        .project
+        .project_repository_id;
+    fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "review".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "shorter",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 31)),
+        )
+        .expect("the workspace is created");
+    let tree = fixture.work().join("shorter");
+    assert_eq!(
+        std::fs::read_to_string(tree.join("long.txt")).expect("it is there"),
+        "x\n",
+        "the workspace holds the user's file and nothing of the base's"
+    );
+    assert_eq!(
+        std::fs::read_to_string(tree.join("empty.txt")).expect("it is there"),
+        "",
+        "an emptied file arrives empty rather than unchanged"
+    );
+}
+
+#[test]
+fn a_deletion_the_user_has_is_carried_by_removing_the_path() {
+    // A copy is not the only way to carry an inclusion. The user deleted a tracked file, and the
+    // checkout put the base's copy back, so carrying that change means removing it again.
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "deleting");
+    std::fs::remove_file(path.join("README.md")).expect("the user deletes a tracked file");
+    let project = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "deleting"),
+                label: "deleting".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 32)),
+        )
+        .expect("it is adopted")
+        .project
+        .project_repository_id;
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "review".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "deleted",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 33)),
+        )
+        .expect("the workspace is created");
+    // The preview names the change as a deletion rather than as a file to copy.
+    assert!(
+        created
+            .preview
+            .entries
+            .iter()
+            .any(|entry| entry.path == "README.md"
+                && entry.change == kr_protocol::project::ChangeKind::Deleted),
+        "the preview names the deletion: {:?}",
+        created.preview.entries
+    );
+    assert!(
+        !fixture.work().join("deleted/README.md").exists(),
+        "the workspace holds the deletion rather than the base's copy"
+    );
+    // And the source still has its own state: the file the user deleted is still deleted there,
+    // and nothing else was touched.
+    assert!(!fixture.work().join("deleting/README.md").exists());
+    assert!(fixture.work().join("deleting/src/lib.rs").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_path_this_host_cannot_read_is_excluded_by_an_exclusion_and_named_by_an_inclusion() {
+    // An unread path is not a text path. A symbolic link is refused by the authority model, so it
+    // is the case this host can reach without waiting for twenty thousand files.
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "unreadable");
+    std::os::unix::fs::symlink("src/lib.rs", path.join("link.rs")).expect("a symbolic link");
+    let project = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "unreadable"),
+                label: "unreadable".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 34)),
+        )
+        .expect("it is adopted")
+        .project
+        .project_repository_id;
+    // An exclusion of binary files leaves it out, because what this host could not read might be
+    // binary and excluding it is the direction that honours the request.
+    let excluded = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "excluded".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy {
+                    dirty_files: InclusionChoice::Include,
+                    untracked_files: InclusionChoice::Include,
+                    submodules: InclusionChoice::Exclude,
+                    binary_files: InclusionChoice::Exclude,
+                    generated_artefacts: InclusionChoice::Exclude,
+                },
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "excluded",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 35)),
+        )
+        .expect("the workspace is created");
+    let link = excluded
+        .preview
+        .entries
+        .iter()
+        .find(|entry| entry.path == "link.rs")
+        .expect("the preview names the link");
+    assert_eq!(link.content, kr_protocol::project::ContentClass::Unknown);
+    assert!(!link.included, "what this host could not read is left out");
+    assert!(excluded.preview.unknown_content.get() >= 1);
+    assert!(!fixture.work().join("excluded/link.rs").exists());
+
+    // An inclusion of binary files takes it, and the result names it as one this host could not
+    // carry rather than pretending the workspace holds it.
+    let included = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "included".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "included",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 36)),
+        )
+        .expect("the workspace is created");
+    assert!(
+        included.unapplied.iter().any(|path| path == "link.rs"),
+        "the result names what it could not carry: {:?}",
+        included.unapplied
+    );
+    // And the link is still in the source tree.
+    assert!(fixture.work().join("unreadable/link.rs").exists());
+}
+
+#[test]
+fn a_live_automation_run_refuses_a_removal_as_a_live_session_does() {
+    // Section 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace
+    // between two sessions or after its last one ended.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "run-bound");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "run".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "run-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 37)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    let run = kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([38; 16]));
+    fixture
+        .service()
+        .bind_run(workspace_id, run, true)
+        .expect("the run binds");
+    let refusal = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+            },
+            Some(&action("workspace.remove", 39)),
+        )
+        .expect_err("a live run refuses a removal");
+    assert_eq!(refusal.code(), ErrorCode::ResourceUnavailable);
+    assert!(
+        refusal
+            .to_string()
+            .contains("automation runs bound to this workspace")
+    );
+    assert!(fixture.work().join("run-tree/README.md").is_file());
+    // A read says which run holds it.
+    let read = fixture
+        .service()
+        .workspace_read(&WorkspaceReadParams { workspace_id })
+        .expect("the workspace reads");
+    assert_eq!(read.workspace.bound_runs, vec![run]);
+    // And the run ending is what admits the removal.
+    fixture
+        .service()
+        .bind_run(workspace_id, run, false)
+        .expect("the run ends");
+    let answer = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+            },
+            Some(&action("workspace.remove", 40)),
+        )
+        .expect("the removal is admitted once nothing holds it");
+    assert_eq!(answer.workspace.state, WorkspaceState::Removed);
+    assert!(!fixture.work().join("run-tree").exists());
+}
+
+#[test]
+fn work_added_after_a_workspace_was_created_still_keeps_it() {
+    // An empty retention table does not establish a clean tree. The tree is measured before a
+    // removal decides anything.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "later-work");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "later".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "later-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 41)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    // Nothing uncommitted was copied in, so the workspace holds nothing yet.
+    let read = fixture
+        .service()
+        .workspace_read(&WorkspaceReadParams { workspace_id })
+        .expect("the workspace reads");
+    assert!(read.workspace.retained.is_empty());
+    // Somebody then works in it.
+    let tree = fixture.work().join("later-tree");
+    write(&tree, "README.md", "edited inside the workspace\n");
+    write(&tree, "new-note.txt", "written inside the workspace\n");
+    let answer = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::KeepEverything,
+            },
+            Some(&action("workspace.remove", 42)),
+        )
+        .expect("the removal is answered");
+    assert!(!answer.working_files_removed);
+    assert_eq!(answer.workspace.state, WorkspaceState::RemovalPending);
+    assert!(
+        answer
+            .retained
+            .iter()
+            .any(|item| item.kind == RetainedKind::DirtyContent),
+        "the work added after the creation keeps it: {:?}",
+        answer.retained
+    );
+    assert_eq!(
+        std::fs::read_to_string(tree.join("new-note.txt")).expect("it is still there"),
+        "written inside the workspace\n"
+    );
+}
+
+#[test]
+fn nothing_new_may_hold_a_workspace_once_its_removal_has_begun() {
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "reserved");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "reserved".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "reserved-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 43)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+            },
+            Some(&action("workspace.remove", 44)),
+        )
+        .expect("the removal runs");
+    // A session or a run that arrived after the removal would be a live holder of a tree that is
+    // already gone, so neither is accepted.
+    let refusal = fixture
+        .service()
+        .bind_session(
+            workspace_id,
+            SessionId::new(Uuid::from_bytes([45; 16])),
+            true,
+        )
+        .expect_err("a removed workspace takes no new holder");
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+    let refusal = fixture
+        .service()
+        .bind_run(
+            workspace_id,
+            kr_protocol::ids::WorkflowRunId::new(Uuid::from_bytes([46; 16])),
+            true,
+        )
+        .expect_err("a removed workspace takes no new run either");
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+}
+
+#[test]
+fn a_removal_this_host_cannot_prove_it_owns_is_refused() {
+    // A materialisation that never recorded the tree's identity leaves a row with none. Removing
+    // whatever is at that path would be removing whatever is there.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "unproven");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "unproven".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "unproven-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 47)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    // The state a materialisation that failed before it created the tree leaves behind.
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE workspaces SET tree_device = NULL, tree_file_id = NULL WHERE workspace_id = ?1",
+            rusqlite::params![workspace_id.get().as_bytes().to_vec()],
+        )
+        .expect("the identity is cleared");
+    drop(journal);
+    let replacement = fixture.reopen();
+    let read = replacement
+        .workspace_read(&WorkspaceReadParams { workspace_id })
+        .expect("the workspace reads");
+    assert!(
+        read.workspace.filesystem_identity.0.is_none(),
+        "an absent identity is reported as absent rather than as zero"
+    );
+    let refusal = replacement
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+            },
+            Some(&action("workspace.remove", 48)),
+        )
+        .expect_err("this host does not remove a directory it cannot prove is its");
+    assert_eq!(refusal.code(), ErrorCode::SourceChanged);
+    assert!(
+        refusal
+            .to_string()
+            .contains("recorded no filesystem identity")
+    );
+    assert!(fixture.work().join("unproven-tree/README.md").is_file());
 }

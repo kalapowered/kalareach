@@ -26,7 +26,8 @@ use std::path::Path;
 
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
-    ActionId, ActorId, ChangeSetId, EnvironmentId, ProjectRepositoryId, SessionId, WorkspaceId,
+    ActionId, ActorId, ChangeSetId, EnvironmentId, ProjectRepositoryId, SessionId, WorkflowRunId,
+    WorkspaceId,
 };
 use kr_protocol::project::{
     AdoptionFlow, DestinationState, InclusionChoice, InclusionPolicy, IsolationMechanism,
@@ -75,6 +76,24 @@ pub struct ProjectRow {
     pub created_at_ms: TimestampMs,
 }
 
+/// What one workspace state change records beside the state.
+///
+/// Every field is optional and an absent one leaves what the row holds alone, so one call carries
+/// whichever of them the caller has learned.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WorkspaceUpdate<'a> {
+    /// The working tree's filesystem identity, once there is one.
+    pub identity: Option<ObjectIdentity>,
+    /// The retention policy a removal was requested under.
+    pub retention: Option<RetentionPolicy>,
+    /// When it was removed.
+    pub removed_at_ms: Option<TimestampMs>,
+    /// The private sibling an independent clone is staged in.
+    pub staging_name: Option<&'a str>,
+    /// Why it is in the state it is in.
+    pub detail: Option<&'a str>,
+}
+
 /// One recorded workspace.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorkspaceRow {
@@ -102,6 +121,10 @@ pub struct WorkspaceRow {
     pub identity: Option<ObjectIdentity>,
     /// The path its working tree is at.
     pub display_path: String,
+    /// The private sibling an independent clone was staged in, while one existed.
+    pub staging_name: Option<String>,
+    /// Why it is in the state it is in, when it ended up there for a reason.
+    pub detail: Option<String>,
     /// The retention policy a removal was requested under, when one was.
     pub retention: Option<RetentionPolicy>,
     /// When it was created.
@@ -313,6 +336,8 @@ impl Store {
                      tree_device           INTEGER,
                      tree_file_id          INTEGER,
                      display_path          TEXT NOT NULL,
+                     staging_name          TEXT,
+                     detail                TEXT,
                      retention             TEXT,
                      created_at_ms         INTEGER NOT NULL,
                      removed_at_ms         INTEGER
@@ -322,6 +347,12 @@ impl Store {
                      session_id   BLOB NOT NULL,
                      live         INTEGER NOT NULL DEFAULT 1,
                      PRIMARY KEY (workspace_id, session_id)
+                 );
+                 CREATE TABLE IF NOT EXISTS workspace_runs (
+                     workspace_id BLOB NOT NULL,
+                     run_id       BLOB NOT NULL,
+                     live         INTEGER NOT NULL DEFAULT 1,
+                     PRIMARY KEY (workspace_id, run_id)
                  );
                  CREATE TABLE IF NOT EXISTS workspace_retained (
                      workspace_id  BLOB NOT NULL,
@@ -461,7 +492,7 @@ impl Store {
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
     pub fn set_operation_state(
-        &self,
+        &mut self,
         action_id: ActionId,
         state: OperationState,
         detail: Option<&str>,
@@ -469,7 +500,9 @@ impl Store {
         staged_identity: Option<StagedWitness>,
         staging_name: Option<&str>,
     ) -> Result<()> {
-        self.connection
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        transaction
             .execute(
                 "UPDATE operations
                     SET state = ?2,
@@ -494,7 +527,13 @@ impl Store {
                 ],
             )
             .map_err(ProjectError::store)?;
-        Ok(())
+        announce(
+            &transaction,
+            &format!("project.operation.{}", operation_state_text(state)),
+            &action_id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
     }
 
     /// Returns one operation.
@@ -671,14 +710,26 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
-    pub fn set_project_state(&self, id: ProjectRepositoryId, state: ProjectState) -> Result<()> {
-        self.connection
+    pub fn set_project_state(
+        &mut self,
+        id: ProjectRepositoryId,
+        state: ProjectState,
+    ) -> Result<()> {
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        transaction
             .execute(
                 "UPDATE projects SET state = ?2 WHERE project_repository_id = ?1",
                 params![id.get().as_bytes().to_vec(), project_state_text(state)],
             )
             .map_err(ProjectError::store)?;
-        Ok(())
+        announce(
+            &transaction,
+            &format!("project.{}", project_state_text(state)),
+            &id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
     }
 
     // ----- workspaces -----------------------------------------------------------------------
@@ -710,21 +761,56 @@ impl Store {
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
     pub fn set_workspace_state(
-        &self,
+        &mut self,
         id: WorkspaceId,
         state: WorkspaceState,
         identity: Option<ObjectIdentity>,
         retention: Option<RetentionPolicy>,
         removed_at_ms: Option<TimestampMs>,
     ) -> Result<()> {
-        self.connection
+        self.set_workspace(
+            id,
+            state,
+            &WorkspaceUpdate {
+                identity,
+                retention,
+                removed_at_ms,
+                staging_name: None,
+                detail: None,
+            },
+        )
+    }
+
+    /// Moves a workspace to a new state, recording everything a later read needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn set_workspace(
+        &mut self,
+        id: WorkspaceId,
+        state: WorkspaceState,
+        update: &WorkspaceUpdate<'_>,
+    ) -> Result<()> {
+        let WorkspaceUpdate {
+            identity,
+            retention,
+            removed_at_ms,
+            staging_name,
+            detail,
+        } = *update;
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        transaction
             .execute(
                 "UPDATE workspaces
                     SET state = ?2,
                         tree_device = COALESCE(?3, tree_device),
                         tree_file_id = COALESCE(?4, tree_file_id),
                         retention = COALESCE(?5, retention),
-                        removed_at_ms = COALESCE(?6, removed_at_ms)
+                        removed_at_ms = COALESCE(?6, removed_at_ms),
+                        staging_name = COALESCE(?7, staging_name),
+                        detail = COALESCE(?8, detail)
                   WHERE workspace_id = ?1",
                 params![
                     id.get().as_bytes().to_vec(),
@@ -733,7 +819,143 @@ impl Store {
                     identity.map(|identity| i64_of(identity.file_id)),
                     retention.map(retention_text),
                     removed_at_ms.map(|stamp| i64_of(stamp.get())),
+                    staging_name,
+                    detail,
                 ],
+            )
+            .map_err(ProjectError::store)?;
+        announce(
+            &transaction,
+            &format!("workspace.{}", workspace_state_text(state)),
+            &id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
+    }
+
+    /// Reserves a workspace for removal, in one transaction with everything the decision needs.
+    ///
+    /// The check and the reservation have to be one step. Otherwise a session or a run bound
+    /// between them would be a live holder of a tree that is already going, and two copies of one
+    /// removal action would both delete before either was told it lost.
+    ///
+    /// What this does, atomically: claims the action, refuses a workspace nothing may remove yet,
+    /// refuses one a live session or run still holds, moves it to `removal_pending`, and returns
+    /// the row and what it holds as they were inside that transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::UnknownWorkspace`] when there is no such workspace,
+    /// [`ProjectError::WrongState`] while it is being materialised, [`ProjectError::StillBound`]
+    /// while a session or a run holds it, or [`ProjectError::IdConflict`] when the action was used
+    /// for another request.
+    pub fn begin_removal(
+        &mut self,
+        workspace_id: WorkspaceId,
+        retention: RetentionPolicy,
+        action: Option<&Action>,
+    ) -> Result<(WorkspaceRow, Vec<RetainedRow>)> {
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        if let Some(action) = action {
+            claim_action(&transaction, action, Some(workspace_id.get()))?;
+        }
+        let row = transaction
+            .query_row(
+                &format!("SELECT {WORKSPACE_COLUMNS} FROM workspaces WHERE workspace_id = ?1"),
+                params![workspace_id.get().as_bytes().to_vec()],
+                read_workspace,
+            )
+            .optional()
+            .map_err(ProjectError::store)?
+            .ok_or_else(|| ProjectError::UnknownWorkspace {
+                workspace: workspace_id.to_string(),
+            })?;
+        if matches!(row.state, WorkspaceState::Materialising) {
+            return Err(ProjectError::WrongState {
+                detail: format!(
+                    "workspace {workspace_id} is still being materialised, so what is in its \
+                     directory is not yet something this host can account for"
+                ),
+            });
+        }
+        let sessions: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_sessions WHERE workspace_id = ?1 AND live = 1",
+                params![workspace_id.get().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .map_err(ProjectError::store)?;
+        let runs: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_runs WHERE workspace_id = ?1 AND live = 1",
+                params![workspace_id.get().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .map_err(ProjectError::store)?;
+        if sessions > 0 || runs > 0 {
+            return Err(ProjectError::StillBound {
+                detail: format!(
+                    "{sessions} sessions and {runs} automation runs bound to this workspace are \
+                     still live, and cleanup happens after every bound session and run has finished"
+                ),
+            });
+        }
+        let mut statement = transaction
+            .prepare(
+                "SELECT kind, detail, change_set_id FROM workspace_retained
+                  WHERE workspace_id = ?1 ORDER BY kind, detail",
+            )
+            .map_err(ProjectError::store)?;
+        let mapped = statement
+            .query_map(params![workspace_id.get().as_bytes().to_vec()], |row| {
+                let kind: String = row.get(0)?;
+                let change_set: Option<Vec<u8>> = row.get(2)?;
+                Ok(RetainedRow {
+                    kind: retained_kind_of(&kind),
+                    detail: row.get(1)?,
+                    change_set_id: change_set
+                        .as_deref()
+                        .and_then(uuid_of)
+                        .map(ChangeSetId::new),
+                })
+            })
+            .map_err(ProjectError::store)?;
+        let mut retained = Vec::new();
+        for item in mapped {
+            retained.push(item.map_err(ProjectError::store)?);
+        }
+        drop(statement);
+        transaction
+            .execute(
+                "UPDATE workspaces SET state = ?2, retention = ?3 WHERE workspace_id = ?1",
+                params![
+                    workspace_id.get().as_bytes().to_vec(),
+                    workspace_state_text(WorkspaceState::RemovalPending),
+                    retention_text(retention),
+                ],
+            )
+            .map_err(ProjectError::store)?;
+        announce(
+            &transaction,
+            "workspace.removal_pending",
+            &workspace_id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)?;
+        Ok((row, retained))
+    }
+
+    /// Forgets a workspace's staging name, once the sibling it named is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn clear_workspace_staging(&self, id: WorkspaceId) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE workspaces SET staging_name = NULL WHERE workspace_id = ?1",
+                params![id.get().as_bytes().to_vec()],
             )
             .map_err(ProjectError::store)?;
         Ok(())
@@ -796,24 +1018,131 @@ impl Store {
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
     pub fn bind_session(
-        &self,
+        &mut self,
         workspace_id: WorkspaceId,
         session_id: SessionId,
         live: bool,
     ) -> Result<()> {
-        self.connection
+        self.bind(
+            workspace_id,
+            "workspace_sessions",
+            "session_id",
+            session_id.get().as_bytes(),
+            live,
+        )
+    }
+
+    /// Records an automation run as bound to a workspace, or as having ended.
+    ///
+    /// Section 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace
+    /// between two sessions or after its last one ended, so it is its own binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails, or
+    /// [`ProjectError::WrongState`] when the workspace is no longer one anything may hold.
+    pub fn bind_run(
+        &mut self,
+        workspace_id: WorkspaceId,
+        run_id: WorkflowRunId,
+        live: bool,
+    ) -> Result<()> {
+        self.bind(
+            workspace_id,
+            "workspace_runs",
+            "run_id",
+            run_id.get().as_bytes(),
+            live,
+        )
+    }
+
+    fn bind(
+        &mut self,
+        workspace_id: WorkspaceId,
+        table: &str,
+        column: &str,
+        holder: &[u8],
+        live: bool,
+    ) -> Result<()> {
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        // A workspace whose removal has begun takes no new holder. Otherwise a binding that
+        // arrived between the removal's check and its deletion would be a live session or run
+        // holding a tree that is already going.
+        let state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM workspaces WHERE workspace_id = ?1",
+                params![workspace_id.get().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(ProjectError::store)?;
+        let state = state.as_deref().map(workspace_state_of);
+        if live
+            && !matches!(
+                state,
+                Some(WorkspaceState::Ready | WorkspaceState::Materialising)
+            )
+        {
+            return Err(ProjectError::WrongState {
+                detail: format!(
+                    "workspace {workspace_id} is {}, so nothing new may hold it",
+                    state.map_or("not a workspace this environment has", workspace_state_text)
+                ),
+            });
+        }
+        transaction
             .execute(
-                "INSERT INTO workspace_sessions (workspace_id, session_id, live)
-                 VALUES (?1, ?2, ?3)
-                 ON CONFLICT (workspace_id, session_id) DO UPDATE SET live = ?3",
+                &format!(
+                    "INSERT INTO {table} (workspace_id, {column}, live) VALUES (?1, ?2, ?3)
+                     ON CONFLICT (workspace_id, {column}) DO UPDATE SET live = ?3"
+                ),
                 params![
                     workspace_id.get().as_bytes().to_vec(),
-                    session_id.get().as_bytes().to_vec(),
-                    live,
+                    holder.to_vec(),
+                    live
                 ],
             )
             .map_err(ProjectError::store)?;
-        Ok(())
+        announce(
+            &transaction,
+            if live {
+                "workspace.bound"
+            } else {
+                "workspace.released"
+            },
+            &workspace_id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
+    }
+
+    /// Returns the automation runs bound to a workspace that are still live.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the rows cannot be read.
+    pub fn live_runs(&self, workspace_id: WorkspaceId) -> Result<Vec<WorkflowRunId>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT run_id FROM workspace_runs
+                  WHERE workspace_id = ?1 AND live = 1 ORDER BY run_id",
+            )
+            .map_err(ProjectError::store)?;
+        let mapped = statement
+            .query_map(params![workspace_id.get().as_bytes().to_vec()], |row| {
+                let bytes: Vec<u8> = row.get(0)?;
+                Ok(uuid_of(&bytes).map(WorkflowRunId::new))
+            })
+            .map_err(ProjectError::store)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            if let Some(run) = row.map_err(ProjectError::store)? {
+                rows.push(run);
+            }
+        }
+        Ok(rows)
     }
 
     /// Returns the sessions bound to a workspace that are still live.
@@ -849,8 +1178,10 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
-    pub fn retain(&self, workspace_id: WorkspaceId, item: &RetainedRow) -> Result<()> {
-        self.connection
+    pub fn retain(&mut self, workspace_id: WorkspaceId, item: &RetainedRow) -> Result<()> {
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        transaction
             .execute(
                 "INSERT INTO workspace_retained (workspace_id, kind, detail, change_set_id)
                  VALUES (?1, ?2, ?3, ?4)
@@ -863,7 +1194,62 @@ impl Store {
                 ],
             )
             .map_err(ProjectError::store)?;
-        Ok(())
+        announce(
+            &transaction,
+            "workspace.retained",
+            &workspace_id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
+    }
+
+    /// Replaces the rows of one retained kind with what the host has just measured.
+    ///
+    /// The uncommitted work a workspace holds is a fact about its tree rather than a record
+    /// somebody wrote, so it is measured before a removal decides anything and the row is replaced
+    /// rather than added to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn replace_retained(
+        &mut self,
+        workspace_id: WorkspaceId,
+        kind: RetainedKind,
+        item: Option<&RetainedRow>,
+    ) -> Result<()> {
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        transaction
+            .execute(
+                "DELETE FROM workspace_retained WHERE workspace_id = ?1 AND kind = ?2",
+                params![
+                    workspace_id.get().as_bytes().to_vec(),
+                    retained_kind_text(kind)
+                ],
+            )
+            .map_err(ProjectError::store)?;
+        if let Some(item) = item {
+            transaction
+                .execute(
+                    "INSERT INTO workspace_retained (workspace_id, kind, detail, change_set_id)
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![
+                        workspace_id.get().as_bytes().to_vec(),
+                        retained_kind_text(item.kind),
+                        item.detail,
+                        item.change_set_id.map(|id| id.get().as_bytes().to_vec()),
+                    ],
+                )
+                .map_err(ProjectError::store)?;
+        }
+        announce(
+            &transaction,
+            "workspace.retained",
+            &workspace_id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
     }
 
     /// Returns everything a workspace holds that a removal has to account for.
@@ -905,13 +1291,23 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
-    pub fn release_retained(&self, workspace_id: WorkspaceId) -> Result<usize> {
-        self.connection
+    pub fn release_retained(&mut self, workspace_id: WorkspaceId) -> Result<usize> {
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        let released = transaction
             .execute(
                 "DELETE FROM workspace_retained WHERE workspace_id = ?1",
                 params![workspace_id.get().as_bytes().to_vec()],
             )
-            .map_err(ProjectError::store)
+            .map_err(ProjectError::store)?;
+        announce(
+            &transaction,
+            "workspace.released",
+            &workspace_id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)?;
+        Ok(released)
     }
 
     // ----- actions --------------------------------------------------------------------------
@@ -1252,7 +1648,7 @@ const PROJECT_COLUMNS: &str = "project_repository_id, environment_id, label, ori
 const WORKSPACE_COLUMNS: &str = "workspace_id, project_repository_id, environment_id, label, \
      kind, isolation, dirty_files, untracked_files, submodules, binary_files, \
      generated_artefacts, state, base_revision, base_change_set_id, tree_device, tree_file_id, \
-     display_path, retention, created_at_ms, removed_at_ms";
+     display_path, staging_name, detail, retention, created_at_ms, removed_at_ms";
 
 fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result<()> {
     let remote = row.remote.as_ref();
@@ -1436,9 +1832,9 @@ fn insert_workspace(transaction: &Transaction<'_>, row: &WorkspaceRow) -> Result
                                      kind, isolation, dirty_files, untracked_files, submodules,
                                      binary_files, generated_artefacts, state, base_revision,
                                      base_change_set_id, tree_device, tree_file_id, display_path,
-                                     retention, created_at_ms, removed_at_ms)
+                                     staging_name, detail, retention, created_at_ms, removed_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                     ?18, ?19, ?20)",
+                     ?18, ?19, ?20, ?21, ?22)",
             params![
                 row.workspace_id.get().as_bytes().to_vec(),
                 row.project_repository_id.get().as_bytes().to_vec(),
@@ -1458,6 +1854,8 @@ fn insert_workspace(transaction: &Transaction<'_>, row: &WorkspaceRow) -> Result
                 row.identity.map(|id| i64_of(id.device)),
                 row.identity.map(|id| i64_of(id.file_id)),
                 row.display_path,
+                row.staging_name,
+                row.detail,
                 row.retention.map(retention_text),
                 i64_of(row.created_at_ms.get()),
                 row.removed_at_ms.map(|stamp| i64_of(stamp.get())),
@@ -1477,7 +1875,7 @@ fn read_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRow> {
     let change_set: Option<Vec<u8>> = row.get(13)?;
     let device: Option<i64> = row.get(14)?;
     let file_id: Option<i64> = row.get(15)?;
-    let retention: Option<String> = row.get(17)?;
+    let retention: Option<String> = row.get(19)?;
     Ok(WorkspaceRow {
         workspace_id: WorkspaceId::new(
             uuid_of(&workspace).unwrap_or_else(|| Uuid::from_bytes([0; 16])),
@@ -1512,10 +1910,12 @@ fn read_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRow> {
             _ => None,
         },
         display_path: row.get(16)?,
+        staging_name: row.get(17)?,
+        detail: row.get(18)?,
         retention: retention.as_deref().map(retention_of),
-        created_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(18)?)),
+        created_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(20)?)),
         removed_at_ms: row
-            .get::<_, Option<i64>>(19)?
+            .get::<_, Option<i64>>(21)?
             .map(|stamp| TimestampMs::new(u64_of(stamp))),
     })
 }
@@ -1677,7 +2077,6 @@ text_enum!(
     RetentionPolicy,
     RetentionPolicy::KeepEverything,
     KeepEverything => "keep_everything",
-    KeepRetainedEvidence => "keep_retained_evidence",
     RemoveRetained => "remove_retained",
 );
 
@@ -1899,6 +2298,8 @@ mod tests {
             base_change_set_id: Some(ChangeSetId::new(Uuid::from_bytes([12; 16]))),
             identity: None,
             display_path: "/tmp/review".to_owned(),
+            staging_name: None,
+            detail: None,
             retention: None,
             created_at_ms: TimestampMs::new(2_000),
             removed_at_ms: None,
@@ -1983,11 +2384,247 @@ mod tests {
 
     #[test]
     fn every_state_change_commits_with_the_event_that_announces_it() {
+        // Section 24 asks every authoritative producer to commit a state transition and its
+        // outbox row in the same local transaction. So every call that changes state is checked
+        // here, not only the one that begins an operation: a change a consumer cannot replay is a
+        // change that happened as far as this host is concerned and never happened as far as
+        // anything downstream is.
         let mut store = Store::in_memory(environment()).expect("a store opens");
+        let mut expected = 0_u64;
+        let mut announced = |store: &Store, what: &str| {
+            expected += 1;
+            assert_eq!(
+                store.event_count().expect("the outbox reads"),
+                expected,
+                "{what} commits with the event that announces it"
+            );
+        };
         assert_eq!(store.event_count().expect("it reads"), 0);
+
+        let row = operation(20, 21);
         store
-            .begin_operation(&operation(20, 21), Some(&action(20, "project.clone")))
+            .begin_operation(&row, Some(&action(20, "project.clone")))
             .expect("it begins");
-        assert_eq!(store.event_count().expect("it reads"), 1);
+        announced(&store, "beginning an operation");
+
+        store
+            .set_operation_state(
+                row.action_id,
+                OperationState::Publishing,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("the state moves");
+        announced(&store, "moving an operation");
+
+        let project = ProjectRepositoryId::new(Uuid::from_bytes([21; 16]));
+        store
+            .set_project_state(project, ProjectState::Detached)
+            .expect("the state moves");
+        announced(&store, "moving a repository");
+
+        let workspace_id = WorkspaceId::new(Uuid::from_bytes([30; 16]));
+        let workspace = WorkspaceRow {
+            workspace_id,
+            project_repository_id: project,
+            environment_id: environment(),
+            label: "review".to_owned(),
+            kind: WorkspaceKind::Isolated,
+            isolation: Some(IsolationMechanism::GitWorktree),
+            policy: InclusionPolicy::base_only(),
+            state: WorkspaceState::Materialising,
+            base_revision: "a".repeat(40),
+            base_change_set_id: None,
+            identity: None,
+            display_path: "/tmp/review".to_owned(),
+            staging_name: None,
+            detail: None,
+            retention: None,
+            created_at_ms: TimestampMs::new(3_000),
+            removed_at_ms: None,
+        };
+        store
+            .begin_workspace(&workspace, Some(&action(31, "workspace.create")))
+            .expect("it begins");
+        announced(&store, "beginning a workspace");
+
+        store
+            .set_workspace_state(workspace_id, WorkspaceState::Ready, None, None, None)
+            .expect("the state moves");
+        announced(&store, "moving a workspace");
+
+        let session = SessionId::new(Uuid::from_bytes([32; 16]));
+        store
+            .bind_session(workspace_id, session, true)
+            .expect("it binds");
+        announced(&store, "binding a session");
+
+        let run = WorkflowRunId::new(Uuid::from_bytes([33; 16]));
+        store.bind_run(workspace_id, run, true).expect("it binds");
+        announced(&store, "binding a run");
+
+        store
+            .retain(
+                workspace_id,
+                &RetainedRow {
+                    kind: RetainedKind::PinnedChangeSet,
+                    detail: "version 1".to_owned(),
+                    change_set_id: None,
+                },
+            )
+            .expect("it retains");
+        announced(&store, "retaining something");
+
+        store
+            .replace_retained(workspace_id, RetainedKind::DirtyContent, None)
+            .expect("it replaces");
+        announced(&store, "replacing what is retained");
+
+        store.release_retained(workspace_id).expect("it releases");
+        announced(&store, "releasing what is retained");
+
+        store
+            .bind_session(workspace_id, session, false)
+            .expect("the session ends");
+        announced(&store, "releasing a session");
+
+        store
+            .bind_run(workspace_id, run, false)
+            .expect("the run ends");
+        announced(&store, "releasing a run");
+
+        store
+            .begin_removal(
+                workspace_id,
+                RetentionPolicy::RemoveRetained,
+                Some(&action(34, "workspace.remove")),
+            )
+            .expect("the removal is reserved");
+        announced(&store, "reserving a removal");
+
+        store
+            .complete_operation(
+                &ProjectRow {
+                    project_repository_id: ProjectRepositoryId::new(Uuid::from_bytes([35; 16])),
+                    environment_id: environment(),
+                    label: "done".to_owned(),
+                    origin: ProjectOrigin::Cloned,
+                    state: ProjectState::Ready,
+                    identity: RepositoryIdentity {
+                        git_dir: ObjectIdentity {
+                            device: 1,
+                            file_id: 2,
+                        },
+                        work_tree: ObjectIdentity {
+                            device: 1,
+                            file_id: 3,
+                        },
+                    },
+                    display_path: "/tmp/done".to_owned(),
+                    remote: None,
+                    created_at_ms: TimestampMs::new(4_000),
+                },
+                row.action_id,
+                None,
+                None,
+                TimestampMs::new(4_000),
+            )
+            .expect("it completes");
+        announced(&store, "completing an operation");
+    }
+
+    #[test]
+    fn a_workspace_whose_removal_has_begun_takes_no_new_holder() {
+        let mut store = Store::in_memory(environment()).expect("a store opens");
+        let workspace_id = WorkspaceId::new(Uuid::from_bytes([40; 16]));
+        let workspace = WorkspaceRow {
+            workspace_id,
+            project_repository_id: ProjectRepositoryId::new(Uuid::from_bytes([2; 16])),
+            environment_id: environment(),
+            label: "reserved".to_owned(),
+            kind: WorkspaceKind::Isolated,
+            isolation: Some(IsolationMechanism::GitWorktree),
+            policy: InclusionPolicy::base_only(),
+            state: WorkspaceState::Ready,
+            base_revision: "a".repeat(40),
+            base_change_set_id: None,
+            identity: None,
+            display_path: "/tmp/reserved".to_owned(),
+            staging_name: None,
+            detail: None,
+            retention: None,
+            created_at_ms: TimestampMs::new(1),
+            removed_at_ms: None,
+        };
+        store.begin_workspace(&workspace, None).expect("it begins");
+        // The reservation, the checks and the claim are one transaction, so a holder that arrives
+        // afterwards finds a workspace nothing new may hold.
+        store
+            .begin_removal(workspace_id, RetentionPolicy::KeepEverything, None)
+            .expect("the removal is reserved");
+        let refusal = store
+            .bind_session(
+                workspace_id,
+                SessionId::new(Uuid::from_bytes([41; 16])),
+                true,
+            )
+            .expect_err("a reserved workspace takes no new session");
+        assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+        // And a second copy of one removal action does not reserve it twice.
+        store
+            .begin_removal(
+                workspace_id,
+                RetentionPolicy::KeepEverything,
+                Some(&action(42, "workspace.remove")),
+            )
+            .expect("the first copy claims it");
+        let refusal = store
+            .begin_removal(
+                workspace_id,
+                RetentionPolicy::KeepEverything,
+                Some(&action(42, "workspace.remove")),
+            )
+            .expect_err("the second copy does not");
+        assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
+    }
+
+    #[test]
+    fn a_live_run_and_a_live_session_each_refuse_a_removal() {
+        let mut store = Store::in_memory(environment()).expect("a store opens");
+        let workspace_id = WorkspaceId::new(Uuid::from_bytes([50; 16]));
+        let workspace = WorkspaceRow {
+            workspace_id,
+            project_repository_id: ProjectRepositoryId::new(Uuid::from_bytes([2; 16])),
+            environment_id: environment(),
+            label: "held".to_owned(),
+            kind: WorkspaceKind::Isolated,
+            isolation: Some(IsolationMechanism::GitWorktree),
+            policy: InclusionPolicy::base_only(),
+            state: WorkspaceState::Ready,
+            base_revision: "a".repeat(40),
+            base_change_set_id: None,
+            identity: None,
+            display_path: "/tmp/held".to_owned(),
+            staging_name: None,
+            detail: None,
+            retention: None,
+            created_at_ms: TimestampMs::new(1),
+            removed_at_ms: None,
+        };
+        store.begin_workspace(&workspace, None).expect("it begins");
+        let run = WorkflowRunId::new(Uuid::from_bytes([51; 16]));
+        store.bind_run(workspace_id, run, true).expect("it binds");
+        let refusal = store
+            .begin_removal(workspace_id, RetentionPolicy::KeepEverything, None)
+            .expect_err("a live run refuses it");
+        assert_eq!(refusal.code(), ErrorCode::ResourceUnavailable);
+        assert_eq!(store.live_runs(workspace_id).expect("it reads"), vec![run]);
+        store.bind_run(workspace_id, run, false).expect("it ends");
+        assert!(store.live_runs(workspace_id).expect("it reads").is_empty());
+        store
+            .begin_removal(workspace_id, RetentionPolicy::KeepEverything, None)
+            .expect("nothing holds it now");
     }
 }

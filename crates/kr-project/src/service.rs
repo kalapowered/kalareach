@@ -25,10 +25,10 @@ use kr_protocol::ids::{
     ActionId, ActorId, EnvironmentId, ProjectRepositoryId, SessionId, WorkspaceId,
 };
 use kr_protocol::project::{
-    AdoptionFlow, DestinationRequest, DestinationState, FilesystemIdentity, IsolationMechanism,
-    MAX_LABEL_LEN, OPERATION_DEADLINE, OperationRecord, OperationState, ProjectAdoptParams,
-    ProjectAdoptResult, ProjectCloneParams, ProjectCloneResult, ProjectInitParams,
-    ProjectInitResult, ProjectListParams, ProjectListResult, ProjectOperationCancelParams,
+    AdoptionFlow, DestinationRequest, DestinationState, IsolationMechanism, MAX_LABEL_LEN,
+    OPERATION_DEADLINE, OperationRecord, OperationState, ProjectAdoptParams, ProjectAdoptResult,
+    ProjectCloneParams, ProjectCloneResult, ProjectInitParams, ProjectInitResult,
+    ProjectListParams, ProjectListResult, ProjectOperationCancelParams,
     ProjectOperationCancelResult, ProjectOrigin, ProjectReadParams, ProjectReadResult,
     ProjectState, ProjectSummary, RemoteSpecification, RetainedItem, RetainedKind, RetentionPolicy,
     WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceKind, WorkspaceListParams,
@@ -47,7 +47,8 @@ use crate::operation::{
     stage_init,
 };
 use crate::store::{
-    Action, OperationRow, ProjectRow, RetainedOutcome, RetainedRow, Store, WorkspaceRow, outcome_of,
+    Action, OperationRow, ProjectRow, RetainedOutcome, RetainedRow, Store, WorkspaceRow,
+    WorkspaceUpdate, outcome_of,
 };
 use crate::workspace::{PreviewRequest, Survey, check_choice, copy_included, survey};
 
@@ -60,8 +61,11 @@ pub struct Recovery {
     pub staging_removed: u64,
     /// Operations this host cannot resolve, whose staging paths are kept.
     pub unresolved: u64,
-    /// Workspaces whose materialisation an earlier daemon did not finish.
+    /// Workspaces whose materialisation an earlier daemon did not finish, and which this host has
+    /// moved out of the states anything may hold or read as ready.
     pub materialisations_unfinished: u64,
+    /// Action claims this host settled from the durable state rather than leaving open.
+    pub claims_settled: u64,
     /// The staging paths a person can still find, for each unresolved operation.
     pub retained_paths: Vec<String>,
 }
@@ -195,6 +199,16 @@ impl ProjectService {
             })
     }
 
+    /// Returns the journal's guard for a call that writes.
+    ///
+    /// Every state change commits with the outbox row that announces it, so every one of them is a
+    /// transaction and needs the guard mutably. Bound to a local by every caller, never taken in
+    /// the head of a condition or a loop: a temporary guard there lives for the whole body, and a
+    /// helper that takes the same lock would wait for itself.
+    fn writable(&self) -> Result<std::sync::MutexGuard<'_, Store>> {
+        self.locked()
+    }
+
     fn check_environment(&self, named: EnvironmentId) -> Result<()> {
         if named == self.environment_id {
             Ok(())
@@ -251,69 +265,151 @@ impl ProjectService {
                 }
             }
         }
-        // A sibling is created before the row that names it is updated, so a daemon that died in
-        // that window leaves one nothing accounts for. Recovery runs before anything is served, so
-        // no operation is in flight and a sibling no row names is one of those.
-        recovery.staging_removed += self.sweep_unaccounted_staging()?;
-        // A workspace whose materialisation did not finish is left as it is rather than removed:
-        // its working files are the user's, and this host does not know which of them are.
-        let unfinished = self
-            .locked()?
-            .workspaces(self.environment_id, None)?
-            .into_iter()
-            .filter(|row| matches!(row.state, WorkspaceState::Materialising))
-            .count();
-        recovery.materialisations_unfinished = u64::try_from(unfinished).unwrap_or(u64::MAX);
+        // Every staging sibling this host created is named by a row before the directory exists,
+        // so what is left to clean up is a recorded name whose operation has ended. Nothing is
+        // removed because of its name alone: a repository a user happened to call
+        // `.kr-project-something` is not this host's to delete.
+        recovery.staging_removed += self.sweep_recorded_staging()?;
+        recovery.materialisations_unfinished = self.resolve_materialisations()?;
+        // A claim whose effect settled durably is answered from that state. A claim this host
+        // cannot resolve is settled as unknown rather than left open for ever, so a repeat of the
+        // action gets a definite answer.
+        recovery.claims_settled = self.settle_open_claims()?;
         Ok(recovery)
     }
 
-    /// Removes every staging sibling no operation row names, in the parents this host has used.
+    /// Removes every staging sibling a row names whose operation has ended.
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::StoreUnavailable`] when the journal cannot be read.
-    fn sweep_unaccounted_staging(&self) -> Result<u64> {
+    /// Returns [`ProjectError::StoreUnavailable`] when the journal cannot be read or written.
+    fn sweep_recorded_staging(&self) -> Result<u64> {
         let rows = self.locked()?.operations_in(&[
-            OperationState::Staging,
-            OperationState::Publishing,
             OperationState::Completed,
             OperationState::Cancelled,
             OperationState::Failed,
             OperationState::Expired,
             OperationState::Unknown,
         ])?;
-        let accounted: std::collections::BTreeSet<&str> = rows
-            .iter()
-            .filter_map(|row| row.staging_name.as_deref())
-            .collect();
-        let parents: std::collections::BTreeSet<&str> =
-            rows.iter().map(|row| row.parent_path.as_str()).collect();
         let mut removed = 0_u64;
-        for parent in parents {
-            let Ok(directory) =
-                kr_transfer::AuthorisedDirectory::open_root(self.environment_id, Path::new(parent))
-            else {
+        for row in rows {
+            let Some(name) = row.staging_name.as_deref() else {
                 continue;
             };
-            let Ok(entries) = directory.handle().entries() else {
+            let Ok(destination) = Destination::resolve(
+                &DestinationRequest {
+                    environment_id: row.environment_id,
+                    parent_path: row.parent_path.clone(),
+                    name: row.destination_name.clone(),
+                },
+                self.environment_id,
+            ) else {
                 continue;
             };
-            for entry in entries.flatten() {
-                let Ok(name) = entry.file_name().into_string() else {
-                    continue;
-                };
-                if !name.starts_with(crate::operation::STAGING_PREFIX)
-                    || accounted.contains(name.as_str())
-                {
-                    continue;
-                }
-                if directory.handle().remove_dir_all(&name).is_ok() {
-                    removed += 1;
-                }
+            let Ok(sibling) = StagingSibling::open(&destination, name) else {
+                continue;
+            };
+            let path = sibling.path().display().to_string();
+            if sibling.remove(&destination).is_ok() {
+                self.writable()?
+                    .record_staging_path(row.action_id, &path, true)?;
+                removed += 1;
             }
-            let _ = directory.sync();
         }
         Ok(removed)
+    }
+
+    /// Resolves every workspace an earlier daemon left part way through its materialisation.
+    ///
+    /// The working files are the user's, so nothing in the directory is removed: this host does
+    /// not know which of them it wrote. What it does know is that the workspace is not what its
+    /// creation asked for, so the row moves to `removal_pending` with the reason, nothing new may
+    /// hold it, and no read calls it ready. The staged sibling of an unfinished independent clone
+    /// is this host's own and is removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the journal cannot be read or written.
+    fn resolve_materialisations(&self) -> Result<u64> {
+        let unfinished: Vec<WorkspaceRow> = self
+            .locked()?
+            .workspaces(self.environment_id, None)?
+            .into_iter()
+            .filter(|row| matches!(row.state, WorkspaceState::Materialising))
+            .collect();
+        let mut resolved = 0_u64;
+        for row in unfinished {
+            if let Some(name) = row.staging_name.as_deref()
+                && let Ok(destination) = Destination::resolve(
+                    &DestinationRequest {
+                        environment_id: row.environment_id,
+                        parent_path: parent_of(&row.display_path),
+                        name: name_of(&row.display_path),
+                    },
+                    self.environment_id,
+                )
+                && let Ok(sibling) = StagingSibling::open(&destination, name)
+            {
+                let _ = sibling.remove(&destination);
+                self.writable()?.clear_workspace_staging(row.workspace_id)?;
+            }
+            self.writable()?.set_workspace(
+                row.workspace_id,
+                WorkspaceState::RemovalPending,
+                &WorkspaceUpdate {
+                    detail: Some(
+                        "the daemon that was materialising this workspace ended before it \
+                         finished, so what is in its directory is not what its creation asked \
+                         for; the files are left where they are and nothing new may hold it",
+                    ),
+                    ..WorkspaceUpdate::default()
+                },
+            )?;
+            resolved += 1;
+        }
+        Ok(resolved)
+    }
+
+    /// Settles every action claim this host left open.
+    ///
+    /// A claim is opened in the same transaction as the state it changes and filled in when the
+    /// effect settles, so a daemon that died between the two leaves one open. An open claim is not
+    /// an answer: a repeat of the action would be told the outcome is unknown for ever. So every
+    /// remaining claim is settled here, from the durable state where that answers it and as an
+    /// unknown outcome naming the object where it does not.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the journal cannot be read or written.
+    fn settle_open_claims(&self) -> Result<u64> {
+        let open = self.locked()?.open_claims()?;
+        let mut settled = 0_u64;
+        for record in open {
+            let action = Action {
+                actor_id: record.actor_id.clone(),
+                action_id: record.action_id,
+                method: record.method.clone(),
+                payload_digest: record.payload_digest,
+            };
+            let detail = match record.subject {
+                Some(subject) => format!(
+                    "the daemon that performed this action ended before it recorded the result; \
+                     {} names what it acted on, and reading that says what happened",
+                    subject
+                ),
+                None => "the daemon that performed this action ended before it recorded the result"
+                    .to_owned(),
+            };
+            let moved = self.writable()?.settle(
+                &action,
+                None,
+                Some((kr_protocol::error::ErrorCode::OutcomeUnknown, &detail)),
+            )?;
+            if moved > 0 {
+                settled += 1;
+            }
+        }
+        Ok(settled)
     }
 
     fn resolve_operation(&self, row: &OperationRow) -> Result<ResolvedStep> {
@@ -334,14 +430,13 @@ impl ProjectService {
             // The destination is untouched, so the staged content is removed and the operation is
             // recorded as failed under its own create token rather than started again.
             let path = staging.as_ref().map(|sibling| sibling.path().to_owned());
+            // As above: the publication is committed, and a cleanup that fails is recorded rather
+            // than allowed to undo it.
             if let Some(sibling) = staging {
-                let path = sibling.path().to_owned();
-                sibling.remove(&destination)?;
-                self.locked()?.record_staging_path(
-                    row.action_id,
-                    &path.display().to_string(),
-                    true,
-                )?;
+                let path = sibling.path().display().to_string();
+                let removed = sibling.remove(&destination).is_ok();
+                self.writable()?
+                    .record_staging_path(row.action_id, &path, removed)?;
             }
             self.settle_failure(
                 row,
@@ -375,10 +470,21 @@ impl ProjectService {
                         Ok(ResolvedStep::Completed)
                     }
                     Err(error) => {
+                        // The row stays in `publishing` with its witness, so the next recovery
+                        // asks the same question again. Recording a failure here would close an
+                        // operation whose publication this host has not decided, and nothing
+                        // would revisit it.
                         let path = sibling.path().display().to_string();
-                        self.locked()?
-                            .record_staging_path(row.action_id, &path, false)?;
-                        self.settle_failure(row, &error, OperationState::Failed)?;
+                        let mut store = self.writable()?;
+                        store.record_staging_path(row.action_id, &path, false)?;
+                        store.set_operation_state(
+                            row.action_id,
+                            OperationState::Publishing,
+                            Some(&error.to_string()),
+                            None,
+                            None,
+                            None,
+                        )?;
                         Ok(ResolvedStep::Unresolved(Some(path)))
                     }
                 }
@@ -453,11 +559,14 @@ impl ProjectService {
             Some(&encoded),
             self.clock.now_ms(),
         )?;
+        // The publication is committed. Removing the staging sibling afterwards is cleanup, and a
+        // cleanup that fails must not turn a landed publication into a failure: the path is
+        // recorded as one that is still there, and the sweep and the next recovery retry it.
         if let Some(sibling) = staging {
-            let path = sibling.path().to_owned();
-            sibling.remove(destination)?;
-            self.locked()?
-                .record_staging_path(row.action_id, &path.display().to_string(), true)?;
+            let path = sibling.path().display().to_string();
+            let removed = sibling.remove(destination).is_ok();
+            self.writable()?
+                .record_staging_path(row.action_id, &path, removed)?;
         }
         Ok(())
     }
@@ -467,17 +576,17 @@ impl ProjectService {
     /// The name goes on to the row as soon as the directory exists, because a replacement daemon
     /// finds the directory through the row: a name recorded only when the publication began would
     /// leave a sibling nothing accounts for if the daemon died before then.
-    fn record_staging(&self, row: &OperationRow, staging: &StagingSibling) -> Result<()> {
-        let store = self.locked()?;
+    fn record_staging(&self, row: &OperationRow, name: &str, path: &Path) -> Result<()> {
+        let mut store = self.writable()?;
         store.set_operation_state(
             row.action_id,
             OperationState::Staging,
             None,
             None,
             None,
-            Some(staging.name()),
+            Some(name),
         )?;
-        store.record_staging_path(row.action_id, &staging.path().display().to_string(), false)
+        store.record_staging_path(row.action_id, &path.display().to_string(), false)
     }
 
     /// Returns the digest the claim of one operation's action was recorded with.
@@ -498,7 +607,7 @@ impl ProjectService {
         state: OperationState,
     ) -> Result<()> {
         let detail = error.to_string();
-        let store = self.locked()?;
+        let mut store = self.writable()?;
         store.set_operation_state(
             row.action_id,
             state,
@@ -750,7 +859,11 @@ impl ProjectService {
                 // repository exists. The row is in `publishing` with the staged object's witness,
                 // so it is reconciled against the create token exactly as a replacement daemon
                 // would reconcile it, rather than recorded as a failure nothing would revisit.
-                if let Some(current) = self.locked()?.operation(row.action_id)?
+                // The row is read into a local first. A temporary guard in the head of a
+                // condition lives for the whole chain, and `resolve_operation` takes the same
+                // lock: the service would wait for itself.
+                let current = self.locked()?.operation(row.action_id)?;
+                if let Some(current) = current
                     && matches!(current.state, OperationState::Publishing)
                     && matches!(
                         self.resolve_operation(&current),
@@ -789,8 +902,12 @@ impl ProjectService {
                 (None, destination.path(), None)
             }
             CreatePlan::Initialise { initial_branch } => {
-                let staging = StagingSibling::create(destination)?;
-                self.record_staging(row, &staging)?;
+                // The name goes on to the row before the directory exists, so a sibling this host
+                // created is always one a row accounts for and nothing is ever removed because of
+                // its name alone.
+                let name = StagingSibling::propose();
+                self.record_staging(row, &name, &destination.parent_path().join(&name))?;
+                let staging = StagingSibling::create(destination, &name)?;
                 stage_init(&self.profile, &staging, initial_branch.as_deref(), cancel)?;
                 let staged = staging.staged_witness()?;
                 self.locked()?.set_operation_state(
@@ -805,8 +922,9 @@ impl ProjectService {
                 (Some(published), destination.path(), Some(staging))
             }
             CreatePlan::Clone { remote } => {
-                let staging = StagingSibling::create(destination)?;
-                self.record_staging(row, &staging)?;
+                let name = StagingSibling::propose();
+                self.record_staging(row, &name, &destination.parent_path().join(&name))?;
+                let staging = StagingSibling::create(destination, &name)?;
                 stage_clone(&self.profile, &staging, remote, cancel)?;
                 let staged = staging.staged_witness()?;
                 self.locked()?.set_operation_state(
@@ -865,11 +983,14 @@ impl ProjectService {
             Some(&encoded),
             self.clock.now_ms(),
         )?;
+        // The publication is committed. Removing the staging sibling afterwards is cleanup, and a
+        // cleanup that fails must not turn a landed publication into a failure: the path is
+        // recorded as one that is still there, and the sweep and the next recovery retry it.
         if let Some(sibling) = staging {
-            let path = sibling.path().to_owned();
-            sibling.remove(destination)?;
-            self.locked()?
-                .record_staging_path(row.action_id, &path.display().to_string(), true)?;
+            let path = sibling.path().display().to_string();
+            let removed = sibling.remove(destination).is_ok();
+            self.writable()?
+                .record_staging_path(row.action_id, &path, removed)?;
         }
         let operation = self.read_operation(row.action_id)?;
         Ok(CreationAnswer {
@@ -1013,7 +1134,15 @@ impl ProjectService {
                 kind: params.kind,
                 policy: params.policy,
                 base_revision: &base_revision,
-                base_reference: head_reference.as_deref(),
+                // The reference is HEAD's, so it belongs to the preview only when the caller let
+                // HEAD decide the revision. A caller that named another revision gets no
+                // reference rather than an unrelated one.
+                base_reference: params
+                    .base_revision
+                    .0
+                    .is_none()
+                    .then_some(head_reference.as_deref())
+                    .flatten(),
                 base_change_set_id: params.base_change_set_id.0,
                 at_ms: self.clock.now_ms(),
             },
@@ -1023,6 +1152,7 @@ impl ProjectService {
             return Ok(WorkspaceCreateResult {
                 workspace: Nullable(None),
                 preview: surveyed.preview,
+                unapplied: Vec::new(),
             });
         }
         let workspace_id = WorkspaceId::new(new_uuid());
@@ -1060,39 +1190,46 @@ impl ProjectService {
             base_change_set_id: params.base_change_set_id.0,
             identity: None,
             display_path: display_path.clone(),
+            staging_name: None,
+            detail: None,
             retention: None,
             created_at_ms: self.clock.now_ms(),
             removed_at_ms: None,
         };
-        self.locked()?.begin_workspace(&row, action)?;
+        self.writable()?.begin_workspace(&row, action)?;
         let outcome = self.materialise(&repository, &row, params, &surveyed);
-        match outcome {
-            Ok(identity) => {
-                self.locked()?.set_workspace_state(
+        let unapplied = match outcome {
+            Ok(materialised) => {
+                self.writable()?.set_workspace_state(
                     workspace_id,
                     WorkspaceState::Ready,
-                    Some(identity),
+                    Some(materialised.identity),
                     None,
                     None,
                 )?;
+                materialised.unapplied
             }
             Err(error) => {
                 let detail = error.to_string();
-                let store = self.locked()?;
-                store.set_workspace_state(
+                // The row keeps whatever identity the materialisation managed to record, so a
+                // removal can reach the tree this host created. Where it recorded none, the
+                // removal refuses: this host does not delete a directory it cannot prove is its.
+                let mut store = self.writable()?;
+                store.set_workspace(
                     workspace_id,
                     WorkspaceState::RemovalPending,
-                    None,
-                    None,
-                    None,
+                    &WorkspaceUpdate {
+                        detail: Some(&detail),
+                        ..WorkspaceUpdate::default()
+                    },
                 )?;
                 if let Some(action) = action {
                     store.settle(action, None, Some((error.code(), &detail)))?;
                 }
                 return Err(error);
             }
-        }
-        let store = self.locked()?;
+        };
+        let store = self.writable()?;
         let row = store
             .workspace(workspace_id)?
             .ok_or_else(|| ProjectError::UnknownWorkspace {
@@ -1102,6 +1239,7 @@ impl ProjectService {
         let result = WorkspaceCreateResult {
             workspace: Nullable(Some(workspace)),
             preview: surveyed.preview,
+            unapplied,
         };
         if let Some(action) = action {
             let encoded = kr_cbor::to_canonical_vec(&result).map_err(ProjectError::store)?;
@@ -1117,12 +1255,15 @@ impl ProjectService {
         row: &WorkspaceRow,
         params: &WorkspaceCreateParams,
         surveyed: &Survey,
-    ) -> Result<ObjectIdentity> {
+    ) -> Result<Materialised> {
         match row.kind {
             WorkspaceKind::SharedExisting => {
                 // The user's own working tree, used where it is. Nothing is created, nothing is
                 // cleaned and nothing is copied.
-                Ok(repository.identity().work_tree)
+                Ok(Materialised {
+                    identity: repository.identity().work_tree,
+                    unapplied: Vec::new(),
+                })
             }
             WorkspaceKind::Isolated => {
                 let request = params.destination.0.as_ref().ok_or_else(|| {
@@ -1136,8 +1277,18 @@ impl ProjectService {
                     Some(IsolationMechanism::GitWorktree) => {
                         // A worktree records its own path inside the repository's administrative
                         // state, so it is created at the path it will keep rather than staged and
-                        // renamed. `git worktree add` refuses a path that exists, which is the
-                        // no-replace rule for this one operation.
+                        // renamed. The directory is reserved first: creating it is the atomic
+                        // no-replace step, and its identity goes on to the row before anything is
+                        // written into it, so a removal afterwards can prove the tree is this
+                        // host's. `git worktree add` accepts an existing empty directory.
+                        let reserved = destination.reserve()?;
+                        self.writable()?.set_workspace_state(
+                            row.workspace_id,
+                            WorkspaceState::Materialising,
+                            Some(reserved.identity()),
+                            None,
+                            None,
+                        )?;
                         let path = destination.path();
                         let arguments: [&OsStr; 5] = [
                             OsStr::new("worktree"),
@@ -1154,7 +1305,18 @@ impl ProjectService {
                         )?;
                     }
                     Some(IsolationMechanism::IndependentClone) | None => {
-                        let staging = StagingSibling::create(&destination)?;
+                        // The name goes on to the row before the directory exists, so recovery
+                        // finds a sibling this host created rather than one it guessed at.
+                        let name = StagingSibling::propose();
+                        self.writable()?.set_workspace(
+                            row.workspace_id,
+                            WorkspaceState::Materialising,
+                            &WorkspaceUpdate {
+                                staging_name: Some(&name),
+                                ..WorkspaceUpdate::default()
+                            },
+                        )?;
+                        let staging = StagingSibling::create(&destination, &name)?;
                         let source = repository.top_level().display().to_string();
                         let arguments: [&OsStr; 6] = [
                             OsStr::new("clone"),
@@ -1192,7 +1354,19 @@ impl ProjectService {
                         )?;
                         let staged = staging.staged_witness()?;
                         publish(&staging, &destination, staged)?;
+                        let tree = destination.parent().subdirectory(destination.name())?;
+                        // The tree exists, so its identity goes on to the row before anything
+                        // else can fail: a removal afterwards can prove the directory is this
+                        // host's.
+                        self.writable()?.set_workspace_state(
+                            row.workspace_id,
+                            WorkspaceState::Materialising,
+                            Some(tree.identity()),
+                            None,
+                            None,
+                        )?;
                         staging.remove(&destination)?;
+                        self.writable()?.clear_workspace_staging(row.workspace_id)?;
                     }
                 }
                 let tree = destination.parent().subdirectory(destination.name())?;
@@ -1200,23 +1374,26 @@ impl ProjectService {
                 // exclusion means this workspace starts without the file, never that the original
                 // is cleaned, stashed or discarded.
                 let report = copy_included(repository.work_tree(), &tree, &surveyed.entries)?;
-                if !report.copied.is_empty() {
-                    // What was copied in is uncommitted work this workspace now holds, so a
+                let carried = report.copied.len() + report.removed.len();
+                if carried > 0 {
+                    // What was carried in is uncommitted work this workspace now holds, so a
                     // removal has to account for it.
-                    self.locked()?.retain(
+                    self.writable()?.retain(
                         row.workspace_id,
                         &RetainedRow {
                             kind: RetainedKind::DirtyContent,
                             detail: format!(
-                                "{} uncommitted paths were copied in when this workspace was \
-                                 created",
-                                report.copied.len()
+                                "{carried} uncommitted paths were carried in when this workspace \
+                                 was created"
                             ),
                             change_set_id: None,
                         },
                     )?;
                 }
-                Ok(tree.identity())
+                Ok(Materialised {
+                    identity: tree.identity(),
+                    unapplied: report.skipped,
+                })
             }
         }
     }
@@ -1235,70 +1412,138 @@ impl ProjectService {
         if let Some(answered) = self.answer_from_record::<WorkspaceRemoveResult>(action)? {
             return Ok(answered);
         }
-        let store = self.locked()?;
-        let row = store.workspace(params.workspace_id)?.ok_or_else(|| {
-            ProjectError::UnknownWorkspace {
-                workspace: params.workspace_id.to_string(),
+        // What a workspace holds is a fact about its tree as well as a set of records, so the
+        // tree is measured *before* anything is decided. Uncommitted work nobody wrote a record
+        // about is still work the user has not approved removing.
+        self.measure_dirty_content(params.workspace_id)?;
+        // The claim, the checks and the reservation are one transaction. A session or a run bound
+        // between a check and a deletion would be a live holder of a tree that is already going,
+        // and two copies of one removal action would both delete before either was told it lost.
+        let (row, retained) =
+            self.writable()?
+                .begin_removal(params.workspace_id, params.retention, action)?;
+        let outcome = self.perform_removal(&row, params.retention, &retained);
+        match outcome {
+            Ok(removed) => self.removal_answer(params.workspace_id, removed, action),
+            Err(error) => {
+                let detail = error.to_string();
+                let mut store = self.writable()?;
+                store.set_workspace(
+                    params.workspace_id,
+                    WorkspaceState::RemovalPending,
+                    &WorkspaceUpdate {
+                        detail: Some(&detail),
+                        ..WorkspaceUpdate::default()
+                    },
+                )?;
+                if let Some(action) = action {
+                    store.settle(action, None, Some((error.code(), &detail)))?;
+                }
+                Err(error)
             }
-        })?;
-        // Cleanup follows after all bound sessions and runs finish. Neither session closure nor
-        // marking a review complete reaches this method, and a live session refuses it.
-        let live = store.live_sessions(params.workspace_id)?;
-        if !live.is_empty() {
-            return Err(ProjectError::StillBound {
-                detail: format!(
-                    "{} sessions bound to this workspace are still live, and cleanup happens \
-                     after every bound session and run has finished",
-                    live.len()
-                ),
-            });
         }
-        let retained = store.retained(params.workspace_id)?;
-        drop(store);
-        let keeps_everything = matches!(params.retention, RetentionPolicy::KeepEverything);
-        if keeps_everything && !retained.is_empty() {
-            // Dirty content, pinned change sets and review evidence are retained until the user
-            // approves their removal. Saying so and changing nothing is the answer.
-            self.locked()?.set_workspace_state(
-                params.workspace_id,
-                WorkspaceState::RemovalPending,
-                None,
-                Some(params.retention),
-                None,
-            )?;
-            return self.removal_answer(params.workspace_id, false, action);
-        }
-        let removed = match row.kind {
-            // A shared workspace *is* the user's own working tree. Removing the record removes the
-            // selection; removing the tree would delete the user's work, which no retention policy
-            // asks for.
-            WorkspaceKind::SharedExisting => false,
-            WorkspaceKind::Isolated => {
-                self.remove_working_tree(&row)?;
-                true
-            }
+    }
+
+    /// Records what uncommitted work a workspace's own tree holds now.
+    ///
+    /// A workspace created from its base alone holds nothing, and then somebody edits a file in
+    /// it. An empty retention table does not establish a clean tree, so the tree is read.
+    ///
+    /// A shared workspace's tree is the user's own and is never removed, so nothing there needs
+    /// this; it is measured anyway, because a read of the workspace should say what it holds.
+    fn measure_dirty_content(&self, workspace_id: WorkspaceId) -> Result<()> {
+        let Some(row) = self.locked()?.workspace(workspace_id)? else {
+            return Ok(());
         };
-        if matches!(params.retention, RetentionPolicy::RemoveRetained) {
-            self.locked()?.release_retained(params.workspace_id)?;
+        if matches!(row.state, WorkspaceState::Removed) {
+            return Ok(());
         }
-        let still_held = !self.locked()?.retained(params.workspace_id)?.is_empty();
-        self.locked()?.set_workspace_state(
-            params.workspace_id,
+        let measured = self.count_dirty(&row);
+        let item = measured.map(|count| RetainedRow {
+            kind: RetainedKind::DirtyContent,
+            detail: format!("{count} paths in this workspace hold uncommitted work"),
+            change_set_id: None,
+        });
+        self.writable()?
+            .replace_retained(workspace_id, RetainedKind::DirtyContent, item.as_ref())
+    }
+
+    /// Returns how many paths of a workspace's own tree hold uncommitted work.
+    ///
+    /// `None` when this host could not read the tree: a workspace whose directory is gone holds
+    /// nothing, and one this host cannot open is one whose contents it will not guess at. Either
+    /// way nothing is recorded, and the identity check is what stops a removal in the second case.
+    fn count_dirty(&self, row: &WorkspaceRow) -> Option<usize> {
+        let opened = OpenedRepository::open(
+            &self.profile,
+            self.environment_id,
+            Path::new(&row.display_path),
+        )
+        .ok()?;
+        let arguments: [&OsStr; 5] = [
+            OsStr::new("status"),
+            OsStr::new("--porcelain=v2"),
+            OsStr::new("-z"),
+            OsStr::new("--untracked-files=all"),
+            OsStr::new("--ignore-submodules=all"),
+        ];
+        let reported = self.profile.run_checked(&opened.read(&arguments)).ok()?;
+        let entries = crate::workspace::parse_status(&reported).ok()?;
+        (!entries.is_empty()).then_some(entries.len())
+    }
+
+    /// Removes what the retention policy permits, and says whether the working files are gone.
+    fn perform_removal(
+        &self,
+        row: &WorkspaceRow,
+        retention: RetentionPolicy,
+        retained: &[RetainedRow],
+    ) -> Result<bool> {
+        // A shared workspace *is* the user's own working tree. Removing the record removes the
+        // selection; removing the tree would delete the user's work, which no retention policy
+        // asks for. So its removal never waits on what the tree holds either.
+        if matches!(row.kind, WorkspaceKind::SharedExisting) {
+            if matches!(retention, RetentionPolicy::RemoveRetained) {
+                self.writable()?.release_retained(row.workspace_id)?;
+            }
+            let _ = retained;
+            let held = !self.locked()?.retained(row.workspace_id)?.is_empty();
+            self.finish_removal(row, retention, held)?;
+            return Ok(false);
+        }
+        if matches!(retention, RetentionPolicy::KeepEverything) && !retained.is_empty() {
+            // Dirty content, pinned change sets and review evidence are retained until the user
+            // approves their removal. Saying what is held and changing nothing is the answer, and
+            // the approval is a second request carrying the other policy.
+            return Ok(false);
+        }
+        self.remove_working_tree(row)?;
+        if matches!(retention, RetentionPolicy::RemoveRetained) {
+            self.writable()?.release_retained(row.workspace_id)?;
+        }
+        let held = !self.locked()?.retained(row.workspace_id)?.is_empty();
+        self.finish_removal(row, retention, held)?;
+        Ok(true)
+    }
+
+    /// Moves a workspace to its terminal state once the removal has done what it may.
+    fn finish_removal(
+        &self,
+        row: &WorkspaceRow,
+        retention: RetentionPolicy,
+        still_held: bool,
+    ) -> Result<()> {
+        self.writable()?.set_workspace_state(
+            row.workspace_id,
             if still_held {
                 WorkspaceState::RemovalPending
             } else {
                 WorkspaceState::Removed
             },
             None,
-            Some(params.retention),
+            Some(retention),
             Some(self.clock.now_ms()),
-        )?;
-        self.locked()?.announce(
-            "workspace.removed",
-            &params.workspace_id.to_string(),
-            self.clock.now_ms(),
-        )?;
-        self.removal_answer(params.workspace_id, removed, action)
+        )
     }
 
     fn removal_answer(
@@ -1307,7 +1552,7 @@ impl ProjectService {
         working_files_removed: bool,
         action: Option<&Action>,
     ) -> Result<WorkspaceRemoveResult> {
-        let store = self.locked()?;
+        let store = self.writable()?;
         let row = store
             .workspace(workspace_id)?
             .ok_or_else(|| ProjectError::UnknownWorkspace {
@@ -1326,24 +1571,23 @@ impl ProjectService {
                 })
                 .collect(),
         };
+        // The claim was opened when the removal was reserved, so this fills it in rather than
+        // recording a second row. A claim that is no longer open belongs to a copy of this action
+        // that settled first, and that record is the answer both callers get.
         if let Some(action) = action {
             let encoded = kr_cbor::to_canonical_vec(&result).map_err(ProjectError::store)?;
-            match store.record_action(
-                &action.actor_id,
-                action.action_id,
-                &action.method,
-                action.payload_digest,
-                &RetainedOutcome::Ok(encoded),
-                self.clock.now_ms(),
-            )? {
-                None => {}
-                Some(RetainedOutcome::Ok(bytes)) => {
-                    return kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
-                        .map_err(ProjectError::store);
-                }
-                Some(RetainedOutcome::Error { code, detail }) => {
-                    return Err(ProjectError::Retained { code, detail });
-                }
+            if store.settle(action, Some(&encoded), None)? == 0
+                && let Some(record) = store.retained_action(&action.actor_id, action.action_id)?
+            {
+                return match outcome_of(&record) {
+                    RetainedOutcome::Ok(bytes) => {
+                        kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+                            .map_err(ProjectError::store)
+                    }
+                    RetainedOutcome::Error { code, detail } => {
+                        Err(ProjectError::Retained { code, detail })
+                    }
+                };
             }
         }
         Ok(result)
@@ -1361,6 +1605,18 @@ impl ProjectService {
                 detail: format!("{} has no final name", path.display()),
             });
         };
+        let Some(expected) = row.identity else {
+            // The materialisation never got as far as recording the tree's identity, so this host
+            // cannot prove the directory at that path is one it created. Removing it would be
+            // removing whatever is there, which is exactly what an identity exists to stop.
+            return Err(ProjectError::IdentityChanged {
+                detail: format!(
+                    "this host recorded no filesystem identity for the workspace at {}, so it \
+                     will not remove what is there; the directory is left for a person to look at",
+                    path.display()
+                ),
+            });
+        };
         let parent = kr_transfer::AuthorisedDirectory::open_root(self.environment_id, parent)?;
         let name = RelativeName::parse(name)?;
         if !parent.occupied(&name)? {
@@ -1370,18 +1626,16 @@ impl ProjectService {
         }
         // The identity is checked before anything is removed: a record whose object has been
         // replaced does not authorise removing whatever now holds its path.
-        if let Some(expected) = row.identity {
-            let here = parent.subdirectory(&name)?;
-            if here.identity() != expected {
-                return Err(ProjectError::IdentityChanged {
-                    detail: format!(
-                        "this workspace was recorded as {expected} and {} now holds {}; nothing \
-                         is removed",
-                        path.display(),
-                        here.identity()
-                    ),
-                });
-            }
+        let here = parent.subdirectory(&name)?;
+        if here.identity() != expected {
+            return Err(ProjectError::IdentityChanged {
+                detail: format!(
+                    "this workspace was recorded as {expected} and {} now holds {}; nothing is \
+                     removed",
+                    path.display(),
+                    here.identity()
+                ),
+            });
         }
         match parent.handle().remove_dir_all(name.as_str()) {
             Ok(()) => {}
@@ -1396,9 +1650,14 @@ impl ProjectService {
         // A worktree's administrative record inside the repository outlives its directory, so it
         // is pruned rather than left naming a path that is gone. `prune` removes that record and
         // nothing of the user's.
-        if matches!(row.isolation, Some(IsolationMechanism::GitWorktree))
-            && let Some(project) = self.locked()?.project(row.project_repository_id)?
-        {
+        // The guard is released before the subprocess starts: a journal lock held across a Git
+        // invocation is a lock held for as long as Git takes.
+        let repository = if matches!(row.isolation, Some(IsolationMechanism::GitWorktree)) {
+            self.locked()?.project(row.project_repository_id)?
+        } else {
+            None
+        };
+        if let Some(project) = repository {
             let arguments: [&OsStr; 2] = [OsStr::new("worktree"), OsStr::new("prune")];
             let top = PathBuf::from(&project.display_path);
             let _ = self.profile.run(&GitRequest::write(&top, &arguments));
@@ -1419,7 +1678,27 @@ impl ProjectService {
         session_id: SessionId,
         live: bool,
     ) -> Result<()> {
-        self.locked()?.bind_session(workspace_id, session_id, live)
+        self.writable()?
+            .bind_session(workspace_id, session_id, live)
+    }
+
+    /// Records an automation run as bound to a workspace, or as having ended.
+    ///
+    /// Section 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace
+    /// between two sessions or after its last one ended, so the workflow service records it here
+    /// and a removal refuses while it is live.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::WrongState`] when the workspace is no longer one anything may
+    /// hold, or [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn bind_run(
+        &self,
+        workspace_id: WorkspaceId,
+        run_id: kr_protocol::ids::WorkflowRunId,
+        live: bool,
+    ) -> Result<()> {
+        self.writable()?.bind_run(workspace_id, run_id, live)
     }
 
     /// Records one thing a workspace holds that a removal has to account for.
@@ -1428,7 +1707,7 @@ impl ProjectService {
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
     pub fn retain(&self, workspace_id: WorkspaceId, item: &RetainedRow) -> Result<()> {
-        self.locked()?.retain(workspace_id, item)
+        self.writable()?.retain(workspace_id, item)
     }
 
     /// Returns one action's retained outcome, when this service has one.
@@ -1596,15 +1875,14 @@ impl ProjectService {
             state: row.state,
             base_revision: row.base_revision.clone(),
             base_change_set_id: Nullable(row.base_change_set_id),
-            filesystem_identity: row.identity.map_or(
-                FilesystemIdentity {
-                    device: U64::new(0),
-                    file_id: U64::new(0),
-                },
-                wire_identity,
-            ),
+            // An absent identity is reported as absent. A workspace whose materialisation did not
+            // get as far as creating its tree has none, and inventing one would be inventing a
+            // filesystem object.
+            filesystem_identity: Nullable(row.identity.map(wire_identity)),
             display_path: row.display_path.clone(),
+            detail: Nullable(row.detail.clone()),
             bound_sessions: store.live_sessions(row.workspace_id)?,
+            bound_runs: store.live_runs(row.workspace_id)?,
             retained: store
                 .retained(row.workspace_id)?
                 .into_iter()
@@ -1658,6 +1936,14 @@ enum ResolvedStep {
     Cleaned,
     /// This host cannot say what happened; the staging path is kept and named.
     Unresolved(Option<String>),
+}
+
+/// What a materialisation produced.
+struct Materialised {
+    /// The working tree's filesystem identity.
+    identity: ObjectIdentity,
+    /// The paths the policy included that this host could not carry.
+    unapplied: Vec<String>,
 }
 
 /// What a creation answers with.
@@ -1770,6 +2056,22 @@ fn check_revision(revision: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Returns the parent of a recorded path, for reopening a destination from a row.
+fn parent_of(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .map(|parent| parent.display().to_string())
+        .unwrap_or_default()
+}
+
+/// Returns the final name of a recorded path.
+fn name_of(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 fn new_uuid() -> Uuid {

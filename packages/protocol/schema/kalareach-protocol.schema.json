@@ -1420,6 +1420,26 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "ChangeKind": {
+      "description": "What the working tree holds for one path.\n\nA copy is not the only way to carry an inclusion: a deletion is carried by removing the path\nfrom the new workspace, and a path this host cannot read is carried by neither.",
+      "oneOf": [
+        {
+          "const": "present",
+          "description": "The content differs from the base, or the path is new.",
+          "type": "string"
+        },
+        {
+          "const": "deleted",
+          "description": "The path is gone from the working tree and the base still has it.",
+          "type": "string"
+        },
+        {
+          "const": "unmerged",
+          "description": "The path has an unresolved merge.",
+          "type": "string"
+        }
+      ]
+    },
     "ChangeSetId": {
       "description": "One immutable captured change set.",
       "format": "uuid",
@@ -1859,6 +1879,26 @@
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "ContentClass": {
+      "description": "What one path's content is, as far as this host read it.\n\nThe test for binary is Git's own: a null byte in the first eight thousand bytes of content as it\nis stored. [`Self::Unknown`] is the honest third answer, for a path this host did not read\nbecause the preview's scan bound was reached, or could not read at all. An unknown path is\ntreated as binary by an exclusion, because excluding what might be binary is the direction that\nhonours the request.",
+      "oneOf": [
+        {
+          "const": "text",
+          "description": "Read, and no null byte in the first eight thousand bytes.",
+          "type": "string"
+        },
+        {
+          "const": "binary",
+          "description": "Read, and a null byte in the first eight thousand bytes.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Not read, so neither.",
+          "type": "string"
+        }
+      ]
     },
     "ControlEvent": {
       "description": "What the host sends on an authorised control stream outside a response.\n\nThe control stream carries ordinary [`Notification`] events once the connection is authorised.\nThese two messages are the connection's own, not an application event: the freshness resource\nand the transport's liveness belong to the connection rather than to any session.",
@@ -5287,8 +5327,12 @@
           },
           "type": "array"
         },
+        "counts_complete": {
+          "description": "True when every count above is the whole of its class.\n\nFalse when a bound was reached: an ignored directory deeper or larger than the walk\ncovers, or a directory this host could not list. Then each count is a lower bound and the\nlimitations say which bound was reached.",
+          "type": "boolean"
+        },
         "entries": {
-          "description": "A bounded sample of the paths, longest-first by class in [`InclusionClass::EVERY`] order.",
+          "description": "A bounded sample of the paths, grouped by class in [`InclusionClass::EVERY`] order.",
           "items": {
             "$ref": "#/$defs/PreviewEntry"
           },
@@ -5307,7 +5351,7 @@
         },
         "omitted_entries": {
           "$ref": "#/$defs/U64",
-          "description": "How many paths the sample left out."
+          "description": "How many paths the sample left out. The counts still cover them."
         },
         "policy": {
           "$ref": "#/$defs/InclusionPolicy",
@@ -5320,6 +5364,10 @@
         "taken_at_ms": {
           "$ref": "#/$defs/TimestampMs",
           "description": "When it was taken."
+        },
+        "unknown_content": {
+          "$ref": "#/$defs/U64",
+          "description": "How many paths this host could not classify as text or binary.\n\nReading every path's first bytes costs an open each, and a working tree with a build\ndirectory in it holds hundreds of thousands. Above [`MAX_BINARY_SCAN_ENTRIES`] the host\nstops reading and says how many it did not read rather than calling them text."
         }
       },
       "required": [
@@ -5332,6 +5380,8 @@
         "counts",
         "entries",
         "omitted_entries",
+        "unknown_content",
+        "counts_complete",
         "limitations",
         "taken_at_ms"
       ],
@@ -8359,10 +8409,6 @@
       "additionalProperties": false,
       "description": "One path an inclusion preview names.",
       "properties": {
-        "binary": {
-          "description": "Whether its content is binary.\n\nThis cuts across the other classes rather than replacing them: a dirty file may be binary,\nand a policy that includes dirty files and excludes binaries leaves this one out. The test\nis Git's own, a NUL byte in the first eight thousand bytes of content as it is stored.",
-          "type": "boolean"
-        },
         "byte_len": {
           "anyOf": [
             {
@@ -8374,9 +8420,17 @@
           ],
           "description": "Its size in bytes, when the host could read one."
         },
+        "change": {
+          "$ref": "#/$defs/ChangeKind",
+          "description": "What change the working tree holds for it."
+        },
         "class": {
           "$ref": "#/$defs/InclusionClass",
           "description": "Which class it belongs to: where in the working tree it came from."
+        },
+        "content": {
+          "$ref": "#/$defs/ContentClass",
+          "description": "What its content is.\n\nThis cuts across the other classes rather than replacing them: a dirty file may be binary,\nand a policy that includes dirty files and excludes binaries leaves this one out."
         },
         "included": {
           "description": "Whether the policy in force would copy it into the new workspace.",
@@ -8390,7 +8444,8 @@
       "required": [
         "path",
         "class",
-        "binary",
+        "change",
+        "content",
         "byte_len",
         "included"
       ],
@@ -11337,17 +11392,12 @@
       "oneOf": [
         {
           "const": "keep_everything",
-          "description": "Keep everything. The workspace is removed only when nothing is retained.\n\nThe default a client should offer, because it is the only one that cannot lose work.",
-          "type": "string"
-        },
-        {
-          "const": "keep_retained_evidence",
-          "description": "Remove the working files and keep dirty content, pinned change sets and review evidence.",
+          "description": "Keep everything. The workspace is removed only when it holds nothing.\n\nThe one a client offers first, because it is the only one that cannot lose work. What the\nworkspace holds is measured rather than assumed: its own uncommitted work as well as the\npins and the review evidence recorded against it. When it holds something, nothing is\nremoved and the result lists what.",
           "type": "string"
         },
         {
           "const": "remove_retained",
-          "description": "Remove everything, including what is retained.\n\nSection 14 keeps dirty content, pinned change sets and review evidence until the user\napproves their removal, so this policy is the approval: a request that carries it names\nexactly what it is removing and the result lists what went.",
+          "description": "Remove everything, including what is held.\n\nSection 14 keeps dirty content, pinned change sets and review evidence until the user\napproves their removal, so this policy *is* the approval: it follows a\n[`Self::KeepEverything`] request that listed what is held, and the result lists what went.\n\nThere is deliberately no third policy that removes the working files while keeping the\ndirty content in them. Keeping content means capturing it, and capturing an immutable\nversion of a workspace is the change-set service's; a policy that claimed to keep what it\nhad just deleted would be a lie.",
           "type": "string"
         }
       ]
@@ -14250,6 +14300,13 @@
           "$ref": "#/$defs/InclusionPreview",
           "description": "What a reviewer would see, always."
         },
+        "unapplied": {
+          "description": "The paths the policy included that this host could not carry into the workspace.\n\nA symbolic link, a device, a submodule's own working tree, and a path whose destination\nthis host could not replace. The workspace exists and is usable; what it does not hold is\nnamed here rather than left for a reviewer to notice.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
         "workspace": {
           "anyOf": [
             {
@@ -14264,7 +14321,8 @@
       },
       "required": [
         "workspace",
-        "preview"
+        "preview",
+        "unapplied"
       ],
       "type": "object"
     },
@@ -14391,7 +14449,7 @@
           "type": "array"
         },
         "working_files_removed": {
-          "description": "True when the working files are gone.",
+          "description": "True when this workspace's own working files are gone.\n\nAlways false for a shared workspace: that tree is the user's own, and removing the selection\nremoves no file. For an isolated one it means the tree is not there any more, whether this\ncall removed it or found it already gone.",
           "type": "boolean"
         },
         "workspace": {
@@ -14450,6 +14508,13 @@
           "description": "The revision it started from.",
           "type": "string"
         },
+        "bound_runs": {
+          "description": "The automation runs bound to it that are still live.\n\nSection 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace\nbetween two sessions or after its last one ended, so it is recorded separately and refuses\na removal in the same way.",
+          "items": {
+            "$ref": "#/$defs/WorkflowRunId"
+          },
+          "type": "array"
+        },
         "bound_sessions": {
           "description": "The sessions bound to it that are still live.\n\nA removal is refused while this is not empty, whatever retention policy it carries.",
           "items": {
@@ -14461,6 +14526,17 @@
           "$ref": "#/$defs/TimestampMs",
           "description": "When it was created."
         },
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why it is in the state it is in, when it ended up there for a reason."
+        },
         "display_path": {
           "description": "The path it was created at, for a person to read.",
           "type": "string"
@@ -14470,8 +14546,15 @@
           "description": "The environment that owns it."
         },
         "filesystem_identity": {
-          "$ref": "#/$defs/FilesystemIdentity",
-          "description": "The stable filesystem identity of its working tree."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FilesystemIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The stable filesystem identity of its working tree, once this host has one.\n\nAbsent while the workspace is being materialised, and absent afterwards only when the\nmaterialisation did not get as far as creating the tree. An absent identity is what refuses\na removal: this host does not delete a directory it cannot prove it created."
         },
         "isolation": {
           "anyOf": [
@@ -14529,7 +14612,9 @@
         "base_change_set_id",
         "filesystem_identity",
         "display_path",
+        "detail",
         "bound_sessions",
+        "bound_runs",
         "retained",
         "created_at_ms"
       ],
@@ -15048,6 +15133,9 @@
     },
     "policy_authority": {
       "$ref": "#/$defs/PolicyAuthority"
+    },
+    "preview_entry": {
+      "$ref": "#/$defs/PreviewEntry"
     },
     "project_adopt_params": {
       "$ref": "#/$defs/ProjectAdoptParams"

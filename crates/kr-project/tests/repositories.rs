@@ -930,3 +930,128 @@ fn a_destination_is_one_name_inside_a_directory_this_host_holds_a_handle_to() {
         .expect_err("another environment's destination is not this service's");
     assert_eq!(refusal.code(), ErrorCode::EnvironmentUnavailable);
 }
+
+#[test]
+fn recovery_removes_the_staging_directories_it_recorded_and_nothing_else() {
+    // A sibling is named on the row before it exists, so what recovery removes is a name this
+    // host recorded. A repository a user happened to call `.kr-project-something` is not one.
+    let fixture = Fixture::create();
+    let decoy = ordinary_repository(fixture.work(), &format!("{STAGING_PREFIX}a-users-own"));
+    let source = ordinary_repository(fixture.work(), "source");
+    let submitted = action("project.clone", 20);
+    let cloned = fixture
+        .service()
+        .project_clone(
+            &actor(),
+            &ProjectCloneParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "swept"),
+                label: "swept".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: String::new(),
+                    credential_broker: String::new(),
+                },
+            },
+            Some(&submitted),
+        )
+        .expect("the clone completes");
+    // A sibling this host recorded and did not get to remove, which is what a daemon that died
+    // between the publication and the cleanup leaves.
+    let recorded = fixture.work().join(format!("{STAGING_PREFIX}recorded"));
+    std::fs::create_dir_all(recorded.join("tree")).expect("a recorded staging directory");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE operations SET staging_name = ?2 WHERE action_id = ?1",
+            rusqlite::params![
+                cloned.operation.action_id.get().as_bytes().to_vec(),
+                format!("{STAGING_PREFIX}recorded"),
+            ],
+        )
+        .expect("the name is recorded");
+    drop(journal);
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover().expect("recovery runs");
+    assert!(recovery.staging_removed >= 1);
+    assert!(!recorded.exists(), "the recorded sibling is removed");
+    // And the user's own repository, whose name merely looks like one of this host's, is untouched.
+    assert!(
+        decoy.join(".git").is_dir(),
+        "a repository this host did not create is not this host's to delete"
+    );
+    assert!(decoy.join("README.md").is_file());
+    assert!(fixture.work().join("swept/.git").is_dir());
+}
+
+#[test]
+fn recovery_settles_a_claim_an_earlier_daemon_left_open() {
+    // A claim is opened with the state it changes and filled in when the effect settles, so a
+    // daemon that died between the two leaves one open. An open claim is not an answer: a repeat
+    // of the action would be told the outcome is unknown for ever.
+    let fixture = Fixture::create();
+    let submitted = action("project.init", 21);
+    let created = fixture
+        .service()
+        .project_init(
+            &actor(),
+            &ProjectInitParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "claimed"),
+                label: "claimed".to_owned(),
+                initial_branch: Nullable(None),
+            },
+            Some(&submitted),
+        )
+        .expect("it is created");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE actions SET result = NULL, error_code = NULL, error_detail = NULL
+              WHERE action_id = ?1",
+            rusqlite::params![submitted.action_id.as_bytes().to_vec()],
+        )
+        .expect("the claim is open again");
+    drop(journal);
+
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover().expect("recovery runs");
+    assert_eq!(recovery.claims_settled, 1);
+    // A repeat now gets a definite answer that names what the action acted on, rather than being
+    // told for ever that the outcome is unknown.
+    let refusal = replacement
+        .project_init(
+            &actor(),
+            &ProjectInitParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "claimed"),
+                label: "claimed".to_owned(),
+                initial_branch: Nullable(None),
+            },
+            Some(&submitted),
+        )
+        .expect_err("the repeat is answered from the settled record");
+    assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
+    assert!(
+        refusal
+            .to_string()
+            .contains(&created.operation.action_id.to_string()),
+        "the answer names what the action acted on: {refusal}"
+    );
+    // And a second recovery has nothing left to settle.
+    assert_eq!(
+        replacement
+            .recover()
+            .expect("recovery runs again")
+            .claims_settled,
+        0
+    );
+}

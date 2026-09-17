@@ -543,9 +543,10 @@ removed. The question it asks is never whether a name exists but which name hold
 was staged, because the operation row carries that object's filesystem identity and the row's key is
 the caller's own action identifier.
 
-The service cannot know which sessions are bound to a workspace and still live, so the daemon
-answers for that: a workspace with a live bound session refuses removal whatever retention policy
-the request carries.
+The service cannot know which sessions and automation runs are bound to a workspace, so whoever
+owns those lifetimes records the binding here and the service enforces it: a workspace a live
+session or run still holds refuses removal whatever retention policy the request carries, and
+nothing new may hold one whose removal has begun.
 
 `docs/project/` has the ten methods, the identity model, the staged publication, the credential rule
 and the restricted Git execution profile.

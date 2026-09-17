@@ -48,12 +48,13 @@ use crate::pairing::{
 };
 use crate::preauth::{PairRedeemParams, PairRedeemResult, PairStatusParams, PairStatusResult};
 use crate::project::{
-    InclusionPreview, OperationRecord, ProjectAdoptParams, ProjectAdoptResult, ProjectCloneParams,
-    ProjectCloneResult, ProjectInitParams, ProjectInitResult, ProjectListParams, ProjectListResult,
-    ProjectOperationCancelParams, ProjectOperationCancelResult, ProjectReadParams,
-    ProjectReadResult, ProjectSummary, WorkspaceCreateParams, WorkspaceCreateResult,
-    WorkspaceListParams, WorkspaceListResult, WorkspaceReadParams, WorkspaceReadResult,
-    WorkspaceRemoveParams, WorkspaceRemoveResult, WorkspaceSummary,
+    InclusionPreview, OperationRecord, PreviewEntry, ProjectAdoptParams, ProjectAdoptResult,
+    ProjectCloneParams, ProjectCloneResult, ProjectInitParams, ProjectInitResult,
+    ProjectListParams, ProjectListResult, ProjectOperationCancelParams,
+    ProjectOperationCancelResult, ProjectReadParams, ProjectReadResult, ProjectSummary,
+    WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceListParams, WorkspaceListResult,
+    WorkspaceReadParams, WorkspaceReadResult, WorkspaceRemoveParams, WorkspaceRemoveResult,
+    WorkspaceSummary,
 };
 use crate::push::{
     PushDeliveryAck, PushDeliveryCredential, PushDeliveryRequest, PushInstallationBinding,
@@ -299,6 +300,7 @@ pub fn protocol_schema() -> Value {
         "upload_status_result" => UploadStatusResult,
         // Project repositories and workspaces, appended for the same reason.
         "inclusion_preview" => InclusionPreview,
+        "preview_entry" => PreviewEntry,
         "operation_record" => OperationRecord,
         "project_adopt_params" => ProjectAdoptParams,
         "project_adopt_result" => ProjectAdoptResult,

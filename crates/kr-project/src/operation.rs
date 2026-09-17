@@ -134,6 +134,37 @@ impl Destination {
         self.parent.host_path(&self.name)
     }
 
+    /// Creates the destination directory, exclusively, and returns it as an authority.
+    ///
+    /// Creating a directory fails when the name is taken, on every platform, so this is the
+    /// atomic no-replace step for an operation that fills the destination in place rather than
+    /// renaming one into it. A linked worktree is such an operation: Git records the path inside
+    /// the repository's administrative state, so the tree cannot be staged elsewhere and moved,
+    /// and `git worktree add` accepts an existing empty directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::Destination`] when the name is taken or the directory cannot be
+    /// created.
+    pub fn reserve(&self) -> Result<AuthorisedDirectory> {
+        self.parent
+            .handle()
+            .create_dir(self.name.as_str())
+            .map_err(|error| ProjectError::Destination {
+                detail: if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!(
+                        "{} is taken, and an isolated workspace is created rather than merged into \
+                         something",
+                        self.path().display()
+                    )
+                } else {
+                    format!("{} could not be created: {error}", self.path().display())
+                },
+            })?;
+        self.parent.sync()?;
+        Ok(self.parent.subdirectory(&self.name)?)
+    }
+
     /// Reports what is at the destination now.
     ///
     /// # Errors
@@ -181,8 +212,8 @@ impl StagingSibling {
     /// # Errors
     ///
     /// Returns [`ProjectError::Destination`] when the directory cannot be created.
-    pub fn create(destination: &Destination) -> Result<Self> {
-        let name = RelativeName::parse(&format!("{STAGING_PREFIX}{}", random_suffix()))?;
+    pub fn create(destination: &Destination, name: &str) -> Result<Self> {
+        let name = RelativeName::parse(name)?;
         let directory = destination.parent.create_subdirectory(&name)?;
         let path = destination.parent.host_path(&name);
         Ok(Self {
@@ -190,6 +221,16 @@ impl StagingSibling {
             name,
             path,
         })
+    }
+
+    /// Returns a name for a sibling that does not exist yet.
+    ///
+    /// The caller records it before creating the directory, so every sibling this host makes is
+    /// one a journal row accounts for. Nothing is ever removed because its name looks like one of
+    /// these: a repository a user happened to call `.kr-project-something` is not this host's.
+    #[must_use]
+    pub fn propose() -> String {
+        format!("{STAGING_PREFIX}{}", random_suffix())
     }
 
     /// Opens a sibling an earlier daemon created, for recovery.
