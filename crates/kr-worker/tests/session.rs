@@ -1528,16 +1528,30 @@ async fn a_shell_that_has_already_ended_is_a_closed_session_rather_than_a_failed
 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_shell_the_host_described_keeps_the_identity_the_kernel_gave_it() {
-    // The other side of the same path. This shell is alive while the host reads it, so what the
-    // closure record carries is the kernel's own start value rather than the reserved one that says
-    // nobody could take a reading. Its exit is collected by the supervision rather than at launch,
-    // which is why the wait below allows for either wake that can find it: the child signal, which
-    // arrives at once, or the sweep behind it.
+    // The other side of the same path. This shell waits to be told to leave, so it is certainly
+    // alive while the host reads it and the identity in the record is the kernel's own rather than
+    // the reserved one that says nobody could take a reading. Nothing here rests on how long a
+    // sleep takes: the shell exits when this test writes to it, and not before. Its exit is then
+    // collected by the supervision rather than at launch, which is why the wait below allows for
+    // either wake that can find it, the child signal or the sweep behind it.
     let host = kr_ipc::testing::TempHost::create();
-    let config = configuration(&host, "printf 'kr-alive\\n'; sleep 1; exit 5");
-    let runtime = std::sync::Arc::new(kr_worker::runtime::start(config).expect("starts a session"));
-    let described = runtime
-        .session()
+    let config = configuration(&host, "printf 'kr-alive\\n'; read leave; exit 5");
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let attachment_id = AttachmentId::new(kr_ipc::new_uuid());
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Input);
+    session
+        .attach(&terminal_attachment(session_id), requested, attachment_id)
+        .expect("attaches");
+    session
+        .acquire_input(attachment_id, ConnectionId::new(kr_ipc::new_uuid()), None)
+        .expect("takes the lease");
+    let epoch = session.lease().epoch.get();
+    let mut stream = session.subscribe(attachment_id).expect("subscribes");
+    let described = session
         .root_identity()
         .expect("the host read the shell it started");
     assert_ne!(
@@ -1545,6 +1559,28 @@ async fn a_shell_the_host_described_keeps_the_identity_the_kernel_gave_it() {
         kr_ipc::identity::START_VALUE_UNREAD,
         "the kernel described this shell, so its identity is a reading"
     );
+    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+
+    // The shell says it is there, and then it is told to leave. Both are events rather than delays.
+    let seen = collect(&mut stream, b"kr-alive").await;
+    assert!(
+        seen.windows(8).any(|window| window == b"kr-alive"),
+        "the shell was running and reading: {}",
+        String::from_utf8_lossy(&seen)
+    );
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(
+                attachment_id,
+                epoch,
+                0,
+                b"leave\n",
+                std::time::Instant::now(),
+            )
+            .expect("writes the line the shell is waiting for");
+        runtime.flush_locked(&mut session);
+    }
 
     let record = tokio::time::timeout(
         kr_worker::lifecycle::IDLE_SWEEP_INTERVAL + Duration::from_secs(15),
