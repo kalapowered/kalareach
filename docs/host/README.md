@@ -134,9 +134,9 @@ that started perfectly well.
 The profile decides which login context a worker is started in, not only which variables it is
 given. On macOS a desktop-bound worker's job goes into the user's graphical domain and a headless
 one's into the background domain, because a headless worker inside the graphical login would have
-that login's access however little of its environment it was given. Windows runs every one of a
-user's processes in that user's own interactive session, so a headless session there is one with no
-desktop handles and no promise about the desktop rather than one that cannot reach it.
+that login's access however little of its environment it was given. On Windows a worker is a child
+of this daemon and runs in the logon session this daemon runs in, so a headless session there is one
+with no desktop handles and no promise about the desktop rather than one that cannot reach it.
 
 Linux places a job in no login session at all: a user service manager started at boot has no
 display, no compositor socket and no session message bus, because those belong to a graphical login
@@ -230,9 +230,11 @@ to use before it creates anything, and the create receipt records the one it use
 changes neither: an invisible session in a desktop context keeps that desktop's access, which is
 what lets an agent with no terminal window drive a browser on the screen in front of you.
 
-The identity is the whole of it. A login-session number that a platform hands out again after a
-logout is a different desktop, because the generation moved with it, so nothing is ever rebound to
-a new login: a session whose desktop ended is closed and you create another.
+The identity is the whole of it. A login-session number that a platform hands out again to a new
+login is a different desktop, because the process that owns that login is a different process, and
+nothing is ever rebound to a new login: a session whose desktop ended is closed and you create
+another. How completely that tells two logins apart is the platform's own business, and
+`docs/host/platforms.md` says what each one establishes.
 `docs/host/platforms.md` has the per-platform detail, including what each platform does at logout
 and what it will not tell this host.
 

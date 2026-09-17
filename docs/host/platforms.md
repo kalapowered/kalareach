@@ -67,9 +67,9 @@ On a host with no per-user service manager the fallback is a detached process in
 group, reparented to the system's first process. A worker started that way is in whatever login
 context the control daemon is in, so a headless session there has the desktop's variables stripped
 rather than a login context of its own. `kr doctor` reports that as what it is. Windows uses that
-fallback, and it also runs every one of a user's processes in that user's own interactive session,
-so a headless session there is a session with no desktop handles and no promise about the desktop
-rather than one that cannot reach it; its capability records say so.
+fallback, and a worker there is a child of the control daemon and runs in the logon session the
+daemon runs in, so a headless session there is a session with no desktop handles and no promise
+about the desktop rather than one that cannot reach it; its capability records say so.
 
 ### Enabling persistence on Linux
 
@@ -216,8 +216,11 @@ those happened.
 
 Each record also names the facility it is about: its path, the number of bytes read, and a digest
 of its contents. A tool replaced at the same path is a different file here even when it kept the
-path, the length and the timestamps. The file is read a block at a time, so a large facility costs
-time rather than memory and every one of them gets a content identity. The digest is for noticing a
+path, the length and the timestamps. The file is read a block at a time, up to sixty-four
+mebibytes, so identifying a facility costs one block of memory and a bounded amount of time. A file
+with more in it than that is not identified at all, and the capability it serves then says that
+this host could not identify its facility rather than claiming anything about it. The digest is for
+noticing a
 change rather than for proving one: a capability record is evidence about what is feasible, never
 authority, and nothing here signs it.
 
