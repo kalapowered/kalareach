@@ -1951,12 +1951,16 @@ async fn an_idle_connection_that_never_acquires_leaves_the_lease_where_it_was() 
 // The writer's own expiry fence: authority that ends while a batch waits for the terminal.
 // ---------------------------------------------------------------------------------------------
 
-/// KR-REQ-08.62, KR-REQ-08.63, KR-REQ-09.10, KR-REQ-09.20.
+/// KR-REQ-08.62 and KR-REQ-08.64, in part.
 ///
 /// The host checks a forwarded batch's authority deadline when it accepts it. That answer goes
 /// stale: an accepted batch waits for the writer, and the writer waits for an application that
 /// may not be reading. The deadline therefore travels with the bytes and is asked again at the
 /// boundary that actually hands them over.
+///
+/// What this covers is that last boundary and nothing else. It says nothing about what a remote
+/// write without the lease is answered with, about what a reconnection discards, or about the
+/// dispatch lease a remote mutation needs.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
     let host = kr_ipc::testing::TempHost::create();
@@ -2046,7 +2050,7 @@ async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
-/// KR-REQ-08.62, KR-REQ-08.64, KR-REQ-09.20.
+/// KR-REQ-08.62 and KR-REQ-08.64, in part.
 ///
 /// A held delimiter prefix carries the authority that admitted it. It is also the one thing a
 /// takeover discards outright, and what is discarded takes its deadline with it: leaving the
@@ -2109,7 +2113,7 @@ async fn a_discarded_prefix_takes_its_authority_deadline_with_it() {
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
 
-/// KR-REQ-08.64, KR-REQ-09.20.
+/// KR-REQ-08.64, in part.
 ///
 /// A push can complete the prefix it was holding and start a new one out of its own bytes. The new
 /// prefix is that write's, so it carries that write's authority: the deadline of the write whose
