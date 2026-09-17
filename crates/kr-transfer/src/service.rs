@@ -856,13 +856,12 @@ impl TransferService {
                         }
                         _ => {
                             drop(store);
-                            let refusal = publication_refusal(&row);
                             // The claim this publication was made under is answered with the
                             // refusal it ended in, so a copy that arrives before the next recovery
                             // pass is owed this answer rather than one for the state this action's
-                            // own publication reached.
-                            self.refuse_claim(action, &refusal)?;
-                            Err(refusal)
+                            // own publication reached. Where the action was settled first, that
+                            // answer is the one that comes back.
+                            self.refuse_publication(action, publication_refusal(&row))
                         }
                     };
                 }
@@ -1049,13 +1048,11 @@ impl TransferService {
         let row = upload_of(&store, params.transfer_id, actor)?;
         drop(store);
         if row.state != UploadState::Published {
-            let refusal = publication_refusal(&row);
             // This call's own claim, answered with what became of the publication it recorded. A
             // claim left open would be filled by the next recovery pass, and until then a copy of
             // this action would be told the outcome is unknown or refused for a state this action
             // reached itself.
-            self.refuse_claim(action, &refusal)?;
-            return Err(refusal);
+            return self.refuse_publication(action, publication_refusal(&row));
         }
         let result = UploadFinishResult {
             handle: handle_of(&row)?,
@@ -1997,6 +1994,7 @@ impl TransferService {
                     &claim.actor_id,
                     claim.action_id,
                     &claim.method,
+                    claim.payload_digest,
                     code.as_str(),
                     &detail,
                 )?,
@@ -2330,29 +2328,44 @@ impl TransferService {
             .map(|_| ())
     }
 
-    /// Records the refusal a claimed action ended in, so every copy of it is owed the same one.
+    /// Answers a publication that did not complete, recording the refusal on its own claim.
     ///
     /// A publication is claimed when its intent commits and answered when the move has landed. One
     /// that cannot be completed has an answer too, and it is this refusal. Without recording it the
     /// claim would stay open until the next recovery pass settled it, and a copy arriving in
     /// between would be refused for the terminal state this action's own publication reached.
     ///
-    /// Nothing replaces an answer already recorded, and a refusal that matches no claim changes
-    /// nothing: a call that never claimed anything, which is every retried finish that found
-    /// somebody else's publication, records nothing here.
-    fn refuse_claim(&self, action: Option<&Action>, refusal: &TransferError) -> Result<()> {
+    /// The refusal is this call's answer only while the claim is still open. Where something else
+    /// settled the action first, a copy of it or a sweep that expired the transfer and resolved its
+    /// claim, that is the action's answer and this caller is owed it rather than a refusal computed
+    /// from a state it read afterwards. One read decides which, and nothing replaces an answer
+    /// already recorded. A call that claimed nothing, which is every retried finish that found
+    /// somebody else's publication, records nothing and keeps its own refusal.
+    fn refuse_publication(
+        &self,
+        action: Option<&Action>,
+        refusal: TransferError,
+    ) -> Result<UploadFinishResult> {
         let Some(action) = action else {
-            return Ok(());
+            return Err(refusal);
         };
-        self.locked()?
-            .fail_action(
-                &action.actor_id,
-                action.action_id,
-                &action.method,
-                refusal.code().as_str(),
-                &refusal.to_string(),
-            )
-            .map(|_| ())
+        let recorded = self.locked()?.fail_action(
+            &action.actor_id,
+            action.action_id,
+            &action.method,
+            action.payload_digest,
+            refusal.code().as_str(),
+            &refusal.to_string(),
+        )?;
+        if recorded {
+            return Err(refusal);
+        }
+        match self.recorded(Some(action))? {
+            Recorded::Answered(answered) => Ok(answered),
+            // Nothing this refusal could fill: no record at all, or a claim that is somehow still
+            // open. Either way this call's answer is the refusal it came with.
+            Recorded::Claimed | Recorded::Absent => Err(refusal),
+        }
     }
 
     /// Answers a refusal from the retained record when this action has already been performed.

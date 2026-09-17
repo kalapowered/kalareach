@@ -1378,6 +1378,62 @@ fn an_invalidated_publication_answers_the_action_that_claimed_it() {
     assert_eq!(fresh.to_string(), refusal.to_string());
 }
 
+/// KR-REQ-14.12, KR-REQ-24.09: two concurrent copies of one finish action on a publication that
+/// cannot be resolved are refused identically, whichever of them invalidates it.
+///
+/// One of the two settles the action and the other finds it settled. Which is which is the
+/// machine's to decide; that they agree is not.
+#[test]
+fn two_concurrent_copies_of_one_finish_action_are_refused_the_same_way() {
+    // Repeated, because the interleaving is what this is about: one copy can settle the action
+    // between the other reading the record and answering from the state it then finds.
+    for _ in 0..6 {
+        let harness = Harness::create();
+        let bytes = pattern(64);
+        let claim = action(&harness, "upload.finish", &bytes);
+        let (transfer_id, staged) =
+            interrupted_publication(&harness, &bytes, "notes.bin", Some(&claim));
+        rewrite_in_place(&staged, bytes.len());
+
+        let refusals: Vec<_> = std::thread::scope(|threads| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let harness = &harness;
+                    let claim = &claim;
+                    let bytes = bytes.as_slice();
+                    threads.spawn(move || harness.finish_as(transfer_id, bytes, Some(claim)))
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("the thread did not panic"))
+                .collect()
+        });
+
+        for refusal in &refusals {
+            let refusal = refusal
+                .as_ref()
+                .expect_err("neither copy publishes bytes that were never verified");
+            assert_eq!(refusal.code(), ErrorCode::AttachmentIntegrity);
+            assert_eq!(
+                refusal.to_string(),
+                refusals[0]
+                    .as_ref()
+                    .expect_err("the first copy was refused too")
+                    .to_string(),
+                "both copies of one action were told the same thing"
+            );
+        }
+        assert_eq!(
+            std::fs::read_dir(harness.service.staging().complete().display_path())
+                .expect("reads the completed area")
+                .count(),
+            0,
+            "and nothing reached the completed area"
+        );
+    }
+}
+
 /// KR-REQ-24.09: an interrupted publication that cannot be resolved does not stop the recovery
 /// pass, so the rows behind it are resolved rather than waiting for a start that never gets past
 /// this one.

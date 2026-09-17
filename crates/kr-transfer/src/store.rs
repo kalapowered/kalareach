@@ -2151,16 +2151,28 @@ impl Store {
         actor_id: &ActorId,
         action_id: Uuid,
         method: &str,
+        payload_digest: Digest256,
         code: &str,
         detail: &str,
     ) -> Result<bool> {
+        // The method and the payload are part of the condition here for the same reason they are
+        // part of completing one: an identifier can be claimed by a different request between a
+        // caller reading the record and writing to it, and that claim's answer is not this
+        // caller's to write.
         let changed = self
             .connection
             .execute(
-                "UPDATE actions SET error_code = ?4, error_detail = ?5
-                 WHERE actor_id = ?1 AND action_id = ?2 AND method = ?3
+                "UPDATE actions SET error_code = ?5, error_detail = ?6
+                 WHERE actor_id = ?1 AND action_id = ?2 AND method = ?3 AND payload_digest = ?4
                    AND result IS NULL AND error_code IS NULL",
-                params![actor_id.as_str(), uuid_sql(action_id), method, code, detail,],
+                params![
+                    actor_id.as_str(),
+                    uuid_sql(action_id),
+                    method,
+                    payload_digest.as_bytes().as_slice(),
+                    code,
+                    detail,
+                ],
             )
             .map_err(TransferError::store)?;
         Ok(changed == 1)
@@ -3006,6 +3018,116 @@ mod tests {
                 .retained_action(&actor(), action_id)
                 .expect("reads")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_failure_names_the_claim_it_fails() {
+        let store = Store::in_memory(environment()).expect("opens");
+        let action_id = Uuid::from_bytes([9; 16]);
+        let claimed = Digest256::from_bytes([1; 32]);
+        store
+            .record_action(
+                &actor(),
+                action_id,
+                &ActionRecord {
+                    method: "upload.finish".to_owned(),
+                    payload_digest: claimed,
+                    result: None,
+                    error_code: None,
+                    error_detail: None,
+                    recorded_at_ms: TimestampMs::new(1000),
+                },
+            )
+            .expect("writes the claim");
+
+        // Another request's refusal, under the same identifier and method but a different payload.
+        // That claim is not this refusal's to answer, any more than its result would be.
+        assert!(
+            !store
+                .fail_action(
+                    &actor(),
+                    action_id,
+                    "upload.finish",
+                    Digest256::from_bytes([2; 32]),
+                    "ATTACHMENT_INTEGRITY",
+                    "another request's refusal",
+                )
+                .expect("writes"),
+        );
+        assert!(
+            !store
+                .fail_action(
+                    &actor(),
+                    action_id,
+                    "upload.cancel",
+                    claimed,
+                    "ATTACHMENT_INTEGRITY",
+                    "another method's refusal",
+                )
+                .expect("writes"),
+        );
+        let other = ActorId::new("local:502").expect("a valid principal");
+        assert!(
+            !store
+                .fail_action(
+                    &other,
+                    action_id,
+                    "upload.finish",
+                    claimed,
+                    "ATTACHMENT_INTEGRITY",
+                    "another actor's refusal",
+                )
+                .expect("writes"),
+        );
+        assert_eq!(
+            store
+                .retained_action(&actor(), action_id)
+                .expect("reads")
+                .expect("exists")
+                .error_code,
+            None,
+            "the claim is still open"
+        );
+
+        // Its own refusal fills it, and nothing replaces what is recorded afterwards.
+        assert!(
+            store
+                .fail_action(
+                    &actor(),
+                    action_id,
+                    "upload.finish",
+                    claimed,
+                    "ATTACHMENT_INTEGRITY",
+                    "these are not the bytes that were verified",
+                )
+                .expect("writes"),
+        );
+        let record = store
+            .retained_action(&actor(), action_id)
+            .expect("reads")
+            .expect("exists");
+        assert_eq!(record.error_code.as_deref(), Some("ATTACHMENT_INTEGRITY"));
+        assert_eq!(
+            record.error_detail.as_deref(),
+            Some("these are not the bytes that were verified")
+        );
+        assert!(
+            !store
+                .fail_action(
+                    &actor(),
+                    action_id,
+                    "upload.finish",
+                    claimed,
+                    "RESOURCE_UNAVAILABLE",
+                    "a later refusal",
+                )
+                .expect("writes"),
+        );
+        assert!(
+            !store
+                .complete_action(&actor(), action_id, "upload.finish", claimed, &[7])
+                .expect("writes"),
         );
     }
 
