@@ -195,10 +195,23 @@ pub enum Applied {
     Installing,
     /// A snapshot completed and replaced the screen. Everything is drawn.
     Installed,
-    /// An update was applied. These stable row identifiers changed.
-    Updated(Vec<u64>),
+    /// An update was applied.
+    Updated(Changed),
     /// The event was refused, and the client must ask for a fresh snapshot.
     Refused(Refusal),
+}
+
+/// What one update changed.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Changed {
+    /// The stable identifiers of the rows that changed.
+    pub rows: Vec<u64>,
+    /// Whether anything but rows changed: the palette, the titles, a mode, the keyboard, the
+    /// character sets, the margins or the dimensions.
+    ///
+    /// A destination sent only the rows would show the previous palette and the previous title
+    /// until the next whole screen arrived.
+    pub state: bool,
 }
 
 /// Why an event was refused.
@@ -359,6 +372,17 @@ impl Projection {
         let Some(screen) = self.screen.as_mut() else {
             return Applied::Refused(Refusal::NoScreen);
         };
+        // Whether this update moved anything a destination has to be told about beyond its rows.
+        let state = !delta.modes.is_empty()
+            || delta.margins.0.is_some()
+            || delta.rendition.0.is_some()
+            || delta.tab_stops.0.is_some()
+            || delta.charsets.0.is_some()
+            || delta.title.0.is_some()
+            || delta.title_stack.0.is_some()
+            || delta.keyboard.0.is_some()
+            || delta.palette.0.is_some()
+            || delta.dimensions.0.is_some();
         let mut changed: Vec<u64> = Vec::with_capacity(delta.rows.len());
         // The viewport is applied before the rows. A scroll moves which identifiers are shown
         // without changing one of them, so a client that drew the rows against the old window
@@ -453,11 +477,17 @@ impl Projection {
             visible.extend(changed);
             visible.sort_unstable();
             visible.dedup();
-            return Applied::Updated(visible);
+            return Applied::Updated(Changed {
+                rows: visible,
+                state,
+            });
         }
         changed.sort_unstable();
         changed.dedup();
-        Applied::Updated(changed)
+        Applied::Updated(Changed {
+            rows: changed,
+            state,
+        })
     }
 }
 
@@ -810,7 +840,10 @@ mod tests {
                 3,
                 vec![row(0, "zz", None)]
             ))),
-            Applied::Updated(vec![0])
+            Applied::Updated(Changed {
+                rows: vec![0],
+                state: false
+            })
         );
         let screen = projection.screen().expect("a screen");
         assert_eq!(screen.cursor_at, 48);
@@ -982,7 +1015,7 @@ mod tests {
         let mut scrolled = delta(0, 5, 1, vec![row(2, "ef", None)]);
         scrolled.viewport.top_row = U64::new(1);
         match projection.apply(ProjectionEvent::Delta(scrolled)) {
-            Applied::Updated(rows) => assert_eq!(rows, vec![1, 2]),
+            Applied::Updated(changed) => assert_eq!(changed.rows, vec![1, 2]),
             other => panic!("the window moved: {other:?}"),
         }
         let screen = projection.screen().expect("a screen");
