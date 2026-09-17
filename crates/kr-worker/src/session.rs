@@ -558,6 +558,12 @@ impl Session {
     ///
     /// They are one size. A terminal whose kernel size and canonical grid disagreed would place
     /// its cursor by one and wrap by the other, so neither is moved without the other.
+    ///
+    /// Telling the subscribers is the caller's, not this function's. A resize advances the
+    /// engine's projection, so every client's screen is at the old size and nothing continues from
+    /// it - but the screen each one is then given is drawn for the window that attachment has, and
+    /// that window is in the attachment table, which the caller commits after this returns.
+    /// Installing here would draw the new grid through the old window.
     fn resize_canonical(&mut self, dimensions: Dimensions) -> Result<()> {
         // The kernel moves first, and the reason is which failure can be undone. A grid that
         // resized has reflowed: rows moved between the screen and the history, and putting the
@@ -591,10 +597,6 @@ impl Session {
             }
             return Err(error);
         }
-        // A resize advances the engine's projection: every client's screen is at the old size and
-        // nothing continues from it. They are told, here, rather than on the next byte the
-        // application happens to write, which for an idle session may be never.
-        self.reinstall_every_subscriber(ProjectionResetReason::Geometry);
         Ok(())
     }
 
@@ -885,6 +887,11 @@ impl Session {
             self.attachments.restore_geometry(&previous);
             return Err(error);
         }
+        if change.resize_required {
+            // The size moved, so every client's screen is at the old one. The table already holds
+            // this attachment and its window, so each screen is drawn for the window it belongs to.
+            self.reinstall_every_subscriber(ProjectionResetReason::Geometry);
+        }
         // Whether this attachment may forward depends on where the parser stands, which is a fact
         // about this moment rather than about the attachment. It is settled here so the answer the
         // attach reports is the answer the session will act on, rather than one that changes
@@ -1054,6 +1061,9 @@ impl Session {
         let change = self
             .attachments
             .resize(attachment_id, dimensions, expected_epoch)?;
+        // After the table, because the screen each client is given is drawn for the window that
+        // client has and the owner's own window is one of the things that just changed.
+        self.reinstall_every_subscriber(ProjectionResetReason::Geometry);
         Ok(change.state)
     }
 

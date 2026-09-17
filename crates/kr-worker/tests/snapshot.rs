@@ -232,7 +232,7 @@ async fn attach(host: &Host, dimensions: Dimensions, profile: Option<&str>) -> A
 /// A resize is not a client's own window changing: it is the *session's* geometry moving, which
 /// every other attachment then sees. Only the owner can move it, so a test that wants a live resize
 /// has to take the geometry first.
-async fn attach_claiming(host: &Host, dimensions: Dimensions) -> Attached {
+async fn attach_claiming(host: &Host, dimensions: Dimensions, profile: Option<&str>) -> Attached {
     let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
         .await
         .expect("connects");
@@ -252,7 +252,7 @@ async fn attach_claiming(host: &Host, dimensions: Dimensions) -> Attached {
                 mode: AttachMode::Terminal,
                 claim_geometry: true,
                 dimensions: Nullable::some(dimensions),
-                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                terminal_profile_id: Nullable(profile.map(str::to_owned)),
                 requested,
             },
         )
@@ -987,7 +987,12 @@ async fn a_hyperlink_survives_a_reconnection_and_a_resize() {
     // And a live resize: the *session's* geometry moves under a client that is already watching.
     // Wider and taller, so nothing rewraps and the cells the link covers are the cells it covered:
     // a link that moved with a reflow would be a different question from a link that survived.
-    let owner = attach_claiming(&host, Dimensions::new(CANONICAL.0 + 10, CANONICAL.1 + 4)).await;
+    let owner = attach_claiming(
+        &host,
+        Dimensions::new(CANONICAL.0 + 10, CANONICAL.1 + 4),
+        Some("xterm-256color"),
+    )
+    .await;
     let resized = collect_until_installed(&mut second.client, Duration::from_secs(5)).await;
     assert!(
         resized
@@ -1014,6 +1019,76 @@ async fn a_hyperlink_survives_a_reconnection_and_a_resize() {
         "and the link is over the same cells of the same row afterwards"
     );
     let _ = owner;
+}
+
+/// KR-REQ-08.83: a resize draws every client's fresh screen for the window that client has now.
+///
+/// The owner's own window is one of the things a resize changes, and the screen it is then given is
+/// drawn for a window: a fresh screen built before the new window was recorded would carry the new
+/// grid inside the old window, and for an idle application nothing would ever correct it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_resize_draws_the_owners_fresh_screen_for_its_new_window() {
+    let host = host("printf 'before the resize\r\n'; sleep 20").await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    // An owner with no declared profile: it owns the size and is still projected, because nothing
+    // qualifies it to be handed the stream. That is the attachment whose window a resize moves.
+    let mut owner = attach_claiming(&host, Dimensions::new(CANONICAL.0, CANONICAL.1), None).await;
+    assert_eq!(
+        owner.presentation,
+        Some(TerminalPresentationMode::Viewport),
+        "a terminal that declared no profile is projected, whatever it owns"
+    );
+    let installed = collect_until_installed(&mut owner.client, Duration::from_secs(5)).await;
+    let epoch = installed
+        .iter()
+        .find_map(|event| match event {
+            Event::Snapshot(header) => Some(header.viewport.columns.get()),
+            _ => None,
+        })
+        .expect("a screen");
+    assert_eq!(epoch, CANONICAL.0, "at the size it attached with");
+
+    // The terminal's window changed, which is what a resize is.
+    let geometry: kr_protocol::attachment::GeometryResult = owner
+        .client
+        .mutate(
+            Method::TerminalResize,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::attachment::TerminalResizeParams {
+                attachment_id: owner.attachment_id,
+                dimensions: Dimensions::new(CANONICAL.0 + 10, CANONICAL.1 + 4),
+                expected_geometry_epoch: kr_protocol::ids::GeometryEpoch::new(1),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the resize succeeds")
+        .to_typed()
+        .expect("decodes");
+    assert_eq!(
+        geometry.geometry.dimensions,
+        Dimensions::new(CANONICAL.0 + 10, CANONICAL.1 + 4),
+        "the session took the size"
+    );
+    let after = collect_until_installed(&mut owner.client, Duration::from_secs(5)).await;
+    let header = after
+        .iter()
+        .find_map(|event| match event {
+            Event::Snapshot(header) => Some(header.as_ref()),
+            _ => None,
+        })
+        .expect("a fresh screen after the resize");
+    assert_eq!(
+        header.dimensions,
+        Dimensions::new(CANONICAL.0 + 10, CANONICAL.1 + 4),
+        "the canonical size is the new one"
+    );
+    assert_eq!(
+        (header.viewport.columns.get(), header.viewport.rows.get()),
+        (CANONICAL.0 + 10, CANONICAL.1 + 4),
+        "and so is the window it is drawn for"
+    );
 }
 
 /// KR-REQ-08.44: the palette's provenance is recorded at creation and succession never moves it.
