@@ -19,9 +19,11 @@
 //! | the login-session generation | a platform that reuses session numbers needs it |
 //!
 //! [`DesktopContext::desktop_session_id`] is the derived name of that whole context, which is why
-//! a reused platform session number is never the same desktop: the generation, or the boot, has
-//! moved with it. Nothing rebinds a session to a new login. A session whose desktop ends is closed
-//! with `desktop_lost`, and the user creates a new one.
+//! a reused platform session number is not by itself the same desktop: the generation, or the
+//! boot, has moved with it. How completely the generation separates one login from the next is the
+//! platform's own answer, and [`DesktopGenerationSource`] names which platform gave it. Nothing
+//! rebinds a session to a new login. A session whose desktop ends is closed with `desktop_lost`,
+//! and the user creates a new one.
 //!
 //! # Capability evidence
 //!
@@ -282,8 +284,10 @@ pub struct DesktopContext {
 impl DesktopContext {
     /// Returns whether this context and another name the same desktop.
     ///
-    /// Every part is compared. A platform session number that came back the same after a new login
-    /// is not the same desktop, because the generation or the boot moved with it.
+    /// Every part is compared, so a platform session number that came back the same after a new
+    /// login is a different desktop wherever the generation or the boot moved with it. Where a
+    /// platform's generation does not move with a new login, the two compare equal;
+    /// [`DesktopGenerationSource`] says what each platform reads it from.
     #[must_use]
     pub fn is_same_desktop(&self, other: &Self) -> bool {
         self.kind == other.kind
@@ -387,7 +391,8 @@ pub enum CapabilityInvalidation {
     PackageSchema,
     /// An operating-system permission changed.
     OsPermission,
-    /// The desktop generation changed, which a new login always does.
+    /// The desktop generation changed. A new login moves it wherever the platform starts a new
+    /// process to own the login session.
     DesktopGeneration,
     /// The execution profile changed.
     WorkerProfile,

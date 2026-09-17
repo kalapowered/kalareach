@@ -1480,7 +1480,7 @@
         },
         {
           "const": "desktop_generation",
-          "description": "The desktop generation changed, which a new login always does.",
+          "description": "The desktop generation changed. A new login moves it wherever the platform starts a new\nprocess to own the login session.",
           "type": "string"
         },
         {

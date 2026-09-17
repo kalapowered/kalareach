@@ -11,7 +11,9 @@
 //! | Windows | the interactive logon session | that session's `winlogon` |
 //!
 //! Anchoring on a process buys two things. The generation is the kernel's own start value for that
-//! process, so two logins that happen to share a session number are still told apart. And the
+//! process, so two logins that happen to share a session number are told apart wherever the
+//! platform starts that process afresh for each login, which macOS and Linux both do; the Windows
+//! reader below says where that does not hold. And the
 //! recheck is one kernel query about a recorded identity —
 //! [`kr_ipc::identity::process_state`] — rather than another conversation with the platform's
 //! session facilities. That matters because a live session asks the question on every wake of its
@@ -180,8 +182,9 @@ pub fn read_login(uid: u32) -> Reading {
 /// running must never be recorded as having lost it, and a session whose login has ended must not
 /// be excused because another login exists.
 ///
-/// The recorded generation is compared where the platform gives one, which is what makes a reused
-/// session number a different login rather than the same one.
+/// The recorded generation is compared where the platform gives one, which tells a reused session
+/// number apart from the login that held it before, as far as the process that platform anchors on
+/// allows.
 #[must_use]
 pub fn named_presence(session: &str, generation: Option<u64>, uid: u32) -> Presence {
     implementation::named_presence(session, generation, uid)
