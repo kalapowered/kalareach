@@ -113,6 +113,60 @@ pub fn current_process_start_identity() -> Result<ProcessStartIdentity> {
     process_start_identity(std::process::id())
 }
 
+/// The start value an identity carries when the kernel would not describe the process.
+///
+/// No platform's start value can reach it. Linux counts clock ticks since the boot, macOS counts
+/// microseconds since the epoch and Windows counts whole seconds since the epoch; a machine that
+/// had been running for as many ticks as this, or a clock this far past 1970, is not a machine this
+/// host will meet. Reserving the value is what lets [`ended_process_identity`] name a process
+/// without claiming a reading nobody took.
+pub const START_VALUE_UNREAD: u64 = u64::MAX;
+
+/// Returns the identity of a process that had already ended before the kernel would describe it.
+///
+/// A process this host started can exit before the host has read its start identity, and on macOS
+/// the kernel then refuses to describe it at all: `proc_pidinfo` answers "No such process" for a
+/// process that has exited, whether or not its status has been collected. There is no reading left
+/// to take, so this names what is known - the identifier, and that the process has ended - and
+/// carries [`START_VALUE_UNREAD`] where the kernel's value would have been.
+///
+/// [`process_state`] answers [`ProcessState::Ended`] for such an identity without asking the
+/// kernel, so a recycled identifier can never make it read as running. What the identity cannot do
+/// is prove *which* process ended: it is the identifier of a process this host started and watched
+/// leave, and a closure record carrying it says exactly that much.
+#[must_use]
+pub fn ended_process_identity(pid: u32) -> ProcessStartIdentity {
+    ProcessStartIdentity::new(
+        u64::from(pid),
+        platform::START_IDENTITY_SOURCE,
+        START_VALUE_UNREAD,
+    )
+}
+
+/// Reads the start identity of a process this host has just started.
+///
+/// The process can be gone before this reads it, and often is: a shell whose startup file says
+/// `exit`, a program that cannot open what it needs, a command that is not there. On macOS the
+/// kernel refuses to describe a process that has exited even before its status is collected, so the
+/// reading fails outright. That is not a failure to start a process, and this does not report it as
+/// one: an absent process is named by [`ended_process_identity`], and what it started is left for
+/// the caller to collect and record.
+///
+/// Every other failure is still a failure. A kernel that will not answer is not a process that has
+/// gone, and a host that treated the two alike would report a live process as ended.
+///
+/// # Errors
+///
+/// Returns [`IpcError::IdentityUnavailable`] when the operating system neither describes the
+/// process nor says it is absent.
+pub fn started_process_identity(pid: u32) -> Result<ProcessStartIdentity> {
+    match process_start_identity(pid) {
+        Ok(identity) => Ok(identity),
+        Err(error) if platform::is_absent(&error) => Ok(ended_process_identity(pid)),
+        Err(error) => Err(error),
+    }
+}
+
 /// What the kernel says about a process the host recorded earlier.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProcessState {
@@ -138,11 +192,20 @@ pub enum ProcessState {
 /// identifier reads as [`ProcessState::Ended`] rather than as the original process.
 #[must_use]
 pub fn process_state(identity: &ProcessStartIdentity) -> ProcessState {
+    // An identity the kernel never described belongs to a process that had already ended when it
+    // was made. Asking about the identifier now would be asking about whoever holds it next.
+    if identity.start_value.get() == START_VALUE_UNREAD {
+        return ProcessState::Ended;
+    }
     let Ok(pid) = u32::try_from(identity.pid.get()) else {
         return ProcessState::Ended;
     };
     match process_start_identity(pid) {
-        Ok(current) if current.matches(identity) => ProcessState::Running,
+        // The identifier and the start value are the process that was recorded. Whether it is
+        // still running is a second question on a platform that describes a process after it has
+        // exited: Linux keeps the `/proc` entry of a process whose status nobody has collected, and
+        // a process waiting to be collected has ended.
+        Ok(current) if current.matches(identity) => platform::liveness(pid),
         Ok(_) => ProcessState::Ended,
         Err(error) if platform::is_absent(&error) => ProcessState::Ended,
         Err(error) => ProcessState::Unknown {
@@ -175,6 +238,35 @@ mod platform {
     const STAT_PROCESS_GROUP: usize = 2;
     /// The controlling terminal's device number, field 7 of the line.
     const STAT_TERMINAL: usize = 4;
+
+    /// Where this platform's start value comes from.
+    pub(super) const START_IDENTITY_SOURCE: ProcessStartSource = ProcessStartSource::LinuxProcStat;
+
+    /// Returns whether a process whose identity still matches is running or waiting to be collected.
+    ///
+    /// Linux keeps the `/proc` entry of a process that has exited until its parent collects its
+    /// status, and the state character says so: `Z` is a process that has ended and whose exit
+    /// status nobody has taken. Reporting it as running would put it in a closure record as a
+    /// surviving resource, and it is not surviving; it is waiting.
+    pub(super) fn liveness(pid: u32) -> super::ProcessState {
+        let path = format!("/proc/{pid}/stat");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            // It left between the reading above and this one.
+            return super::ProcessState::Ended;
+        };
+        match state_character(&text) {
+            Some('Z') => super::ProcessState::Ended,
+            // A state this reader does not recognise is not a death. The entry is there and the
+            // identity matched, so the process is the one that was recorded.
+            _ => super::ProcessState::Running,
+        }
+    }
+
+    /// Returns the state character of a `/proc/<pid>/stat` line, which is the field after the name.
+    fn state_character(text: &str) -> Option<char> {
+        let tail = text.rfind(')').map(|end| &text[end + 1..])?;
+        tail.split_whitespace().next()?.chars().next()
+    }
 
     pub(super) fn processes_on_terminal(terminal: u32) -> Result<Vec<u32>> {
         stat_field_matches(STAT_TERMINAL, terminal, "controlling terminal")
@@ -376,9 +468,23 @@ mod platform {
         })
     }
 
+    /// Where this platform's start value comes from.
+    pub(super) const START_IDENTITY_SOURCE: ProcessStartSource =
+        ProcessStartSource::MacosProcBsdInfo;
+
+    /// Returns whether a process whose identity still matches is running.
+    ///
+    /// On this platform the question is already answered by the reading that matched: the kernel
+    /// refuses to describe a process that has exited, collected or not, so an identity that still
+    /// matches belongs to a process that is still there.
+    pub(super) const fn liveness(_pid: u32) -> super::ProcessState {
+        super::ProcessState::Running
+    }
+
     pub(super) fn is_absent(error: &crate::error::IpcError) -> bool {
         // `proc_pidinfo` reports a process that is not there as "No such process"; every other
-        // failure leaves the question open.
+        // failure leaves the question open. A process that has exited is one of those: this
+        // platform stops describing it at once, before its status has been collected.
         let message = error.to_string();
         message.contains("No such process") || message.contains("not a process identifier")
     }
@@ -440,6 +546,18 @@ mod platform {
         })
     }
 
+    /// Where this platform's start value comes from.
+    pub(super) const START_IDENTITY_SOURCE: ProcessStartSource =
+        ProcessStartSource::WindowsProcessStartSeconds;
+
+    /// Returns whether a process whose identity still matches is running.
+    ///
+    /// The reading that matched came from the process table, which does not keep a process that
+    /// has exited, so there is nothing further to ask.
+    pub(super) const fn liveness(_pid: u32) -> super::ProcessState {
+        super::ProcessState::Running
+    }
+
     pub(super) fn is_absent(error: &crate::error::IpcError) -> bool {
         error.to_string().contains("is gone")
     }
@@ -489,6 +607,47 @@ mod tests {
         let mut altered = current_process_start_identity().expect("the kernel answers");
         altered.start_value = kr_protocol::scalars::U64::new(altered.start_value.get() + 1);
         assert_eq!(process_state(&altered), ProcessState::Ended);
+    }
+
+    #[test]
+    fn a_process_that_has_ended_is_named_rather_than_left_unavailable() {
+        // The case a host meets when what it started leaves at once. The child has certainly ended
+        // by the time this reads it, and its status has not been collected, which is the state each
+        // platform describes differently: Linux keeps the `/proc` entry, macOS refuses to describe
+        // the process at all. Either way the host has to come away with an identity rather than a
+        // failure, and with the answer that the process has ended.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawns a child that leaves at once");
+        let pid = child.id();
+        while child.try_wait().ok().flatten().is_none() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let named = started_process_identity(pid).expect("the host names what it started");
+        assert_eq!(named.pid.get(), u64::from(pid));
+        assert_eq!(
+            process_state(&named),
+            ProcessState::Ended,
+            "a process that has ended reads as ended, however this platform describes it"
+        );
+    }
+
+    #[test]
+    fn a_process_that_ended_before_it_could_be_described_is_ended_without_asking() {
+        // This process is running, and an identity the kernel never described still reads as
+        // ended: the reserved start value is what says the reading never happened, so an
+        // identifier that has been recycled cannot make a dead process look alive.
+        let unread = ended_process_identity(std::process::id());
+        assert_eq!(unread.pid.get(), u64::from(std::process::id()));
+        assert_eq!(unread.start_value.get(), START_VALUE_UNREAD);
+        assert_eq!(process_state(&unread), ProcessState::Ended);
+        assert_eq!(
+            process_state(&current_process_start_identity().expect("the kernel answers")),
+            ProcessState::Running,
+            "and the real identity of the same process still reads as running"
+        );
     }
 
     #[test]

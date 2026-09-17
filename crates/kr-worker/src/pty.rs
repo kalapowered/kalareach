@@ -166,7 +166,14 @@ impl Pty {
         let pid = child
             .process_id()
             .ok_or_else(|| WorkerError::pty("start the root shell", "no process identifier"))?;
-        let identity = kr_ipc::identity::process_start_identity(pid)?;
+        // A shell can be gone before this reads it. `exit 0` in a startup file, a shell that cannot
+        // open something it needs, a program that is not the shell it was declared to be: all of
+        // them run and leave inside the moment between the spawn above and the reading here, and on
+        // macOS the kernel then refuses to describe the process at all. That is not a launch
+        // failure. The shell ran, and the session it belongs to closes on the root shell's exit
+        // through the ordinary sequence, with its status read from the child itself; what this
+        // needs is an identity that says so rather than an error that loses it.
+        let identity = kr_ipc::identity::started_process_identity(pid)?;
         Ok(RootShell {
             child,
             identity,
