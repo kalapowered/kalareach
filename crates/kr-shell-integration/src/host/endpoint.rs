@@ -56,8 +56,17 @@ impl HostEndpoint {
     /// when the resulting address does not fit a socket address, [`HostError::Crypto`] when the
     /// secret cannot be generated, and [`HostError::Ipc`] when the endpoint cannot be bound.
     pub fn open(session_id: SessionId, directory: &Path) -> Result<Self> {
+        Self::open_named(session_id, directory, ENDPOINT_BASENAME)
+    }
+
+    /// Creates the endpoint at a named file inside an owner-only directory.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::open`].
+    pub fn open_named(session_id: SessionId, directory: &Path, basename: &str) -> Result<Self> {
         check_owner_only(directory)?;
-        let (address, bound) = Self::address_in(session_id, directory)?;
+        let (address, bound) = Self::address_in(session_id, directory, basename)?;
         address.validate()?;
         // The listener replaces an address a dead process left behind, sets a Unix socket file to
         // 0600 as it binds, and removes it again when this endpoint is dropped: it compares the
@@ -87,14 +96,20 @@ impl HostEndpoint {
         runtime_dir: &Path,
         session_id: SessionId,
     ) -> Result<Self> {
-        let directory = session_directory(runtime_dir, session_id);
-        kr_ipc::paths::create_private_tree(runtime_root, &directory)?;
-        Self::open(session_id, &directory)
+        // The environment's runtime directory itself, which is already owner-only, rather than a
+        // directory of this session's own inside it. Every component costs bytes a socket address
+        // does not have, and it is the same protection either way.
+        kr_ipc::paths::create_private_tree(runtime_root, runtime_dir)?;
+        Self::open_named(session_id, runtime_dir, &session_basename(session_id))
     }
 
     #[cfg(unix)]
-    fn address_in(_session_id: SessionId, directory: &Path) -> Result<(BridgeEndpoint, Endpoint)> {
-        let path = directory.join(ENDPOINT_BASENAME);
+    fn address_in(
+        _session_id: SessionId,
+        directory: &Path,
+        basename: &str,
+    ) -> Result<(BridgeEndpoint, Endpoint)> {
+        let path = directory.join(basename);
         let text = path
             .to_str()
             .map(str::to_owned)
@@ -107,7 +122,11 @@ impl HostEndpoint {
     }
 
     #[cfg(not(unix))]
-    fn address_in(session_id: SessionId, _directory: &Path) -> Result<(BridgeEndpoint, Endpoint)> {
+    fn address_in(
+        session_id: SessionId,
+        _directory: &Path,
+        _basename: &str,
+    ) -> Result<(BridgeEndpoint, Endpoint)> {
         // A named pipe lives in the pipe namespace rather than the filesystem, so the address is a
         // name. It is scoped by the user and the session for the same reason the Unix socket lives
         // in a per-user, per-session directory. The shell is given the full `\\.\pipe\` form,
@@ -166,20 +185,22 @@ impl HostEndpoint {
     }
 }
 
-/// Returns the directory one session's bridge endpoint lives in.
+/// Returns the file name one session's bridge endpoint is bound at.
 ///
-/// Eight characters of the session identifier, which is what the rest of the runtime tree uses for
-/// the same reason: the whole identity is recorded in the descriptor, and the directory name only
-/// has to tell one live session from another.
+/// Six characters of the session identifier, which is what the rest of the runtime tree uses a
+/// prefix for and for the same reason: a socket address is 104 bytes on the tightest platform and
+/// the runtime root has already spent most of them, the whole identity is recorded in the
+/// descriptor, and two live sessions of one environment whose identifiers shared a prefix would be
+/// told by the bind rather than served.
 #[must_use]
-pub fn session_directory(runtime_dir: &Path, session_id: SessionId) -> std::path::PathBuf {
+pub fn session_basename(session_id: SessionId) -> String {
     let text = session_id.to_string();
     let short: String = text
         .chars()
         .filter(char::is_ascii_hexdigit)
-        .take(8)
+        .take(6)
         .collect();
-    runtime_dir.join(format!("b{short}"))
+    format!("b{short}")
 }
 
 /// Returns the kind of endpoint this platform listens on.
@@ -353,6 +374,30 @@ mod tests {
             .expect("group and world readable");
         let error = HostEndpoint::open(session(), directory.path()).expect_err("refused");
         assert!(matches!(error, HostError::Directory { .. }), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_endpoint_adds_as_little_as_it_can_to_the_directory_it_is_in() {
+        // A socket address is 104 bytes on the tightest platform, and a runtime root inside a
+        // temporary directory has already spent most of them. What this host controls is what it
+        // adds, and it adds a separator and seven characters.
+        let name = session_basename(session());
+        assert_eq!(name.len(), 7, "{name}");
+        let directory = owner_only_directory();
+        let endpoint = HostEndpoint::open_named(session(), directory.path(), &name).expect("binds");
+        assert_eq!(endpoint.address().validate(), Ok(()));
+        assert_eq!(
+            endpoint.address().path.len(),
+            directory.path().as_os_str().len() + 1 + name.len(),
+            "the endpoint is the directory plus one separator and the name"
+        );
+        // Two sessions are told apart, and two that were not would be told by the bind rather than
+        // served the same socket.
+        assert_ne!(
+            name,
+            session_basename(SessionId::new(Uuid::from_bytes([0x5b; 16])))
+        );
     }
 
     #[tokio::test]
