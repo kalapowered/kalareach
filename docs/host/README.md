@@ -241,8 +241,8 @@ and what it will not tell this host.
 A desktop is not a permission. Screen capture and input injection each need an operating-system
 permission that selecting a desktop does not carry, and `environment.capabilities` answers each of
 them separately, in the shared capability-evidence shape, saying what produced the answer and what
-makes it stale. Nothing there performs the operation a capability is: a platform query can refuse a
-capability and cannot establish one, so an answer nothing has run says exactly that. There is no
+makes it stale. Nothing there performs the operation a capability is: a platform query can refuse
+either of them and cannot establish one, so an answer nothing has run says exactly that. There is no
 general desktop-control interface here either: desktop automation means the user's own tools
 running in the selected context under the permissions they were actually granted.
 

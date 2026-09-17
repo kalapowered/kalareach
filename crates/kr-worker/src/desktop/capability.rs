@@ -187,7 +187,9 @@ fn invalidation(capability: &str) -> Vec<CapabilityInvalidation> {
 ///
 /// The context is asked first, and it can only refuse: a container, a context with no graphical
 /// login and a desktop that is not usable right now each end the question before any facility is
-/// looked for. Nothing here can turn a desktop selection into an available capability.
+/// looked for. What is left is settled only where the desktop and the installed facility are the
+/// whole of the condition, as they are for the display server and for launching an application;
+/// a capability whose check is the operation itself is never answered available here.
 #[must_use]
 pub fn answer(capability: &str, desktop: &DesktopContext) -> Answer {
     if let Some(refusal) = context_refusal(capability, desktop) {

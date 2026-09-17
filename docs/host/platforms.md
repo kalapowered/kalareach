@@ -203,9 +203,10 @@ Selecting a desktop is not evidence that anything may be done on it. `environmen
 answers each capability separately, says what produced the answer, and says what makes it stale.
 
 Nothing here performs the operation a capability is, and nothing here changes a screen, a clipboard
-or an input queue. What a platform query can do is refuse a capability, and what it cannot do is
-establish one: on every platform the operation itself is the check. So each record says which of
-those happened.
+or an input queue. A platform query settles the two capabilities whose only conditions are which
+desktop this is and what is installed: the display server, and launching an application. For the
+rest, a query can refuse a capability and cannot establish one, because the operation itself is the
+check and no permission is granted by asking about it. So each record says which of those happened.
 
 | Platform | Established | Refused, with the reason | Left as `not_tested` |
 | --- | --- | --- | --- |
