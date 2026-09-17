@@ -879,11 +879,12 @@ impl TransferService {
             if let Recorded::Answered(answered) = recorded_with(&store, action)? {
                 return Ok(answered);
             }
-            // An upload that ended without publishing answers with the reason it ended, not with
-            // the bare state. That is the refusal the caller of the failed publication was given
-            // and the one the record hands a repeat of its action, so a caller asking now is told
-            // the same thing rather than something in another category.
-            if matches!(row.state, UploadState::Invalidated | UploadState::Expired) {
+            // An invalidated upload answers with the reason it was invalidated, not with the bare
+            // state. That is the refusal the caller of the failed publication was given and the one
+            // the record hands a repeat of its action, so a caller asking now is told the same
+            // thing rather than something in another category. Every other state is
+            // `check_live`'s, including an expiry, which it is also the one to record.
+            if row.state == UploadState::Invalidated {
                 return Err(publication_refusal(&row));
             }
             self.check_live(&mut store, &row, "it cannot be finished")?;
@@ -2638,14 +2639,17 @@ fn check_declaration(row: &UploadRow, params: &UploadFinishParams) -> Result<()>
 
 /// The refusal a caller is owed when the publication it asked for did not complete.
 ///
-/// A publication that ended invalidated or expired is an integrity refusal carrying the reason the
-/// row recorded. That is word for word the answer a repeat of the same action is given from the
-/// record, so the caller of the failing publication and every later copy of its action agree.
+/// An invalidated publication is an integrity refusal carrying the reason the row recorded: the
+/// bytes were not the bytes that were verified, or they were gone, and either way the identifier is
+/// spent. Every caller is told that, and so is every copy of the action, because the refusal is
+/// recorded on the claim as it happens.
 ///
-/// Any other terminal state is that state: a cancellation that closed this transfer first is not an
-/// integrity failure, and saying so would spend the wrong code on it.
+/// Any other terminal state is that state. A cancellation that closed this transfer first is not an
+/// integrity failure, and neither is an expiry: an upload that ran out of time did not fail a
+/// digest, and answering as though it had would spend the wrong code on it and disagree with the
+/// refusal the expiry itself gives.
 fn publication_refusal(row: &UploadRow) -> TransferError {
-    if matches!(row.state, UploadState::Invalidated | UploadState::Expired) {
+    if row.state == UploadState::Invalidated {
         return TransferError::integrity(
             row.invalid_reason
                 .clone()
