@@ -366,7 +366,14 @@ a frame without one is news.
 
 A binding belongs to the connection that registered it. Another connection that has the identifier
 finds no binding, which is the same answer it would get for one nobody ever registered, and a
-connection that ends takes its own bindings and nobody else's.
+connection that ends takes its own bindings and nobody else's, once whatever it had running has
+finished.
+
+A document travels as its own frames, chunked so each fits one, and every piece names the document it
+belongs to; only the last is marked as the last. That is how a reader knows which notices go together
+and when it has all of them, and a document that cannot be delivered whole is dropped whole rather
+than leaving a reader with pieces it cannot tell are incomplete. A response carries no nodes: it
+names the document number the call drew instead, or nothing at all when the call drew nothing.
 
 An observation is answered on the task that read it, because it enters no component: it is a queue
 push. Everything that can enter a component runs in a task of its own, so reading the next request
