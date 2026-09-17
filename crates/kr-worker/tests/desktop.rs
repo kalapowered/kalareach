@@ -941,8 +941,9 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
     drop(client);
     second.stop().await;
 
-    for (session_id, endpoint) in endpoints {
-        let Ok(endpoint) = kr_ipc::paths::Endpoint::from_path(&endpoint) else {
+    for (session_id, endpoint) in &endpoints {
+        let session_id = *session_id;
+        let Ok(endpoint) = kr_ipc::paths::Endpoint::from_path(endpoint) else {
             continue;
         };
         let Ok(mut worker) = LocalClient::connect(&endpoint, LocalClientKind::Cli, build()).await
@@ -958,8 +959,26 @@ async fn a_boot_that_is_not_this_one_closes_the_live_executions_of_both_profiles
             )
             .await;
     }
-    tokio::time::sleep(Duration::from_secs(1)).await;
+    // A worker ends itself once it has accepted the close, and an endpoint that stops answering is
+    // what says it has. Waiting for that leaves nothing of this run behind; a fixed pause would
+    // have hidden a worker that stayed.
+    let deadline = std::time::Instant::now() + WORKER_EXIT_DEADLINE;
+    for (_, endpoint) in &endpoints {
+        let Ok(endpoint) = kr_ipc::paths::Endpoint::from_path(endpoint) else {
+            continue;
+        };
+        while std::time::Instant::now() < deadline
+            && LocalClient::connect(&endpoint, LocalClientKind::Cli, build())
+                .await
+                .is_ok()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 }
+
+/// How long a worker this test closed is given to end.
+const WORKER_EXIT_DEADLINE: Duration = Duration::from_secs(60);
 
 /// KR-REQ-03.23: the desktop a session was created on outlives its worker, so a host that finds
 /// the worker gone can say whether the desktop went with it.
