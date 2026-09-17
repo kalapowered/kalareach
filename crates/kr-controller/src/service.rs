@@ -3508,7 +3508,7 @@ impl Controller {
         if let Some(existing) = self.registry.lock().await.closure(record.session_id)? {
             return Ok(existing);
         }
-        self.retire(record).await?;
+        self.write_closure(record).await?;
         Ok(record.clone())
     }
 
@@ -3534,7 +3534,7 @@ impl Controller {
         // written from outside knows none of those. This is read only after the worker is
         // confirmed gone, so nothing is still writing to it.
         if let Some(recovered) = self.recovered_closure(session_id) {
-            self.retire(&recovered).await?;
+            self.write_closure(&recovered).await?;
             return Ok(recovered);
         }
         // Nothing authoritative survived. What is written instead says so: the coverage is
@@ -3557,7 +3557,7 @@ impl Controller {
             durability: kr_protocol::session::Durability::Durable,
             closed_at_ms: kr_ipc::now_ms(),
         };
-        self.retire(&record).await?;
+        self.write_closure(&record).await?;
         Ok(record)
     }
 
@@ -3596,12 +3596,47 @@ impl Controller {
         )
     }
 
+    /// Records a closure from outside this daemon's own bookkeeping, unless one is already
+    /// recorded, and looks at the sleep setting afterwards.
+    ///
+    /// This is the entry point for a closure a caller outside this module has been handed, which
+    /// today is the answer a worker gives a paired device. It holds the same lock across its check
+    /// and its write as [`Self::record_closure_once`] and [`Self::record_final`], so a worker's own
+    /// account of how its session ended can never be replaced by a later record, whichever path
+    /// carried it. A session that has ended is work that has ended, so the setting is looked at
+    /// once the record is written; the caller's own answer never waits for that.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry cannot be read or written.
+    pub async fn retire(self: &Arc<Self>, record: &ClosureRecord) -> Result<()> {
+        {
+            let _finalising = self.finalising.lock().await;
+            if self
+                .registry
+                .lock()
+                .await
+                .closure(record.session_id)?
+                .is_some()
+            {
+                return Ok(());
+            }
+            self.write_closure(record).await?;
+        }
+        self.review_power_soon();
+        Ok(())
+    }
+
     /// Records a closed session, removes its descriptor and forgets its key.
+    ///
+    /// The caller holds `finalising` and has found that no closure is recorded yet. Nothing else
+    /// may write one: two writers without that hold would let this daemon's own account of a
+    /// worker it found gone replace the worker's own.
     ///
     /// # Errors
     ///
     /// Returns an error when the registry cannot be written.
-    pub async fn retire(&self, record: &ClosureRecord) -> Result<()> {
+    async fn write_closure(&self, record: &ClosureRecord) -> Result<()> {
         let mut registry = self.registry.lock().await;
         registry.record_closure(record)?;
         drop(registry);
