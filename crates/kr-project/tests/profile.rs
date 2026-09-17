@@ -999,3 +999,46 @@ fn preparing_the_profile_repeats_no_part_of_a_path_it_was_given() {
         "and the same code"
     );
 }
+
+#[test]
+fn a_git_invocation_names_an_absolute_directory_and_leaves_the_profiles_own_one_empty() {
+    // A Git child starts in the empty directory this host owns rather than in whatever directory
+    // this process is in, which is what keeps a subprocess away from places nobody chose for it.
+    // The other half of that decision: a relative directory would name something other than what
+    // the caller meant, so it is refused rather than resolved against a directory of this host's.
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "absolute");
+    let profile = fixture.service().profile();
+    let arguments: [&OsStr; 2] = [OsStr::new("rev-parse"), OsStr::new("--show-toplevel")];
+
+    let refusal = profile
+        .run(&GitRequest::read(std::path::Path::new("."), &arguments))
+        .expect_err("a relative directory is refused");
+    assert_eq!(
+        refusal.code(),
+        kr_protocol::error::ErrorCode::InvalidArgument
+    );
+    assert!(
+        refusal.to_string().contains("absolute directory"),
+        "and says why: {refusal}"
+    );
+
+    // The same invocation against the repository's own absolute path runs, and nothing lands in
+    // the directory the child started in.
+    let reported = profile
+        .run_checked(&GitRequest::read(&path, &arguments))
+        .expect("an absolute directory runs");
+    assert_eq!(
+        std::fs::canonicalize(reported.trim()).expect("the reported tree"),
+        std::fs::canonicalize(&path).expect("the repository"),
+    );
+    let home = profile.home_directory();
+    assert!(
+        std::fs::read_dir(home)
+            .expect("the child's own directory reads")
+            .next()
+            .is_none(),
+        "the directory every Git child starts in is still empty: {}",
+        home.display()
+    );
+}

@@ -496,6 +496,19 @@ impl RestrictedProfile {
     /// Returns [`ProjectError::StagingUnavailable`] when a directory or the empty file cannot be
     /// created, or when one of them is not empty.
     pub fn prepare_with(root: &Path, git: GitProgram) -> Result<Self> {
+        // Every directory in the profile is derived from this one, and one of them is where each
+        // Git child starts. A relative root would name a different directory depending on where
+        // this process happens to be, so it is refused rather than resolved into one.
+        if !root.is_absolute() {
+            return Err(ProjectError::StagingUnavailable {
+                detail: format!(
+                    "the restricted profile is prepared inside an absolute directory, and {} is \
+                     not one",
+                    redact(&root.display().to_string())
+                )
+                .into(),
+            });
+        }
         let profile = root.join(PROFILE_DIRECTORY);
         std::fs::create_dir_all(&profile).map_err(ProjectError::staging)?;
         let hooks = profile.join(HOOKS_DIRECTORY);
@@ -569,6 +582,15 @@ impl RestrictedProfile {
         &self.empty_config
     }
 
+    /// Returns the empty directory each Git child starts in, which is also its home.
+    ///
+    /// It stays empty: nothing this service runs writes there, because every path an invocation
+    /// names is absolute or the one `-C` names.
+    #[must_use]
+    pub fn home_directory(&self) -> &Path {
+        &self.home
+    }
+
     /// Runs one Git invocation and returns its output.
     ///
     /// # Errors
@@ -580,6 +602,21 @@ impl RestrictedProfile {
         // The allowlist is checked here rather than at each call site, because here is the one
         // place a subprocess is started.
         check_arguments(request.arguments)?;
+        // The child starts in a directory this host owns rather than in this process's own, so a
+        // relative directory would name something other than what the caller meant by it. A caller
+        // that has a relative path resolves it against the directory it means, which is a decision
+        // this host cannot make for it.
+        if let Some(directory) = request.directory
+            && !directory.is_absolute()
+        {
+            return Err(ProjectError::InvalidArgument(
+                format!(
+                    "a Git invocation names an absolute directory, and {} is not one",
+                    redact(&directory.display().to_string())
+                )
+                .into(),
+            ));
+        }
         let mut command = Command::new(&self.git.program);
         command.env_clear();
         // The child starts in a directory this host owns and keeps empty, rather than wherever this
