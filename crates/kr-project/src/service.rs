@@ -24,16 +24,17 @@ use kr_ipc::paths::EnvironmentPaths;
 use kr_protocol::ids::{
     ActionId, ActorId, EnvironmentId, ProjectRepositoryId, SessionId, WorkspaceId,
 };
+use kr_protocol::method::Method;
 use kr_protocol::project::{
-    AdoptionFlow, DestinationRequest, DestinationState, IsolationMechanism, MAX_LABEL_LEN,
-    OPERATION_DEADLINE, OperationRecord, OperationState, ProjectAdoptParams, ProjectAdoptResult,
-    ProjectCloneParams, ProjectCloneResult, ProjectInitParams, ProjectInitResult,
-    ProjectListParams, ProjectListResult, ProjectOperationCancelParams,
-    ProjectOperationCancelResult, ProjectOrigin, ProjectReadParams, ProjectReadResult,
-    ProjectState, ProjectSummary, RemoteSpecification, RetainedItem, RetainedKind, RetentionPolicy,
-    WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceKind, WorkspaceListParams,
-    WorkspaceListResult, WorkspaceReadParams, WorkspaceReadResult, WorkspaceRemoveParams,
-    WorkspaceRemoveResult, WorkspaceState, WorkspaceSummary,
+    AdoptionFlow, DestinationRequest, DestinationState, InclusionClass, InclusionPreview,
+    IsolationMechanism, MAX_LABEL_LEN, OPERATION_DEADLINE, OperationRecord, OperationState,
+    PreviewCount, ProjectAdoptParams, ProjectAdoptResult, ProjectCloneParams, ProjectCloneResult,
+    ProjectInitParams, ProjectInitResult, ProjectListParams, ProjectListResult,
+    ProjectOperationCancelParams, ProjectOperationCancelResult, ProjectOrigin, ProjectReadParams,
+    ProjectReadResult, ProjectState, ProjectSummary, RemoteSpecification, RetainedItem,
+    RetainedKind, RetentionPolicy, WorkspaceCreateParams, WorkspaceCreateResult, WorkspaceKind,
+    WorkspaceListParams, WorkspaceListResult, WorkspaceReadParams, WorkspaceReadResult,
+    WorkspaceRemoveParams, WorkspaceRemoveResult, WorkspaceState, WorkspaceSummary,
 };
 use kr_protocol::scalars::{Nullable, U64, Uuid};
 use kr_transfer::{Clock, ObjectIdentity, RelativeName, SystemClock};
@@ -50,7 +51,16 @@ use crate::store::{
     Action, OperationRow, OperationUpdate, ProjectRow, RetainedOutcome, RetainedRow, Store,
     WorkspaceRow, WorkspaceUpdate, outcome_of,
 };
-use crate::workspace::{PreviewRequest, Survey, check_choice, copy_included, survey};
+use crate::workspace::{
+    PathOutcome, PreviewRequest, Survey, check_choice, copy_included, outcome_text, survey,
+};
+
+/// How many paths an inclusion journals in one transaction.
+///
+/// One transaction for every path would make the journal the slow part of a copy; one at the end
+/// would leave an interrupted copy with no record at all. A batch is the middle: what an
+/// interrupted inclusion loses is at most this many paths' worth of progress.
+const PROGRESS_BATCH: usize = 64;
 
 /// What a recovery resolved.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -66,6 +76,8 @@ pub struct Recovery {
     pub materialisations_unfinished: u64,
     /// Action claims this host settled from the durable state rather than leaving open.
     pub claims_settled: u64,
+    /// Removal reservations an earlier daemon held, released so a later removal is not refused.
+    pub removals_released: u64,
     /// The staging paths a person can still find, for each unresolved operation.
     pub retained_paths: Vec<String>,
 }
@@ -251,14 +263,15 @@ impl ProjectService {
                     }
                 },
                 Err(error) => {
-                    // A row this host could not examine is recorded as unresolved rather than
-                    // guessed at, and its staging path is kept so a person can find it.
+                    // A row this host could not examine keeps the state it was in, so the next
+                    // recovery asks the same question again. Moving it to `unknown` here would
+                    // close an operation this host has not decided, and nothing would revisit it.
+                    // Its staging path stays recorded either way, so a person can find it.
                     self.locked()?.set_operation_state(
                         row.action_id,
-                        OperationState::Unknown,
+                        row.state,
                         &OperationUpdate {
                             detail: Some(&error.to_string()),
-                            ended_at_ms: Some(self.clock.now_ms()),
                             ..OperationUpdate::default()
                         },
                     )?;
@@ -272,6 +285,9 @@ impl ProjectService {
         // `.kr-project-something` is not this host's to delete.
         recovery.staging_removed += self.sweep_recorded_staging()?;
         recovery.materialisations_unfinished = self.resolve_materialisations()?;
+        // A removal reservation belongs to the daemon that took it, and that daemon is gone.
+        // Leaving one behind would refuse every later removal of that workspace for ever.
+        recovery.removals_released = self.writable()?.release_stale_removals()?;
         // A claim whose effect settled durably is answered from that state. A claim this host
         // cannot resolve is settled as unknown rather than left open for ever, so a repeat of the
         // action gets a definite answer.
@@ -340,43 +356,85 @@ impl ProjectService {
     ///
     /// Returns [`ProjectError::StoreUnavailable`] when the journal cannot be read or written.
     fn resolve_materialisations(&self) -> Result<u64> {
-        let unfinished: Vec<WorkspaceRow> = self
-            .locked()?
-            .workspaces(self.environment_id, None)?
+        let rows = self.locked()?.workspaces(self.environment_id, None)?;
+        // A staging sibling is this host's own directory, wherever the row that named it ended up.
+        // So the cleanup covers every row that still names one rather than only the unfinished
+        // ones: a workspace that reached `ready` while its cleanup failed keeps a sibling until
+        // one of these recoveries takes it away.
+        for row in &rows {
+            self.sweep_workspace_staging(row)?;
+        }
+        let mut resolved = 0_u64;
+        for row in rows
             .into_iter()
             .filter(|row| matches!(row.state, WorkspaceState::Materialising))
-            .collect();
-        let mut resolved = 0_u64;
-        for row in unfinished {
-            if let Some(name) = row.staging_name.as_deref()
-                && let Ok(destination) = Destination::resolve(
-                    &DestinationRequest {
-                        environment_id: row.environment_id,
-                        parent_path: parent_of(&row.display_path),
-                        name: name_of(&row.display_path),
-                    },
-                    self.environment_id,
-                )
-                && let Ok(sibling) = StagingSibling::open(&destination, name)
-            {
-                let _ = sibling.remove(&destination);
-                self.writable()?.clear_workspace_staging(row.workspace_id)?;
-            }
+        {
+            // What the inclusion had applied is journalled as it goes, so the reason says how far
+            // it got rather than only that it stopped.
+            let applied = self.locked()?.workspace_progress(row.workspace_id)?.len();
             self.writable()?.set_workspace(
                 row.workspace_id,
                 WorkspaceState::RemovalPending,
                 &WorkspaceUpdate {
-                    detail: Some(
+                    detail: Some(&format!(
                         "the daemon that was materialising this workspace ended before it \
-                         finished, so what is in its directory is not what its creation asked \
-                         for; the files are left where they are and nothing new may hold it",
-                    ),
+                         finished, after {applied} of its paths had been applied, so what is in \
+                         its directory is not what its creation asked for; the files are left \
+                         where they are and nothing new may hold it"
+                    )),
                     ..WorkspaceUpdate::default()
                 },
             )?;
             resolved += 1;
         }
         Ok(resolved)
+    }
+
+    /// Removes the staging sibling one workspace row names, when the object at that name is the
+    /// one the row recorded.
+    ///
+    /// The name is forgotten only once the directory is gone. A removal that failed leaves the
+    /// name on the row so the next recovery tries again, rather than leaving a directory nothing
+    /// accounts for.
+    fn sweep_workspace_staging(&self, row: &WorkspaceRow) -> Result<()> {
+        let Some(name) = row.staging_name.as_deref() else {
+            return Ok(());
+        };
+        let Ok(destination) = Destination::resolve(
+            &DestinationRequest {
+                environment_id: row.environment_id,
+                parent_path: parent_of(&row.display_path),
+                name: name_of(&row.display_path),
+            },
+            self.environment_id,
+        ) else {
+            return Ok(());
+        };
+        let Ok(sibling) = StagingSibling::open(&destination, name) else {
+            // The name is forgotten only when nothing is at it. A directory this host could not
+            // open for any other reason is one it has not accounted for, so the name stays and
+            // the next recovery tries again.
+            let absent = matches!(
+                std::fs::symlink_metadata(destination.parent_path().join(name)),
+                Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
+            );
+            if absent {
+                self.writable()?.clear_workspace_staging(row.workspace_id)?;
+            }
+            return Ok(());
+        };
+        // A recorded name is not authority to remove whatever holds it now. Where the row did not
+        // record the sibling's identity, the name is left alone rather than removed on the
+        // strength of its spelling.
+        let Some(expected) = row.staging_identity else {
+            return Ok(());
+        };
+        let gone = sibling.remove_if(&destination, Some(expected)).is_ok()
+            || !sibling.occupied(&destination);
+        if gone {
+            self.writable()?.clear_workspace_staging(row.workspace_id)?;
+        }
+        Ok(())
     }
 
     /// Settles every action claim this host left open.
@@ -429,10 +487,14 @@ impl ProjectService {
                     }
                 }
             }
-            // A workspace claim. Its result carries the inclusion preview, which is not durable,
-            // so the answer names the workspace and what state it is in rather than inventing a
-            // preview the host no longer has.
+            // A workspace claim.
             let workspace = self.locked()?.workspace(WorkspaceId::new(subject))?;
+            if let Some(row) = workspace.as_ref()
+                && self.settle_workspace_claim(&action, &record.method, row)?
+            {
+                settled += 1;
+                continue;
+            }
             let detail = match workspace {
                 Some(row) => format!(
                     "the daemon that performed this action ended before it recorded the result; \
@@ -478,6 +540,104 @@ impl ProjectService {
         Ok(store.settle(action, Some(&encoded), None)? > 0)
     }
 
+    /// Settles one workspace claim from the workspace's own durable state.
+    ///
+    /// A creation that reached `ready` and a removal that reached its terminal state both left
+    /// their whole answer in the journal, and reconstructing it beats telling the caller the
+    /// outcome is unknown when the workspace is sitting there. What cannot be reconstructed is the
+    /// inclusion preview: it is a reading of the *source* tree taken at the moment of the request,
+    /// and it is not journalled. So the preview a recovered answer carries says what it is — a
+    /// preview this host no longer holds — rather than pretending to counts nobody took.
+    ///
+    /// Returns whether the claim was settled here. A workspace in any other state is left to the
+    /// caller's unknown answer.
+    fn settle_workspace_claim(
+        &self,
+        action: &Action,
+        method: &str,
+        row: &WorkspaceRow,
+    ) -> Result<bool> {
+        if method == Method::WorkspaceCreate.as_str() && matches!(row.state, WorkspaceState::Ready)
+        {
+            let store = self.writable()?;
+            let workspace = self.summarise_workspace(&store, row)?;
+            let unapplied = store
+                .workspace_progress(row.workspace_id)?
+                .into_iter()
+                .filter(|(_, outcome)| outcome == "unapplied")
+                .map(|(path, _)| path)
+                .collect();
+            let result = WorkspaceCreateResult {
+                workspace: Nullable(Some(workspace)),
+                preview: self.recovered_preview(row),
+                unapplied,
+            };
+            let encoded = kr_cbor::to_canonical_vec(&result).map_err(ProjectError::store)?;
+            return Ok(store.settle(action, Some(&encoded), None)? > 0);
+        }
+        if method == Method::WorkspaceRemove.as_str()
+            && matches!(
+                row.state,
+                WorkspaceState::Removed | WorkspaceState::RemovalPending
+            )
+        {
+            let store = self.writable()?;
+            let result = WorkspaceRemoveResult {
+                workspace: self.summarise_workspace(&store, row)?,
+                working_files_removed: self.tree_gone(row),
+                retained: store
+                    .retained(row.workspace_id)?
+                    .into_iter()
+                    .map(|item| RetainedItem {
+                        kind: item.kind,
+                        detail: item.detail,
+                        change_set_id: Nullable(item.change_set_id),
+                    })
+                    .collect(),
+            };
+            let encoded = kr_cbor::to_canonical_vec(&result).map_err(ProjectError::store)?;
+            return Ok(store.settle(action, Some(&encoded), None)? > 0);
+        }
+        Ok(false)
+    }
+
+    /// Builds the preview a recovered creation answer carries.
+    ///
+    /// Every count is zero and `counts_complete` is false, which is what "this host does not hold
+    /// the preview that was taken" comes to in the wire type. The limitation says so in words,
+    /// because a reader who sees zeroes deserves to know they are not a measurement.
+    fn recovered_preview(&self, row: &WorkspaceRow) -> InclusionPreview {
+        InclusionPreview {
+            project_repository_id: row.project_repository_id,
+            kind: row.kind,
+            policy: row.policy,
+            base_revision: row.base_revision.clone(),
+            base_reference: Nullable(None),
+            base_change_set_id: Nullable(row.base_change_set_id),
+            counts: InclusionClass::EVERY
+                .iter()
+                .map(|class| PreviewCount {
+                    class: *class,
+                    total: U64::new(0),
+                    included: U64::new(0),
+                    byte_len: U64::new(0),
+                })
+                .collect(),
+            entries: Vec::new(),
+            omitted_entries: U64::new(0),
+            unknown_content: U64::new(0),
+            counts_complete: false,
+            limitations: vec![
+                "this answer was rebuilt from the journal after the daemon that took it ended, \
+                 and the inclusion preview is a reading of the source working tree that is not \
+                 journalled: the counts here are not a measurement. What the workspace holds is \
+                 what reading it says."
+                    .to_owned(),
+            ],
+            taken_at_ms: row.created_at_ms,
+        }
+    }
+
     /// Settles one claim as an outcome this host cannot establish.
     fn settle_unknown(&self, action: &Action, detail: &str) -> Result<usize> {
         self.writable()?.settle(
@@ -509,9 +669,13 @@ impl ProjectService {
             // than allowed to undo it.
             if let Some(sibling) = staging {
                 let path = sibling.path().display().to_string();
-                let removed = sibling.remove(&destination).is_ok();
-                self.writable()?
-                    .record_staging_path(row.action_id, &path, removed)?;
+                let removed = sibling
+                    .remove_if(&destination, row.staging_identity)
+                    .map(|()| true)
+                    .unwrap_or_else(|_| !sibling.occupied(&destination));
+                let _ = self
+                    .writable()
+                    .and_then(|mut store| store.record_staging_path(row.action_id, &path, removed));
             }
             self.settle_failure(
                 row,
@@ -637,11 +801,20 @@ impl ProjectService {
         // The publication is committed. Removing the staging sibling afterwards is cleanup, and a
         // cleanup that fails must not turn a landed publication into a failure: the path is
         // recorded as one that is still there, and the sweep and the next recovery retry it.
+        // Recording the note is cleanup too, so a journal that refuses it does not undo the
+        // publication either.
         if let Some(sibling) = staging {
             let path = sibling.path().display().to_string();
-            let removed = sibling.remove(destination).is_ok();
-            self.writable()?
-                .record_staging_path(row.action_id, &path, removed)?;
+            // The identity checked here is the *sibling's* own, which the row recorded when the
+            // directory was created. The published tree's identity is a different object: it is
+            // what came out of the sibling.
+            let removed = sibling
+                .remove_if(destination, row.staging_identity)
+                .map(|()| true)
+                .unwrap_or_else(|_| !sibling.occupied(destination));
+            let _ = self
+                .writable()
+                .and_then(|mut store| store.record_staging_path(row.action_id, &path, removed));
         }
         Ok(())
     }
@@ -954,9 +1127,6 @@ impl ProjectService {
                 // The row is read into a local first. A temporary guard in the head of a
                 // condition lives for the whole chain, and `resolve_operation` takes the same
                 // lock: the service would wait for itself.
-                // The row is read into a local first. A temporary guard in the head of a
-                // condition lives for the whole chain, and `resolve_operation` takes the same
-                // lock: the service would wait for itself.
                 let current = self.locked()?.operation(row.action_id)?;
                 if let Some(current) = current
                     && matches!(current.state, OperationState::Publishing)
@@ -973,21 +1143,19 @@ impl ProjectService {
                             }
                         }
                         _ => {
-                            let detail = format!(
-                                "this operation's publication is not decided: {error}. The \
-                                 operation keeps its create token and the host resolves it against \
-                                 the object it staged rather than starting again"
-                            );
-                            let unknown = ProjectError::OutcomeUnknown { detail };
-                            if let Some(action) = action {
-                                let message = unknown.to_string();
-                                self.writable()?.settle(
-                                    action,
-                                    None,
-                                    Some((unknown.code(), &message)),
-                                )?;
-                            }
-                            return Err(unknown);
+                            // The claim stays open. Settling it here would record a permanent
+                            // unknown against an action whose effect this host may yet establish,
+                            // and a recovery that then completed the publication could not
+                            // replace that answer. An open claim tells a repeat that the effect
+                            // is in flight, which is what is true.
+                            return Err(ProjectError::OutcomeUnknown {
+                                detail: format!(
+                                    "this operation's publication is not decided: {error}. The \
+                                     operation keeps its create token, its action is not answered \
+                                     yet, and the host resolves it against the object it staged \
+                                     rather than starting again"
+                                ),
+                            });
                         }
                     }
                 }
@@ -1108,11 +1276,18 @@ impl ProjectService {
         // The publication is committed. Removing the staging sibling afterwards is cleanup, and a
         // cleanup that fails must not turn a landed publication into a failure: the path is
         // recorded as one that is still there, and the sweep and the next recovery retry it.
+        // Recording the note is cleanup too, so a journal that refuses it does not undo the
+        // publication either.
         if let Some(sibling) = staging {
             let path = sibling.path().display().to_string();
-            let removed = sibling.remove(destination).is_ok();
-            self.writable()?
-                .record_staging_path(row.action_id, &path, removed)?;
+            let identity = sibling.identity();
+            let removed = sibling
+                .remove_if(destination, Some(identity))
+                .map(|()| true)
+                .unwrap_or_else(|_| !sibling.occupied(destination));
+            let _ = self
+                .writable()
+                .and_then(|mut store| store.record_staging_path(row.action_id, &path, removed));
         }
         let operation = self.read_operation(row.action_id)?;
         Ok(CreationAnswer {
@@ -1313,6 +1488,7 @@ impl ProjectService {
             identity: None,
             display_path: display_path.clone(),
             staging_name: None,
+            staging_identity: None,
             detail: None,
             retention: None,
             created_at_ms: self.clock.now_ms(),
@@ -1403,6 +1579,12 @@ impl ProjectService {
                         // no-replace step, and its identity goes on to the row before anything is
                         // written into it, so a removal afterwards can prove the tree is this
                         // host's. `git worktree add` accepts an existing empty directory.
+                        // The configuration is read again immediately before the first write.
+                        // It does not close the window between that reading and the process
+                        // starting — nothing Git offers does — but a write runs under a
+                        // configuration read a moment earlier rather than one read whenever the
+                        // repository was opened.
+                        repository.recheck(&self.profile)?;
                         let reserved = destination.reserve()?;
                         self.writable()?.set_workspace_state(
                             row.workspace_id,
@@ -1438,7 +1620,19 @@ impl ProjectService {
                                 ..WorkspaceUpdate::default()
                             },
                         )?;
+                        repository.recheck(&self.profile)?;
                         let staging = StagingSibling::create(&destination, &name)?;
+                        // The sibling's own identity goes on to the row as soon as the directory
+                        // exists. A recorded name is not authority to remove whatever holds it
+                        // later: the cleanup removes this object or nothing.
+                        self.writable()?.set_workspace(
+                            row.workspace_id,
+                            WorkspaceState::Materialising,
+                            &WorkspaceUpdate {
+                                staging_identity: Some(staging.identity()),
+                                ..WorkspaceUpdate::default()
+                            },
+                        )?;
                         let source = repository.top_level().display().to_string();
                         let arguments: [&OsStr; 6] = [
                             OsStr::new("clone"),
@@ -1489,8 +1683,10 @@ impl ProjectService {
                         publish(&staging, &destination, staged)?;
                         // Removing the sibling is cleanup. A failure here does not undo a
                         // publication that landed: the name stays on the row and recovery retries
-                        // it.
-                        let removed = staging.remove(&destination).is_ok();
+                        // it. What is removed is the object whose identity the row holds.
+                        let identity = staging.identity();
+                        let removed = staging.remove_if(&destination, Some(identity)).is_ok()
+                            || !staging.occupied(&destination);
                         if removed {
                             self.writable()?.clear_workspace_staging(row.workspace_id)?;
                         }
@@ -1498,9 +1694,44 @@ impl ProjectService {
                 }
                 let tree = destination.parent().subdirectory(destination.name())?;
                 // The inclusion is a copy out of the source tree. The source is only read: an
-                // exclusion means this workspace starts without the file, never that the original
-                // is cleaned, stashed or discarded.
-                let report = copy_included(repository.work_tree(), &tree, &surveyed.entries)?;
+                // exclusion means this workspace holds the base's version of the path rather than
+                // the user's, and never that the original is cleaned, stashed or discarded.
+                //
+                // Each path's outcome is journalled as it settles, in batches, so a daemon that
+                // dies part way through leaves a record of what it had applied.
+                let mut batch: Vec<(String, &'static str)> = Vec::new();
+                let mut journalled = |path: &str, outcome: PathOutcome| -> Result<()> {
+                    batch.push((path.to_owned(), outcome_text(outcome)));
+                    if batch.len() >= PROGRESS_BATCH {
+                        let recorded = std::mem::take(&mut batch);
+                        self.writable()?
+                            .record_workspace_progress(row.workspace_id, &recorded)?;
+                    }
+                    Ok(())
+                };
+                let outcome = {
+                    // The closure holds the batch while it runs, and the tail of the batch is
+                    // written after it: the borrow ends with this block.
+                    copy_included(
+                        repository.work_tree(),
+                        &tree,
+                        &surveyed.entries,
+                        &mut journalled,
+                    )
+                };
+                if !batch.is_empty() {
+                    self.writable()?
+                        .record_workspace_progress(row.workspace_id, &batch)?;
+                }
+                let mut report = outcome?;
+                // A path the survey found that is not file content — a link, a socket, a device —
+                // is one the workspace does not hold as the policy asked, so it is reported with
+                // the rest rather than left for the caller to notice.
+                report.skipped.extend(surveyed.unsupported.iter().cloned());
+                // A temporary file a failed copy left behind is named too: something nobody
+                // accounts for in the user's new workspace is worse than something named.
+                let leftover = report.leftover.clone();
+                report.skipped.extend(leftover);
                 let carried = report.copied.len() + report.removed.len();
                 // What the copy carried and what it could not goes on to the row before the
                 // workspace is called ready, so a reader of a workspace this host finished knows
@@ -1559,12 +1790,19 @@ impl ProjectService {
         // first. From this moment nothing new may hold the workspace and nothing new may be
         // recorded against it, so the measurement below and the decision after it see a workspace
         // that cannot gain a session, a run or a pin underneath them.
-        let row = self
-            .writable()?
-            .begin_removal(params.workspace_id, params.retention, action)?;
-        let outcome = self.perform_removal(&row, params.retention);
+        let reserved =
+            self.writable()?
+                .begin_removal(params.workspace_id, params.retention, action)?;
+        let outcome = self.perform_removal(&reserved.row, params.retention);
         match outcome {
-            Ok(removed) => self.removal_answer(params.workspace_id, removed, action),
+            Ok(removed) => {
+                // The reservation is given up whether or not the workspace reached its terminal
+                // state: what it excludes is a second removal running beside this one, not a
+                // second request after it.
+                self.writable()?
+                    .release_removal(params.workspace_id, reserved.token)?;
+                self.removal_answer(params.workspace_id, removed, action)
+            }
             Err(error) => {
                 let detail = error.to_string();
                 let mut store = self.writable()?;
@@ -1576,6 +1814,7 @@ impl ProjectService {
                         ..WorkspaceUpdate::default()
                     },
                 )?;
+                store.release_removal(params.workspace_id, reserved.token)?;
                 if let Some(action) = action {
                     store.settle(action, None, Some((error.code(), &detail)))?;
                 }
@@ -1633,13 +1872,13 @@ impl ProjectService {
                 // A directory that is not there holds nothing, and a workspace already recorded as
                 // removed holds nothing either. Anything else is a tree this host could not
                 // inspect, and an inspection it could not make is not an inspection that found the
-                // tree empty.
+                // tree empty. A metadata call that fails for any reason *other* than absence says
+                // nothing about what is there, so it is not read as absence.
                 let absent = matches!(row.state, WorkspaceState::Removed)
-                    || kr_transfer::AuthorisedDirectory::open_root(
-                        self.environment_id,
-                        Path::new(&row.display_path),
-                    )
-                    .is_err();
+                    || matches!(
+                        std::fs::symlink_metadata(&row.display_path),
+                        Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
+                    );
                 return if absent {
                     DirtyCount::Clean
                 } else {
@@ -1659,11 +1898,52 @@ impl ProjectService {
             Ok(reported) => reported,
             Err(error) => return DirtyCount::Unmeasurable(error.to_string()),
         };
-        match crate::workspace::parse_status(&reported) {
-            Err(error) => DirtyCount::Unmeasurable(error.to_string()),
-            Ok(entries) if entries.is_empty() => DirtyCount::Clean,
-            Ok(entries) => DirtyCount::Holds(entries.len()),
+        let entries = match crate::workspace::parse_status(&reported) {
+            Err(error) => return DirtyCount::Unmeasurable(error.to_string()),
+            Ok(entries) => entries,
+        };
+        if !entries.is_empty() {
+            return DirtyCount::Holds(entries.len());
         }
+        // The status above asked Git to ignore submodules, because looking inside one would run
+        // under a configuration this host has not audited. So an empty status is an empty status
+        // *of the tree outside its submodules*: a populated submodule may hold uncommitted work
+        // this host has not read, and work it has not read is not work it found absent.
+        match self.populated_submodules(&opened) {
+            Ok(paths) if paths.is_empty() => DirtyCount::Clean,
+            Ok(paths) => DirtyCount::Unmeasurable(format!(
+                "{} holds submodules whose own working trees this host does not look inside ({})",
+                row.display_path,
+                paths.join(", ")
+            )),
+            Err(error) => DirtyCount::Unmeasurable(error.to_string()),
+        }
+    }
+
+    /// Returns the submodule paths that have something in them.
+    ///
+    /// Read from the index and the directory entry alone: nothing is run inside a submodule, and
+    /// its own configuration is never read.
+    fn populated_submodules(&self, opened: &OpenedRepository) -> Result<Vec<String>> {
+        let mut populated = Vec::new();
+        for path in crate::workspace::submodule_paths(&self.profile, opened)? {
+            let Ok(name) = kr_transfer::RelativeName::parse(&path) else {
+                populated.push(path);
+                continue;
+            };
+            let Ok(directory) = opened.work_tree().subdirectory(&name) else {
+                continue;
+            };
+            let holds = directory
+                .handle()
+                .entries()
+                .map(|mut entries| entries.next().is_some())
+                .unwrap_or(true);
+            if holds {
+                populated.push(path);
+            }
+        }
+        Ok(populated)
     }
 
     /// Removes what the retention policy permits, and says whether the working files are gone.
@@ -1678,20 +1958,34 @@ impl ProjectService {
         if matches!(row.kind, WorkspaceKind::SharedExisting) {
             self.writable()?
                 .finish_removal(row.workspace_id, retention, self.clock.now_ms())?;
-            return Ok(false);
+            // The user's own tree is not this host's to remove, so what the answer says about it
+            // is read from the filesystem rather than assumed: a tree the user deleted themselves
+            // is gone whoever deleted it.
+            return Ok(self.tree_gone(row));
         }
         if matches!(retention, RetentionPolicy::KeepEverything) && !held.is_empty() {
             // Dirty content, pinned change sets and review evidence are retained until the user
             // approves their removal. Saying what is held and changing nothing is the answer, and
             // the approval is a second request carrying the other policy.
-            return Ok(false);
+            return Ok(self.tree_gone(row));
         }
         self.remove_working_tree(row)?;
         self.writable()?
             .finish_removal(row.workspace_id, retention, self.clock.now_ms())?;
         // What the result says is what is true of the tree now, whether this call removed it or
         // found it already gone.
-        Ok(!Path::new(&row.display_path).exists())
+        Ok(self.tree_gone(row))
+    }
+
+    /// Returns whether a workspace's working files are gone.
+    ///
+    /// A path this host cannot look at is not a path it found empty, so anything other than a
+    /// plain absence answers "still there".
+    fn tree_gone(&self, row: &WorkspaceRow) -> bool {
+        matches!(
+            std::fs::symlink_metadata(&row.display_path),
+            Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
+        )
     }
 
     fn removal_answer(
@@ -1997,6 +2291,10 @@ impl ProjectService {
             OsStr::new(&spec),
         ];
         let output = self.profile.run(&repository.read(&arguments))?;
+        // A non-zero exit is this method's answer for a revision the repository does not hold, so
+        // the exit code is not on its own enough: an output this host read only part of would be
+        // taken for the identifier it names.
+        output.require_complete()?;
         if !output.success {
             return Err(ProjectError::InvalidArgument(format!(
                 "{revision} is not a revision this repository holds"

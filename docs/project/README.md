@@ -217,8 +217,8 @@ user.
 
 ### Nothing is cleaned, stashed or discarded
 
-An exclusion means the new workspace starts without that file, or with the base's version of it
-where the base has one. It never means the original is touched. The service reads the source tree
+An exclusion means the new workspace holds the base's version of that file, or nothing where the
+base holds nothing. It never means the original is touched. The service reads the source tree
 and writes only into the new one.
 
 An inclusion replaces the destination rather than writing over it: the copy is written to a name of
@@ -226,9 +226,11 @@ this host's own, flushed to disk, given the source's permission bits, and then r
 destination. A rename replaces a file in one step, so the destination is either the base's file or
 the user's and never half of each, and a failure anywhere before the rename leaves the destination
 as it was. What the host could not carry it names rather than hides: a symbolic link, a device, a
-submodule's own working tree and a path whose destination could not be replaced all appear in the
-creation's `unapplied` list, and the workspace is still returned because it is usable and what it
-does not hold is stated.
+submodule's own working tree, a path whose parent could not be created, a path whose permissions
+could not be carried and a path whose destination could not be replaced all appear in the
+creation's `unapplied` list, and so does a temporary file a failed copy left behind because even
+its cleanup failed. The workspace is still returned because it is usable, and what it does not
+hold is stated.
 
 An **exclusion** of a dirty tracked file means the workspace holds the *base's* version of it, not
 that the path is absent: the checkout put the base's content there and an exclusion is the host not
@@ -323,6 +325,11 @@ the submodule, where it would apply. So every read passes `--ignore-submodules=a
 setting `submodule.recurse=false` and `diff.ignoreSubmodules=all`, submodules are counted from the
 index, and the preview says that what a submodule holds is neither measured nor copied.
 
+That cuts both ways for a removal. An empty status is an empty status of the tree *outside* its
+submodules, so a workspace holding a populated submodule is a workspace whose contents this host
+has not wholly read: the measurement records that, and `keep_everything` keeps the workspace rather
+than deleting work nobody inspected.
+
 **What the repository's own configuration is allowed to name.** A `filter`, `diff` or `merge` driver
 is named by an attribute and *defined* in configuration, and the set of names is whatever the
 repository chose, so a fixed list of overrides cannot cover it. The effective configuration is
@@ -374,17 +381,31 @@ check rather than the guarantee. The Windows path has not been executed on Windo
 outside this host's handles: it passes a path with `-C`, and Git opens the configuration for itself.
 So a writer under the same operating-system account could put a different tree at that path, or add
 a driver the audit did not blank, between the check and the invocation. Neither is preventable
-through Git's own interface, so what this host does is notice. After every read it re-opens the
-path, compares both filesystem identities, re-reads the configuration and compares its digest; a
-result produced against something else is refused rather than returned. What remains is a change
-made and undone inside one invocation, which two readings cannot distinguish from no change at all.
+through Git's own interface, so what this host does is notice, and shorten the window. Before a
+*write* it re-reads the configuration and refuses a change; after a review refresh it re-opens the
+path, compares both filesystem identities, re-reads the configuration and compares its digest, and
+a result produced against something else is refused rather than returned. Detection is not
+prevention: a driver added in the moment between the last reading and the process starting runs,
+and this host reports afterwards that the configuration changed. Closing that needs an isolation
+boundary outside Git — a sandbox that denies the process anything but the paths it was granted —
+and this build does not have one. Not every read confirms, either: the measurement a removal takes
+reads the tree once and treats anything it could not establish as work to keep.
+
+**One removal of a workspace at a time.** `removal_pending` is a state a workspace *rests* in — it
+holds work the user has not approved removing — so the state alone cannot say whether a removal is
+running. A reservation does: while one removal holds it, a second is refused rather than allowed to
+measure a tree the first is deleting underneath it. The reservation is given up when the removal
+ends, and a reservation an earlier daemon held is released on recovery.
 
 **Partial progress survives, and is not called finished.** A workspace whose materialisation this
 host did not finish keeps every file in its directory: the files may be the user's, and this host
 does not know which of them it wrote. What it does not do is call that workspace ready. The row
-moves out of the states anything may hold, the reason is recorded, and a person decides. Per-path
-apply progress is the diff service's contract, not this one's; what this service records is which
-tree it created and what it carried into it.
+moves out of the states anything may hold, the reason is recorded, and a person decides. What the
+inclusion had applied when the daemon ended is recorded too: each path's outcome is journalled as
+the copy goes, in batches, so an interrupted inclusion leaves a record of the paths it carried
+rather than only the fact that it stopped. Applying a change set path by path is the diff service's
+contract, not this one's; what this service records is which tree it created, what it carried into
+it, and how far it got.
 
 **A cancellation contains a process group on Unix and a single process elsewhere.** Every Git child
 this service starts leads its own process group, so a cancellation ends the helper, the ssh process
@@ -412,13 +433,16 @@ refusal rather than a thing to work around.
 
 ## The journal
 
-`projects.sqlite`, write-ahead logging, full synchronisation, forward-only migrations. Every state
-change commits with the outbox row that announces it.
+`projects.sqlite`, write-ahead logging, full synchronisation, forward-only migrations: the tables are created
+where they are absent and a store an earlier build wrote gains the columns added since, one
+`ALTER TABLE` each, before the recorded version moves on. A store from a *later* build is refused
+rather than half read.
 
 | Table | What it holds |
 | --- | --- |
 | `operations` | One row per creation, keyed by the caller's action identifier: the create token |
 | `operation_paths` | Every staging path an operation left behind or removed |
+| `workspace_progress` | What an inclusion made of each path it reached, written as it went |
 | `projects` | One row per repository, with both filesystem identities |
 | `workspaces` | One row per working copy, with its policy, its base and its tree's identity |
 | `workspace_sessions` | Which sessions are bound to a workspace, and which are still live |
@@ -437,19 +461,24 @@ takes the lock and releases it, and every Git invocation runs with none held. A 
 bound to a local first, never taken in the head of a condition or a loop: a temporary guard there
 lives for the whole body, and a helper that takes the same lock would wait for itself.
 
-Every state change commits with the outbox row that announces it, in one transaction. That covers
-the state setters, the session and run bindings and the retention changes as well as the two calls
-that begin an operation and a workspace, because a change a consumer cannot replay is a change that
-happened here and never happened anywhere downstream.
+Every transition of an owned object commits with the outbox row that announces it, in one
+transaction: the state setters, the session and run bindings, the retention changes, the staging
+records and the inclusion's progress batches, as well as the two calls that begin an operation and
+a workspace. A change a consumer cannot replay is a change that happened here and never happened
+anywhere downstream. The two exceptions are stated where they are: the `actions` table, which is
+the de-duplication record rather than an object whose transitions anybody replays, and the removal
+reservation, which is a lock this daemon holds rather than a fact about the workspace.
 
 ### What recovery resolves
 
 | What an earlier daemon left | What a replacement does |
 | --- | --- |
 | An operation in `staging` or `publishing` | Reconciles it against the create token, as the table above says |
-| A staging sibling a row names, whose operation has ended | Removes it. Nothing is removed because of its name alone: a repository a user called `.kr-project-something` is not this host's |
-| A workspace in `materialising` | Removes the staged sibling it recorded, leaves every file in the directory alone, and moves the row to `removal_pending` with the reason. The files may be the user's, and this host does not know which of them it wrote; what it does know is that the workspace is not what its creation asked for, so nothing new may hold it and no read calls it ready |
-| An action claim with no result | Consults the object the claim names. A completed operation's own rows reconstruct the result the caller never received, and that is what the claim settles with. An operation still in `staging` or `publishing` is one this host may yet decide, so its claim stays open on purpose for the next recovery. Anything else settles as an unknown outcome naming the object and the state it is in. An open claim is not an answer, and neither is a permanent unknown where the state says otherwise |
+| A staging sibling a row names, whose operation has ended | Removes it, when the object at that name is the one the row recorded. Nothing is removed because of its name alone: a repository a user called `.kr-project-something` is not this host's. The contents go through the sibling's own open handle and the name itself through an empty-directory removal, which refuses anything that was put there since |
+| A staging sibling a *workspace* row names | The same, whatever state the row is in: a workspace that reached `ready` while its cleanup failed keeps the name until one of these recoveries takes the directory away. The name is forgotten only once the directory is gone |
+| A workspace in `materialising` | Leaves every file in the directory alone and moves the row to `removal_pending` with the reason, including how many of the inclusion's paths had been applied. The files may be the user's, and this host does not know which of them it wrote; what it does know is that the workspace is not what its creation asked for, so nothing new may hold it and no read calls it ready |
+| A removal reservation | Releases it. The daemon that held it is gone, and leaving it would refuse every later removal of that workspace |
+| An action claim with no result | Consults the object the claim names. A completed operation's own rows reconstruct the result the caller never received, and so do a ready workspace's and a removed one's; that is what the claim settles with. A reconstructed answer is the state the journal holds rather than a replay of the bytes the first call returned, and where a creation's inclusion preview is part of it, the preview says it is not a measurement this host still holds. An operation still in `staging` or `publishing` is one this host may yet decide, so its claim stays open on purpose for the next recovery. Anything else settles as an unknown outcome naming the object and the state it is in. An open claim is not an answer, and neither is a permanent unknown where the state says otherwise |
 
 ## Errors
 

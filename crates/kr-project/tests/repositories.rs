@@ -633,12 +633,40 @@ fn an_interrupted_publication_is_reconciled_against_the_create_token() {
             rusqlite::params![submitted.action_id.as_bytes().to_vec()],
         )
         .expect("the claim is open again");
+    // And the staging sibling the dying daemon had not got round to removing, with its own
+    // identity on the row: finishing the publication has to take it away, and the identity it
+    // checks is the sibling's rather than the published tree's.
+    let name: String = journal
+        .query_row(
+            "SELECT staging_name FROM operations WHERE action_id = ?1",
+            rusqlite::params![cloned.operation.action_id.get().as_bytes().to_vec()],
+            |row| row.get(0),
+        )
+        .expect("the row names its sibling");
+    let sibling = fixture.work().join(&name);
+    std::fs::create_dir_all(sibling.join("tree")).expect("the sibling is back");
+    let sibling_identity = std::fs::metadata(&sibling).expect("its metadata");
+    journal
+        .execute(
+            "UPDATE operations SET staging_device = ?2, staging_file_id = ?3
+              WHERE action_id = ?1",
+            rusqlite::params![
+                cloned.operation.action_id.get().as_bytes().to_vec(),
+                std::os::unix::fs::MetadataExt::dev(&sibling_identity) as i64,
+                std::os::unix::fs::MetadataExt::ino(&sibling_identity) as i64,
+            ],
+        )
+        .expect("the sibling's own identity is recorded");
     drop(journal);
 
     let replacement = fixture.reopen();
     let recovery = replacement.recover().expect("recovery runs");
     assert_eq!(recovery.publications_completed, 1);
     assert_eq!(recovery.unresolved, 0);
+    assert!(
+        !sibling.exists(),
+        "the sibling the publication came out of is removed"
+    );
     let read = replacement
         .project_read(&ProjectReadParams {
             project_repository_id: cloned.project.project_repository_id,
@@ -706,13 +734,21 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
             .join(kr_project::store::STORE_FILE_NAME),
     )
     .expect("the journal opens");
+    // The row carries the sibling's own identity as well as its name, because that is what a
+    // daemon records when it creates one and what makes the cleanup a removal of this host's own
+    // directory rather than of whatever holds the name.
+    let abandoned = std::fs::metadata(&staging).expect("its metadata");
     journal
         .execute(
             "UPDATE operations SET state = 'staging', ended_at_ms = NULL, staged_device = NULL,
-                    staged_file_id = NULL, staging_name = ?2 WHERE action_id = ?1",
+                    staged_file_id = NULL, staging_name = ?2, staging_device = ?3,
+                    staging_file_id = ?4
+              WHERE action_id = ?1",
             rusqlite::params![
                 cloned.operation.action_id.get().as_bytes().to_vec(),
                 format!("{STAGING_PREFIX}abandoned"),
+                std::os::unix::fs::MetadataExt::dev(&abandoned) as i64,
+                std::os::unix::fs::MetadataExt::ino(&abandoned) as i64,
             ],
         )
         .expect("the row moves back to staging");
@@ -1117,10 +1153,10 @@ fn recovery_settles_a_claim_an_earlier_daemon_left_open() {
 }
 
 #[test]
-fn a_claim_whose_publication_is_still_undecided_is_left_open_for_the_next_recovery() {
-    // A claim is closed only when this host can say what happened. An operation still in
-    // `publishing` is one it may yet decide, and settling it now would replace a result it could
-    // establish with a permanent unknown.
+fn a_publication_neither_name_holds_is_recorded_as_unknown_and_answered_from_that() {
+    // The one case this host can close: the object it staged is at neither the destination nor the
+    // staging name, so whether the rename landed is a question nothing can answer. The operation
+    // says unknown, its staging path is kept, and a repeat is told the same.
     let fixture = Fixture::create();
     let source = ordinary_repository(fixture.work(), "source");
     let submitted = action("project.clone", 24);
@@ -1192,4 +1228,106 @@ fn a_claim_whose_publication_is_still_undecided_is_left_open_for_the_next_recove
         )
         .expect_err("the repeat is answered with what this host could establish");
     assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
+}
+
+#[test]
+fn a_claim_whose_publication_is_still_undecided_is_left_open_for_the_next_recovery() {
+    // A claim is closed only when this host can say what happened. An operation whose publication
+    // this host could not examine stays in `publishing` and keeps its claim open: settling it now
+    // would record a permanent unknown against an effect the next recovery may yet establish.
+    let fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "undecidable-source");
+    let submitted = action("project.clone", 26);
+    let cloned = fixture
+        .service()
+        .project_clone(
+            &actor(),
+            &ProjectCloneParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "undecidable"),
+                label: "undecidable".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: String::new(),
+                    credential_broker: String::new(),
+                },
+            },
+            Some(&submitted),
+        )
+        .expect("the clone completes");
+    // A plain directory, not a repository, standing where the operation's destination is. The
+    // reconciliation says the object it staged is published there — the identity matches — and
+    // then opening it as a repository fails, which is a publication this host cannot examine.
+    let plain = fixture.work().join("plain");
+    std::fs::create_dir_all(&plain).expect("a plain directory");
+    let identity = std::fs::metadata(&plain).expect("its metadata");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE operations SET state = 'publishing', ended_at_ms = NULL, staging_name = NULL,
+                    destination_name = 'plain', staged_device = ?2, staged_file_id = ?3,
+                    staged_created_at_ms = NULL
+              WHERE action_id = ?1",
+            rusqlite::params![
+                cloned.operation.action_id.get().as_bytes().to_vec(),
+                std::os::unix::fs::MetadataExt::dev(&identity) as i64,
+                std::os::unix::fs::MetadataExt::ino(&identity) as i64,
+            ],
+        )
+        .expect("the row points at something this host cannot read");
+    journal
+        .execute(
+            "UPDATE actions SET result = NULL, error_code = NULL, error_detail = NULL
+              WHERE action_id = ?1",
+            rusqlite::params![submitted.action_id.as_bytes().to_vec()],
+        )
+        .expect("the claim is open again");
+    drop(journal);
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover().expect("recovery runs");
+    assert_eq!(recovery.unresolved, 1);
+    assert_eq!(
+        recovery.claims_settled, 0,
+        "a claim this host may yet answer is not closed"
+    );
+    let operation = replacement
+        .read_operation(cloned.operation.action_id)
+        .expect("the operation reads");
+    assert_eq!(
+        operation.state,
+        OperationState::Publishing,
+        "the row stays where the next recovery will find it"
+    );
+    // A repeat is told the effect is in flight rather than given a permanent answer.
+    let refusal = replacement
+        .project_clone(
+            &actor(),
+            &ProjectCloneParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "undecidable"),
+                label: "undecidable".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: String::new(),
+                    credential_broker: String::new(),
+                },
+            },
+            Some(&submitted),
+        )
+        .expect_err("the repeat is not answered yet");
+    assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
+    assert!(
+        refusal.to_string().contains("not recorded yet"),
+        "and says the effect is still in flight: {refusal}"
+    );
+    // A second recovery asks the same question again rather than having closed it.
+    let again = replacement.recover().expect("recovery runs again");
+    assert_eq!(again.unresolved, 1);
+    assert_eq!(again.claims_settled, 0);
 }

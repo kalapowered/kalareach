@@ -644,24 +644,91 @@ fn a_configuration_key_that_carries_a_credential_is_not_repeated_in_a_diagnostic
             "kr:",
         ],
     );
+    // A token in a query is as much a credential as one in user information.
+    support::git_raw(
+        &path,
+        [
+            "config",
+            "--local",
+            "--",
+            "url.https://example.invalid/?access_token=QUERYSECRET.insteadOf",
+            "kq:",
+        ],
+    );
+    // And a driver's own name is a subsection too, so it can hold one as well.
+    support::git_raw(
+        &path,
+        [
+            "config",
+            "--local",
+            "--",
+            "filter.https://driveruser:DRIVERSECRET@example.invalid/.clean",
+            "cat",
+        ],
+    );
     let repository =
         OpenedRepository::open(fixture.service().profile(), fixture.environment_id(), &path)
             .expect("a read is allowed and states the limitation");
     let limitations = repository.audit().limitations().join("\n");
     assert!(
-        limitations.contains("insteadof"),
+        limitations.to_ascii_lowercase().contains("insteadof"),
         "the limitation names the key: {limitations}"
     );
     assert!(
-        !limitations.contains("SECRET"),
-        "and does not repeat what it carried: {limitations}"
+        limitations.contains("url.https://<credential removed>@example.invalid/"),
+        "what is left of the key is the key the repository holds: {limitations}"
     );
+    assert!(
+        limitations.contains("url.https://example.invalid/<query removed>"),
+        "a token in a query goes the same way: {limitations}"
+    );
+    assert!(
+        limitations.contains("the filter driver https://<credential removed>@example.invalid/"),
+        "and a driver's own name goes through the same redaction: {limitations}"
+    );
+    for secret in ["SECRET", "QUERYSECRET", "DRIVERSECRET"] {
+        assert!(
+            !limitations.contains(secret),
+            "no limitation repeats what a key carried ({secret}): {limitations}"
+        );
+    }
     let refusal = repository
         .audit()
         .require_neutralised()
         .expect_err("taking it into the registry is refused");
-    assert!(
-        !refusal.to_string().contains("SECRET"),
-        "the refusal does not repeat it either: {refusal}"
-    );
+    for secret in ["SECRET", "QUERYSECRET"] {
+        assert!(
+            !refusal.to_string().contains(secret),
+            "the refusal does not repeat it either ({secret}): {refusal}"
+        );
+    }
+}
+
+#[test]
+fn the_shortest_abbreviation_of_a_forbidden_option_is_refused() {
+    // Git accepts an unambiguous abbreviation of a long option, so a check that only looks at the
+    // spelled-out form is a check a caller walks around. `--t` is `--template`.
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "abbreviated");
+    for argument in [
+        "--t=/etc",
+        "--templ=/etc",
+        "-qf",
+        "--conf=filter.x.clean=sh",
+    ] {
+        let arguments = [
+            std::ffi::OsStr::new("status"),
+            std::ffi::OsStr::new(argument),
+        ];
+        let refusal = fixture
+            .service()
+            .profile()
+            .run(&kr_project::git::GitRequest::read(&path, &arguments))
+            .expect_err("an abbreviation of a forbidden option is refused");
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::InvalidArgument,
+            "{argument} is refused: {refusal}"
+        );
+    }
 }

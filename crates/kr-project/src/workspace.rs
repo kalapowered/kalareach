@@ -8,7 +8,8 @@
 //! Three rules run through everything here.
 //!
 //! * **Nothing is cleaned, stashed or discarded to start a reviewer.** An exclusion means the new
-//!   workspace starts without that file; it never means the original is touched. The restricted
+//!   workspace holds the base's version of that file rather than the user's; it never means the
+//!   original is touched. The restricted
 //!   profile enforces the same rule from underneath: `git clean`, `git stash`, `git reset`,
 //!   `git restore` and every `--force` are not things this service can run at all.
 //! * **A shared workspace keeps the user's state in place.** So its policy includes every class,
@@ -89,6 +90,12 @@ pub struct Survey {
     pub preview: InclusionPreview,
     /// Every entry, with its inclusion decision.
     pub entries: Vec<SurveyEntry>,
+    /// The paths inside an included directory that this host does not carry: a symbolic link, a
+    /// socket, a device.
+    ///
+    /// Named rather than dropped. A creation reports each of them as unapplied, so a workspace
+    /// that does not hold something the policy asked for says which paths those are.
+    pub unsupported: Vec<String>,
 }
 
 /// Parses `git status --porcelain=v2 -z`.
@@ -274,6 +281,7 @@ pub fn survey(
     // copies the files rather than nothing.
     let mut budget = MAX_BINARY_SCAN_ENTRIES;
     let mut truncated = 0_u64;
+    let mut unsupported: Vec<String> = Vec::new();
     let mut status: Vec<StatusEntry> = submodules
         .into_iter()
         .map(|path| StatusEntry {
@@ -289,9 +297,12 @@ pub fn survey(
                 repository.work_tree(),
                 prefix,
                 entry.class,
-                &mut status,
-                &mut budget,
-                &mut truncated,
+                &mut Walk {
+                    out: &mut status,
+                    budget: &mut budget,
+                    truncated: &mut truncated,
+                    unsupported: &mut unsupported,
+                },
                 0,
             ),
         }
@@ -392,9 +403,18 @@ pub fn survey(
     }
     if truncated > 0 {
         limitations.push(format!(
-            "{truncated} ignored directories hold more than the {MAX_BINARY_SCAN_ENTRIES} paths \
-             this preview walks, or are nested deeper than {MAX_DIRECTORY_DEPTH} levels, so what \
-             they hold beyond that is neither counted nor copied"
+            "{truncated} directories inside an ignored directory were not walked to the end: they \
+             hold more than the {MAX_BINARY_SCAN_ENTRIES} paths this preview walks, are nested \
+             deeper than {MAX_DIRECTORY_DEPTH} levels, or hold an entry this host could not read. \
+             What is beyond that is neither counted nor copied"
+        ));
+    }
+    if !unsupported.is_empty() {
+        limitations.push(format!(
+            "{} paths inside an ignored directory are a symbolic link, a socket or a device \
+             rather than file content; this host carries file content, so each is reported as \
+             unapplied rather than copied",
+            unsupported.len()
         ));
     }
     if omitted > 0 {
@@ -417,12 +437,25 @@ pub fn survey(
             unknown_content: U64::new(unknown),
             // The binary count covers the paths this host read, so a path it did not read makes
             // that count a lower bound as surely as an unwalked directory does.
-            counts_complete: truncated == 0 && unknown == 0,
+            counts_complete: truncated == 0 && unknown == 0 && unsupported.is_empty(),
             limitations,
             taken_at_ms: request.at_ms,
         },
         entries,
+        unsupported,
     })
+}
+
+/// What one directory walk is filling in.
+struct Walk<'a> {
+    /// The entries the walk found.
+    out: &'a mut Vec<StatusEntry>,
+    /// How many more paths it may read.
+    budget: &'a mut usize,
+    /// How many directories it could not walk to the end of.
+    truncated: &'a mut u64,
+    /// The paths it found that are not file content.
+    unsupported: &'a mut Vec<String>,
 }
 
 /// How deep this preview walks into an ignored directory.
@@ -440,13 +473,11 @@ fn expand(
     tree: &AuthorisedDirectory,
     prefix: &str,
     class: InclusionClass,
-    out: &mut Vec<StatusEntry>,
-    budget: &mut usize,
-    truncated: &mut u64,
+    walk: &mut Walk<'_>,
     depth: usize,
 ) {
-    if depth >= MAX_DIRECTORY_DEPTH || *budget == 0 {
-        *truncated += 1;
+    if depth >= MAX_DIRECTORY_DEPTH || *walk.budget == 0 {
+        *walk.truncated += 1;
         return;
     }
     let Ok(name) = RelativeName::parse(prefix) else {
@@ -454,7 +485,7 @@ fn expand(
     };
     let Ok(directory) = tree.subdirectory(&name) else {
         // Not a directory after all, or not reachable. It is still one entry the status reported.
-        out.push(StatusEntry {
+        walk.out.push(StatusEntry {
             path: prefix.to_owned(),
             class,
             change: ChangeKind::Present,
@@ -462,39 +493,40 @@ fn expand(
         return;
     };
     let Ok(entries) = directory.handle().entries() else {
-        *truncated += 1;
+        *walk.truncated += 1;
         return;
     };
     for entry in entries {
         let Ok(entry) = entry else {
             // A directory entry this host could not read is one it did not count.
-            *truncated += 1;
+            *walk.truncated += 1;
             continue;
         };
         let Ok(file_name) = entry.file_name().into_string() else {
-            *truncated += 1;
+            *walk.truncated += 1;
             continue;
         };
         let child = format!("{prefix}/{file_name}");
         match entry.file_type() {
             Ok(kind) if kind.is_dir() => {
-                expand(tree, &child, class, out, budget, truncated, depth + 1);
+                expand(tree, &child, class, walk, depth + 1);
             }
             Ok(kind) if kind.is_file() => {
-                if *budget == 0 {
-                    *truncated += 1;
+                if *walk.budget == 0 {
+                    *walk.truncated += 1;
                     return;
                 }
-                *budget -= 1;
-                out.push(StatusEntry {
+                *walk.budget -= 1;
+                walk.out.push(StatusEntry {
                     path: child,
                     class,
                     change: ChangeKind::Present,
                 });
             }
-            // A link, a socket or a device is not content this host copies, and one it did not
-            // count is one its counts do not cover.
-            _ => *truncated += 1,
+            // A link, a socket or a device is not file content, and this host carries file
+            // content. Each is named so a creation can report it as unapplied rather than leave
+            // the caller to notice it is missing.
+            _ => walk.unsupported.push(child),
         }
     }
 }
@@ -617,7 +649,8 @@ pub fn limitations_for(kind: WorkspaceKind) -> Vec<String> {
              what is copied is what was there when it was copied"
                 .to_owned(),
             "nothing in the source tree is cleaned, stashed or discarded: an exclusion means this \
-             workspace starts without the file, and the original stays where it is"
+             workspace holds the base's version of the file rather than the user's, and the \
+             original stays where it is"
                 .to_owned(),
         ],
     }
@@ -693,8 +726,35 @@ pub struct CopyReport {
     /// A symbolic link, a device, a submodule's own working tree, and a path whose destination
     /// this host could not replace. The caller reports these; it does not treat them as copied.
     pub skipped: Vec<String>,
+    /// The temporary files a failed copy left behind, because removing them failed too.
+    ///
+    /// A copy writes beside its destination and renames over it, so a failure ordinarily leaves
+    /// nothing. Where even the cleanup failed, the name goes here and the caller records it: a
+    /// file nobody accounts for in the user's new workspace is worse than a named one.
+    pub leftover: Vec<String>,
     /// How many bytes were copied.
     pub byte_len: u64,
+}
+
+/// What became of one path a copy was asked to carry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PathOutcome {
+    /// The workspace now holds the user's version of it.
+    Carried,
+    /// The workspace no longer holds it, because the user's tree does not.
+    Removed,
+    /// The workspace holds whatever the base had, because this host could not carry the user's.
+    Unapplied,
+}
+
+/// Returns the word one outcome is recorded under.
+#[must_use]
+pub const fn outcome_text(outcome: PathOutcome) -> &'static str {
+    match outcome {
+        PathOutcome::Carried => "carried",
+        PathOutcome::Removed => "removed",
+        PathOutcome::Unapplied => "unapplied",
+    }
 }
 
 /// Copies the entries a policy includes from one working tree into another.
@@ -711,6 +771,7 @@ pub fn copy_included(
     source: &AuthorisedDirectory,
     destination: &AuthorisedDirectory,
     entries: &[SurveyEntry],
+    progress: &mut dyn FnMut(&str, PathOutcome) -> Result<()>,
 ) -> Result<CopyReport> {
     let mut report = CopyReport::default();
     for entry in entries {
@@ -722,10 +783,12 @@ pub fn copy_included(
         // one is recorded as unapplied rather than half done.
         if matches!(entry.class, InclusionClass::Submodule) {
             report.skipped.push(entry.path.clone());
+            progress(&entry.path, PathOutcome::Unapplied)?;
             continue;
         }
         let Ok(name) = RelativeName::parse(&entry.path) else {
             report.skipped.push(entry.path.clone());
+            progress(&entry.path, PathOutcome::Unapplied)?;
             continue;
         };
         // A deletion is carried by removing the path from the new workspace. The checkout put the
@@ -733,15 +796,23 @@ pub fn copy_included(
         if matches!(entry.change, ChangeKind::Deleted) {
             if remove_one(destination, &name) {
                 report.removed.push(entry.path.clone());
+                progress(&entry.path, PathOutcome::Removed)?;
             } else {
                 report.skipped.push(entry.path.clone());
+                progress(&entry.path, PathOutcome::Unapplied)?;
             }
             continue;
         }
-        if copy_one(source, destination, &name, &mut report.byte_len)? {
+        // Each path's outcome is reported as it settles, not at the end. A daemon that dies part
+        // way through an inclusion leaves a record of which paths it had applied, which is what a
+        // reader of an unfinished workspace needs and what recovery reports.
+        let carried = copy_one(source, destination, &name, &mut report)?;
+        if carried {
             report.copied.push(entry.path.clone());
+            progress(&entry.path, PathOutcome::Carried)?;
         } else {
             report.skipped.push(entry.path.clone());
+            progress(&entry.path, PathOutcome::Unapplied)?;
         }
     }
     Ok(report)
@@ -776,12 +847,20 @@ fn copy_one(
     source: &AuthorisedDirectory,
     destination: &AuthorisedDirectory,
     name: &RelativeName,
-    total: &mut u64,
+    report: &mut CopyReport,
 ) -> Result<bool> {
     let Ok(file) = source.open_read(name, ObjectPolicy::ReadableFile) else {
         return Ok(false);
     };
+    // The source's permission bits are read before anything is written, because a copy that
+    // cannot carry them is a copy of a different file: an executable script that arrives without
+    // its executable bit does not run. A path whose mode this host could not read is reported as
+    // unapplied and the destination keeps what the base put there.
+    let Ok(mode) = source_mode(&file) else {
+        return Ok(false);
+    };
     let byte_len = file.byte_len();
+    let total = &mut report.byte_len;
     *total = total.saturating_add(byte_len);
     if *total > MAX_WORKSPACE_COPY_BYTES {
         return Err(ProjectError::QuotaExceeded {
@@ -803,11 +882,16 @@ fn copy_one(
     for component in parents {
         let component = RelativeName::parse(component)?;
         let above = here.as_ref().unwrap_or(destination);
-        here = Some(above.create_subdirectory(&component)?);
+        // A directory this host could not make is one path it cannot carry, not a reason to stop
+        // the inclusion: the checkout may hold a *file* at a name the user's tree has a directory
+        // at. The path is reported and the destination keeps what the base put there.
+        let Ok(next) = above.create_subdirectory(&component) else {
+            return Ok(false);
+        };
+        here = Some(next);
     }
     let target = here.as_ref().unwrap_or(destination);
     let leaf = RelativeName::parse(leaf)?;
-    let mode = source_mode(&file);
     let mut handle = file.into_handle();
     // The checkout may already have put the base's content at this name, and writing over it would
     // leave the base's tail behind whenever the user's file is shorter. So the copy is written to
@@ -815,10 +899,16 @@ fn copy_one(
     // a file in one step, so the destination is either the base's file or the user's and never
     // half of each. A failure anywhere before the rename leaves the destination as it was.
     let temporary = RelativeName::parse(&format!(".kr-copy-{}", random_name()))?;
-    let _ = target.remove(&temporary);
+    // Created exclusively, and never removed first: a name this host has not written is not its
+    // to delete, however unlikely the collision.
     let mut written = match target.create_new(&temporary) {
         Ok(created) => created,
         Err(_) => return Ok(false),
+    };
+    let temporary_path = if parents.is_empty() {
+        temporary.to_string()
+    } else {
+        format!("{}/{temporary}", parents.join("/"))
     };
     let mut buffer = vec![0_u8; 256 * 1024];
     let outcome = (|| -> Result<()> {
@@ -840,6 +930,10 @@ fn copy_one(
                     detail: format!("{leaf} could not be written: {error}"),
                 })?;
         }
+        // An executable script that arrives without its executable bit is not the file the user
+        // has, so the source's mode is carried across where the platform has one. It goes on
+        // before the flush, so what reaches the disk is the file's content *and* its mode.
+        apply_mode(&written, mode)?;
         // The bytes are durable before the name changes, so a power loss cannot leave the
         // destination naming a file whose content never reached the disk.
         written
@@ -848,21 +942,29 @@ fn copy_one(
             .map_err(|error| ProjectError::Destination {
                 detail: format!("{leaf} could not be flushed: {error}"),
             })?;
-        // An executable script that arrives without its executable bit is not the file the user
-        // has, so the source's mode is carried across where the platform has one.
-        apply_mode(&written, mode);
         Ok(())
     })();
     drop(written);
+    // Whatever went wrong, the destination keeps what it had. What is reported is whether this
+    // host managed to take its own temporary file away again.
     if let Err(error) = outcome {
-        let _ = target.remove(&temporary);
-        return Err(error);
+        if target.remove(&temporary).is_err() {
+            report.leftover.push(temporary_path);
+        }
+        // A quota is the one failure that stops the whole inclusion; anything about this one path
+        // is reported as a path that was not applied.
+        if matches!(error, ProjectError::QuotaExceeded { .. }) {
+            return Err(error);
+        }
+        return Ok(false);
     }
     if target.rename_into(&temporary, target, &leaf).is_err() {
         // Something this host could not replace is at the name: a directory where the source has a
         // file. The destination keeps whatever it had and the path is named rather than written
         // over.
-        let _ = target.remove(&temporary);
+        if target.remove(&temporary).is_err() {
+            report.leftover.push(temporary_path);
+        }
         return Ok(false);
     }
     target.sync()?;
@@ -870,37 +972,62 @@ fn copy_one(
 }
 
 /// Returns the source file's permission bits, where the platform has them.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::Destination`] when the source's own metadata cannot be read, because a
+/// copy that cannot carry the mode is a copy of a different file.
 #[cfg(unix)]
-fn source_mode(file: &kr_transfer::AuthorisedFile) -> Option<u32> {
+fn source_mode(file: &kr_transfer::AuthorisedFile) -> Result<Option<u32>> {
     use cap_std::fs::MetadataExt as _;
 
-    file.handle()
+    let metadata = file
+        .handle()
         .metadata()
-        .ok()
-        .map(|metadata| metadata.mode())
+        .map_err(|error| ProjectError::Destination {
+            detail: format!("a file's own permissions could not be read: {error}"),
+        })?;
+    Ok(Some(metadata.mode()))
 }
 
 /// Returns the source file's permission bits, where the platform has them.
+///
+/// # Errors
+///
+/// Never on a platform without permission bits.
 #[cfg(not(unix))]
-fn source_mode(_file: &kr_transfer::AuthorisedFile) -> Option<u32> {
-    None
+fn source_mode(_file: &kr_transfer::AuthorisedFile) -> Result<Option<u32>> {
+    Ok(None)
 }
 
 /// Puts the source's permission bits on the copy, where the platform has them.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::Destination`] when the bits cannot be set.
 #[cfg(unix)]
-fn apply_mode(file: &kr_transfer::AuthorisedFile, mode: Option<u32>) {
+fn apply_mode(file: &kr_transfer::AuthorisedFile, mode: Option<u32>) -> Result<()> {
     use cap_std::fs::PermissionsExt as _;
 
     if let Some(mode) = mode {
-        let _ = file
-            .handle()
-            .set_permissions(cap_std::fs::Permissions::from_mode(mode));
+        file.handle()
+            .set_permissions(cap_std::fs::Permissions::from_mode(mode))
+            .map_err(|error| ProjectError::Destination {
+                detail: format!("a copy's permissions could not be set: {error}"),
+            })?;
     }
+    Ok(())
 }
 
 /// Puts the source's permission bits on the copy, where the platform has them.
+///
+/// # Errors
+///
+/// Never on a platform without permission bits.
 #[cfg(not(unix))]
-fn apply_mode(_file: &kr_transfer::AuthorisedFile, _mode: Option<u32>) {}
+fn apply_mode(_file: &kr_transfer::AuthorisedFile, _mode: Option<u32>) -> Result<()> {
+    Ok(())
+}
 
 /// Returns a name for a copy in progress that nothing else will collide with.
 fn random_name() -> String {

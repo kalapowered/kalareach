@@ -276,6 +276,25 @@ impl OpenedRepository {
         self.audit.unchanged(&later)
     }
 
+    /// Re-reads this repository's configuration and refuses when it changed.
+    ///
+    /// The overrides an invocation runs with are built from the audit taken when the repository
+    /// was opened, and a writer under the same operating-system account can add a driver after
+    /// that. This is what a caller runs immediately before writing: it does not close the window
+    /// between the reading and the process starting — nothing Git offers does — but it does mean
+    /// the configuration a write runs under was read a moment earlier rather than whenever the
+    /// repository was opened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::IdentityChanged`] when the configuration changed, or
+    /// [`ProjectError::ConfigurationRejected`] when what it now holds cannot be neutralised.
+    pub fn recheck(&self, profile: &RestrictedProfile) -> Result<()> {
+        let later = ConfigurationAudit::take(profile, &self.top_level)?;
+        later.require_expressible()?;
+        self.audit.unchanged(&later)
+    }
+
     /// Builds a read that runs under this repository's own driver overrides.
     #[must_use]
     pub fn read<'a>(&'a self, arguments: &'a [&'a OsStr]) -> GitRequest<'a> {
@@ -302,6 +321,10 @@ impl OpenedRepository {
             OsStr::new("HEAD"),
         ];
         let output = profile.run(&self.read(&arguments))?;
+        // A non-zero exit is the answer for a repository with no commit yet, so the exit code is
+        // not what is checked here. A short read is still refused: an output this host holds only
+        // part of would look exactly like that answer.
+        output.require_complete()?;
         let revision = if output.success {
             let text = output.text().trim().to_owned();
             (!text.is_empty()).then_some(text)
@@ -314,6 +337,7 @@ impl OpenedRepository {
             OsStr::new("HEAD"),
         ];
         let output = profile.run(&self.read(&arguments))?;
+        output.require_complete()?;
         let reference = if output.success {
             let text = output.text().trim().to_owned();
             (!text.is_empty()).then_some(text)

@@ -867,6 +867,7 @@ fn a_workspace_row_holds_every_field_a_replacement_needs() {
         }),
         display_path: "/tmp/review".to_owned(),
         staging_name: None,
+        staging_identity: None,
         detail: None,
         retention: Some(RetentionPolicy::KeepEverything),
         created_at_ms: kr_protocol::scalars::TimestampMs::new(1),
@@ -1373,15 +1374,19 @@ fn an_included_executable_arrives_executable_and_a_failed_copy_leaves_the_base_i
     let fixture = Fixture::create();
     let path = ordinary_repository(fixture.work(), "executable");
     write(&path, "run.sh", "#!/bin/sh\necho base\n");
-    write(&path, "blocked", "the base's content\n");
+    std::fs::create_dir_all(path.join("blocked")).expect("a directory in the base");
+    write(&path.join("blocked"), "inner.txt", "the base's content\n");
     std::fs::set_permissions(path.join("run.sh"), std::fs::Permissions::from_mode(0o755))
         .expect("the script is executable");
     support::git_raw(&path, ["add", "-A"]);
     support::git_raw(&path, ["commit", "-m", "the base"]);
-    // The user's own versions.
+    // The user's own versions. Where the base has a directory, the user has a plain file: a copy
+    // cannot replace one with the other, so this is the path the inclusion has to report rather
+    // than write over.
     write(&path, "run.sh", "#!/bin/sh\necho mine\n");
     std::fs::set_permissions(path.join("run.sh"), std::fs::Permissions::from_mode(0o755))
         .expect("the user's script is executable too");
+    std::fs::remove_dir_all(path.join("blocked")).expect("the user removed the directory");
     write(&path, "blocked", "the user's content\n");
     let project = fixture
         .service()
@@ -1397,8 +1402,6 @@ fn an_included_executable_arrives_executable_and_a_failed_copy_leaves_the_base_i
         .expect("it is adopted")
         .project
         .project_repository_id;
-    // A worktree the host reserves, so a directory can be put where a file is expected before the
-    // inclusion runs. That is the case a copy must not write over.
     let created = fixture
         .service()
         .workspace_create(
@@ -1436,6 +1439,24 @@ fn an_included_executable_arrives_executable_and_a_failed_copy_leaves_the_base_i
         0o111,
         "an included executable keeps its executable bit"
     );
+    // The copy that could not land is named, and what the base put there is still there.
+    assert!(
+        created.unapplied.iter().any(|path| path == "blocked"),
+        "the path this host could not carry is named: {:?}",
+        created.unapplied
+    );
+    assert!(
+        tree.join("blocked").is_dir(),
+        "a copy that could not land does not write over what is at the name"
+    );
+    // And nothing of this host's own is left behind in the user's workspace.
+    let strays: Vec<String> = std::fs::read_dir(&tree)
+        .expect("the workspace lists")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".kr-copy-"))
+        .collect();
+    assert!(strays.is_empty(), "no copy in progress is left: {strays:?}");
 }
 
 #[test]
@@ -1616,5 +1637,261 @@ fn a_staged_deletion_is_carried_like_an_unstaged_one() {
     assert!(
         !fixture.work().join("staged-tree/README.md").exists(),
         "the workspace holds the deletion rather than the base's copy"
+    );
+}
+
+#[test]
+fn a_workspace_holding_a_populated_submodule_is_kept_rather_than_removed() {
+    // The status a removal reads asks Git to ignore submodules, because looking inside one would
+    // run under a configuration this host has not audited. So an empty status is an empty status
+    // of the tree *outside* its submodules, and work inside one is work this host has not read.
+    let fixture = Fixture::create();
+    let planted = support::planted_submodule(fixture.work(), "submodule-holder");
+    let project = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "submodule-holder",
+                ),
+                label: "holder".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 60)),
+        )
+        .expect("it is adopted")
+        .project
+        .project_repository_id;
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "holder".to_owned(),
+                kind: WorkspaceKind::SharedExisting,
+                isolation: Nullable(None),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(None),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 61)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    assert!(
+        planted.parent.join("vendor/child").is_dir(),
+        "the submodule's own tree is populated"
+    );
+    let answer = fixture
+        .service()
+        .workspace_remove(
+            &WorkspaceRemoveParams {
+                workspace_id,
+                retention: RetentionPolicy::KeepEverything,
+            },
+            Some(&action("workspace.remove", 62)),
+        )
+        .expect("the removal is answered");
+    assert_eq!(answer.workspace.state, WorkspaceState::RemovalPending);
+    assert!(
+        answer
+            .retained
+            .iter()
+            .any(|item| item.detail.contains("does not look inside")),
+        "the host says the submodule is work it has not read: {:?}",
+        answer.retained
+    );
+    assert!(
+        planted.parent.join("vendor/child/a.txt").is_file(),
+        "nothing inside the submodule was touched"
+    );
+    // And no marker inside the submodule ran while the removal measured what the workspace holds.
+    assert!(
+        !planted.sentinels.exists()
+            || std::fs::read_dir(&planted.sentinels)
+                .is_ok_and(|mut entries| entries.next().is_none()),
+        "no planted helper ran"
+    );
+}
+
+#[test]
+fn a_recovered_workspace_creation_answers_from_the_journal_rather_than_unknown() {
+    // A daemon can die between calling a workspace ready and recording the result. The workspace
+    // is sitting there, so a repeat of the action is answered from the journal: the summary and
+    // what the inclusion could not carry are durable, and the preview says it is not a measurement
+    // this host still holds.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "recovered");
+    let submitted = action("workspace.create", 63);
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "recovered".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "recovered-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&submitted),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    // The state a daemon that died before recording the result leaves: the workspace is ready and
+    // the claim is open.
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE actions SET result = NULL, error_code = NULL, error_detail = NULL
+              WHERE action_id = ?1",
+            rusqlite::params![submitted.action_id.as_bytes().to_vec()],
+        )
+        .expect("the claim is open again");
+    drop(journal);
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover().expect("recovery runs");
+    assert_eq!(recovery.claims_settled, 1);
+    let repeated = replacement
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "recovered".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "recovered-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&submitted),
+        )
+        .expect("the repeat is answered from the journal");
+    assert_eq!(
+        repeated.workspace.0.expect("the workspace").workspace_id,
+        workspace_id
+    );
+    assert!(
+        !repeated.preview.counts_complete,
+        "a rebuilt preview does not claim to be a measurement"
+    );
+    assert!(
+        repeated
+            .preview
+            .limitations
+            .iter()
+            .any(|line| line.contains("rebuilt from the journal")),
+        "and says so: {:?}",
+        repeated.preview.limitations
+    );
+}
+
+#[test]
+fn a_staging_name_a_workspace_recorded_is_swept_only_while_it_holds_that_object() {
+    // A workspace row names the private sibling an independent clone was staged in. A recorded
+    // name is not authority to remove whatever holds it later, so the sweep removes the object
+    // whose identity the row holds and leaves a replacement alone.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "sibling");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "sibling".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::IndependentClone)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "sibling-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 64)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    // A directory the user put at a name this host once used, recorded on the row with the
+    // identity of something else.
+    let replaced = fixture.work().join(".kr-project-replaced");
+    std::fs::create_dir_all(replaced.join("mine")).expect("the user's own directory");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE workspaces SET staging_name = ?2, staging_device = ?3, staging_file_id = ?4
+              WHERE workspace_id = ?1",
+            rusqlite::params![
+                workspace_id.get().as_bytes().to_vec(),
+                ".kr-project-replaced",
+                1_i64,
+                1_i64,
+            ],
+        )
+        .expect("the name and a different identity are recorded");
+    drop(journal);
+    let replacement = fixture.reopen();
+    replacement.recover().expect("recovery runs");
+    assert!(
+        replaced.join("mine").is_dir(),
+        "a directory whose identity is not the recorded one is left alone"
+    );
+    // And once the row holds that object's own identity, the sweep takes it.
+    let identity = std::fs::metadata(&replaced).expect("its metadata");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE workspaces SET staging_name = ?2, staging_device = ?3, staging_file_id = ?4
+              WHERE workspace_id = ?1",
+            rusqlite::params![
+                workspace_id.get().as_bytes().to_vec(),
+                ".kr-project-replaced",
+                std::os::unix::fs::MetadataExt::dev(&identity) as i64,
+                std::os::unix::fs::MetadataExt::ino(&identity) as i64,
+            ],
+        )
+        .expect("the recorded identity is that object's own");
+    drop(journal);
+    let replacement = fixture.reopen();
+    replacement.recover().expect("recovery runs again");
+    assert!(
+        !replaced.exists(),
+        "the sibling whose identity the row holds is removed"
     );
 }

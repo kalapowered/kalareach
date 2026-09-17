@@ -46,7 +46,7 @@ use crate::identity::RepositoryIdentity;
 use crate::operation::StagedWitness;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// The directory, under the environment's state directory, that the project service owns.
 pub const PROJECTS_DIRECTORY: &str = "projects";
@@ -110,8 +110,19 @@ pub struct WorkspaceUpdate<'a> {
     pub removed_at_ms: Option<TimestampMs>,
     /// The private sibling an independent clone is staged in.
     pub staging_name: Option<&'a str>,
+    /// The filesystem identity of that sibling, once the directory exists.
+    pub staging_identity: Option<ObjectIdentity>,
     /// Why it is in the state it is in.
     pub detail: Option<&'a str>,
+}
+
+/// A workspace reserved for removal, and the token that reservation is held under.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reservation {
+    /// The workspace as it was inside the reserving transaction.
+    pub row: WorkspaceRow,
+    /// What the reservation is held under, so only its holder releases it.
+    pub token: Uuid,
 }
 
 /// One recorded workspace.
@@ -143,6 +154,9 @@ pub struct WorkspaceRow {
     pub display_path: String,
     /// The private sibling an independent clone was staged in, while one existed.
     pub staging_name: Option<String>,
+    /// That sibling's own filesystem identity, so a cleanup removes the directory this host
+    /// created rather than whatever holds the name now.
+    pub staging_identity: Option<ObjectIdentity>,
     /// Why it is in the state it is in, when it ended up there for a reason.
     pub detail: Option<String>,
     /// The retention policy a removal was requested under, when one was.
@@ -362,10 +376,19 @@ impl Store {
                      tree_file_id          INTEGER,
                      display_path          TEXT NOT NULL,
                      staging_name          TEXT,
+                     staging_device        INTEGER,
+                     staging_file_id       INTEGER,
+                     removal_action        BLOB,
                      detail                TEXT,
                      retention             TEXT,
                      created_at_ms         INTEGER NOT NULL,
                      removed_at_ms         INTEGER
+                 );
+                 CREATE TABLE IF NOT EXISTS workspace_progress (
+                     workspace_id BLOB NOT NULL,
+                     path         TEXT NOT NULL,
+                     outcome      TEXT NOT NULL,
+                     PRIMARY KEY (workspace_id, path)
                  );
                  CREATE TABLE IF NOT EXISTS workspace_sessions (
                      workspace_id BLOB NOT NULL,
@@ -457,6 +480,18 @@ impl Store {
                     .map_err(ProjectError::store)?;
             }
             Some(version) if version == SCHEMA_VERSION => {}
+            // Forward only. `CREATE TABLE IF NOT EXISTS` leaves a table that already exists
+            // exactly as it was, so a store written by an earlier build has the tables and not
+            // the columns added since: each one is added here and the version is moved on.
+            Some(version) if version < SCHEMA_VERSION => {
+                self.add_missing_columns()?;
+                self.connection
+                    .execute(
+                        "UPDATE schema_version SET version = ?1",
+                        params![SCHEMA_VERSION],
+                    )
+                    .map_err(ProjectError::store)?;
+            }
             Some(version) => {
                 return Err(ProjectError::StoreUnavailable {
                     detail: format!(
@@ -464,6 +499,37 @@ impl Store {
                          {SCHEMA_VERSION}"
                     ),
                 });
+            }
+        }
+        Ok(())
+    }
+
+    /// Adds the columns a store written by an earlier build does not have.
+    ///
+    /// Every one of them is nullable and means "not recorded", which is what an older row holds
+    /// anyway: a staging directory an earlier build created has no recorded identity, and the
+    /// cleanup leaves such a name alone rather than deleting whatever now holds it.
+    fn add_missing_columns(&self) -> Result<()> {
+        const ADDED: &[(&str, &str, &str)] = &[
+            ("operations", "staging_device", "INTEGER"),
+            ("operations", "staging_file_id", "INTEGER"),
+            ("workspaces", "staging_device", "INTEGER"),
+            ("workspaces", "staging_file_id", "INTEGER"),
+            ("workspaces", "removal_action", "BLOB"),
+        ];
+        for (table, column, kind) in ADDED {
+            let present: i64 = self
+                .connection
+                .query_row(
+                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                    params![table, column],
+                    |row| row.get(0),
+                )
+                .map_err(ProjectError::store)?;
+            if present == 0 {
+                self.connection
+                    .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))
+                    .map_err(ProjectError::store)?;
             }
         }
         Ok(())
@@ -823,6 +889,7 @@ impl Store {
                 retention,
                 removed_at_ms,
                 staging_name: None,
+                staging_identity: None,
                 detail: None,
             },
         )
@@ -844,6 +911,7 @@ impl Store {
             retention,
             removed_at_ms,
             staging_name,
+            staging_identity,
             detail,
         } = *update;
         let now = kr_ipc::now_ms();
@@ -857,7 +925,9 @@ impl Store {
                         retention = COALESCE(?5, retention),
                         removed_at_ms = COALESCE(?6, removed_at_ms),
                         staging_name = COALESCE(?7, staging_name),
-                        detail = COALESCE(?8, detail)
+                        staging_device = COALESCE(?8, staging_device),
+                        staging_file_id = COALESCE(?9, staging_file_id),
+                        detail = COALESCE(?10, detail)
                   WHERE workspace_id = ?1",
                 params![
                     id.get().as_bytes().to_vec(),
@@ -867,6 +937,8 @@ impl Store {
                     retention.map(retention_text),
                     removed_at_ms.map(|stamp| i64_of(stamp.get())),
                     staging_name,
+                    staging_identity.map(|identity| i64_of(identity.device)),
+                    staging_identity.map(|identity| i64_of(identity.file_id)),
                     detail,
                 ],
             )
@@ -893,15 +965,15 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`ProjectError::UnknownWorkspace`] when there is no such workspace,
-    /// [`ProjectError::WrongState`] while it is being materialised, [`ProjectError::StillBound`]
-    /// while a session or a run holds it, or [`ProjectError::IdConflict`] when the action was used
-    /// for another request.
+    /// [`ProjectError::WrongState`] while it is being materialised or while another removal of it
+    /// is in progress, [`ProjectError::StillBound`] while a session or a run holds it, or
+    /// [`ProjectError::IdConflict`] when the action was used for another request.
     pub fn begin_removal(
         &mut self,
         workspace_id: WorkspaceId,
         retention: RetentionPolicy,
         action: Option<&Action>,
-    ) -> Result<WorkspaceRow> {
+    ) -> Result<Reservation> {
         let now = kr_ipc::now_ms();
         let transaction = self.transaction()?;
         if let Some(action) = action {
@@ -923,6 +995,30 @@ impl Store {
                 detail: format!(
                     "workspace {workspace_id} is still being materialised, so what is in its \
                      directory is not yet something this host can account for"
+                ),
+            });
+        }
+        // One removal at a time. `removal_pending` is a state a workspace *rests* in — it holds
+        // work the user has not approved removing — so the state alone cannot say whether a
+        // removal is running. This does: while one holds the reservation, a second is refused
+        // rather than allowed to measure a tree the first is deleting underneath it.
+        let held: Option<Vec<u8>> = transaction
+            .query_row(
+                "SELECT removal_action FROM workspaces WHERE workspace_id = ?1",
+                params![workspace_id.get().as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .map_err(ProjectError::store)?;
+        // A call with no action identifier still excludes another: the reservation is held
+        // under a token of this host's own making.
+        let token = action.map_or_else(fresh_uuid, |action| action.action_id);
+        if let Some(held) = held.as_deref().and_then(uuid_of)
+            && held != token
+        {
+            return Err(ProjectError::WrongState {
+                detail: format!(
+                    "a removal of workspace {workspace_id} is already in progress; read the \
+                     workspace for what it holds rather than removing it twice"
                 ),
             });
         }
@@ -950,11 +1046,13 @@ impl Store {
         }
         transaction
             .execute(
-                "UPDATE workspaces SET state = ?2, retention = ?3 WHERE workspace_id = ?1",
+                "UPDATE workspaces SET state = ?2, retention = ?3, removal_action = ?4
+                  WHERE workspace_id = ?1",
                 params![
                     workspace_id.get().as_bytes().to_vec(),
                     workspace_state_text(WorkspaceState::RemovalPending),
                     retention_text(retention),
+                    token.as_bytes().to_vec(),
                 ],
             )
             .map_err(ProjectError::store)?;
@@ -965,7 +1063,108 @@ impl Store {
             now,
         )?;
         transaction.commit().map_err(ProjectError::store)?;
-        Ok(row)
+        Ok(Reservation { row, token })
+    }
+
+    /// Releases a removal reservation without changing what the workspace holds.
+    ///
+    /// What a removal that failed leaves behind is a workspace nothing is removing, so the next
+    /// request can be served. The token is checked: a release only ever gives up this caller's own
+    /// reservation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn release_removal(&mut self, workspace_id: WorkspaceId, token: Uuid) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE workspaces SET removal_action = NULL
+                  WHERE workspace_id = ?1 AND removal_action = ?2",
+                params![
+                    workspace_id.get().as_bytes().to_vec(),
+                    token.as_bytes().to_vec()
+                ],
+            )
+            .map(|_| ())
+            .map_err(ProjectError::store)
+    }
+
+    /// Releases every removal reservation, because the daemon that held them is gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn release_stale_removals(&mut self) -> Result<u64> {
+        let changed = self
+            .connection
+            .execute(
+                "UPDATE workspaces SET removal_action = NULL WHERE removal_action IS NOT NULL",
+                [],
+            )
+            .map_err(ProjectError::store)?;
+        Ok(u64::try_from(changed).unwrap_or(0))
+    }
+
+    /// Records what became of one batch of paths an inclusion was asked to carry.
+    ///
+    /// Written as the copy runs rather than at the end of it, so a daemon that dies part way
+    /// through leaves a record of the paths it had applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn record_workspace_progress(
+        &mut self,
+        workspace_id: WorkspaceId,
+        applied: &[(String, &'static str)],
+    ) -> Result<()> {
+        if applied.is_empty() {
+            return Ok(());
+        }
+        let now = kr_ipc::now_ms();
+        let transaction = self.transaction()?;
+        for (path, outcome) in applied {
+            transaction
+                .execute(
+                    "INSERT INTO workspace_progress (workspace_id, path, outcome)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT (workspace_id, path) DO UPDATE SET outcome = excluded.outcome",
+                    params![workspace_id.get().as_bytes().to_vec(), path, outcome],
+                )
+                .map_err(ProjectError::store)?;
+        }
+        announce(
+            &transaction,
+            "workspace.progress",
+            &workspace_id.to_string(),
+            now,
+        )?;
+        transaction.commit().map_err(ProjectError::store)
+    }
+
+    /// Returns what an inclusion recorded for each path it reached, in path order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the rows cannot be read.
+    pub fn workspace_progress(&self, workspace_id: WorkspaceId) -> Result<Vec<(String, String)>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT path, outcome FROM workspace_progress WHERE workspace_id = ?1
+                  ORDER BY path",
+            )
+            .map_err(ProjectError::store)?;
+        let mapped = statement
+            .query_map(params![workspace_id.get().as_bytes().to_vec()], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(ProjectError::store)?;
+        let mut rows = Vec::new();
+        for row in mapped {
+            rows.push(row.map_err(ProjectError::store)?);
+        }
+        Ok(rows)
     }
 
     /// Finishes a removal in one transaction: re-reads what is held, releases it where the policy
@@ -1026,7 +1225,8 @@ impl Store {
         };
         transaction
             .execute(
-                "UPDATE workspaces SET state = ?2, retention = ?3, removed_at_ms = ?4
+                "UPDATE workspaces SET state = ?2, retention = ?3, removed_at_ms = ?4,
+                        removal_action = NULL
                   WHERE workspace_id = ?1",
                 params![
                     workspace_id.get().as_bytes().to_vec(),
@@ -1056,7 +1256,9 @@ impl Store {
         let transaction = self.transaction()?;
         transaction
             .execute(
-                "UPDATE workspaces SET staging_name = NULL WHERE workspace_id = ?1",
+                "UPDATE workspaces
+                    SET staging_name = NULL, staging_device = NULL, staging_file_id = NULL
+                  WHERE workspace_id = ?1",
                 params![id.get().as_bytes().to_vec()],
             )
             .map_err(ProjectError::store)?;
@@ -1781,7 +1983,8 @@ const PROJECT_COLUMNS: &str = "project_repository_id, environment_id, label, ori
 const WORKSPACE_COLUMNS: &str = "workspace_id, project_repository_id, environment_id, label, \
      kind, isolation, dirty_files, untracked_files, submodules, binary_files, \
      generated_artefacts, state, base_revision, base_change_set_id, tree_device, tree_file_id, \
-     display_path, staging_name, detail, retention, created_at_ms, removed_at_ms";
+     display_path, staging_name, detail, retention, created_at_ms, removed_at_ms, \
+     staging_device, staging_file_id";
 
 fn insert_operation(transaction: &Transaction<'_>, row: &OperationRow) -> Result<()> {
     let remote = row.remote.as_ref();
@@ -2021,6 +2224,8 @@ fn read_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRow> {
     let device: Option<i64> = row.get(14)?;
     let file_id: Option<i64> = row.get(15)?;
     let retention: Option<String> = row.get(19)?;
+    let staging_device: Option<i64> = row.get(22)?;
+    let staging_file_id: Option<i64> = row.get(23)?;
     Ok(WorkspaceRow {
         workspace_id: WorkspaceId::new(
             uuid_of(&workspace).unwrap_or_else(|| Uuid::from_bytes([0; 16])),
@@ -2056,6 +2261,13 @@ fn read_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRow> {
         },
         display_path: row.get(16)?,
         staging_name: row.get(17)?,
+        staging_identity: match (staging_device, staging_file_id) {
+            (Some(device), Some(file_id)) => Some(ObjectIdentity {
+                device: u64_of(device),
+                file_id: u64_of(file_id),
+            }),
+            _ => None,
+        },
         detail: row.get(18)?,
         retention: retention.as_deref().map(retention_of),
         created_at_ms: TimestampMs::new(u64_of(row.get::<_, i64>(20)?)),
@@ -2078,6 +2290,11 @@ fn actor_column(row: &rusqlite::Row<'_>, index: usize) -> rusqlite::Result<Actor
             )),
         )
     })
+}
+
+/// Returns an identifier nothing else holds.
+fn fresh_uuid() -> Uuid {
+    Uuid::from_bytes(*uuid::Uuid::new_v4().as_bytes())
 }
 
 /// Reads a 16-byte identifier out of a stored blob.
@@ -2445,6 +2662,7 @@ mod tests {
             identity: None,
             display_path: "/tmp/review".to_owned(),
             staging_name: None,
+            staging_identity: None,
             detail: None,
             retention: None,
             created_at_ms: TimestampMs::new(2_000),
@@ -2585,6 +2803,7 @@ mod tests {
             identity: None,
             display_path: "/tmp/review".to_owned(),
             staging_name: None,
+            staging_identity: None,
             detail: None,
             retention: None,
             created_at_ms: TimestampMs::new(3_000),
@@ -2698,6 +2917,7 @@ mod tests {
             identity: None,
             display_path: "/tmp/reserved".to_owned(),
             staging_name: None,
+            staging_identity: None,
             detail: None,
             retention: None,
             created_at_ms: TimestampMs::new(1),
@@ -2706,7 +2926,7 @@ mod tests {
         store.begin_workspace(&workspace, None).expect("it begins");
         // The reservation, the checks and the claim are one transaction, so a holder that arrives
         // afterwards finds a workspace nothing new may hold.
-        store
+        let reserved = store
             .begin_removal(workspace_id, RetentionPolicy::KeepEverything, None)
             .expect("the removal is reserved");
         let refusal = store
@@ -2717,6 +2937,19 @@ mod tests {
             )
             .expect_err("a reserved workspace takes no new session");
         assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+        // While that reservation is held, another removal is refused rather than allowed to
+        // measure a tree the first one is deleting underneath it.
+        let refusal = store
+            .begin_removal(
+                workspace_id,
+                RetentionPolicy::KeepEverything,
+                Some(&action(41, "workspace.remove")),
+            )
+            .expect_err("a second removal does not begin beside the first");
+        assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+        store
+            .release_removal(workspace_id, reserved.token)
+            .expect("the reservation is released");
         // And a second copy of one removal action does not reserve it twice.
         store
             .begin_removal(
@@ -2733,6 +2966,91 @@ mod tests {
             )
             .expect_err("the second copy does not");
         assert_eq!(refusal.code(), ErrorCode::OutcomeUnknown);
+    }
+
+    #[test]
+    fn a_store_written_by_an_earlier_build_gains_the_columns_it_is_missing() {
+        // The tables are created only when they are absent, so a store an earlier build wrote has
+        // the tables and not the columns added since. Opening it has to add them: a replacement
+        // daemon that cannot read its own journal cannot recover anything.
+        let directory = tempfile::tempdir().expect("a directory");
+        let path = directory.path().join("projects.sqlite");
+        let earlier = Connection::open(&path).expect("an earlier store opens");
+        earlier
+            .execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES (1);
+                 CREATE TABLE operations (
+                     action_id             BLOB PRIMARY KEY,
+                     actor_id              TEXT NOT NULL,
+                     environment_id        BLOB NOT NULL,
+                     project_repository_id BLOB NOT NULL,
+                     method                TEXT NOT NULL,
+                     state                 TEXT NOT NULL,
+                     remote_name           TEXT,
+                     remote_transport      TEXT,
+                     remote_url            TEXT,
+                     remote_provider       TEXT,
+                     remote_broker         TEXT,
+                     flow                  TEXT,
+                     destination_state     TEXT NOT NULL,
+                     parent_path           TEXT NOT NULL,
+                     destination_name      TEXT NOT NULL,
+                     staging_name          TEXT,
+                     staged_device         INTEGER,
+                     staged_file_id        INTEGER,
+                     staged_created_at_ms  INTEGER,
+                     detail                TEXT,
+                     started_at_ms         INTEGER NOT NULL,
+                     ended_at_ms           INTEGER
+                 );
+                 CREATE TABLE workspaces (
+                     workspace_id          BLOB PRIMARY KEY,
+                     project_repository_id BLOB NOT NULL,
+                     environment_id        BLOB NOT NULL,
+                     label                 TEXT NOT NULL,
+                     kind                  TEXT NOT NULL,
+                     isolation             TEXT,
+                     dirty_files           TEXT NOT NULL,
+                     untracked_files       TEXT NOT NULL,
+                     submodules            TEXT NOT NULL,
+                     binary_files          TEXT NOT NULL,
+                     generated_artefacts   TEXT NOT NULL,
+                     state                 TEXT NOT NULL,
+                     base_revision         TEXT NOT NULL,
+                     base_change_set_id    BLOB,
+                     tree_device           INTEGER,
+                     tree_file_id          INTEGER,
+                     display_path          TEXT NOT NULL,
+                     staging_name          TEXT,
+                     detail                TEXT,
+                     retention             TEXT,
+                     created_at_ms         INTEGER NOT NULL,
+                     removed_at_ms         INTEGER
+                 );",
+            )
+            .expect("the earlier shape is written");
+        drop(earlier);
+        let store = Store::open(&path, environment()).expect("this build opens it");
+        // The columns a replacement daemon reads are there, and the version says so.
+        assert!(store.operations_in(&[OperationState::Staging]).is_ok());
+        assert!(store.workspaces(environment(), None).is_ok());
+        let version: i64 = store
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .expect("the version reads");
+        assert_eq!(version, SCHEMA_VERSION);
+        // And a store from a *later* build is refused rather than half read.
+        store
+            .connection
+            .execute(
+                "UPDATE schema_version SET version = ?1",
+                params![SCHEMA_VERSION + 1],
+            )
+            .expect("a later version is written");
+        drop(store);
+        let refusal = Store::open(&path, environment()).expect_err("a later store is refused");
+        assert_eq!(refusal.code(), ErrorCode::StorageUnavailable);
     }
 
     #[test]
@@ -2753,6 +3071,7 @@ mod tests {
             identity: None,
             display_path: "/tmp/held".to_owned(),
             staging_name: None,
+            staging_identity: None,
             detail: None,
             retention: None,
             created_at_ms: TimestampMs::new(1),

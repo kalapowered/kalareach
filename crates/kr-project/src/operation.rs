@@ -340,8 +340,21 @@ impl StagingSibling {
     ///
     /// Returns [`ProjectError::Destination`] when the removal fails for a reason other than the
     /// directory already being gone.
-    pub fn remove(self, destination: &Destination) -> Result<()> {
+    pub fn remove(&self, destination: &Destination) -> Result<()> {
         self.remove_if(destination, None)
+    }
+
+    /// Returns whether anything is at the sibling's name now.
+    ///
+    /// What a cleanup records is whether the directory is gone, and "gone" is a fact about the
+    /// filesystem rather than about whether this call did the removing.
+    #[must_use]
+    pub fn occupied(&self, destination: &Destination) -> bool {
+        destination
+            .parent
+            .handle()
+            .symlink_metadata(self.name.as_str())
+            .is_ok()
     }
 
     /// Removes the sibling only when it is still the object whose identity was recorded.
@@ -355,7 +368,7 @@ impl StagingSibling {
     /// [`ProjectError::Destination`] when the removal fails for a reason other than the directory
     /// already being gone.
     pub fn remove_if(
-        self,
+        &self,
         destination: &Destination,
         expected: Option<ObjectIdentity>,
     ) -> Result<()> {
@@ -371,11 +384,15 @@ impl StagingSibling {
                 ),
             });
         }
-        match destination
-            .parent
-            .handle()
-            .remove_dir_all(self.name.as_str())
-        {
+        // What is inside goes through this sibling's *own* open handle, so every one of those
+        // removals is of something reached from the directory whose identity was just checked
+        // rather than through a name that could be swapped underneath it.
+        self.clear()?;
+        // The name itself can only be removed through the parent, and there is no way to ask a
+        // filesystem to remove "the name, if it still holds this object". What there is, is this:
+        // an empty-directory removal refuses a directory that is not empty. So a replacement that
+        // holds anything is refused here rather than deleted, and the caller is told.
+        match destination.parent.handle().remove_dir(self.name.as_str()) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -385,6 +402,41 @@ impl StagingSibling {
             }
         }
         destination.parent.sync()?;
+        Ok(())
+    }
+
+    /// Removes everything inside the sibling, through the sibling's own handle.
+    fn clear(&self) -> Result<()> {
+        let entries = match self.directory.handle().entries() {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(ProjectError::Destination {
+                    detail: format!("{} could not be read: {error}", self.path.display()),
+                });
+            }
+        };
+        for entry in entries {
+            let entry = entry.map_err(|error| ProjectError::Destination {
+                detail: format!("{} could not be read: {error}", self.path.display()),
+            })?;
+            let name = entry.file_name();
+            let directory = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            let outcome = if directory {
+                self.directory.handle().remove_dir_all(&name)
+            } else {
+                self.directory.handle().remove_file(&name)
+            };
+            match outcome {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(ProjectError::Destination {
+                        detail: format!("{} could not be emptied: {error}", self.path.display()),
+                    });
+                }
+            }
+        }
         Ok(())
     }
 }

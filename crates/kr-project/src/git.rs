@@ -48,8 +48,8 @@ use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kr_protocol::project::{GIT_READ_DEADLINE, MAX_GIT_OUTPUT_BYTES, RemoteTransport};
@@ -303,7 +303,7 @@ pub fn check_arguments(arguments: &[&OsStr]) -> Result<()> {
         // The one template directory an invocation may name is the empty one the profile already
         // points at, so an explicit `--template=` carries nothing. An abbreviation of it is the
         // same option, so only the exact empty form is allowed through.
-        if "--template".starts_with(head) && head.len() > 3 && text != "--template=" {
+        if "--template".starts_with(head) && head.len() > 2 && text != "--template=" {
             return Err(ProjectError::InvalidArgument(format!(
                 "{text} names a template directory whose hooks would be copied into the new \
                  repository"
@@ -632,12 +632,17 @@ impl RestrictedProfile {
         };
         let out = join(out, request)?;
         let err = join(err, request)?;
+        let stderr = redact(&String::from_utf8_lossy(&err.bytes));
         Ok(GitOutput {
             status: status.code(),
             success: status.success(),
             stdout: out.bytes,
             stdout_truncated: out.truncated,
-            stderr: redact(&String::from_utf8_lossy(&err.bytes)),
+            stderr: if err.truncated {
+                format!("{stderr} (this host read part of what was said)")
+            } else {
+                stderr
+            },
             command: request.describe(),
         })
     }
@@ -1140,6 +1145,28 @@ impl GitOutput {
         Ok(())
     }
 
+    /// Refuses when the output this host holds is not the whole of what Git wrote.
+    ///
+    /// A caller that reads the output without going through [`Self::require_success`] — one that
+    /// treats a non-zero exit as an answer rather than a failure — needs this: a short read looks
+    /// exactly like an empty answer, and an empty answer is a fact about the repository.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::GitFailed`] when the standard output was cut short.
+    pub fn require_complete(&self) -> Result<()> {
+        if self.stdout_truncated {
+            return Err(ProjectError::GitFailed {
+                detail: format!(
+                    "{} produced more output than this host could read, so what it said is not \
+                     what this host holds",
+                    self.command
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Returns the standard output as text.
     #[must_use]
     pub fn text(&self) -> std::borrow::Cow<'_, str> {
@@ -1267,9 +1294,14 @@ impl ConfigurationAudit {
             }
             for rule in EXECUTION_KEYS {
                 if rule.matches(&lower) {
+                    // The key is matched against its lowercase form and recorded as it is
+                    // written. A subsection is case-sensitive, and a key whose subsection holds a
+                    // URL carries that URL's own case: recording the lowercase form would put a
+                    // key in a diagnostic that is not the key the repository holds, and would
+                    // hide a credential from the redaction that runs over it.
                     match rule.disposal {
-                        Disposal::Blank => blanked.push(lower.clone()),
-                        Disposal::Refuse => refused.push(lower.clone()),
+                        Disposal::Blank => blanked.push(key.to_owned()),
+                        Disposal::Refuse => refused.push(key.to_owned()),
                     }
                 }
             }
@@ -1324,8 +1356,9 @@ impl ConfigurationAudit {
         }
         for (section, name) in &self.drivers {
             lines.push(format!(
-                "the {section} driver {name} is defined and is not run, so content it would have \
-                 converted is read as it is stored"
+                "the {section} driver {} is defined and is not run, so content it would have \
+                 converted is read as it is stored",
+                redact(name)
             ));
         }
         for key in &self.refused {
@@ -1446,7 +1479,21 @@ pub fn redact(text: &str) -> String {
             }
             _ => out.push_str(authority),
         }
-        rest = tail;
+        // A token travels in a query as often as in user information
+        // (`https://host/path?access_token=...`), and a fragment is no safer. The URL ends at
+        // whitespace or a quote, so everything from the first `?` or `#` to there goes too.
+        let ends_at = tail
+            .find([' ', '\t', '\n', '\r', '"', '\''])
+            .unwrap_or(tail.len());
+        let (url_tail, beyond) = tail.split_at(ends_at);
+        match url_tail.find(['?', '#']) {
+            Some(query) => {
+                out.push_str(&url_tail[..query]);
+                out.push_str("<query removed>");
+            }
+            None => out.push_str(url_tail),
+        }
+        rest = beyond;
     }
     out.push_str(rest);
     out
@@ -1466,32 +1513,62 @@ struct Bounded {
 /// was read so far is what the caller gets, with the shortfall reported.
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(5);
 
+/// One pipe being read, and the bytes read so far.
+struct Reader {
+    handle: std::thread::JoinHandle<Result<()>>,
+    read: Arc<Mutex<Bounded>>,
+}
+
 /// Waits for one bounded reader, for no longer than [`PIPE_DRAIN_GRACE`].
-fn join(
-    handle: Option<std::thread::JoinHandle<Result<Bounded>>>,
-    request: &GitRequest<'_>,
-) -> Result<Bounded> {
-    let Some(handle) = handle else {
+///
+/// What the caller gets back is what has been read when the wait ends, whether that is the whole
+/// of the output or the part of it that arrived before something Git started stopped closing the
+/// pipe. A short read is reported: `truncated` is what every checked caller refuses on, so a
+/// partial answer is never mistaken for a complete one.
+fn join(reader: Option<Reader>, request: &GitRequest<'_>) -> Result<Bounded> {
+    let Some(reader) = reader else {
         return Ok(Bounded::default());
     };
     let deadline = Instant::now() + PIPE_DRAIN_GRACE;
-    while !handle.is_finished() {
+    let mut ran_out = false;
+    while !reader.handle.is_finished() {
         if Instant::now() >= deadline {
             // Something Git started still holds the pipe. The thread owns its own end and goes
             // when the pipe closes; this call does not wait for it.
-            return Ok(Bounded {
-                bytes: Vec::new(),
-                truncated: true,
-            });
+            ran_out = true;
+            break;
         }
         std::thread::sleep(Duration::from_millis(5));
     }
-    handle.join().map_err(|_| ProjectError::GitFailed {
+    if ran_out {
+        let held = reader.read.lock().map_err(|_| ProjectError::GitFailed {
+            detail: format!(
+                "{} produced output this host could not read",
+                request.describe()
+            ),
+        })?;
+        return Ok(Bounded {
+            bytes: held.bytes.clone(),
+            truncated: true,
+        });
+    }
+    let outcome = reader.handle.join().map_err(|_| ProjectError::GitFailed {
         detail: format!(
             "{} produced output this host could not read",
             request.describe()
         ),
-    })?
+    })?;
+    let held = reader.read.lock().map_err(|_| ProjectError::GitFailed {
+        detail: format!(
+            "{} produced output this host could not read",
+            request.describe()
+        ),
+    })?;
+    outcome?;
+    Ok(Bounded {
+        bytes: held.bytes.clone(),
+        truncated: held.truncated,
+    })
 }
 
 /// Reads one pipe to its end, keeping at most [`MAX_GIT_OUTPUT_BYTES`].
@@ -1499,35 +1576,37 @@ fn join(
 /// Reading continues past the bound and discards, because a child whose output nobody reads stops
 /// on a full pipe and would then be killed for running past its deadline instead of reported for
 /// producing too much.
-fn read_bounded<R: std::io::Read + Send + 'static>(
-    mut pipe: R,
-) -> std::thread::JoinHandle<Result<Bounded>> {
-    std::thread::spawn(move || {
+fn read_bounded<R: std::io::Read + Send + 'static>(pipe: R) -> Reader {
+    let read = Arc::new(Mutex::new(Bounded::default()));
+    let held = Arc::clone(&read);
+    let handle = std::thread::spawn(move || {
+        let mut pipe = pipe;
         let ceiling = usize::try_from(MAX_GIT_OUTPUT_BYTES).unwrap_or(usize::MAX);
-        let mut kept: Vec<u8> = Vec::new();
         let mut buffer = [0_u8; 64 * 1024];
-        let mut truncated = false;
         loop {
             match pipe.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
-                    let room = ceiling.saturating_sub(kept.len());
+                    // The shared buffer is what a caller whose wait runs out reads, so each chunk
+                    // goes into it as it arrives rather than at the end.
+                    let mut kept = held.lock().map_err(|_| ProjectError::GitFailed {
+                        detail: "a pipe reader could not reach its own buffer".to_owned(),
+                    })?;
+                    let room = ceiling.saturating_sub(kept.bytes.len());
                     if read > room {
-                        kept.extend_from_slice(&buffer[..room]);
-                        truncated = true;
+                        kept.bytes.extend_from_slice(&buffer[..room]);
+                        kept.truncated = true;
                     } else {
-                        kept.extend_from_slice(&buffer[..read]);
+                        kept.bytes.extend_from_slice(&buffer[..read]);
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(ProjectError::staging(error)),
             }
         }
-        Ok(Bounded {
-            bytes: kept,
-            truncated,
-        })
-    })
+        Ok(())
+    });
+    Reader { handle, read }
 }
 
 /// Finds one program on the process's own `PATH`.
