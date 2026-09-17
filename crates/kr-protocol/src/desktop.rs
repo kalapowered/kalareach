@@ -79,10 +79,12 @@ impl DesktopSessionKind {
 
 /// What the login-session generation was read from.
 ///
-/// The generation is the part of a desktop identity that distinguishes two logins which happen to
-/// share a platform session number. Every platform answers it the same way, through the process
-/// that owns the login session, and each names a different process. The source is recorded because
-/// the value is only ever comparable with another value from the same source on the same host.
+/// The generation is the part of a desktop identity that tells two logins apart when they share a
+/// platform session number. Every platform answers it the same way, through the kernel's start
+/// value for the process that owns the login session, and each names a different process. How
+/// completely that distinguishes one login from another follows from the process each platform
+/// names, which is why the source is part of the record; the value is also only ever comparable
+/// with another value from the same source on the same host.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]

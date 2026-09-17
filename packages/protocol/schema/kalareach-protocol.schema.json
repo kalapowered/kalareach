@@ -2769,7 +2769,7 @@
       "type": "object"
     },
     "DesktopGenerationSource": {
-      "description": "What the login-session generation was read from.\n\nThe generation is the part of a desktop identity that distinguishes two logins which happen to\nshare a platform session number. Every platform answers it the same way, through the process\nthat owns the login session, and each names a different process. The source is recorded because\nthe value is only ever comparable with another value from the same source on the same host.",
+      "description": "What the login-session generation was read from.\n\nThe generation is the part of a desktop identity that tells two logins apart when they share a\nplatform session number. Every platform answers it the same way, through the kernel's start\nvalue for the process that owns the login session, and each names a different process. How\ncompletely that distinguishes one login from another follows from the process each platform\nnames, which is why the source is part of the record; the value is also only ever comparable\nwith another value from the same source on the same host.",
       "oneOf": [
         {
           "const": "macos_session_creator",
