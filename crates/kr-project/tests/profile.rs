@@ -783,3 +783,58 @@ fn the_shortest_abbreviation_of_a_forbidden_option_is_refused() {
         );
     }
 }
+
+#[test]
+fn a_credential_git_itself_prints_does_not_reach_a_caller() {
+    // Git prints the configuration key and the value it objected to, so a credential can travel
+    // to a caller in Git's *own* words rather than in this host's. The key here holds a URL, a
+    // quote, a space and a query, which is every shape a search for a credential read wrongly.
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "git-said-it");
+    let key = concat!(
+        "diff.https://b.invalid/x?next=\"two words\"&access_token=GITSAIDSECRET",
+        ".binary"
+    );
+    support::git_raw(&path, ["config", "--local", "--", key, "invalid"]);
+    // Git refuses the boolean, so this is an error path rather than a successful read.
+    let arguments = [
+        std::ffi::OsStr::new("status"),
+        std::ffi::OsStr::new("--porcelain=v2"),
+    ];
+    let output = fixture
+        .service()
+        .profile()
+        .run(&kr_project::git::GitRequest::read(&path, &arguments))
+        .expect("the invocation itself runs");
+    assert!(
+        !output.success,
+        "Git refuses the value, which is the error path this test is about"
+    );
+    for secret in ["GITSAIDSECRET", "access_token", "two words"] {
+        assert!(
+            !output.stderr.contains(secret),
+            "what Git said does not reach a caller with {secret} in it: {}",
+            output.stderr
+        );
+    }
+    assert!(
+        output.stderr.contains("this host does not repeat"),
+        "and what was taken out is named: {}",
+        output.stderr
+    );
+    // The same through the service's own error, which is what a caller and the journal hold.
+    let refusal = kr_project::identity::OpenedRepository::open(
+        fixture.service().profile(),
+        fixture.environment_id(),
+        &path,
+    )
+    .err()
+    .map(|error| error.to_string())
+    .unwrap_or_default();
+    for secret in ["GITSAIDSECRET", "access_token"] {
+        assert!(
+            !refusal.contains(secret),
+            "nor through the service's own error: {refusal}"
+        );
+    }
+}

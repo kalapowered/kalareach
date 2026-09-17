@@ -132,10 +132,10 @@ A network operation names three things and carries no fourth.
    `?access_token=` is the other place a credential reaches remote state. An `ssh` remote keeps its
    user, because ssh needs it and an ssh user name is not a secret.
 
-   No refusal repeats the URL it refused. A URL this host could not parse is one it could not vouch for
-   either, and a malformed authority is exactly where a credential sits, so a refusal names what is
-   wrong instead. Where a diagnostic from Git itself carries a URL, the whole user information is
-   removed unless the scheme is `ssh` and it holds no colon.
+   No refusal repeats the URL it refused. A URL this host could not parse is one it could not vouch
+   for either, and a malformed authority is exactly where a credential sits, so a refusal names what
+   is wrong instead. What a diagnostic from Git itself may repeat is settled further down, under
+   the restricted profile.
 3. **The provider** is the host name as this host resolved it, recorded beside the remote so a
    receipt says which service was reached.
 4. **The broker** is one this host has. It supplies a *program* — a credential helper, and an ssh
@@ -371,13 +371,21 @@ is what a subsection is not. A subsection that holds none of `:`, `@`, `?`, `#`,
 control character is repeated as it is, because naming the remote or the driver is the whole use of
 the message. Anything else is replaced by its length and a fingerprint of its bytes: a person can
 still find the key in the file and tell two keys apart, and nothing the repository chose is echoed.
-Git's own standard error is a message rather than a key, and it can hold either: Git prints the
-configuration key it objected to. So a message is not scanned for the shape of a URL either. A word
-in it that holds `://` is repeated only when a URL parser says it is a URL, of a scheme this service
-uses, with no password, no query, no fragment, no user name beyond a bare `ssh` login and nothing
-in its path a credential could sit in. `https://github.com/user/repo.git` therefore still reads,
-quoted or not; a configuration key with a URL inside it does not, because `diff.https` is not a
-scheme this service uses. Anything replaced carries its length and a fingerprint of its bytes.
+Git's own standard error is the harder case, because Git prints the configuration key and the value
+it objected to, quotes and spaces and all. So a message is not searched for a credential either. A
+word in it is repeated only when **every character in it** is a letter, a digit, or one of
+`- _ . , ; : ( ) ! ' * + ~ /`. Absent from that set is every character a credential travels in or
+beside: `@`, `?`, `&`, `=`, `#`, `%`, and the quotes and brackets that let one piece of text pose as
+another. A word with any of them is replaced whole, whichever side of a space it falls on, and
+carries its length and a fingerprint instead.
+
+`fatal: unable to access 'https://github.com/user/repo.git/': Failed to connect to github.com port
+443` therefore reads as Git wrote it, and so do paths and Git's own words. A key with a URL inside
+it does not, nor does an `ssh://git@host/x` login name, because `@` is user information's own
+character and this host does not decide from a shape which user information is a login and which is
+a token. What it cannot catch is a secret that is *itself* an ordinary word, echoed as a
+configuration value: nothing distinguishes it from an ordinary word, and only repeating none of
+Git's text would.
 
 Nothing here rewrites the user's Git configuration. The overrides live on one child process's
 command line and in its environment. A terminal command under broad shell access keeps normal Git
