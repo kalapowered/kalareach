@@ -201,7 +201,10 @@ enum Printed {
     /// could not reach its own service, or that refused for a reason of its own, has not
     /// established that a login session is gone, and treating it as though it had would close a
     /// live session.
-    Failed(String),
+    ///
+    /// The Windows reader carries the text without reading it: the task listing prints no phrase
+    /// that means "that session is not there", so every failure of it leaves the question open.
+    Failed(#[cfg_attr(windows, allow(dead_code))] String),
     /// It could not be run at all, so the platform was never asked.
     NotRun,
 }
@@ -233,8 +236,9 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
 ///
 /// Only these answers are absence. Everything else a facility can fail with — a service it could
 /// not reach, a permission it did not have, a version that does not know the question — leaves the
-/// question open.
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+/// question open. The Windows reader asks nothing that answers this way, so it is the two
+/// platforms whose session facilities name what is missing that use this.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn says_absent(said: &str, absent: &[&str]) -> bool {
     absent.iter().any(|phrase| said.contains(phrase))
 }
