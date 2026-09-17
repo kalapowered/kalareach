@@ -565,6 +565,15 @@ and the restricted Git execution profile.
    process identities that were terminated, and an ownership-coverage flag. The record never claims
    every application was discovered.
 
+Every process in that record is named by its identifier *and* the kernel's record of when it
+started, because an identifier alone can belong to something else within milliseconds. One case
+cannot have both: a shell that leaves before the host has read it. A session whose shell exits
+immediately, because a startup file says so or because the program it named is not there, is a
+session that ran, and the host records it as one; macOS stops describing a process the moment it
+exits, so there is no start value left to read, and the identity carries a reserved value that says
+the reading never happened. Such an identity always reads as ended, which is what it is, and it
+never matches a live process that inherits the identifier.
+
 If the journal is unavailable the closure still happens — storage failure must not prevent an
 authorised stop — and the reply says `durability=volatile` rather than claiming otherwise.
 
