@@ -173,6 +173,10 @@ pub struct CompiledCache {
     /// The components this process compiled or loaded, by entry. Shared by every clone, because
     /// every clone is the same cache.
     resident: Arc<Mutex<HashMap<String, wasmtime::component::Component>>>,
+    /// How many artefact bytes those components were made from, so a host can report what its
+    /// compiled cache is costing rather than only how many entries it holds. Section 5 asks for
+    /// resource accounting that includes compiled caches, and a count of entries is not that.
+    resident_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl CompiledCache {
@@ -193,6 +197,7 @@ impl CompiledCache {
         Ok(Self {
             root,
             resident: Arc::new(Mutex::new(HashMap::new())),
+            resident_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -200,6 +205,13 @@ impl CompiledCache {
     #[must_use]
     pub fn resident(&self) -> usize {
         self.resident.lock().map_or(0, |resident| resident.len())
+    }
+
+    /// Returns how many compiled bytes this process is holding in memory.
+    #[must_use]
+    pub fn resident_bytes(&self) -> u64 {
+        self.resident_bytes
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Returns the name an entry is held under in memory.
@@ -217,11 +229,15 @@ impl CompiledCache {
     }
 
     /// Keeps a component in memory, up to the resident bound.
-    fn keep(&self, key: &CacheKey, component: &wasmtime::component::Component) {
+    fn keep(&self, key: &CacheKey, component: &wasmtime::component::Component, bytes: u64) {
         if let Ok(mut resident) = self.resident.lock()
             && resident.len() < MAX_RESIDENT
+            && resident
+                .insert(Self::resident_name(key), component.clone())
+                .is_none()
         {
-            resident.insert(Self::resident_name(key), component.clone());
+            self.resident_bytes
+                .fetch_add(bytes, std::sync::atomic::Ordering::AcqRel);
         }
     }
 
@@ -365,7 +381,7 @@ impl CompiledCache {
             .map_err(|error| {
             RuntimeError::cache_refused(format!("{}: {error}", self.artefact_path(key).display()))
         })?;
-        self.keep(key, &component);
+        self.keep(key, &component, artefact.len() as u64);
         Ok(Some(component))
     }
 
@@ -426,7 +442,7 @@ impl CompiledCache {
                 detail: error.to_string(),
             }
         })?;
-        self.keep(key, component);
+        self.keep(key, component, artefact.len() as u64);
         Ok(())
     }
 

@@ -281,6 +281,19 @@ async fn kr_req_06_06_a_worker_registers_delivers_and_calls_over_the_protocol() 
         0
     );
 
+    // The host accounts for what it is holding, the compiled cache included: "how many entries"
+    // is not resource accounting, and section 5 asks for the shared service and its caches.
+    let health = client.health().await.expect("a health report");
+    assert!(
+        health.resident_components > 0,
+        "the cache holds nothing after a compile"
+    );
+    assert!(
+        health.resident_bytes > 0,
+        "the cache reports no bytes for the components it holds"
+    );
+    assert!(health.queued_notice_bytes <= 4 * 1024 * 1024);
+
     // A second registration of the same component finds the artefact rather than compiling again.
     let again = client
         .register(
@@ -419,13 +432,16 @@ async fn a_call_on_a_binding_nobody_registered_is_refused() {
 // KR-REQ-11.38: the queue's overflow is reported to the worker rather than hidden.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_11_38_a_worker_is_told_when_the_queue_overflowed() {
-    let Some(wasm) = components::well_behaved() else {
+    // The slow component, so that the queue's bound is what decides this rather than the
+    // scheduler: a component that answered instantly could drain the events as fast as they were
+    // offered, and then nothing would overflow and the test would be measuring the machine.
+    let Some(wasm) = components::component("slow-observe") else {
         return;
     };
     let served = Served::start().await;
     let client = served.client().await;
-    let (path, digest, bytes) = served.install("well-behaved", &wasm);
-    let request = components::request("well-behaved", 5);
+    let (path, digest, bytes) = served.install("slow-observe", &wasm);
+    let request = components::request("slow-observe", 5);
     client
         .register(
             request.binding_id,
@@ -461,19 +477,22 @@ async fn kr_req_11_38_a_worker_is_told_when_the_queue_overflowed() {
         });
     }
     let mut gapped = false;
+    let mut seen: std::collections::BTreeMap<&'static str, u32> = std::collections::BTreeMap::new();
     while let Some(joined) = delivering.join_next().await {
         let admission = joined
             .expect("the delivery ran")
             .expect("the event is offered");
+        *seen.entry(admission_name(&admission)).or_insert(0) += 1;
         if let Admission::QueuedWithGap { events, bytes } = admission {
             assert!(events > 0);
             assert!(bytes > 0);
             gapped = true;
         }
     }
+
     assert!(
         gapped,
-        "the worker was never told the observation queue overflowed"
+        "the worker was never told the observation queue overflowed; the admissions were {seen:?}"
     );
 }
 
@@ -756,4 +775,12 @@ async fn a_client_whose_connection_failed_is_told_without_waiting() {
         .expect_err("the connection is gone");
     assert!(matches!(error, RuntimeError::ServiceUnavailable { .. }));
     assert!(asked.elapsed() < core::time::Duration::from_millis(500));
+}
+
+fn admission_name(admission: &Admission) -> &'static str {
+    match admission {
+        Admission::Queued => "queued",
+        Admission::QueuedWithGap { .. } => "queued_with_gap",
+        Admission::Refused { .. } => "refused",
+    }
 }

@@ -462,6 +462,8 @@ pub struct HostHealth {
     pub binding_bound: u64,
     /// How many compiled components the cache is holding in memory.
     pub resident_components: u64,
+    /// How many compiled bytes those components were made from.
+    pub resident_bytes: u64,
     /// How many bytes of notices this connection has waiting to be written.
     pub queued_notice_bytes: u64,
     /// How many documents this connection has dropped for want of room.

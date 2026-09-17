@@ -494,6 +494,7 @@ impl PluginHost {
                 connection_bindings: served.bindings.taken() as u64,
                 binding_bound: MAX_BINDINGS_PER_CONNECTION as u64,
                 resident_components: self.runtime.cache().resident() as u64,
+                resident_bytes: self.runtime.cache().resident_bytes(),
                 queued_notice_bytes: served.notices.held_bytes(),
                 dropped_documents: served.notices.dropped_documents(),
                 engine_version: self.runtime.engine().version().to_owned(),
