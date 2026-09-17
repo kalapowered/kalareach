@@ -221,11 +221,15 @@ impl ProbeSession {
                 self.complete = true;
             }
         }
-        // Whatever the lexer is still holding is the beginning of something the person is part way
-        // through typing. It belongs to them, so the exchange gives it back rather than dropping
-        // it with the lexer: a key half pressed is still a key pressed.
-        self.typed
-            .extend_from_slice(self.lexer.take_pending().as_ref());
+        if self.complete {
+            // The exchange ended in this read, so whatever the lexer is still holding arrived
+            // after the terminator and belongs to the person: a key half pressed is still a key
+            // pressed. Until the terminator arrives the lexer keeps what it is holding, because a
+            // terminal is free to answer across two reads and taking the held bytes here would
+            // throw away the first half of an answer still in flight.
+            self.typed
+                .extend_from_slice(self.lexer.take_pending().as_ref());
+        }
         Ok(if self.complete {
             ProbeProgress::Complete
         } else {
@@ -276,6 +280,18 @@ impl ProbeSession {
     #[must_use]
     pub fn typed(&self) -> &[u8] {
         &self.typed
+    }
+
+    /// Takes the person's typing from an exchange that did not finish.
+    ///
+    /// A failed exchange does not make somebody's keystrokes nobody's, and the lexer may still be
+    /// holding the half of a key they were pressing when the deadline passed.
+    #[must_use]
+    pub fn into_typing(mut self) -> Vec<u8> {
+        let held = self.lexer.take_pending();
+        let mut typed = self.typed;
+        typed.extend_from_slice(&held);
+        typed
     }
 
     /// Whether the terminator has arrived.

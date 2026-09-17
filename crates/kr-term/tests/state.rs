@@ -557,6 +557,88 @@ fn a_probe_completes_on_its_terminator() {
     );
 }
 
+/// KR-REQ-08.42: a terminal is free to answer across two reads, and the answer still counts.
+#[test]
+fn an_answer_split_across_two_reads_is_still_an_answer() {
+    let (mut session, _) =
+        ProbeSession::start(0, InputContext::Clean, PROBE_SET).expect("clean stream");
+    // Every answer arrives in halves, the terminator included. Nothing here is a whole sequence.
+    for half in [
+        &b"\x1bP>|iTe"[..],
+        &b"rm2 3.5\x1b\\"[..],
+        &b"\x1b]10;rgb:ff"[..],
+        &b"ff/ffff/ffff\x1b\\"[..],
+        &b"\x1b]11;rgb:00"[..],
+        &b"00/0000/0000\x1b\\"[..],
+        &b"\x1b[?0"[..],
+        &b"u"[..],
+        &b"\x1b[?2026"[..],
+        &b";2$y"[..],
+        &b"\x1b[?62;1"[..],
+    ] {
+        assert_eq!(
+            session.observe(half, 10).expect("a half of an answer"),
+            ProbeProgress::Collecting,
+            "{:?} is half of something",
+            String::from_utf8_lossy(half)
+        );
+    }
+    assert_eq!(
+        session.observe(b";6;22c", 40).expect("the terminator"),
+        ProbeProgress::Complete,
+        "the last half of the terminator finishes the exchange"
+    );
+    let outcome = session.finish(50).expect("every question was answered");
+    assert!(
+        outcome.typed().is_empty(),
+        "and none of it was mistaken for typing: {:?}",
+        String::from_utf8_lossy(outcome.typed())
+    );
+    let palette = outcome.adopt_palette().expect("colours were shared");
+    assert_eq!(palette.source(), PaletteSource::ClientPreference);
+}
+
+/// KR-REQ-08.43: what the person typed around the answers is theirs, whole keys and half ones.
+#[test]
+fn the_typing_around_the_answers_comes_back_whole() {
+    let (mut session, _) =
+        ProbeSession::start(0, InputContext::Clean, &[ProbeItem::DeviceAttributes])
+            .expect("clean stream");
+    // Typed before the terminator, then the terminator, then more typing with an unfinished key
+    // at the end of it: the person pressed something whose sequence has not arrived yet.
+    session.observe(b"ab", 5).expect("typing");
+    assert_eq!(
+        session
+            .observe(b"\x1b[?62;22c", 10)
+            .expect("the terminator"),
+        ProbeProgress::Complete
+    );
+    session.observe(b"cd\x1b[", 12).expect("more typing");
+    let outcome = session.finish(20).expect("complete");
+    assert_eq!(
+        outcome.typed(),
+        b"abcd\x1b[",
+        "every byte the person typed, in order: {:?}",
+        String::from_utf8_lossy(outcome.typed())
+    );
+}
+
+/// KR-REQ-08.43: an exchange that failed still gives back what the person typed into it.
+#[test]
+fn a_failed_exchange_still_gives_back_the_typing() {
+    let (mut session, _) =
+        ProbeSession::start(0, InputContext::Clean, &[ProbeItem::DeviceAttributes])
+            .expect("clean stream");
+    session.observe(b"hel", 5).expect("typing");
+    session.observe(b"lo", 6).expect("typing");
+    assert!(session.observe(b"\x1b[", 1_001).is_err(), "the deadline");
+    assert_eq!(
+        session.into_typing(),
+        b"hello",
+        "the keys are the person's whatever the terminal did"
+    );
+}
+
 #[test]
 fn a_probe_without_its_terminator_fails_the_attach() {
     let (mut session, _) =

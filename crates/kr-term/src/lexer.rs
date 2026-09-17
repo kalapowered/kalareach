@@ -257,17 +257,20 @@ impl Lexer {
         self.pending_len
     }
 
-    /// Takes the incomplete bytes the lexer is holding, leaving it on ground.
+    /// Takes everything the lexer is still holding, leaving it on ground.
     ///
-    /// For a caller whose stream is not the session's: the probe reads a person's own typing off
-    /// the terminal, and a key they are part way through pressing is still theirs. A session's
-    /// stream never uses this, because there the held bytes are the beginning of a sequence the
-    /// next read completes.
+    /// Two things can be held at once, and both come back in the order they arrived: the tail of a
+    /// text run, which the lexer keeps in case a combining mark follows it, and the beginning of a
+    /// control sequence, which it keeps until the sequence ends.
+    ///
+    /// For a caller whose stream is not the session's, and only once that stream is over. The probe
+    /// reads a person's own typing off the terminal, and a key they are part way through pressing is
+    /// still theirs, so what the lexer holds when the exchange ends is given back rather than
+    /// dropped. Calling this while more of that stream is still coming would throw away the first
+    /// half of whatever is in flight, which is why a session's stream never uses it.
     pub fn take_pending(&mut self) -> Vec<u8> {
-        let held = core::mem::take(&mut self.pending);
-        self.pending_len = 0;
-        self.pending_truncated = false;
-        self.pending_controls.clear();
+        let mut held = core::mem::take(&mut self.text);
+        held.extend_from_slice(&self.pending);
         self.reset_to_ground();
         held
     }
