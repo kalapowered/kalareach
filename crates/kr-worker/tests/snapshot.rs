@@ -568,14 +568,17 @@ async fn a_snapshot_carries_the_state_of_a_screen_and_then_its_rows_in_pages() {
         (2, 17),
         "the scroll region is the one the application set, zero-based"
     );
-    assert!(
-        header
-            .saved_cursors
-            .iter()
-            .any(|saved| saved.buffer == ProjectedBuffer::Primary),
-        "the cursor this session saved is carried, because nothing on the screen says where it \
-         was: {:?}",
-        header.saved_cursors
+    let saved = header
+        .saved_cursors
+        .iter()
+        .find(|saved| saved.buffer == ProjectedBuffer::Primary)
+        .expect("the cursor this session saved");
+    assert_eq!(
+        (saved.column.get(), saved.row.get()),
+        (0, 1),
+        "the cursor this session saved is carried where it was saved, because nothing on the \
+         screen says where that was: the application printed one line and saved the cursor after \
+         it"
     );
     assert!(
         header

@@ -213,11 +213,13 @@ have changed them.
 does not answer. The session's own keyboard modes are still cleared when the attachment ends, since
 the session could have set them, but nothing comes back afterwards: that is what never asking costs.
 
-A projection installs the session's keyboard negotiation only on a terminal that reported its own.
-That follows from the same rule: what a cleanup writes back is what the terminal *said*, so a
-terminal nobody asked is left with its own protocols rather than put into a state nothing could put
-back. It applies to `--no-probe` and equally to a profile whose questions do not include the
-keyboard.
+A projection installs the session's Kitty keyboard flags only on a terminal that reported its own.
+That follows from the same rule: what a cleanup writes back is what the terminal *said*, and the
+Kitty protocol has no sequence that returns a terminal to what it had, so flags installed on a
+terminal nobody asked could not be put back. The `modifyOtherKeys` level is different: `CSI > 4 m`
+returns a terminal to its own initial value whether or not anybody read it first, and the host
+advertises that encoding for an `xterm`-named terminal whatever the probe asked, so the session's
+level is installed on any terminal and taken back off on the way out.
 
 The choice is made before the first byte goes out, which is the only time it can be made honestly.
 After a failed handshake the stream is not clean any more: a late reply could still arrive on it, so

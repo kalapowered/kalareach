@@ -1011,7 +1011,7 @@ async fn attach_samples(
                         // A screen a terminal can draw, not merely a frame that arrived: the
                         // payload decodes and it places the cursor, which every restoration ends
                         // by doing.
-                        return places_the_cursor(event.bytes.as_slice());
+                        return ends_a_restoration(event.bytes.as_slice());
                     }
                     continue;
                 }
@@ -1053,11 +1053,22 @@ async fn attach_samples(
     samples
 }
 
-/// Whether a restoration's bytes place the cursor, which is how one ends.
+/// Whether a restoration's bytes end the way a restoration ends.
 ///
-/// Not "contains an escape sequence": a frame carrying half a screen also does. A cursor address
-/// is `CSI row ; column H`, and the restoration writes one last of all, so finding one is finding
-/// the end of a screen a terminal can draw.
+/// Not "contains an escape sequence": a frame carrying half a screen also does. And not a cursor
+/// address alone, because a restoration addresses the cursor for every row it draws. What only the
+/// end has is both: the cursor placed where the session's own cursor is, and the cursor's
+/// visibility set after it. Finding the two together is finding a screen a terminal can draw.
+fn ends_a_restoration(bytes: &[u8]) -> bool {
+    places_the_cursor(bytes) && sets_cursor_visibility(bytes)
+}
+
+/// Whether the bytes set the cursor's visibility, which a restoration does last of all.
+fn sets_cursor_visibility(bytes: &[u8]) -> bool {
+    bytes.windows(5).any(|window| window == b"\x1b[?25")
+}
+
+/// Whether the bytes address the cursor.
 fn places_the_cursor(bytes: &[u8]) -> bool {
     let mut index = 0;
     while let Some(position) = bytes[index..]
