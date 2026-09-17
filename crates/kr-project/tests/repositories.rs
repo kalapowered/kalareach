@@ -859,6 +859,46 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
         "the path a person can find is named: {:?}",
         recovery.retained_paths
     );
+    // And a name whose directory is not there at all: the daemon died between recording the name
+    // and creating the sibling. Nothing was removed and nothing is retained, so the figures say
+    // neither, and the operation's own record does not name a path that is not there.
+    let absent = format!("{STAGING_PREFIX}absent");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE operations SET state = 'staging', ended_at_ms = NULL, staged_device = NULL,
+                    staged_file_id = NULL, staging_name = ?2, staging_device = NULL,
+                    staging_file_id = NULL
+              WHERE action_id = ?1",
+            rusqlite::params![
+                cloned.operation.action_id.get().as_bytes().to_vec(),
+                absent.clone(),
+            ],
+        )
+        .expect("the row names a sibling that was never created");
+    drop(journal);
+    let replacement = fixture.reopen();
+    let recovery = replacement.recover().expect("recovery runs once more");
+    assert_eq!(
+        (recovery.staging_removed, recovery.unresolved),
+        (0, 0),
+        "a name whose object was never created is neither a cleanup nor an unresolved path"
+    );
+    let operation = replacement
+        .read_operation(cloned.operation.action_id)
+        .expect("the operation reads");
+    assert!(
+        !operation
+            .retained_staging_paths
+            .iter()
+            .any(|path| path.ends_with(&absent)),
+        "and the result does not name a path that is not there: {:?}",
+        operation.retained_staging_paths
+    );
     assert!(
         operation
             .detail

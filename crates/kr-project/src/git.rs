@@ -1463,12 +1463,7 @@ pub fn redact(text: &str) -> String {
         // URL's `://`, and reading it as the end of this authority would leave the rest of the
         // message, credential and all, copied verbatim.
         let end = after
-            .find(|character: char| {
-                matches!(
-                    character,
-                    '/' | '?' | '#' | ' ' | '\t' | '\n' | '\r' | '"' | '\''
-                )
-            })
+            .find(AUTHORITY_ENDS_AT)
             .unwrap_or(after.len())
             .min(next_scheme(after));
         let (authority, tail) = after.split_at(end);
@@ -1502,9 +1497,7 @@ pub fn redact(text: &str) -> String {
         // URL would leave what followed it, which is where the token was. Text after a query in
         // the same word goes with it, because a query's own terminator cannot be told from a
         // token's content, and losing the tail of a diagnostic is the safe direction.
-        let delimiter = tail
-            .find([' ', '\t', '\n', '\r', '"', '\''])
-            .unwrap_or(tail.len());
+        let delimiter = tail.find(URL_ENDS_AT).unwrap_or(tail.len());
         let ends_at = delimiter.min(next_scheme(tail));
         match tail[..ends_at].find(['?', '#']) {
             Some(query) => {
@@ -1521,6 +1514,22 @@ pub fn redact(text: &str) -> String {
     out.push_str(rest);
     out
 }
+
+/// The characters one URL's authority ends at.
+///
+/// The path, query and fragment separators, and the characters a URL cannot contain at all. An
+/// apostrophe is deliberately absent, for the reason [`URL_ENDS_AT`] gives.
+const AUTHORITY_ENDS_AT: [char; 8] = ['/', '?', '#', ' ', '\t', '\n', '\r', '"'];
+
+/// The characters a URL in a message cannot contain, and therefore ends at.
+///
+/// Whitespace and a double quote, and nothing else. What is *not* here matters more than what is:
+/// an apostrophe is a legal sub-delimiter, so `https://o'brien:token@host/` is one URL and a scan
+/// that stopped at the apostrophe would never reach the `@` that says where the credential ends.
+/// The same goes for a query: `?token=a'b` is one query. A URL this host has to quote in a message
+/// is quoted with `"`, and anything a URL legitimately holds must be percent-encoded, so these
+/// three are the whole of the set.
+const URL_ENDS_AT: [char; 5] = [' ', '\t', '\n', '\r', '"'];
 
 /// Returns where the next URL's scheme begins, or the length of the text when there is none.
 ///
@@ -1758,6 +1767,18 @@ mod tests {
             "a second URL is found even when the first has no path: {redacted}"
         );
         assert!(redacted.contains("a.invalid"), "{redacted}");
+        // An apostrophe is a legal sub-delimiter, in user information and in a query alike, so a
+        // scan that stopped at one would never reach the `@` that ends the credential.
+        let redacted = super::redact("https://o'brien:VERYSECRET@b.invalid/x");
+        assert!(
+            !redacted.contains("VERYSECRET"),
+            "an apostrophe in user information is part of the URL: {redacted}"
+        );
+        let redacted = super::redact("https://b.invalid/x?access_token=prefix'VERYSECRET");
+        assert!(
+            !redacted.contains("VERYSECRET"),
+            "and part of a query: {redacted}"
+        );
         // Text that holds no URL is returned as it is.
         assert_eq!(super::redact("no url here"), "no url here");
     }

@@ -692,6 +692,7 @@ impl ProjectService {
                 .unwrap_or(true),
             _ => false,
         };
+        let had_sibling = staging.is_some();
         let Some(staged) = row.staged_identity else {
             // Nothing was published, because the identity a publication needs was never recorded.
             // The destination is untouched, so the staged content is removed and the operation is
@@ -732,8 +733,9 @@ impl ProjectService {
             )?;
             // What this counted is what it removed. A staging directory it left alone, because
             // nothing recorded which object this host had created or because it could not look at
-            // the name, is reported as a path that is still there. A row that named no sibling at
-            // all is neither: the operation is closed and nothing on the filesystem changed.
+            // the name, is reported as a path that is still there. A name whose object is not
+            // there, and a row that named no sibling at all, are neither: the operation is closed
+            // and nothing on the filesystem changed.
             if let Some(path) = left_behind {
                 return Ok(ResolvedStep::Unresolved(Some(path)));
             }
@@ -741,6 +743,17 @@ impl ProjectService {
                 return Ok(ResolvedStep::Unresolved(
                     named.map(|path| path.display().to_string()),
                 ));
+            }
+            if let Some(path) = named.as_deref()
+                && !had_sibling
+            {
+                // The name was recorded and nothing is at it: the daemon died between recording
+                // the name and creating the directory. The path record says so, so the operation's
+                // own result does not report a retained path that is not there.
+                let _ = self.writable().and_then(|mut store| {
+                    store.record_staging_path(row.action_id, &path.display().to_string(), true)
+                });
+                return Ok(ResolvedStep::Closed);
             }
             return Ok(match named {
                 Some(_) => ResolvedStep::Cleaned,

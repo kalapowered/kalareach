@@ -3171,17 +3171,37 @@ mod tests {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .expect("the version reads");
         assert_eq!(version, SCHEMA_VERSION);
-        // And a store from a *later* build is refused rather than half read.
-        store
-            .connection
+        drop(store);
+        // And a store from a *later* build is refused rather than half read. What it leaves behind
+        // is what it found: the whole migration is one transaction, so the tables this build would
+        // have created are not there either.
+        let later = directory.path().join("later.sqlite");
+        let ahead = Connection::open(&later).expect("the later store opens");
+        ahead
+            .execute_batch(EARLIEST)
+            .expect("the earliest shape is written once more");
+        ahead
             .execute(
                 "UPDATE schema_version SET version = ?1",
                 params![SCHEMA_VERSION + 1],
             )
             .expect("a later version is written");
-        drop(store);
-        let refusal = Store::open(&partial, environment()).expect_err("a later store is refused");
+        drop(ahead);
+        let refusal = Store::open(&later, environment()).expect_err("a later store is refused");
         assert_eq!(refusal.code(), ErrorCode::StorageUnavailable);
+        let refused = Connection::open(&later).expect("the refused store opens");
+        let tables: i64 = refused
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                  WHERE type = 'table' AND name IN ('workspace_progress', 'workspace_runs')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("the table list reads");
+        assert_eq!(
+            tables, 0,
+            "a store this build refuses is left exactly as it was found"
+        );
     }
 
     #[test]
