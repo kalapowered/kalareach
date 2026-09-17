@@ -251,10 +251,11 @@ whether the entry is being added or removed.
 
 A file that changed between being read and being written is left alone and the change is reported,
 because a replacement built on what was read would throw away whatever was saved in between. The
-contents and the file's own identity are checked immediately before the rename, after the write and
-the flush, so the window is the rename itself. That is as narrow as the platform allows: a comparison
-and a rename are two steps, and an editor that saves inside that window has its save replaced. Two of
-these commands running at once are serialised against each other.
+contents are checked immediately before the rename, after the write and the flush, and on Unix so is
+the file's own identity, so a file that was replaced rather than edited is caught too. What is left
+is the interval between that check and the rename: a comparison and a rename are two steps on every
+platform this runs on, and an editor that saves inside that interval has its save replaced. Two of
+these commands in one process are serialised against each other; two `kr` processes are not.
 
 ## Section 23's private group
 

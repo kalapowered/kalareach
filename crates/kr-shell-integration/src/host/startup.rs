@@ -316,9 +316,10 @@ fn strip(contents: &str) -> Option<(String, String)> {
 /// built on stale contents would silently drop whatever was saved in between.
 ///
 /// That last check is as good as this can be without the platform offering a comparison and a
-/// rename in one step. This process's own calls are serialised against each other; a writer
-/// outside it that saves inside the rename itself is not detected, and its save is what the rename
-/// replaces.
+/// rename in one step. This process's own calls are serialised against each other; another process
+/// that saves between the check and the rename is not detected, and its save is what the rename
+/// replaces. The identity half of the check is a Unix one: elsewhere a file that was replaced
+/// rather than edited is caught only by its contents.
 fn replace(path: &Path, expected: &str, contents: &str) -> std::io::Result<()> {
     // The file the configuration actually lives in. A symlink is a deliberate arrangement of the
     // user's, and renaming over the link would replace it with a regular file and quietly cut the
