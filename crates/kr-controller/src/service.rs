@@ -272,12 +272,18 @@ struct DemandScan {
 }
 
 /// What one session was last observed to have outstanding.
+///
+/// The worker's own activity and this host's own work are separate fields because they end
+/// separately. A worker that has gone is not working and is not waiting for an answer, and a
+/// closure this host accepted is its own work until it has recorded it.
 #[derive(Clone, Copy, Debug, Default)]
 struct SessionDemand {
     /// Whether its worker reported an agent at work.
     work: bool,
-    /// Requests this host has accepted for it and not finished.
-    outstanding: u64,
+    /// Whether its worker reported a decision waiting to be answered.
+    approval: bool,
+    /// Whether this host has a closure for it that it has not finished.
+    closing: bool,
 }
 
 /// The desktop this host has, and how old the reading is.
@@ -2385,7 +2391,7 @@ impl Controller {
     /// The evaluation and the review decision happen in one hold of the inhibitor's lock. Two
     /// holds would let a review that has just decided to stop clear the mark while another caller
     /// is taking an assertion, and that assertion would then have nothing watching it.
-    async fn evaluate_power(&self, claim: Claim) -> (SleepInhibitionState, Review) {
+    async fn evaluate_power(self: &Arc<Self>, claim: Claim) -> (SleepInhibitionState, Review) {
         let setting = power::read(&self.paths);
         let off = setting == kr_protocol::desktop::SleepInhibitionSetting::Off;
         // A host whose owner has not chosen this pays nothing for it: no worker is asked and no
@@ -2457,14 +2463,19 @@ impl Controller {
     /// processes and draining their output, and a create that has not reported its worker yet. An
     /// idle shell counts for nothing, however much output it has produced.
     ///
-    /// Each worker is given a bounded moment to answer. A session whose worker holds its socket
-    /// and stops answering must not be able to keep this host awake for good, and it must not be
-    /// able to delay the answer another session is waiting for either.
+    /// Each worker is given a bounded moment to answer, and no worker can delay the answer another
+    /// session is waiting for. A worker that holds its socket and stops answering keeps what it
+    /// last said, because a worker that will not answer has not said its work ended; what ends
+    /// that is the kernel saying its process has gone, which this scan asks about, or the session
+    /// leaving this host's list of workers.
     ///
     /// What a scan cannot ask about inside its budget it counts as it last found it. A partial
     /// scan says nothing about the sessions it skipped, so counting those as idle would release
-    /// the assertion in the middle of a closure it had just taken one for.
-    async fn demand(&self) -> Demand {
+    /// the assertion in the middle of a closure it had just taken one for. The other side of that
+    /// is that a host with more sessions than one scan can ask about carries observations from one
+    /// scan to the next, so what is counted can be up to one review interval per unasked session
+    /// behind.
+    async fn demand(self: &Arc<Self>) -> Demand {
         let mut workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
         let mut scan = self.demand_scan.lock().await;
         // A session that is no longer in the directory is a session that has gone, and what it had
@@ -2485,8 +2496,9 @@ impl Controller {
         let mut asked = 0;
         for worker in workers {
             // The scan as a whole is bounded, not only each worker in it. A host with many
-            // sessions must still decide within the interval its own review runs on, or the time
-            // an assertion can outlive its work would grow with the number of sessions.
+            // sessions must still answer within the interval its own review runs on, so what it
+            // cannot ask about in this scan it asks about in the next one, starting where this one
+            // stopped.
             let Some(left) = DEMAND_BUDGET.checked_sub(spent.elapsed()) else {
                 break;
             };
@@ -2497,14 +2509,35 @@ impl Controller {
                 .ok();
             let Some(summary) = summary else {
                 // A worker that did not answer has not said its work ended, so what it last said
-                // stands. A worker whose process the kernel says is gone has ended, though, and
-                // what it last said goes with it: an assertion that outlived the session it was
-                // taken for would keep the machine awake until something else noticed.
+                // stands. A worker whose process the kernel says is gone is different: it is not
+                // running an agent and it is not waiting for an answer, whatever it last said, so
+                // those go. What does not go with it is a closure this host accepted, because
+                // finishing that is this host's own work and not the worker's; it is outstanding
+                // until the closure is recorded, which is also when the session leaves the list
+                // above and this record with it. So the host is asked to finish it rather than
+                // left to notice another time.
                 if matches!(
                     kr_ipc::identity::process_state(&worker.descriptor.process_start_identity),
                     kr_ipc::identity::ProcessState::Ended
                 ) {
-                    scan.seen.remove(&worker.descriptor.session_id);
+                    let session_id = worker.descriptor.session_id;
+                    let closing = scan.seen.get(&session_id).is_some_and(|seen| seen.closing);
+                    if closing {
+                        scan.seen.insert(
+                            session_id,
+                            SessionDemand {
+                                work: false,
+                                approval: false,
+                                closing: true,
+                            },
+                        );
+                    } else {
+                        scan.seen.remove(&session_id);
+                    }
+                    let controller = Arc::clone(self);
+                    tokio::spawn(async move {
+                        let _ = controller.reconcile(session_id).await;
+                    });
                 }
                 continue;
             };
@@ -2517,18 +2550,20 @@ impl Controller {
             if summary.application_state.as_ref()
                 == Some(&kr_protocol::session::ApplicationState::AwaitingApproval)
             {
-                observed.outstanding += 1;
+                observed.approval = true;
             }
             // A closure this host accepted and has not finished. Suspending in the middle of one
             // is how a session's own processes stop being accounted for.
-            if summary.state == SessionState::Closing {
-                observed.outstanding += 1;
-            }
+            observed.closing = summary.state == SessionState::Closing;
             scan.seen.insert(worker.descriptor.session_id, observed);
         }
         scan.cursor = scan.cursor.wrapping_add(asked);
         let sessions_with_work = scan.seen.values().filter(|seen| seen.work).count() as u64;
-        let outstanding: u64 = scan.seen.values().map(|seen| seen.outstanding).sum();
+        let outstanding = scan
+            .seen
+            .values()
+            .map(|seen| u64::from(seen.approval) + u64::from(seen.closing))
+            .sum::<u64>();
         drop(scan);
         Demand {
             sessions_with_work,
