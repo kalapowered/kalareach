@@ -3231,6 +3231,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-plugin-host"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "kr-cbor",
+ "kr-controller",
+ "kr-crypto",
+ "kr-ipc",
+ "kr-plugin-runtime",
+ "kr-plugin-sdk",
+ "kr-protocol",
+ "kr-worker",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "kr-plugin-runtime"
 version = "0.1.0"
 dependencies = [

@@ -5,11 +5,16 @@
 //! It holds the component engine, the per-instance bounds, the compiled-code cache, the binding
 //! lifecycle, and the client and protocol of the per-environment service that owns the instances.
 //!
-//! # What it holds
+//! # The two halves
 //!
-//! [`runtime`] owns the engine, the generated bindings, the four host imports, the limiter, fuel
-//! and deadlines, the fault counter, the compiled-code cache, lazy compilation and the binding
-//! lifecycle.
+//! | Module | What it owns |
+//! | --- | --- |
+//! | [`runtime`] | The engine, the generated bindings, the four host imports, the limiter, fuel and deadlines, the fault counter, the cache, lazy compilation and the binding lifecycle |
+//! | [`service`] | The protocol a worker speaks to the plugin-host process, both ends of it, and the launcher that starts the host |
+//!
+//! A worker never links the engine. It registers a binding with the plugin host over [`service`],
+//! and the host runs the component in its own process. That is what makes a component fault
+//! survivable: a plugin-host crash invalidates rich bindings and nothing else.
 //!
 //! # What a component can reach
 //!
@@ -56,5 +61,6 @@
 //! ```
 
 pub mod runtime;
+pub mod service;
 
 pub use crate::runtime::error::{RuntimeError, RuntimeResult};

@@ -1,0 +1,38 @@
+[package]
+name = "kr-plugin-host"
+description = "The KalaReach plugin-runtime service: one lazily started per-environment process that owns component instances"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "kr-plugin-host"
+path = "src/bin/kr-plugin-host.rs"
+
+[dependencies]
+clap.workspace = true
+kr-cbor.workspace = true
+kr-crypto.workspace = true
+kr-ipc.workspace = true
+kr-plugin-runtime.workspace = true
+kr-plugin-sdk.workspace = true
+kr-protocol.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+# The end-to-end tests start a real plugin host process beside a real worker session with a real
+# shell in a real pseudo-terminal. The worker and the control daemon are test-only dependencies, so
+# the service binary does not link either of them.
+[dev-dependencies]
+kr-controller.workspace = true
+kr-crypto.workspace = true
+kr-ipc = { workspace = true, features = ["testing"] }
+kr-worker.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

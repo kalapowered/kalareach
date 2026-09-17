@@ -10,6 +10,11 @@
 //! the wrong thing. Setting `KR_REQUIRE_PLUGIN_FIXTURES=1`, which continuous integration does,
 //! turns the first case into a failure too.
 
+#![allow(
+    dead_code,
+    reason = "two test binaries share this module, and each uses the part of it that its cases need"
+)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
