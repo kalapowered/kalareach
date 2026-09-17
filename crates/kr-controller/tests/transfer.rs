@@ -1422,7 +1422,7 @@ fn start_daemon(program: &std::path::Path, host: &kr_ipc::testing::TempHost) -> 
         .append(true)
         .open(&logs)
         .expect("opens the daemon's log");
-    std::process::Command::new(program)
+    let daemon = std::process::Command::new(program)
         .arg("--runtime-dir")
         .arg(host.root().join("r"))
         .arg("--state-dir")
@@ -1431,12 +1431,90 @@ fn start_daemon(program: &std::path::Path, host: &kr_ipc::testing::TempHost) -> 
         // started.
         .arg("--worker")
         .arg(host.root().join("no-such-worker"))
+        // Never this test's own directory: the build tree can be on a removable volume, and a
+        // process holding one open is a volume the person at the machine cannot eject.
+        .current_dir(host.root())
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().expect("duplicates the log"))
         .stderr(log)
         .spawn()
         .map(|child| Daemon(Some(child)))
-        .expect("starts the daemon")
+        .expect("starts the daemon");
+    runs_where_this_test_put_it(&daemon, host);
+    daemon
+}
+
+/// Asserts that the daemon this test started runs where this test put it.
+///
+/// Read from the process table, because what is being checked is what the operating system
+/// actually gave the process: a launch that quietly inherited a directory looks exactly like one
+/// that was given the right one until the kernel is asked.
+#[cfg(unix)]
+fn runs_where_this_test_put_it(daemon: &Daemon, host: &kr_ipc::testing::TempHost) {
+    let Some(child) = daemon.0.as_ref() else {
+        return;
+    };
+    let expected = std::fs::canonicalize(host.root()).expect("this test's own directory exists");
+    let workspace = workspace_root();
+    assert!(
+        !expected.starts_with(&workspace),
+        "this test's directories are not inside the workspace: {}",
+        expected.display()
+    );
+    let Some(actual) = working_directory_of(child.id()) else {
+        eprintln!(
+            "skipped: this platform does not report another process's working directory here"
+        );
+        return;
+    };
+    assert_eq!(
+        std::fs::canonicalize(&actual).unwrap_or(actual),
+        expected,
+        "the daemon runs in the directory this test configured"
+    );
+}
+
+/// Returns the working directory the operating system gave a running process.
+#[cfg(unix)]
+fn working_directory_of(pid: u32) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(
+            std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|error| {
+                panic!("the working directory of process {pid} could not be read: {error}")
+            }),
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = std::process::Command::new("/usr/sbin/lsof")
+            .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
+            .output()
+            .unwrap_or_else(|error| panic!("the process table could not be read: {error}"));
+        Some(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| line.strip_prefix('n').map(std::path::PathBuf::from))
+                .unwrap_or_else(|| {
+                    panic!("the process table named no working directory for process {pid}")
+                }),
+        )
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Returns the workspace this test was built from.
+#[cfg(unix)]
+fn workspace_root() -> std::path::PathBuf {
+    let mut root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // `<workspace>/crates/<crate>`.
+    root.pop();
+    root.pop();
+    std::fs::canonicalize(&root).unwrap_or(root)
 }
 
 /// How long a freshly started daemon is given to answer.

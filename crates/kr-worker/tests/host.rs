@@ -207,21 +207,31 @@ async fn create(client: &mut LocalClient, host: &Host) -> SessionCreateResult {
 ///
 /// Read from the process table rather than from anything this test arranged: what is being checked
 /// is what the process actually got, and a launch that quietly inherited a directory looks exactly
-/// like one that was given the right one until the kernel is asked.
+/// like one that was given the right one until the kernel is asked. `None` means this platform has
+/// no way to ask; a platform that has one and refuses to answer is a failure, not a skip.
 fn working_directory_of(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        Some(
+            std::fs::read_link(format!("/proc/{pid}/cwd")).unwrap_or_else(|error| {
+                panic!("the working directory of process {pid} could not be read: {error}")
+            }),
+        )
     }
     #[cfg(target_os = "macos")]
     {
         let output = std::process::Command::new("/usr/sbin/lsof")
             .args(["-a", "-d", "cwd", "-p", &pid.to_string(), "-Fn"])
             .output()
-            .ok()?;
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
+            .unwrap_or_else(|error| panic!("the process table could not be read: {error}"));
+        Some(
+            String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
+                .unwrap_or_else(|| {
+                    panic!("the process table named no working directory for process {pid}")
+                }),
+        )
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
@@ -246,23 +256,11 @@ fn runs_where_the_host_put_it(host: &Host, session_id: SessionId) {
         .into_iter()
         .find(|worker| worker.session_id == session_id)
         .expect("the created session has a worker record");
-    let pid = worker.process_identity.pid.get();
-    let pid = u32::try_from(pid).expect("a process identifier");
-    let Some(actual) = working_directory_of(pid) else {
-        // Nothing to compare against rather than a comparison that failed. Saying so is better
-        // than a pass that checked nothing.
-        eprintln!(
-            "skipped: this platform does not report another process's working directory here"
-        );
-        return;
-    };
+    let pid = u32::try_from(worker.process_identity.pid.get()).expect("a process identifier");
     let expected = std::fs::canonicalize(host.paths().worker_dir(session_id))
         .expect("the worker's own directory exists");
-    assert_eq!(
-        std::fs::canonicalize(&actual).unwrap_or(actual),
-        expected,
-        "the worker runs in the directory the host configured"
-    );
+    // Checked whatever the process table can be asked: the directory the host configured and the
+    // binary it started are both outside the workspace, which may be on a removable volume.
     let workspace = workspace_root();
     assert!(
         !expected.starts_with(&workspace),
@@ -273,6 +271,19 @@ fn runs_where_the_host_put_it(host: &Host, session_id: SessionId) {
         !host.worker.starts_with(&workspace),
         "and the binary it started is not inside it either: {}",
         host.worker.display()
+    );
+    let Some(actual) = working_directory_of(pid) else {
+        // Nothing to compare against rather than a comparison that failed. Saying so is better
+        // than a pass that checked nothing.
+        eprintln!(
+            "skipped: this platform does not report another process's working directory here"
+        );
+        return;
+    };
+    assert_eq!(
+        std::fs::canonicalize(&actual).unwrap_or(actual),
+        expected,
+        "the worker runs in the directory the host configured"
     );
 }
 

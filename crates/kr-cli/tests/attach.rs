@@ -530,6 +530,9 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
     let session = hosted.session_id.to_string();
     let detach = std::process::Command::new(env!("CARGO_BIN_EXE_kr"))
         .args(["detach", &session])
+        // Never this test's own directory: the build tree can be on a removable volume, and
+        // nothing this suite starts is given a working directory there.
+        .current_dir(hosted.temp.root())
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env(
@@ -623,6 +626,9 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
     let session = hosted.session_id.to_string();
     let detach = std::process::Command::new(env!("CARGO_BIN_EXE_kr"))
         .args(["detach", &session])
+        // Never this test's own directory: the build tree can be on a removable volume, and
+        // nothing this suite starts is given a working directory there.
+        .current_dir(hosted.temp.root())
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env(
