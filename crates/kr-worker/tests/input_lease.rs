@@ -1928,14 +1928,17 @@ async fn an_idle_connection_that_never_acquires_leaves_the_lease_where_it_was() 
     let started = tokio::time::Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
     while tokio::time::Instant::now() < deadline {
-        let Ok(Ok(frame)) = tokio::time::timeout(Duration::from_secs(2), idle.recv()).await else {
-            break;
-        };
-        if let ControlFrame::Notification(notification) = frame
-            && notification.event_type.as_str() == "session.output"
-        {
-            received = true;
-            break;
+        // A quiet moment is a busy machine rather than an answer, so only a connection that has
+        // gone ends this before the deadline does.
+        match tokio::time::timeout(Duration::from_secs(2), idle.recv()).await {
+            Ok(Ok(ControlFrame::Notification(notification)))
+                if notification.event_type.as_str() == "session.output" =>
+            {
+                received = true;
+                break;
+            }
+            Ok(Ok(_)) | Err(_) => {}
+            Ok(Err(_)) => break,
         }
     }
     assert!(

@@ -535,10 +535,8 @@ mod platform {
                 ("an unknown state", line("Q", 1, 987_654)),
                 (
                     "a thread count that is not a number",
-                    format!(
-                        "42 (sh) Z 1 42 42 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 many 0 987654 0 0 0 \
-                         0 0"
-                    ),
+                    "42 (sh) Z 1 42 42 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 many 0 987654 0 0 0 0 0"
+                        .to_owned(),
                 ),
             ];
             for (what, text) in unaccountable {

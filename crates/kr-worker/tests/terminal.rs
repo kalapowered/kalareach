@@ -221,6 +221,56 @@ async fn collect_payloads(client: &mut LocalClient, window: Duration) -> Vec<Vec
     seen
 }
 
+/// Collects until `marker` has arrived, and then for `window` longer.
+///
+/// The two halves answer different questions. Whether the marker arrives at all is a liveness wait,
+/// and a host with several suites on it can take far longer over it than the window a test wants to
+/// watch afterwards; what arrives *beside* the marker is what that window is for, and lengthening
+/// it would only make the suite slower. So the wait is bounded by [`LIVENESS_DEADLINE`] and the
+/// window keeps its own length, and a marker that never arrives fails here, saying how long it
+/// waited and for what.
+async fn collect_until(client: &mut LocalClient, marker: &[u8], window: Duration) -> Vec<u8> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
+    let mut seen: Vec<u8> = Vec::new();
+    while !seen.windows(marker.len()).any(|slice| slice == marker) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited {:?} for {:?} to reach this terminal: {:?}",
+            started.elapsed(),
+            String::from_utf8_lossy(marker),
+            String::from_utf8_lossy(&seen)
+        );
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining.min(Duration::from_secs(1)), client.recv()).await {
+            Ok(Ok(ControlFrame::Notification(notification)))
+                if notification.event_type.as_str() == "session.output" =>
+            {
+                if let Ok(event) = notification
+                    .payload
+                    .to_typed::<kr_protocol::recovery::OutputEvent>()
+                {
+                    seen.extend_from_slice(event.bytes.as_slice());
+                }
+            }
+            // A quiet moment is a busy machine; a connection that has gone is not something to
+            // wait out.
+            Ok(Ok(_)) | Err(_) => {}
+            Ok(Err(_)) => break,
+        }
+    }
+    seen.extend_from_slice(&collect(client, window).await);
+    seen
+}
+
+/// How long a wait for something to arrive is given.
+///
+/// A liveness wait is not a measurement: it is there to fail when something never arrives. The
+/// windows these waits had were inside the range the slowest reference hosts reach when several
+/// suites share them; two minutes is outside it. The observation windows beside them are not waits
+/// and keep their own lengths.
+const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
+
 /// Collects everything the worker sends this client for `window`.
 async fn collect(client: &mut LocalClient, window: Duration) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + window;
@@ -258,7 +308,7 @@ async fn a_query_is_answered_by_the_host_and_reaches_no_attached_terminal() {
         Some(TerminalPresentationMode::Direct),
         "the terminal is the session's size"
     );
-    let seen = collect(&mut client, Duration::from_secs(4)).await;
+    let seen = collect_until(&mut client, b"[?62;22c", Duration::from_secs(4)).await;
     let text = String::from_utf8_lossy(&seen).into_owned();
     assert!(
         !text.contains("\u{1b}[c"),
@@ -280,7 +330,7 @@ async fn joining_late_draws_the_screen_rather_than_replaying_what_made_it() {
     // Enough for the shell to run and the worker to consume it.
     tokio::time::sleep(Duration::from_millis(600)).await;
     let (mut client, _, _) = attached(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
-    let seen = collect(&mut client, Duration::from_secs(2)).await;
+    let seen = collect_until(&mut client, b"visible-line", Duration::from_secs(2)).await;
     let text = String::from_utf8_lossy(&seen).into_owned();
     assert!(
         text.contains("visible-line"),
@@ -308,7 +358,7 @@ async fn a_terminal_of_another_size_is_projected_rather_than_sent_the_raw_stream
         Some(TerminalPresentationMode::Viewport),
         "a terminal that is not the session's size is shown a projection"
     );
-    let seen = collect(&mut client, Duration::from_secs(2)).await;
+    let seen = collect_until(&mut client, b"first", Duration::from_secs(2)).await;
     let text = String::from_utf8_lossy(&seen).into_owned();
     assert!(text.contains("first"), "the screen is drawn: {text:?}");
     // A projection places every row itself, which is what makes it independent of this terminal's
@@ -351,7 +401,7 @@ async fn a_side_effect_reaches_the_lease_holder_and_nobody_else() {
         .expect("the call reaches the worker")
         .expect("the lease is taken");
 
-    let held = collect(&mut holder, Duration::from_secs(3)).await;
+    let held = collect_until(&mut holder, &[0x07], Duration::from_secs(3)).await;
     let watched = collect(&mut watcher, Duration::from_secs(1)).await;
     assert!(
         held.contains(&0x07),

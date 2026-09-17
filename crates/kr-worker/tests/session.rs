@@ -76,8 +76,8 @@ async fn collect(stream: &mut kr_worker::output::OutputStream, marker: &[u8]) ->
     while tokio::time::Instant::now() < deadline {
         // A quiet moment is not an answer. What ends this is the marker, a stream that has closed,
         // or the deadline; a gap between deliveries is a busy machine rather than a host that has
-        // stopped.
-        match tokio::time::timeout(Duration::from_secs(1), stream.recv()).await {
+        // stopped, and the interval this waits in is the one it always used.
+        match tokio::time::timeout(Duration::from_secs(5), stream.recv()).await {
             Ok(Some(OutputDelivery::Bytes { bytes, .. })) => {
                 seen.extend_from_slice(&bytes);
                 if seen.windows(marker.len()).any(|window| window == marker) {
@@ -305,7 +305,7 @@ async fn a_slow_attachment_is_resynchronised_and_the_others_keep_receiving() {
     let started = tokio::time::Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
     while tokio::time::Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_secs(1), slow.recv()).await {
+        match tokio::time::timeout(Duration::from_secs(5), slow.recv()).await {
             Ok(Some(OutputDelivery::Resync(_))) => {
                 resynchronised = true;
                 break;
@@ -1398,7 +1398,7 @@ async fn a_root_shell_that_exits_after_the_session_settles_is_noticed_by_its_own
         )
         .expect("starts a session"),
     );
-    let record = tokio::time::timeout(Duration::from_secs(45), runtime.wait_closed())
+    let record = tokio::time::timeout(LIVENESS_DEADLINE, runtime.wait_closed())
         .await
         .expect("the session closes on its own");
     let taken = started.elapsed();

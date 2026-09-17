@@ -833,9 +833,9 @@ async fn an_equal_sized_terminal_shares_the_stream_and_a_smaller_one_is_clipped_
     wired.runtime.flush_input();
     retained_within(&wired.runtime, b"kr-drawn.", LIVENESS_DEADLINE).await;
 
-    let direct = collect(&mut same, Duration::from_secs(3)).await;
-    let also_direct = collect(&mut also_same, Duration::from_secs(3)).await;
-    let clipped = collect(&mut narrow, Duration::from_secs(3)).await;
+    let direct = collect_until(&mut same, b"kr-far-two", Duration::from_secs(3)).await;
+    let also_direct = collect_until(&mut also_same, b"kr-far-two", Duration::from_secs(3)).await;
+    let clipped = collect_until(&mut narrow, b"kr-near-two", Duration::from_secs(3)).await;
 
     // Equal size means the same filtered live byte stream, to both of them.
     assert!(
@@ -1557,6 +1557,47 @@ async fn resynchronised(client: &mut LocalClient, within: Duration) -> bool {
 }
 
 /// Collects everything this client is sent for `window`.
+/// Collects until `marker` has arrived, and then for `window` longer.
+///
+/// The two halves answer different questions. Whether the marker arrives at all is a liveness wait,
+/// and a loaded host can take far longer over it than the window a test wants to watch afterwards;
+/// what arrives *beside* the marker is what that window is for. So the wait is bounded by
+/// [`LIVENESS_DEADLINE`] and the window keeps its own length, and a marker that never arrives fails
+/// here, saying how long it waited and for what.
+async fn collect_until(client: &mut LocalClient, marker: &[u8], window: Duration) -> Vec<u8> {
+    let started = tokio::time::Instant::now();
+    let deadline = started + LIVENESS_DEADLINE;
+    let mut seen: Vec<u8> = Vec::new();
+    while !contains(&seen, marker) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "waited {:?} for {:?} to reach this terminal: {}",
+            started.elapsed(),
+            String::from_utf8_lossy(marker),
+            String::from_utf8_lossy(&seen).escape_debug()
+        );
+        let remaining = deadline - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining.min(Duration::from_secs(1)), client.recv()).await {
+            Ok(Ok(ControlFrame::Notification(notification)))
+                if notification.event_type.as_str() == "session.output" =>
+            {
+                if let Ok(event) = notification
+                    .payload
+                    .to_typed::<kr_protocol::recovery::OutputEvent>()
+                {
+                    seen.extend_from_slice(event.bytes.as_slice());
+                }
+            }
+            // A quiet moment is a busy machine; a connection that has gone is not something to
+            // wait out.
+            Ok(Ok(_)) | Err(_) => {}
+            Ok(Err(_)) => break,
+        }
+    }
+    seen.extend_from_slice(&collect(client, window).await);
+    seen
+}
+
 async fn collect(client: &mut LocalClient, window: Duration) -> Vec<u8> {
     let deadline = tokio::time::Instant::now() + window;
     let mut seen = Vec::new();
