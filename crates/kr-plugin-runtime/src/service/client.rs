@@ -203,17 +203,11 @@ impl Pending {
             transport.offers.abort();
             transport.notices.close();
             transport.offered_bytes.store(0, Ordering::Release);
+            // The writer, if nobody is using it. Whoever is holds it out of the slot for the length
+            // of their own frame and drops it rather than putting it back once this flag is set, so
+            // there is no case in which it survives a closure and no cleanup to schedule.
             if let Ok(mut writer) = transport.writer.try_lock() {
                 let _closed = writer.take();
-            } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                // Somebody is mid-write. They hold the only reference that matters and will find
-                // the connection closed when they look; taking it from under them is not something
-                // a lock is for. This runs on a runtime only when there is one: closing can happen
-                // in a drop, and a drop is not somewhere to assume an executor.
-                let writer = Arc::clone(&transport.writer);
-                handle.spawn(async move {
-                    let _closed = writer.lock().await.take();
-                });
             }
         }
     }
@@ -250,30 +244,6 @@ struct Waiting<'a> {
 impl Drop for Waiting<'_> {
     fn drop(&mut self) {
         let _taken = self.pending.take(self.request_id);
-    }
-}
-
-/// One frame on its way to the host, and what happens if it does not get there.
-///
-/// A [`FrameWriter`] that is part way through a frame refuses every later one, and nothing on this
-/// side can resume a frame whose sender has gone. So a write that did not finish, for whatever
-/// reason, is the end of the connection rather than the end of one call.
-struct Attempting<'a> {
-    pending: &'a Pending,
-    finished: bool,
-}
-
-impl Attempting<'_> {
-    fn finished(mut self, wrote: bool) {
-        self.finished = wrote;
-    }
-}
-
-impl Drop for Attempting<'_> {
-    fn drop(&mut self) {
-        if !self.finished {
-            self.pending.close();
-        }
     }
 }
 
@@ -727,23 +697,27 @@ impl PluginClient {
         let exchange = async {
             {
                 let mut held = self.writer.lock().await;
-                let Some(writer) = held.as_mut() else {
+                // Taken out for the write and put back only if the frame finished. A frame that is
+                // half written and then abandoned -- by a failure, by a deadline, or by a caller
+                // that stopped polling -- leaves a writer that refuses every later frame, and there
+                // is no way back from that on this connection. Holding the writer here means the
+                // abandoning drops it, which closes the socket's write half; nothing has to be
+                // scheduled, and nothing has to run on an executor that may not exist.
+                let Some(mut writer) = held.take() else {
                     return Err(RuntimeError::ServiceUnavailable {
                         detail: "the plugin host closed the connection".to_owned(),
                     });
                 };
-                // Armed once the writer is held, and not before: a caller whose deadline ran out
-                // while it was queueing for the writer has written nothing, and ending the
-                // connection over that would be a failure it did not cause. From here on, a frame
-                // that is half written and then abandoned -- by a failure, by a deadline, or by a
-                // caller that stopped polling -- leaves the writer unable to start another one, and
-                // there is no way back from that on this connection.
-                let attempt = Attempting {
-                    pending: &self.pending,
-                    finished: false,
-                };
                 let written = writer.write_message(&Request { request_id, body }).await;
-                attempt.finished(written.is_ok());
+                if written.is_ok() && !self.pending.is_closed() {
+                    *held = Some(writer);
+                } else {
+                    // The frame did not arrive, or this connection ended while it was being
+                    // written. Either way the writer goes, and with it the write half.
+                    drop(writer);
+                    self.pending.close();
+                }
+                drop(held);
                 written.map_err(|error| RuntimeError::ServiceUnavailable {
                     detail: error.to_string(),
                 })?;
@@ -855,11 +829,18 @@ async fn write_offered(
         // Bounded, the wait for the writer included: a host that stopped reading would otherwise
         // hold this task and the lock every request on this connection needs.
         let written = tokio::time::timeout(OFFER_WRITE_DEADLINE, async {
+            // Taken out and put back, for the reason the request path takes it out: this task can
+            // be stopped at the await below, and a writer left in the slot part way through a frame
+            // would refuse every frame after it.
             let mut held = writer.lock().await;
-            match held.as_mut() {
-                Some(writer) => writer.write_message(&request).await,
-                None => Err(kr_ipc::IpcError::PeerClosed),
+            let Some(mut owned) = held.take() else {
+                return Err(kr_ipc::IpcError::PeerClosed);
+            };
+            let written = owned.write_message(&request).await;
+            if written.is_ok() && !pending.is_closed() {
+                *held = Some(owned);
             }
+            written
         })
         .await;
         if !matches!(written, Ok(Ok(()))) {

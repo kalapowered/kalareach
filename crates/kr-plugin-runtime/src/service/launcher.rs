@@ -59,6 +59,36 @@ use crate::service::protocol::{
 /// The largest descriptor this host writes or reads.
 const MAX_DESCRIPTOR_BYTES: u64 = 8 * 1024;
 
+/// Which launch's publication is the current one, per environment.
+///
+/// Writing a descriptor is a file write, a flush and a rename, and a timer cannot interrupt any of
+/// it: a publication this launcher stopped waiting for still finishes. What must not happen is that
+/// it finishes *after* a later launch published its own and replaces it. Each attempt takes a
+/// number, and a publication that is no longer the newest writes nothing. One entry per
+/// environment, which is a number this host has one of per environment it serves.
+static PUBLICATIONS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<EnvironmentId, u64>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The source of publication numbers, which are never reused inside a process.
+static NEXT_PUBLICATION: AtomicU64 = AtomicU64::new(1);
+
+/// Takes the next publication number for one environment, superseding any earlier attempt.
+fn claim_publication(environment_id: EnvironmentId) -> u64 {
+    let attempt = NEXT_PUBLICATION.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut current) = PUBLICATIONS.lock() {
+        current.insert(environment_id, attempt);
+    }
+    attempt
+}
+
+/// Returns whether this attempt is still the newest publication for its environment.
+fn is_current_publication(environment_id: EnvironmentId, attempt: u64) -> bool {
+    PUBLICATIONS
+        .lock()
+        .is_ok_and(|current| current.get(&environment_id) == Some(&attempt))
+}
+
 /// What can go wrong starting or verifying a plugin host.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -675,31 +705,36 @@ impl HostReservation {
                     // Publishing and acknowledging are inside the deadline too: a host waiting to
                     // be told it was accepted is a host that is not serving, and a launcher that
                     // took an unbounded time over either would be holding it there.
-                    // Publishing writes a file, flushes it and renames it. A timer cannot
-                    // interrupt any of that, so the deadline is checked *before* it starts and the
-                    // write is then waited for rather than abandoned: a publication given up on
-                    // would still finish, and could replace the descriptor a later launch had
-                    // successfully published. What the deadline bounds here is whether the
-                    // publication is started at all.
-                    if deadline
-                        .saturating_duration_since(tokio::time::Instant::now())
-                        .is_zero()
-                    {
-                        return Err(LaunchError::NoRendezvous { deadline_ms });
-                    }
+                    // Publishing writes a file, flushes it and renames it, and a timer cannot
+                    // interrupt any of that: a publication this launcher stops waiting for still
+                    // finishes. So it is fenced rather than merely bounded -- it writes nothing once
+                    // a later launch has taken the environment's publication -- and the wait for it
+                    // is inside the deadline like every other stage.
+                    let attempt = claim_publication(self.environment_id);
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
                     let publishing = {
                         let paths = environment.clone();
                         let descriptor = descriptor.clone();
-                        tokio::task::spawn_blocking(move || publish_descriptor(&paths, &descriptor))
+                        let environment_id = self.environment_id;
+                        tokio::task::spawn_blocking(move || {
+                            if is_current_publication(environment_id, attempt) {
+                                publish_descriptor(&paths, &descriptor)
+                            } else {
+                                // A later launch has published, or is publishing. Its descriptor is
+                                // the one that should be there.
+                                Ok(())
+                            }
+                        })
                     };
-                    match publishing.await {
-                        Ok(Ok(())) => {}
-                        Ok(Err(error)) => return Err(error),
-                        Err(error) => {
+                    match tokio::time::timeout(left, publishing).await {
+                        Ok(Ok(Ok(()))) => {}
+                        Ok(Ok(Err(error))) => return Err(error),
+                        Ok(Err(error)) => {
                             return Err(LaunchError::Refused {
                                 detail: format!("the descriptor could not be published: {error}"),
                             });
                         }
+                        Err(_elapsed) => return Err(LaunchError::NoRendezvous { deadline_ms }),
                     }
 
                     // The host does not serve workers until it has this. Publishing a descriptor
@@ -1078,6 +1113,25 @@ mod tests {
         );
         assert!(read_descriptor(&environment).expect("a read").is_none());
         silent.abort();
+    }
+
+    #[test]
+    fn a_publication_a_later_launch_superseded_writes_nothing() {
+        let environment_id = EnvironmentId::new(kr_ipc::new_uuid());
+        let first = claim_publication(environment_id);
+        assert!(is_current_publication(environment_id, first));
+
+        // A second launch for the same environment. The first one's publication, if it is still
+        // running, is no longer the one that should be on disk.
+        let second = claim_publication(environment_id);
+        assert!(!is_current_publication(environment_id, first));
+        assert!(is_current_publication(environment_id, second));
+
+        // Another environment's publications are its own.
+        let elsewhere = EnvironmentId::new(kr_ipc::new_uuid());
+        let theirs = claim_publication(elsewhere);
+        assert!(is_current_publication(elsewhere, theirs));
+        assert!(is_current_publication(environment_id, second));
     }
 
     #[tokio::test]

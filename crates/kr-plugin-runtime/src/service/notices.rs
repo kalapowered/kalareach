@@ -255,6 +255,7 @@ impl Drop for NoticeStream {
             queue.waiting.clear();
             queue.lost.clear();
             queue.lost_order.clear();
+            queue.dropped_through.clear();
             queue.held = 0;
         }
     }
@@ -284,22 +285,18 @@ impl Queued {
 
         // A piece of a document this queue has already dropped. Queueing it would leave a reader
         // with part of a document and no way to tell; it belongs to the loss that took the rest.
-        if let Notice::Document {
-            binding_id,
-            document,
-            ..
-        } = &notice
-            && self
-                .dropped_through
-                .get(binding_id)
-                .is_some_and(|through| *document <= *through)
-        {
+        if self.already_dropped(&notice) {
             return Offered::Dropped;
         }
 
         let cost = notice_bytes(&notice);
         let droppable = matches!(notice, Notice::Document { .. });
         while self.held + cost > MAX_NOTICE_BYTES && self.evict_oldest_document() {}
+        // Making room can drop the very document this piece belongs to, and a piece admitted after
+        // its own document went would be the one thing this record exists to prevent.
+        if self.already_dropped(&notice) {
+            return Offered::Dropped;
+        }
         if self.held + cost > MAX_NOTICE_BYTES {
             if droppable {
                 // Nothing left to make room with, and this is presentation. It goes, and the
@@ -318,9 +315,39 @@ impl Queued {
             self.overflowed = true;
             return Offered::Overflowed;
         }
+        // A document later than the last one dropped for this binding is proof that the dropped
+        // one is finished: a binding's documents are numbered in order, and one call draws one.
+        // The record has done its work and goes.
+        if let Notice::Document {
+            binding_id,
+            document,
+            ..
+        } = &notice
+            && self
+                .dropped_through
+                .get(binding_id)
+                .is_some_and(|through| *document > *through)
+        {
+            self.dropped_through.remove(binding_id);
+        }
         self.held += cost;
         self.waiting.push_back(notice);
         Offered::Kept
+    }
+
+    /// Returns true when this notice is a piece of a document this queue has already dropped.
+    fn already_dropped(&self, notice: &Notice) -> bool {
+        let Notice::Document {
+            binding_id,
+            document,
+            ..
+        } = notice
+        else {
+            return false;
+        };
+        self.dropped_through
+            .get(binding_id)
+            .is_some_and(|through| *document <= *through)
     }
 
     /// Folds one loss into what its binding has already lost.
@@ -428,10 +455,6 @@ impl Queued {
             && let Some(loss) = self.lost.remove(&binding_id)
         {
             self.held = self.held.saturating_sub(NOTICE_OVERHEAD_BYTES);
-            // The reader has been told. Every piece of the dropped document was offered while it
-            // was being dropped -- a document's pieces are produced by one call and forwarded
-            // together -- so nothing more is coming that this record would have to catch.
-            self.dropped_through.remove(&binding_id);
             return Some(Notice::Gap {
                 binding_id,
                 events: loss.events,
@@ -667,6 +690,79 @@ mod tests {
             }
         }
         assert_eq!(first, 0, "a piece of the dropped document was delivered");
+    }
+
+    #[test]
+    fn a_piece_that_makes_room_by_dropping_its_own_document_goes_with_it() {
+        let (sink, mut stream) = channel();
+        let big = 512 * 1024;
+        let piece = |number: u64, last: bool, index: usize| Notice::Document {
+            binding_id: binding(1),
+            call: "snapshot".to_owned(),
+            document: number,
+            last,
+            nodes: vec![WireNode {
+                node_id: format!("n{index}"),
+                node_revision: 1,
+                body_json: "x".repeat(big),
+            }],
+        };
+        // Fill the queue with one document's pieces until the next piece has to evict one of them
+        // -- its own document's. The piece that forced that eviction must go with the document it
+        // was part of, not be admitted after it.
+        let mut admitted = 0;
+        let mut dropped = false;
+        for index in 0..16 {
+            match sink.send(piece(1, index == 15, index)) {
+                Offered::Kept => admitted += 1,
+                Offered::Dropped => dropped = true,
+                other => panic!("the queue answered {other:?}"),
+            }
+        }
+        assert!(dropped, "nothing was dropped, so nothing is under test");
+
+        let mut delivered = 0;
+        while let Some(notice) = stream.try_recv() {
+            if let Notice::Document { document: 1, .. } = notice {
+                delivered += 1;
+            }
+        }
+        assert_eq!(
+            delivered, 0,
+            "{delivered} of the {admitted} admitted pieces of a dropped document were delivered"
+        );
+    }
+
+    #[test]
+    fn the_next_document_clears_the_record_of_the_one_before_it() {
+        let (sink, mut stream) = channel();
+        let big = 512 * 1024;
+        let piece = |number: u64| Notice::Document {
+            binding_id: binding(1),
+            call: "observe".to_owned(),
+            document: number,
+            last: true,
+            nodes: vec![WireNode {
+                node_id: "n0".to_owned(),
+                node_revision: 1,
+                body_json: "x".repeat(big),
+            }],
+        };
+        for number in 1..12 {
+            sink.send(piece(number));
+        }
+        // Whatever was dropped is behind the newest document, so the newest one is delivered.
+        let newest = 99;
+        assert_eq!(sink.send(piece(newest)), Offered::Kept);
+        let mut seen = false;
+        while let Some(notice) = stream.try_recv() {
+            if let Notice::Document { document, .. } = notice
+                && document == newest
+            {
+                seen = true;
+            }
+        }
+        assert!(seen, "the newest document was refused by an older loss");
     }
 
     #[test]

@@ -299,6 +299,7 @@ impl PluginHost {
 
         if let Ok(mut held) = served.registered.lock() {
             held.live.clear();
+            held.preparing.clear();
             held.owed.clear();
         }
 
@@ -512,10 +513,11 @@ impl PluginHost {
                 if matches!(removed, Unbound::Stopped) {
                     served.bindings.give_back();
                 }
-                if let Some(removing) = removing
-                    && let Ok(mut held) = served.registered.lock()
-                {
-                    held.parted(binding_id, &removing);
+                if let Ok(mut held) = served.registered.lock() {
+                    if let Some(removing) = removing {
+                        held.parted(binding_id, &removing);
+                    }
+                    held.gave_up(binding_id);
                 }
                 Ok(ResponseBody::Unbound {
                     existed: removed.existed(),
@@ -628,6 +630,17 @@ impl PluginHost {
             facts: facts_of(&facts),
             executable,
         };
+        // Recorded before the forwarder starts, because what `bind` draws reaches the notice queue
+        // before this registration returns: a document lost in that moment has to be an obligation
+        // this connection can still discharge.
+        if let Ok(mut held) = served.registered.lock() {
+            held.preparing(binding_id);
+        }
+        let started_registering = Registering {
+            registered: &served.registered,
+            binding_id,
+            kept: false,
+        };
         let events = Self::forward_notices(
             binding,
             served.notices.clone(),
@@ -642,6 +655,7 @@ impl PluginHost {
         if let Ok(mut held) = served.registered.lock() {
             held.joined(binding_id, bound);
         }
+        started_registering.keep();
         admitted.keep();
         Ok(ResponseBody::Registered {
             origin: match compiled.origin {
@@ -714,29 +728,51 @@ type Registered = Arc<std::sync::Mutex<Held>>;
 #[derive(Debug, Default)]
 struct Held {
     live: std::collections::HashMap<Uuid, Arc<BindingHandle>>,
-    /// Bindings that lost a document before this connection had their handle.
+    /// Bindings this connection is registering, whose handles do not exist yet.
     ///
     /// What `bind` draws reaches the notice queue before the registration that started it has
-    /// returned, so a document lost in that moment has no handle to ask. The obligation is kept
-    /// here until there is one, rather than dropped for want of somewhere to put it.
+    /// returned, so a document lost in that moment has no handle to ask.
+    preparing: std::collections::HashSet<Uuid>,
+    /// Redraws owed to bindings that were still being registered when the loss was reported.
+    ///
+    /// Only for identifiers in `preparing`: a loss reported for a binding that has already gone is
+    /// a loss with nobody to tell, and remembering those would be a record that grew for as long as
+    /// the connection lasted.
     owed: std::collections::HashSet<Uuid>,
 }
 
 impl Held {
+    /// Records that this connection has started registering a binding.
+    fn preparing(&mut self, binding_id: Uuid) {
+        self.preparing.insert(binding_id);
+    }
+
     /// Records a binding, and discharges any redraw it owed from before it existed.
     fn joined(&mut self, binding_id: Uuid, handle: Arc<BindingHandle>) {
+        self.preparing.remove(&binding_id);
         if self.owed.remove(&binding_id) {
             handle.require_snapshot();
         }
         self.live.insert(binding_id, handle);
     }
 
+    /// Forgets a registration that did not finish.
+    fn gave_up(&mut self, binding_id: Uuid) {
+        self.preparing.remove(&binding_id);
+        self.owed.remove(&binding_id);
+    }
+
     /// Asks one binding to draw again, or remembers that it owes a drawing.
+    ///
+    /// A loss for an identifier this connection neither holds nor is registering is a loss with
+    /// nobody to tell: the binding has gone, and its next incarnation will draw from scratch.
     fn redraw(&mut self, binding_id: Uuid) {
         match self.live.get(&binding_id) {
             Some(handle) => handle.require_snapshot(),
             None => {
-                self.owed.insert(binding_id);
+                if self.preparing.contains(&binding_id) {
+                    self.owed.insert(binding_id);
+                }
             }
         }
     }
@@ -802,6 +838,32 @@ impl Conversation {
 #[derive(Debug, Default)]
 struct BindingPlaces {
     held: AtomicUsize,
+}
+
+/// One registration in progress, forgotten if it does not finish.
+///
+/// A registration that failed leaves an identifier nothing is preparing any more, and a redraw owed
+/// to it is owed to nobody. Forgetting it here is what keeps that record from growing.
+struct Registering<'a> {
+    registered: &'a Registered,
+    binding_id: Uuid,
+    kept: bool,
+}
+
+impl Registering<'_> {
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Registering<'_> {
+    fn drop(&mut self) {
+        if !self.kept
+            && let Ok(mut held) = self.registered.lock()
+        {
+            held.gave_up(self.binding_id);
+        }
+    }
 }
 
 /// One taken place, given back if its registration does not finish.
