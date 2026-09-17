@@ -394,27 +394,34 @@ async fn run(cli: Cli) -> Result<Completion> {
             let selector = session_selector(arguments.session.as_deref())?;
             let wanted = parse_environment(arguments.environment.as_deref())?;
             let environment = kr_cli::resolve::select(&paths, arguments.environment.as_deref())?;
-            let summary = match find(&paths, &selector, wanted) {
-                Ok((known, descriptor)) => match read_session(&descriptor).await {
-                    Ok(summary) => summary,
-                    // A descriptor that no longer answers is a hint that has gone stale. The
-                    // daemon reconciles it and returns the closure record.
-                    Err(CliError::HostUnavailable(_)) => {
-                        let mut client = open_controller(&known.paths, build_id()).await?;
-                        read_from_controller(&mut client, descriptor.session_id).await?
-                    }
-                    Err(error) => return Err(error),
-                },
+            // The environment the session was found in, which is not always the one this
+            // installation opens by default. Reading one environment's session and another's
+            // power setting would describe a machine the session is not on.
+            let (summary, host) = match find(&paths, &selector, wanted) {
+                Ok((known, descriptor)) => {
+                    let summary = match read_session(&descriptor).await {
+                        Ok(summary) => summary,
+                        // A descriptor that no longer answers is a hint that has gone stale. The
+                        // daemon reconciles it and returns the closure record.
+                        Err(CliError::HostUnavailable(_)) => {
+                            let mut client = open_controller(&known.paths, build_id()).await?;
+                            read_from_controller(&mut client, descriptor.session_id).await?
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    (summary, known.paths)
+                }
                 Err(CliError::UnknownSession(_)) => {
                     let mut client = open_controller(&environment.paths, build_id()).await?;
                     let session_id = resolve_closed(&mut client, &selector).await?;
-                    read_from_controller(&mut client, session_id).await?
+                    let summary = read_from_controller(&mut client, session_id).await?;
+                    (summary, environment.paths)
                 }
                 Err(error) => return Err(error),
             };
             // What this host is keeping itself awake for belongs in a status read: a machine
             // that will not sleep is something a person should be able to see the reason for.
-            let power = match open_controller(&environment.paths, build_id()).await {
+            let power = match open_controller(&host, build_id()).await {
                 Ok(mut client) => {
                     typed::<HostInfoResult>(client.request(Method::HostInfo, &()).await?)
                         .ok()
