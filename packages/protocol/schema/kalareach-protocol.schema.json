@@ -5187,7 +5187,7 @@
       ]
     },
     "InclusionClass": {
-      "description": "Which class of the working tree one previewed entry belongs to.",
+      "description": "Which class of the working tree one previewed entry belongs to.\n\nThe first four say where a path came from and a path has exactly one of them.\n[`Self::BinaryFile`] is the exception: it cuts across the others, so it appears in the counts\nand in [`PreviewEntry::binary`] rather than as a path's own class.",
       "oneOf": [
         {
           "const": "dirty_file",
@@ -8359,6 +8359,10 @@
       "additionalProperties": false,
       "description": "One path an inclusion preview names.",
       "properties": {
+        "binary": {
+          "description": "Whether its content is binary.\n\nThis cuts across the other classes rather than replacing them: a dirty file may be binary,\nand a policy that includes dirty files and excludes binaries leaves this one out. The test\nis Git's own, a NUL byte in the first eight thousand bytes of content as it is stored.",
+          "type": "boolean"
+        },
         "byte_len": {
           "anyOf": [
             {
@@ -8372,7 +8376,7 @@
         },
         "class": {
           "$ref": "#/$defs/InclusionClass",
-          "description": "Which class it belongs to."
+          "description": "Which class it belongs to: where in the working tree it came from."
         },
         "included": {
           "description": "Whether the policy in force would copy it into the new workspace.",
@@ -8386,6 +8390,7 @@
       "required": [
         "path",
         "class",
+        "binary",
         "byte_len",
         "included"
       ],

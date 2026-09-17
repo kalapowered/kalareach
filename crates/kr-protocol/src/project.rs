@@ -65,6 +65,14 @@ pub const MAX_LABEL_LEN: usize = 255;
 /// untracked files needs the count and a sample, not every name.
 pub const MAX_PREVIEW_ENTRIES: usize = 512;
 
+/// How many paths a preview reads to decide whether their content is binary.
+///
+/// The counts are exact for every class the status reports, because that costs one read of the
+/// repository. Deciding whether a path's *content* is binary costs one file open each, and a
+/// working tree with a build directory in it holds hundreds of thousands. Beyond this many the
+/// preview says how many it did not read rather than pretending to have read them.
+pub const MAX_BINARY_SCAN_ENTRIES: usize = 20_000;
+
 /// The transports a repository operation may use.
 ///
 /// An allowlist, because the question is not which transports Git can be talked into using (a list
@@ -322,6 +330,10 @@ impl InclusionPolicy {
 }
 
 /// Which class of the working tree one previewed entry belongs to.
+///
+/// The first four say where a path came from and a path has exactly one of them.
+/// [`Self::BinaryFile`] is the exception: it cuts across the others, so it appears in the counts
+/// and in [`PreviewEntry::binary`] rather than as a path's own class.
 #[derive(
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, JsonSchema,
 )]
@@ -368,8 +380,14 @@ impl InclusionClass {
 pub struct PreviewEntry {
     /// The path, relative to the repository's top level.
     pub path: String,
-    /// Which class it belongs to.
+    /// Which class it belongs to: where in the working tree it came from.
     pub class: InclusionClass,
+    /// Whether its content is binary.
+    ///
+    /// This cuts across the other classes rather than replacing them: a dirty file may be binary,
+    /// and a policy that includes dirty files and excludes binaries leaves this one out. The test
+    /// is Git's own, a NUL byte in the first eight thousand bytes of content as it is stored.
+    pub binary: bool,
     /// Its size in bytes, when the host could read one.
     pub byte_len: Nullable<U64>,
     /// Whether the policy in force would copy it into the new workspace.

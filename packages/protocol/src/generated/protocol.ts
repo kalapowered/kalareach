@@ -4684,11 +4684,19 @@ export interface PreviewCount {
  */
 export interface PreviewEntry {
   /**
+   * Whether its content is binary.
+   *
+   * This cuts across the other classes rather than replacing them: a dirty file may be binary,
+   * and a policy that includes dirty files and excludes binaries leaves this one out. The test
+   * is Git's own, a NUL byte in the first eight thousand bytes of content as it is stored.
+   */
+  binary: boolean
+  /**
    * Its size in bytes, when the host could read one.
    */
   byte_len: U64 | null
   /**
-   * Which class it belongs to.
+   * Which class it belongs to: where in the working tree it came from.
    */
   class: 'dirty_file' | 'untracked_file' | 'submodule' | 'binary_file' | 'generated_artefact'
   /**
