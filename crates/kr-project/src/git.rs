@@ -1483,30 +1483,30 @@ pub fn redact(text: &str) -> String {
         // (`https://host/path?access_token=...`), and a fragment is no safer, so everything from
         // the first `?` or `#` goes too.
         //
-        // How far it goes is the whole of this decision. A query can hold anything, including
-        // another URL (`?next=https://elsewhere/&access_token=...`), so a query is removed all
-        // the way to whitespace or a quote: stopping earlier would leave whatever followed the
-        // nested URL, which is where the token was. Where there is *no* query, the URL ends at
-        // the earlier of that delimiter and the start of the next URL's own scheme, because a
-        // message can hold two URLs with nothing but a comma between them and treating the second
-        // as part of the first's path would leave its credential in the message.
+        // How far it goes is the whole of this decision, and it is decided in two steps.
         //
-        // What is deliberately not treated as an end of a query is any character a query could
-        // contain. Text after a query is removed with it, because a query's own terminator cannot
-        // be told from a token's content, and losing the tail of a diagnostic is the safe
-        // direction.
+        // First, where *this* URL ends: the earlier of a delimiter (whitespace or a quote) and the
+        // start of the next URL's own scheme. A message can hold two URLs with nothing but a comma
+        // between them, and reading the second as part of the first's path would carry its
+        // credential past this loop unredacted.
+        //
+        // Then, whether this URL has a query of its own. If it has, the removal runs from the `?`
+        // or `#` all the way to the delimiter rather than to the end of this URL: a query can hold
+        // another URL (`?next=https://elsewhere/&access_token=...`), and stopping at that nested
+        // URL would leave what followed it, which is where the token was. Text after a query in
+        // the same word goes with it, because a query's own terminator cannot be told from a
+        // token's content, and losing the tail of a diagnostic is the safe direction.
         let delimiter = tail
             .find([' ', '\t', '\n', '\r', '"', '\''])
             .unwrap_or(tail.len());
-        let query = tail[..delimiter].find(['?', '#']);
-        match query {
+        let ends_at = delimiter.min(next_scheme(tail));
+        match tail[..ends_at].find(['?', '#']) {
             Some(query) => {
                 out.push_str(&tail[..query]);
                 out.push_str("<query removed>");
                 rest = &tail[delimiter..];
             }
             None => {
-                let ends_at = delimiter.min(next_scheme(tail));
                 out.push_str(&tail[..ends_at]);
                 rest = &tail[ends_at..];
             }
@@ -1735,6 +1735,15 @@ mod tests {
         let redacted =
             super::redact("https://a.invalid/p,\u{e9}https://user:VERYSECRET@b.invalid/x");
         assert!(!redacted.contains("VERYSECRET"), "{redacted}");
+        // A query belongs to the URL it is part of. One URL's query must not decide how the
+        // *next* URL is read, or the next URL's credential travels in the part that is copied
+        // verbatim.
+        let redacted =
+            super::redact("url.https://a.invalid/p,https://user:VERYSECRET@b.invalid/x?q=1");
+        assert!(
+            !redacted.contains("VERYSECRET"),
+            "a second URL with a query of its own is still redacted: {redacted}"
+        );
         // Text that holds no URL is returned as it is.
         assert_eq!(super::redact("no url here"), "no url here");
     }

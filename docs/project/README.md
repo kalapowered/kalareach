@@ -407,8 +407,11 @@ reads the tree once and treats anything it could not establish as work to keep.
 **One removal of a workspace at a time.** `removal_pending` is a state a workspace *rests* in — it
 holds work the user has not approved removing — so the state alone cannot say whether a removal is
 running. A reservation does: while one removal holds it, a second is refused rather than allowed to
-measure a tree the first is deleting underneath it. The reservation is given up when the removal
-ends, and a reservation an earlier daemon held is released on recovery.
+measure a tree the first is deleting underneath it. The reservation is given up after the answer is
+built, on the failure path as well as the ordinary one and whether or not the journal accepted the
+reason. Two things can still leave one behind: a panic inside the call, and a release the journal
+itself refuses. The next recovery releases every reservation it finds, because the daemon that held
+one is gone.
 
 **Partial progress survives, and is not called finished.** A workspace whose materialisation this
 host did not finish keeps every file in its directory: the files may be the user's, and this host
@@ -422,9 +425,12 @@ it: a copy that landed and whose flush this host never saw leaves the row as it 
 the workspace says how many paths were carried and how many are unestablished.
 
 The temporary name a copy writes under follows from the destination's own path rather than from
-chance, which is what makes the `planned` row account for the temporary as well: a replacement
-daemon can turn the recorded path back into the one name a copy of it could have left behind. A
-stale one is this host's own leftover and is taken away before the copy is written again.
+chance, which is what makes the `planned` row account for the temporary as well: a person or a
+later task can turn the recorded path back into the one name a copy of it could have left behind.
+What that name does not establish is ownership. A repository can hold a tracked file at it, and
+nothing tells that file apart from a copy an earlier daemon left, so the copy is created
+exclusively and nothing is ever removed to make room for it: an occupied name means the path is
+reported as unapplied and what is there is untouched.
 
 Applying a change set path by path is the diff service's contract, not this one's; what this
 service records is which tree it created, what it carried into it, and how far it got.
@@ -457,7 +463,8 @@ refusal rather than a thing to work around.
 
 `projects.sqlite`, write-ahead logging, full synchronisation, forward-only migrations: the tables are created
 where they are absent and a store an earlier build wrote gains the columns added since, one
-`ALTER TABLE` each, before the recorded version moves on. The version says which build wrote the
+`ALTER TABLE` each, in one transaction with the version that describes them, so a store is never
+left saying it is at a version whose columns it does not have. The version says which build wrote the
 store rather than which columns it has, so the step runs for every version below the current one
 and adds whatever is missing instead of trusting a number to describe a shape. A store from a
 *later* build is refused rather than half read.

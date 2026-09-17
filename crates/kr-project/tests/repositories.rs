@@ -800,6 +800,17 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
         "a name with no identity beside it is not this host's to remove"
     );
     assert!(unproven.join("tree").is_dir(), "so it is still there");
+    // And what the recovery reports is that path, because a figure that counted it as cleaned up
+    // would be saying something this host did not do.
+    assert_eq!(recovery.unresolved, 1);
+    assert!(
+        recovery
+            .retained_paths
+            .iter()
+            .any(|path| path.ends_with("unproven")),
+        "the path a person can find is named: {:?}",
+        recovery.retained_paths
+    );
     assert!(
         operation
             .detail

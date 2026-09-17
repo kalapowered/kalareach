@@ -255,6 +255,7 @@ impl ProjectService {
                 Ok(step) => match step {
                     ResolvedStep::Completed => recovery.publications_completed += 1,
                     ResolvedStep::Cleaned => recovery.staging_removed += 1,
+                    ResolvedStep::Closed => {}
                     ResolvedStep::Unresolved(path) => {
                         recovery.unresolved += 1;
                         if let Some(path) = path {
@@ -669,10 +670,18 @@ impl ProjectService {
             },
             self.environment_id,
         )?;
+        // A name that is recorded and a sibling that could be opened are two different things. A
+        // directory this host could not look at is one it has not accounted for, and saying it was
+        // cleaned up would be saying something it did not establish.
+        let named = row
+            .staging_name
+            .as_deref()
+            .map(|name| destination.parent_path().join(name));
         let staging = row
             .staging_name
             .as_deref()
             .and_then(|name| StagingSibling::open(&destination, name).ok());
+        let unopened = named.is_some() && staging.is_none();
         let Some(staged) = row.staged_identity else {
             // Nothing was published, because the identity a publication needs was never recorded.
             // The destination is untouched, so the staged content is removed and the operation is
@@ -712,11 +721,20 @@ impl ProjectService {
                 OperationState::Failed,
             )?;
             // What this counted is what it removed. A staging directory it left alone, because
-            // nothing recorded which object this host had created, is reported as a path that is
-            // still there rather than as one that was cleaned up.
-            return Ok(match left_behind {
-                None => ResolvedStep::Cleaned,
-                Some(path) => ResolvedStep::Unresolved(Some(path)),
+            // nothing recorded which object this host had created or because it could not look at
+            // the name, is reported as a path that is still there. A row that named no sibling at
+            // all is neither: the operation is closed and nothing on the filesystem changed.
+            if let Some(path) = left_behind {
+                return Ok(ResolvedStep::Unresolved(Some(path)));
+            }
+            if unopened {
+                return Ok(ResolvedStep::Unresolved(
+                    named.map(|path| path.display().to_string()),
+                ));
+            }
+            return Ok(match named {
+                Some(_) => ResolvedStep::Cleaned,
+                None => ResolvedStep::Closed,
             });
         };
         match reconcile(&destination, staging.as_ref(), staged)? {
@@ -2486,6 +2504,11 @@ enum ResolvedStep {
     Completed,
     /// Nothing was published, and the staged content was removed.
     Cleaned,
+    /// Nothing was published and there was nothing to remove, so the operation is simply closed.
+    ///
+    /// Counted as neither a cleanup nor an unresolved path: a recovery's figures say what it did,
+    /// and this did nothing to the filesystem.
+    Closed,
     /// This host cannot say what happened; the staging path is kept and named.
     Unresolved(Option<String>),
 }

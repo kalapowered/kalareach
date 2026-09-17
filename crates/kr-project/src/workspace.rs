@@ -947,13 +947,10 @@ fn copy_one(
     // that finds a path recorded as `planned` can name the one temporary a copy of it could have
     // left. A random name would be an object nothing could account for.
     let temporary = RelativeName::parse(&temporary_name(name))?;
-    // A copy of *this* path that an earlier daemon did not finish. The name is this host's own,
-    // derived from the path it was copying, so taking it away is taking away this host's own
-    // leftover rather than anything of the user's. A name this host could not look at is left
-    // alone and the creation below reports the path instead.
-    if target.occupied(&temporary).unwrap_or(false) && target.remove(&temporary).is_err() {
-        return Ok(false);
-    }
+    // Created exclusively, and nothing is ever removed to make room for it. A name derived from a
+    // path is a name a repository can also hold a file under, and this host cannot tell a file the
+    // user tracked from a copy an earlier daemon left: they are the same object at the same name.
+    // So an occupied name means this path is not carried, and the creation says so.
     let mut written = match target.create_new(&temporary) {
         Ok(created) => created,
         Err(_) => return Ok(false),
@@ -1085,9 +1082,14 @@ fn apply_mode(_file: &kr_transfer::AuthorisedFile, _mode: Option<u32>) -> Result
 /// Returns the name a copy of one path is written under before it replaces it.
 ///
 /// Derived from the path rather than drawn at random, so the name is recoverable: the journal
-/// records the destination path before the copy begins, and this function is how a replacement
-/// daemon turns that path back into the one temporary name a copy of it could have left behind.
-/// The digest is the whole relative path, so two paths in one directory never collide.
+/// records the destination path before the copy begins, and this function is how a person or a
+/// later task turns that path back into the one temporary name a copy of it could have left
+/// behind. The digest covers the whole relative path, which makes a collision between two paths
+/// in one directory as unlikely as a 128-bit digest prefix allows.
+///
+/// What the name does **not** establish is ownership. A repository can hold a tracked file at this
+/// name, and nothing distinguishes it from a copy an earlier daemon left, so a copy never removes
+/// what is at this name: an occupied name means the path is reported rather than carried.
 #[must_use]
 pub fn temporary_name(name: &RelativeName) -> String {
     let digest = kr_cbor::sha256(name.to_string().as_bytes());

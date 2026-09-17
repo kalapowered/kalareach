@@ -2124,3 +2124,73 @@ fn a_link_the_policy_includes_is_named_rather_than_copied() {
         .expect("the link has a row");
     assert_eq!(recorded, "unapplied");
 }
+
+#[test]
+fn a_users_file_at_the_name_a_copy_would_use_is_never_removed() {
+    // The name a copy writes under follows from the destination's path, which makes it
+    // recoverable. It does not make it this host's: a repository can hold a tracked file at that
+    // name, and nothing tells it apart from a copy an earlier daemon left. So the copy is never
+    // written over it and the path is reported instead.
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "collided");
+    let occupied = kr_project::workspace::temporary_name(
+        &kr_transfer::RelativeName::parse("notes.txt").expect("a name"),
+    );
+    write(&path, "notes.txt", "the base's notes\n");
+    write(&path, &occupied, "the user's own file at that name\n");
+    support::git_raw(&path, ["add", "-A"]);
+    support::git_raw(&path, ["commit", "-m", "the base"]);
+    write(&path, "notes.txt", "the user's notes\n");
+    let project = fixture
+        .service()
+        .project_adopt(
+            &actor(),
+            &ProjectAdoptParams {
+                destination: destination(fixture.environment_id(), fixture.work(), "collided"),
+                label: "collided".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+            Some(&action("project.adopt", 69)),
+        )
+        .expect("it is adopted")
+        .project
+        .project_repository_id;
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "collided".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "collided-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 70)),
+        )
+        .expect("the workspace is created");
+    let tree = fixture.work().join("collided-tree");
+    assert_eq!(
+        std::fs::read_to_string(tree.join(&occupied)).expect("the user's file is there"),
+        "the user's own file at that name\n",
+        "a file at the name a copy would use is not removed to make room for it"
+    );
+    assert!(
+        created.unapplied.iter().any(|path| path == "notes.txt"),
+        "and the path that could not be carried is named: {:?}",
+        created.unapplied
+    );
+    assert_eq!(
+        std::fs::read_to_string(tree.join("notes.txt")).expect("the base's version"),
+        "the base's notes\n",
+        "so the workspace holds the base's version rather than half of either"
+    );
+}

@@ -48,7 +48,7 @@ use crate::operation::StagedWitness;
 /// The schema version this build reads.
 pub const SCHEMA_VERSION: i64 = 3;
 
-/// What an inclusion records for a path it has not reached yet.
+/// What an inclusion records for a path whose outcome it has not established.
 pub const PROGRESS_PLANNED: &str = "planned";
 
 /// The directory, under the environment's state directory, that the project service owns.
@@ -330,7 +330,7 @@ impl Store {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(ProjectError::store)?;
-        let store = Self {
+        let mut store = Self {
             connection,
             environment_id,
         };
@@ -338,7 +338,7 @@ impl Store {
         Ok(store)
     }
 
-    fn migrate(&self) -> Result<()> {
+    fn migrate(&mut self) -> Result<()> {
         self.connection
             .execute_batch(
                 "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
@@ -492,13 +492,18 @@ impl Store {
             // step runs for every version below the current one and adds whatever is missing,
             // rather than trusting a version number to describe a shape.
             Some(version) if version < SCHEMA_VERSION => {
-                self.add_missing_columns()?;
-                self.connection
+                // One transaction: the columns and the version they describe land together or
+                // neither does, so a store is never left saying it is at a version whose columns
+                // it does not have.
+                let transaction = self.connection.transaction().map_err(ProjectError::store)?;
+                add_missing_columns(&transaction)?;
+                transaction
                     .execute(
                         "UPDATE schema_version SET version = ?1",
                         params![SCHEMA_VERSION],
                     )
                     .map_err(ProjectError::store)?;
+                transaction.commit().map_err(ProjectError::store)?;
             }
             Some(version) => {
                 return Err(ProjectError::StoreUnavailable {
@@ -507,44 +512,6 @@ impl Store {
                          {SCHEMA_VERSION}"
                     ),
                 });
-            }
-        }
-        Ok(())
-    }
-
-    /// Adds the columns a store written by an earlier build does not have.
-    ///
-    /// Every one of them is nullable and means "not recorded", which is what an older row holds
-    /// anyway: a staging directory an earlier build created has no recorded identity, and the
-    /// cleanup leaves such a name alone rather than deleting whatever now holds it.
-    fn add_missing_columns(&self) -> Result<()> {
-        // Every nullable column this build reads that some earlier shape of this schema did not
-        // have. The list is the whole of them rather than the ones added last: a store written by
-        // *any* earlier build has to be readable, and a column that is already there costs one
-        // `pragma_table_info` to find out.
-        const ADDED: &[(&str, &str, &str)] = &[
-            ("operations", "staging_device", "INTEGER"),
-            ("operations", "staging_file_id", "INTEGER"),
-            ("operations", "staged_created_at_ms", "INTEGER"),
-            ("workspaces", "staging_name", "TEXT"),
-            ("workspaces", "staging_device", "INTEGER"),
-            ("workspaces", "staging_file_id", "INTEGER"),
-            ("workspaces", "removal_action", "BLOB"),
-            ("workspaces", "detail", "TEXT"),
-        ];
-        for (table, column, kind) in ADDED {
-            let present: i64 = self
-                .connection
-                .query_row(
-                    "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
-                    params![table, column],
-                    |row| row.get(0),
-                )
-                .map_err(ProjectError::store)?;
-            if present == 0 {
-                self.connection
-                    .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))
-                    .map_err(ProjectError::store)?;
             }
         }
         Ok(())
@@ -1198,7 +1165,7 @@ impl Store {
         transaction.commit().map_err(ProjectError::store)
     }
 
-    /// Returns what an inclusion recorded for each path it reached, in path order.
+    /// Returns what an inclusion recorded for each path it accounted for, in path order.
     ///
     /// # Errors
     ///
@@ -2036,6 +2003,43 @@ const PROJECT_COLUMNS: &str = "project_repository_id, environment_id, label, ori
      remote_name, remote_transport, remote_url, remote_provider, remote_broker, created_at_ms";
 
 /// The columns a workspace row is read from.
+/// Adds the columns a store written by an earlier build does not have.
+///
+/// Every one of them is nullable and means "not recorded", which is what an older row holds
+/// anyway: a staging directory an earlier build created has no recorded identity, and the cleanup
+/// leaves such a name alone rather than deleting whatever now holds it.
+fn add_missing_columns(transaction: &Transaction<'_>) -> Result<()> {
+    // Every nullable column this build reads that some earlier shape of this schema did not have.
+    // The list is the whole of them rather than the ones added last: a store written by *any*
+    // earlier build has to be readable, and a column that is already there costs one
+    // `pragma_table_info` to find out.
+    const ADDED: &[(&str, &str, &str)] = &[
+        ("operations", "staging_device", "INTEGER"),
+        ("operations", "staging_file_id", "INTEGER"),
+        ("operations", "staged_created_at_ms", "INTEGER"),
+        ("workspaces", "staging_name", "TEXT"),
+        ("workspaces", "staging_device", "INTEGER"),
+        ("workspaces", "staging_file_id", "INTEGER"),
+        ("workspaces", "removal_action", "BLOB"),
+        ("workspaces", "detail", "TEXT"),
+    ];
+    for (table, column, kind) in ADDED {
+        let present: i64 = transaction
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info(?1) WHERE name = ?2",
+                params![table, column],
+                |row| row.get(0),
+            )
+            .map_err(ProjectError::store)?;
+        if present == 0 {
+            transaction
+                .execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} {kind}"))
+                .map_err(ProjectError::store)?;
+        }
+    }
+    Ok(())
+}
+
 const WORKSPACE_COLUMNS: &str = "workspace_id, project_repository_id, environment_id, label, \
      kind, isolation, dirty_files, untracked_files, submodules, binary_files, \
      generated_artefacts, state, base_revision, base_change_set_id, tree_device, tree_file_id, \
@@ -2790,7 +2794,7 @@ mod tests {
 
     #[test]
     fn a_store_from_a_later_build_is_refused_rather_than_read() {
-        let store = Store::in_memory(environment()).expect("a store opens");
+        let mut store = Store::in_memory(environment()).expect("a store opens");
         store
             .connection
             .execute(
