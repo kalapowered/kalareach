@@ -178,9 +178,10 @@ impl Host {
             .clone()
             .expect("a launch plan");
         match outcome {
-            Ok(descriptor) => Started {
+            Ok((descriptor, fence)) => Started {
                 descriptor,
                 launch: Some(launch),
+                fence: Some(fence),
             },
             Err(error) => {
                 // A host that failed before it had a connection has one place to say why: the
@@ -251,12 +252,22 @@ impl Host {
 struct Started {
     descriptor: HostDescriptor,
     launch: Option<ServiceLaunch>,
+    /// Held for the host's life: it keeps the reservation's endpoint this launcher's, so a second
+    /// claim on it is refused rather than accepted by somebody else's listener.
+    fence: Option<launcher::HostFence>,
 }
 
 impl Started {
     fn pid(&self) -> u32 {
         u32::try_from(self.descriptor.process_start_identity.pid.get())
             .expect("a process identifier")
+    }
+
+    /// Returns how many second claims this launch's reservation has refused.
+    fn duplicate_claims(&self) -> u64 {
+        self.fence
+            .as_ref()
+            .map_or(0, launcher::HostFence::duplicate_claims)
     }
 
     fn label(&self) -> &str {
@@ -682,6 +693,10 @@ async fn kr_req_05_06_the_plugin_runtime_is_a_lazily_started_job_of_its_own() {
     let health = client.health().await.expect("the host reports itself");
     assert_eq!(health.live_bindings, 0);
     assert!(health.deadlines_enforceable);
+
+    // One reservation, one host. Nothing else claimed this one, and the launcher still holds the
+    // endpoint a second claim would have to arrive on.
+    assert_eq!(started.duplicate_claims(), 0);
 
     started.kill();
     let _ = launcher::retire_descriptor(&environment);

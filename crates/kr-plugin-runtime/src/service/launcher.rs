@@ -36,6 +36,8 @@
 //! claiming one reservation means the host does not know which of them owns the endpoint.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use kr_crypto::keys::AuthorisationKeyPair;
 use kr_crypto::sign;
@@ -56,39 +58,6 @@ use crate::service::protocol::{
 
 /// The largest descriptor this host writes or reads.
 const MAX_DESCRIPTOR_BYTES: u64 = 8 * 1024;
-
-/// The reservations a claim has already been accepted for, and how many second claims were refused.
-///
-/// Exactly one rendezvous per reservation succeeds. The record is what makes that true rather than
-/// hoped for: a second claim naming a reservation this process has already accepted is refused by
-/// the record, whatever it is signed with and whichever listener it arrived on, and it is counted so
-/// that two processes claiming one reservation is something a host can see rather than infer.
-static CLAIMED: std::sync::LazyLock<std::sync::Mutex<ClaimRecord>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(ClaimRecord::default()));
-
-#[derive(Debug, Default)]
-struct ClaimRecord {
-    accepted: std::collections::HashSet<ReservationId>,
-    duplicates: u64,
-}
-
-/// Records one accepted claim, or says the reservation was already claimed.
-fn claim_once(reservation_id: ReservationId) -> bool {
-    let Ok(mut record) = CLAIMED.lock() else {
-        return false;
-    };
-    if record.accepted.insert(reservation_id) {
-        return true;
-    }
-    record.duplicates = record.duplicates.saturating_add(1);
-    false
-}
-
-/// Returns how many second claims this process has refused.
-#[must_use]
-pub fn duplicate_claims() -> u64 {
-    CLAIMED.lock().map_or(0, |record| record.duplicates)
-}
 
 /// What can go wrong starting or verifying a plugin host.
 #[derive(Debug, thiserror::Error)]
@@ -496,6 +465,79 @@ pub fn retire_descriptor(environment: &EnvironmentPaths) -> LaunchResult<()> {
     }
 }
 
+/// What keeps one reservation one host's.
+///
+/// The launcher holds this for as long as the host it started is running. It owns the rendezvous
+/// endpoint that reservation was made on, so a second claim against it reaches this and nothing
+/// else: the connection is accepted, refused without a word, and counted. Dropping the fence gives
+/// the endpoint up, which is what a launcher does when the host it fenced is gone.
+///
+/// A fence rather than a record of every reservation this process ever accepted: a record would
+/// grow for as long as the process ran, and this is one endpoint per running host.
+#[derive(Debug)]
+pub struct HostFence {
+    reservation_id: ReservationId,
+    duplicates: Arc<AtomicU64>,
+    stop: tokio::sync::watch::Sender<bool>,
+}
+
+impl HostFence {
+    /// Returns the reservation this fence holds.
+    #[must_use]
+    pub const fn reservation_id(&self) -> ReservationId {
+        self.reservation_id
+    }
+
+    /// Returns how many second claims this reservation has refused.
+    #[must_use]
+    pub fn duplicate_claims(&self) -> u64 {
+        self.duplicates.load(core::sync::atomic::Ordering::Acquire)
+    }
+}
+
+impl Drop for HostFence {
+    fn drop(&mut self) {
+        let _told = self.stop.send(true);
+    }
+}
+
+/// Holds one reservation's endpoint, refusing and counting every further claim on it.
+fn fence(reservation_id: ReservationId, listener: Listener) -> HostFence {
+    let duplicates = Arc::new(AtomicU64::new(0));
+    let (stop, mut stopping) = tokio::sync::watch::channel(false);
+    let counted = Arc::clone(&duplicates);
+    tokio::spawn(async move {
+        // A listener that keeps failing is one this fence can do nothing with, and spinning on it
+        // would cost a core for nothing. Anything that arrives resets the count.
+        let mut failures = 0_u32;
+        loop {
+            tokio::select! {
+                _stopped = stopping.changed() => return,
+                accepted = listener.accept() => {
+                    // Whatever arrived, this reservation already has its host. The connection is
+                    // dropped without an answer and counted, because two processes claiming one
+                    // reservation is something a host should be able to see. A connection that
+                    // failed on arrival is a claim that arrived all the same.
+                    counted.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+                    if accepted.is_ok() {
+                        failures = 0;
+                    } else {
+                        failures += 1;
+                        if failures > 64 {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    HostFence {
+        reservation_id,
+        duplicates,
+        stop,
+    }
+}
+
 /// A reservation to start one plugin host, with the rendezvous endpoint already listening.
 ///
 /// Created before anything is started, so a host that connects immediately finds a listener. The
@@ -612,7 +654,7 @@ impl HostReservation {
         environment: &EnvironmentPaths,
         launched: &ProcessStartIdentity,
         within: core::time::Duration,
-    ) -> LaunchResult<HostDescriptor> {
+    ) -> LaunchResult<(HostDescriptor, HostFence)> {
         let deadline = tokio::time::Instant::now() + within;
         let deadline_ms = u64::try_from(within.as_millis()).unwrap_or(u64::MAX);
         let mut refused: Option<LaunchError> = None;
@@ -634,17 +676,32 @@ impl HostReservation {
                     .await;
             match received {
                 Ok(Ok((descriptor, mut writer))) => {
-                    publish_descriptor(environment, &descriptor)?;
-                    // The host does not serve workers until it has this. Publishing a descriptor
-                    // for a process that had already started answering would mean a worker could
-                    // reach a host the launcher was still deciding about.
-                    let accepted = RendezvousAccepted {
-                        reservation_id: descriptor.reservation_id,
-                        environment_id: descriptor.environment_id,
-                        endpoint: descriptor.endpoint.clone(),
-                    };
-                    writer.write_message(&accepted).await?;
-                    return Ok(descriptor);
+                    // Publishing and acknowledging are inside the deadline too: a host waiting to
+                    // be told it was accepted is a host that is not serving, and a launcher that
+                    // took an unbounded time over either would be holding it there.
+                    let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    let settled = tokio::time::timeout(left, async {
+                        publish_descriptor(environment, &descriptor)?;
+                        // The host does not serve workers until it has this. Publishing a
+                        // descriptor for a process that had already started answering would mean a
+                        // worker could reach a host the launcher was still deciding about.
+                        let accepted = RendezvousAccepted {
+                            reservation_id: descriptor.reservation_id,
+                            environment_id: descriptor.environment_id,
+                            endpoint: descriptor.endpoint.clone(),
+                        };
+                        writer.write_message(&accepted).await?;
+                        Ok::<(), LaunchError>(())
+                    })
+                    .await;
+                    match settled {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => return Err(error),
+                        Err(_elapsed) => return Err(LaunchError::NoRendezvous { deadline_ms }),
+                    }
+                    // One reservation, one host: the endpoint stays this launcher's, and every
+                    // later claim on it is refused and counted.
+                    return Ok((descriptor, fence(self.reservation_id, self.listener)));
                 }
                 // One refused claim is not the end of the wait: the process the service manager
                 // started may still be on its way. The refusal is kept and reported if nothing
@@ -732,15 +789,6 @@ impl HostReservation {
                 ),
             });
         }
-        // Last, because a claim that fails any check above was never this reservation's to take.
-        if !claim_once(claim.reservation_id) {
-            return Err(LaunchError::Refused {
-                detail: format!(
-                    "reservation {} has already been claimed, and one reservation is one host",
-                    claim.reservation_id
-                ),
-            });
-        }
         Ok((
             HostDescriptor {
                 protocol: protocol::PROTOCOL.to_owned(),
@@ -770,7 +818,7 @@ pub async fn start(
     packages: &Path,
     starter: HostStarter<'_>,
     within: core::time::Duration,
-) -> LaunchResult<HostDescriptor> {
+) -> LaunchResult<(HostDescriptor, HostFence)> {
     // The rendezvous listener exists before anything is started, so a host that connects the
     // instant it starts finds somebody listening.
     let reservation = HostReservation::open(environment)?;
@@ -1010,18 +1058,56 @@ mod tests {
         silent.abort();
     }
 
-    #[test]
-    fn one_reservation_is_one_host_and_a_second_claim_is_counted() {
-        let reservation = ReservationId::new(kr_ipc::new_uuid());
-        let before = duplicate_claims();
-        assert!(claim_once(reservation), "the first claim is the one");
-        assert!(!claim_once(reservation), "a second claim is refused");
-        assert_eq!(
-            duplicate_claims(),
-            before + 1,
-            "a second claim on one reservation is counted, not merely refused"
+    #[tokio::test]
+    async fn one_reservation_is_one_host_and_a_second_claim_is_refused_and_counted() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let reservation = HostReservation::open(&environment).expect("a reservation");
+        let reservation_id = reservation.reservation_id();
+        let endpoint = reservation.endpoint().clone();
+        // The fence takes the endpoint the reservation was made on, which is the only address a
+        // claim for that reservation can arrive at.
+        let fenced = fence(reservation_id, reservation.listener);
+        assert_eq!(fenced.reservation_id(), reservation_id);
+
+        // Nobody else can take that address while the fence holds it, so a second launch cannot
+        // put its own listener where this reservation's claims would arrive.
+        assert!(
+            Listener::bind(&endpoint).is_err(),
+            "the reservation's endpoint was not held"
         );
-        // A different reservation is a different host, and unaffected.
-        assert!(claim_once(ReservationId::new(kr_ipc::new_uuid())));
+
+        // A second process claiming this reservation gets no answer: the fence accepts it and
+        // drops it, which its own connect sees as the peer going. Either way the claim arrived,
+        // and the fence counted it.
+        for _ in 0..3 {
+            let attempt = Connection::connect(&endpoint).await;
+            if let Ok(connection) = attempt {
+                drop(connection);
+            }
+        }
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+        while fenced.duplicate_claims() == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fence counted none of the second claims"
+            );
+            tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+        }
+
+        // And the address goes when the fence does, so a launcher that gave one host up is not
+        // still holding what a replacement needs.
+        drop(fenced);
+        let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+        loop {
+            if Listener::bind(&endpoint).is_ok() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the reservation's endpoint was never given up"
+            );
+            tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+        }
     }
 }
