@@ -152,8 +152,10 @@ impl ExecutionContext {
 /// names is still the one that is there, and the generation is what makes a reused session number
 /// a different desktop.
 ///
-/// A host with no boot identity to bind to, or no graphical login session, has no binding. A
-/// session with no binding is bound to no desktop and cannot lose one.
+/// A host with no boot identity to bind to, or no graphical login session, records no binding.
+/// That is not the end of the question for a desktop-bound session: a reading that failed a moment
+/// before the session was created would otherwise be a session that could never lose its desktop,
+/// so its watch keeps asking and adopts the login session it is in when the platform names one.
 #[must_use]
 pub fn desktop_binding() -> kr_protocol::identity::DesktopBinding {
     let Ok(boot) = kr_ipc::identity::boot_identity() else {

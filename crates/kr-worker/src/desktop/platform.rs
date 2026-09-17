@@ -171,6 +171,22 @@ pub fn read_login(uid: u32) -> Reading {
     implementation::read_login(uid)
 }
 
+/// Asks whether the login session a host recorded, named by the platform's own identifier, is
+/// still there.
+///
+/// This is a different question from which login session the user has now, and it has to be.
+/// Linux and Windows both let one user hold several login sessions at once, so a live desktop that
+/// is not the recorded one says nothing about the recorded one: a session whose own login is still
+/// running must never be recorded as having lost it, and a session whose login has ended must not
+/// be excused because another login exists.
+///
+/// The recorded generation is compared where the platform gives one, which is what makes a reused
+/// session number a different login rather than the same one.
+#[must_use]
+pub fn named_presence(session: &str, generation: Option<u64>, uid: u32) -> Presence {
+    implementation::named_presence(session, generation, uid)
+}
+
 /// What running a platform command produced.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 enum Printed {
@@ -241,7 +257,7 @@ const HEADER_LINES: usize = 64;
 
 #[cfg(target_os = "macos")]
 mod implementation {
-    use super::{Login, Printed, Reading, anchor, run};
+    use super::{Login, Presence, Printed, Reading, anchor, run};
     use kr_protocol::desktop::{
         DesktopAvailability, DesktopGenerationSource, DesktopSessionKind, DisplayServer,
     };
@@ -309,6 +325,34 @@ mod implementation {
         })
     }
 
+    /// Asks whether a recorded Aqua login session is still there.
+    ///
+    /// One user has at most one Aqua session at a time: the graphical domain is the user's own,
+    /// and switching users gives the other account its own domain rather than this one a second
+    /// session. So reading the domain for this user is a question about the recorded session, and
+    /// a domain that carries another security session or another creator is that session gone.
+    pub(super) fn named_presence(session: &str, generation: Option<u64>, uid: u32) -> Presence {
+        match read_login(uid) {
+            Reading::Desktop(live) => {
+                let same_session = live.platform_session.as_deref() == Some(session);
+                let same_generation = match (live.generation, generation) {
+                    (Some(live), Some(recorded)) => live == recorded,
+                    // Nothing recorded a generation to compare, so the session identifier is all
+                    // there is to go on.
+                    _ => true,
+                };
+                if same_session && same_generation {
+                    Presence::Present
+                } else {
+                    Presence::Ended
+                }
+            }
+            // The user has no graphical login at all, so the recorded one is not there either.
+            Reading::None => Presence::Ended,
+            Reading::Unavailable => Presence::Unknown,
+        }
+    }
+
     /// Reads whether the session's screen is locked.
     ///
     /// The window server publishes the lock state in the device registry while the screen is
@@ -360,7 +404,7 @@ mod implementation {
 
 #[cfg(target_os = "linux")]
 mod implementation {
-    use super::{Login, Printed, Reading, anchor, run};
+    use super::{Login, Presence, Printed, Reading, anchor, run};
     use kr_protocol::desktop::{
         DesktopAvailability, DesktopGenerationSource, DesktopSessionKind, DisplayServer,
     };
@@ -445,6 +489,39 @@ mod implementation {
         })
     }
 
+    /// Asks whether a recorded login session is still there.
+    ///
+    /// The session is asked about by its own identifier, because this user can be logged in to
+    /// several sessions at once and the one this host reads first is not necessarily the one being
+    /// asked about. The manager saying it has no such session is a logout; a manager that could
+    /// not answer establishes nothing.
+    pub(super) fn named_presence(session: &str, generation: Option<u64>, _uid: u32) -> Presence {
+        let printed = match run("loginctl", &["show-session", session, "--property=Leader"]) {
+            Printed::Output(printed) => printed,
+            Printed::Failed(said) => {
+                return if super::says_absent(&said, SESSION_ABSENT) {
+                    Presence::Ended
+                } else {
+                    Presence::Unknown
+                };
+            }
+            Printed::NotRun => return Presence::Unknown,
+        };
+        let leader = super::key_values(&printed)
+            .into_iter()
+            .find(|(key, _)| key == "Leader")
+            .and_then(|(_, value)| value.parse::<u32>().ok())
+            .and_then(anchor);
+        match (leader, generation) {
+            // The session number came round again for another login: the session the manager
+            // describes is led by a different process from the recorded one.
+            (Some(live), Some(recorded)) if live.start_value.get() != recorded => Presence::Ended,
+            (Some(_), _) => Presence::Present,
+            // The session is described and its leader is not readable, so nothing is established.
+            (None, _) => Presence::Unknown,
+        }
+    }
+
     /// Returns the graphical session identifier to read, or nothing when there is none.
     ///
     /// The error is the login manager not answering, which is a different thing from the user not
@@ -489,7 +566,7 @@ mod implementation {
 
 #[cfg(windows)]
 mod implementation {
-    use super::{Login, Printed, Reading, anchor, run};
+    use super::{Login, Presence, Printed, Reading, anchor, run};
     use kr_protocol::desktop::{
         DesktopAvailability, DesktopGenerationSource, DesktopSessionKind, DisplayServer,
     };
@@ -541,6 +618,30 @@ mod implementation {
         })
     }
 
+    /// Asks whether a recorded interactive logon session is still there.
+    ///
+    /// The same account signs in to several sessions at once over a remote desktop connection and
+    /// through user switching, so the session number is asked about directly rather than through
+    /// the session this process happens to be in. A session number with no logon process is a
+    /// sign-out.
+    pub(super) fn named_presence(session: &str, generation: Option<u64>, _uid: u32) -> Presence {
+        let Ok(number) = session.parse::<u32>() else {
+            return Presence::Unknown;
+        };
+        match logon_process(number) {
+            Ok(Some(pid)) => match (anchor(pid), generation) {
+                (Some(live), Some(recorded)) if live.start_value.get() != recorded => {
+                    Presence::Ended
+                }
+                (Some(_), _) => Presence::Present,
+                (None, _) => Presence::Unknown,
+            },
+            // No logon process owns that session number, so that login has ended.
+            Ok(None) => Presence::Ended,
+            Err(()) => Presence::Unknown,
+        }
+    }
+
     /// Returns the session number this process runs in.
     fn own_session() -> Result<Option<u32>, ()> {
         match run(
@@ -583,11 +684,20 @@ mod implementation {
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 mod implementation {
-    use super::Reading;
+    use super::{Presence, Reading};
 
     /// A platform this host has no desktop reading for has no desktop.
     pub(super) const fn read_login(_uid: u32) -> Reading {
         Reading::None
+    }
+
+    /// A platform this host has no desktop reading for has nothing to ask about a session.
+    pub(super) const fn named_presence(
+        _session: &str,
+        _generation: Option<u64>,
+        _uid: u32,
+    ) -> Presence {
+        Presence::Unknown
     }
 }
 

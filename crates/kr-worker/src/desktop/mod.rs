@@ -486,6 +486,50 @@ pub fn describes(live: &Login, recorded: &DesktopBinding) -> Option<bool> {
     }
 }
 
+/// Asks whether the desktop a record names is still there.
+///
+/// This is the question to ask about a worker that is already gone, and it is not the same question
+/// as which desktop this host has now. One user can hold several login sessions at once on Linux
+/// and over a remote desktop connection on Windows, so the desktop a host reads now is no answer
+/// about the one a session was created on: a worker that crashed while its own login session
+/// carried on would otherwise be recorded as having lost a desktop that is still there.
+///
+/// The recorded name carries the platform's own session identifier, the generation and the boot, so
+/// the platform can be asked about that session by name. A record that names no session has nothing
+/// to ask about, and a platform that will not answer leaves the question open.
+#[must_use]
+pub fn recorded_presence(recorded: &DesktopBinding) -> Presence {
+    let Some(name) = recorded.desktop_session_id.as_ref() else {
+        return Presence::Unknown;
+    };
+    let name = name.as_str();
+    // A reboot ends every login session there was, and the boot is part of the name.
+    if let (Some(recorded_boot), Ok(boot)) =
+        (field(name, "boot"), kr_ipc::identity::boot_identity())
+        && recorded_boot != hex(boot.value.as_slice())
+    {
+        return Presence::Ended;
+    }
+    let Some(session) = field(name, "session") else {
+        return Presence::Unknown;
+    };
+    let generation = recorded
+        .login_generation
+        .as_ref()
+        .map(|generation| generation.get())
+        .or_else(|| field(name, "generation").and_then(|value| value.parse().ok()));
+    platform::named_presence(session, generation, kr_ipc::paths::current_uid())
+}
+
+/// Returns one named part of a desktop identity.
+///
+/// The name is built here, from parts joined with colons, so it is read here the same way. A part
+/// this build does not find is absent rather than guessed at.
+fn field<'a>(name: &'a str, key: &str) -> Option<&'a str> {
+    name.split(':')
+        .find_map(|part| part.strip_prefix(key)?.strip_prefix('='))
+}
+
 /// Returns the binding one live reading would be recorded as.
 fn binding_of(live: &Login) -> DesktopBinding {
     let Ok(boot) = kr_ipc::identity::boot_identity() else {
