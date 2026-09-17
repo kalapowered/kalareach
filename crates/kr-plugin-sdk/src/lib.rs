@@ -43,6 +43,7 @@
 //! | [`text`] | Bounded label, description and reason text |
 //! | [`version`] | Package versions and the ranges a package accepts |
 //! | [`digest`] | Payload digests and declared sizes |
+//! | [`identity`] | What binds executable plugin semantics to a verified package |
 //! | [`paths`] | Safe package paths and case-collision detection |
 //! | [`limits`] | The execution limits and repository budgets a package runs under |
 //! | [`capability`] | Requested capabilities and capability evidence |
@@ -91,6 +92,7 @@ pub mod connector;
 pub mod digest;
 pub mod effect;
 pub mod example;
+pub mod identity;
 pub mod ids;
 pub mod limits;
 pub mod matching;

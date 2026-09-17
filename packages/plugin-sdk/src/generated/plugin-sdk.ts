@@ -688,6 +688,7 @@ export interface KalaReachPluginSDK {
   document_node?: DocumentNode
   index_entry?: IndexEntry
   instance_limits?: InstanceLimits
+  plugin_identity?: PluginIdentity
   plugin_manifest?: PluginManifest
   presentation_manifest?: PresentationManifest
   publisher_record?: PublisherRecord
@@ -2842,6 +2843,27 @@ export interface InstanceLimits {
    * Deadline in milliseconds for `snapshot`.
    */
   snapshot_deadline_ms: string
+}
+/**
+ * The identity of one executable plugin package, as a host records it.
+ */
+export interface PluginIdentity {
+  /**
+   * A SHA-256 digest as 64 lower-case hexadecimal characters.
+   */
+  package_hash: string
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+  /**
+   * The catalogue generation the package was resolved against.
+   */
+  repository_generation: string
+  /**
+   * An exact semantic version, such as 1.4.0 or 2.0.0-rc.1.
+   */
+  version: string
 }
 /**
  * The `plugin.json` manifest.

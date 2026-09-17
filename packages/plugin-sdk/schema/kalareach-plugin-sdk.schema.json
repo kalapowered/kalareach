@@ -2821,6 +2821,35 @@
       "minLength": 1,
       "type": "string"
     },
+    "PluginIdentity": {
+      "additionalProperties": false,
+      "description": "The identity of one executable plugin package, as a host records it.",
+      "properties": {
+        "package_hash": {
+          "$ref": "#/$defs/PayloadDigest",
+          "description": "The digest of the package payload the host verified."
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The plugin, as its manifest names it."
+        },
+        "repository_generation": {
+          "$ref": "#/$defs/RepositoryGeneration",
+          "description": "The catalogue generation the package was resolved against."
+        },
+        "version": {
+          "$ref": "#/$defs/PackageVersion",
+          "description": "The exact version."
+        }
+      },
+      "required": [
+        "plugin_id",
+        "version",
+        "package_hash",
+        "repository_generation"
+      ],
+      "type": "object"
+    },
     "PluginManifest": {
       "additionalProperties": false,
       "description": "The `plugin.json` manifest.",
@@ -3926,6 +3955,9 @@
     },
     "instance_limits": {
       "$ref": "#/$defs/InstanceLimits"
+    },
+    "plugin_identity": {
+      "$ref": "#/$defs/PluginIdentity"
     },
     "plugin_manifest": {
       "$ref": "#/$defs/PluginManifest"

@@ -15,6 +15,7 @@ use crate::capability::{CapabilityEvidence, PluginCapability};
 use crate::catalogue::{CatalogueIndex, INDEX_VERSION, IndexEntry, PublisherRecord};
 use crate::connector::ConnectorManifest;
 use crate::effect::{ActionInvocation, EffectClass};
+use crate::identity::PluginIdentity;
 use crate::limits::{InstanceLimits, RepositoryBudgets};
 use crate::plugin::PluginManifest;
 use crate::predicate::Predicate;
@@ -53,6 +54,7 @@ pub fn sdk_schema() -> Value {
         "index_entry" => IndexEntry,
         "publisher_record" => PublisherRecord,
         "capability_evidence" => CapabilityEvidence,
+        "plugin_identity" => PluginIdentity,
         "document_node" => DocumentNode,
         "unsupported_node" => UnsupportedNode,
         "visibility_predicate" => Predicate,
