@@ -668,6 +668,19 @@ impl CanonicalGrid {
     /// byte of a session's output travels this path, so a second list of every event's actions on
     /// it is a copy a session pays for and nothing reads.
     pub(crate) fn apply_handing_over_actions(&mut self, event: &Event) -> Applied {
+        // Printed text is what a session sends most of, and adapting a run of it builds a copy of
+        // the run that the draw below never reads: the draw works from the event's own bytes,
+        // because the profile's width model cuts the run where the library's cluster reducer would
+        // not. So the run is drawn without asking for an adaptation. A run whose bytes are not
+        // valid text cannot come out of the lexer, and where one did the adaptation is what
+        // answers for it, so that case takes the ordinary path below.
+        if let EventKind::Text { .. } = &event.kind
+            && let Ok(text) = core::str::from_utf8(event.raw())
+        {
+            self.print(text);
+            self.sync_history();
+            return Applied::default();
+        }
         let mut adapted = self.adapt_event(event);
         self.drive(event, &mut adapted);
         Applied {
