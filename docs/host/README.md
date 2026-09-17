@@ -230,11 +230,11 @@ to use before it creates anything, and the create receipt records the one it use
 changes neither: an invisible session in a desktop context keeps that desktop's access, which is
 what lets an agent with no terminal window drive a browser on the screen in front of you.
 
-The identity is the whole of it. A login-session number that a platform hands out again to a new
-login is a different desktop, because the process that owns that login is a different process, and
-nothing is ever rebound to a new login: a session whose desktop ended is closed and you create
-another. How completely that tells two logins apart is the platform's own business, and
-`docs/host/platforms.md` says what each one establishes.
+The identity is the whole of it, and nothing is ever rebound to a new login: a session whose
+desktop ended is closed and you create another. How well a reused login-session number is told
+apart from the login before it depends on the platform, because the generation is the start value
+of the process that owns the login and each platform owns its login differently.
+`docs/host/platforms.md` says what each one establishes, including where the answer is weaker.
 `docs/host/platforms.md` has the per-platform detail, including what each platform does at logout
 and what it will not tell this host.
 
