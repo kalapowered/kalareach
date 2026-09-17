@@ -66,6 +66,15 @@ pub struct WorkerLaunch {
     /// daemon. Neither is a directory the worker has any claim on, and either can be a volume the
     /// person at the machine expects to be able to unmount.
     pub working_directory: PathBuf,
+    /// The selected desktop's own environment, for a platform that does not place a job in a
+    /// login session by itself.
+    ///
+    /// Empty for a headless worker, and empty on the platforms whose service manager puts a
+    /// per-user job in the login session that started it. On Linux it carries the graphical
+    /// session's display, compositor socket, display authority and message bus, because a user
+    /// service manager started at boot has none of them and a worker that inherited nothing would
+    /// fail at the first desktop tool it ran.
+    pub desktop_environment: Vec<(String, String)>,
 }
 
 impl WorkerLaunch {
@@ -392,10 +401,20 @@ impl SystemdSupervisor {
 #[cfg(target_os = "linux")]
 impl WorkerSupervisor for SystemdSupervisor {
     fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
-        self.start_service(&launch.service())
+        // A worker's unit carries the selected desktop's own handles. Every other service this
+        // manager starts carries none, because nothing else here belongs to a login session.
+        self.start_unit(&launch.service(), &launch.desktop_environment)
     }
 
     fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
+        self.start_unit(launch, &[])
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl SystemdSupervisor {
+    /// Starts one transient unit, with whatever login-session environment its launch carries.
+    fn start_unit(&self, launch: &ServiceLaunch, desktop: &[(String, String)]) -> LaunchOutcome {
         let unit = launch.label.clone();
         // A transient *service*, not a scope: `MainPID` is defined for a service, so the launcher
         // has an identity to record. A scope would leave the controller guessing.
@@ -409,8 +428,14 @@ impl WorkerSupervisor for SystemdSupervisor {
             "-p".to_owned(),
             format!("WorkingDirectory={}", launch.working_directory.display()),
             "--quiet".to_owned(),
-            launch.program.display().to_string(),
         ];
+        // The selected desktop's own handles, passed to the unit rather than left to whatever the
+        // user manager happens to hold. A manager started at boot holds none of them. They are
+        // options to the launcher, so they go before the program it is told to start.
+        for (name, value) in desktop {
+            arguments.push(format!("--setenv={name}={value}"));
+        }
+        arguments.push(launch.program.display().to_string());
         arguments.extend(launch.arguments.clone());
         let borrowed: Vec<&str> = arguments.iter().map(String::as_str).collect();
         match run("systemd-run", &borrowed) {
@@ -478,6 +503,7 @@ impl WorkerSupervisor for DetachedSupervisor {
             &launch.program,
             &launch.arguments,
             &launch.working_directory,
+            &launch.desktop_environment,
         ) {
             Ok(child) => settle(child),
             // The spawn itself failed, so no process exists.
@@ -493,7 +519,12 @@ impl WorkerSupervisor for DetachedSupervisor {
 }
 
 #[cfg(unix)]
-fn detached_command(program: &Path, arguments: &[String], working_directory: &Path) -> Result<u32> {
+fn detached_command(
+    program: &Path,
+    arguments: &[String],
+    working_directory: &Path,
+    desktop: &[(String, String)],
+) -> Result<u32> {
     use std::os::unix::process::CommandExt as _;
 
     // The worker gets its own process group here, and makes itself a session leader as soon as it
@@ -508,6 +539,10 @@ fn detached_command(program: &Path, arguments: &[String], working_directory: &Pa
     // Never the daemon's own directory: the worker outlives this daemon, so a directory inherited
     // from it would be held open by a process nothing can see the parentage of.
     command.current_dir(working_directory);
+    // This supervisor launches from the daemon's own environment, so a desktop-bound worker is
+    // given the selected login session's handles explicitly rather than inheriting whatever the
+    // daemon was started with.
+    command.envs(desktop.iter().map(|(name, value)| (name, value)));
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -519,7 +554,12 @@ fn detached_command(program: &Path, arguments: &[String], working_directory: &Pa
 }
 
 #[cfg(not(unix))]
-fn detached_command(program: &Path, arguments: &[String], working_directory: &Path) -> Result<u32> {
+fn detached_command(
+    program: &Path,
+    arguments: &[String],
+    working_directory: &Path,
+    desktop: &[(String, String)],
+) -> Result<u32> {
     use std::os::windows::process::CommandExt as _;
 
     // A worker must outlive this daemon. A process started by a daemon that is itself inside a
@@ -535,6 +575,7 @@ fn detached_command(program: &Path, arguments: &[String], working_directory: &Pa
     // Never the daemon's own directory, for the same reason as on Unix: a current directory is a
     // handle on a volume, and this process outlives the one that started it.
     command.current_dir(working_directory);
+    command.envs(desktop.iter().map(|(name, value)| (name, value)));
     command
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -659,6 +700,7 @@ mod tests {
             working_directory: PathBuf::from(
                 "/var/lib/kr/workers/02020202-0202-0202-0202-020202020202",
             ),
+            desktop_environment: Vec::new(),
         }
     }
 

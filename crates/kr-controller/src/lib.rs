@@ -13,6 +13,7 @@
 //! | --- | --- |
 //! | [`agent_tools`] | Installing the contact skill for an agent, and undoing exactly what it wrote |
 //! | [`authority`] | The dispatch lease, the revocation barrier and the generation both are bound to |
+//! | [`desktop`] | Which profile a session gets, what logout does to it, and the host power setting |
 //! | [`registry`] | Reservations, display-number allocation, worker records and closure tombstones |
 //! | [`singleton`] | The per-environment lock and the persistent generation |
 //! | [`supervision`] | Starting a worker through the platform's own service manager |
@@ -24,6 +25,7 @@
 
 pub mod agent_tools;
 pub mod authority;
+pub mod desktop;
 pub mod directory;
 pub mod error;
 pub mod project;

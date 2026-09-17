@@ -17,6 +17,10 @@ use kr_ipc::paths::{Endpoint, EnvironmentPaths};
 use kr_ipc::peer::PeerIdentity;
 use kr_ipc::verify::{ControllerIdentity, check_rendezvous};
 use kr_protocol::action::RevocationBarrier;
+use kr_protocol::desktop::{
+    DesktopContext, EnvironmentCapabilitiesParams, EnvironmentCapabilitiesResult,
+    SleepInhibitionState,
+};
 use kr_protocol::envelope::{
     ControlEvent, ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
@@ -29,7 +33,8 @@ use kr_protocol::hostinfo::{
 };
 use kr_protocol::identity::{BootIdentity, WorkerProfile};
 use kr_protocol::ids::{
-    ActorId, AuthorityRevision, BootEpoch, BuildId, ConnectionId, ControllerGeneration,
+    ActorId, AuthorityRevision, BootEpoch, BuildId, CapabilityRevision, ConnectionId,
+    ControllerGeneration,
     EnvironmentId, RequestId, SessionEpoch, SessionId,
 };
 use kr_protocol::local::{LocalClientKind, LocalHelloAck, LocalPeer, LocalRole};
@@ -48,6 +53,7 @@ use kr_transport::lease::LeaseRefusal;
 use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 use tokio::sync::{Mutex, oneshot};
 
+use crate::desktop::power::{self, Demand, Inhibitor};
 use crate::directory::{Directory, KnownWorker, Reconnect};
 use crate::error::{ControllerError, Result};
 use crate::registry::{LaunchPhase, Registry, WorkerRecord};
@@ -64,6 +70,19 @@ pub mod net;
 
 /// How long a closing worker is watched before the controller stops waiting for it to end.
 pub const CLOSURE_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How long a desktop reading is reused before the platform is asked again.
+///
+/// The reading costs a conversation with the platform's session facilities, and the answer changes
+/// only when somebody logs in or out. Nothing waits this out: it is the age at which the next
+/// question asks the platform rather than the cache.
+pub const DESKTOP_REREAD_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How often a held sleep assertion is reviewed.
+///
+/// This runs only while an assertion is held, which is only while the host has admitted work that
+/// justifies one. An idle host reviews nothing, because there is nothing to release.
+pub const POWER_REVIEW_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How long the rendezvous waits for the launcher to report the worker's identity.
 pub const LAUNCH_IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
@@ -178,7 +197,32 @@ pub struct Controller {
     build_id: BuildId,
     release: String,
     started_at_ms: TimestampMs,
+    /// The desktop this host has, as last read, and the capability revision that reading is
+    /// evidence for.
+    desktop: Mutex<DesktopReading>,
+    /// The sleep assertion this daemon holds, where it holds one.
+    inhibitor: Mutex<Inhibitor>,
+    /// Whether a held assertion is already being reviewed.
+    ///
+    /// The review exists to release an assertion when the work that justified it ends. It runs
+    /// only while one is held, so a host with nothing outstanding runs no timer at all.
+    power_review: std::sync::atomic::AtomicBool,
     _lock: SingletonLock,
+}
+
+/// The desktop this host has, and how old the reading is.
+#[derive(Debug)]
+struct DesktopReading {
+    /// The context, as last read.
+    context: DesktopContext,
+    /// The revision the capability records of this context are evidence for.
+    ///
+    /// It advances when the desktop changes, which a new login always is. Section 11 requires
+    /// evidence to be invalidated on a desktop generation change, and an advancing revision is how
+    /// an action notices.
+    revision: CapabilityRevision,
+    /// When the platform was last asked.
+    read_at: std::time::Instant,
 }
 
 impl std::fmt::Debug for Controller {
@@ -213,6 +257,7 @@ impl Controller {
         let generation = lock.advance(&mut registry)?;
         let identity = (setup.identity)()?;
         let boot_epoch = kr_ipc::identity::boot_epoch(&setup.boot_identity)?;
+        let boot = setup.boot_identity.clone();
         let clock = Arc::new(SystemContinuousClock::new());
         let authority_revision = registry.authority_revision()?;
         let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths).await?);
@@ -245,6 +290,13 @@ impl Controller {
             build_id: setup.build_id,
             release: setup.release,
             started_at_ms: kr_ipc::now_ms(),
+            desktop: Mutex::new(DesktopReading {
+                context: crate::desktop::current(boot.clone()),
+                revision: CapabilityRevision::new(1),
+                read_at: std::time::Instant::now(),
+            }),
+            inhibitor: Mutex::new(Inhibitor::new()),
+            power_review: std::sync::atomic::AtomicBool::new(false),
             _lock: lock,
         });
         // Reconnecting is not only verifying. A replacement daemon has to present the generation it
@@ -254,6 +306,10 @@ impl Controller {
             Directory::rebuild(&controller.paths, &registry, &controller.reconnect()).await?
         };
         *controller.directory.lock().await = directory;
+        // A reboot ends every live execution, of either profile. Sessions published in an earlier
+        // boot are closed with that as their reason before anything tries to recover them, so the
+        // record says the host restarted rather than that a worker died for reasons unknown.
+        controller.close_previous_boot().await?;
         controller.recover_reservations().await?;
         // Recovery has settled every reservation it can, so what is left under the workers
         // directory that no session claims is nothing's.
@@ -1304,13 +1360,27 @@ impl Controller {
         let reservation = registry
             .reservation(reservation_id)?
             .ok_or_else(|| ControllerError::rendezvous("the reservation vanished"))?;
+        // The profile is the one the create request recorded, not a default: it decides what a
+        // logout does to this session, and a record that said otherwise would promise the wrong
+        // lifetime.
+        let profile = reservation
+            .create_intent
+            .as_deref()
+            .and_then(|recorded| {
+                kr_cbor::from_canonical_slice::<SessionCreateParams>(
+                    recorded,
+                    &kr_cbor::Limits::DEFAULT,
+                )
+                .ok()
+            })
+            .map_or(WorkerProfile::HeadlessUser, |create| create.worker_profile);
         let record = WorkerRecord {
             session_id: reservation.session_id,
             display_number: reservation.display_number,
             public_key: claim.worker_public_key,
             process_identity: claim.process_start_identity.clone(),
             endpoint: ready.endpoint.clone(),
-            profile: WorkerProfile::HeadlessUser,
+            profile,
             state: SessionState::Live,
             // A worker starts having acknowledged nothing. The first announcement it receives is
             // what moves this.
@@ -1331,7 +1401,7 @@ impl Controller {
             protocol_version: PROTOCOL_VERSION,
             endpoint: ready.endpoint.clone(),
             worker_public_key: claim.worker_public_key,
-            worker_profile: WorkerProfile::HeadlessUser,
+            worker_profile: profile,
             published_at_ms: kr_ipc::now_ms(),
         };
         kr_ipc::descriptor::publish(&self.paths, &descriptor)?;
@@ -1862,6 +1932,7 @@ impl Controller {
         }
         let outcome = match method {
             Method::HostInfo => self.host_info().await,
+            Method::EnvironmentCapabilities => self.environment_capabilities(&request.params).await,
             Method::EnvironmentList => self.environment_list().await,
             Method::HostDoctor => self.host_doctor().await,
             Method::SessionList => self.session_list(&request.params).await,
@@ -2092,7 +2163,7 @@ impl Controller {
         crate::agent_tools::Installer::discover(self.paths.state_dir())
     }
 
-    async fn host_info(&self) -> Result<ParamsValue> {
+    async fn host_info(self: &Arc<Self>) -> Result<ParamsValue> {
         let registry = self.registry.lock().await;
         let live = registry.occupancy()?;
         let limit = registry.session_limit()?;
@@ -2106,8 +2177,177 @@ impl Controller {
             started_at_ms: self.started_at_ms,
             live_sessions: U64::new(live),
             session_limit: U64::new(limit),
-            default_worker_profile: WorkerProfile::HeadlessUser,
+            default_worker_profile: self.default_profile().await,
+            power: self.power_state().await,
         })
+    }
+
+    /// Returns the desktop this host has, and the revision its capability evidence belongs to.
+    ///
+    /// The platform is asked again when the reading is older than [`DESKTOP_REREAD_INTERVAL`]. A
+    /// reading that names a different desktop advances the revision, because evidence taken in one
+    /// login is not evidence about the next.
+    async fn desktop(&self) -> (DesktopContext, CapabilityRevision) {
+        let mut reading = self.desktop.lock().await;
+        if reading.read_at.elapsed() >= DESKTOP_REREAD_INTERVAL {
+            let current = crate::desktop::current(self.boot_identity.clone());
+            if !current.is_same_desktop(&reading.context) {
+                reading.revision =
+                    CapabilityRevision::new(reading.revision.get().saturating_add(1));
+            }
+            reading.context = current;
+            reading.read_at = std::time::Instant::now();
+        }
+        (reading.context.clone(), reading.revision)
+    }
+
+    /// Returns the execution profile this host creates sessions with when a request chooses none.
+    pub async fn default_profile(&self) -> WorkerProfile {
+        crate::desktop::default_profile(&self.desktop().await.0)
+    }
+
+    /// Returns what this host's sleep inhibition is doing, taking or releasing the assertion.
+    ///
+    /// Every caller that can have changed an input asks this, which is how the assertion follows
+    /// the work rather than a clock. While one is held, a review keeps asking until the work ends,
+    /// because the end of a shell's own job is not something this daemon is told about.
+    pub async fn power_state(self: &Arc<Self>) -> SleepInhibitionState {
+        let state = self.evaluate_power().await;
+        if state.active {
+            self.review_power();
+        }
+        state
+    }
+
+    /// Takes or releases the assertion for what this host currently has outstanding.
+    async fn evaluate_power(&self) -> SleepInhibitionState {
+        let setting = power::read(&self.paths);
+        if setting == kr_protocol::desktop::SleepInhibitionSetting::Off {
+            // Nothing is read and nothing is asked: a host whose owner has not chosen this pays
+            // nothing for it, and an assertion held under a setting that has since been turned off
+            // is released here.
+            return self.inhibitor.lock().await.evaluate(
+                setting,
+                Demand::default(),
+                kr_protocol::desktop::PowerSource::Unknown,
+            );
+        }
+        let demand = self.demand().await;
+        let source = power::power_source();
+        self.inhibitor
+            .lock()
+            .await
+            .evaluate(setting, demand, source)
+    }
+
+    /// Keeps reviewing a held assertion until the work that justified it ends.
+    fn review_power(self: &Arc<Self>) {
+        if self
+            .power_review
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
+        let controller = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(POWER_REVIEW_INTERVAL).await;
+                if !controller.evaluate_power().await.active {
+                    break;
+                }
+            }
+            controller
+                .power_review
+                .store(false, std::sync::atomic::Ordering::Release);
+        });
+    }
+
+    /// Returns what this host has outstanding that justifies keeping it awake.
+    ///
+    /// Both counts are of admitted work rather than of activity. A session counts when its worker
+    /// reports an agent working or a decision waiting for an answer; a create this daemon has
+    /// accepted and not yet resolved counts as a request outstanding. An idle shell counts for
+    /// nothing, however much output it has produced.
+    async fn demand(&self) -> Demand {
+        let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
+        let mut sessions_with_work = 0;
+        let mut awaiting = 0;
+        for worker in workers {
+            if let Ok(summary) = self.read_from_worker(&worker).await {
+                match summary.application_state.as_ref() {
+                    Some(kr_protocol::session::ApplicationState::AgentBusy) => {
+                        sessions_with_work += 1;
+                    }
+                    Some(kr_protocol::session::ApplicationState::AwaitingApproval) => {
+                        awaiting += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Demand {
+            sessions_with_work,
+            pending_requests: awaiting + self.pending.lock().await.len() as u64,
+        }
+    }
+
+    /// Reports what this environment can currently do.
+    ///
+    /// Capability evidence, never authority: every record says what produced it and what makes it
+    /// stale, and an action still checks its own grant and rechecks the revision here.
+    async fn environment_capabilities(
+        self: &Arc<Self>,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
+        let params: EnvironmentCapabilitiesParams = parse(params)?;
+        if params.environment_id != self.paths.environment_id() {
+            return Err(ControllerError::InvalidArgument(format!(
+                "this daemon owns environment {}",
+                self.paths.environment_id()
+            )));
+        }
+        let (context, revision) = self.desktop().await;
+        encode(&EnvironmentCapabilitiesResult {
+            environment_id: self.paths.environment_id(),
+            default_worker_profile: crate::desktop::default_profile(&context),
+            desktop: crate::desktop::capabilities(self.paths.environment_id(), context, revision),
+            persistence: crate::desktop::persistence(&self.supervisor.describe()),
+            power: self.power_state().await,
+        })
+    }
+
+    /// Closes every session published in an earlier boot.
+    ///
+    /// A reboot ends the live executions of both profiles: a desktop-bound worker went with its
+    /// login session and a headless one went with the machine. The record says the host restarted,
+    /// which is what happened, rather than describing a worker that vanished.
+    async fn close_previous_boot(&self) -> Result<()> {
+        let rows = {
+            let registry = self.registry.lock().await;
+            registry.workers()?
+        };
+        for entry in kr_ipc::descriptor::read_all(&self.paths)? {
+            let Ok(descriptor) = entry.descriptor else {
+                continue;
+            };
+            if descriptor.boot_identity == self.boot_identity {
+                continue;
+            }
+            let Some(row) = rows
+                .iter()
+                .find(|row| row.session_id == descriptor.session_id)
+            else {
+                continue;
+            };
+            self.directory.lock().await.remove(descriptor.session_id);
+            self.record_final(
+                descriptor.session_id,
+                ClosureReason::HostShutdown,
+                &row.process_identity,
+            )
+            .await?;
+        }
+        Ok(())
     }
 
     async fn environment_list(&self) -> Result<ParamsValue> {
@@ -2273,7 +2513,7 @@ impl Controller {
     /// checked again at the moment the launch becomes possible, rather than only when the request
     /// arrived.
     async fn session_create(
-        &self,
+        self: &Arc<Self>,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         carried: crate::authority::AdmittedMutation,
@@ -2285,6 +2525,18 @@ impl Controller {
         // nothing measured.
         if let Some(refusal) = create.palette_refusal() {
             return Err(ControllerError::InvalidArgument(refusal));
+        }
+        // A desktop-bound session needs a desktop. This host does not manufacture one: an SSH
+        // connection is a transport rather than a graphical login, and a request that asked to be
+        // bound to a desktop that is not there would be given a session bound to nothing.
+        if create.worker_profile == WorkerProfile::DesktopBound {
+            let (desktop, _) = self.desktop().await;
+            if !desktop.is_desktop() || !desktop.graphic_access {
+                return Err(ControllerError::NotConfigured(
+                    "this host has no graphical login session to bind a session to; create it in                      the headless user profile instead"
+                        .to_owned(),
+                ));
+            }
         }
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
@@ -2379,6 +2631,11 @@ impl Controller {
             state_directory: self.paths.state_root().to_path_buf(),
             jobs_directory: self.paths.jobs_dir(),
             working_directory,
+            // The desktop the worker is started in. Two platforms place a per-user job in the
+            // login session that started it and need nothing here; Linux publishes the session's
+            // display, compositor and message bus into the user manager, and this is where they
+            // are collected for the worker's own unit.
+            desktop_environment: crate::desktop::agent::environment(create.worker_profile),
         };
         let identity = match self.supervisor.start(&launch) {
             LaunchOutcome::Started(identity) => identity,
@@ -2442,6 +2699,9 @@ impl Controller {
             .cloned()
             .ok_or_else(|| ControllerError::supervision("the worker is not in the directory"))?;
         let summary = self.read_from_worker(&worker).await?;
+        // A new session can be the work that justifies keeping this host awake, and the setting
+        // decides whether it does.
+        let _ = self.power_state().await;
         encode(&SessionCreateResult {
             session: summary,
             endpoint: Nullable::some(ready.endpoint),
