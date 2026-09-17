@@ -1,25 +1,31 @@
 //! What the project service can fail with, and the protocol code each failure is reported under.
 
+use std::fmt;
+
 use kr_protocol::error::{ErrorCode, ProtocolError};
 
 /// A project-service failure.
-#[derive(Debug, thiserror::Error)]
+///
+/// Every variant carries the sentence this host composed for it, and each place that composes one
+/// puts the part it did not write itself through [`crate::git::redact`], which is what keeps the
+/// host's own words legible. [`fmt::Display`] is the bar underneath that: a failure becomes text
+/// in exactly one place, and the whole of it goes through the rule there. So a Rust caller, a log
+/// line, the daemon's standard error and the wire all read the same protected message, and a
+/// producer nobody thought about cannot reach any of them with something else.
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum ProjectError {
     /// The project store could not be read or written.
-    #[error("the project store is unavailable: {detail}")]
     StoreUnavailable {
         /// What went wrong.
         detail: String,
     },
     /// The service's own directories could not be prepared or used.
-    #[error("the project service's directories are unavailable: {detail}")]
     StagingUnavailable {
         /// What went wrong.
         detail: String,
     },
     /// The request names another environment.
-    #[error("{named} is not this environment; this service owns {owned}")]
     WrongEnvironment {
         /// The environment the request named.
         named: String,
@@ -27,25 +33,21 @@ pub enum ProjectError {
         owned: String,
     },
     /// The named repository does not exist here.
-    #[error("no repository {project}")]
     UnknownProject {
         /// The identifier that was named.
         project: String,
     },
     /// The named workspace does not exist here.
-    #[error("no workspace {workspace}")]
     UnknownWorkspace {
         /// The identifier that was named.
         workspace: String,
     },
     /// The named operation does not exist here.
-    #[error("no repository operation {operation}")]
     UnknownOperation {
         /// The identifier that was named.
         operation: String,
     },
     /// The destination is not usable for this operation.
-    #[error("{detail}")]
     Destination {
         /// What is wrong with it.
         detail: String,
@@ -54,7 +56,6 @@ pub enum ProjectError {
     ///
     /// Section 14 refuses a nonempty or existing destination unless the user explicitly chose an
     /// independently supported adoption flow, and never merges a clone into one.
-    #[error("{detail}")]
     AdoptionRequired {
         /// What is at the destination, and what the caller would have to choose.
         detail: String,
@@ -63,55 +64,46 @@ pub enum ProjectError {
     ///
     /// A rename, a replacement or an added worktree does not extend a grant, so the record is kept
     /// and nothing is served from it until the identity matches again.
-    #[error("{detail}")]
     IdentityChanged {
         /// What was recorded and what is there now.
         detail: String,
     },
     /// A remote, a transport or a credential broker is not one this host will use.
-    #[error("{detail}")]
     RemoteRejected {
         /// Which rule the remote breaks.
         detail: String,
     },
     /// The repository's own configuration names something this host will not execute.
-    #[error("{detail}")]
     ConfigurationRejected {
         /// Which key, and why.
         detail: String,
     },
     /// Installed Git could not be used.
-    #[error("{detail}")]
     GitUnavailable {
         /// What went wrong.
         detail: String,
     },
     /// A Git invocation failed, ran too long, or produced more output than the host accepts.
-    #[error("{detail}")]
     GitFailed {
         /// The command, its status and its scrubbed output.
         detail: String,
     },
     /// The object or the workspace is not in a state that admits this call.
-    #[error("{detail}")]
     WrongState {
         /// What state it is in, and what cannot be done in it.
         detail: String,
     },
     /// A workspace still has live bound sessions or runs.
-    #[error("{detail}")]
     StillBound {
         /// Which sessions, and how many.
         detail: String,
     },
     /// The caller's authority does not reach this operation.
-    #[error("{detail}")]
     PermissionDenied {
         /// What was refused.
         detail: String,
     },
     /// The same action identifier was reused for a different request.
-    #[error("action {action} was already used for {method}")]
     IdConflict {
         /// The identifier.
         action: String,
@@ -119,13 +111,11 @@ pub enum ProjectError {
         method: String,
     },
     /// This host cannot say whether an interrupted publication landed.
-    #[error("{detail}")]
     OutcomeUnknown {
         /// What is known, and what is not.
         detail: String,
     },
     /// A retained failure, replayed under the code it was first produced with.
-    #[error("{detail}")]
     Retained {
         /// The code the first attempt produced.
         code: ErrorCode,
@@ -137,23 +127,72 @@ pub enum ProjectError {
     /// Section 23's error table names no cancellation code, so a cancelled operation is reported
     /// as unavailable with a detail that says the owner stopped it: the repository the operation
     /// would have created does not exist, and asking again is a new operation rather than a retry.
-    #[error("{detail}")]
     Cancelled {
         /// What was stopped.
         detail: String,
     },
     /// A configured resource limit is reached.
-    #[error("{detail}")]
     QuotaExceeded {
         /// Which limit, and what it is.
         detail: String,
     },
     /// A request field is malformed.
-    #[error("{0}")]
     InvalidArgument(String),
 }
 
+impl fmt::Display for ProjectError {
+    /// Writes the failure as one protected sentence.
+    ///
+    /// This is the only place a `ProjectError` becomes text, so it is where the rule applies to
+    /// the whole of it. A message whose untrusted fragments were already replaced where it was
+    /// composed passes through unchanged, because the rule leaves its own output alone; a message
+    /// that holds something this host will not repeat is replaced whole rather than repeated.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&crate::git::redact(&self.compose()))
+    }
+}
+
+impl std::error::Error for ProjectError {}
+
 impl ProjectError {
+    /// Returns the sentence this host composed for the failure, before the rule.
+    fn compose(&self) -> String {
+        match self {
+            Self::StoreUnavailable { detail } => {
+                format!("the project store is unavailable: {detail}")
+            }
+            Self::StagingUnavailable { detail } => {
+                format!("the project service's directories are unavailable: {detail}")
+            }
+            Self::WrongEnvironment { named, owned } => {
+                format!("{named} is not this environment; this service owns {owned}")
+            }
+            Self::UnknownProject { project } => format!("no repository {project}"),
+            Self::UnknownWorkspace { workspace } => format!("no workspace {workspace}"),
+            Self::UnknownOperation { operation } => format!("no repository operation {operation}"),
+            Self::IdConflict { action, method } => {
+                format!("action {action} was already used for {method}")
+            }
+            // The rest say what this host decided and nothing about their category, because the
+            // category is the code the caller is answered under.
+            Self::Destination { detail }
+            | Self::AdoptionRequired { detail }
+            | Self::IdentityChanged { detail }
+            | Self::RemoteRejected { detail }
+            | Self::ConfigurationRejected { detail }
+            | Self::GitUnavailable { detail }
+            | Self::GitFailed { detail }
+            | Self::WrongState { detail }
+            | Self::StillBound { detail }
+            | Self::PermissionDenied { detail }
+            | Self::OutcomeUnknown { detail }
+            | Self::Retained { detail, .. }
+            | Self::Cancelled { detail }
+            | Self::QuotaExceeded { detail }
+            | Self::InvalidArgument(detail) => detail.clone(),
+        }
+    }
+
     /// Wraps a store failure.
     pub fn store(error: impl std::fmt::Display) -> Self {
         Self::StoreUnavailable {
@@ -202,17 +241,12 @@ impl ProjectError {
 }
 
 impl From<ProjectError> for ProtocolError {
-    /// Every project error becomes a wire error here, and this is where the rule is applied to the
-    /// whole of it.
+    /// Every project error becomes a wire error here, under the code the service decided.
     ///
-    /// Each place that composes a message also puts the untrusted part of it through
-    /// [`crate::git::redact`], which is what keeps this host's own words legible: a message whose
-    /// fragments are already safe passes through unchanged. This is the bar underneath that, for
-    /// the message nobody thought about: fourteen reviews of this service each found one more
-    /// producer that had been missed, and a bar at the one place every error passes through does
-    /// not depend on anybody remembering.
+    /// The message is [`fmt::Display`]'s, which is where the rule applies to the whole of it, so
+    /// the wire and a Rust caller are told the same thing in the same words.
     fn from(error: ProjectError) -> Self {
-        Self::new(error.code(), crate::git::redact(&error.to_string()))
+        Self::new(error.code(), error.to_string())
     }
 }
 
@@ -241,6 +275,91 @@ pub type Result<T> = std::result::Result<T, ProjectError>;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_variant_can_put_what_this_host_will_not_repeat_in_front_of_a_caller() {
+        // The rule is applied where each message is composed, which is what keeps the host's own
+        // words legible. This is the bar underneath that: a producer that forgets cannot reach a
+        // Rust caller, a log line or the wire with a fragment nobody looked at, because a failure
+        // becomes text in one place and the whole of it goes through the rule there.
+        const HOSTILE: &str = "https://user:BOUNDARYSECRET@host/x?access_token=BOUNDARYSECRET";
+        let every = [
+            ProjectError::store(HOSTILE),
+            ProjectError::staging(HOSTILE),
+            ProjectError::WrongEnvironment {
+                named: HOSTILE.to_owned(),
+                owned: HOSTILE.to_owned(),
+            },
+            ProjectError::UnknownProject {
+                project: HOSTILE.to_owned(),
+            },
+            ProjectError::UnknownWorkspace {
+                workspace: HOSTILE.to_owned(),
+            },
+            ProjectError::UnknownOperation {
+                operation: HOSTILE.to_owned(),
+            },
+            ProjectError::Destination {
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::AdoptionRequired {
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::IdentityChanged {
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::RemoteRejected {
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::ConfigurationRejected {
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::GitUnavailable {
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::GitFailed {
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::WrongState {
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::StillBound {
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::PermissionDenied {
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::IdConflict {
+                action: HOSTILE.to_owned(),
+                method: HOSTILE.to_owned(),
+            },
+            ProjectError::OutcomeUnknown {
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::Retained {
+                code: ErrorCode::RepositoryUntrusted,
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::Cancelled {
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::QuotaExceeded {
+                detail: HOSTILE.to_owned(),
+            },
+            ProjectError::InvalidArgument(HOSTILE.to_owned()),
+        ];
+        for failure in every {
+            let code = failure.code();
+            let said = failure.to_string();
+            assert!(
+                !said.contains("BOUNDARYSECRET"),
+                "a Rust caller is told no more than the wire is: {said}"
+            );
+            let wire: ProtocolError = failure.into();
+            assert_eq!(wire.message, said, "and both are told the same thing");
+            assert_eq!(wire.code, code, "under the code the service decided");
+        }
+    }
 
     #[test]
     fn a_retained_failure_keeps_the_code_the_first_attempt_produced() {

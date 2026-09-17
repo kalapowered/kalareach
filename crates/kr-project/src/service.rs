@@ -2167,12 +2167,18 @@ impl ProjectService {
         let path = PathBuf::from(&row.display_path);
         let Some(parent) = path.parent() else {
             return Err(ProjectError::Destination {
-                detail: format!("{} has no parent directory", path.display()),
+                detail: format!(
+                    "{} has no parent directory",
+                    crate::git::redact(&path.display().to_string())
+                ),
             });
         };
         let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
             return Err(ProjectError::Destination {
-                detail: format!("{} has no final name", path.display()),
+                detail: format!(
+                    "{} has no final name",
+                    crate::git::redact(&path.display().to_string())
+                ),
             });
         };
         let Some(expected) = row.identity else {
@@ -2219,7 +2225,10 @@ impl ProjectService {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(ProjectError::Destination {
-                    detail: format!("{} could not be removed: {error}", path.display()),
+                    detail: format!(
+                        "{} could not be removed: {error}",
+                        crate::git::redact(&path.display().to_string())
+                    ),
                 });
             }
         }

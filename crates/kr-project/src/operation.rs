@@ -158,7 +158,10 @@ impl Destination {
                         crate::git::redact(&self.path().display().to_string())
                     )
                 } else {
-                    format!("{} could not be created: {error}", self.path().display())
+                    format!(
+                        "{} could not be created: {error}",
+                        crate::git::redact(&self.path().display().to_string())
+                    )
                 },
             })?;
         self.parent.sync()?;
@@ -403,7 +406,10 @@ impl StagingSibling {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(ProjectError::Destination {
-                    detail: format!("{} could not be removed: {error}", self.path.display()),
+                    detail: format!(
+                        "{} could not be removed: {error}",
+                        crate::git::redact(&self.path.display().to_string())
+                    ),
                 });
             }
         }
@@ -434,13 +440,19 @@ pub fn clear_through(directory: &AuthorisedDirectory, path: &Path) -> Result<()>
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
                 return Err(ProjectError::Destination {
-                    detail: format!("{} could not be read: {error}", path.display()),
+                    detail: format!(
+                        "{} could not be read: {error}",
+                        crate::git::redact(&path.display().to_string())
+                    ),
                 });
             }
         };
         for entry in entries {
             let entry = entry.map_err(|error| ProjectError::Destination {
-                detail: format!("{} could not be read: {error}", path.display()),
+                detail: format!(
+                    "{} could not be read: {error}",
+                    crate::git::redact(&path.display().to_string())
+                ),
             })?;
             let name = entry.file_name();
             let below = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
@@ -454,7 +466,10 @@ pub fn clear_through(directory: &AuthorisedDirectory, path: &Path) -> Result<()>
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(ProjectError::Destination {
-                        detail: format!("{} could not be emptied: {error}", path.display()),
+                        detail: format!(
+                            "{} could not be emptied: {error}",
+                            crate::git::redact(&path.display().to_string())
+                        ),
                     });
                 }
             }
@@ -574,12 +589,16 @@ fn rename_no_replace(
     .map_err(|error| match error {
         rustix::io::Errno::EXIST | rustix::io::Errno::NOTEMPTY => ProjectError::Destination {
             detail: format!(
-                "{to_name} was taken between this operation's check and its publication, so \
-                 nothing was replaced"
+                "{} was taken between this operation's check and its publication, so nothing was \
+                 replaced",
+                crate::git::redact(to_name.as_str())
             ),
         },
         other => ProjectError::Destination {
-            detail: format!("{to_name} could not be published: {other}"),
+            detail: format!(
+                "{} could not be published: {other}",
+                crate::git::redact(to_name.as_str())
+            ),
         },
     })
 }
@@ -594,7 +613,10 @@ fn rename_no_replace(
 ) -> Result<()> {
     if to.occupied(to_name)? {
         return Err(ProjectError::Destination {
-            detail: format!("{to_name} is taken, so nothing was replaced"),
+            detail: format!(
+                "{} is taken, so nothing was replaced",
+                crate::git::redact(to_name.as_str())
+            ),
         });
     }
     from.rename_into(from_name, to, to_name)?;

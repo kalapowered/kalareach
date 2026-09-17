@@ -963,3 +963,39 @@ fn nothing_a_caller_or_a_repository_supplied_reaches_a_refusal() {
     }
     let _ = path;
 }
+
+#[test]
+fn preparing_the_profile_repeats_no_part_of_a_path_it_was_given() {
+    // The profile is prepared inside a directory this host is told to use, and a refusal names the
+    // file it is refusing. A Rust caller gets the refusal itself rather than the wire's copy of
+    // it, so the rule has to reach that message too.
+    let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let root = directory.path().join("access_token=PROFILESECRET");
+    std::fs::create_dir_all(root.join(kr_project::git::PROFILE_DIRECTORY))
+        .expect("the profile directory");
+    std::fs::write(
+        root.join(kr_project::git::PROFILE_DIRECTORY)
+            .join(kr_project::git::EMPTY_CONFIG_FILE),
+        "[url \"https://token@host/\"]\n\tinsteadOf = https://host/\n",
+    )
+    .expect("a file the profile requires to be empty");
+    let refusal = kr_project::git::RestrictedProfile::prepare(&root)
+        .expect_err("a configuration file with bytes in it is refused");
+    let said = refusal.to_string();
+    assert!(
+        !said.contains("PROFILESECRET"),
+        "the refusal repeats no part of the path it was given: {said}"
+    );
+    assert!(
+        said.contains("must be empty for the restricted profile"),
+        "and it still says what is wrong: {said}"
+    );
+    // The wire's copy and the caller's copy are the same words.
+    let wire: kr_protocol::error::ProtocolError = refusal.into();
+    assert_eq!(wire.message, said);
+    assert_eq!(
+        wire.code,
+        kr_protocol::error::ErrorCode::StorageUnavailable,
+        "and the same code"
+    );
+}

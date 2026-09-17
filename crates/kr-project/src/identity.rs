@@ -105,7 +105,7 @@ impl OpenedRepository {
             return Err(ProjectError::Destination {
                 detail: format!(
                     "{} is not inside a Git working tree, so it is not a project repository",
-                    path.display()
+                    crate::git::redact(&path.display().to_string())
                 ),
             });
         }
@@ -113,7 +113,7 @@ impl OpenedRepository {
             return Err(ProjectError::GitFailed {
                 detail: format!(
                     "{} did not report its own repository and working tree",
-                    path.display()
+                    crate::git::redact(&path.display().to_string())
                 ),
             });
         }

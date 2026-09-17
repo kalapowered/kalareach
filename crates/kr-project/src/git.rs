@@ -386,11 +386,17 @@ impl GitProgram {
         let program = path
             .canonicalize()
             .map_err(|error| ProjectError::GitUnavailable {
-                detail: format!("{} could not be resolved: {error}", path.display()),
+                detail: format!(
+                    "{} could not be resolved: {error}",
+                    redact(&path.display().to_string())
+                ),
             })?;
         if !program.is_absolute() {
             return Err(ProjectError::GitUnavailable {
-                detail: format!("{} is not an absolute path", program.display()),
+                detail: format!(
+                    "{} is not an absolute path",
+                    redact(&program.display().to_string())
+                ),
             });
         }
         // Asked of the resolved binary with an environment of nothing, so the answer is the
@@ -400,8 +406,8 @@ impl GitProgram {
             return Err(ProjectError::GitUnavailable {
                 detail: format!(
                     "{} reports a relative helper directory {}",
-                    program.display(),
-                    exec_path.display()
+                    redact(&program.display().to_string()),
+                    redact(&exec_path.display().to_string())
                 ),
             });
         }
@@ -513,7 +519,7 @@ impl RestrictedProfile {
                         detail: format!(
                             "{} must be empty for the restricted profile and it holds {length} \
                              bytes",
-                            empty_config.display()
+                            redact(&empty_config.display().to_string())
                         ),
                     });
                 }
@@ -1749,16 +1755,16 @@ fn ask(program: &Path, arguments: &[&str]) -> Result<String> {
         .map_err(|error| ProjectError::GitUnavailable {
             detail: format!(
                 "{} {} could not run: {error}",
-                program.display(),
-                arguments.join(" ")
+                redact(&program.display().to_string()),
+                redact(&arguments.join(" "))
             ),
         })?;
     if !output.status.success() {
         return Err(ProjectError::GitUnavailable {
             detail: format!(
                 "{} {} exited {}",
-                program.display(),
-                arguments.join(" "),
+                redact(&program.display().to_string()),
+                redact(&arguments.join(" ")),
                 output
                     .status
                     .code()

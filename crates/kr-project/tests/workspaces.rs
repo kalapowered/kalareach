@@ -2358,3 +2358,75 @@ fn a_successful_answer_an_earlier_build_recorded_is_protected_before_a_repeat_re
     assert_eq!(repeated.workspace.workspace_id, workspace_id);
     assert!(!format!("{repeated:?}").contains("REPLAYSECRET"));
 }
+
+#[cfg(unix)]
+#[test]
+fn a_filesystem_refusal_repeats_no_part_of_what_the_caller_named() {
+    // A creation whose destination the host cannot make: the name is the caller's, the failure is
+    // the filesystem's, and the message names both. A Rust caller gets that refusal itself rather
+    // than the wire's copy of it, so the rule has to reach it there too.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "refused");
+    let parent = fixture.work().join("read-only-parent");
+    std::fs::create_dir_all(&parent).expect("a parent directory");
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555))
+        .expect("a parent nothing may be created in");
+    let params = WorkspaceCreateParams {
+        project_repository_id: project,
+        label: "refused".to_owned(),
+        kind: WorkspaceKind::Isolated,
+        isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+        policy: InclusionPolicy::base_only(),
+        base_revision: Nullable(None),
+        base_change_set_id: Nullable(None),
+        destination: Nullable(Some(destination(
+            fixture.environment_id(),
+            &parent,
+            "access_token=TREESECRET",
+        ))),
+        preview_only: false,
+    };
+    let refusal = fixture
+        .service()
+        .workspace_create(&actor(), &params, Some(&action("workspace.create", 74)))
+        .expect_err("nothing can be created there");
+    let said = refusal.to_string();
+    assert!(
+        !said.contains("TREESECRET"),
+        "a refusal repeats no part of the name the caller chose: {said}"
+    );
+    assert!(
+        said.contains("could not be created"),
+        "and the host's own words survive, because the name is replaced before the sentence is \
+         built: {said}"
+    );
+    // The journal's copy is the caller's copy: a direct call and a replay say the same thing.
+    let recorded = fixture
+        .service()
+        .workspace_list(&WorkspaceListParams {
+            environment_id: fixture.environment_id(),
+            project_repository_id: Nullable(Some(project)),
+        })
+        .expect("the workspaces read")
+        .workspaces
+        .into_iter()
+        .find(|workspace| workspace.label == "refused")
+        .expect("the row the creation began");
+    let kept = recorded.detail.0.expect("the reason is recorded");
+    assert!(
+        !kept.contains("TREESECRET"),
+        "the journal's copy too: {kept}"
+    );
+    assert_eq!(kept, said, "and it is the same message");
+    // And the repeat of that action is answered with it, under the same code.
+    let repeated = fixture
+        .service()
+        .workspace_create(&actor(), &params, Some(&action("workspace.create", 74)))
+        .expect_err("the action is answered from the journal");
+    assert_eq!(repeated.to_string(), said);
+    assert_eq!(repeated.code(), refusal.code());
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755))
+        .expect("the parent is left removable");
+}
