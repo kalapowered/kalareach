@@ -570,15 +570,20 @@ impl Instance {
                 // A component that tried to emit or return past its output budget has broken a
                 // stated bound, whatever else it did. The nodes it produced travel with this
                 // outcome; the call is a fault.
-                if let Some(bytes) = oversized {
-                    Err(RuntimeError::NodeTooLarge {
-                        bytes,
-                        limit: crate::runtime::host::MAX_NODE_BYTES,
-                    })
-                } else if overran {
+                //
+                // The stated bound is reported first. A value that overran the call's output
+                // budget also will not fit a frame, and saying so would report a consequence of
+                // the failure instead of the failure. What the frame bound catches is the value
+                // that stayed inside the output budget and still cannot be delivered.
+                if overran {
                     Err(RuntimeError::OutputBudget {
                         call: kind.as_str(),
                         limit: kr_plugin_sdk::limits::OUTPUT_BYTES_PER_CALL,
+                    })
+                } else if let Some(bytes) = oversized {
+                    Err(RuntimeError::NodeTooLarge {
+                        bytes,
+                        limit: crate::runtime::host::MAX_NODE_BYTES,
                     })
                 } else {
                     Ok(answer)
