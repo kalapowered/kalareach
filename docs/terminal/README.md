@@ -599,13 +599,28 @@ destination measures differently from moving anything:
    text is measured against the profile's pinned model and compared with the cell span the session
    gave it. A disagreement means the text cannot be placed at canonical positions, so the span is
    filled with spaces and counted.
+4. **The coordinate system is established, not assumed.** A frame clears origin mode, the left and
+   right margins and insert mode, and makes the whole screen the scroll region, before its first
+   cell. A destination that was being forwarded the stream a moment ago can be in any of those, and
+   each one changes where an absolute address lands or what drawing a cell does to its neighbours.
+   The session's own are installed after the last row, so a projection that becomes a direct
+   presentation leaves the application the terminal it is writing for; a window showing part of the
+   grid cannot carry a margin, which is a row of the grid, and reports that instead.
 
 A cluster the window's edge falls inside is never half drawn: it becomes one space for each of its
 cells that is inside, which keeps every later cell on its own column. A cursor outside the window is
 hidden rather than misplaced, because a person types where the cursor appears to be. What a frame
 could not carry is counted rather than hidden: cells outside the window, clusters the edge fell
 inside, runs the destination cannot place, soft-wrap markers a drawn row cannot carry, rows the
-session had already shortened, and the pending wrap, which no cursor placement can reproduce.
+session had already shortened, the scroll region a window could not carry, and the pending wrap,
+which no cursor placement can reproduce.
+
+One thing a projection deliberately does not make identical: an indexed colour nothing overrode.
+The snapshot carries the session's dynamic colours and every override an application made, and the
+renderer installs those; the rest of the 256 come from the destination's own configuration, which is
+exactly what a terminal being forwarded the stream would draw them in. Two destinations with
+different themes therefore agree about every colour the session set and keep their own for the ones
+it did not.
 
 ### Bounds
 

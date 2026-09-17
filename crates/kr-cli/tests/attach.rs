@@ -822,6 +822,8 @@ fn stack_operations(bytes: &[u8]) -> usize {
     seen
 }
 
+/// KR-REQ-08.84: the outer terminal's input, mouse, cursor visibility and keyboard modes come
+/// back after the attach process is killed outright, because the guard is holding them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
     let hosted = hosted("while true; do echo ready; sleep 1; done").await;
@@ -931,6 +933,8 @@ async fn the_terminal_comes_back_after_the_attach_process_is_killed() {
     let _ = shell.wait();
 }
 
+/// KR-REQ-08.84: the same modes come back on an ordinary detach, which is the path that runs in
+/// this process rather than in the guard.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn detaching_from_another_window_ends_the_attachment_and_restores_its_terminal() {
     let hosted = hosted("while true; do echo ready; sleep 1; done").await;
@@ -1193,6 +1197,8 @@ async fn a_terminal_that_does_not_finish_the_handshake_fails_the_attach_and_keep
     let _ = shell.wait();
 }
 
+/// KR-REQ-08.43: what a person typed while the host was asking is theirs, and it is the first
+/// input the attachment forwards.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn what_was_typed_during_the_handshake_reaches_the_application() {
     // The session echoes whatever it is given, so a byte that reached the application comes back
