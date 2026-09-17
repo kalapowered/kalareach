@@ -1489,7 +1489,10 @@ impl Controller {
             return self.transfer.write_frame(actor_id, mutation, method).await;
         }
         let outcome = match method {
-            Method::SessionCreate => self.session_create(actor_id, mutation, accepted).await,
+            Method::SessionCreate => {
+                self.session_create(actor_id, mutation, connection_id, accepted)
+                    .await
+            }
             Method::SessionClose => {
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
                 self.session_close(mutation, &actor, accepted).await
@@ -1674,10 +1677,19 @@ impl Controller {
         }
     }
 
+    /// Reserves a session and starts its worker.
+    ///
+    /// `connection_id` is the connection that asked, on whichever ingress. A create is the one
+    /// mutation this daemon performs itself and the slowest thing it does: it writes the
+    /// reservation, waits for a lock, starts a process and waits for that process to report
+    /// itself. The connection identity travels with it so the registration behind it can be
+    /// checked again at the moment the launch becomes possible, rather than only when the request
+    /// arrived.
     async fn session_create(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
+        connection_id: ConnectionId,
         accepted: AcceptedDeadline,
     ) -> Result<ParamsValue> {
         let create: SessionCreateParams = parse(&mutation.params)?;
@@ -1714,25 +1726,38 @@ impl Controller {
         // The reservation moves to `spawned` before anything is started. A worker can reach the
         // rendezvous socket the instant the service manager starts it, which is sooner than the
         // launcher returns, and a reservation still recorded as merely reserved would fence its own
-        // worker. The deadline the host accepted is checked in the same critical section, and after
-        // the durable write rather than before it: everything from there to the launch runs without
-        // waiting for anything, so an action whose life ran out queueing for this lock does not go
-        // on to start a shell.
+        // worker. The deadline the host accepted and the registration behind the request are both
+        // checked in the same critical section, and after the durable write rather than before it:
+        // everything from there to the launch runs without waiting for anything, so neither an
+        // action whose life ran out queueing for this lock nor one whose authority was withdrawn
+        // while it queued goes on to start a shell.
+        //
+        // The registration is read with the registry lock already held, which is the order a
+        // revocation takes: a revocation that has installed its revision has already withdrawn the
+        // registrations that revision replaced, so what this reads is never a registration the
+        // revocation is part way through removing.
         {
             let mut registry = self.registry.lock().await;
             registry.set_phase(reservation.reservation_id, LaunchPhase::Spawned)?;
-            if self.clock.now() >= accepted.deadline {
+            let refusal = if self.clock.now() >= accepted.deadline {
+                Some(ControllerError::WindowExpired {
+                    detail:
+                        "the deadline this create was admitted under passed before it could start"
+                            .to_owned(),
+                })
+            } else {
+                self.authorised(connection_id).await.err()
+            };
+            if let Some(refusal) = refusal {
+                // Nothing was started, so the reservation is resolved as a confirmed failure and
+                // stops occupying the environment. The caller is told which of the two it was.
                 registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
                 drop(registry);
                 self.pending
                     .lock()
                     .await
                     .remove(&reservation.reservation_id);
-                return Err(ControllerError::WindowExpired {
-                    detail:
-                        "the deadline this create was admitted under passed before it could start"
-                            .to_owned(),
-                });
+                return Err(refusal);
             }
         }
         let launch = WorkerLaunch {
@@ -2477,5 +2502,200 @@ mod tests {
         )
         .expect("some of the deadline is left");
         assert_eq!(forwarded.get(), 400);
+    }
+}
+
+/// A create that reserved its identity and then waited across a revocation.
+///
+/// The window this covers cannot be reached from outside the daemon: a create passes the
+/// admission check, writes its reservation, and only then waits. What holds it here is the map it
+/// records its pending launch report in, which is taken between the reservation and the transition
+/// to `spawned` and nowhere else during a create.
+#[cfg(test)]
+mod create_across_a_revocation {
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use kr_crypto::store::MemoryStore;
+    use kr_ipc::peer::PeerIdentity;
+    use kr_protocol::envelope::{ActionTarget, MutationRequest, ParamsValue};
+    use kr_protocol::error::ErrorCode;
+    use kr_protocol::ids::{ActionId, ActionWindowId, BuildId, ConnectionId, RequestId};
+    use kr_protocol::method::{Method, MethodVersion};
+    use kr_protocol::scalars::{DurationMs, Nullable};
+    use kr_protocol::session::{Presentation, SessionCreateParams, ShellMode};
+    use kr_transport::clock::ContinuousClock as _;
+    use kr_transport::window::{AcceptedDeadline, DeadlineBound};
+
+    use crate::error::ControllerError;
+    use crate::registry::LaunchPhase;
+    use crate::service::{Controller, ControllerSetup};
+    use crate::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
+
+    /// A supervisor that records what it was asked to start, and starts nothing.
+    #[derive(Debug, Default)]
+    struct RecordingSupervisor {
+        asked: Arc<Mutex<Vec<WorkerLaunch>>>,
+    }
+
+    impl WorkerSupervisor for RecordingSupervisor {
+        fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+            self.asked
+                .lock()
+                .expect("the record is not poisoned")
+                .push(launch.clone());
+            LaunchOutcome::NotStarted {
+                detail: "this test starts no workers".to_owned(),
+            }
+        }
+
+        fn describe(&self) -> String {
+            "a supervisor that records every launch and starts nothing".to_owned()
+        }
+    }
+
+    fn create_params(environment_id: kr_protocol::ids::EnvironmentId) -> SessionCreateParams {
+        SessionCreateParams {
+            environment_id,
+            presentation: Presentation::Invisible,
+            shell: Nullable::null(),
+            shell_mode: ShellMode::NativeCompat,
+            cwd: Nullable::some("/".to_owned()),
+            dimensions: Nullable::null(),
+            worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+            environment_snapshot: Vec::new(),
+        }
+    }
+
+    fn create_request(environment_id: kr_protocol::ids::EnvironmentId) -> MutationRequest {
+        MutationRequest {
+            request_id: RequestId::new(1),
+            method: Method::SessionCreate.into(),
+            method_version: MethodVersion::V1,
+            action_id: ActionId::new(kr_ipc::new_uuid()),
+            grant_id: Nullable::null(),
+            target: ActionTarget::environment(environment_id),
+            expected: ParamsValue::empty(),
+            action_window_id: ActionWindowId::new("local:test").expect("a window"),
+            requested_ttl_ms: DurationMs::new(30_000),
+            params: ParamsValue::from_typed(&create_params(environment_id)).expect("encodes"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_that_waited_across_a_revocation_launches_nothing() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let environment_id = temp.environment_id();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let controller = Controller::start(ControllerSetup {
+            paths: environment.clone(),
+            environment_id,
+            identity: Box::new(move || {
+                Ok(kr_ipc::verify::ControllerIdentity::open(
+                    &MemoryStore::new(),
+                    environment_id,
+                    false,
+                )
+                .expect("an identity"))
+            }),
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            supervisor: Box::new(RecordingSupervisor {
+                asked: Arc::clone(&asked),
+            }),
+            worker_program: temp.root().join("kr-worker"),
+            build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+            release: "0".to_owned(),
+        })
+        .await
+        .expect("the daemon starts");
+
+        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        let actor_id = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+        controller
+            .admit_connection(
+                connection_id,
+                &actor_id,
+                &PeerIdentity {
+                    uid: kr_ipc::paths::current_uid(),
+                    gid: 0,
+                    pid: None,
+                },
+            )
+            .await
+            .expect("the connection is registered");
+
+        let accepted = AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_secs(30))
+                .expect("a deadline half a minute out"),
+            bound: DeadlineBound::RequestedTtl,
+        };
+        let mutation = create_request(environment_id);
+
+        // The create stops here, between its reservation and the transition to `spawned`.
+        let paused = controller.pending.lock().await;
+        let create = tokio::spawn({
+            let controller = Arc::clone(&controller);
+            let actor_id = actor_id.clone();
+            async move {
+                controller
+                    .session_create(&actor_id, &mutation, connection_id, accepted)
+                    .await
+            }
+        });
+        // The reservation is durable before the launch, so its row is what says the create has
+        // reached the point this test is about.
+        loop {
+            let registry = controller.registry.lock().await;
+            let reserved = registry
+                .reservations_in(LaunchPhase::Reserved)
+                .expect("reads the reservations");
+            drop(registry);
+            if !reserved.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The revocation completes while the create waits: the revision is advanced and every
+        // registration made under the old one is withdrawn.
+        controller
+            .revoke_authority()
+            .await
+            .expect("the revocation completes");
+        drop(paused);
+
+        let outcome = create.await.expect("the create finishes");
+        let error = outcome.expect_err("a create whose authority was withdrawn starts nothing");
+        assert_eq!(
+            error.code(),
+            ErrorCode::PermissionDenied,
+            "the receipt says the authority behind the create was withdrawn: {error}"
+        );
+        assert!(
+            matches!(error, ControllerError::PermissionDenied { .. }),
+            "the refusal names the withdrawn registration: {error}"
+        );
+        assert!(
+            asked.lock().expect("the record is not poisoned").is_empty(),
+            "no worker is started for a create the host refused"
+        );
+        let registry = controller.registry.lock().await;
+        assert_eq!(
+            registry
+                .reservations_in(LaunchPhase::Failed)
+                .expect("reads the reservations")
+                .len(),
+            1,
+            "the refused create is resolved rather than left occupying the environment"
+        );
+        assert_eq!(
+            registry.occupancy().expect("counts"),
+            0,
+            "the reservation it made is released"
+        );
     }
 }

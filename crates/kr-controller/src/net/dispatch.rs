@@ -707,9 +707,15 @@ impl RemoteConnection {
                 let controller = Arc::clone(&self.controller);
                 let mutation = mutation.clone();
                 let request_id = mutation.request_id;
+                // The connection travels with the create. A create reserves its identity and then
+                // waits — for a lock, for a process to start, for that process to report itself —
+                // and a revocation that completes during that wait must stop the launch. The
+                // daemon checks this connection's registration again at the moment the launch
+                // becomes possible, which nothing out here can do on its behalf.
+                let connection_id = self.connection_id();
                 let effect = tokio::spawn(async move {
                     controller
-                        .session_create(&actor_id, &mutation, accepted)
+                        .session_create(&actor_id, &mutation, connection_id, accepted)
                         .await
                 });
                 let answer = settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await);
