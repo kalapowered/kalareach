@@ -461,6 +461,10 @@ enum WaylandPath {
 /// protocol a compositor does not implement, and a tool that goes through the input devices is not
 /// asking the compositor for anything at all.
 ///
+/// The compositor alone does not settle it: the protocol route needs a compositor that implements
+/// those protocols *and* a tool built against them, because a compositor that implements them does
+/// nothing for a tool that asks its desktop's own service instead.
+///
 /// What this cannot do from a name is establish that a tool needs the user's permission each time.
 /// A desktop's own capture service and its portal are different routes with the same command in
 /// front of them, so the answer says the route is not established rather than blaming a
@@ -478,17 +482,31 @@ fn wayland_path(capability: &str, tool: &str, compositor: &str) -> WaylandPath {
         // about it.
         return WaylandPath::Unqualified;
     }
+    if !PROTOCOL_TOOLS.iter().any(|known| tool.contains(known)) {
+        // The compositor family is qualified and this tool is not one built for it. A desktop's
+        // own capture service and the portal are different routes, and which one this tool takes
+        // is not something the compositor's name settles.
+        return WaylandPath::Unqualified;
+    }
     WaylandPath::Protocol
 }
 
 /// Tools that reach the input devices through their own service rather than the compositor.
 const DEVICE_TOOLS: &[&str] = &["ydotool", "dotool"];
 
-/// Returns whether a compositor is one of the family whose protocols the tools above use.
+/// Tools built against the Wayland protocols the compositor family below implements.
+///
+/// The pair has to match, not just the compositor: a compositor that implements the screen-copy
+/// and virtual-input protocols does nothing for a tool that asks its desktop's own service
+/// instead. Naming both is what makes the answer about this host rather than about Wayland.
+const PROTOCOL_TOOLS: &[&str] = &["grim", "grimblast", "wtype"];
+
+/// Returns whether a compositor is one of the family whose protocols the protocol tools use.
 ///
 /// These compositors implement the screen-copy and virtual-input protocols directly, so a tool
-/// built for them is not waiting on a permission. The list is a qualification rather than a guess:
-/// a compositor that is not on it leaves the answer unestablished rather than claimed either way.
+/// built against those protocols is not waiting on a permission. Both halves are checked: this
+/// list is about the compositor and [`PROTOCOL_TOOLS`] is about the tool. A compositor that is not
+/// on it leaves the answer unestablished rather than claimed either way.
 fn wlroots(compositor: &str) -> bool {
     ["sway", "river", "hyprland", "wayfire", "labwc", "niri"]
         .iter()
@@ -578,44 +596,43 @@ fn runnable(path: &std::path::Path) -> bool {
 ///
 /// Section 11 requires the record to name the exact thing the answer was about, so that an
 /// installed upgrade invalidates it rather than silently changing what the record describes. This
-/// is the file's own contents, digested, together with its length: a replacement at the same path
-/// is a different file here even when it kept the path, the length and the timestamps.
+/// is the file's own contents, digested, together with the number of bytes digested: a replacement
+/// at the same path is a different file here even when it kept the path, the length and the
+/// timestamps.
+///
+/// The file is read a block at a time, so the cost of identifying a large facility is its size in
+/// time and never in memory, and every facility gets a content identity rather than the largest
+/// ones getting a description of their metadata. A facility that cannot be read has no identity
+/// here, which is what an answer with nothing established about the file looks like.
 ///
 /// The digest is for noticing a change rather than for proving one: a capability record is
-/// evidence about what is feasible, never authority, and nothing here signs it. A file too large
-/// to read in a diagnostic is named by its length and its modification time instead, and says so.
+/// evidence about what is feasible, never authority, and nothing here signs it.
 fn facility_identity(tool: Option<&String>) -> Option<String> {
-    let path = tool?;
-    let metadata = std::fs::metadata(path).ok()?;
-    if metadata.len() > MAX_DIGESTED {
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or_else(
-                || "an unknown time".to_owned(),
-                |since| format!("{}.{:09}", since.as_secs(), since.subsec_nanos()),
-            );
-        return Some(format!(
-            "{} bytes, modified {modified}, too large to digest",
-            metadata.len()
-        ));
-    }
-    let contents = std::fs::read(path).ok()?;
+    use std::io::Read as _;
+
+    let mut file = std::fs::File::open(tool?).ok()?;
     let mut hasher = std::hash::DefaultHasher::new();
-    std::hash::Hasher::write(&mut hasher, &contents);
+    let mut block = [0_u8; DIGEST_BLOCK];
+    let mut digested: u64 = 0;
+    loop {
+        match file.read(&mut block) {
+            Ok(0) => break,
+            Ok(count) => {
+                std::hash::Hasher::write(&mut hasher, &block[..count]);
+                digested = digested.saturating_add(count as u64);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return None,
+        }
+    }
     Some(format!(
-        "{} bytes, digest {:016x}",
-        metadata.len(),
+        "{digested} bytes, digest {:016x}",
         std::hash::Hasher::finish(&hasher)
     ))
 }
 
-/// The largest facility this host digests to identify it.
-///
-/// Reading a file is what a diagnostic can afford; reading an arbitrarily large one is not. Every
-/// facility in the table above is a few megabytes at most.
-const MAX_DIGESTED: u64 = 64 * 1024 * 1024;
+/// How much of a facility is held in memory while it is being digested.
+const DIGEST_BLOCK: usize = 64 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -678,8 +695,20 @@ mod tests {
                 !record.state.is_available(),
                 "{capability} was reported available on a desktop selection alone"
             );
-            assert_eq!(record.state, CapabilityState::NotTested);
-            assert_eq!(record.evidence_source, CapabilityEvidenceSource::NotProbed);
+            // Which refusal this is depends on whether the platform's own facility is installed,
+            // which differs between hosts: a facility that is there leaves the operation itself
+            // unestablished, and one that is not is a missing installation. Neither of them is
+            // the capability being available on a desktop selection.
+            assert_eq!(
+                record.state == CapabilityState::NotTested,
+                record.identity.binary.is_present(),
+                "{capability}: {record:?}"
+            );
+            assert_eq!(
+                record.evidence_source == CapabilityEvidenceSource::NotProbed,
+                record.identity.binary.is_present(),
+                "{capability}: {record:?}"
+            );
             assert!(
                 record.disabled_reason.is_present(),
                 "{capability} says why it is unavailable"
