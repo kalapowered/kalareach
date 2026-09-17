@@ -688,16 +688,24 @@ impl DeviceDirectory {
         Ok(recorded.flatten().is_some())
     }
 
-    /// Clears the record above, for a clock that has caught up with what this host observed.
+    /// Clears the record above, and marks the moment the clock was established at.
+    ///
+    /// The mark moves with it, to `now_ms`. It has to: the mark is what a rollback is measured
+    /// against, and a host whose clock had been running *ahead* would otherwise be told it had
+    /// gone backwards by the very correction the owner just authenticated. What does not move is
+    /// anything already decided - the expiry tombstones, and the deadlines this boot holds - so a
+    /// grant this host has already found to be over stays over.
     ///
     /// # Errors
     ///
     /// Returns an error when the row cannot be written.
-    pub fn trust_clock(&self) -> Result<()> {
+    pub fn trust_clock(&self, now_ms: TimestampMs) -> Result<()> {
         self.with(|connection| {
             connection.execute(
-                "UPDATE network_clock SET untrusted_at_ms = NULL WHERE id = 0",
-                [],
+                "INSERT INTO network_clock (id, observed_ms, untrusted_at_ms)
+                 VALUES (0, ?1, NULL)
+                 ON CONFLICT (id) DO UPDATE SET observed_ms = ?1, untrusted_at_ms = NULL",
+                params![i64::try_from(now_ms.get()).unwrap_or(i64::MAX)],
             )
         })?;
         Ok(())

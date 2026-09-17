@@ -660,7 +660,7 @@ impl WorkerService {
             }
             ControlFrame::Mutation(mutation) => {
                 let caller = Caller::local(state.actor_id.clone());
-                Some(self.mutation(state, &mutation, &caller, Freshness::Window))
+                Some(self.mutation(state, &mutation, &caller, Freshness::Window, false))
             }
             ControlFrame::Forwarded(forwarded) => Some(self.forwarded(state, &forwarded)),
             ControlFrame::ForwardedRead(forwarded) => Some(self.forwarded_read(state, &forwarded)),
@@ -1271,12 +1271,18 @@ impl WorkerService {
     ///    the dispatch marker. Durable acceptance does not preserve authority that has since gone.
     /// 4. The dispatch marker is committed **before** the effect. A failure after it is `unknown`,
     ///    never `rejected`: nothing here can prove the effect did not happen.
+    ///
+    /// `forwarded` says whether the answer goes to a proxy rather than to the actor whose action
+    /// it is. A proxy is told when the answer came from a retained action instead of from this
+    /// worker performing one, because passing a retained result on is a read of a receipt and the
+    /// daemon has an authority check to make before it does that.
     fn mutation(
         &self,
         state: &mut ConnectionState,
         mutation: &MutationRequest,
         caller: &Caller,
         freshness: Freshness,
+        forwarded: bool,
     ) -> ControlFrame {
         if !state.negotiated {
             return failure(mutation.request_id, &not_negotiated());
@@ -1291,10 +1297,21 @@ impl WorkerService {
             return failure(mutation.request_id, &unlisted());
         };
         match self.receipted(state, mutation, method, entry, caller, freshness) {
-            Ok(value) => ControlFrame::Response(Response {
+            Ok(Answered::Performed(value)) => ControlFrame::Response(Response {
                 request_id: mutation.request_id,
                 outcome: Outcome::Ok(value),
             }),
+            Ok(Answered::Retained(value)) => {
+                let response = Response {
+                    request_id: mutation.request_id,
+                    outcome: Outcome::Ok(value),
+                };
+                if forwarded {
+                    ControlFrame::RetainedResponse(Box::new(response))
+                } else {
+                    ControlFrame::Response(response)
+                }
+            }
             Err(error) => failure(mutation.request_id, &error.to_protocol_error()),
         }
     }
@@ -1371,6 +1388,7 @@ impl WorkerService {
             &forwarded.mutation,
             &Caller::forwarded(&forwarded.actor),
             Freshness::Vouched(deadline),
+            true,
         )
     }
 
@@ -1434,7 +1452,7 @@ impl WorkerService {
         entry: &'static kr_protocol::authority::MethodEntry,
         caller: &Caller,
         freshness: Freshness,
-    ) -> Result<ParamsValue> {
+    ) -> Result<Answered> {
         let actor_id = caller.actor_id.clone();
         // Everything from here to the recorded outcome happens inside the barrier. The authority
         // this request was admitted under cannot change underneath it, and two mutations cannot
@@ -1461,7 +1479,7 @@ impl WorkerService {
         // its own effect moved the subject on.
         let stopping = method == Method::SessionClose;
         match self.retained(&actor_id, mutation, digest) {
-            Ok(Some(retained)) => return Ok(retained),
+            Ok(Some(retained)) => return Ok(Answered::Retained(retained)),
             Ok(None) => {}
             // A journal this host cannot read has no retained action to give back. For an ordinary
             // mutation that is a storage failure and the request stops here; for an authorised stop
@@ -1645,7 +1663,7 @@ impl WorkerService {
             AfterEffect::None => {}
             AfterEffect::Close(gate) => state.close_gate = Some((mutation.action_id, gate)),
         }
-        Ok(value)
+        Ok(Answered::Performed(value))
     }
 
     /// Returns the answer a retained action is owed, when this caller has one.
@@ -2413,6 +2431,17 @@ pub struct JoinedScreen {
 /// A local caller is the operating-system identity the socket authenticated. A forwarded caller is
 /// whoever the control daemon authenticated somewhere else, and the daemon vouches for four things
 /// this worker cannot establish for itself: the principal, the ingress the request entered the host
+/// Where a mutation's answer came from.
+///
+/// The value is the same either way. What differs is what producing it means: performing the
+/// action, or handing back what an earlier submission of the same action produced. A proxy is told
+/// which, because passing a retained result on is a read of somebody's receipt.
+enum Answered {
+    /// This worker performed the action now.
+    Performed(ParamsValue),
+    /// The journal already held this action's result.
+    Retained(ParamsValue),
+}
 /// by, the grant it was checked against and the authority revision it was checked at.
 #[derive(Clone, Debug)]
 pub struct Caller {

@@ -483,8 +483,11 @@ impl PairingHost {
             &self.clock,
             approval.request,
             approval.proof,
-            approval.signer,
-            approval.enrolment,
+            // This host's own enrolled signer, not the one the approval carries: an approval is a
+            // request to be checked, and checking it against a key it supplied itself would
+            // accept any key at all.
+            &self.owner_signer,
+            self.enrolment,
             &kr_pairing::confirm::ConfirmationExpectation {
                 action: SensitiveAction::ChangeHostAuthority,
                 action_digest: digest,

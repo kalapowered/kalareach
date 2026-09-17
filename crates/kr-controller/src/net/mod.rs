@@ -381,8 +381,9 @@ pub struct NetworkHost {
     /// Set once this host's wall clock has been found to have gone backwards.
     ///
     /// The durable record is the one a later run reads; this holds the decision for this run,
-    /// including when that write fails. Only an owner's approval clears either.
-    clock_distrusted: std::sync::atomic::AtomicBool,
+    /// including when that write fails. Shared with the task that keeps the record, which is what
+    /// retries the write until it lands. Only an owner's approval clears either.
+    clock_distrusted: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for NetworkHost {
@@ -739,7 +740,9 @@ impl NetworkHost {
             )
         })?;
         pairing.accept_clock(approval)?;
-        self.devices.trust_clock()?;
+        // The record first, then the latch: a latch cleared over a failed write would let this
+        // host decide expiries from a clock whose distrust the next run still reads.
+        self.devices.trust_clock(kr_ipc::now_ms())?;
         self.clock_distrusted
             .store(false, std::sync::atomic::Ordering::Release);
         Ok(())
@@ -818,24 +821,34 @@ pub const CLOCK_MARK_INTERVAL: std::time::Duration = std::time::Duration::from_s
 /// Two things it owns rather than a connection: the mark that says time has passed, and the
 /// tombstones a connection observed but could not write. Both have to outlive the connection that
 /// noticed them, and neither can wait for the next device to arrive.
-async fn keep_the_record(devices: Arc<DeviceDirectory>, pending: Arc<devices::PendingExpiry>) {
+async fn keep_the_record(
+    devices: Arc<DeviceDirectory>,
+    pending: Arc<devices::PendingExpiry>,
+    distrusted: Arc<std::sync::atomic::AtomicBool>,
+) {
     loop {
         tokio::time::sleep(CLOCK_MARK_INTERVAL).await;
         match devices.utc_at_least(kr_ipc::now_ms()) {
             // A clock stepped backwards is the same fact whoever sees it. This task sees it
-            // between connections, which is exactly when nothing else would.
+            // between connections, which is exactly when nothing else would, and the latch is set
+            // before anything is written: what storage does next cannot lose the observation.
             Ok(observed) if observed.behind_ms > CLOCK_TOLERANCE_MS => {
-                if let Err(error) = devices.note_clock_untrusted(observed.now) {
-                    eprintln!(
-                        "kr-controller: could not record that this host's clock went backwards: \
-                         {error}"
-                    );
-                }
+                distrusted.store(true, std::sync::atomic::Ordering::Release);
             }
             Ok(_) => {}
             Err(error) => {
                 eprintln!("kr-controller: could not record the moment this host is at: {error}");
             }
+        }
+        // Whatever the latch holds is written down until the write lands. A decision this host
+        // has made about its own clock has to survive its own restart.
+        if distrusted.load(std::sync::atomic::Ordering::Acquire)
+            && !devices.clock_untrusted().unwrap_or(false)
+            && let Err(error) = devices.note_clock_untrusted(kr_ipc::now_ms())
+        {
+            eprintln!(
+                "kr-controller: could not record that this host's clock went backwards: {error}"
+            );
         }
         pending.settle(&devices);
     }
@@ -847,6 +860,15 @@ async fn keep_the_record(devices: Arc<DeviceDirectory>, pending: Arc<devices::Pe
 /// write. A larger one says the wall clock is not currently a clock this host can measure a grant
 /// against, and section 9 does not let it guess in the device's favour.
 pub const CLOCK_TOLERANCE_MS: u64 = 5_000;
+
+/// What a remote close settled as.
+#[derive(Debug)]
+pub(crate) struct ClosedRemotely {
+    /// The close result.
+    pub value: kr_protocol::envelope::ParamsValue,
+    /// Whether the worker answered from an action it had already performed.
+    pub retained: bool,
+}
 
 /// How long a close's link is held for the acceptance to reach the device that asked for it.
 ///
@@ -993,7 +1015,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
         live: std::sync::Mutex::new(std::collections::BTreeMap::new()),
         endpoint_id,
         pending_expiry: Arc::new(devices::PendingExpiry::default()),
-        clock_distrusted: std::sync::atomic::AtomicBool::new(false),
+        clock_distrusted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     });
     // The record of the wall clock moves while this host runs, whether or not anything asks it a
     // question. A mark that only advanced when a device connected would stand still through a
@@ -1003,6 +1025,7 @@ pub async fn register(controller: &Arc<Controller>, setup: NetworkSetup) -> Resu
     let marking = tokio::spawn(keep_the_record(
         Arc::clone(&host.devices),
         Arc::clone(&host.pending_expiry),
+        Arc::clone(&host.clock_distrusted),
     ));
     // The guard owns that task from here, so every way out of this function ends it: a duplicate
     // registration, an endpoint that will not bind, or a daemon that is dropped.
@@ -1132,13 +1155,23 @@ impl Controller {
         mutation: &kr_protocol::envelope::MutationRequest,
         actor: &kr_protocol::actor::ActorEnvelope,
         accepted: AcceptedDeadline,
-        answer: tokio::sync::oneshot::Sender<Result<kr_protocol::envelope::ParamsValue>>,
+        observer: &dispatch::ExpiryObserver,
+        answer: tokio::sync::oneshot::Sender<Result<ClosedRemotely>>,
         delivered: tokio::sync::oneshot::Receiver<()>,
     ) {
         let mut link = None;
+        let mut retained = false;
         let settled = self
-            .close_through(mutation, actor, accepted, &mut link)
-            .await;
+            .close_through(
+                mutation,
+                actor,
+                accepted,
+                observer,
+                &mut link,
+                &mut retained,
+            )
+            .await
+            .map(|value| ClosedRemotely { value, retained });
         let _ = answer.send(settled);
         if let Some(proxy) = link {
             let _ = tokio::time::timeout(CLOSE_DELIVERY, delivered).await;
@@ -1152,7 +1185,9 @@ impl Controller {
         mutation: &kr_protocol::envelope::MutationRequest,
         actor: &kr_protocol::actor::ActorEnvelope,
         accepted: AcceptedDeadline,
+        observer: &dispatch::ExpiryObserver,
         link: &mut Option<Arc<WorkerProxy>>,
+        retained: &mut bool,
     ) -> Result<kr_protocol::envelope::ParamsValue> {
         let params: kr_protocol::session::SessionCloseParams =
             crate::service::parse(&mutation.params)?;
@@ -1186,8 +1221,17 @@ impl Controller {
             accepted.deadline,
             None,
         )
-        .ok_or_else(|| ControllerError::WindowExpired {
-            detail: "the deadline this close was admitted under has passed".to_owned(),
+        .ok_or_else(|| {
+            // This task outlives the connection that asked for the close, so it can be the one
+            // that finds the grant's own deadline spent. Section 9 has that written down wherever
+            // it is observed, and the observer here belongs to the device rather than to the
+            // connection. A window or a requested lifetime running out is not the grant's expiry.
+            if accepted.bound == kr_transport::window::DeadlineBound::AuthorityDeadline {
+                observer.grant_expired();
+            }
+            ControllerError::WindowExpired {
+                detail: "the deadline this close was admitted under has passed".to_owned(),
+            }
         })?;
         // The link is this close's own, and it is released whichever way the exchange ends.
         let (notifications, _unread) = tokio::sync::mpsc::channel(1);
@@ -1200,8 +1244,12 @@ impl Controller {
             )
             .await?;
         *link = Some(Arc::clone(&proxy));
-        let response = proxy.forward_mutation(mutation, actor, deadline).await?;
-        let value = match response.outcome {
+        let answered = proxy.forward_mutation(mutation, actor, deadline).await?;
+        // Whether this came from the worker's journal rather than from a close it performed now.
+        // The connection that asked decides whether it may be told a retained result; the close
+        // itself happened either way, which is what section 7 asks of a stop.
+        *retained = answered.retained;
+        let value = match answered.response.outcome {
             kr_protocol::envelope::Outcome::Ok(value) => value,
             // The worker's own code, carried through rather than flattened. A reused action
             // identifier is `ID_CONFLICT` and expired authority is `PERMISSION_DENIED`, and

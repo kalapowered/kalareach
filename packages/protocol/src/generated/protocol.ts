@@ -168,6 +168,9 @@ export type ControlFrame =
       forwarded_read: ForwardedRequest
     }
   | {
+      retained_response: Response
+    }
+  | {
       acceptance_delivered: ActionId
     }
 /**

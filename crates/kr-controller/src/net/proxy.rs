@@ -133,6 +133,19 @@ impl RelayBudget {
     }
 }
 
+/// What a worker answered one forwarded request with.
+#[derive(Debug)]
+pub struct Forwarded {
+    /// The response itself.
+    pub response: Response,
+    /// Whether the worker answered from an action it had already performed.
+    ///
+    /// Passing one of those on is a read of somebody's receipt, and section 23 has the host check
+    /// present view authority over the subject before it returns either half of a retained
+    /// result. Keeping the two apart here is what lets the dispatcher make that check.
+    pub retained: bool,
+}
+
 /// One remote connection's link to one worker.
 #[derive(Debug)]
 pub struct WorkerProxy {
@@ -159,7 +172,7 @@ pub struct WorkerProxy {
 /// Whom this link owes an answer, and whether it can still give one.
 #[derive(Debug, Default)]
 struct Waiters {
-    pending: HashMap<RequestId, oneshot::Sender<Response>>,
+    pending: HashMap<RequestId, oneshot::Sender<Forwarded>>,
     ended: bool,
 }
 
@@ -279,7 +292,7 @@ impl WorkerProxy {
         mutation: &MutationRequest,
         actor: &ActorEnvelope,
         accepted_deadline_boot_ms: U64,
-    ) -> Result<Response> {
+    ) -> Result<Forwarded> {
         let request_id = self.next_request_id();
         let mut forwarded = mutation.clone();
         // The request identity is this link's; the durable identity is the action's, and that
@@ -312,7 +325,8 @@ impl WorkerProxy {
             actor: actor.clone(),
             authority_deadline_boot_ms,
         }));
-        self.call(request_id, &frame).await
+        // A read is a read whichever way the worker answered it, so the marker means nothing here.
+        Ok(self.call(request_id, &frame).await?.response)
     }
 
     /// Calls one read on this link as the daemon itself, for its own housekeeping.
@@ -334,7 +348,7 @@ impl WorkerProxy {
             method_version: method.entry().version,
             params,
         });
-        self.call(request_id, &frame).await
+        Ok(self.call(request_id, &frame).await?.response)
     }
 
     /// Ends the link.
@@ -354,7 +368,7 @@ impl WorkerProxy {
         self.lost.notify_waiters();
     }
 
-    async fn call(&self, request_id: RequestId, frame: &ControlFrame) -> Result<Response> {
+    async fn call(&self, request_id: RequestId, frame: &ControlFrame) -> Result<Forwarded> {
         let receiver = {
             let mut waiters = self.waiters();
             if waiters.ended {
@@ -425,7 +439,7 @@ impl WorkerProxy {
             return Err(error.into());
         }
         match tokio::time::timeout(CALL_TIMEOUT, receiver).await {
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(answered)) => Ok(answered),
             Ok(Err(_)) => Err(ControllerError::Uncertain {
                 detail: "this session's link ended before it answered, so what became of the \
                          action is unknown"
@@ -487,16 +501,23 @@ async fn read_loop(
             Err(_) => break,
         };
         match frame {
-            ControlFrame::Response(response) => {
-                let waiter = waiters
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .pending
-                    .remove(&response.request_id);
-                if let Some(sender) = waiter {
-                    let _ = sender.send(response);
-                }
-            }
+            ControlFrame::Response(response) => answer(
+                &waiters,
+                Forwarded {
+                    response,
+                    retained: false,
+                },
+            ),
+            // The worker answered from a receipt it already held rather than by performing the
+            // action. Whether that may be passed on is the caller's authority to read it, which
+            // the dispatcher decides; this only has to keep the two apart.
+            ControlFrame::RetainedResponse(response) => answer(
+                &waiters,
+                Forwarded {
+                    response: *response,
+                    retained: true,
+                },
+            ),
             // A subscription this link started. It goes to the relay, which is what decides
             // whether the remote connection may still be served it. A connection that is not
             // keeping up is told rather than waited for: the link ends, which takes its
@@ -547,9 +568,21 @@ async fn read_loop(
     lost.notify_waiters();
 }
 
+/// Hands one answer to whatever is waiting for that request.
+fn answer(waiters: &Arc<std::sync::Mutex<Waiters>>, answered: Forwarded) {
+    let waiter = waiters
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .pending
+        .remove(&answered.response.request_id);
+    if let Some(sender) = waiter {
+        let _ = sender.send(answered);
+    }
+}
+
 fn frame_name(frame: &ControlFrame) -> &'static str {
     match frame {
-        ControlFrame::Response(_) => "a response",
+        ControlFrame::Response(_) | ControlFrame::RetainedResponse(_) => "a response",
         ControlFrame::Notification(_) => "a notification",
         ControlFrame::Event(_) => "a connection event",
         _ => "another message",

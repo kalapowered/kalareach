@@ -502,6 +502,14 @@ pub enum ControlFrame {
     Forwarded(Box<crate::local::ForwardedMutation>),
     /// A read the control daemon admitted for a caller it authenticated elsewhere.
     ForwardedRead(Box<crate::local::ForwardedRequest>),
+    /// A response a worker answered from a retained action rather than by performing it.
+    ///
+    /// Only on the forwarded path, and only to the control daemon: a caller that submits its own
+    /// mutation is answered with an ordinary response, because it is the actor whose action it is.
+    /// A proxy is not, and what comes back to it is a *read* of a receipt belonging to the actor it
+    /// forwarded for. Section 23 has the host check present view authority over the subject before
+    /// it returns either half of a retained result, and it cannot check what it cannot tell apart.
+    RetainedResponse(Box<Response>),
     /// A proxy's confirmation that a caller has received an action's acceptance.
     ///
     /// A close is accepted before anything is signalled, because the requester is often a command

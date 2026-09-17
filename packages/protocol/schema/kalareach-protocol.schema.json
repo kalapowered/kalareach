@@ -2164,6 +2164,19 @@
         },
         {
           "additionalProperties": false,
+          "description": "A response a worker answered from a retained action rather than by performing it.\n\nOnly on the forwarded path, and only to the control daemon: a caller that submits its own\nmutation is answered with an ordinary response, because it is the actor whose action it is.\nA proxy is not, and what comes back to it is a *read* of a receipt belonging to the actor it\nforwarded for. Section 23 has the host check present view authority over the subject before\nit returns either half of a retained result, and it cannot check what it cannot tell apart.",
+          "properties": {
+            "retained_response": {
+              "$ref": "#/$defs/Response"
+            }
+          },
+          "required": [
+            "retained_response"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
           "description": "A proxy's confirmation that a caller has received an action's acceptance.\n\nA close is accepted before anything is signalled, because the requester is often a command\ninside the process group the closure will stop. When the acceptance travels through a proxy,\nthe worker learns it has arrived here rather than assuming its own write was the end of the\njourney.",
           "properties": {
             "acceptance_delivered": {

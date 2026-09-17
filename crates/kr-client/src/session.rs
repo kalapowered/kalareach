@@ -826,6 +826,9 @@ async fn route(state: &Arc<SessionState>, frame: ControlFrame) -> bool {
         | ControlFrame::AuthorityRevisionAck(_)
         | ControlFrame::Forwarded(_)
         | ControlFrame::ForwardedRead(_)
+        // A marked retained answer travels between a host and a worker, never to a client: what a
+        // client submitted is answered as its own action, retained or performed.
+        | ControlFrame::RetainedResponse(_)
         | ControlFrame::AcceptanceDelivered(_) => return false,
     }
     true

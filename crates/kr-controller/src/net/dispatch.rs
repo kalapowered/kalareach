@@ -126,6 +126,23 @@ pub struct RemoteOutput {
     authority: Arc<Authorisation>,
 }
 
+/// Records a grant's expiry for work that outlives the connection which admitted it.
+///
+/// An action can be admitted under the grant's own deadline and then wait: for a lock, for a
+/// worker, for a link. The task that finds nothing left of that deadline is the one that observed
+/// the grant running out, and section 9 wants that written down wherever it is seen. It is not the
+/// same observation as a window or a requested lifetime running out, which say nothing about the
+/// grant, so only the authority deadline reaches this.
+#[derive(Clone, Debug)]
+pub struct ExpiryObserver(Arc<Authorisation>);
+
+impl ExpiryObserver {
+    /// Records that the grant behind the work this belongs to has run out.
+    pub fn grant_expired(&self) {
+        self.0.expire();
+    }
+}
+
 /// What a connection must still hold for a frame to be written on it.
 #[derive(Debug)]
 struct Authorisation {
@@ -435,6 +452,12 @@ impl RemoteConnection {
         }
     }
 
+    /// Returns what records this device's grant expiry, for work that outlives this connection.
+    #[must_use]
+    pub fn expiry_observer(&self) -> ExpiryObserver {
+        ExpiryObserver(Arc::clone(&self.authority))
+    }
+
     /// Returns this connection's write boundary.
     #[must_use]
     pub fn output(&self) -> &Arc<RemoteOutput> {
@@ -497,6 +520,7 @@ impl RemoteConnection {
             | ControlFrame::AuthorityRevisionAck(_)
             | ControlFrame::Forwarded(_)
             | ControlFrame::ForwardedRead(_)
+            | ControlFrame::RetainedResponse(_)
             | ControlFrame::AcceptanceDelivered(_) => None,
         }
     }
@@ -701,16 +725,30 @@ impl RemoteConnection {
                 let (answer, answered) = tokio::sync::oneshot::channel();
                 let (tell, delivered) = tokio::sync::oneshot::channel();
                 self.output().on_delivery(request_id, tell);
+                let observer = self.expiry_observer();
                 tokio::spawn(async move {
                     controller
-                        .close_remote_session(&mutation, &envelope, accepted, answer, delivered)
+                        .close_remote_session(
+                            &mutation, &envelope, accepted, &observer, answer, delivered,
+                        )
                         .await;
                 });
                 match tokio::time::timeout(EFFECT_WAIT, answered).await {
-                    Ok(Ok(Ok(value))) => ControlFrame::Response(Response {
-                        request_id,
-                        outcome: Outcome::Ok(value),
-                    }),
+                    Ok(Ok(Ok(closed))) => {
+                        // A close the worker answered from its journal is a read of that receipt,
+                        // and this is the check section 23 wants before either half of a retained
+                        // result goes back. The close itself happened: section 7's stop does not
+                        // wait on this, and only the answer does.
+                        if closed.retained
+                            && let Err(error) = self.may_read_receipts(Some(session_id))
+                        {
+                            return failure(request_id, error);
+                        }
+                        ControlFrame::Response(Response {
+                            request_id,
+                            outcome: Outcome::Ok(closed.value),
+                        })
+                    }
                     Ok(Ok(Err(error))) => failure(request_id, error.to_protocol_error()),
                     // The close is running on a task that outlives this connection, so a wait
                     // that ended says the outcome is not known rather than that it failed.
@@ -836,7 +874,15 @@ impl RemoteConnection {
             .await
         {
             Ok(deadline) => deadline,
-            Err(error) => return failure(mutation.request_id, error.to_protocol_error()),
+            Err(error) => {
+                // Nothing left of a deadline the grant itself set is the grant having run out,
+                // and that is written down wherever it is seen. A window or a requested lifetime
+                // running out says nothing about the grant.
+                if accepted.bound == kr_transport::window::DeadlineBound::AuthorityDeadline {
+                    self.authority.expire();
+                }
+                return failure(mutation.request_id, error.to_protocol_error());
+            }
         };
         // The effect runs on a task that outlives this connection, for the same reason the
         // daemon's own effects do: the worker commits the intent before it answers, and a
@@ -848,13 +894,38 @@ impl RemoteConnection {
                 async move { proxy.forward_mutation(&mutation, &envelope, deadline).await },
             );
         match effect.await {
-            Ok(Ok(response)) => ControlFrame::Response(Response {
-                request_id,
-                outcome: response.outcome,
-            }),
+            Ok(Ok(answered)) => {
+                if answered.retained
+                    && let Err(error) = self.may_read_receipts(Some(session_id))
+                {
+                    return failure(request_id, error);
+                }
+                ControlFrame::Response(Response {
+                    request_id,
+                    outcome: answered.response.outcome,
+                })
+            }
             Ok(Err(error)) => failure(request_id, error.to_protocol_error()),
             Err(_) => failure(request_id, outcome_unknown()),
         }
+    }
+
+    /// Returns whether this device may be told what one of its own actions produced.
+    ///
+    /// A retained answer is a read of a receipt, and section 23 has present view authority over
+    /// the subject decide whether either half of a retained result is returned. The rights that
+    /// decide it are `action.read`'s over the session the receipt belongs to, not the ones the
+    /// mutation needed: a device that may act on a session it cannot observe does not learn what
+    /// its action produced by submitting it twice.
+    fn may_read_receipts(
+        &self,
+        session_id: Option<SessionId>,
+    ) -> std::result::Result<(), ProtocolError> {
+        let entry = self.admit(
+            Method::ActionRead.as_str(),
+            Method::ActionRead.entry().version,
+        )?;
+        self.check_grant(session_id, entry, false)
     }
 
     /// Returns this connection's link to one worker, opening it on first use.
@@ -988,22 +1059,10 @@ impl RemoteConnection {
         let Some(session_id) = routed.session_id else {
             return Ok(None);
         };
-        // Reading a receipt is `action.read`, and it is admitted as `action.read`: the rights that
-        // method requires over the session the receipt belongs to, not the rights the mutation
-        // needed. Section 23 has the host check present view authority over the subject before it
-        // returns either half of a retained result, and a device that may act on a session without
-        // being able to observe it does not learn what its action produced by resubmitting it.
-        let Ok(entry) = self.admit(
-            Method::ActionRead.as_str(),
-            Method::ActionRead.entry().version,
-        ) else {
-            return Ok(None);
-        };
         // A refusal here is the answer, not a reason to go on. This action has already been
         // dispatched, and forwarding it again would have the worker answer from the receipt this
-        // device may not read: section 23 has present view authority over the subject decide
-        // whether either half of a retained result is returned.
-        self.check_grant(Some(session_id), entry, false)
+        // device may not read.
+        self.may_read_receipts(Some(session_id))
             .map_err(RouteRefusal::Conflict)?;
         // A link that cannot be opened is not an answer. The ordinary path decides what this
         // request gets, which for a session whose worker has gone is that session's own refusal
