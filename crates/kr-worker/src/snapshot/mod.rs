@@ -320,37 +320,45 @@ pub fn install(
     // What the reset and the header cost. They come before any row and a client cannot use a row
     // without them, so they are the part of the budget the rows do not get.
     let fixed: usize = events.iter().map(|outgoing| outgoing.bytes).sum();
-    let mut carried: Vec<(ProjectedBuffer, &Vec<kr_term::grid::GridRow>)> = vec![
-        (inactive_buffer, &snapshot.inactive_rows),
-        (wire::buffer(snapshot.active_buffer), &snapshot.rows),
-    ];
-    // Converted one row at a time, and each row cut as it is converted rather than after the whole
-    // screen has been built. Two bounds apply: what one page can carry, and this subscriber's own
-    // share of its send queue. The second is rough here - it ignores what the pages themselves
-    // cost, which the passes below settle - and it is a ceiling rather than a target, so an
-    // ordinary screen on an ordinary queue passes through it untouched. What it buys is the peak: a
-    // sixty-four mebibyte screen converted whole and then thrown away is sixty-four mebibytes this
-    // session had to find first.
-    let held: usize = carried.iter().map(|(_, rows)| rows.len()).sum();
-    let ceiling = budget
-        .checked_div(held)
-        .map_or(PAGE_BYTES, |share| share.max(1));
+    // Converted one row at a time, against a running total, so that the whole screen is never
+    // built above this subscriber's queue and then cut down to it: a sixty-four mebibyte screen
+    // materialised and thrown away is sixty-four mebibytes this session had to find first. A row is
+    // cut only once the rows before it have used the queue up, so a screen that fits arrives whole
+    // however unevenly its content is spread - one enormous row among eighty blank ones keeps
+    // everything it has.
+    //
+    // The *showing* buffer is converted first, so that the budget goes to the screen the person is
+    // looking at and the buffer they are not looking at is what loses content. The pages are still
+    // ordered with the other buffer first, which is what a client needs to leave a full-screen
+    // application later.
     let mut converted: Vec<(ProjectedBuffer, Vec<ProjectedRow>)> = Vec::new();
     // Whether this subscriber's queue - rather than a page bound or the engine's own limits - is
     // why some of the session is missing from this screen. It is what the header says out loud.
     let mut cut = false;
-    for (buffer, rows) in core::mem::take(&mut carried) {
+    let mut held = 0_usize;
+    for (buffer, rows) in [
+        (wire::buffer(snapshot.active_buffer), &snapshot.rows),
+        (inactive_buffer, &snapshot.inactive_rows),
+    ] {
         let mut kept: Vec<ProjectedRow> = Vec::with_capacity(rows.len());
         for row in rows {
             let mut row = wire::row(row)?;
             truncate_row(&mut row);
-            let runs = row.runs.len();
-            truncate_row_to(&mut row, ceiling, PAGE_ITEMS);
-            cut |= row.runs.len() != runs;
+            let cost = wire::row_cost(&row).bytes;
+            if cost > budget.saturating_sub(held) {
+                // The rows so far have reached the queue. What is left of it is what this row may
+                // have, and the rows after it get their envelope and nothing more.
+                let runs = row.runs.len();
+                truncate_row_to(&mut row, budget.saturating_sub(held), PAGE_ITEMS);
+                cut |= row.runs.len() != runs;
+            }
+            held = held.saturating_add(wire::row_cost(&row).bytes);
             kept.push(row);
         }
         converted.push((buffer, kept));
     }
+    // Paged with the buffer that is not showing first, whichever was converted first.
+    converted.reverse();
     // A screen has to arrive whole or not at all: a client that holds some of the pages holds no
     // screen and draws nothing. So the whole installation is measured against this subscriber's own
     // send queue - the reset, the header and every page as it will be sent - and a screen larger

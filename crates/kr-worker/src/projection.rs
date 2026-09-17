@@ -788,6 +788,67 @@ mod projection_tests {
         );
     }
 
+    /// KR-REQ-08.79: a screen that fits arrives whole, however unevenly its content is spread.
+    ///
+    /// The bound is on the whole installation, not on each row's share of it. One long row among
+    /// many short ones is a screen a person can read, and a rule that gave every row the same
+    /// allowance would cut that row for the sake of a budget the screen never came near.
+    #[test]
+    fn one_long_row_among_short_ones_keeps_what_it_has() {
+        let mut engine = engine();
+        let mut stream = Vec::new();
+        // One row carrying a long hyperlink on every cell, and twenty-three rows carrying a word.
+        for column in 0..80_u32 {
+            let target = format!("https://example.invalid/{column}/{}", "u".repeat(1_900));
+            stream.extend_from_slice(format!("\x1b]8;;{target}\x1b\\x\x1b]8;;\x1b\\").as_bytes());
+        }
+        stream.extend_from_slice(b"\r\n");
+        for line in 0..23 {
+            stream.extend_from_slice(format!("line {line}\r\n").as_bytes());
+        }
+        engine.feed(0, &stream, LaneGate::default(), 0);
+        // A queue several times what this screen costs, and far less than forty-eight times what
+        // its longest row costs: a rule that gave every row the same allowance would cut that row
+        // here, and the screen it belongs to never came near the queue.
+        let (update, _) = engine
+            .projection_install(
+                dimensions(80, 24),
+                ProjectionResetReason::Attached,
+                LaneGate::default(),
+                0,
+                512 * 1024,
+            )
+            .expect("a snapshot");
+        let total: usize = update.events.iter().map(|outgoing| outgoing.bytes).sum();
+        assert!(
+            total < 512 * 1024,
+            "the screen is well inside the queue: {total} bytes"
+        );
+        let header = update
+            .events
+            .iter()
+            .find_map(|outgoing| match &outgoing.event {
+                kr_protocol::projection::ProjectionEvent::Snapshot(header) => Some(header),
+                _ => None,
+            })
+            .expect("a header");
+        assert!(!header.degraded, "so nothing of it was given up");
+        let truncated = update
+            .events
+            .iter()
+            .filter_map(|outgoing| match &outgoing.event {
+                kr_protocol::projection::ProjectionEvent::Rows(page) => Some(page),
+                _ => None,
+            })
+            .flat_map(|page| page.rows.iter())
+            .filter(|row| row.truncated)
+            .count();
+        assert_eq!(
+            truncated, 0,
+            "and no row was cut, although one of them is far longer than an even share"
+        );
+    }
+
     /// KR-REQ-08.79 and KR-REQ-08.80: a screen larger than a subscriber's queue is cut to it,
     /// explicitly, rather than refused for ever.
     ///

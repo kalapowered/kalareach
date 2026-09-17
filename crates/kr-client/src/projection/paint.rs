@@ -2107,6 +2107,56 @@ mod fixtures {
         );
     }
 
+    /// KR-ACC-002: a run the session holds a link over is drawn inside that link's own sequence.
+    ///
+    /// What makes a link a link on a destination is `OSC 8`, and it is what a person's terminal
+    /// acts on when they activate one. The projection carries the target as metadata and the
+    /// renderer puts it back around exactly the cells it covers: opened before the run's first
+    /// cell, closed after its last, so a destination that supports `OSC 8` has a link over those
+    /// cells and over nothing else.
+    #[test]
+    fn a_linked_run_is_drawn_inside_its_own_link_sequence() {
+        let case = serde_json::json!({
+            "window": {"top_row": 0, "left_column": 0, "rows": 1, "columns": 12},
+            "rows": [{"row": 0, "soft_wrapped": false, "runs": [
+                {"column": 0, "cells": 4, "text": "read"},
+                {"column": 4, "cells": 4, "text": "here"},
+                {"column": 8, "cells": 4, "text": "then"}
+            ]}],
+            "cursor": {"column": 0, "row": 0, "visible": true, "style": 1, "pending_wrap": false}
+        });
+        let (mut screen, window) = screen_of(&case);
+        // The middle run carries the link, which is how the session holds one: on the cells it
+        // covers rather than on the row.
+        if let Some(row) = screen.rows.get_mut(&(ProjectedBuffer::Primary, 0)) {
+            row.runs[1].hyperlink =
+                kr_protocol::scalars::Nullable::some("https://example.invalid/guide".to_owned());
+        }
+        let painted = install(&screen, window, Keyboard::NOTHING);
+        let drawn = String::from_utf8_lossy(&painted.bytes).into_owned();
+        let opened = drawn
+            .find("\u{1b}]8;;https://example.invalid/guide\u{1b}\\")
+            .expect("the link is opened with the session's own target");
+        let text = drawn[opened..]
+            .find("here")
+            .map(|at| at + opened)
+            .expect("the linked text follows it");
+        let closed = drawn[text..]
+            .find("\u{1b}]8;;\u{1b}\\")
+            .map(|at| at + text)
+            .expect("and the link is closed after it");
+        let unlinked = drawn.find("then").expect("the run after it is drawn");
+        assert!(
+            closed < unlinked,
+            "the link closes before the run that is not in it: {}",
+            drawn.escape_debug()
+        );
+        assert!(
+            drawn[..opened].contains("read"),
+            "and the run before it was drawn outside the link"
+        );
+    }
+
     /// KR-REQ-08.40: a panned window places the cursor on the line that holds its row.
     #[test]
     fn a_panned_window_places_the_cursor_on_the_right_line() {
