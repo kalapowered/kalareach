@@ -28,6 +28,10 @@ use crate::attachment::{
     TerminalResizeParams,
 };
 use crate::authority::MethodEntry;
+use crate::desktop::{
+    CapabilityRecord, DesktopCapabilityReport, DesktopContext, EnvironmentCapabilitiesParams,
+    EnvironmentCapabilitiesResult, SleepInhibitionState,
+};
 use crate::envelope::{ControlFrame, MutationRequest, Notification, Request, Response};
 use crate::error::ProtocolError;
 use crate::frame::StreamHeader;
@@ -162,15 +166,20 @@ pub fn protocol_schema() -> Value {
         "authority_revision_ack" => AuthorityRevisionAck,
         "authority_revision_notice" => AuthorityRevisionNotice,
         "authority_revision_record" => AuthorityRevisionRecord,
+        "capability_record" => CapabilityRecord,
         "client_offer" => ClientOffer,
         "closure_record" => ClosureRecord,
         "connect_reply" => ConnectReply,
         "control_frame" => ControlFrame,
         "controller_connection_role" => ControllerConnectionRole,
         "controller_generation_token" => ControllerGenerationToken,
+        "desktop_capability_report" => DesktopCapabilityReport,
+        "desktop_context" => DesktopContext,
         "direct_challenge" => DirectChallenge,
         "direct_redeem_proof" => DirectRedeemProof,
         "envelope_plaintext" => EnvelopePlaintext,
+        "environment_capabilities_params" => EnvironmentCapabilitiesParams,
+        "environment_capabilities_result" => EnvironmentCapabilitiesResult,
         "expiration_tombstone" => ExpirationTombstone,
         "fence_evidence" => FenceEvidence,
         "fenced_action" => FencedAction,
@@ -282,6 +291,7 @@ pub fn protocol_schema() -> Value {
         "shell_launch_params" => ShellLaunchParams,
         "shell_launch_result" => ShellLaunchResult,
         "signed_archive_manifest" => SignedArchiveManifest,
+        "sleep_inhibition_state" => SleepInhibitionState,
         "signed_client_bundle" => SignedClientBundle,
         "signed_host_bundle" => SignedHostBundle,
         "signed_relay_consumption_receipt" => SignedRelayConsumptionReceipt,

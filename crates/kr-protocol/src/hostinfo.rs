@@ -6,6 +6,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::desktop::SleepInhibitionState;
 use crate::hello::ProtocolVersion;
 use crate::identity::{BootIdentity, WorkerProfile};
 use crate::ids::{BuildId, ControllerGeneration, EnvironmentId};
@@ -33,6 +34,8 @@ pub struct HostInfoResult {
     pub session_limit: U64,
     /// The worker profile this host creates sessions with unless the request says otherwise.
     pub default_worker_profile: WorkerProfile,
+    /// What this host's sleep inhibition is doing, whether it is active or not.
+    pub power: SleepInhibitionState,
 }
 
 /// One environment this host serves.

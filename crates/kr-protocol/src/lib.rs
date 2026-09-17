@@ -42,6 +42,7 @@
 //! | [`push`] | Push registration, sender authorisation and delivery |
 //! | [`archive`] | Backup key wraps, manifests, descriptors and recovery material |
 //! | [`account`] | Membership leases and the organisation policy-signing authority chain |
+//! | [`desktop`] | The desktop execution context, capability evidence and the power setting |
 //! | [`digest`] | The mutation payload digest |
 //! | [`project`] | Project repositories, workspaces, inclusion previews and repository operations |
 //! | [`limits`] | Protocol defaults |
@@ -98,6 +99,7 @@ pub mod actor;
 pub mod archive;
 pub mod attachment;
 pub mod authority;
+pub mod desktop;
 pub mod digest;
 pub mod envelope;
 pub mod error;
