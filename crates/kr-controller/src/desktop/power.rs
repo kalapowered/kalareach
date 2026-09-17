@@ -34,10 +34,16 @@
 //! nothing, and a host that reported one would be promising a machine that stays awake when it
 //! does not.
 //!
-//! Releasing is closing the pipe, so nothing is ever signalled: the facility sees its input end,
-//! exits, and the assertion goes with it. That also means a control daemon that dies releases
-//! everything it held, because the pipe dies with the process. An assertion that could outlive the
-//! daemon holding it would be a machine that never sleeps again.
+//! Releasing is closing the pipe: the facility sees its input end, exits, and the assertion goes
+//! with it. That also means a control daemon that dies releases everything it held, because the
+//! pipe dies with the process. An assertion that could outlive the daemon holding it would be a
+//! machine that never sleeps again.
+//!
+//! Two endings are not that graceful one, and both are bounded on purpose. A facility whose
+//! acquisition the platform did not confirm is stopped rather than left running, and a facility
+//! that has not exited two seconds after its input ended is stopped too, because an assertion that
+//! stayed held because its holder hung would be a machine that stopped sleeping for good. The only
+//! process either of those ends is this daemon's own child.
 //!
 //! # What an assertion does not promise
 //!
@@ -84,6 +90,10 @@ const QUERY_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 pub const ACQUIRE_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// How often an acquisition is asked whether it has been confirmed.
+///
+/// Only a platform that publishes a listing is asked more than once; where the facility reports
+/// its own acquisition there is one answer to wait for.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 const ACQUIRE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// What the host currently has outstanding.
@@ -242,7 +252,7 @@ impl Inhibitor {
         }
         let wanted = setting.permits(power).then(|| demand.reason()).flatten();
         match wanted {
-            Some(reason) => self.hold(reason, setting, power),
+            Some(reason) => self.hold(reason, setting, demand, power),
             None => {
                 self.release();
                 self.withheld = withheld_reason(setting, demand, power);
@@ -254,8 +264,9 @@ impl Inhibitor {
     /// Releases the assertion, if one is held.
     ///
     /// The facility's input is dropped, which is what it waits on, and the child is then reaped.
-    /// Nothing is signalled: the only process involved is this daemon's own child, and closing a
-    /// pipe is how it was designed to be told.
+    /// Closing a pipe is how the facility was designed to be told, so that is how it is told; the
+    /// one that has not exited by its deadline is ended, and the only process either way is this
+    /// daemon's own child.
     pub fn release(&mut self) {
         let Some(mut held) = self.held.take() else {
             return;
@@ -304,17 +315,22 @@ impl Inhibitor {
     }
 
     /// Takes the assertion, or keeps the one that is already held.
+    ///
+    /// The demand is carried through rather than reconstructed from the reason it produced. The
+    /// reported counts are counts: two accepted requests are two, and a reason says only that
+    /// there was at least one of each kind.
     fn hold(
         &mut self,
         reason: InhibitionReason,
         setting: SleepInhibitionSetting,
+        demand: Demand,
         power: PowerSource,
     ) -> SleepInhibitionState {
         if let Some(held) = self.held.as_mut() {
             // The assertion is the same assertion; only what it is held for can have changed.
             held.reason = reason;
             self.withheld = None;
-            return self.state(setting, self.demand_of(reason), power);
+            return self.state(setting, demand, power);
         }
         match platform::hold() {
             Some((mut facility, holder)) => {
@@ -357,25 +373,7 @@ impl Inhibitor {
                 );
             }
         }
-        self.state(setting, self.demand_of(reason), power)
-    }
-
-    /// Returns the demand one reason describes, for reporting.
-    const fn demand_of(&self, reason: InhibitionReason) -> Demand {
-        match reason {
-            InhibitionReason::ForegroundWork => Demand {
-                sessions_with_work: 1,
-                pending_requests: 0,
-            },
-            InhibitionReason::PendingRequests => Demand {
-                sessions_with_work: 0,
-                pending_requests: 1,
-            },
-            InhibitionReason::ForegroundWorkAndPendingRequests => Demand {
-                sessions_with_work: 1,
-                pending_requests: 1,
-            },
-        }
+        self.state(setting, demand, power)
     }
 }
 
