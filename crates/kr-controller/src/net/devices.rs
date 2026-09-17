@@ -18,6 +18,7 @@
 //! The network module owns these two tables and nothing else in that file.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use kr_crypto::connect::PairedPeer;
 use kr_protocol::grant::Grant;
@@ -29,6 +30,22 @@ use kr_transport::handshake::PairedDirectory;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::error::{ControllerError, Result};
+
+/// The durable records a connection reads and writes, and the boundaries they move behind.
+///
+/// One handle, because a connection needs all three and none of them belongs to it: the directory
+/// it was admitted from, what the host owes that directory, and the decision about the clock those
+/// records are dated by. Each outlives the connection, which is why they are the host's and not
+/// the connection's.
+#[derive(Clone, Debug)]
+pub struct HostRecords {
+    /// Every device this host has paired, and where each remote action went.
+    pub devices: Arc<DeviceDirectory>,
+    /// The expiry records this host owes that directory.
+    pub pending: Arc<PendingExpiry>,
+    /// Whether this host may decide an expiry from its own wall clock.
+    pub clock: Arc<ClockTrust>,
+}
 
 /// Whether this host may decide an expiry from its own wall clock, and the transitions of that.
 ///
@@ -47,34 +64,52 @@ pub struct ClockTrust {
 }
 
 impl ClockTrust {
-    /// Samples the wall clock against this host's mark, and records a rollback as distrust.
+    /// Samples the wall clock and says whether this host may decide against what it read.
+    ///
+    /// One operation, because the two halves are one decision: the clock is read, a rollback
+    /// becomes distrust, and the answer says whether the reading may be used. Anything that read
+    /// the clock and then asked separately could be answered about a clock an owner established in
+    /// between, and would then measure a grant from the reading it took before that.
+    ///
+    /// The clock is read *inside* the boundary too, so a caller that paused before it got here
+    /// cannot contribute a stale reading.
     ///
     /// # Errors
     ///
-    /// Returns an error when the mark cannot be read or written.
-    pub fn observe(&self, devices: &DeviceDirectory, now_ms: TimestampMs) -> Result<ObservedUtc> {
+    /// Returns an error when the mark or the decision cannot be read or written. A host that
+    /// cannot tell decides nothing.
+    pub fn sample(&self, devices: &DeviceDirectory) -> Result<Option<ObservedUtc>> {
         let mut distrusted = self.held();
-        let observed = devices.utc_at_least(now_ms)?;
+        let observed = devices.utc_at_least(kr_ipc::now_ms())?;
         if observed.behind_ms > CLOCK_TOLERANCE_MS {
             *distrusted = true;
             // The decision is in memory before anything is written, and the write is attempted
             // here and retried by whoever calls [`Self::settle`] until it lands.
             let _ = devices.note_clock_untrusted(observed.now);
         }
-        Ok(observed)
+        if *distrusted || devices.clock_untrusted()? {
+            return Ok(None);
+        }
+        Ok(Some(observed))
     }
 
-    /// Returns whether this host's clock is one it may decide an expiry against.
+    /// Records the moment this host is at, for a caller that needs the reading rather than a
+    /// decision from it.
+    ///
+    /// A tombstone is written at the moment it was observed, and a rollback observed while doing
+    /// it is the same fact as one observed anywhere else: it becomes distrust here too.
     ///
     /// # Errors
     ///
-    /// Returns an error when the record cannot be read. A host that cannot tell decides nothing.
-    pub fn untrusted(&self, devices: &DeviceDirectory) -> Result<bool> {
-        let distrusted = self.held();
-        if *distrusted {
-            return Ok(true);
+    /// Returns an error when the mark cannot be read or written.
+    pub fn observe(&self, devices: &DeviceDirectory) -> Result<TimestampMs> {
+        let mut distrusted = self.held();
+        let observed = devices.utc_at_least(kr_ipc::now_ms())?;
+        if observed.behind_ms > CLOCK_TOLERANCE_MS {
+            *distrusted = true;
+            let _ = devices.note_clock_untrusted(observed.now);
         }
-        devices.clock_untrusted()
+        Ok(observed.now)
     }
 
     /// Writes down a decision this host is holding, until the write lands.
@@ -99,9 +134,11 @@ impl ClockTrust {
     /// # Errors
     ///
     /// Returns an error when the record cannot be written. The decision stands if it cannot.
-    pub fn establish(&self, devices: &DeviceDirectory, now_ms: TimestampMs) -> Result<()> {
+    pub fn establish(&self, devices: &DeviceDirectory) -> Result<()> {
         let mut distrusted = self.held();
-        devices.trust_clock(now_ms)?;
+        // Read inside the boundary, like every other reading of this clock: the moment the owner
+        // established is the moment this host is at now, not one sampled before it got here.
+        devices.trust_clock(kr_ipc::now_ms())?;
         *distrusted = false;
         Ok(())
     }

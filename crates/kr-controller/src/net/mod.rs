@@ -547,21 +547,18 @@ impl NetworkHost {
         boot_now: u64,
     ) -> Result<u64> {
         let controller = self.daemon()?;
-        // One boundary for the sample, the mark, the decision and its record: everything this
-        // reads was written inside it, so an owner establishing the clock and an observation of a
-        // rollback cannot interleave halfway.
-        let observed = self.clock_trust.observe(&self.devices, kr_ipc::now_ms())?;
-        // Distrust stands until something authenticates the clock again. Reaching a moment this
-        // host had already written down is not that evidence: it proves neither what the time is
-        // now nor how much of it passed while the host was not running. Only
-        // [`NetworkHost::establish_clock`], which an owner's approval reaches, clears it.
-        if self.clock_trust.untrusted(&self.devices)? {
+        // One boundary, and one answer from it: the reading and the decision about the reading
+        // are taken together, so a grant's life cannot be measured from a moment the host had
+        // already decided it could not trust. Distrust stands until something authenticates the
+        // clock again; reaching a moment this host had already written down is not that evidence,
+        // and only [`NetworkHost::establish_clock`], which an owner's approval reaches, clears it.
+        let Some(observed) = self.clock_trust.sample(&self.devices)? else {
             return Err(ControllerError::ClockUntrusted {
                 detail: "this host's clock went backwards and has not been established again, so \
                          it cannot say whether this device's grant has run out"
                     .to_owned(),
             });
-        }
+        };
         let remaining = expires_at_ms.get().saturating_sub(observed.now.get());
         if remaining > 0 {
             self.devices.record_grant_deadline(
@@ -606,8 +603,7 @@ impl NetworkHost {
         };
         let remote = Arc::new(RemoteConnection::new(
             Arc::clone(&controller),
-            Arc::clone(&self.devices),
-            Arc::clone(&self.pending_expiry),
+            self.records(),
             device,
             &session,
             notifications,
@@ -706,7 +702,16 @@ impl NetworkHost {
             )
         })?;
         pairing.accept_clock(approval)?;
-        self.clock_trust.establish(&self.devices, kr_ipc::now_ms())
+        self.clock_trust.establish(&self.devices)
+    }
+
+    /// Returns the records a connection reads and writes, each of which outlives it.
+    fn records(&self) -> devices::HostRecords {
+        devices::HostRecords {
+            devices: Arc::clone(&self.devices),
+            pending: Arc::clone(&self.pending_expiry),
+            clock: Arc::clone(&self.clock_trust),
+        }
     }
 
     /// Returns the live connections this predicate selects, holding each one for the caller.
@@ -792,7 +797,7 @@ async fn keep_the_record(
         // A clock stepped backwards is the same fact whoever sees it. This task sees it between
         // connections, which is exactly when nothing else would, and it observes through the same
         // boundary every other reader and writer of that decision takes.
-        if let Err(error) = clock.observe(&devices, kr_ipc::now_ms()) {
+        if let Err(error) = clock.observe(&devices) {
             eprintln!("kr-controller: could not record the moment this host is at: {error}");
         }
         // Whatever the decision holds is written down until the write lands. A decision this host

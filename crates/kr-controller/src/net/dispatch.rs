@@ -157,6 +157,8 @@ struct Authorisation {
     devices: Arc<super::devices::DeviceDirectory>,
     /// What this host owes its directory, for an expiry whose write did not succeed here.
     pending: Arc<super::devices::PendingExpiry>,
+    /// The boundary every reading of this host's wall clock takes.
+    clock: Arc<super::devices::ClockTrust>,
     device_id: DeviceId,
     connection_id: ConnectionId,
     /// When this connection's grant runs out, on the continuous clock.
@@ -228,10 +230,13 @@ impl Authorisation {
             return;
         }
         if !self.recorded.swap(true, Ordering::AcqRel) {
+            // Through the boundary, like every other reading of this clock: a rollback observed
+            // while writing a tombstone is the same fact as one observed anywhere else, and it
+            // becomes this host's decision about its clock rather than a number nobody kept.
             let now = self
-                .devices
-                .utc_at_least(kr_ipc::now_ms())
-                .map_or_else(|_| kr_ipc::now_ms(), |observed| observed.now);
+                .clock
+                .observe(&self.devices)
+                .unwrap_or_else(|_| kr_ipc::now_ms());
             self.pending.owe(self.device_id, now);
         }
         // Written here when it can be, so the ordinary case costs nothing but this call.
@@ -419,8 +424,7 @@ impl RemoteConnection {
     #[must_use]
     pub fn new(
         controller: Arc<Controller>,
-        devices: Arc<super::devices::DeviceDirectory>,
-        pending: Arc<super::devices::PendingExpiry>,
+        records: super::devices::HostRecords,
         device: DeviceRecord,
         session: &AuthorisedSession,
         notifications: tokio::sync::mpsc::Sender<Relayed>,
@@ -430,15 +434,16 @@ impl RemoteConnection {
             grant_deadline,
             controller: Arc::clone(&controller),
             device_id: device.device_id,
-            devices: Arc::clone(&devices),
-            pending,
+            devices: Arc::clone(&records.devices),
+            pending: Arc::clone(&records.pending),
+            clock: Arc::clone(&records.clock),
             connection_id: session.connection_id,
             expired: AtomicBool::new(false),
             recorded: AtomicBool::new(false),
         });
         Self {
             controller,
-            devices,
+            devices: Arc::clone(&records.devices),
             device,
             actor: session.actor.clone(),
             connection_id: session.connection_id,
@@ -703,7 +708,16 @@ impl RemoteConnection {
                         .session_create(&actor_id, &mutation, accepted)
                         .await
                 });
-                settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await)
+                let answer = settled(request_id, tokio::time::timeout(EFFECT_WAIT, effect).await);
+                // A create the daemon answered from the reservation an earlier submission made is
+                // the same read of somebody's result as a retained answer anywhere else, and it
+                // says so: `deduplicated` is what distinguishes it from a session made now.
+                if deduplicated(&answer)
+                    && let Err(error) = self.may_read_receipts(answered_session(&answer))
+                {
+                    return failure(request_id, error);
+                }
+                answer
             }
             // A close is dispatched to the worker, so it goes over a bounded link of its own
             // rather than over the connection this host announces authority revisions on: a worker
@@ -1578,6 +1592,20 @@ fn settled(request_id: RequestId, outcome: Effect) -> ControlFrame {
         }),
         Ok(Err(_)) | Err(_) => failure(request_id, outcome_unknown()),
     }
+}
+
+/// Returns whether an answer is a create the daemon deduplicated rather than performed.
+fn deduplicated(answer: &ControlFrame) -> bool {
+    let ControlFrame::Response(Response {
+        outcome: Outcome::Ok(value),
+        ..
+    }) = answer
+    else {
+        return false;
+    };
+    value
+        .to_typed::<kr_protocol::session::SessionCreateResult>()
+        .is_ok_and(|created| created.deduplicated)
 }
 
 /// Returns the session a retained answer is about, when it names one.
