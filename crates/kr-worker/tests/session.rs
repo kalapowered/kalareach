@@ -1509,7 +1509,9 @@ async fn a_shell_that_has_already_ended_is_a_closed_session_rather_than_a_failed
 async fn a_shell_the_host_described_keeps_the_identity_the_kernel_gave_it() {
     // The other side of the same path. This shell is alive while the host reads it, so what the
     // closure record carries is the kernel's own start value rather than the reserved one that says
-    // nobody could take a reading. The exit is collected by the supervision, on the child signal.
+    // nobody could take a reading. Its exit is collected by the supervision rather than at launch,
+    // which is why the wait below allows for either wake that can find it: the child signal, which
+    // arrives at once, or the sweep behind it.
     let host = kr_ipc::testing::TempHost::create();
     let config = configuration(&host, "printf 'kr-alive\\n'; sleep 1; exit 5");
     let runtime = std::sync::Arc::new(kr_worker::runtime::start(config).expect("starts a session"));
@@ -1523,9 +1525,12 @@ async fn a_shell_the_host_described_keeps_the_identity_the_kernel_gave_it() {
         "the kernel described this shell, so its identity is a reading"
     );
 
-    let record = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed())
-        .await
-        .expect("the session closes on the root shell's exit");
+    let record = tokio::time::timeout(
+        kr_worker::lifecycle::IDLE_SWEEP_INTERVAL + Duration::from_secs(15),
+        runtime.wait_closed(),
+    )
+    .await
+    .expect("the session closes on the root shell's exit");
 
     assert_eq!(record.reason, ClosureReason::RootExit);
     assert_eq!(
