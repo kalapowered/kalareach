@@ -52,12 +52,15 @@ use crate::runtime::host::{
 };
 use crate::runtime::limits::InstanceLimiter;
 
-/// The epoch deadline given to a call that has none.
+/// The epoch deadline instantiation and `bind` run under.
 ///
-/// Epoch interruption is on for the whole engine, so every store has a deadline whether its call
-/// needs one or not. A delta this size is about thirty years of ticks: far enough away to mean
-/// "no deadline" and small enough that adding it to the current epoch cannot overflow.
-const NO_DEADLINE_TICKS: u64 = 1 << 40;
+/// Neither has one of section 11's call deadlines, and neither is unbounded: a component whose
+/// constructors never return would otherwise hold a binding thread for ever.
+fn setup_ticks() -> u64 {
+    crate::runtime::budget::SETUP_DEADLINE_MS
+        .div_ceil(crate::runtime::engine::EPOCH_TICK_MS)
+        .saturating_add(1)
+}
 
 /// What a call produced.
 ///
@@ -282,7 +285,7 @@ impl Instance {
             let _in_flight = engine.in_flight();
             // Instantiation has no deadline of its own, and epoch interruption is on, so the store
             // needs a deadline it will not reach rather than none at all.
-            store.set_epoch_deadline(NO_DEADLINE_TICKS);
+            store.set_epoch_deadline(setup_ticks());
             Plugin::instantiate(&mut store, component, linker)
                 .map_err(RuntimeError::instantiation)?
         };
@@ -490,7 +493,8 @@ impl Instance {
         }
         match budget.epoch_ticks(crate::runtime::engine::EPOCH_TICK_MS) {
             Some(ticks) => self.store.set_epoch_deadline(ticks),
-            None => self.store.set_epoch_deadline(NO_DEADLINE_TICKS),
+            // `bind`, which runs under the preparation deadline rather than a call's.
+            None => self.store.set_epoch_deadline(setup_ticks()),
         }
 
         let called = {

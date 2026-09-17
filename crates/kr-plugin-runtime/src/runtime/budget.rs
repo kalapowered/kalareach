@@ -40,6 +40,15 @@ use kr_plugin_sdk::limits::{
 /// Changing it changes how much work a call may do, and nothing about how long it may take.
 pub const FUEL_PER_DEADLINE_MS: u64 = 100_000_000;
 
+/// How long instantiation and `bind` may take.
+///
+/// Neither is a call in section 11's list, so neither has one of its deadlines. Neither is
+/// unbounded either: a component whose constructors never return would otherwise hold a binding
+/// thread for ever. The figure is the compilation budget, because preparation is what both belong
+/// to and a host that accepted a compile of up to that long has to be willing to wait for the
+/// instantiation that follows it.
+pub const SETUP_DEADLINE_MS: u64 = crate::runtime::compile::COMPILE_DEADLINE_MS;
+
 /// The work allowance instantiation and `bind` run under.
 ///
 /// Neither is a call in section 11's list: both happen during binding preparation, under the
@@ -110,8 +119,9 @@ impl CallKind {
 
     /// Returns the elapsed deadline in milliseconds.
     ///
-    /// `bind` has none of its own: it runs inside binding preparation, under the compilation
-    /// budget, which is the whole reason a cold compile never appears in an observation deadline.
+    /// `bind` has none of section 11's: it runs inside binding preparation, which is the whole
+    /// reason a cold compile never appears in an observation deadline. It runs under
+    /// [`SETUP_DEADLINE_MS`] instead, so it is bounded without being bounded by a call's figure.
     #[must_use]
     pub const fn deadline_ms(self) -> Option<u64> {
         match self {
@@ -209,6 +219,12 @@ mod tests {
         assert_eq!(CallKind::Bind.deadline_ms(), None);
         assert_eq!(CallBudget::of(CallKind::Bind).deadline_ms, None);
         assert_eq!(CallBudget::of(CallKind::Bind).epoch_ticks(1), None);
+        // Bounded all the same, by the preparation deadline rather than by a call's.
+        assert_eq!(
+            SETUP_DEADLINE_MS,
+            crate::runtime::compile::COMPILE_DEADLINE_MS
+        );
+        assert!(SETUP_DEADLINE_MS > SNAPSHOT_DEADLINE_MS);
         // And its work allowance is the setup one, whatever the call fuel rate is. A host that
         // tightened the call rate would otherwise find it could no longer instantiate anything.
         assert_eq!(CallBudget::of(CallKind::Bind).fuel, SETUP_FUEL);
