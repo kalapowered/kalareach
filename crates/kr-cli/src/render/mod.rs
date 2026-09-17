@@ -195,14 +195,21 @@ impl ProjectedDisplay {
 
 /// What an attachment could not establish about the terminal it borrowed.
 ///
-/// The modes this attachment changes and then owes back are read rather than assumed, and they can
-/// come back unread. That does not stop an attachment, because every one of them has a documented
-/// default, but it is a smaller promise than the one a terminal that answers gets, and a person is
-/// told which promise was made rather than left to assume the larger one.
+/// Two things are read rather than assumed, and each can come back unread: the modes this
+/// attachment changes and then owes back, and whether the destination measures a character the way
+/// the session does. Neither stops an attachment - every mode has a documented default, and a
+/// projection addresses every cluster absolutely - but each is a smaller promise than the one a
+/// qualified terminal gets, and a person is told which promise was made rather than left to assume
+/// the larger one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Qualification {
     /// The modes nothing could be read for, which are the ones a detach puts back to their default.
     pub defaulted_modes: Vec<kr_term::probe::SavedMode>,
+    /// The declared identity of a destination that is not qualified for the session's width model.
+    ///
+    /// `None` for a qualified destination, and for an attachment that drew no projection: where the
+    /// width model decides anything is where a projected renderer puts each cluster.
+    pub width_unqualified: Option<String>,
 }
 
 impl Qualification {
@@ -225,6 +232,13 @@ impl Qualification {
                 "{subject}{} {verb} put back to the documented default rather than to the value \
                  this terminal had, because it never reported one",
                 named.join(", ")
+            ));
+        }
+        if let Some(identity) = &self.width_unqualified {
+            parts.push(format!(
+                "it calls itself {identity}, which is not qualified for the character widths this \
+                 session measures with, so a character it draws wider than the session does costs \
+                 that character's own cell and nothing after it"
             ));
         }
         if parts.is_empty() {
@@ -358,6 +372,48 @@ mod tests {
 
     /// One named loss, and the one field of a comparison that holds it.
     type Loss = (&'static str, fn(&mut Comparison));
+
+    /// KR-REQ-08.40 and KR-ACC-023: a destination outside the session's width model is named.
+    ///
+    /// Section 8 pins the width table as a release-profile decision rather than something inferred
+    /// from a name, so a destination this build has not measured is not qualified for it however it
+    /// calls itself. Nothing is refused over that - every cluster is addressed absolutely, which is
+    /// what keeps a disagreement to that cluster's own cell - but the person drawing a session onto
+    /// it is told which of the two they have.
+    #[test]
+    fn a_destination_outside_the_width_model_is_named_in_the_report() {
+        assert_eq!(
+            Qualification::default().report(),
+            None,
+            "a terminal that answered everything, drawing nothing, has nothing to report"
+        );
+        let unqualified = Qualification {
+            defaulted_modes: Vec::new(),
+            width_unqualified: Some("xterm-256color".to_owned()),
+        };
+        let sentence = unqualified
+            .report()
+            .expect("an unqualified destination is reported");
+        assert!(
+            sentence.contains("xterm-256color"),
+            "the report names the destination as it declared itself: {sentence}"
+        );
+        assert!(
+            !kr_term::profile::width_qualified("xterm-256color"),
+            "and a terminfo name is not a width table: nothing is qualified by calling itself one"
+        );
+
+        // Both facts in one sentence, because they are two halves of the same promise.
+        let both = Qualification {
+            defaulted_modes: vec![kr_term::probe::SavedMode::MouseClicks],
+            width_unqualified: Some("xterm-256color".to_owned()),
+        };
+        let sentence = both.report().expect("both are reported");
+        assert!(
+            sentence.contains("mode 1000") && sentence.contains("xterm-256color"),
+            "each is named: {sentence}"
+        );
+    }
 
     /// KR-ACC-023: a projection that could not carry something says what, in words, always.
     #[test]

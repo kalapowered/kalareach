@@ -271,11 +271,19 @@ pub async fn run(
         );
     }
     // And what this attachment could not establish about the terminal itself: the modes it had to
-    // put back to their documented default because nothing could be read for them. That is the
-    // attachment making a smaller promise than a terminal that answers gets, and it is said out
-    // loud rather than assumed either way.
+    // put back to their documented default because nothing could be read for them, and a
+    // destination whose declared identity is not qualified for the character widths this session
+    // measures with. Both are the attachment making a smaller promise than a qualified terminal
+    // gets, and both are said out loud rather than assumed either way.
     let qualification = crate::render::Qualification {
         defaulted_modes: modes.unanswered(),
+        width_unqualified: (display.frames().0 > 0)
+            .then(|| {
+                declared
+                    .clone()
+                    .unwrap_or_else(|| "a terminal with no name of its own".to_owned())
+            })
+            .filter(|identity| !kr_term::profile::width_qualified(identity)),
     };
     if let Some(detail) = qualification.report() {
         eprintln!("kr: not everything about this terminal could be established: {detail}");

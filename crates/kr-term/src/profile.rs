@@ -165,6 +165,29 @@ pub const WITHHELD: &[Withheld] = &[
     },
 ];
 
+/// The declared identities qualified for this profile's width model.
+///
+/// Section 8 pins the width table as a release-profile decision and says outright that it is "not
+/// inferred from a library name". A terminal's declared identity names a terminfo entry, not a width
+/// table: two terminals calling themselves `xterm-256color` can and do measure an ambiguous-width
+/// character differently, and a session that assumed otherwise would place a cell where the
+/// destination does not draw it.
+///
+/// So an identity appears here only once that terminal has been measured against the pinned table
+/// and the result has been written into a release profile. Nothing is presumed from a name. A
+/// destination that is not on this list is drawn with every cluster addressed absolutely, which is
+/// what keeps a disagreement to that cluster's own cell, and it is named as unqualified in what the
+/// attachment reports.
+pub const WIDTH_QUALIFIED_IDENTITIES: &[&str] = &[];
+
+/// Whether a destination's declared identity is qualified for this profile's width model.
+#[must_use]
+pub fn width_qualified(declared: &str) -> bool {
+    WIDTH_QUALIFIED_IDENTITIES
+        .iter()
+        .any(|known| known.eq_ignore_ascii_case(declared))
+}
+
 /// The complete profile description.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Profile {

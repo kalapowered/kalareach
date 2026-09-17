@@ -214,6 +214,14 @@ to the cell before it. A multi-scalar emoji sequence therefore takes one cell pe
 width: U+1F469 U+200D U+1F4BB is four cells, not two, and a thumbs-up with a skin-tone modifier is
 four, not two. The profile does not advertise mode 2027 and does not pretend to implement it.
 
+That model is a release-profile pin, not something read off a terminal's name. A destination
+declares a terminfo entry, and two terminals declaring `xterm-256color` can still measure an
+ambiguous-width character differently, so an identity counts as width-qualified only once that
+terminal has been measured against the pinned table. Nothing is refused over the difference: a
+projection addresses every cluster absolutely, so a character a destination draws wider costs that
+character's own cell and nothing after it, and the attachment names the destination as unqualified
+in what it reports rather than leaving the person to assume otherwise.
+
 The grid library's own cluster reducer is more modern than that: it folds emoji sequences, Hangul
 jamo and more into single cells. The qualified change is in what the library is given rather than in
 the library: a run that is not plain ASCII is cut at every cell, so the reducer never sees two of

@@ -2073,6 +2073,40 @@ mod fixtures {
              rather than a wrapped line"
         );
 
+        // The last column of a row that is *not* the last row, which is the case a wrap would be
+        // visible in: a disagreement there would push a cell into the row below and everything
+        // after it down the screen. Nothing does, because autowrap is off before the first cell of
+        // every frame and every row is addressed absolutely.
+        let between = serde_json::json!({
+            "window": {"top_row": 0, "left_column": 0, "rows": 2, "columns": 4},
+            "rows": [
+                {"row": 0, "soft_wrapped": false, "runs": [
+                    {"column": 0, "cells": 4, "text": "abc\u{3b1}"}]},
+                {"row": 1, "soft_wrapped": false, "runs": [
+                    {"column": 0, "cells": 4, "text": "wxyz"}]}
+            ],
+            "cursor": {"column": 0, "row": 0, "visible": true, "style": 1, "pending_wrap": false}
+        });
+        let (screen, window) = screen_of(&between);
+        let painted = install(&screen, window, Keyboard::NOTHING);
+        let mut destination = Destination::new(2, 4);
+        destination.width = Width::Widening;
+        destination.feed(&painted.bytes);
+        assert!(
+            !destination.scrolled,
+            "a glyph the last column cannot hold does not wrap into the row below it"
+        );
+        assert_eq!(
+            destination.cells[1],
+            ["w", "x", "y", "z"],
+            "and the row after it is the canonical one, drawn from its own address"
+        );
+        assert_eq!(
+            destination.cells[0][..3],
+            ["a", "b", "c"],
+            "with the cells before the disagreement its own"
+        );
+
         // And the one case where the bound is two cells rather than one: a cell the session holds
         // *blank*. A row is cleared before it is drawn and a blank cell has no run, so nothing is
         // written over the second half of a glyph this destination drew wide. The person sees the
