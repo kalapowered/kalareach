@@ -641,7 +641,8 @@ impl PluginHost {
         let attempt = served
             .registered
             .lock()
-            .map_or(0, |mut held| held.preparing(binding_id));
+            .ok()
+            .and_then(|mut held| held.preparing(binding_id));
         let started_registering = Registering {
             registered: &served.registered,
             binding_id,
@@ -755,16 +756,29 @@ static NEXT_REGISTRATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 impl Held {
     /// Records that this connection has started registering a binding, and returns the attempt.
-    fn preparing(&mut self, binding_id: Uuid) -> u64 {
+    ///
+    /// Nothing, when an attempt on that identifier is already under way: the runtime refuses the
+    /// second registration of one identifier, and letting it overwrite the first one's record would
+    /// leave the first with nothing to clean up by.
+    fn preparing(&mut self, binding_id: Uuid) -> Option<u64> {
+        if self.preparing.contains_key(&binding_id) {
+            return None;
+        }
         let attempt = NEXT_REGISTRATION.fetch_add(1, Ordering::Relaxed);
         self.preparing.insert(binding_id, attempt);
-        attempt
+        Some(attempt)
     }
 
     /// Records a binding, and discharges any redraw it owed from before it existed.
-    fn joined(&mut self, binding_id: Uuid, attempt: u64, handle: Arc<BindingHandle>) {
-        self.gave_up(binding_id, attempt);
-        if self.owed.remove(&binding_id) {
+    fn joined(&mut self, binding_id: Uuid, attempt: Option<u64>, handle: Arc<BindingHandle>) {
+        // The redraw first: it is taken before the cleanup that would otherwise remove it, because
+        // a document lost while this binding was being registered is a document the binding still
+        // has to draw again.
+        let owed = self.owed.remove(&binding_id);
+        if let Some(attempt) = attempt {
+            self.gave_up(binding_id, attempt);
+        }
+        if owed {
             handle.require_snapshot();
         }
         self.live.insert(binding_id, handle);
@@ -805,7 +819,6 @@ impl Held {
         {
             self.live.remove(&binding_id);
         }
-        self.owed.remove(&binding_id);
     }
 }
 
@@ -863,7 +876,7 @@ struct BindingPlaces {
 struct Registering<'a> {
     registered: &'a Registered,
     binding_id: Uuid,
-    attempt: u64,
+    attempt: Option<u64>,
     kept: bool,
 }
 
@@ -876,9 +889,10 @@ impl Registering<'_> {
 impl Drop for Registering<'_> {
     fn drop(&mut self) {
         if !self.kept
+            && let Some(attempt) = self.attempt
             && let Ok(mut held) = self.registered.lock()
         {
-            held.gave_up(self.binding_id, self.attempt);
+            held.gave_up(self.binding_id, attempt);
         }
     }
 }

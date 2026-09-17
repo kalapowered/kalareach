@@ -56,8 +56,8 @@ const NODE_OVERHEAD_BYTES: u64 = crate::runtime::host::NODE_OVERHEAD_BYTES;
 /// One per binding with an unfinished dropped document is what it takes in practice: a document's
 /// pieces are produced by one call and offered one after another, so a record is made and released
 /// within one pass. The bound is what keeps a pathological producer from making the record itself
-/// the thing that grows, and the oldest goes first because the newest is the one whose pieces are
-/// still arriving.
+/// the thing that grows. Past it the connection ends, because forgetting one of these records would
+/// mean delivering the end of a document without its beginning.
 const MAX_DROPPED_REMEMBERED: usize = 256;
 
 /// What became of a notice this queue was offered.
@@ -393,10 +393,13 @@ impl Queued {
         }
         if self.gone.insert((binding_id, document)) {
             self.gone_order.push_back((binding_id, document));
-            while self.gone_order.len() > MAX_DROPPED_REMEMBERED {
-                if let Some(oldest) = self.gone_order.pop_front() {
-                    self.gone.remove(&oldest);
-                }
+            if self.gone_order.len() > MAX_DROPPED_REMEMBERED {
+                // Forgetting one would let its remaining pieces be queued afterwards, and a reader
+                // given the end of a document without its beginning is the one thing this record
+                // exists to prevent. A connection that has this many unfinished dropped documents
+                // is one whose presentation is already beyond saving, so it ends instead.
+                self.closed = true;
+                self.overflowed = true;
             }
         }
     }

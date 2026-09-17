@@ -278,6 +278,8 @@ pub struct PluginClient {
     writer: Writer,
     pending: Arc<Pending>,
     notices: NoticeStream,
+    /// The other end of the notice queue, so a binding that goes takes its records with it.
+    sink: NoticeSink,
     offered: tokio::sync::mpsc::Sender<Request>,
     offered_bytes: Arc<AtomicU64>,
     next_request: AtomicU64,
@@ -336,6 +338,7 @@ impl PluginClient {
         let writer: Writer = Arc::new(tokio::sync::Mutex::new(Some(writer)));
         let pending = Arc::new(Pending::default());
         let (sink, notices) = notices::channel();
+        let sink_for_client = sink.clone();
         let reader_task = tokio::spawn(read_frames(reader, Arc::clone(&pending), sink.clone()));
 
         // The handoff the terminal path uses: bounded, written by a task of its own, never waited
@@ -361,6 +364,7 @@ impl PluginClient {
             writer,
             pending,
             notices,
+            sink: sink_for_client,
             offered,
             offered_bytes,
             next_request: AtomicU64::new(1),
@@ -626,7 +630,12 @@ impl PluginClient {
             })
             .await?;
         match body {
-            ResponseBody::Unbound { existed } => Ok(existed),
+            ResponseBody::Unbound { existed } => {
+                // The binding has gone, so what this client's queue was holding for it has nothing
+                // left to catch, and the identifier's next incarnation starts clean.
+                self.sink.forget(binding_id.get());
+                Ok(existed)
+            }
             other => Err(protocol_error(&other)),
         }
     }
@@ -769,6 +778,15 @@ impl PluginClient {
                     self.pending.close();
                 }
                 drop(held);
+                // Closing takes the writer when nobody is holding it, and this caller was holding
+                // it: a closure that happened between the check above and the line after it found
+                // the lock taken and did nothing. Looking again now, with the lock free, is what
+                // leaves no order in which a writer outlives its connection.
+                if self.pending.is_closed()
+                    && let Ok(mut slot) = self.writer.try_lock()
+                {
+                    let _closed = slot.take();
+                }
                 written.map_err(|error| RuntimeError::ServiceUnavailable {
                     detail: error.to_string(),
                 })?;
@@ -894,6 +912,14 @@ async fn write_offered(
             let written = owned.write_message(&request).await;
             if written.is_ok() && !pending.is_closed() {
                 *held = Some(owned);
+            }
+            drop(held);
+            // The same look as the request path takes, for the same order: a closure while this
+            // task held the writer found the lock taken and left the writer where it was.
+            if pending.is_closed()
+                && let Ok(mut slot) = writer.try_lock()
+            {
+                let _closed = slot.take();
             }
             written
         })

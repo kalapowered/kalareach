@@ -193,9 +193,9 @@ record per binding, so a reader that stopped reading cannot be given a backlog o
 document is dropped whole: every piece of it that is waiting goes together, and the pieces of it that
 have not arrived yet are dropped as they arrive, whether they were dropped to make room or refused
 for want of it. Half a document would tell a reader it had a whole one. The queue remembers which
-documents went until their last piece has been accounted for, until their binding goes, or -- if a
-producer somehow made more of those records than the queue will keep -- until the oldest is made way
-for. A fault and a disabling are never dropped; if even those will not fit once every document has
+documents went until their last piece has been accounted for or until their binding goes. That
+record is counted rather than measured: past 256 unfinished ones the connection ends, because
+forgetting one would mean delivering the end of a document without its beginning. A fault and a disabling are never dropped; if even those will not fit once every document has
 gone, the connection is over, because a connection whose reliable news cannot be delivered is not one
 worth keeping open.
 
