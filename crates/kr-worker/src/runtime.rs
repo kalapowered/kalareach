@@ -630,9 +630,12 @@ impl SessionRuntime {
                 let lease_epoch = epoch.unwrap_or_default();
                 // A second fence, independent of the lease's. The lease says who may write; this
                 // says how long what they wrote stays admissible. A batch the session accepted a
-                // moment before its caller's grant ran out can wait here — for the terminal, for
-                // an application that is not reading — and the grant can end while it waits.
-                // Nothing written after the deadline reaches the application.
+                // moment before its caller's grant ran out can wait here, for the terminal and for
+                // an application that is not reading, and the grant can end while it waits. No
+                // piece of such a batch is offered to the terminal after the deadline. The one
+                // thing that still goes is the rest of a paste delimiter whose first bytes are
+                // already with the application: half a delimiter is what an abandoned batch can
+                // never leave behind, because the next actor's input would complete it.
                 let expired = |clock: &dyn kr_ipc::clock::SharedClock| {
                     authority_deadline.is_some_and(|deadline| clock.boot_elapsed_ms() >= deadline)
                 };

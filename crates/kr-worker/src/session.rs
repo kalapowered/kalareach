@@ -190,9 +190,9 @@ pub struct Session {
     terminal_gone: Arc<std::sync::atomic::AtomicBool>,
     /// When the authority behind the bytes the recogniser is still holding runs out.
     ///
-    /// A held delimiter prefix is queued later than the write that produced it — by its own
-    /// deadline, by the paste mode being turned off, or by the next write completing it — and it
-    /// is still that write's authority that admitted it. The tightest deadline of the writes whose
+    /// A held delimiter prefix is queued later than the write that produced it: by its own
+    /// deadline, by the paste mode being turned off, or by the next write completing it. It is
+    /// still that write's authority that admitted it. The tightest deadline of the writes whose
     /// bytes are in the prefix is what it carries, so a prefix that outlived the grant behind it
     /// is fenced with everything else that grant sent.
     held_input_deadline: Option<u64>,
@@ -427,6 +427,16 @@ impl Session {
     #[must_use]
     pub fn output_waiter(&self) -> Option<crate::pty::OutputWaiter> {
         self.pty.output_waiter()
+    }
+
+    /// Discards the framing the lease that is ending left behind.
+    ///
+    /// The held delimiter prefix goes with it, so the deadline that prefix was carrying goes too.
+    /// Leaving it would put an ended actor's authority on the next actor's first keystrokes: the
+    /// bytes it belonged to have been discarded, and the deadline is a fact about those bytes.
+    fn close_framing_for_takeover(&mut self) -> crate::input::TakeoverFraming {
+        self.held_input_deadline = None;
+        self.framer.close_for_takeover()
     }
 
     /// Ends the lease that was in force and returns what it left the writer holding.
@@ -747,7 +757,7 @@ impl Session {
         let ending_epoch = self.lease.epoch();
         let discarded_queue = self.lease.release_attachment(attachment_id);
         if held {
-            let framing = self.framer.close_for_takeover();
+            let framing = self.close_framing_for_takeover();
             let ended = self.end_lease();
             // The source of this input has gone, which is the loss section 8 asks to be reported.
             // The attachment that is leaving has no answer left to read it in, so it is carried to
@@ -960,7 +970,7 @@ impl Session {
 
         // An interrupted paste is closed before the new lease writes, so the application never
         // sees a paste finished under a different actor.
-        let framing = self.framer.close_for_takeover();
+        let framing = self.close_framing_for_takeover();
         // Read before the lease moves: it is the ending lease's answer, not the new one's.
         let ending_epoch = self.lease.epoch();
         let discarded_queue = self.lease.acquire(attachment_id, connection_id);
@@ -1013,7 +1023,7 @@ impl Session {
         // application into a bracketed paste that nothing was ever going to end, so the next
         // keystroke would arrive inside somebody else's paste. The writer supplies the terminator,
         // because it is the only thing that knows whether the application ever saw the start.
-        let framing = self.framer.close_for_takeover();
+        let framing = self.close_framing_for_takeover();
         // What this lease handed over and the writer has not written goes with it, counted on the
         // same boundary that stopped the writer from touching it. The answer to a release is the
         // lease state, which has nowhere to say it, so it is carried to whoever takes the keys next
@@ -1110,9 +1120,18 @@ impl Session {
                 authority_deadline_boot_ms: admitted,
             });
         }
-        // What is still held belongs to whichever authority ends first among the writes that put
-        // bytes there; nothing held means nothing to fence later.
-        self.held_input_deadline = (outcome.held > 0).then_some(admitted).flatten();
+        // What is still held is a suffix of the prefix that was held and the bytes this write
+        // added. Longer than this write means it still carries bytes an earlier one handed over,
+        // and then the earlier authority is part of it; no longer than this write means every
+        // byte in it is this write's, and an earlier deadline has nothing to do with it. Nothing
+        // held means nothing to fence later.
+        self.held_input_deadline = if outcome.held == 0 {
+            None
+        } else if outcome.held > bytes.len() {
+            admitted
+        } else {
+            authority_deadline_boot_ms
+        };
         // A paste that has just closed, or a frame that has just completed, opens the gate the
         // response lane was waiting on. An application that asked a question during one of those
         // and then sat still would otherwise wait for its answer until the next byte of output.
@@ -1354,7 +1373,7 @@ impl Session {
         }
         let ending_epoch = self.lease.epoch();
         let discarded_queue = self.lease.release_attachment(holder);
-        let framing = self.framer.close_for_takeover();
+        let framing = self.close_framing_for_takeover();
         let ended = self.end_lease();
         // What this lease lost is carried rather than dropped. Nobody asked for the release, so
         // there is no answer to put it in; the next acquire reports it with its own.
@@ -1709,7 +1728,7 @@ impl Session {
                 if let Some(holder) = self.lease.holder() {
                     self.lease.release_attachment(holder);
                 }
-                self.framer.close_for_takeover();
+                self.close_framing_for_takeover();
                 let _ = self.end_lease().left;
                 CloseAcceptance {
                     state: SessionState::Closing,

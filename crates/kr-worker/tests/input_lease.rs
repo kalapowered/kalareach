@@ -2045,3 +2045,143 @@ async fn a_batch_whose_authority_ran_out_while_it_waited_is_never_written() {
 
     runtime.close(ClosureReason::CloseRequested).1.release();
 }
+
+/// KR-REQ-08.62, KR-REQ-08.64, KR-REQ-09.20.
+///
+/// A held delimiter prefix carries the authority that admitted it. It is also the one thing a
+/// takeover discards outright, and what is discarded takes its deadline with it: leaving the
+/// deadline behind would put an ended actor's authority on the next actor's first keystrokes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_discarded_prefix_takes_its_authority_deadline_with_it() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(
+        &host,
+        "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec cat",
+    );
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let first = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let second = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let held = session
+        .acquire_input(first, connection(), None)
+        .expect("the keys");
+    let epoch = held.lease.epoch.get();
+
+    let clock = kr_ipc::clock::ManualSharedClock::new();
+    let runtime = Arc::new(
+        SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
+    );
+    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    let deadline = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock) + 1_000;
+
+    let next_epoch = {
+        let mut session = runtime.session();
+        // Four bytes of a paste delimiter, which the recogniser holds rather than forwards.
+        let accepted = session
+            .write_input(first, epoch, 0, b"\x1b[20", Some(deadline), Instant::now())
+            .expect("accepted");
+        assert_eq!(
+            accepted.held_prefix_bytes, 4,
+            "the recogniser is holding a partial delimiter"
+        );
+        runtime.flush_locked(&mut session);
+        // The next actor takes the lease, which discards that prefix.
+        let taken = session
+            .acquire_input(second, connection(), None)
+            .expect("the keys move");
+        runtime.flush_locked(&mut session);
+        taken.lease.epoch.get()
+    };
+
+    // The grant behind the discarded prefix runs out. It has nothing left to fence.
+    clock.advance(Duration::from_secs(5));
+    {
+        let mut session = runtime.session();
+        session
+            .write_input(second, next_epoch, 0, b"kr-next", None, Instant::now())
+            .expect("accepted");
+        runtime.flush_locked(&mut session);
+    }
+    let seen = retained_within(&runtime, b"kr-next", Duration::from_secs(10)).await;
+    assert!(
+        contains(&seen, b"kr-next"),
+        "the next holder's input is not fenced by a deadline the previous holder's prefix \
+         carried: {seen:?}"
+    );
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
+
+/// KR-REQ-08.64, KR-REQ-09.20.
+///
+/// A push can complete the prefix it was holding and start a new one out of its own bytes. The new
+/// prefix is that write's, so it carries that write's authority: the deadline of the write whose
+/// bytes have all been forwarded no longer applies to anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_prefix_made_only_of_the_newer_bytes_keeps_the_newer_deadline() {
+    let host = kr_ipc::testing::TempHost::create();
+    let config = configuration(
+        &host,
+        "stty raw -echo; printf '\\033[?2004hkr-ready.'; exec cat",
+    );
+    let session_id = config.session_id;
+    let mut session = Session::open(config).expect("opens");
+    session.launch().expect("launches");
+    let id = attach(&mut session, &terminal(session_id, Some("xterm-256color")));
+    let held = session
+        .acquire_input(id, connection(), None)
+        .expect("the keys");
+    let epoch = held.lease.epoch.get();
+
+    let clock = kr_ipc::clock::ManualSharedClock::new();
+    let runtime = Arc::new(
+        SessionRuntime::start(session, std::sync::Arc::new(clock.clone())).expect("starts"),
+    );
+    retained_within(&runtime, b"kr-ready.", Duration::from_secs(10)).await;
+    let now = kr_ipc::clock::SharedClock::boot_elapsed_ms(&clock);
+    let early = now + 1_000;
+    let late = now + 600_000;
+
+    {
+        let mut session = runtime.session();
+        let accepted = session
+            .write_input(id, epoch, 0, b"\x1b[20", Some(early), Instant::now())
+            .expect("accepted");
+        assert_eq!(accepted.held_prefix_bytes, 4);
+        // This write finishes that delimiter and starts a prefix of its own out of its last byte.
+        let accepted = session
+            .write_input(id, epoch, 1, b"0~\x1b", Some(late), Instant::now())
+            .expect("accepted");
+        assert_eq!(
+            (accepted.forwarded_bytes, accepted.held_prefix_bytes),
+            (6, 1),
+            "the delimiter goes and one byte of the next one is held"
+        );
+        runtime.flush_locked(&mut session);
+    }
+    retained_within(&runtime, PASTE_START, Duration::from_secs(10)).await;
+
+    // The first write's authority runs out. The byte still held is not its byte.
+    clock.advance(Duration::from_secs(5));
+    {
+        let mut session = runtime.session();
+        let released =
+            session.expire_paste_prefix(Instant::now() + std::time::Duration::from_secs(1));
+        assert_eq!(released, 1, "the held byte is released by its own deadline");
+        runtime.flush_locked(&mut session);
+    }
+    let seen = retained_within(
+        &runtime,
+        b"\x1b[200~\x1b",
+        std::time::Duration::from_secs(10),
+    )
+    .await;
+    assert!(
+        contains(&seen, b"\x1b[200~\x1b"),
+        "a prefix made of the second write's bytes is admitted by the second write's \
+         authority: {seen:?}"
+    );
+
+    runtime.close(ClosureReason::CloseRequested).1.release();
+}
