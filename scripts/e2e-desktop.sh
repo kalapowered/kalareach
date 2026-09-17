@@ -144,8 +144,14 @@ while [ "$(date +%s)" -lt "$daemon_deadline" ]; do
   fi
   sleep 0.2
 done
+# The question that settles it is the one below, so the clock is read after it: a daemon that
+# answered the last attempt at sixty-five seconds took sixty-five, not the sixty the loop allowed.
+answered=0
+if "$kr" doctor --json >"$run_root/evidence/doctor.json" 2>&1; then
+  answered=1
+fi
 daemon_waited=$(( $(date +%s) - daemon_started_at ))
-if ! "$kr" doctor --json >"$run_root/evidence/doctor.json" 2>&1; then
+if [ "$answered" -eq 0 ]; then
   fail "the control daemon did not start"
   echo "waited $daemon_waited seconds for it"
   echo "--- what the daemon printed ---"
