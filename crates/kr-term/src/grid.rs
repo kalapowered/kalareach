@@ -1542,9 +1542,11 @@ impl CanonicalGrid {
     /// The rows that are showing are read; the retained rows are counted. A retained row's content
     /// is the historical cache's to carry, and it is carried, charged where the row leaves the
     /// screen. What is left of a retained row is the slot it takes in the array its screen keeps,
-    /// and how many slots a screen has taken is a number the library already has. So this costs
-    /// what a screen costs however much history sits behind it, and a session printing steadily
-    /// can afford it on every read.
+    /// and how many slots a screen has taken is a number the library already has. So the cells this
+    /// reads are the cells of a screen however much history sits behind it, and a session printing
+    /// steadily can afford it on every read. The walk that finds the rows that are showing still
+    /// steps over the retained ones, one index comparison each, because the library offers no
+    /// borrow of one row of a screen that is right for both halves of the deque its rows sit in.
     #[must_use]
     pub fn screen_bytes(&self) -> ScreenBytes {
         let alternate = self.alternate_active();

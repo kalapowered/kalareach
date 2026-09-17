@@ -690,13 +690,13 @@ rendition and the character-set designations and leaves the rest of the modes wh
 what it clears is noted before the restore and put back afterwards, through the same sequences an
 application would have used.
 
-The historical-row bound is enforced rather than reported. The engine measures the retained rows
-periodically, and when they pass the bound it lowers the library's scrollback row count so older
-rows are evicted as new ones arrive. Measuring every retained row means walking the scrollback, so
-doing it on every read would cost more than the bound saves. A full measurement happens when the
-rows have grown, when the stream goes quiet, when something asks, and every 64 reads otherwise;
-between two of them the charge is what the rows that scrolled off cost, which is taken where they
-arrive.
+The historical-row bound is enforced rather than reported. What the retained rows cost is carried,
+charged where each row leaves the screen, and when the charge passes the bound the engine lowers the
+library's scrollback row count so older rows are evicted as new ones arrive. That happens after
+every grid mutation, so the bound is enforced where the rows arrive rather than at whichever read
+comes next: two rows can carry more than the whole of it. Reading every retained row's cells is a
+separate thing, needed for what the hyperlink objects cost, and it happens when the stream goes
+quiet, when something asks, and every 64 reads otherwise.
 
 Enforcing it needs the primary buffer to be the one showing, because the library drops the rows it
 is told to drop as it appends to them and it appends only to the buffer that is showing. Rows can
@@ -770,9 +770,9 @@ the charges of rows the library drops.
 One thing does read every retained row: what the hyperlink objects cost. An object is shared, so it
 has to be found wherever it sits and counted once, and a row that is not showing can be the only
 place one sits. That measurement is not proportional to the reads. It runs every sixty-fourth read,
-when a link would otherwise be refused, and when something asked for it; between two of them every
-link is reserved for where it arrives, so the figure the envelope is checked against is at or above
-the truth. A snapshot of the history reads retained rows too, when one is asked for.
+when the reserved figure says a link's whole charge would not fit, and when something asked for it;
+between two of them every link is reserved for where it arrives, so the figure the envelope is
+checked against is at or above the truth. A snapshot of the history reads retained rows too, when one is asked for.
 
 Nothing else on the read path reads a retained row's cells. What the session's screens hold is read
 from the rows that are showing; what their records cost is read from how many rows there are, which
@@ -1020,21 +1020,28 @@ keeps no file; continuous integration sets it and retains the directory.
 ### What a read costs
 
 A read is one lexical pass over its bytes, a policy decision for each event that pass produced, the
-grid work each event asks for, and a measurement of resident state. What each of those costs is
-bounded by the bytes of the read and by the geometry. None of it is proportional to the history
-behind the screen, to how many links the session has opened, or to how long it has been printing:
+grid work each event asks for, and a measurement of resident state. The cells a read reads are the
+cells of the bytes it carries and the cells of a screen, whatever the history behind that screen and
+however long the session has been printing. The exception is what the hyperlink objects cost, which
+has to be found wherever the objects sit and therefore reads every row of both buffers; that is
+taken on its own schedule rather than on every read, and it is the one part of a measurement that
+grows with the rows a session holds:
 
 * the lexical pass appends a run of printable bytes in one step rather than a byte at a time, and
   reuses the buffer it collects a sequence in rather than handing it over, so a sequence no longer
   than the room that buffer has already grown to costs no allocation to collect. A sequence longer
-  than the room there is still grows it once, and a sequence longer than the inline form still
-  allocates the copy the event carries;
-* the actions an event adapts to are handed to the grid library rather than copied to it on the
-  session's own path, and a parameter list is split into the shape the class table is written in
+  than that still grows the buffer, once for each time the room it has runs out, and a sequence
+  longer than the inline form still allocates the copy the event carries;
+* a run of text is drawn from the event's own bytes rather than from a copy of it, because the
+  profile's width model cuts the run where the library's cluster reducer would not and the copy an
+  adaptation would build is never read;
+* the actions any other event adapts to are handed to the grid library rather than copied to it on
+  the session's own path, and a parameter list is split into the shape the class table is written in
   without growing as it goes. `CanonicalGrid::apply` still returns the actions it applied, for a
   caller that wants them;
 * what the screens hold is read from the rows that are showing, what their records cost from how
-  many rows there are, and what the retained rows hold is carried;
+  many rows there are, and what the retained rows hold is carried. The walk that finds the rows that
+  are showing steps over the retained ones for an index comparison each and reads no cell of one;
 * what the hyperlink objects cost is the one figure that has to be found wherever the objects sit,
   because an object is shared and a row that is not showing can be the only place one sits. That is
   read every sixty-fourth read, before a link is charged that the reserved figure says would not
@@ -1045,8 +1052,8 @@ behind the screen, to how many links the session has opened, or to how long it h
 The figures below are what this engine measured on the hosts it has run on, in September 2026, each
 one the rate three passes sustained after a discarded warm-up. Neither stream is reliably the harder
 of the two: the one that scrolls pays for every row joining the historical cache, and the plain one
-spends most of what it is asked to do on clearing the screen, which writes the cells of as many rows
-as the erasure covers.
+spends most of what it is asked to do on clearing the screen, which writes the cells of every row
+the erasure covers that is not already empty.
 
 | Host | Plain stream | Stream that scrolls | Where it was measured |
 | --- | --- | --- | --- |
