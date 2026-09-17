@@ -20,8 +20,9 @@
 //! there is no desktop, the tool is not installed, the screen is locked, this is a container.
 //! What it cannot do is establish that a screen image can be taken or a keystroke delivered,
 //! because on every platform the operation itself is the check. Those records therefore say
-//! [`CapabilityState::NotTested`] and name what is missing, and an action that wants the answer
-//! performs its own operation and reports what happened.
+//! [`CapabilityState::NotTested`] and name what is missing: what establishes such a capability is
+//! the tool in the session performing the operation, under the permissions the operating system
+//! granted it.
 //!
 //! # What the display server changes
 //!
@@ -77,8 +78,9 @@ impl Answer {
 /// Builds the capability report for one desktop.
 ///
 /// The revision is the caller's: it advances when the evidence can have changed, which a new
-/// login, a changed profile and a changed permission all do. Every record carries it, and an
-/// action rechecks it rather than trusting a record it read earlier.
+/// login, a changed profile and a changed permission all do. Every record carries it, so a caller
+/// holding an earlier record can see that what it read has been superseded rather than taking a
+/// stale answer for a current one.
 #[must_use]
 pub fn report(
     environment_id: EnvironmentId,
@@ -105,7 +107,7 @@ pub fn report(
     let records = names
         .into_iter()
         .filter_map(|name| {
-            let answer = answer(name, &desktop);
+            let (answer, identity) = identified(name, answer(name, &desktop));
             let capability = CapabilityId::new(name).ok()?;
             Some(CapabilityRecord {
                 capability,
@@ -115,7 +117,7 @@ pub fn report(
                 state: answer.state,
                 evidence_source: answer.evidence,
                 identity: CapabilityIdentity {
-                    version: Nullable(facility_identity(answer.tool.as_ref())),
+                    version: Nullable(identity),
                     binary: Nullable(answer.tool),
                     package: Nullable::null(),
                     schema: Nullable::null(),
@@ -128,6 +130,44 @@ pub fn report(
         })
         .collect();
     DesktopCapabilityReport { desktop, records }
+}
+
+/// Returns an answer together with the identity of the facility it is about.
+///
+/// An answer about a facility this host cannot identify is not an answer. Section 11 requires the
+/// record to name the exact thing the evidence is about, so that replacing the facility
+/// invalidates it; a record that named a path and nothing else would go on describing whatever was
+/// put there. So a facility that cannot be identified turns the answer into a refusal that says
+/// so, and nothing is claimed about the capability.
+///
+/// A capability whose evidence does not turn on a binary identity has no file in it. The display
+/// server is the one of those: the answer is about the server itself, which the platform names,
+/// and there is no installed thing whose replacement could invalidate it.
+fn identified(capability: &str, answer: Answer) -> (Answer, Option<String>) {
+    if !invalidation(capability).contains(&CapabilityInvalidation::BinaryIdentity) {
+        return (answer, None);
+    }
+    let Some(tool) = answer.tool.as_deref() else {
+        return (answer, None);
+    };
+    match facility_identity(tool) {
+        Some(identity) => (answer, Some(identity)),
+        None => {
+            let reason = format!(
+                "this host could not identify {tool} within the work a diagnostic may do, so \
+                 nothing about this capability is established"
+            );
+            (
+                Answer {
+                    state: CapabilityState::TemporarilyUnavailable,
+                    evidence: CapabilityEvidenceSource::PlatformQuery,
+                    reason: Some(reason),
+                    tool: answer.tool,
+                },
+                None,
+            )
+        }
+    }
 }
 
 /// Returns what invalidates one capability's evidence.
@@ -600,17 +640,23 @@ fn runnable(path: &std::path::Path) -> bool {
 /// at the same path is a different file here even when it kept the path, the length and the
 /// timestamps.
 ///
-/// The file is read a block at a time, so the cost of identifying a large facility is its size in
-/// time and never in memory, and every facility gets a content identity rather than the largest
-/// ones getting a description of their metadata. A facility that cannot be read has no identity
-/// here, which is what an answer with nothing established about the file looks like.
+/// The work is bounded twice over. The file is read a block at a time, so identifying it costs one
+/// block of memory whatever its size, and at most [`MAX_IDENTIFIED`] bytes are read, so it costs a
+/// bounded amount of time as well. A file with more than that in it has no identity here, and
+/// neither has one that cannot be read: both are answered as the facility this host could not
+/// identify rather than as a facility described by its metadata, because a length and a timestamp
+/// are what an installer keeps.
+///
+/// The bound is on the work and not on the clock. A facility that was identified a moment ago and
+/// unidentifiable now, because the host was busy, would advance the capability revision without
+/// anything having changed.
 ///
 /// The digest is for noticing a change rather than for proving one: a capability record is
 /// evidence about what is feasible, never authority, and nothing here signs it.
-fn facility_identity(tool: Option<&String>) -> Option<String> {
+fn facility_identity(tool: &str) -> Option<String> {
     use std::io::Read as _;
 
-    let mut file = std::fs::File::open(tool?).ok()?;
+    let mut file = std::fs::File::open(tool).ok()?;
     let mut hasher = std::hash::DefaultHasher::new();
     let mut block = [0_u8; DIGEST_BLOCK];
     let mut digested: u64 = 0;
@@ -620,6 +666,9 @@ fn facility_identity(tool: Option<&String>) -> Option<String> {
             Ok(count) => {
                 std::hash::Hasher::write(&mut hasher, &block[..count]);
                 digested = digested.saturating_add(count as u64);
+                if digested > MAX_IDENTIFIED {
+                    return None;
+                }
             }
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
             Err(_) => return None,
@@ -633,6 +682,13 @@ fn facility_identity(tool: Option<&String>) -> Option<String> {
 
 /// How much of a facility is held in memory while it is being digested.
 const DIGEST_BLOCK: usize = 64 * 1024;
+
+/// The most of a facility this host reads to identify it.
+///
+/// Every facility in the table above is a few megabytes. Reading a bounded amount is what a
+/// diagnostic can afford; reading a file that keeps growing is not, and a host that spent
+/// unbounded time on a capability answer would be a host that stopped answering.
+const MAX_IDENTIFIED: u64 = 64 * 1024 * 1024;
 
 #[cfg(test)]
 mod tests {
@@ -695,18 +751,18 @@ mod tests {
                 !record.state.is_available(),
                 "{capability} was reported available on a desktop selection alone"
             );
-            // Which refusal this is depends on whether the platform's own facility is installed,
-            // which differs between hosts: a facility that is there leaves the operation itself
-            // unestablished, and one that is not is a missing installation. Neither of them is
-            // the capability being available on a desktop selection.
+            // Which refusal this is depends on whether the platform's own facility is installed
+            // and identifiable, which differs between hosts: a facility this host identified
+            // leaves the operation itself unestablished, and anything else is a refusal about the
+            // facility. Neither of them is the capability being available on a desktop selection.
             assert_eq!(
                 record.state == CapabilityState::NotTested,
-                record.identity.binary.is_present(),
+                record.identity.version.is_present(),
                 "{capability}: {record:?}"
             );
             assert_eq!(
                 record.evidence_source == CapabilityEvidenceSource::NotProbed,
-                record.identity.binary.is_present(),
+                record.identity.version.is_present(),
                 "{capability}: {record:?}"
             );
             assert!(
@@ -732,9 +788,61 @@ mod tests {
         );
         assert_eq!(
             launch.state.is_available(),
-            launch.identity.binary.is_present(),
-            "a launcher that was found is the whole of that answer"
+            launch.identity.version.is_present(),
+            "a launcher this host found and identified is the whole of that answer"
         );
+    }
+
+    #[test]
+    fn a_facility_this_host_cannot_identify_establishes_nothing() {
+        let asked = |tool: &str| {
+            identified(
+                capabilities::SCREEN_CAPTURE,
+                Answer {
+                    state: CapabilityState::NotTested,
+                    evidence: CapabilityEvidenceSource::NotProbed,
+                    reason: None,
+                    tool: Some(tool.to_owned()),
+                },
+            )
+        };
+
+        // A facility this host can read is identified by its contents.
+        let readable = std::env::current_exe().expect("this test is a file");
+        let (answer, identity) = asked(&readable.display().to_string());
+        assert_eq!(answer.state, CapabilityState::NotTested);
+        let identity = identity.expect("a facility this host read has an identity");
+        assert!(identity.contains("digest"), "{identity}");
+
+        // One it cannot read has no identity, and an answer about a facility with no identity
+        // would be an answer about whatever is at that path later.
+        let (answer, identity) = asked("/this/path/holds/no/facility");
+        assert_eq!(answer.state, CapabilityState::TemporarilyUnavailable);
+        assert!(identity.is_none());
+        assert!(
+            answer
+                .reason
+                .as_ref()
+                .is_some_and(|reason| reason.contains("could not identify")),
+            "{answer:?}"
+        );
+
+        // And one larger than this host reads to identify it is the same answer. The file is made
+        // by its length rather than by writing to it, so the test costs the reading and nothing
+        // else.
+        let large = std::env::temp_dir().join(format!(
+            "kalareach-facility-bound-{}-{}",
+            std::process::id(),
+            kr_ipc::now_ms().get()
+        ));
+        std::fs::File::create(&large)
+            .expect("a file")
+            .set_len(MAX_IDENTIFIED + 1)
+            .expect("a length");
+        let (answer, identity) = asked(&large.display().to_string());
+        let _ = std::fs::remove_file(&large);
+        assert_eq!(answer.state, CapabilityState::TemporarilyUnavailable);
+        assert!(identity.is_none(), "{identity:?}");
     }
 
     #[test]
