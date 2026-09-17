@@ -124,10 +124,13 @@ for entry in document.get("sessions", []):
 trap cleanup EXIT
 
 echo "starting the control daemon"
-"$run_root/bin/kr-controller" \
+# Started from the run's own root rather than from this checkout. A daemon's working directory is
+# what the workers it launches inherit, and a launched process that reaches the workspace volume
+# makes the operating system ask the person at the machine for permission.
+(cd "$run_root" && exec "$run_root/bin/kr-controller" \
   --runtime-dir "$run_root/r" \
   --state-dir "$run_root/s" \
-  --worker "$run_root/bin/kr-worker" \
+  --worker "$run_root/bin/kr-worker") \
   >"$run_root/evidence/controller.log" 2>&1 &
 started_pids+=("$!")
 # A minute of asking, because this is a real daemon on a real machine: it opens its registry,
@@ -186,7 +189,7 @@ print("" if document is None else document)
 
 echo
 echo "1. a session in the desktop execution context"
-"$kr" new --invisible --desktop --json >"$run_root/evidence/create-desktop.json"
+"$kr" new --invisible --desktop --cwd "$run_root" --json >"$run_root/evidence/create-desktop.json"
 desktop_display="$(read_json "$run_root/evidence/create-desktop.json" display_number)"
 require "$(read_json "$run_root/evidence/create-desktop.json" worker_profile)" \
   "desktop_bound" "the session runs in the desktop execution context"
@@ -227,7 +230,7 @@ cat >"$run_root/bin/session-shell.sh" <<SCRIPT
 exec "$run_root/bin/launch-gui.sh" "$run_root/evidence"
 SCRIPT
 chmod +x "$run_root/bin/session-shell.sh"
-"$kr" new --invisible --desktop --shell "$run_root/bin/session-shell.sh" --json \
+"$kr" new --invisible --desktop --cwd "$run_root" --shell "$run_root/bin/session-shell.sh" --json \
   >"$run_root/evidence/create-gui.json"
 gui_display="$(read_json "$run_root/evidence/create-gui.json" display_number)"
 for _ in $(seq 1 100); do
@@ -338,7 +341,7 @@ require "$(read_json "$run_root/evidence/power-restored.json" power.setting)" "o
 
 echo
 echo "5. an invisible session takes this host's own execution context"
-"$kr" new --invisible --json >"$run_root/evidence/create-default.json"
+"$kr" new --invisible --cwd "$run_root" --json >"$run_root/evidence/create-default.json"
 default_display="$(read_json "$run_root/evidence/create-default.json" display_number)"
 require "$(read_json "$run_root/evidence/create-default.json" worker_profile)" "desktop_bound" \
   "an invisible session on a desktop host is not an implicit headless one"
@@ -360,7 +363,7 @@ cat >"$run_root/bin/headless-shell.sh" <<SCRIPT
 exec cat
 SCRIPT
 chmod +x "$run_root/bin/headless-shell.sh"
-"$kr" new --invisible --headless --shell "$run_root/bin/headless-shell.sh" --json \
+"$kr" new --invisible --headless --cwd "$run_root" --shell "$run_root/bin/headless-shell.sh" --json \
   >"$run_root/evidence/create-headless.json"
 headless_display="$(read_json "$run_root/evidence/create-headless.json" display_number)"
 for _ in $(seq 1 100); do

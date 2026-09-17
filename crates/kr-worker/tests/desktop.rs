@@ -48,6 +48,21 @@ use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::session::{Session, SessionConfig};
 
+/// Moves this test process out of the checkout, once.
+///
+/// A worker is launched with the daemon's working directory, and here that daemon is this test
+/// process, whose own directory is the crate it was built from. The workspace can be on a
+/// removable volume, and a process a launcher starts is a new identity to the operating system, so
+/// one that holds a directory there makes the machine ask the person in front of it for permission
+/// and waits for the answer. The temporary directory is on the internal disk and outlives every
+/// test here, so it is what the process holds instead.
+fn start_outside_the_workspace() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_current_dir(std::env::temp_dir()).expect("a directory off the workspace");
+    });
+}
+
 /// A host tree on the internal disk, with the worker beside it.
 struct Host {
     temp: kr_ipc::testing::TempHost,
@@ -57,6 +72,7 @@ struct Host {
 
 impl Host {
     fn create() -> Self {
+        start_outside_the_workspace();
         let temp = kr_ipc::testing::TempHost::create();
         let environment_id = temp.environment_id();
         let worker = temp.root().join("kr-worker");
