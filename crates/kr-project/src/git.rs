@@ -1480,11 +1480,18 @@ pub fn redact(text: &str) -> String {
             _ => out.push_str(authority),
         }
         // A token travels in a query as often as in user information
-        // (`https://host/path?access_token=...`), and a fragment is no safer. The URL ends at
-        // whitespace or a quote, so everything from the first `?` or `#` to there goes too.
-        let ends_at = tail
-            .find([' ', '\t', '\n', '\r', '"', '\''])
-            .unwrap_or(tail.len());
+        // (`https://host/path?access_token=...`), and a fragment is no safer, so everything from
+        // the first `?` or `#` to the end of this URL goes too.
+        //
+        // Where this URL ends decides two things: what is removed with the query, and where the
+        // scan for the *next* URL starts. It is the earlier of whitespace or a quote, and the
+        // start of the next URL's own scheme, because a message can hold two URLs with nothing but a
+        // comma between them, and treating the second as part of the first's path would leave its
+        // credential in the message. What is deliberately *not* treated as an end is any
+        // character a query could contain: text after a query is removed with it, because a
+        // query's own terminator cannot be told from a token's content, and losing the tail of a
+        // diagnostic is the safe direction.
+        let ends_at = end_of_url(tail);
         let (url_tail, beyond) = tail.split_at(ends_at);
         match url_tail.find(['?', '#']) {
             Some(query) => {
@@ -1497,6 +1504,28 @@ pub fn redact(text: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+/// Returns where one URL ends inside the text that follows its authority.
+///
+/// The earlier of two things: whitespace or a quote, and the beginning of the next URL's scheme.
+/// A scheme is the run of scheme characters immediately before a `://`, so the second answer is
+/// that run's start rather than the `://` itself.
+fn end_of_url(tail: &str) -> usize {
+    let delimiter = tail
+        .find([' ', '\t', '\n', '\r', '"', '\''])
+        .unwrap_or(tail.len());
+    let next = tail.find("://").map_or(tail.len(), |marker| {
+        tail[..marker]
+            .rfind(|character: char| {
+                !(character.is_ascii_alphanumeric()
+                    || character == '+'
+                    || character == '-'
+                    || character == '.')
+            })
+            .map_or(0, |boundary| boundary + 1)
+    });
+    delimiter.min(next)
 }
 
 /// What a bounded read produced.
@@ -1665,6 +1694,30 @@ fn parse_version(reported: &str) -> Option<(u32, u32)> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_second_url_in_one_message_is_redacted_as_well_as_the_first() {
+        // The scan for the next URL starts where this one ends, and a message can hold two with
+        // nothing but a comma between them. Treating the second as part of the first's path would
+        // leave its credential in the message.
+        let redacted =
+            super::redact("url.https://a.invalid/p,https://user:VERYSECRET@b.invalid/x.insteadof");
+        assert!(
+            !redacted.contains("VERYSECRET"),
+            "the second URL's credential goes too: {redacted}"
+        );
+        assert!(
+            redacted.contains("a.invalid/p"),
+            "and the first URL is still legible: {redacted}"
+        );
+        // A query goes with everything after it, because a query's own terminator cannot be told
+        // from a token's content.
+        let redacted = super::redact("https://a.invalid/p?access_token=VERYSECRET");
+        assert!(!redacted.contains("VERYSECRET"), "{redacted}");
+        assert!(redacted.contains("<query removed>"), "{redacted}");
+        // Text that holds no URL is returned as it is.
+        assert_eq!(super::redact("no url here"), "no url here");
+    }
+
     use super::*;
 
     #[test]

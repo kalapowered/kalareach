@@ -90,11 +90,12 @@ pub struct Survey {
     pub preview: InclusionPreview,
     /// Every entry, with its inclusion decision.
     pub entries: Vec<SurveyEntry>,
-    /// The paths inside an included directory that this host does not carry: a symbolic link, a
-    /// socket, a device.
+    /// The paths the policy includes that are not file content: a symbolic link, a socket, a
+    /// device.
     ///
     /// Named rather than dropped. A creation reports each of them as unapplied, so a workspace
-    /// that does not hold something the policy asked for says which paths those are.
+    /// that does not hold something the policy asked for says which paths those are. A path whose
+    /// class the policy excludes is not here: the workspace was never going to hold it.
     pub unsupported: Vec<String>,
 }
 
@@ -281,7 +282,7 @@ pub fn survey(
     // copies the files rather than nothing.
     let mut budget = MAX_BINARY_SCAN_ENTRIES;
     let mut truncated = 0_u64;
-    let mut unsupported: Vec<String> = Vec::new();
+    let mut unsupported: Vec<(String, InclusionClass)> = Vec::new();
     let mut status: Vec<StatusEntry> = submodules
         .into_iter()
         .map(|path| StatusEntry {
@@ -412,8 +413,8 @@ pub fn survey(
     if !unsupported.is_empty() {
         limitations.push(format!(
             "{} paths inside an ignored directory are a symbolic link, a socket or a device \
-             rather than file content; this host carries file content, so each is reported as \
-             unapplied rather than copied",
+             rather than file content; this host carries file content, so each the policy \
+             includes is reported as unapplied rather than copied",
             unsupported.len()
         ));
     }
@@ -442,7 +443,15 @@ pub fn survey(
             taken_at_ms: request.at_ms,
         },
         entries,
-        unsupported,
+        // Only what the policy asked for. A path the workspace was never going to hold is not a
+        // path it failed to hold, and `unapplied` is the paths the policy included.
+        unsupported: unsupported
+            .into_iter()
+            .filter(|(_, class)| {
+                shared || matches!(request.policy.choice(*class), InclusionChoice::Include)
+            })
+            .map(|(path, _)| path)
+            .collect(),
     })
 }
 
@@ -454,8 +463,8 @@ struct Walk<'a> {
     budget: &'a mut usize,
     /// How many directories it could not walk to the end of.
     truncated: &'a mut u64,
-    /// The paths it found that are not file content.
-    unsupported: &'a mut Vec<String>,
+    /// The paths it found that are not file content, each with the class it was found under.
+    unsupported: &'a mut Vec<(String, InclusionClass)>,
 }
 
 /// How deep this preview walks into an ignored directory.
@@ -525,8 +534,16 @@ fn expand(
             }
             // A link, a socket or a device is not file content, and this host carries file
             // content. Each is named so a creation can report it as unapplied rather than leave
-            // the caller to notice it is missing.
-            _ => walk.unsupported.push(child),
+            // the caller to notice it is missing, and each costs one of the walk's paths so the
+            // list cannot outgrow the bound the preview advertises.
+            _ => {
+                if *walk.budget == 0 {
+                    *walk.truncated += 1;
+                    return;
+                }
+                *walk.budget -= 1;
+                walk.unsupported.push((child, class));
+            }
         }
     }
 }
@@ -745,6 +762,8 @@ pub enum PathOutcome {
     Removed,
     /// The workspace holds whatever the base had, because this host could not carry the user's.
     Unapplied,
+    /// A copy in progress that this host could not take away again, named so it is accounted for.
+    Leftover,
 }
 
 /// Returns the word one outcome is recorded under.
@@ -754,6 +773,7 @@ pub const fn outcome_text(outcome: PathOutcome) -> &'static str {
         PathOutcome::Carried => "carried",
         PathOutcome::Removed => "removed",
         PathOutcome::Unapplied => "unapplied",
+        PathOutcome::Leftover => "leftover",
     }
 }
 
@@ -806,7 +826,13 @@ pub fn copy_included(
         // Each path's outcome is reported as it settles, not at the end. A daemon that dies part
         // way through an inclusion leaves a record of which paths it had applied, which is what a
         // reader of an unfinished workspace needs and what recovery reports.
+        let left = report.leftover.len();
         let carried = copy_one(source, destination, &name, &mut report)?;
+        // A copy in progress this host could not take away again is journalled like any other
+        // path, so nothing it wrote is left unaccounted for.
+        for stray in &report.leftover[left..] {
+            progress(stray, PathOutcome::Leftover)?;
+        }
         if carried {
             report.copied.push(entry.path.clone());
             progress(&entry.path, PathOutcome::Carried)?;

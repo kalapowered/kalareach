@@ -48,6 +48,9 @@ use crate::operation::StagedWitness;
 /// The schema version this build reads.
 pub const SCHEMA_VERSION: i64 = 2;
 
+/// What an inclusion records for a path it has not reached yet.
+pub const PROGRESS_PLANNED: &str = "planned";
+
 /// The directory, under the environment's state directory, that the project service owns.
 pub const PROJECTS_DIRECTORY: &str = "projects";
 
@@ -510,12 +513,19 @@ impl Store {
     /// anyway: a staging directory an earlier build created has no recorded identity, and the
     /// cleanup leaves such a name alone rather than deleting whatever now holds it.
     fn add_missing_columns(&self) -> Result<()> {
+        // Every nullable column this build reads that some earlier shape of this schema did not
+        // have. The list is the whole of them rather than the ones added last: a store written by
+        // *any* earlier build has to be readable, and a column that is already there costs one
+        // `pragma_table_info` to find out.
         const ADDED: &[(&str, &str, &str)] = &[
             ("operations", "staging_device", "INTEGER"),
             ("operations", "staging_file_id", "INTEGER"),
+            ("operations", "staged_created_at_ms", "INTEGER"),
+            ("workspaces", "staging_name", "TEXT"),
             ("workspaces", "staging_device", "INTEGER"),
             ("workspaces", "staging_file_id", "INTEGER"),
             ("workspaces", "removal_action", "BLOB"),
+            ("workspaces", "detail", "TEXT"),
         ];
         for (table, column, kind) in ADDED {
             let present: i64 = self
@@ -1009,9 +1019,10 @@ impl Store {
                 |row| row.get(0),
             )
             .map_err(ProjectError::store)?;
-        // A call with no action identifier still excludes another: the reservation is held
-        // under a token of this host's own making.
-        let token = action.map_or_else(fresh_uuid, |action| action.action_id);
+        // The token is this host's own, always, and never the action identifier: two actors may
+        // submit the same identifier, and the claim above is what tells those two apart. A
+        // reservation is one call's hold on one workspace, so it is one identifier per call.
+        let token = fresh_uuid();
         if let Some(held) = held.as_deref().and_then(uuid_of)
             && held != token
         {
@@ -1121,6 +1132,39 @@ impl Store {
         if applied.is_empty() {
             return Ok(());
         }
+        self.write_progress(workspace_id, applied)
+    }
+
+    /// Records every path an inclusion is about to attempt, as `planned`.
+    ///
+    /// Written before the copy starts, in one transaction. What it buys is that a crash anywhere
+    /// in the copy leaves every path either resolved or `planned`: a path with no row at all
+    /// would be a path nothing accounts for, which is the thing a replacement daemon cannot
+    /// report.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::StoreUnavailable`] when the write fails.
+    pub fn plan_workspace_progress(
+        &mut self,
+        workspace_id: WorkspaceId,
+        paths: &[String],
+    ) -> Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let planned: Vec<(String, &'static str)> = paths
+            .iter()
+            .map(|path| (path.clone(), PROGRESS_PLANNED))
+            .collect();
+        self.write_progress(workspace_id, &planned)
+    }
+
+    fn write_progress(
+        &mut self,
+        workspace_id: WorkspaceId,
+        applied: &[(String, &'static str)],
+    ) -> Result<()> {
         let now = kr_ipc::now_ms();
         let transaction = self.transaction()?;
         for (path, outcome) in applied {
@@ -3032,6 +3076,68 @@ mod tests {
             .expect("the earlier shape is written");
         drop(earlier);
         let store = Store::open(&path, environment()).expect("this build opens it");
+        drop(store);
+        // And the shape before that one, which had neither of the workspace columns this build
+        // reads nor the staged instant: every earlier shape has to be readable, not only the last.
+        let earliest = directory.path().join("earliest.sqlite");
+        let first = Connection::open(&earliest).expect("the earliest store opens");
+        first
+            .execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL);
+                 INSERT INTO schema_version (version) VALUES (1);
+                 CREATE TABLE operations (
+                     action_id             BLOB PRIMARY KEY,
+                     actor_id              TEXT NOT NULL,
+                     environment_id        BLOB NOT NULL,
+                     project_repository_id BLOB NOT NULL,
+                     method                TEXT NOT NULL,
+                     state                 TEXT NOT NULL,
+                     remote_name           TEXT,
+                     remote_transport      TEXT,
+                     remote_url            TEXT,
+                     remote_provider       TEXT,
+                     remote_broker         TEXT,
+                     flow                  TEXT,
+                     destination_state     TEXT NOT NULL,
+                     parent_path           TEXT NOT NULL,
+                     destination_name      TEXT NOT NULL,
+                     staging_name          TEXT,
+                     staged_device         INTEGER,
+                     staged_file_id        INTEGER,
+                     detail                TEXT,
+                     started_at_ms         INTEGER NOT NULL,
+                     ended_at_ms           INTEGER
+                 );
+                 CREATE TABLE workspaces (
+                     workspace_id          BLOB PRIMARY KEY,
+                     project_repository_id BLOB NOT NULL,
+                     environment_id        BLOB NOT NULL,
+                     label                 TEXT NOT NULL,
+                     kind                  TEXT NOT NULL,
+                     isolation             TEXT,
+                     dirty_files           TEXT NOT NULL,
+                     untracked_files       TEXT NOT NULL,
+                     submodules            TEXT NOT NULL,
+                     binary_files          TEXT NOT NULL,
+                     generated_artefacts   TEXT NOT NULL,
+                     state                 TEXT NOT NULL,
+                     base_revision         TEXT NOT NULL,
+                     base_change_set_id    BLOB,
+                     tree_device           INTEGER,
+                     tree_file_id          INTEGER,
+                     display_path          TEXT NOT NULL,
+                     retention             TEXT,
+                     created_at_ms         INTEGER NOT NULL,
+                     removed_at_ms         INTEGER
+                 );",
+            )
+            .expect("the earliest shape is written");
+        drop(first);
+        let store = Store::open(&earliest, environment()).expect("this build opens that too");
+        assert!(store.operations_in(&[OperationState::Publishing]).is_ok());
+        assert!(store.workspaces(environment(), None).is_ok());
+        drop(store);
+        let store = Store::open(&path, environment()).expect("and the later shape again");
         // The columns a replacement daemon reads are there, and the version says so.
         assert!(store.operations_in(&[OperationState::Staging]).is_ok());
         assert!(store.workspaces(environment(), None).is_ok());

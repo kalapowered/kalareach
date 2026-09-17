@@ -371,16 +371,24 @@ impl ProjectService {
         {
             // What the inclusion had applied is journalled as it goes, so the reason says how far
             // it got rather than only that it stopped.
-            let applied = self.locked()?.workspace_progress(row.workspace_id)?.len();
+            let progress = self.locked()?.workspace_progress(row.workspace_id)?;
+            let carried = progress
+                .iter()
+                .filter(|(_, outcome)| outcome == "carried" || outcome == "removed")
+                .count();
+            let pending = progress
+                .iter()
+                .filter(|(_, outcome)| outcome == crate::store::PROGRESS_PLANNED)
+                .count();
             self.writable()?.set_workspace(
                 row.workspace_id,
                 WorkspaceState::RemovalPending,
                 &WorkspaceUpdate {
                     detail: Some(&format!(
                         "the daemon that was materialising this workspace ended before it \
-                         finished, after {applied} of its paths had been applied, so what is in \
-                         its directory is not what its creation asked for; the files are left \
-                         where they are and nothing new may hold it"
+                         finished, with {carried} of its paths carried in and {pending} not \
+                         reached, so what is in its directory is not what its creation asked \
+                         for; the files are left where they are and nothing new may hold it"
                     )),
                     ..WorkspaceUpdate::default()
                 },
@@ -561,10 +569,14 @@ impl ProjectService {
         {
             let store = self.writable()?;
             let workspace = self.summarise_workspace(&store, row)?;
+            // Everything the workspace does not hold as the policy asked: the paths the copy
+            // could not carry, the paths that were not file content, and a copy in progress
+            // nobody could take away. All of them are journalled as the inclusion goes, which is
+            // what makes this list the same list the original answer carried.
             let unapplied = store
                 .workspace_progress(row.workspace_id)?
                 .into_iter()
-                .filter(|(_, outcome)| outcome == "unapplied")
+                .filter(|(_, outcome)| outcome == "unapplied" || outcome == "leftover")
                 .map(|(path, _)| path)
                 .collect();
             let result = WorkspaceCreateResult {
@@ -669,10 +681,16 @@ impl ProjectService {
             // than allowed to undo it.
             if let Some(sibling) = staging {
                 let path = sibling.path().display().to_string();
-                let removed = sibling
-                    .remove_if(&destination, row.staging_identity)
-                    .map(|()| true)
-                    .unwrap_or_else(|_| !sibling.occupied(&destination));
+                // A name with no recorded identity beside it is not this host's to remove: the
+                // daemon died before it could say which object it had created. The path is
+                // recorded as one that is still there and a person decides.
+                let removed = match row.staging_identity {
+                    Some(expected) => sibling
+                        .remove_if(&destination, Some(expected))
+                        .map(|()| true)
+                        .unwrap_or_else(|_| !sibling.occupied(&destination)),
+                    None => false,
+                };
                 let _ = self
                     .writable()
                     .and_then(|mut store| store.record_staging_path(row.action_id, &path, removed));
@@ -808,10 +826,15 @@ impl ProjectService {
             // The identity checked here is the *sibling's* own, which the row recorded when the
             // directory was created. The published tree's identity is a different object: it is
             // what came out of the sibling.
-            let removed = sibling
-                .remove_if(destination, row.staging_identity)
-                .map(|()| true)
-                .unwrap_or_else(|_| !sibling.occupied(destination));
+            let removed = match row.staging_identity {
+                Some(expected) => sibling
+                    .remove_if(destination, Some(expected))
+                    .map(|()| true)
+                    .unwrap_or_else(|_| !sibling.occupied(destination)),
+                // No recorded identity, so nothing proves the directory at that name is this
+                // host's. The publication stands and the path is reported as still there.
+                None => false,
+            };
             let _ = self
                 .writable()
                 .and_then(|mut store| store.record_staging_path(row.action_id, &path, removed));
@@ -1289,7 +1312,12 @@ impl ProjectService {
                 .writable()
                 .and_then(|mut store| store.record_staging_path(row.action_id, &path, removed));
         }
-        let operation = self.read_operation(row.action_id)?;
+        // The completion is committed, so nothing after it may fail the operation. A read of the
+        // row that fails is answered from the row this call already holds rather than propagated
+        // into the error path, which would record a failure against a repository that exists.
+        let operation = self
+            .read_operation(row.action_id)
+            .unwrap_or_else(|_| self.operation_record(row, OperationState::Completed, None));
         Ok(CreationAnswer {
             project: summary,
             operation,
@@ -1699,13 +1727,39 @@ impl ProjectService {
                 //
                 // Each path's outcome is journalled as it settles, in batches, so a daemon that
                 // dies part way through leaves a record of what it had applied.
+                // Every path the inclusion is about to attempt is recorded as `planned` before
+                // the copy starts, so a crash anywhere in it leaves each path either resolved or
+                // planned rather than unaccounted for. The outcomes then replace those rows in
+                // batches.
+                let planned: Vec<String> = surveyed
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.included)
+                    .map(|entry| entry.path.clone())
+                    .collect();
+                self.writable()?
+                    .plan_workspace_progress(row.workspace_id, &planned)?;
+                // A path the survey found that is not file content (a link, a socket, a device)
+                // is one the workspace does not hold as the policy asked, so it is journalled
+                // with the rest before anything else happens.
+                self.writable()?.record_workspace_progress(
+                    row.workspace_id,
+                    &surveyed
+                        .unsupported
+                        .iter()
+                        .map(|path| (path.clone(), outcome_text(PathOutcome::Unapplied)))
+                        .collect::<Vec<(String, &'static str)>>(),
+                )?;
                 let mut batch: Vec<(String, &'static str)> = Vec::new();
                 let mut journalled = |path: &str, outcome: PathOutcome| -> Result<()> {
                     batch.push((path.to_owned(), outcome_text(outcome)));
                     if batch.len() >= PROGRESS_BATCH {
-                        let recorded = std::mem::take(&mut batch);
+                        // The batch is cleared only once its transaction has committed. A write
+                        // that fails leaves the outcomes in hand for the tail flush rather than
+                        // dropping them.
                         self.writable()?
-                            .record_workspace_progress(row.workspace_id, &recorded)?;
+                            .record_workspace_progress(row.workspace_id, &batch)?;
+                        batch.clear();
                     }
                     Ok(())
                 };
@@ -1794,33 +1848,37 @@ impl ProjectService {
             self.writable()?
                 .begin_removal(params.workspace_id, params.retention, action)?;
         let outcome = self.perform_removal(&reserved.row, params.retention);
-        match outcome {
-            Ok(removed) => {
-                // The reservation is given up whether or not the workspace reached its terminal
-                // state: what it excludes is a second removal running beside this one, not a
-                // second request after it.
-                self.writable()?
-                    .release_removal(params.workspace_id, reserved.token)?;
-                self.removal_answer(params.workspace_id, removed, action)
-            }
+        // The answer is built *inside* the reservation, so what it says about the tree and what it
+        // says about the workspace are one state rather than two readings with another removal
+        // between them. The reservation is then given up whatever happened: what it excludes is a
+        // second removal running beside this one, not a second request after it.
+        let answered = match outcome {
+            Ok(removed) => self.removal_answer(params.workspace_id, removed, action),
             Err(error) => {
                 let detail = error.to_string();
-                let mut store = self.writable()?;
-                store.set_workspace(
-                    params.workspace_id,
-                    WorkspaceState::RemovalPending,
-                    &WorkspaceUpdate {
-                        detail: Some(&detail),
-                        ..WorkspaceUpdate::default()
-                    },
-                )?;
-                store.release_removal(params.workspace_id, reserved.token)?;
-                if let Some(action) = action {
-                    store.settle(action, None, Some((error.code(), &detail)))?;
-                }
+                let recorded = self.writable().and_then(|mut store| {
+                    store.set_workspace(
+                        params.workspace_id,
+                        WorkspaceState::RemovalPending,
+                        &WorkspaceUpdate {
+                            detail: Some(&detail),
+                            ..WorkspaceUpdate::default()
+                        },
+                    )?;
+                    if let Some(action) = action {
+                        store.settle(action, None, Some((error.code(), &detail)))?;
+                    }
+                    Ok(())
+                });
+                // A journal that refuses the reason does not keep the reservation: the release
+                // below runs either way, and the caller is told about the original failure.
+                let _ = recorded;
                 Err(error)
             }
-        }
+        };
+        self.writable()?
+            .release_removal(params.workspace_id, reserved.token)?;
+        answered
     }
 
     /// Records what uncommitted work a workspace's own tree holds now.
@@ -1932,6 +1990,16 @@ impl ProjectService {
                 continue;
             };
             let Ok(directory) = opened.work_tree().subdirectory(&name) else {
+                // Only a plain absence is absence. A path this host could not open, or one that
+                // is not a directory at all, is a path it has not established anything about, so
+                // it counts as work it has not read.
+                let absent = matches!(
+                    std::fs::symlink_metadata(opened.top_level().join(&path)),
+                    Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
+                );
+                if !absent {
+                    populated.push(path);
+                }
                 continue;
             };
             let holds = directory
@@ -2079,7 +2147,14 @@ impl ProjectService {
                 ),
             });
         }
-        match parent.handle().remove_dir_all(name.as_str()) {
+        // What is inside goes through the tree's *own* open handle, so every one of those
+        // removals is of something reached from the directory whose identity was just checked
+        // rather than through a name that could be swapped underneath it. The name itself can only
+        // be removed through the parent, and an empty-directory removal refuses a directory that
+        // is not empty: a replacement holding anything is refused here rather than deleted.
+        crate::operation::clear_through(&here, &path)?;
+        drop(here);
+        match parent.handle().remove_dir(name.as_str()) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -2100,9 +2175,22 @@ impl ProjectService {
             None
         };
         if let Some(project) = repository {
-            let arguments: [&OsStr; 2] = [OsStr::new("worktree"), OsStr::new("prune")];
+            // A write to the user's own repository, so the configuration is read again first and
+            // the prune is skipped rather than run under one this host has not audited. Skipping
+            // it leaves a record naming a path that is gone, which `git worktree list` reports
+            // and a later prune clears; running Git under an unaudited configuration would be
+            // worse than that.
             let top = PathBuf::from(&project.display_path);
-            let _ = self.profile.run(&GitRequest::write(&top, &arguments));
+            if let Ok(opened) = OpenedRepository::open_recorded(
+                &self.profile,
+                self.environment_id,
+                &top,
+                project.identity,
+            ) && opened.recheck(&self.profile).is_ok()
+            {
+                let arguments: [&OsStr; 2] = [OsStr::new("worktree"), OsStr::new("prune")];
+                let _ = self.profile.run(&opened.write(&arguments));
+            }
         }
         Ok(())
     }

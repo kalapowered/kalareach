@@ -282,6 +282,12 @@ materialisation never recorded one is **refused** rather than removed. This host
 directory it cannot prove it created; the directory is left for a person to look at, and the reason
 is on the record.
 
+The deletion itself goes the way a staging sibling's does. The identity is checked through the open
+handle, the contents are removed *through that same handle* so that no name in the path can be
+swapped underneath them, and the name itself is taken away with an empty-directory removal, which
+refuses a directory that is not empty. A directory whose metadata this host could not read at all
+is not one it found absent, so it is not one it reports as gone either.
+
 ## The restricted Git execution profile
 
 Section 14 requires brokered Git reads to run through argument vectors **and** a restricted
@@ -474,7 +480,7 @@ reservation, which is a lock this daemon holds rather than a fact about the work
 | What an earlier daemon left | What a replacement does |
 | --- | --- |
 | An operation in `staging` or `publishing` | Reconciles it against the create token, as the table above says |
-| A staging sibling a row names, whose operation has ended | Removes it, when the object at that name is the one the row recorded. Nothing is removed because of its name alone: a repository a user called `.kr-project-something` is not this host's. The contents go through the sibling's own open handle and the name itself through an empty-directory removal, which refuses anything that was put there since |
+| A staging sibling a row names, whose operation has ended | Removes it, when the object at that name is the one the row recorded. Nothing is removed because of its name alone: a repository a user called `.kr-project-something` is not this host's, and a name with no recorded identity beside it is left for a person. The contents go through the sibling's own open handle and the name itself through an empty-directory removal, which refuses anything that was put there since |
 | A staging sibling a *workspace* row names | The same, whatever state the row is in: a workspace that reached `ready` while its cleanup failed keeps the name until one of these recoveries takes the directory away. The name is forgotten only once the directory is gone |
 | A workspace in `materialising` | Leaves every file in the directory alone and moves the row to `removal_pending` with the reason, including how many of the inclusion's paths had been applied. The files may be the user's, and this host does not know which of them it wrote; what it does know is that the workspace is not what its creation asked for, so nothing new may hold it and no read calls it ready |
 | A removal reservation | Releases it. The daemon that held it is gone, and leaving it would refuse every later removal of that workspace |

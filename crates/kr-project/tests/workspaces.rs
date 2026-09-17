@@ -1895,3 +1895,135 @@ fn a_staging_name_a_workspace_recorded_is_swept_only_while_it_holds_that_object(
         "the sibling whose identity the row holds is removed"
     );
 }
+
+#[test]
+fn an_inclusion_records_every_path_it_will_attempt_before_it_attempts_any() {
+    // A crash inside the first batch would otherwise leave paths this host had copied with no
+    // record at all. So every path the inclusion will attempt is written as `planned` first, and
+    // each outcome replaces its row: a path with no row is a path nothing accounts for.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "planned");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "planned".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: include_everything(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "planned-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 65)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    let mut statement = journal
+        .prepare("SELECT path, outcome FROM workspace_progress WHERE workspace_id = ?1")
+        .expect("the progress reads");
+    let rows: Vec<(String, String)> = statement
+        .query_map(
+            rusqlite::params![workspace_id.get().as_bytes().to_vec()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("the rows map")
+        .map(|row| row.expect("a row"))
+        .collect();
+    assert!(
+        !rows.is_empty(),
+        "an inclusion of a tree with uncommitted work journalled something"
+    );
+    assert!(
+        rows.iter().all(|(_, outcome)| outcome != "planned"),
+        "a finished inclusion leaves nothing unresolved: {rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .any(|(path, outcome)| path == "README.md" && outcome == "carried"),
+        "and says what became of each path: {rows:?}"
+    );
+    // Every path the copy carried is a path the creation reported, and nothing it could not carry
+    // is missing from `unapplied`.
+    let unapplied: Vec<&String> = rows
+        .iter()
+        .filter(|(_, outcome)| outcome == "unapplied" || outcome == "leftover")
+        .map(|(path, _)| path)
+        .collect();
+    for path in unapplied {
+        assert!(
+            created.unapplied.contains(path),
+            "{path} is journalled as unapplied and named in the reply: {:?}",
+            created.unapplied
+        );
+    }
+}
+
+#[test]
+fn a_staging_name_with_no_recorded_identity_is_never_removed() {
+    // A daemon can die after creating a staging sibling and before recording which object it
+    // created. A name alone is not authority to remove anything, so the sweep leaves it and a
+    // person decides.
+    let fixture = Fixture::create();
+    let project = adopted_with_changes(&fixture, "unproven-sibling");
+    let created = fixture
+        .service()
+        .workspace_create(
+            &actor(),
+            &WorkspaceCreateParams {
+                project_repository_id: project,
+                label: "unproven".to_owned(),
+                kind: WorkspaceKind::Isolated,
+                isolation: Nullable(Some(IsolationMechanism::GitWorktree)),
+                policy: InclusionPolicy::base_only(),
+                base_revision: Nullable(None),
+                base_change_set_id: Nullable(None),
+                destination: Nullable(Some(destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "unproven-sibling-tree",
+                ))),
+                preview_only: false,
+            },
+            Some(&action("workspace.create", 66)),
+        )
+        .expect("the workspace is created");
+    let workspace_id = created.workspace.0.expect("it exists").workspace_id;
+    let unproven = fixture.work().join(".kr-project-unproven");
+    std::fs::create_dir_all(unproven.join("tree")).expect("a sibling with no recorded identity");
+    let journal = rusqlite::Connection::open(
+        kr_project::ProjectService::root_of(&fixture.host().environment())
+            .join(kr_project::store::STORE_FILE_NAME),
+    )
+    .expect("the journal opens");
+    journal
+        .execute(
+            "UPDATE workspaces SET staging_name = ?2, staging_device = NULL,
+                    staging_file_id = NULL
+              WHERE workspace_id = ?1",
+            rusqlite::params![
+                workspace_id.get().as_bytes().to_vec(),
+                ".kr-project-unproven",
+            ],
+        )
+        .expect("the name is recorded and the identity is not");
+    drop(journal);
+    let replacement = fixture.reopen();
+    replacement.recover().expect("recovery runs");
+    assert!(
+        unproven.join("tree").is_dir(),
+        "a name with no identity beside it is not this host's to remove"
+    );
+}

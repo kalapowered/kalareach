@@ -14212,7 +14212,7 @@
     },
     "WorkspaceCreateParams": {
       "additionalProperties": false,
-      "description": "Parameters of `workspace.preview`, which is a read `workspace.create` shares its shape with.\n\nThis is not a method of its own: `workspace.create` carries the same fields and the daemon\nanswers the preview from the create parameters when `preview_only` is set. One shape means a\nuser cannot be shown a preview of a different policy from the one that is then created.",
+      "description": "Parameters of `workspace.preview`, which is a read `workspace.create` shares its shape with.\n\nThis is not a method of its own: `workspace.create` carries the same fields and the daemon\nanswers the preview from the create parameters when `preview_only` is set. One shape is a\nconvenience rather than a binding: a preview and a creation are two independent requests, and\na creation returns the preview it was created under, which is what a client shows.",
       "properties": {
         "base_change_set_id": {
           "anyOf": [
@@ -14449,7 +14449,7 @@
           "type": "array"
         },
         "working_files_removed": {
-          "description": "True when this workspace's own working files are gone.\n\nAlways false for a shared workspace: that tree is the user's own, and removing the selection\nremoves no file. For an isolated one it means the tree is not there any more, whether this\ncall removed it or found it already gone.",
+          "description": "True when this workspace's own working files are gone.\n\nRead from the filesystem rather than from what the removal did: the tree is not there any\nmore, whether this call removed it, an earlier one did, or the user did. A removal never\ntouches a *shared* workspace's tree, because that tree is the user's own, so this is\nordinarily false for one; it says false whenever the host could not establish that the\ndirectory is absent.",
           "type": "boolean"
         },
         "workspace": {

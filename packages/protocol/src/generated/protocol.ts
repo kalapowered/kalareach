@@ -10073,8 +10073,9 @@ export interface ProtocolVersion5 {
  * Parameters of `workspace.preview`, which is a read `workspace.create` shares its shape with.
  *
  * This is not a method of its own: `workspace.create` carries the same fields and the daemon
- * answers the preview from the create parameters when `preview_only` is set. One shape means a
- * user cannot be shown a preview of a different policy from the one that is then created.
+ * answers the preview from the create parameters when `preview_only` is set. One shape is a
+ * convenience rather than a binding: a preview and a creation are two independent requests, and
+ * a creation returns the preview it was created under, which is what a client shows.
  */
 export interface WorkspaceCreateParams {
   /**
@@ -10386,9 +10387,11 @@ export interface WorkspaceRemoveResult {
   /**
    * True when this workspace's own working files are gone.
    *
-   * Always false for a shared workspace: that tree is the user's own, and removing the selection
-   * removes no file. For an isolated one it means the tree is not there any more, whether this
-   * call removed it or found it already gone.
+   * Read from the filesystem rather than from what the removal did: the tree is not there any
+   * more, whether this call removed it, an earlier one did, or the user did. A removal never
+   * touches a *shared* workspace's tree, because that tree is the user's own, so this is
+   * ordinarily false for one; it says false whenever the host could not establish that the
+   * directory is absent.
    */
   working_files_removed: boolean
   workspace: WorkspaceSummary2

@@ -350,11 +350,17 @@ impl StagingSibling {
     /// filesystem rather than about whether this call did the removing.
     #[must_use]
     pub fn occupied(&self, destination: &Destination) -> bool {
-        destination
-            .parent
-            .handle()
-            .symlink_metadata(self.name.as_str())
-            .is_ok()
+        // Only a plain absence is absence. A metadata call that fails for any other reason says
+        // nothing about what is at the name, and the caller uses this to decide whether a
+        // directory is gone: answering "gone" from a failure would forget a directory that is
+        // still there.
+        !matches!(
+            destination
+                .parent
+                .handle()
+                .symlink_metadata(self.name.as_str()),
+            Err(ref failure) if failure.kind() == std::io::ErrorKind::NotFound
+        )
     }
 
     /// Removes the sibling only when it is still the object whose identity was recorded.
@@ -407,32 +413,48 @@ impl StagingSibling {
 
     /// Removes everything inside the sibling, through the sibling's own handle.
     fn clear(&self) -> Result<()> {
-        let entries = match self.directory.handle().entries() {
+        clear_through(&self.directory, &self.path)
+    }
+}
+
+/// Removes everything inside one directory, through that directory's own handle.
+///
+/// Every removal is of something reached from the open handle rather than through a name that
+/// could be swapped underneath it. What this does *not* do is remove the directory itself: the
+/// name can only be removed through the parent, and the caller does that with an empty-directory
+/// removal so that a replacement holding anything is refused rather than deleted.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::Destination`] when an entry cannot be read or removed.
+pub fn clear_through(directory: &AuthorisedDirectory, path: &Path) -> Result<()> {
+    {
+        let entries = match directory.handle().entries() {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => {
                 return Err(ProjectError::Destination {
-                    detail: format!("{} could not be read: {error}", self.path.display()),
+                    detail: format!("{} could not be read: {error}", path.display()),
                 });
             }
         };
         for entry in entries {
             let entry = entry.map_err(|error| ProjectError::Destination {
-                detail: format!("{} could not be read: {error}", self.path.display()),
+                detail: format!("{} could not be read: {error}", path.display()),
             })?;
             let name = entry.file_name();
-            let directory = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
-            let outcome = if directory {
-                self.directory.handle().remove_dir_all(&name)
+            let below = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+            let outcome = if below {
+                directory.handle().remove_dir_all(&name)
             } else {
-                self.directory.handle().remove_file(&name)
+                directory.handle().remove_file(&name)
             };
             match outcome {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => {
                     return Err(ProjectError::Destination {
-                        detail: format!("{} could not be emptied: {error}", self.path.display()),
+                        detail: format!("{} could not be emptied: {error}", path.display()),
                     });
                 }
             }
