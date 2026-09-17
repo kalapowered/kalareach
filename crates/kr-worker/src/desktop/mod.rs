@@ -16,7 +16,10 @@
 //! The generation is the part that makes the identity survive contact with reality. Linux and
 //! Windows both reuse a login-session number, so the number alone would say a session created in
 //! one login belongs to the next. [`platform`] takes the generation from the process that owns the
-//! login session, whose kernel start value is different for every login.
+//! login session, and how much that distinguishes is the platform's own business: on macOS and
+//! Linux that process is created with the login and dies with it, and on Windows the logon process
+//! owns the interactive session, which this host reads without establishing that a new one is
+//! started for each sign-in.
 //!
 //! [`DesktopContext::desktop_session_id`] is the derived *name* of that whole context. Equality is
 //! decided by the record's fields, never by the name: a host whose boot identity is too long to
@@ -495,39 +498,61 @@ pub fn describes(live: &Login, recorded: &DesktopBinding) -> Option<bool> {
 /// carried on would otherwise be recorded as having lost a desktop that is still there.
 ///
 /// The recorded name carries the platform's own session identifier, the generation and the boot, so
-/// the platform can be asked about that session by name. A record that names no session has nothing
-/// to ask about, and a platform that will not answer leaves the question open.
+/// the platform can be asked about that session by name. A record whose name this host cannot read
+/// as one of its own has nothing to ask about, and a platform that will not answer leaves the
+/// question open.
 #[must_use]
 pub fn recorded_presence(recorded: &DesktopBinding) -> Presence {
     let Some(name) = recorded.desktop_session_id.as_ref() else {
         return Presence::Unknown;
     };
-    let name = name.as_str();
+    let Some(parts) = parts(name.as_str()) else {
+        return Presence::Unknown;
+    };
     // A reboot ends every login session there was, and the boot is part of the name.
-    if let (Some(recorded_boot), Ok(boot)) =
-        (field(name, "boot"), kr_ipc::identity::boot_identity())
-        && recorded_boot != hex(boot.value.as_slice())
+    if let Ok(boot) = kr_ipc::identity::boot_identity()
+        && parts.boot != hex(boot.value.as_slice())
     {
         return Presence::Ended;
     }
-    let Some(session) = field(name, "session") else {
-        return Presence::Unknown;
-    };
     let generation = recorded
         .login_generation
         .as_ref()
         .map(|generation| generation.get())
-        .or_else(|| field(name, "generation").and_then(|value| value.parse().ok()));
-    platform::named_presence(session, generation, kr_ipc::paths::current_uid())
+        .or(parts.generation);
+    platform::named_presence(parts.session, generation, kr_ipc::paths::current_uid())
 }
 
-/// Returns one named part of a desktop identity.
+/// The structural parts of a desktop identity's name.
+struct Parts<'a> {
+    /// The platform's own login-session identifier.
+    session: &'a str,
+    /// The login-session generation, where it is a number this build can read.
+    generation: Option<u64>,
+    /// The boot the name was derived in.
+    boot: &'a str,
+}
+
+/// Reads the structural parts of a desktop identity's name.
 ///
-/// The name is built here, from parts joined with colons, so it is read here the same way. A part
-/// this build does not find is absent rather than guessed at.
-fn field<'a>(name: &'a str, key: &str) -> Option<&'a str> {
-    name.split(':')
-        .find_map(|part| part.strip_prefix(key)?.strip_prefix('='))
+/// The name is `<kind>:user=<user>:uid=<uid>:session=<session>:generation=<generation>:boot=<boot>`,
+/// and only the last four fields are read, in that order, counting from the end. The user's own
+/// name is free text that the operating system supplies, so it can contain the separators this
+/// format uses; a reader that searched for the first field with the right prefix would find a part
+/// of the user's name instead of the host's own value, and answer about a desktop that was never
+/// recorded. A name whose trailing fields are not these four, in this order, is not one this build
+/// derived and is read as nothing rather than in part.
+fn parts(name: &str) -> Option<Parts<'_>> {
+    let mut fields = name.rsplit(':');
+    let boot = fields.next()?.strip_prefix("boot=")?;
+    let generation = fields.next()?.strip_prefix("generation=")?;
+    let session = fields.next()?.strip_prefix("session=")?;
+    fields.next()?.strip_prefix("uid=")?;
+    Some(Parts {
+        session,
+        generation: generation.parse().ok(),
+        boot,
+    })
 }
 
 /// Returns the binding one live reading would be recorded as.
@@ -582,6 +607,46 @@ mod tests {
         assert!(text.contains("session=100019"), "{text}");
         assert!(text.contains("generation=42"), "{text}");
         assert!(text.contains("boot=abcd"), "{text}");
+    }
+
+    #[test]
+    fn a_name_is_read_from_its_own_fields_and_not_from_the_user_s_name() {
+        let name = derive_name(
+            &login("100019", Some(42)),
+            501,
+            "someone",
+            &boot(&[0xab, 0xcd]),
+        )
+        .expect("a desktop has a name");
+        let read = parts(name.as_str()).expect("the name this build derived is readable");
+        assert_eq!(read.session, "100019");
+        assert_eq!(read.generation, Some(42));
+        assert_eq!(read.boot, "abcd");
+
+        // The operating system supplies the user's own name, and it can contain the separators
+        // this format uses. The host's own fields are the last four, so that is where they are
+        // read from: a reader that took the first field with the right prefix would answer about
+        // a boot and a session that were never recorded.
+        let awkward = derive_name(
+            &login("100019", Some(42)),
+            501,
+            "someone:boot=00:session=7:generation=1",
+            &boot(&[0xab, 0xcd]),
+        )
+        .expect("a name");
+        let read = parts(awkward.as_str()).expect("readable");
+        assert_eq!(read.session, "100019", "{awkward}");
+        assert_eq!(read.generation, Some(42), "{awkward}");
+        assert_eq!(read.boot, "abcd", "{awkward}");
+
+        assert!(
+            parts("not a name this build derived").is_none(),
+            "a name without these fields is read as nothing rather than in part"
+        );
+        assert!(
+            parts("macos_security_session:user=someone:session=2:generation=1:boot=ab").is_none(),
+            "and so is one whose fields are not in this order"
+        );
     }
 
     #[test]

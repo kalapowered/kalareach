@@ -579,7 +579,11 @@ mod implementation {
     /// The session number is what matters and the account name is not enough: the same account
     /// signs in to different sessions over a remote desktop connection and through user
     /// switching, and a worker belongs to exactly one of them. The session's own logon process
-    /// anchors the generation, so a reused session number after a sign-out is a different desktop.
+    /// anchors the generation, which tells a session number reused by a later session apart from
+    /// this one. It is a weaker generation than the other two platforms give: this host reads the
+    /// logon process that owns the session, and does not establish that one is started for each
+    /// authenticated sign-in, so a sign-out and a sign-in that kept both the session number and
+    /// its logon process would read as the same desktop.
     pub(super) fn read_login(_uid: u32) -> Reading {
         let session = match own_session() {
             Ok(Some(session)) => session,
