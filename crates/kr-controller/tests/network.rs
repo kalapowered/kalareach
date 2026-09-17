@@ -1957,3 +1957,117 @@ async fn a_listing_names_only_the_sessions_a_grant_admits() {
     close_session(&mut local, &host, session_id).await;
     daemon.stop().await;
 }
+
+/// KR-REQ-23.25, KR-REQ-23.34, KR-REQ-23.48.
+///
+/// One answer, two doors. What the host does to a method's result before it leaves belongs to the
+/// method, not to the ingress the request arrived on: the grant decides what a device may ask
+/// about, and once it has admitted the subject the device is given the answer the owner's own
+/// socket is given. A second filter on one path and not the other would make the two ingresses
+/// disagree about what the same method means.
+// Ignored by default: this suite starts real processes, and the binary it launches is built by
+// `scripts/end-to-end.sh`, which runs it with `--include-ignored`. A suite that skipped itself
+// silently when that binary was absent would report a pass for something it never ran.
+#[ignore = "launches a worker process; run through scripts/end-to-end.sh"]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_same_method_answers_both_ingresses_alike_once_the_grant_admits_the_subject() {
+    let Some(host) = Host::create() else {
+        return;
+    };
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let daemon = host.start(loopback(), &owner).await;
+    let mut local = host.client().await;
+    let created = create(&mut local, &host).await;
+    let session_id = created.session.session_id;
+
+    // A grant whose selector admits every session, so nothing is narrowed away and any difference
+    // between the two answers is a difference the ingress made.
+    let device = Device::create(&loopback()).await;
+    let record = pair_with(
+        &daemon,
+        &device,
+        &owner,
+        viewer_proposal(SessionSelector::Any),
+    )
+    .await;
+    let session = connect(&daemon, &device, &record).await;
+
+    let locally: kr_protocol::hostinfo::HostInfoResult = local
+        .request(Method::HostInfo, &())
+        .await
+        .expect("the call reaches the daemon")
+        .expect("host.info succeeds")
+        .to_typed()
+        .expect("decodes");
+    let remotely: kr_protocol::hostinfo::HostInfoResult = session
+        .read(Method::HostInfo, &())
+        .await
+        .expect("host.info is served to the device");
+    assert_eq!(
+        locally, remotely,
+        "host.info is the same answer on both ingresses"
+    );
+
+    let locally: kr_protocol::hostinfo::EnvironmentListResult = local
+        .request(Method::EnvironmentList, &())
+        .await
+        .expect("the call reaches the daemon")
+        .expect("environment.list succeeds")
+        .to_typed()
+        .expect("decodes");
+    let remotely: kr_protocol::hostinfo::EnvironmentListResult = session
+        .read(Method::EnvironmentList, &())
+        .await
+        .expect("environment.list is served to the device");
+    assert_eq!(
+        locally, remotely,
+        "environment.list is the same answer on both ingresses"
+    );
+
+    let locally: SessionReadResult = local
+        .request(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect("the call reaches the daemon")
+        .expect("session.read succeeds")
+        .to_typed()
+        .expect("decodes");
+    let remotely: SessionReadResult = session
+        .read(Method::SessionRead, &SessionReadParams { session_id })
+        .await
+        .expect("session.read is served to the device");
+    assert_eq!(
+        locally, remotely,
+        "a session the grant admits reads the same on both ingresses"
+    );
+
+    let parameters = kr_protocol::session::SessionListParams {
+        environment_id: Nullable::null(),
+        include_closed: true,
+    };
+    let locally: kr_protocol::session::SessionListResult = local
+        .request(Method::SessionList, &parameters)
+        .await
+        .expect("the call reaches the daemon")
+        .expect("session.list succeeds")
+        .to_typed()
+        .expect("decodes");
+    let remotely: kr_protocol::session::SessionListResult = session
+        .read(Method::SessionList, &parameters)
+        .await
+        .expect("session.list is served to the device");
+    assert_eq!(
+        locally, remotely,
+        "a listing a selector admits whole is the same listing on both ingresses"
+    );
+    assert!(
+        locally
+            .sessions
+            .iter()
+            .any(|summary| summary.session_id == session_id),
+        "and it is the listing that names this session, not an empty one"
+    );
+
+    session.close();
+    close_session(&mut local, &host, session_id).await;
+    daemon.stop().await;
+}
