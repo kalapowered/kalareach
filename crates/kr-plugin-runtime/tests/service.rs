@@ -16,7 +16,9 @@ use kr_plugin_runtime::runtime::queue::Admission;
 use kr_plugin_runtime::service::client::{PluginClient, new_binding_id};
 use kr_plugin_runtime::service::host::{HostConfig, PluginHost};
 use kr_plugin_runtime::service::launcher::{HostIdentity, host_endpoint};
-use kr_plugin_runtime::service::protocol::{ComponentSource, HostDescriptor, Notice, PROTOCOL};
+use kr_plugin_runtime::service::protocol::{
+    ComponentSource, Frame, HostDescriptor, Notice, PROTOCOL, RequestBody, ResponseBody,
+};
 use kr_plugin_sdk::digest::PayloadDigest;
 
 /// A plugin host serving in this process, with a client connected to it.
@@ -100,6 +102,39 @@ impl Drop for Served {
     fn drop(&mut self) {
         self.serving.abort();
     }
+}
+
+/// Collects the nodes of the next document one binding's `call` produced.
+///
+/// Documents arrive as notices and a component draws one whenever it has something to say, so a
+/// test that wanted one export's document had to be able to say which. Anything else that arrives
+/// while it waits is returned to the caller's attention by being asserted on: a fault here would be
+/// a test passing for the wrong reason.
+async fn documents_until(
+    client: &mut PluginClient,
+    binding_id: kr_plugin_runtime::runtime::binding::BindingId,
+    call: &str,
+) -> Option<Vec<kr_plugin_runtime::service::protocol::WireNode>> {
+    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        match tokio::time::timeout(core::time::Duration::from_millis(200), client.notice()).await {
+            Ok(Some(Notice::Document {
+                binding_id: bound,
+                call: drew,
+                nodes,
+            })) => {
+                assert_eq!(bound, binding_id.get());
+                if drew == call {
+                    return Some(nodes);
+                }
+            }
+            Ok(Some(other @ (Notice::Fault { .. } | Notice::Disabled { .. }))) => {
+                panic!("the binding produced {other:?}")
+            }
+            Ok(Some(Notice::Gap { .. })) | Ok(None) | Err(_) => {}
+        }
+    }
+    None
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -189,37 +224,34 @@ async fn kr_req_06_06_a_worker_registers_delivers_and_calls_over_the_protocol() 
         .expect("the event is offered");
     assert_eq!(admission, Admission::Queued);
 
-    // The document arrives as a notice, stamped with the binding it belongs to.
-    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
-    let mut document = None;
-    while std::time::Instant::now() < deadline && document.is_none() {
-        match tokio::time::timeout(core::time::Duration::from_millis(200), client.notice()).await {
-            Ok(Some(Notice::Document {
-                binding_id: bound,
-                call,
-                nodes,
-            })) => {
-                assert_eq!(bound, binding_id.get());
-                assert_eq!(call, "observe");
-                document = Some(nodes);
-            }
-            Ok(Some(other)) => panic!("the binding produced {other:?}"),
-            Ok(None) | Err(_) => {}
-        }
-    }
-    let nodes = document.expect("the observation produced a document");
+    // Documents arrive as notices, stamped with the binding they belong to. Two of them: what
+    // `bind` drew when the binding was registered, and what the observation drew. Both are the
+    // component's presentation and neither is discarded.
+    let bound = documents_until(&mut client, binding_id, "bind")
+        .await
+        .expect("bind drew a document");
+    assert!(!bound.is_empty());
+    let observed = documents_until(&mut client, binding_id, "observe")
+        .await
+        .expect("the observation produced a document");
     assert!(
-        nodes.iter().any(|node| node.body_json.contains("building")),
+        observed
+            .iter()
+            .any(|node| node.body_json.contains("building")),
         "the document did not carry the observation"
     );
 
-    // A call returns the component's answer and the nodes it emitted.
+    // A call returns the component's answer. The nodes it drew travel as notices of their own,
+    // because one call may draw more than one frame carries.
     let called = client
         .snapshot(binding_id, core::time::Duration::from_millis(500))
         .await
         .expect("the snapshot runs");
     assert!(called.answered());
-    assert!(!called.nodes.is_empty());
+    let drawn = documents_until(&mut client, binding_id, "snapshot")
+        .await
+        .expect("the snapshot drew a document");
+    assert!(!drawn.is_empty());
 
     // Checkpoint and restore round-trip the component's own state.
     let checkpointed = client
@@ -440,4 +472,252 @@ async fn kr_req_11_38_a_worker_is_told_when_the_queue_overflowed() {
         gapped,
         "the worker was never told the observation queue overflowed"
     );
+}
+
+// KR-REQ-05.07: a binding belongs to the connection that registered it, and to nothing else.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_binding_belongs_to_the_connection_that_registered_it() {
+    let Some(wasm) = components::well_behaved() else {
+        return;
+    };
+    let served = Served::start().await;
+    let first = served.client().await;
+    let second = served.client().await;
+    let (path, digest, bytes) = served.install("well-behaved", &wasm);
+    let request = components::request("well-behaved", 6);
+    first
+        .register(
+            request.binding_id,
+            &request.identity,
+            &request.facts,
+            &request.executable,
+            &ComponentSource {
+                path: path.clone(),
+                digest,
+                bytes,
+            },
+        )
+        .await
+        .expect("the binding registers");
+
+    // The identifier is not a capability. Another connection that has it finds no binding, which
+    // is the same answer it would get for one nobody ever registered.
+    let error = second
+        .snapshot(request.binding_id, core::time::Duration::from_millis(500))
+        .await
+        .expect_err("another connection cannot call this binding");
+    assert!(
+        error.to_string().contains("no binding"),
+        "the refusal was {error}"
+    );
+    assert!(
+        !second
+            .unbind(request.binding_id)
+            .await
+            .expect("the unbind runs"),
+        "another connection removed a binding that was not its own"
+    );
+
+    // And the owner still has it.
+    let called = first
+        .snapshot(request.binding_id, core::time::Duration::from_millis(500))
+        .await
+        .expect("the owner's call runs");
+    assert!(called.answered());
+
+    // A connection that ends takes its own bindings with it and leaves the host running.
+    drop(first);
+    let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        if second
+            .health()
+            .await
+            .expect("a health report")
+            .live_bindings
+            == 0
+        {
+            break;
+        }
+        tokio::time::sleep(core::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        second
+            .health()
+            .await
+            .expect("a health report")
+            .live_bindings,
+        0,
+        "a connection that ended left its binding behind"
+    );
+}
+
+// KR-REQ-11.39: an observation is answered while a call is running on the same connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_39_an_observation_is_not_behind_a_call_on_the_same_connection() {
+    let Some(wasm) = components::component("infinite-loop") else {
+        return;
+    };
+    let served = Served::start().await;
+    let client = Arc::new(served.client().await);
+    let (path, digest, bytes) = served.install("infinite-loop", &wasm);
+    let request = components::request("infinite-loop", 7);
+    client
+        .register(
+            request.binding_id,
+            &request.identity,
+            &request.facts,
+            &request.executable,
+            &ComponentSource {
+                path: path.clone(),
+                digest,
+                bytes,
+            },
+        )
+        .await
+        .expect("the binding registers");
+
+    // A snapshot this component never returns from. It runs until its own deadline stops it.
+    let calling = tokio::spawn({
+        let client = Arc::clone(&client);
+        let binding_id = request.binding_id;
+        async move {
+            client
+                .snapshot(binding_id, core::time::Duration::from_secs(5))
+                .await
+        }
+    });
+    // Long enough for the call to be inside the component.
+    tokio::time::sleep(core::time::Duration::from_millis(100)).await;
+
+    // While it is running, an observation is answered by the queue. Measured, because the claim is
+    // about time and not merely about order.
+    let offered = std::time::Instant::now();
+    let admission = client
+        .deliver(request.binding_id, &components::scrape("se-1", "x"))
+        .await
+        .expect("the event is offered while a call is running");
+    let waited = offered.elapsed();
+    assert!(
+        matches!(
+            admission,
+            Admission::Queued | Admission::QueuedWithGap { .. }
+        ),
+        "the event was {admission:?}"
+    );
+    assert!(
+        waited < core::time::Duration::from_millis(500),
+        "an observation waited {waited:?} behind a component call"
+    );
+
+    // And the handoff that never waits at all does not even write a frame.
+    let offered = std::time::Instant::now();
+    let handoff = client.offer(request.binding_id, &components::scrape("se-2", "y"));
+    let waited = offered.elapsed();
+    assert_eq!(
+        handoff,
+        kr_plugin_runtime::service::client::Handoff::Accepted
+    );
+    assert!(
+        waited < core::time::Duration::from_millis(20),
+        "handing an event over took {waited:?}"
+    );
+
+    // Health, too: nothing about this connection is behind the component.
+    let asked = std::time::Instant::now();
+    let health = client.health().await.expect("a health report");
+    assert!(
+        asked.elapsed() < core::time::Duration::from_millis(500),
+        "a health report waited behind a component call"
+    );
+    assert_eq!(health.connection_bindings, 1);
+    assert_eq!(health.binding_bound, 64);
+
+    let _outcome = calling.await.expect("the call finished");
+}
+
+// KR-REQ-05.07: a client whose host is gone is told at once rather than waiting out its deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_client_whose_connection_failed_is_told_without_waiting() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let identity = HostIdentity::generate(temp.environment_id()).expect("an identity");
+    let endpoint = host_endpoint(&environment).expect("an endpoint");
+    let descriptor = HostDescriptor {
+        protocol: PROTOCOL.to_owned(),
+        environment_id: temp.environment_id(),
+        reservation_id: kr_protocol::worker::ReservationId::new(kr_ipc::new_uuid()),
+        endpoint: endpoint.as_text(),
+        boot_identity: identity.boot_identity().clone(),
+        process_start_identity: identity.process_start_identity().clone(),
+        host_public_key: *identity.public_key(),
+    };
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a listener");
+
+    // A host that completes the handshake and then goes. Its connection closing is what every
+    // caller waiting on it is told by, at once, rather than each waiting out its own deadline.
+    let serving = tokio::spawn({
+        let descriptor = descriptor.clone();
+        async move {
+            let (connection, _peer) = listener.accept().await.expect("a connection");
+            let (mut reader, mut writer) =
+                kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+            for _ in 0..2 {
+                let request: kr_plugin_runtime::service::protocol::Request =
+                    reader.read_message().await.expect("a request");
+                let body = match request.body {
+                    RequestBody::Hello { .. } => ResponseBody::Hello {
+                        protocol: PROTOCOL.to_owned(),
+                        descriptor: Box::new(descriptor.clone()),
+                    },
+                    RequestBody::Verify { nonce } => ResponseBody::Verified(Box::new(
+                        identity
+                            .answer(&nonce, &descriptor.endpoint)
+                            .expect("an answer"),
+                    )),
+                    other => panic!("the client asked for {other:?}"),
+                };
+                writer
+                    .write_message(&Frame::Response {
+                        reply_to: request.request_id,
+                        body,
+                    })
+                    .await
+                    .expect("the answer is written");
+            }
+            // And then it is gone, the way a plugin host that crashed is gone.
+        }
+    });
+
+    let connection = kr_ipc::endpoint::Connection::connect(&endpoint)
+        .await
+        .expect("connects");
+    let client = PluginClient::over(connection, descriptor)
+        .await
+        .expect("the handshake and the challenge");
+    serving.await.expect("the host finished");
+
+    let asked = std::time::Instant::now();
+    let error = client
+        .health()
+        .await
+        .expect_err("a host that is gone cannot report itself");
+    let waited = asked.elapsed();
+    assert!(
+        matches!(error, RuntimeError::ServiceUnavailable { .. }),
+        "the failure was {error}"
+    );
+    assert!(
+        waited < core::time::Duration::from_secs(2),
+        "the client waited {waited:?} for a connection that had failed"
+    );
+
+    // And a call made afterwards is refused at once too, rather than being written to a socket
+    // nobody is reading.
+    let asked = std::time::Instant::now();
+    let error = client
+        .unbind(new_binding_id())
+        .await
+        .expect_err("the connection is gone");
+    assert!(matches!(error, RuntimeError::ServiceUnavailable { .. }));
+    assert!(asked.elapsed() < core::time::Duration::from_millis(500));
 }

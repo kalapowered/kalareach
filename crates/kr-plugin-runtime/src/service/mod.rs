@@ -21,8 +21,10 @@
 //! | [`client`] | What a worker uses: connect, verify, register, deliver, call, unbind |
 //! | [`launcher`] | Starting the host as its own job, taking its rendezvous, publishing its descriptor |
 //! | [`host`] | Serving workers: the accept loop, peer credentials and the request handling |
+//! | [`notices`] | The bounded queue a connection's unasked-for news waits in |
 
 pub mod client;
 pub mod host;
 pub mod launcher;
+pub mod notices;
 pub mod protocol;

@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use kr_plugin_runtime::RuntimeError;
 use kr_plugin_runtime::runtime::binding::{
-    BindingEvent, DEFAULT_EVENT_QUEUE, Runtime, RuntimeConfig,
+    BindingEvent, BindingOwner, DEFAULT_EVENT_QUEUE, Runtime, RuntimeConfig,
 };
 use kr_plugin_runtime::runtime::bindings::{
     ActionToken, Argument, EffectClass, Fault, NamedArgument, PreparedOperation, RequestSnapshot,
@@ -33,10 +33,11 @@ use kr_plugin_sdk::limits::{
 /// How long a test waits for a compile. Generous: a machine under load is not the case under test.
 const COMPILE_WAIT: core::time::Duration = core::time::Duration::from_secs(60);
 
-/// A cache directory that removes itself, and the runtime built over it.
+/// A cache directory that removes itself, the runtime built over it, and who its bindings belong to.
 struct Host {
     _directory: tempfile::TempDir,
     runtime: Runtime,
+    owner: BindingOwner,
 }
 
 fn host() -> Host {
@@ -46,6 +47,7 @@ fn host() -> Host {
     Host {
         _directory: directory,
         runtime,
+        owner: BindingOwner::next(),
     }
 }
 
@@ -897,6 +899,7 @@ async fn kr_req_11_41_a_cold_compile_is_not_inside_an_observation_deadline() {
     let handle = host
         .runtime
         .instantiate(
+            host.owner,
             components::request("slow-compile", 4),
             &compiled,
             events,
@@ -963,6 +966,7 @@ async fn kr_req_11_38_three_faults_in_a_minute_disable_the_binding() {
     let handle = host
         .runtime
         .instantiate(
+            host.owner,
             components::request("infinite-loop", 5),
             &compiled,
             events,
@@ -1039,6 +1043,7 @@ async fn kr_req_11_38_queue_overflow_produces_a_gap_and_a_fresh_snapshot() {
     let handle = host
         .runtime
         .instantiate(
+            host.owner,
             components::request("well-behaved", 6),
             &compiled,
             events,
@@ -1116,7 +1121,13 @@ async fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() 
     let request = components::request("well-behaved", 7);
     let handle = host
         .runtime
-        .instantiate(request.clone(), &compiled, first_events, COMPILE_WAIT)
+        .instantiate(
+            host.owner,
+            request.clone(),
+            &compiled,
+            first_events,
+            COMPILE_WAIT,
+        )
         .await
         .expect("the component instantiates");
     assert_eq!(handle.identity(), &request.identity);
@@ -1127,7 +1138,13 @@ async fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() 
     let (other_events, _other_received) = events();
     let error = host
         .runtime
-        .instantiate(request.clone(), &compiled, other_events, COMPILE_WAIT)
+        .instantiate(
+            host.owner,
+            request.clone(),
+            &compiled,
+            other_events,
+            COMPILE_WAIT,
+        )
         .await
         .expect_err("a binding that is already live is refused");
     assert!(
@@ -1153,7 +1170,13 @@ async fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() 
     let (second_events, _second_received) = events();
     let upgraded_handle = host
         .runtime
-        .instantiate(second.clone(), &compiled, second_events, COMPILE_WAIT)
+        .instantiate(
+            host.owner,
+            second.clone(),
+            &compiled,
+            second_events,
+            COMPILE_WAIT,
+        )
         .await
         .expect("the upgraded package binds under its own identifier");
     assert_eq!(upgraded_handle.identity(), &second.identity);
@@ -1179,8 +1202,8 @@ async fn kr_req_06_06_a_binding_names_the_plugin_the_bytes_and_the_generation() 
     let facts: &BindingFacts = &handle.request().facts;
     assert_eq!(facts.plugin_id, request.identity.plugin_id.as_str());
 
-    assert!(host.runtime.unbind(request.binding_id));
-    assert!(host.runtime.unbind(second.binding_id));
+    assert!(host.runtime.unbind(host.owner, request.binding_id));
+    assert!(host.runtime.unbind(host.owner, second.binding_id));
     assert_eq!(host.runtime.live_bindings(), 0);
 }
 

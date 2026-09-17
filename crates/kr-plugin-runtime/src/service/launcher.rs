@@ -50,11 +50,45 @@ use kr_protocol::scalars::{AuthorisationKey, Nonce256};
 use kr_protocol::worker::ReservationId;
 
 use crate::service::protocol::{
-    self, HostDescriptor, HostRendezvous, HostVerifyProof, RENDEZVOUS_DOMAIN, VERIFY_DOMAIN,
+    self, HostDescriptor, HostRendezvous, HostVerifyProof, RENDEZVOUS_DOMAIN, RendezvousAccepted,
+    VERIFY_DOMAIN,
 };
 
 /// The largest descriptor this host writes or reads.
 const MAX_DESCRIPTOR_BYTES: u64 = 8 * 1024;
+
+/// The reservations a claim has already been accepted for, and how many second claims were refused.
+///
+/// Exactly one rendezvous per reservation succeeds. The record is what makes that true rather than
+/// hoped for: a second claim naming a reservation this process has already accepted is refused by
+/// the record, whatever it is signed with and whichever listener it arrived on, and it is counted so
+/// that two processes claiming one reservation is something a host can see rather than infer.
+static CLAIMED: std::sync::LazyLock<std::sync::Mutex<ClaimRecord>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(ClaimRecord::default()));
+
+#[derive(Debug, Default)]
+struct ClaimRecord {
+    accepted: std::collections::HashSet<ReservationId>,
+    duplicates: u64,
+}
+
+/// Records one accepted claim, or says the reservation was already claimed.
+fn claim_once(reservation_id: ReservationId) -> bool {
+    let Ok(mut record) = CLAIMED.lock() else {
+        return false;
+    };
+    if record.accepted.insert(reservation_id) {
+        return true;
+    }
+    record.duplicates = record.duplicates.saturating_add(1);
+    false
+}
+
+/// Returns how many second claims this process has refused.
+#[must_use]
+pub fn duplicate_claims() -> u64 {
+    CLAIMED.lock().map_or(0, |record| record.duplicates)
+}
 
 /// What can go wrong starting or verifying a plugin host.
 #[derive(Debug, thiserror::Error)]
@@ -558,33 +592,69 @@ impl HostReservation {
         }
     }
 
-    /// Waits for the host's claim, checks it, and publishes the descriptor.
+    /// Waits for the host's claim, checks it, publishes the descriptor and acknowledges it.
     ///
     /// `launched` is the process identity the service manager reported. It is compared with the
     /// connecting peer's own identity and with what the claim says, which is what stops another
     /// process from claiming a reservation it was not started for.
     ///
+    /// `within` bounds the whole exchange and not just the connection: a peer that connects and
+    /// then says nothing is a peer that would otherwise hold a startup open for ever. A connection
+    /// that is refused does not end the wait either; the deadline does, and the last refusal is
+    /// what the caller is told about.
+    ///
     /// # Errors
     ///
-    /// Returns [`LaunchError::NoRendezvous`] when nothing connects in time, or
-    /// [`LaunchError::Refused`] when the claim does not match the reservation or the peer.
+    /// Returns [`LaunchError::NoRendezvous`] when nothing claims the reservation in time, or
+    /// [`LaunchError::Refused`] when the last claim did not match the reservation or the peer.
     pub async fn accept(
         self,
         environment: &EnvironmentPaths,
         launched: &ProcessStartIdentity,
         within: core::time::Duration,
     ) -> LaunchResult<HostDescriptor> {
-        let accepted = tokio::time::timeout(within, self.listener.accept())
-            .await
-            .map_err(|_elapsed| LaunchError::NoRendezvous {
-                deadline_ms: u64::try_from(within.as_millis()).unwrap_or(u64::MAX),
-            })??;
-        let (connection, peer) = accepted;
-        let descriptor = self
-            .receive(environment, launched, connection, peer)
-            .await?;
-        publish_descriptor(environment, &descriptor)?;
-        Ok(descriptor)
+        let deadline = tokio::time::Instant::now() + within;
+        let deadline_ms = u64::try_from(within.as_millis()).unwrap_or(u64::MAX);
+        let mut refused: Option<LaunchError> = None;
+        loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                return Err(refused.unwrap_or(LaunchError::NoRendezvous { deadline_ms }));
+            }
+            let accepted = match tokio::time::timeout(left, self.listener.accept()).await {
+                Ok(accepted) => accepted?,
+                Err(_elapsed) => {
+                    return Err(refused.unwrap_or(LaunchError::NoRendezvous { deadline_ms }));
+                }
+            };
+            let (connection, peer) = accepted;
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let received =
+                tokio::time::timeout(left, self.receive(environment, launched, connection, peer))
+                    .await;
+            match received {
+                Ok(Ok((descriptor, mut writer))) => {
+                    publish_descriptor(environment, &descriptor)?;
+                    // The host does not serve workers until it has this. Publishing a descriptor
+                    // for a process that had already started answering would mean a worker could
+                    // reach a host the launcher was still deciding about.
+                    let accepted = RendezvousAccepted {
+                        reservation_id: descriptor.reservation_id,
+                        environment_id: descriptor.environment_id,
+                        endpoint: descriptor.endpoint.clone(),
+                    };
+                    writer.write_message(&accepted).await?;
+                    return Ok(descriptor);
+                }
+                // One refused claim is not the end of the wait: the process the service manager
+                // started may still be on its way. The refusal is kept and reported if nothing
+                // better arrives.
+                Ok(Err(error)) => refused = Some(error),
+                Err(_elapsed) => {
+                    return Err(refused.unwrap_or(LaunchError::NoRendezvous { deadline_ms }));
+                }
+            }
+        }
     }
 
     async fn receive(
@@ -593,9 +663,9 @@ impl HostReservation {
         launched: &ProcessStartIdentity,
         connection: Connection,
         peer: PeerIdentity,
-    ) -> LaunchResult<HostDescriptor> {
+    ) -> LaunchResult<(HostDescriptor, kr_ipc::framed::FrameWriter)> {
         peer.authorise(kr_ipc::paths::current_uid())?;
-        let (mut reader, _writer) = split(connection, StreamKind::Control);
+        let (mut reader, writer) = split(connection, StreamKind::Control);
         let claim: HostRendezvous = reader.read_message().await?;
         check_rendezvous(&claim)?;
 
@@ -618,23 +688,40 @@ impl HostReservation {
                 ),
             });
         }
-        // The peer's own identity, from the kernel, against the one the claim asserts. A process
-        // that borrowed another's claim fails here even though the signature checks out.
-        if let Some(pid) = peer.pid {
-            let observed = kr_ipc::identity::process_start_identity(pid).map_err(|error| {
-                LaunchError::Refused {
-                    detail: format!("the connecting process is unreadable: {error}"),
-                }
-            })?;
-            if !observed.matches(launched) {
-                return Err(LaunchError::Refused {
-                    detail: format!(
-                        "the connecting process is {} and the service manager started {}",
-                        observed.pid.get(),
-                        launched.pid.get()
-                    ),
-                });
+        // The kernel's own account of who connected, which the claim cannot choose. A peer the
+        // kernel will not name is a peer this launcher cannot check, and an unverifiable claim is
+        // refused rather than taken on the strength of a signature anyone holding the key could
+        // make.
+        let Some(pid) = peer.pid else {
+            return Err(LaunchError::Refused {
+                detail: "the connecting process has no kernel identity to check the claim against"
+                    .to_owned(),
+            });
+        };
+        let observed = kr_ipc::identity::process_start_identity(pid).map_err(|error| {
+            LaunchError::Refused {
+                detail: format!("the connecting process is unreadable: {error}"),
             }
+        })?;
+        if !observed.matches(launched) {
+            return Err(LaunchError::Refused {
+                detail: format!(
+                    "the connecting process is {} and the service manager started {}",
+                    observed.pid.get(),
+                    launched.pid.get()
+                ),
+            });
+        }
+        // The boot this launcher is running in. A claim carrying another boot's identity is a claim
+        // from a recorded startup rather than from the process that just started.
+        let boot = kr_ipc::identity::boot_identity().map_err(|error| LaunchError::Refused {
+            detail: format!("this host's boot identity is unreadable: {error}"),
+        })?;
+        if claim.boot_identity != boot {
+            return Err(LaunchError::Refused {
+                detail: "the claim names a different boot from the one this launcher is running in"
+                    .to_owned(),
+            });
         }
         let expected = host_endpoint(environment)?.as_text();
         if claim.endpoint != expected {
@@ -645,15 +732,27 @@ impl HostReservation {
                 ),
             });
         }
-        Ok(HostDescriptor {
-            protocol: protocol::PROTOCOL.to_owned(),
-            environment_id: claim.environment_id,
-            reservation_id: claim.reservation_id,
-            endpoint: claim.endpoint,
-            boot_identity: claim.boot_identity,
-            process_start_identity: claim.process_start_identity,
-            host_public_key: claim.host_public_key,
-        })
+        // Last, because a claim that fails any check above was never this reservation's to take.
+        if !claim_once(claim.reservation_id) {
+            return Err(LaunchError::Refused {
+                detail: format!(
+                    "reservation {} has already been claimed, and one reservation is one host",
+                    claim.reservation_id
+                ),
+            });
+        }
+        Ok((
+            HostDescriptor {
+                protocol: protocol::PROTOCOL.to_owned(),
+                environment_id: claim.environment_id,
+                reservation_id: claim.reservation_id,
+                endpoint: claim.endpoint,
+                boot_identity: claim.boot_identity,
+                process_start_identity: claim.process_start_identity,
+                host_public_key: claim.host_public_key,
+            },
+            writer,
+        ))
     }
 }
 
@@ -870,5 +969,59 @@ mod tests {
         .expect_err("nothing reported itself");
         assert!(matches!(outcome, LaunchError::NoRendezvous { .. }));
         assert!(read_descriptor(&environment).expect("a read").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_peer_that_connects_and_says_nothing_does_not_hold_a_startup_open() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let identity = HostIdentity::generate(host.environment_id()).expect("an identity");
+        let reservation = HostReservation::open(&environment).expect("a reservation");
+        let endpoint = reservation.endpoint().clone();
+
+        // Somebody connects to the rendezvous endpoint and never writes a claim. The deadline
+        // covers receiving the claim, not just accepting the connection, so this ends.
+        let silent = tokio::spawn(async move {
+            let connection = Connection::connect(&endpoint).await.expect("connects");
+            // Held open, saying nothing, for longer than the launcher's deadline.
+            tokio::time::sleep(core::time::Duration::from_secs(2)).await;
+            drop(connection);
+        });
+
+        let started = std::time::Instant::now();
+        let outcome = reservation
+            .accept(
+                &environment,
+                identity.process_start_identity(),
+                core::time::Duration::from_millis(200),
+            )
+            .await
+            .expect_err("a peer that says nothing does not complete a startup");
+        let waited = started.elapsed();
+        assert!(
+            matches!(outcome, LaunchError::NoRendezvous { .. }),
+            "{outcome}"
+        );
+        assert!(
+            waited < core::time::Duration::from_secs(1),
+            "the launcher waited {waited:?}"
+        );
+        assert!(read_descriptor(&environment).expect("a read").is_none());
+        silent.abort();
+    }
+
+    #[test]
+    fn one_reservation_is_one_host_and_a_second_claim_is_counted() {
+        let reservation = ReservationId::new(kr_ipc::new_uuid());
+        let before = duplicate_claims();
+        assert!(claim_once(reservation), "the first claim is the one");
+        assert!(!claim_once(reservation), "a second claim is refused");
+        assert_eq!(
+            duplicate_claims(),
+            before + 1,
+            "a second claim on one reservation is counted, not merely refused"
+        );
+        // A different reservation is a different host, and unaffected.
+        assert!(claim_once(ReservationId::new(kr_ipc::new_uuid())));
     }
 }

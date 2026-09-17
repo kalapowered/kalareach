@@ -6,10 +6,22 @@
 //!
 //! # Delivering an event never waits on a component
 //!
-//! [`PluginClient::deliver`] writes one frame and reads its acknowledgement. The acknowledgement is
-//! the queue's answer, not a component's: the host pushes onto the bounded queue and replies
-//! without entering an instance. A component in the middle of an unbounded loop does not delay it,
-//! which is what keeps PTY draining independent of an observation callback.
+//! Two forms, and neither enters an instance.
+//!
+//! [`PluginClient::offer`] is the one the terminal path uses. It puts the event on a bounded queue
+//! and returns: no lock a component holds, no socket write, no answer waited for. A full queue is
+//! an immediate refusal, which the caller records as a gap, rather than a wait.
+//!
+//! [`PluginClient::deliver`] writes one frame and reads its acknowledgement, for a caller that
+//! wants the queue's answer. The acknowledgement is the queue's, not a component's: the host
+//! answers an observation on the task that read it, without entering an instance, so a component in
+//! the middle of an unbounded loop does not delay it.
+//!
+//! # Every request carries one deadline
+//!
+//! The deadline covers being admitted, being written and being answered. A host that stopped
+//! reading its socket cannot hold a caller past it, and a connection that fails answers every call
+//! waiting on it at once rather than leaving each to time out on its own.
 //!
 //! # What a plugin-host crash costs this worker
 //!
@@ -17,15 +29,16 @@
 //! [`crate::RuntimeError::ServiceUnavailable`], and the worker's own ledger is untouched because
 //! it was never in the other process. Re-registering the bindings is the whole of the recovery.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use kr_ipc::endpoint::Connection;
 use kr_ipc::framed::{FrameReader, FrameWriter, split};
 use kr_ipc::paths::{Endpoint, EnvironmentPaths};
 use kr_protocol::frame::StreamKind;
 use kr_protocol::scalars::Uuid;
-use tokio::sync::{Mutex, oneshot};
+use tokio::sync::oneshot;
 
 use kr_plugin_sdk::identity::PluginIdentity;
 
@@ -35,9 +48,10 @@ use crate::runtime::host::{BindingFacts, ScopedSourceEvent};
 use crate::runtime::queue::Admission;
 use crate::service::host::{wire_event, wire_facts};
 use crate::service::launcher::{self, LaunchError};
+use crate::service::notices::{self, MAX_NOTICE_BYTES, NoticeSink, NoticeStream};
 use crate::service::protocol::{
     BindingRegistration, CallValue, ComponentSource, Frame, HostDescriptor, HostHealth, Notice,
-    Request, RequestBody, ResponseBody, WireNode,
+    Request, RequestBody, ResponseBody,
 };
 
 /// How long a worker waits for an answer before it stops waiting.
@@ -55,20 +69,95 @@ pub const DEFAULT_DEADLINE: core::time::Duration = core::time::Duration::from_se
 pub const REGISTER_DEADLINE: core::time::Duration =
     core::time::Duration::from_millis(crate::runtime::compile::COMPILE_DEADLINE_MS + 5_000);
 
+/// How many offered events may be waiting to be written.
+///
+/// The terminal path hands an event over and carries on, so there has to be somewhere for it to
+/// wait, and that somewhere has to be bounded in both directions: how many, and how much they hold.
+const MAX_OFFERED_EVENTS: usize = 256;
+
+/// What an event handed over without waiting became.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Handoff {
+    /// The event is on its way to the host.
+    Accepted,
+    /// The queue is full. The event was not taken, and the caller records the loss.
+    Refused {
+        /// How many bytes the queue was holding.
+        held_bytes: u64,
+    },
+    /// The connection to the host is gone.
+    Unavailable,
+}
+
 /// One request's answer, on its way back to whoever asked.
 type Answer = oneshot::Sender<ResponseBody>;
 
-/// The requests this client is waiting on, by the number their answers will carry.
-type Waiting = Arc<Mutex<Vec<(u64, Answer)>>>;
+/// The requests this client is waiting on, and whether its connection still exists.
+#[derive(Debug, Default)]
+struct Pending {
+    waiting: Mutex<HashMap<u64, Answer>>,
+    closed: AtomicBool,
+}
+
+impl Pending {
+    /// Records that a request is waiting for its number.
+    fn wait_for(&self, request_id: u64, answer: Answer) {
+        if let Ok(mut waiting) = self.waiting.lock() {
+            waiting.insert(request_id, answer);
+        }
+    }
+
+    /// Takes one request's sender, if it is still waiting.
+    fn take(&self, request_id: u64) -> Option<Answer> {
+        self.waiting
+            .lock()
+            .ok()
+            .and_then(|mut waiting| waiting.remove(&request_id))
+    }
+
+    /// Drops every waiting sender and records that the connection is gone.
+    ///
+    /// Dropping a sender is what tells its caller the host closed the connection, at once, rather
+    /// than each caller waiting out its own deadline for an answer that cannot arrive.
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut waiting) = self.waiting.lock() {
+            waiting.clear();
+        }
+    }
+
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
+/// One request's place in the waiting set, removed however the caller leaves.
+///
+/// A timeout, a write failure and a cancelled future all end the same way: the entry goes. Without
+/// this, a caller that gave up would leave its sender behind and the set would grow with every call
+/// that did not arrive.
+struct Waiting<'a> {
+    pending: &'a Pending,
+    request_id: u64,
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let _taken = self.pending.take(self.request_id);
+    }
+}
 
 /// A worker's connection to the plugin host.
 pub struct PluginClient {
-    writer: Mutex<FrameWriter>,
-    waiting: Waiting,
-    notices: tokio::sync::mpsc::UnboundedReceiver<Notice>,
+    writer: Arc<tokio::sync::Mutex<FrameWriter>>,
+    pending: Arc<Pending>,
+    notices: NoticeStream,
+    offered: tokio::sync::mpsc::Sender<Request>,
+    offered_bytes: Arc<AtomicU64>,
     next_request: AtomicU64,
     descriptor: HostDescriptor,
     reader_task: tokio::task::JoinHandle<()>,
+    offer_task: tokio::task::JoinHandle<()>,
 }
 
 impl core::fmt::Debug for PluginClient {
@@ -118,17 +207,31 @@ impl PluginClient {
     /// Returns the handshake or verification failure.
     pub async fn over(connection: Connection, descriptor: HostDescriptor) -> RuntimeResult<Self> {
         let (reader, writer) = split(connection, StreamKind::Control);
-        let waiting: Waiting = Arc::new(Mutex::new(Vec::new()));
-        let (notices, received) = tokio::sync::mpsc::unbounded_channel();
-        let reader_task = tokio::spawn(read_frames(reader, Arc::clone(&waiting), notices));
+        let writer = Arc::new(tokio::sync::Mutex::new(writer));
+        let pending = Arc::new(Pending::default());
+        let (sink, notices) = notices::channel();
+        let reader_task = tokio::spawn(read_frames(reader, Arc::clone(&pending), sink));
+
+        // The handoff the terminal path uses: bounded, written by a task of its own, never waited
+        // on by whoever offered the event.
+        let (offered, waiting_events) = tokio::sync::mpsc::channel::<Request>(MAX_OFFERED_EVENTS);
+        let offered_bytes = Arc::new(AtomicU64::new(0));
+        let offer_task = tokio::spawn(write_offered(
+            waiting_events,
+            Arc::clone(&writer),
+            Arc::clone(&offered_bytes),
+        ));
 
         let client = Self {
-            writer: Mutex::new(writer),
-            waiting,
-            notices: received,
+            writer,
+            pending,
+            notices,
+            offered,
+            offered_bytes,
             next_request: AtomicU64::new(1),
             descriptor,
             reader_task,
+            offer_task,
         };
 
         let hello = client
@@ -201,10 +304,49 @@ impl PluginClient {
         }
     }
 
-    /// Offers one source event to a binding's observation queue.
+    /// Hands one source event over without waiting for anything.
     ///
-    /// Nothing runs a component here. The answer is the queue's, and it comes back whatever the
-    /// component is doing.
+    /// This is the terminal path's form. It takes no lock a component holds, writes no frame and
+    /// waits for no answer: the event goes on a bounded queue and a task of this client's own
+    /// writes it. A full queue is an immediate refusal the caller records as a gap, which is the
+    /// same answer the host's own queue gives when it overflows and for the same reason.
+    pub fn offer(&self, binding_id: BindingId, event: &ScopedSourceEvent) -> Handoff {
+        let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
+        let wire = wire_event(event);
+        let cost = wire.bytes.len() as u64 + wire.handle.as_str().len() as u64;
+        let held = self.offered_bytes.load(Ordering::Acquire);
+        if held.saturating_add(cost) > MAX_NOTICE_BYTES {
+            return Handoff::Refused { held_bytes: held };
+        }
+        let request = Request {
+            request_id,
+            body: RequestBody::Event {
+                binding_id: binding_id.get(),
+                event: wire,
+            },
+        };
+        match self.offered.try_send(request) {
+            Ok(()) => {
+                self.offered_bytes.fetch_add(cost, Ordering::AcqRel);
+                Handoff::Accepted
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                Handoff::Refused { held_bytes: held }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => Handoff::Unavailable,
+        }
+    }
+
+    /// Returns how many bytes of offered events are waiting to be written.
+    #[must_use]
+    pub fn offered_bytes(&self) -> u64 {
+        self.offered_bytes.load(Ordering::Acquire)
+    }
+
+    /// Offers one source event and waits for the queue's answer.
+    ///
+    /// Nothing runs a component here either: the host answers an observation on the task that read
+    /// it. This form exists for a caller that wants to know what the queue did with the event.
     ///
     /// # Errors
     ///
@@ -328,7 +470,7 @@ impl PluginClient {
 
     /// Takes the next notice a binding produced, if one is waiting.
     pub fn try_notice(&mut self) -> Option<Notice> {
-        self.notices.try_recv().ok()
+        self.notices.try_recv()
     }
 
     /// Waits for the next notice a binding produced.
@@ -339,17 +481,12 @@ impl PluginClient {
     async fn call(&self, body: RequestBody) -> RuntimeResult<Called> {
         let answered = self.request(body).await?;
         match answered {
-            ResponseBody::Called {
-                value,
-                fault,
-                nodes,
-            } => Ok(Called {
+            ResponseBody::Called { value, fault } => Ok(Called {
                 state: match value {
                     Some(CallValue::State(state)) => Some(state),
                     Some(CallValue::Document) | None => None,
                 },
                 fault,
-                nodes,
             }),
             ResponseBody::Refused {
                 detail, disabled, ..
@@ -368,38 +505,60 @@ impl PluginClient {
         self.request_within(body, DEFAULT_DEADLINE).await
     }
 
+    /// Sends one request and waits for its answer, all inside one deadline.
+    ///
+    /// The deadline covers being admitted to the waiting set, taking the writer, writing the frame
+    /// and receiving the answer. Starting it after the write would let a host that stopped reading
+    /// its socket hold a caller for as long as it liked, which is the one thing a deadline on this
+    /// path exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RuntimeError::ServiceUnavailable`] when the connection is gone,
+    /// [`RuntimeError::CallerDeadline`] when the deadline passes first.
     async fn request_within(
         &self,
         body: RequestBody,
         deadline: core::time::Duration,
     ) -> RuntimeResult<ResponseBody> {
+        if self.pending.is_closed() {
+            return Err(RuntimeError::ServiceUnavailable {
+                detail: "the plugin host closed the connection".to_owned(),
+            });
+        }
         let request_id = self.next_request.fetch_add(1, Ordering::Relaxed);
         let (answer, reply) = oneshot::channel();
-        self.waiting.lock().await.push((request_id, answer));
-        {
-            let mut writer = self.writer.lock().await;
-            writer
-                .write_message(&Request { request_id, body })
-                .await
-                .map_err(|error| RuntimeError::ServiceUnavailable {
-                    detail: error.to_string(),
-                })?;
-        }
-        match tokio::time::timeout(deadline, reply).await {
-            Ok(Ok(body)) => Ok(body),
-            // The reader task dropped the sender, which means the connection is gone.
-            Ok(Err(_)) => Err(RuntimeError::ServiceUnavailable {
-                detail: "the plugin host closed the connection".to_owned(),
-            }),
-            Err(_elapsed) => {
-                self.waiting
-                    .lock()
+        self.pending.wait_for(request_id, answer);
+        // Removed however this call ends: answered, timed out, failed to write, or dropped by a
+        // caller that stopped waiting.
+        let _place = Waiting {
+            pending: &self.pending,
+            request_id,
+        };
+
+        let exchange = async {
+            {
+                let mut writer = self.writer.lock().await;
+                writer
+                    .write_message(&Request { request_id, body })
                     .await
-                    .retain(|(waiting, _answer)| *waiting != request_id);
-                Err(RuntimeError::CallerDeadline {
-                    deadline_ms: millis(deadline),
-                })
+                    .map_err(|error| RuntimeError::ServiceUnavailable {
+                        detail: error.to_string(),
+                    })?;
             }
+            match reply.await {
+                Ok(body) => Ok(body),
+                // The reader dropped the sender, which means the connection is gone.
+                Err(_closed) => Err(RuntimeError::ServiceUnavailable {
+                    detail: "the plugin host closed the connection".to_owned(),
+                }),
+            }
+        };
+        match tokio::time::timeout(deadline, exchange).await {
+            Ok(outcome) => outcome,
+            Err(_elapsed) => Err(RuntimeError::CallerDeadline {
+                deadline_ms: millis(deadline),
+            }),
         }
     }
 }
@@ -407,6 +566,8 @@ impl PluginClient {
 impl Drop for PluginClient {
     fn drop(&mut self) {
         self.reader_task.abort();
+        self.offer_task.abort();
+        self.pending.close();
     }
 }
 
@@ -420,14 +581,15 @@ pub struct Registration {
 }
 
 /// What a call produced.
+///
+/// The document it drew is not here. Nodes arrive as notices, because one call may draw more than
+/// one frame carries; a caller that wants the document reads [`PluginClient::notice`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Called {
     /// A component's own resumable state, where the call returns one.
     pub state: Option<Vec<u8>>,
     /// The fault the component declared, where it declared one.
     pub fault: Option<String>,
-    /// The nodes it emitted while answering.
-    pub nodes: Vec<WireNode>,
 }
 
 impl Called {
@@ -438,36 +600,58 @@ impl Called {
     }
 }
 
-async fn read_frames(
-    mut reader: FrameReader,
-    waiting: Waiting,
-    notices: tokio::sync::mpsc::UnboundedSender<Notice>,
-) {
+/// Reads frames until the connection ends, then tells everyone waiting that it has.
+async fn read_frames(mut reader: FrameReader, pending: Arc<Pending>, notices: NoticeSink) {
     loop {
         let frame: Frame = match reader.read_message().await {
             Ok(frame) => frame,
             // The connection is gone, or the host sent something this protocol does not admit.
-            // Either way the waiting callers are told by their senders being dropped here.
-            Err(_error) => return,
+            // Either way every caller waiting on it is told now: an answer that cannot arrive is
+            // not something to make each of them wait out its own deadline for.
+            Err(_error) => break,
         };
         match frame {
             Frame::Response { reply_to, body } => {
-                let mut held = waiting.lock().await;
-                if let Some(position) = held
-                    .iter()
-                    .position(|(request_id, _answer)| *request_id == reply_to)
-                {
-                    let (_request_id, answer) = held.remove(position);
-                    drop(held);
-                    let _ = answer.send(body);
+                if let Some(answer) = pending.take(reply_to) {
+                    let _delivered = answer.send(body);
                 }
             }
             Frame::Notice(notice) => {
-                if notices.send(notice).is_err() {
-                    return;
+                if !notices.send(notice) {
+                    break;
                 }
             }
         }
+    }
+    pending.close();
+    notices.close();
+}
+
+/// Writes the events a caller handed over without waiting.
+async fn write_offered(
+    mut offered: tokio::sync::mpsc::Receiver<Request>,
+    writer: Arc<tokio::sync::Mutex<FrameWriter>>,
+    held: Arc<AtomicU64>,
+) {
+    while let Some(request) = offered.recv().await {
+        let cost = offered_bytes_of(&request);
+        let mut writer = writer.lock().await;
+        let written = writer.write_message(&request).await;
+        drop(writer);
+        held.fetch_sub(cost.min(held.load(Ordering::Acquire)), Ordering::AcqRel);
+        if written.is_err() {
+            return;
+        }
+    }
+}
+
+/// Returns what one offered event was counted as when it was admitted.
+fn offered_bytes_of(request: &Request) -> u64 {
+    match &request.body {
+        RequestBody::Event { event, .. } => {
+            event.bytes.len() as u64 + event.handle.as_str().len() as u64
+        }
+        _ => 0,
     }
 }
 
@@ -525,13 +709,11 @@ mod tests {
         let answered = Called {
             state: None,
             fault: None,
-            nodes: Vec::new(),
         };
         assert!(answered.answered());
         let refused = Called {
             state: None,
             fault: Some("refused: not mine".to_owned()),
-            nodes: Vec::new(),
         };
         assert!(!refused.answered());
     }

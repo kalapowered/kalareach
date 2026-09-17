@@ -3,10 +3,14 @@
 //! The order matters and is not an implementation detail:
 //!
 //! 1. Generate the per-process signing key. It exists only in this process's memory.
-//! 2. Bind the owner-only endpoint workers will use. Binding it before reporting in means that a
-//!    worker acting on the descriptor the daemon publishes always finds a listener.
-//! 3. Present the startup claim on the daemon's rendezvous endpoint, signed with that key.
-//! 4. Serve workers until a termination signal arrives.
+//! 2. Bind the owner-only endpoint workers will use, and hold it. Binding it before reporting in
+//!    means a worker acting on the descriptor the daemon publishes always finds a listener; holding
+//!    it through the report means there is no moment between claiming the endpoint and answering on
+//!    it during which another process could take it.
+//! 3. Present the startup claim on the daemon's rendezvous endpoint, signed with that key, and wait
+//!    for the daemon to say it accepted the claim. A host that started serving before that would be
+//!    answering workers as a process the daemon might still refuse.
+//! 4. Serve workers on the listener from step 2 until a termination signal arrives.
 //!
 //! A host that cannot do step 1, 2 or 3 exits without serving. A host that has done all three is
 //! the process the descriptor names, and a worker can prove it with a challenge.
@@ -20,6 +24,7 @@ use kr_plugin_runtime::service::host::{HostConfig, PluginHost};
 use kr_plugin_runtime::service::launcher::{
     HostIdentity, LaunchError, LaunchResult, host_endpoint,
 };
+use kr_plugin_runtime::service::protocol::RendezvousAccepted;
 use kr_protocol::frame::StreamKind;
 
 use crate::options::Options;
@@ -39,9 +44,11 @@ pub async fn run(options: Options) -> LaunchResult<()> {
     let endpoint = host_endpoint(&environment)?;
 
     // The endpoint is the host's to own, and a previous incarnation's socket file may still be
-    // sitting there. Binding is what proves this process holds it.
+    // sitting there. Binding is what proves this process holds it, and holding the listener from
+    // here until `serve_on` is what keeps that proof true: a bind, a release and a second bind
+    // would let another launch win the endpoint between them, and the descriptor the daemon
+    // published would name the process that lost.
     let listener = Listener::bind(&endpoint)?;
-    drop(listener);
 
     let host = Arc::new(PluginHost::new(
         identity,
@@ -54,14 +61,20 @@ pub async fn run(options: Options) -> LaunchResult<()> {
 
     report_in(&host, &options, &endpoint.as_text()).await?;
 
-    host.serve(termination()).await
+    host.serve_on(listener, termination()).await
 }
 
-/// Presents the startup claim on the control daemon's rendezvous endpoint.
+/// How long the daemon is given to accept this host's claim.
+///
+/// A daemon that has taken the claim and not answered is a daemon this host cannot serve for, and
+/// waiting for ever would leave a process holding an endpoint nobody published.
+const ACCEPTANCE_DEADLINE: core::time::Duration = core::time::Duration::from_secs(30);
+
+/// Presents the startup claim on the control daemon's rendezvous endpoint and waits to be accepted.
 async fn report_in(host: &Arc<PluginHost>, options: &Options, endpoint: &str) -> LaunchResult<()> {
     let rendezvous = kr_ipc::paths::Endpoint::from_path(&options.rendezvous)?;
     let connection = Connection::connect(&rendezvous).await?;
-    let (_reader, mut writer) = split(connection, StreamKind::Control);
+    let (mut reader, mut writer) = split(connection, StreamKind::Control);
     let claim = host
         .identity()
         .rendezvous(options.reservation_id(), endpoint)?;
@@ -69,6 +82,25 @@ async fn report_in(host: &Arc<PluginHost>, options: &Options, endpoint: &str) ->
         .write_message(&claim)
         .await
         .map_err(LaunchError::Endpoint)?;
+
+    let accepted: RendezvousAccepted =
+        match tokio::time::timeout(ACCEPTANCE_DEADLINE, reader.read_message()).await {
+            Ok(message) => message.map_err(LaunchError::Endpoint)?,
+            Err(_elapsed) => {
+                return Err(LaunchError::NoRendezvous {
+                    deadline_ms: u64::try_from(ACCEPTANCE_DEADLINE.as_millis()).unwrap_or(u64::MAX),
+                });
+            }
+        };
+    if accepted.reservation_id != options.reservation_id()
+        || accepted.environment_id != options.environment_id()
+        || accepted.endpoint != endpoint
+    {
+        return Err(LaunchError::Refused {
+            detail: "the daemon accepted a different reservation, environment or endpoint"
+                .to_owned(),
+        });
+    }
     Ok(())
 }
 

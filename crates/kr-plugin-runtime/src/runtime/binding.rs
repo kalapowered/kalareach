@@ -245,13 +245,51 @@ pub struct Runtime {
     bindings: Mutex<HashMap<BindingId, Registration>>,
 }
 
+/// Who a binding belongs to.
+///
+/// One per worker connection, and one per in-process caller that prepares bindings of its own. A
+/// binding exists to serve the caller that prepared it, so every lookup and every removal names an
+/// owner: a second connection that guessed an identifier finds no binding rather than somebody
+/// else's, and a connection that goes takes its own bindings and nobody else's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct BindingOwner(u64);
+
+/// The source of owner identifiers, which are never reused inside a process.
+static NEXT_OWNER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+impl BindingOwner {
+    /// Takes an owner identifier nothing else in this process holds.
+    #[must_use]
+    pub fn next() -> Self {
+        Self(NEXT_OWNER.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Returns the raw identifier, for a health report or a record.
+    #[must_use]
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl core::fmt::Display for BindingOwner {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Display::fmt(&self.0, formatter)
+    }
+}
+
 /// One entry in the registry.
 ///
 /// A binding is reserved before anything is started and becomes live when its instance exists.
 /// Reserving first is what makes two registrations of one identifier a refusal rather than a race:
 /// without it both could pass a "is it live" check before either had finished starting.
 #[derive(Debug)]
-enum Registration {
+struct Registration {
+    owner: BindingOwner,
+    state: RegistrationState,
+}
+
+#[derive(Debug)]
+enum RegistrationState {
     /// Somebody is preparing this binding.
     Reserved,
     /// The binding is live.
@@ -308,28 +346,49 @@ impl Runtime {
         self.bindings.lock().map_or(0, |bindings| {
             bindings
                 .values()
-                .filter(|entry| matches!(entry, Registration::Live(_)))
+                .filter(|entry| matches!(entry.state, RegistrationState::Live(_)))
                 .count()
         })
     }
 
-    /// Returns a live binding.
+    /// Returns how many bindings one owner holds.
     #[must_use]
-    pub fn binding(&self, binding_id: BindingId) -> Option<Arc<BindingHandle>> {
+    pub fn bindings_of(&self, owner: BindingOwner) -> usize {
+        self.bindings.lock().map_or(0, |bindings| {
+            bindings
+                .values()
+                .filter(|entry| entry.owner == owner)
+                .count()
+        })
+    }
+
+    /// Returns a live binding of `owner`'s.
+    ///
+    /// An identifier another owner holds is not found, which is the point: an identifier is not a
+    /// capability, and a caller that guessed one gets the same answer as a caller that invented one.
+    #[must_use]
+    pub fn binding(
+        &self,
+        owner: BindingOwner,
+        binding_id: BindingId,
+    ) -> Option<Arc<BindingHandle>> {
         self.bindings
             .lock()
             .ok()
             .and_then(|bindings| match bindings.get(&binding_id) {
-                Some(Registration::Live(handle)) => Some(Arc::clone(handle)),
-                Some(Registration::Reserved) | None => None,
+                Some(Registration {
+                    owner: held,
+                    state: RegistrationState::Live(handle),
+                }) if *held == owner => Some(Arc::clone(handle)),
+                _ => None,
             })
     }
 
-    /// Reserves an identifier, or says it is taken.
+    /// Reserves an identifier for `owner`, or says it is taken.
     ///
     /// Taken under the lock and before anything is started, so two registrations of one identifier
     /// cannot both get past it.
-    fn reserve(&self, binding_id: BindingId) -> RuntimeResult<()> {
+    fn reserve(&self, owner: BindingOwner, binding_id: BindingId) -> RuntimeResult<()> {
         let mut bindings = self
             .bindings
             .lock()
@@ -341,14 +400,26 @@ impl Runtime {
                 detail: format!("binding {binding_id} is already live"),
             });
         }
-        bindings.insert(binding_id, Registration::Reserved);
+        bindings.insert(
+            binding_id,
+            Registration {
+                owner,
+                state: RegistrationState::Reserved,
+            },
+        );
         Ok(())
     }
 
     /// Gives up a reservation that did not become a binding.
-    fn release(&self, binding_id: BindingId) {
+    fn release(&self, owner: BindingOwner, binding_id: BindingId) {
         if let Ok(mut bindings) = self.bindings.lock()
-            && matches!(bindings.get(&binding_id), Some(Registration::Reserved))
+            && matches!(
+                bindings.get(&binding_id),
+                Some(Registration {
+                    owner: held,
+                    state: RegistrationState::Reserved,
+                }) if *held == owner
+            )
         {
             bindings.remove(&binding_id);
         }
@@ -385,6 +456,7 @@ impl Runtime {
     /// when that binding is already live.
     pub async fn instantiate(
         &self,
+        owner: BindingOwner,
         request: BindingRequest,
         compiled: &Compiled,
         events: tokio::sync::mpsc::Sender<BindingEvent>,
@@ -394,7 +466,7 @@ impl Runtime {
         // One binding, one instance. Replacing a live binding silently would leave an instance
         // running that nothing could reach and nothing would stop, so the identifier is taken
         // before anything is started rather than checked before anything is awaited.
-        self.reserve(binding_id)?;
+        self.reserve(owner, binding_id)?;
 
         let handle = BindingHandle::start(
             request,
@@ -404,7 +476,7 @@ impl Runtime {
             FaultCounter::new(Arc::clone(&self.config.clock)),
             events,
         )
-        .inspect_err(|_| self.release(binding_id))?;
+        .inspect_err(|_| self.release(owner, binding_id))?;
         let handle = Arc::new(handle);
         match handle.ready(within).await {
             Ok(()) => {}
@@ -413,12 +485,37 @@ impl Runtime {
                 // run out, and joining here would hold its thread for as long as the instantiation
                 // it gave up on.
                 handle.signal_stop();
-                self.release(binding_id);
+                self.release(owner, binding_id);
                 return Err(error);
             }
         }
-        if let Ok(mut bindings) = self.bindings.lock() {
-            bindings.insert(binding_id, Registration::Live(Arc::clone(&handle)));
+        // The reservation is what this replaces. An owner that went away while its instance was
+        // starting took its reservation with it, and the instance it no longer has a use for is
+        // stopped here rather than left running for nobody.
+        let live = self
+            .bindings
+            .lock()
+            .is_ok_and(|mut bindings| match bindings.get(&binding_id) {
+                Some(Registration {
+                    owner: held,
+                    state: RegistrationState::Reserved,
+                }) if *held == owner => {
+                    bindings.insert(
+                        binding_id,
+                        Registration {
+                            owner,
+                            state: RegistrationState::Live(Arc::clone(&handle)),
+                        },
+                    );
+                    true
+                }
+                _ => false,
+            });
+        if !live {
+            handle.signal_stop();
+            return Err(RuntimeError::NoSuchBinding {
+                binding: binding_id.to_string(),
+            });
         }
         Ok(handle)
     }
@@ -436,6 +533,7 @@ impl Runtime {
     /// `deadline`.
     pub async fn prepare(
         &self,
+        owner: BindingOwner,
         request: BindingRequest,
         wasm: Arc<[u8]>,
         deadline: core::time::Duration,
@@ -445,7 +543,7 @@ impl Runtime {
         let compilation = self.compile(wasm)?;
         let compiled = compilation.wait(deadline).await?;
         let remaining = remaining_of(started, deadline)?;
-        self.instantiate(request, &compiled, events, remaining)
+        self.instantiate(owner, request, &compiled, events, remaining)
             .await
     }
 
@@ -454,22 +552,64 @@ impl Runtime {
     /// Blocks until the thread is gone, so a caller knows the instance is no longer running when
     /// this returns. The component's own state goes with it; nothing a decision depends on was in
     /// there, because pending and dispatch state is the worker broker's.
-    pub fn unbind(&self, binding_id: BindingId) -> bool {
-        let entry = self
-            .bindings
-            .lock()
-            .ok()
-            .and_then(|mut bindings| bindings.remove(&binding_id));
+    pub fn unbind(&self, owner: BindingOwner, binding_id: BindingId) -> bool {
+        let entry =
+            self.bindings
+                .lock()
+                .ok()
+                .and_then(|mut bindings| match bindings.get(&binding_id) {
+                    Some(held) if held.owner == owner => bindings.remove(&binding_id),
+                    _ => None,
+                });
         match entry {
-            Some(Registration::Live(handle)) => {
+            Some(Registration {
+                state: RegistrationState::Live(handle),
+                ..
+            }) => {
                 handle.stop();
                 true
             }
             // A reservation somebody is still preparing. Removing it is the whole of the removal:
             // the preparation will find its reservation gone and give the handle up.
-            Some(Registration::Reserved) => true,
+            Some(Registration {
+                state: RegistrationState::Reserved,
+                ..
+            }) => true,
             None => false,
         }
+    }
+
+    /// Removes every binding one owner holds, and stops them.
+    ///
+    /// What a connection's end costs: its own bindings and nothing else. Reservations go too, so a
+    /// preparation still running for a caller that has gone finds its reservation removed and stops
+    /// the instance it was about to hand over.
+    pub fn release_owner(&self, owner: BindingOwner) -> usize {
+        let handles: Vec<Arc<BindingHandle>> = self
+            .bindings
+            .lock()
+            .map(|mut bindings| {
+                let held: Vec<BindingId> = bindings
+                    .iter()
+                    .filter(|(_id, entry)| entry.owner == owner)
+                    .map(|(id, _entry)| *id)
+                    .collect();
+                held.into_iter()
+                    .filter_map(|id| match bindings.remove(&id) {
+                        Some(Registration {
+                            state: RegistrationState::Live(handle),
+                            ..
+                        }) => Some(handle),
+                        _ => None,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let stopped = handles.len();
+        for handle in handles {
+            handle.stop();
+        }
+        stopped
     }
 
     /// Removes every binding and stops every thread. Blocks, as [`Self::unbind`] does.
@@ -480,9 +620,9 @@ impl Runtime {
             .map(|mut bindings| {
                 bindings
                     .drain()
-                    .filter_map(|(_id, entry)| match entry {
-                        Registration::Live(handle) => Some(handle),
-                        Registration::Reserved => None,
+                    .filter_map(|(_id, entry)| match entry.state {
+                        RegistrationState::Live(handle) => Some(handle),
+                        RegistrationState::Reserved => None,
                     })
                     .collect()
             })
@@ -1497,7 +1637,10 @@ mod tests {
     fn unbinding_something_that_is_not_bound_says_so() {
         let (_directory, config) = config();
         let runtime = Runtime::new(config).expect("a runtime");
-        assert!(!runtime.unbind(BindingId::new(Uuid::from_bytes([9; 16]))));
+        let owner = BindingOwner::next();
+        assert!(!runtime.unbind(owner, BindingId::new(Uuid::from_bytes([9; 16]))));
+        assert_eq!(runtime.bindings_of(owner), 0);
+        assert_eq!(runtime.release_owner(owner), 0);
     }
 
     #[test]

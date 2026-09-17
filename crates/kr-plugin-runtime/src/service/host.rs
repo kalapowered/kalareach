@@ -19,8 +19,10 @@
 //! catalogue, and the host checks the file against that digest before it compiles anything, so the
 //! bytes that become machine code are the bytes the catalogue signed.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kr_ipc::endpoint::Listener;
 use kr_ipc::framed::{FrameReader, FrameWriter, split};
@@ -31,14 +33,18 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::Uuid;
 
 use crate::runtime::binding::{
-    BindingEvent, BindingId, BindingRequest, DEFAULT_EVENT_QUEUE, Runtime, RuntimeConfig,
+    BindingEvent, BindingId, BindingOwner, BindingRequest, DEFAULT_EVENT_QUEUE, Runtime,
+    RuntimeConfig, remaining_of,
 };
 use crate::runtime::budget::CallKind;
 use crate::runtime::compile::CompileOrigin;
 use crate::runtime::error::RuntimeError;
-use crate::runtime::host::{BindingActivity, BindingFacts, ScopedSourceEvent, SourceProvenance};
+use crate::runtime::host::{
+    BindingActivity, BindingFacts, MAX_NODE_BYTES, ScopedSourceEvent, SourceProvenance,
+};
 use crate::runtime::queue::Admission;
 use crate::service::launcher::{HostIdentity, LaunchError, LaunchResult};
+use crate::service::notices::{NoticeSink, NoticeStream, node_bytes};
 use crate::service::protocol::{
     BindingRegistration, CallValue, ComponentSource, Frame, HostHealth, Notice, Request,
     RequestBody, ResponseBody, WireFacts, WireNode, WireSourceEvent,
@@ -47,11 +53,37 @@ use crate::service::protocol::{
 /// How long a registration may keep a worker waiting.
 ///
 /// The compilation budget is what bounds the compile, and this is the same figure: a host that
-/// accepted a compile of up to that long has to be willing to wait for one. The worker's own
-/// deadline is a little longer again, so the answer a worker gets is the host's own rather than
-/// its patience running out first.
+/// accepted a compile of up to that long has to be willing to wait for one. It covers the whole
+/// registration -- reading the payload, compiling it, instantiating and binding -- rather than each
+/// stage in turn, because what the worker is waiting for is the registration. The worker's own
+/// deadline is a little longer again, so the answer a worker gets is the host's own rather than its
+/// patience running out first.
 pub const REGISTER_DEADLINE: core::time::Duration =
     core::time::Duration::from_millis(crate::runtime::compile::COMPILE_DEADLINE_MS);
+
+/// How many bindings one worker connection may hold.
+///
+/// A binding is an instance, a thread and a queue, and a connection that could register without
+/// limit could make this process hold without limit. The figure is far above what a session with
+/// rich bindings uses and far below what would exhaust a host.
+pub const MAX_BINDINGS_PER_CONNECTION: usize = 64;
+
+/// How many requests that enter a component one connection may have in flight.
+///
+/// Reading the next request never waits for the last one to finish, so that an observation, which
+/// enters no component, is never behind a call that does. What keeps that from being unbounded work
+/// is this: a connection with this many calls already running is told its next one is refused
+/// rather than having it queued behind the others.
+const MAX_CONCURRENT_CALLS: usize = 16;
+
+/// How long a connection's notices are given to finish being written once it is over.
+const NOTICE_DRAIN: core::time::Duration = core::time::Duration::from_secs(2);
+
+/// How much of a refusal is carried back to the worker.
+///
+/// A refusal names a component's own failure, and a component chooses those words. Clipping them
+/// keeps a response inside one frame whatever the component said.
+const MAX_REFUSAL_BYTES: usize = 4 * 1024;
 
 /// What the plugin host was started with.
 #[derive(Clone, Debug)]
@@ -134,6 +166,23 @@ impl PluginHost {
         shutdown: impl core::future::Future<Output = ()> + Send,
     ) -> LaunchResult<()> {
         let listener = Listener::bind(&self.config.endpoint)?;
+        self.serve_on(listener, shutdown).await
+    }
+
+    /// Serves workers on an endpoint this process already holds.
+    ///
+    /// The startup path uses this one. A host binds its endpoint before it reports itself and keeps
+    /// that listener through the report, so there is no moment between proving which process owns
+    /// the endpoint and answering on it during which another process could take it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaunchError::Endpoint`] when the listener fails.
+    pub async fn serve_on(
+        self: Arc<Self>,
+        listener: Listener,
+        shutdown: impl core::future::Future<Output = ()> + Send,
+    ) -> LaunchResult<()> {
         let mut shutdown = core::pin::pin!(shutdown);
         loop {
             tokio::select! {
@@ -159,70 +208,97 @@ impl PluginHost {
     async fn serve_connection(self: Arc<Self>, connection: kr_ipc::endpoint::Connection) {
         let (reader, writer) = split(connection, StreamKind::Control);
         let writer = Arc::new(tokio::sync::Mutex::new(writer));
-        let (notices, mut pending) = tokio::sync::mpsc::unbounded_channel::<Notice>();
-        let bindings: Arc<tokio::sync::Mutex<Vec<BindingId>>> =
-            Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let (sink, stream) = crate::service::notices::channel();
+        let served = Arc::new(Served {
+            owner: BindingOwner::next(),
+            notices: sink.clone(),
+            writer: Arc::clone(&writer),
+            work: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CALLS)),
+            bindings: BindingPlaces::default(),
+        });
 
         // One task writes notices, so a burst of document nodes from one binding cannot interleave
         // with another's inside a frame.
         let notice_writer = Arc::clone(&writer);
-        let notices_task = tokio::spawn(async move {
-            while let Some(notice) = pending.recv().await {
-                let mut writer = notice_writer.lock().await;
-                if writer.write_message(&Frame::Notice(notice)).await.is_err() {
-                    return;
-                }
-            }
-        });
+        let mut notices_task = tokio::spawn(write_notices(stream, notice_writer));
 
-        let outcome = self
-            .read_requests(reader, Arc::clone(&writer), &notices, Arc::clone(&bindings))
-            .await;
-        let _ = outcome;
-        drop(notices);
-        notices_task.abort();
+        Arc::clone(&self).read_requests(reader, &served).await;
+
+        // The queue is closed first, so the writer stops waiting for more; it is then given a
+        // bounded moment to finish what it holds before it is abandoned. A peer that has stopped
+        // reading does not get to keep this task alive.
+        sink.close();
+        if tokio::time::timeout(NOTICE_DRAIN, &mut notices_task)
+            .await
+            .is_err()
+        {
+            notices_task.abort();
+        }
 
         // The worker is gone. Its bindings go with it: a binding exists to serve one worker's
-        // connection, and nothing durable was in it.
-        let held = bindings.lock().await.clone();
-        for binding_id in held {
-            self.runtime.unbind(binding_id);
-        }
+        // connection, and nothing durable was in it. Stopping one joins its thread, so it happens
+        // off the executor.
+        let runtime = Arc::clone(&self.runtime);
+        let owner = served.owner;
+        let _stopped = tokio::task::spawn_blocking(move || runtime.release_owner(owner)).await;
     }
 
-    async fn read_requests(
-        &self,
-        mut reader: FrameReader,
-        writer: Arc<tokio::sync::Mutex<FrameWriter>>,
-        notices: &tokio::sync::mpsc::UnboundedSender<Notice>,
-        bindings: Arc<tokio::sync::Mutex<Vec<BindingId>>>,
-    ) -> LaunchResult<()> {
+    async fn read_requests(self: Arc<Self>, mut reader: FrameReader, served: &Arc<Served>) {
         loop {
             let request: Request = match reader.read_message().await {
                 Ok(request) => request,
                 // A closed connection or a frame this protocol does not admit. Either way this
                 // conversation is over; the union is closed so an unrecognised frame is a refusal
                 // rather than something to guess at.
-                Err(_error) => return Ok(()),
+                Err(_error) => return,
             };
             let reply_to = request.request_id;
-            let body = self
-                .handle(request.body, notices, &bindings)
-                .await
-                .unwrap_or_else(|(request, detail, disabled)| ResponseBody::Refused {
-                    request,
-                    detail,
-                    disabled,
-                });
-            let mut writer = writer.lock().await;
-            if writer
-                .write_message(&Frame::Response { reply_to, body })
-                .await
-                .is_err()
-            {
-                return Ok(());
+            let name = request.body.name();
+            if immediate(&request.body) {
+                // Answered on the reading task, because none of these enters a component: the
+                // answer is this host's own and it is already known.
+                let body = self.answer(request.body, served).await;
+                if !respond(&served.writer, reply_to, name, body).await {
+                    return;
+                }
+                continue;
             }
+            // Everything that can enter a component runs in a task of its own, so reading the next
+            // request never waits for it. That is what keeps an observation from queueing behind a
+            // snapshot, and a registration from delaying either.
+            let Ok(permit) = Arc::clone(&served.work).try_acquire_owned() else {
+                let body = ResponseBody::Refused {
+                    request: name.to_owned(),
+                    detail: format!(
+                        "this connection already has the {MAX_CONCURRENT_CALLS} calls it may have running"
+                    ),
+                    disabled: false,
+                };
+                if !respond(&served.writer, reply_to, name, body).await {
+                    return;
+                }
+                continue;
+            };
+            let host = Arc::clone(&self);
+            let served = Arc::clone(served);
+            tokio::spawn(async move {
+                let _permit = permit;
+                let body = host.answer(request.body, &served).await;
+                let _delivered = respond(&served.writer, reply_to, name, body).await;
+            });
         }
+    }
+
+    /// Answers one request, turning a refusal into the answer that carries it.
+    async fn answer(&self, body: RequestBody, served: &Arc<Served>) -> ResponseBody {
+        let name = body.name();
+        self.handle(body, served)
+            .await
+            .unwrap_or_else(|(detail, disabled)| ResponseBody::Refused {
+                request: name.to_owned(),
+                detail: clipped(detail),
+                disabled,
+            })
     }
 
     /// Starts a task that stamps one binding's events with its identifier.
@@ -231,13 +307,15 @@ impl PluginHost {
     /// one binding's fault to another.
     fn forward_notices(
         binding_id: BindingId,
-        notices: tokio::sync::mpsc::UnboundedSender<Notice>,
+        notices: NoticeSink,
     ) -> tokio::sync::mpsc::Sender<BindingEvent> {
         let (events, mut pending) = tokio::sync::mpsc::channel::<BindingEvent>(DEFAULT_EVENT_QUEUE);
         tokio::spawn(async move {
             while let Some(event) = pending.recv().await {
-                if notices.send(notice_of(binding_id, event)).is_err() {
-                    return;
+                for notice in notices_of(binding_id, event) {
+                    if !notices.send(notice) {
+                        return;
+                    }
                 }
             }
         });
@@ -247,15 +325,12 @@ impl PluginHost {
     async fn handle(
         &self,
         body: RequestBody,
-        notices: &tokio::sync::mpsc::UnboundedSender<Notice>,
-        bindings: &Arc<tokio::sync::Mutex<Vec<BindingId>>>,
-    ) -> Result<ResponseBody, (String, String, bool)> {
-        let name = body.name().to_owned();
+        served: &Arc<Served>,
+    ) -> Result<ResponseBody, (String, bool)> {
         match body {
             RequestBody::Hello { protocol } => {
                 if protocol != crate::service::protocol::PROTOCOL {
                     return Err((
-                        name,
                         format!(
                             "this host speaks {} and the caller offered {protocol}",
                             crate::service::protocol::PROTOCOL
@@ -272,56 +347,15 @@ impl PluginHost {
                 let proof = self
                     .identity
                     .answer(&nonce, &self.config.endpoint.as_text())
-                    .map_err(|error| (name, error.to_string(), false))?;
+                    .map_err(|error| (error.to_string(), false))?;
                 Ok(ResponseBody::Verified(Box::new(proof)))
             }
             RequestBody::RegisterBinding(registration) => {
-                let BindingRegistration {
-                    binding_id,
-                    identity,
-                    facts,
-                    executable,
-                    component,
-                } = *registration;
-                let wasm = self
-                    .read_component(&component)
-                    .map_err(|detail| (name.clone(), detail, false))?;
-                // Two steps rather than one, because they are two steps: the compile happens on a
-                // background thread under its own budget, and only once an instance exists does any
-                // call budget start.
-                let compiled = self
-                    .runtime
-                    .compile(wasm)
-                    .map_err(|error| (name.clone(), error.to_string(), false))?
-                    .wait(REGISTER_DEADLINE)
-                    .await
-                    .map_err(|error| (name.clone(), error.to_string(), false))?;
-                let binding = BindingId::new(binding_id);
-                let request = BindingRequest {
-                    binding_id: binding,
-                    identity,
-                    facts: facts_of(&facts),
-                    executable,
-                };
-                let events = Self::forward_notices(binding, notices.clone());
-                self.runtime
-                    .instantiate(request, &compiled, events, REGISTER_DEADLINE)
-                    .await
-                    .map_err(|error| (name, error.to_string(), false))?;
-                bindings.lock().await.push(binding);
-                Ok(ResponseBody::Registered {
-                    origin: match compiled.origin {
-                        CompileOrigin::Compiled => "compiled".to_owned(),
-                        CompileOrigin::Cached => "cached".to_owned(),
-                    },
-                    elapsed_ms: compiled.elapsed_ms,
-                })
+                self.register(*registration, served).await
             }
             RequestBody::Event { binding_id, event } => {
-                let binding = self
-                    .binding(binding_id)
-                    .map_err(|detail| (name.clone(), detail, false))?;
-                let scoped = event_of(&event).map_err(|detail| (name, detail, false))?;
+                let binding = self.binding(served.owner, binding_id)?;
+                let scoped = event_of(&event).map_err(|detail| (detail, false))?;
                 let admission = binding.enqueue_observation(scoped);
                 Ok(admission_of(admission))
             }
@@ -329,60 +363,53 @@ impl PluginHost {
                 binding_id,
                 deadline_ms,
             } => {
-                let binding = self
-                    .binding(binding_id)
-                    .map_err(|detail| (name.clone(), detail, false))?;
+                let binding = self.binding(served.owner, binding_id)?;
                 let result = binding
                     .snapshot(core::time::Duration::from_millis(deadline_ms))
                     .await;
-                Ok(called_of(
-                    result
-                        .map(|result| (result.answer.map(|()| CallValue::Document), result.nodes)),
-                    &name,
-                )?)
+                called_of(result.map(|result| result.answer.map(|()| CallValue::Document)))
             }
             RequestBody::Checkpoint {
                 binding_id,
                 deadline_ms,
             } => {
-                let binding = self
-                    .binding(binding_id)
-                    .map_err(|detail| (name.clone(), detail, false))?;
+                let binding = self.binding(served.owner, binding_id)?;
                 let result = binding
                     .checkpoint(core::time::Duration::from_millis(deadline_ms))
                     .await;
-                Ok(called_of(
-                    result.map(|result| (result.answer.map(CallValue::State), result.nodes)),
-                    &name,
-                )?)
+                called_of(result.map(|result| result.answer.map(CallValue::State)))
             }
             RequestBody::Restore {
                 binding_id,
                 state,
                 deadline_ms,
             } => {
-                let binding = self
-                    .binding(binding_id)
-                    .map_err(|detail| (name.clone(), detail, false))?;
+                let binding = self.binding(served.owner, binding_id)?;
                 let result = binding
                     .restore(state, core::time::Duration::from_millis(deadline_ms))
                     .await;
-                Ok(called_of(
-                    result
-                        .map(|result| (result.answer.map(|()| CallValue::Document), result.nodes)),
-                    &name,
-                )?)
+                called_of(result.map(|result| result.answer.map(|()| CallValue::Document)))
             }
             RequestBody::Unbind { binding_id } => {
-                let existed = self.runtime.unbind(BindingId::new(binding_id));
-                bindings
-                    .lock()
+                // Removing a binding waits for its thread, so it happens off the executor.
+                let runtime = Arc::clone(&self.runtime);
+                let owner = served.owner;
+                let binding = BindingId::new(binding_id);
+                let existed = tokio::task::spawn_blocking(move || runtime.unbind(owner, binding))
                     .await
-                    .retain(|held| held.get() != binding_id);
+                    .unwrap_or(false);
+                if existed {
+                    served.bindings.give_back();
+                }
                 Ok(ResponseBody::Unbound { existed })
             }
             RequestBody::Health => Ok(ResponseBody::Health(Box::new(HostHealth {
                 live_bindings: self.runtime.live_bindings() as u64,
+                connection_bindings: served.bindings.taken() as u64,
+                binding_bound: MAX_BINDINGS_PER_CONNECTION as u64,
+                resident_components: self.runtime.cache().resident() as u64,
+                queued_notice_bytes: served.notices.held_bytes(),
+                dropped_documents: served.notices.dropped_documents(),
                 engine_version: self.runtime.engine().version().to_owned(),
                 target: self.runtime.engine().target().to_owned(),
                 engine_compatibility: self.runtime.engine().compatibility().to_owned(),
@@ -390,6 +417,68 @@ impl PluginHost {
                 deadlines_enforceable: self.runtime.engine().deadlines_enforceable(),
             }))),
         }
+    }
+
+    /// Registers one binding inside one deadline.
+    ///
+    /// The deadline is absolute across every stage: reading the payload, compiling it, and creating
+    /// and binding the instance. Giving each stage the whole figure would let a registration take
+    /// three times what the worker was told to expect, and the worker would give up first.
+    async fn register(
+        &self,
+        registration: BindingRegistration,
+        served: &Arc<Served>,
+    ) -> Result<ResponseBody, (String, bool)> {
+        let started = std::time::Instant::now();
+        let BindingRegistration {
+            binding_id,
+            identity,
+            facts,
+            executable,
+            component,
+        } = registration;
+        let admitted = served.bindings.admit()?;
+
+        // Reading a file is blocking work, and a payload is up to sixteen mebibytes. Neither
+        // belongs on the executor that is reading this connection's next request.
+        let root = self.config.packages_root.clone();
+        let wasm = tokio::task::spawn_blocking(move || read_component(&root, &component))
+            .await
+            .map_err(|error| (format!("the payload could not be read: {error}"), false))?
+            .map_err(|detail| (detail, false))?;
+
+        // Two steps rather than one, because they are two steps: the compile happens on a
+        // background thread under its own budget, and only once an instance exists does any
+        // call budget start.
+        let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
+        let compiled = self
+            .runtime
+            .compile(wasm)
+            .map_err(refusal)?
+            .wait(remaining)
+            .await
+            .map_err(refusal)?;
+        let binding = BindingId::new(binding_id);
+        let request = BindingRequest {
+            binding_id: binding,
+            identity,
+            facts: facts_of(&facts),
+            executable,
+        };
+        let events = Self::forward_notices(binding, served.notices.clone());
+        let remaining = remaining_of(started, REGISTER_DEADLINE).map_err(refusal)?;
+        self.runtime
+            .instantiate(served.owner, request, &compiled, events, remaining)
+            .await
+            .map_err(refusal)?;
+        admitted.keep();
+        Ok(ResponseBody::Registered {
+            origin: match compiled.origin {
+                CompileOrigin::Compiled => "compiled".to_owned(),
+                CompileOrigin::Cached => "cached".to_owned(),
+            },
+            elapsed_ms: compiled.elapsed_ms,
+        })
     }
 
     fn descriptor(&self) -> crate::service::protocol::HostDescriptor {
@@ -408,96 +497,300 @@ impl PluginHost {
 
     fn binding(
         &self,
+        owner: BindingOwner,
         binding_id: Uuid,
-    ) -> Result<Arc<crate::runtime::binding::BindingHandle>, String> {
+    ) -> Result<Arc<crate::runtime::binding::BindingHandle>, (String, bool)> {
         self.runtime
-            .binding(BindingId::new(binding_id))
+            .binding(owner, BindingId::new(binding_id))
             .ok_or_else(|| {
-                RuntimeError::NoSuchBinding {
-                    binding: binding_id.to_string(),
-                }
-                .to_string()
+                (
+                    RuntimeError::NoSuchBinding {
+                        binding: binding_id.to_string(),
+                    }
+                    .to_string(),
+                    false,
+                )
             })
-    }
-
-    /// Reads a component payload, refusing anything outside the packages directory.
-    fn read_component(&self, source: &ComponentSource) -> Result<Arc<[u8]>, String> {
-        let path = Path::new(&source.path);
-        let root = self
-            .config
-            .packages_root
-            .canonicalize()
-            .unwrap_or_else(|_| self.config.packages_root.clone());
-        let resolved = path
-            .canonicalize()
-            .map_err(|error| format!("{} is unreadable: {error}", path.display()))?;
-        if !resolved.starts_with(&root) {
-            return Err(format!(
-                "{} is outside the packages directory {}",
-                resolved.display(),
-                root.display()
-            ));
-        }
-        if source.bytes > crate::runtime::compile::MAX_COMPONENT_BYTES {
-            return Err(format!(
-                "the component declares {} bytes, over the {} byte compilation bound",
-                source.bytes,
-                crate::runtime::compile::MAX_COMPONENT_BYTES
-            ));
-        }
-        let bytes = std::fs::read(&resolved)
-            .map_err(|error| format!("{} is unreadable: {error}", resolved.display()))?;
-        if bytes.len() as u64 != source.bytes {
-            return Err(format!(
-                "{} is {} bytes and the caller verified {}",
-                resolved.display(),
-                bytes.len(),
-                source.bytes
-            ));
-        }
-        // The digest the caller verified against the catalogue. Bytes that do not match it never
-        // reach the compiler, so what becomes machine code is what the catalogue signed.
-        let digest = PayloadDigest::of(&bytes);
-        if digest != source.digest {
-            return Err(format!(
-                "{} is not the payload the caller verified",
-                resolved.display()
-            ));
-        }
-        Ok(Arc::from(bytes))
     }
 }
 
-fn called_of(
-    result: Result<
-        (
-            Result<CallValue, String>,
-            Vec<crate::runtime::host::EmittedNode>,
-        ),
-        RuntimeError,
-    >,
+/// What one worker connection holds.
+struct Served {
+    /// Who the bindings on this connection belong to.
+    owner: BindingOwner,
+    /// Where this connection's notices are put.
+    notices: NoticeSink,
+    /// The one writer, so two answers never interleave inside a frame.
+    writer: Arc<tokio::sync::Mutex<FrameWriter>>,
+    /// How much work that enters a component this connection may have running.
+    work: Arc<tokio::sync::Semaphore>,
+    /// How many bindings it holds.
+    bindings: BindingPlaces,
+}
+
+/// How many bindings one connection holds, and how many it may.
+#[derive(Debug, Default)]
+struct BindingPlaces {
+    held: AtomicUsize,
+}
+
+/// One taken place, given back if its registration does not finish.
+struct Place<'a> {
+    places: &'a BindingPlaces,
+    kept: bool,
+}
+
+impl Place<'_> {
+    /// Keeps the place: the binding exists now.
+    fn keep(mut self) {
+        self.kept = true;
+    }
+}
+
+impl Drop for Place<'_> {
+    fn drop(&mut self) {
+        if !self.kept {
+            self.places.give_back();
+        }
+    }
+}
+
+impl BindingPlaces {
+    /// Takes one place, or says they are all taken.
+    fn admit(&self) -> Result<Place<'_>, (String, bool)> {
+        self.held
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                (held < MAX_BINDINGS_PER_CONNECTION).then_some(held + 1)
+            })
+            .map(|_held| Place {
+                places: self,
+                kept: false,
+            })
+            .map_err(|held| {
+                (
+                    format!(
+                        "this connection holds {held} bindings, which is the {MAX_BINDINGS_PER_CONNECTION} it may hold"
+                    ),
+                    false,
+                )
+            })
+    }
+
+    /// Gives one place back.
+    fn give_back(&self) {
+        let _held = self
+            .held
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |held| {
+                held.checked_sub(1)
+            });
+    }
+
+    /// Returns how many places are taken.
+    fn taken(&self) -> usize {
+        self.held.load(Ordering::Acquire)
+    }
+}
+
+/// Writes one connection's notices, one frame at a time.
+async fn write_notices(mut notices: NoticeStream, writer: Arc<tokio::sync::Mutex<FrameWriter>>) {
+    while let Some(notice) = notices.recv().await {
+        let mut writer = writer.lock().await;
+        if writer.write_message(&Frame::Notice(notice)).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Writes one answer, and says whether the connection is still usable.
+///
+/// An answer that will not fit a frame is this host's failure to bound something, not the
+/// connection's end: the caller is told so by name and the connection carries on.
+async fn respond(
+    writer: &Arc<tokio::sync::Mutex<FrameWriter>>,
+    reply_to: u64,
     name: &str,
-) -> Result<ResponseBody, (String, String, bool)> {
+    body: ResponseBody,
+) -> bool {
+    let mut writer = writer.lock().await;
+    match writer
+        .write_message(&Frame::Response { reply_to, body })
+        .await
+    {
+        Ok(()) => true,
+        Err(kr_ipc::IpcError::Frame(error)) => {
+            let refused = ResponseBody::Refused {
+                request: name.to_owned(),
+                detail: format!("this host could not deliver its own answer: {error}"),
+                disabled: false,
+            };
+            writer
+                .write_message(&Frame::Response {
+                    reply_to,
+                    body: refused,
+                })
+                .await
+                .is_ok()
+        }
+        Err(_error) => false,
+    }
+}
+
+/// Returns true for the requests this host answers without entering a component.
+///
+/// An observation is one of them: it is a queue push, and answering it on the reading task is what
+/// makes a worker's delivery independent of whatever a component is doing.
+const fn immediate(body: &RequestBody) -> bool {
+    matches!(
+        body,
+        RequestBody::Hello { .. }
+            | RequestBody::Verify { .. }
+            | RequestBody::Event { .. }
+            | RequestBody::Health
+    )
+}
+
+/// Turns a runtime failure into a refusal, saying whether the binding is now disabled.
+fn refusal(error: RuntimeError) -> (String, bool) {
+    let disabled = matches!(error, RuntimeError::Disabled { .. });
+    (error.to_string(), disabled)
+}
+
+/// Returns `text`, or as much of it as one refusal carries.
+fn clipped(text: String) -> String {
+    if text.len() <= MAX_REFUSAL_BYTES {
+        return text;
+    }
+    let mut end = MAX_REFUSAL_BYTES;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{} (and {} more bytes)", &text[..end], text.len() - end)
+}
+
+/// Reads a component payload, refusing anything outside the packages directory.
+///
+/// Blocking work, called off the executor. What it refuses, in order: a path that does not resolve
+/// inside the packages directory, something that is not a regular file, a length the caller did not
+/// declare, more bytes than this host compiles, and bytes that are not the payload whose digest the
+/// caller verified against the catalogue. The digest is taken over the bytes this read returned and
+/// no others, so a file replaced between the check and the read is refused by its contents.
+fn read_component(root: &Path, source: &ComponentSource) -> Result<Arc<[u8]>, String> {
+    if source.bytes > crate::runtime::compile::MAX_COMPONENT_BYTES {
+        return Err(format!(
+            "the component declares {} bytes, over the {} byte compilation bound",
+            source.bytes,
+            crate::runtime::compile::MAX_COMPONENT_BYTES
+        ));
+    }
+    let path = Path::new(&source.path);
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let resolved = path
+        .canonicalize()
+        .map_err(|error| format!("{} is unreadable: {error}", path.display()))?;
+    if !resolved.starts_with(&root) {
+        return Err(format!(
+            "{} is outside the packages directory {}",
+            resolved.display(),
+            root.display()
+        ));
+    }
+
+    let mut file = std::fs::File::open(&resolved)
+        .map_err(|error| format!("{} is unreadable: {error}", resolved.display()))?;
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("{} is unreadable: {error}", resolved.display()))?;
+    // A directory, a device or a named pipe is not a component. A pipe matters most: reading one
+    // would wait for a writer that may never come, and no length would bound it.
+    if !opened.is_file() {
+        return Err(format!(
+            "{} is not a regular file, and a component payload is",
+            resolved.display()
+        ));
+    }
+    if !same_file(&opened, &resolved) {
+        return Err(format!(
+            "{} was replaced while it was being opened",
+            resolved.display()
+        ));
+    }
+    if opened.len() != source.bytes {
+        return Err(format!(
+            "{} is {} bytes and the caller verified {}",
+            resolved.display(),
+            opened.len(),
+            source.bytes
+        ));
+    }
+
+    // Bounded by what the caller declared rather than by what the file says now, and read one byte
+    // past it so a file that grew between the check and the read is refused rather than truncated.
+    let limit = source.bytes.saturating_add(1);
+    let mut bytes = Vec::with_capacity(usize::try_from(source.bytes).unwrap_or(0));
+    file.by_ref()
+        .take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("{} is unreadable: {error}", resolved.display()))?;
+    if bytes.len() as u64 != source.bytes {
+        return Err(format!(
+            "{} read as {} bytes and the caller verified {}",
+            resolved.display(),
+            bytes.len(),
+            source.bytes
+        ));
+    }
+
+    // The digest the caller verified against the catalogue, over the bytes this read returned.
+    // Bytes that do not match it never reach the compiler, so what becomes machine code is what the
+    // catalogue signed.
+    let digest = PayloadDigest::of(&bytes);
+    if digest != source.digest {
+        return Err(format!(
+            "{} is not the payload the caller verified",
+            resolved.display()
+        ));
+    }
+    Ok(Arc::from(bytes))
+}
+
+/// Returns whether an open handle and a path still name the same file.
+///
+/// A canonical path is checked against the packages directory before the file is opened, and the
+/// two steps are not one operation. Comparing what was opened with what the path names now closes
+/// the window in which a component of that path could have been replaced.
+#[cfg(unix)]
+fn same_file(opened: &std::fs::Metadata, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata(path)
+        .is_ok_and(|named| named.dev() == opened.dev() && named.ino() == opened.ino())
+}
+
+#[cfg(not(unix))]
+fn same_file(opened: &std::fs::Metadata, path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|named| {
+        named.len() == opened.len() && named.modified().ok() == opened.modified().ok()
+    })
+}
+
+/// Turns what a call produced into the answer that carries it.
+///
+/// The document the call drew is not in here. Nodes travel as notices, chunked to fit a frame, and
+/// they have already been sent by the time this is built: carrying them again in the response would
+/// deliver every document twice and would make an answer that fitted the output budget one the
+/// protocol could not deliver.
+fn called_of(
+    result: Result<Result<CallValue, String>, RuntimeError>,
+) -> Result<ResponseBody, (String, bool)> {
     match result {
-        Ok((answer, nodes)) => {
-            let nodes = nodes.iter().map(node_of).collect();
-            match answer {
-                Ok(value) => Ok(ResponseBody::Called {
-                    value: Some(value),
-                    fault: None,
-                    nodes,
-                }),
-                Err(fault) => Ok(ResponseBody::Called {
-                    value: None,
-                    fault: Some(fault),
-                    nodes,
-                }),
-            }
-        }
-        Err(error) => {
-            let disabled = matches!(error, RuntimeError::Disabled { .. });
-            Err((name.to_owned(), error.to_string(), disabled))
-        }
+        Ok(Ok(value)) => Ok(ResponseBody::Called {
+            value: Some(value),
+            fault: None,
+        }),
+        Ok(Err(fault)) => Ok(ResponseBody::Called {
+            value: None,
+            fault: Some(clipped(fault)),
+        }),
+        Err(error) => Err(refusal(error)),
     }
 }
 
@@ -521,39 +814,67 @@ fn admission_of(admission: Admission) -> ResponseBody {
     }
 }
 
-fn notice_of(binding_id: BindingId, event: BindingEvent) -> Notice {
+/// Turns one thing a binding produced into the notices that carry it.
+///
+/// A document becomes as many notices as it takes for each to fit one frame. One call may draw a
+/// mebibyte across many nodes, and a control frame carries a mebibyte including its envelope, so a
+/// document sent whole would be a document that fitted every stated bound and still could not be
+/// delivered. Each node is already bounded below one frame, so every chunk holds at least one node.
+fn notices_of(binding_id: BindingId, event: BindingEvent) -> Vec<Notice> {
     let binding_id = binding_id.get();
     match event {
-        BindingEvent::Document { call, nodes } => Notice::Document {
-            binding_id,
-            call: call.as_str().to_owned(),
-            nodes: nodes.iter().map(node_of).collect(),
-        },
-        BindingEvent::Gap(gap) => Notice::Gap {
+        BindingEvent::Document { call, nodes } => {
+            let call = call.as_str().to_owned();
+            let mut chunks: Vec<Notice> = Vec::new();
+            let mut holding: Vec<WireNode> = Vec::new();
+            let mut held = 0;
+            for node in nodes.iter().map(node_of) {
+                let cost = node_bytes(&node);
+                if !holding.is_empty() && held + cost > MAX_NODE_BYTES {
+                    chunks.push(Notice::Document {
+                        binding_id,
+                        call: call.clone(),
+                        nodes: core::mem::take(&mut holding),
+                    });
+                    held = 0;
+                }
+                held += cost;
+                holding.push(node);
+            }
+            if !holding.is_empty() {
+                chunks.push(Notice::Document {
+                    binding_id,
+                    call,
+                    nodes: holding,
+                });
+            }
+            chunks
+        }
+        BindingEvent::Gap(gap) => vec![Notice::Gap {
             binding_id,
             events: gap.events,
             bytes: gap.bytes,
-        },
+        }],
         // A dropped presentation is a gap in what the worker has seen rather than in what the
         // component has: no event was lost, and the component is rebuilding its document. The
         // worker is told by the same notice, with no events named, so it knows to expect a fresh
         // document rather than a continuation.
-        BindingEvent::PresentationDropped { documents } => Notice::Gap {
+        BindingEvent::PresentationDropped { documents } => vec![Notice::Gap {
             binding_id,
             events: 0,
             bytes: u64::from(documents),
-        },
+        }],
         BindingEvent::Fault {
             call,
             detail,
             faults_in_window,
-        } => Notice::Fault {
+        } => vec![Notice::Fault {
             binding_id,
             call: call.as_str().to_owned(),
             detail,
             faults_in_window,
-        },
-        BindingEvent::Disabled { reason } => Notice::Disabled { binding_id, reason },
+        }],
+        BindingEvent::Disabled { reason } => vec![Notice::Disabled { binding_id, reason }],
     }
 }
 
@@ -761,60 +1082,210 @@ mod tests {
         let elsewhere = directory.path().join("elsewhere.wasm");
         std::fs::write(&elsewhere, b"not a component").expect("a file");
 
-        let identity = HostIdentity::generate(kr_protocol::ids::EnvironmentId::new(
-            kr_protocol::scalars::Uuid::from_bytes([1; 16]),
-        ))
-        .expect("an identity");
-        let host = PluginHost::new(
-            identity,
-            HostConfig {
-                endpoint: Endpoint::from_path(directory.path().join("p.sock"))
-                    .expect("an endpoint"),
-                packages_root: packages.clone(),
-                cache_root: directory.path().join("cache"),
-            },
-        )
-        .expect("a host");
-
-        let error = host
-            .read_component(&ComponentSource {
+        let error = read_component(
+            &packages,
+            &ComponentSource {
                 path: elsewhere.display().to_string(),
                 digest: PayloadDigest::of(b"not a component"),
                 bytes: 15,
-            })
-            .expect_err("a path outside the packages directory is refused");
+            },
+        )
+        .expect_err("a path outside the packages directory is refused");
         assert!(error.contains("outside the packages directory"));
 
         // Inside it, the digest still has to match what the caller verified.
         let inside = packages.join("component.wasm");
         std::fs::write(&inside, b"not a component").expect("a file");
-        let error = host
-            .read_component(&ComponentSource {
+        let error = read_component(
+            &packages,
+            &ComponentSource {
                 path: inside.display().to_string(),
                 digest: PayloadDigest::of(b"something else entirely"),
                 bytes: 15,
-            })
-            .expect_err("a digest that does not match is refused");
+            },
+        )
+        .expect_err("a digest that does not match is refused");
         assert!(error.contains("not the payload the caller verified"));
 
         // And so does the length.
-        let error = host
-            .read_component(&ComponentSource {
+        let error = read_component(
+            &packages,
+            &ComponentSource {
                 path: inside.display().to_string(),
                 digest: PayloadDigest::of(b"not a component"),
                 bytes: 99,
-            })
-            .expect_err("a length that does not match is refused");
+            },
+        )
+        .expect_err("a length that does not match is refused");
         assert!(error.contains("the caller verified"));
 
         // With both right, the bytes are read.
-        let bytes = host
-            .read_component(&ComponentSource {
+        let bytes = read_component(
+            &packages,
+            &ComponentSource {
                 path: inside.display().to_string(),
                 digest: PayloadDigest::of(b"not a component"),
                 bytes: 15,
-            })
-            .expect("the payload is read");
+            },
+        )
+        .expect("the payload is read");
         assert_eq!(&bytes[..], b"not a component");
+    }
+
+    #[test]
+    fn a_declared_length_is_refused_before_anything_is_read() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let packages = directory.path().join("packages");
+        std::fs::create_dir_all(&packages).expect("the packages directory");
+        let inside = packages.join("component.wasm");
+        std::fs::write(&inside, b"small").expect("a file");
+
+        // The declared length is over the compilation bound. Nothing is opened and nothing is
+        // allocated: the refusal is the declaration's own.
+        let error = read_component(
+            &packages,
+            &ComponentSource {
+                path: inside.display().to_string(),
+                digest: PayloadDigest::of(b"small"),
+                bytes: crate::runtime::compile::MAX_COMPONENT_BYTES + 1,
+            },
+        )
+        .expect_err("a declared length over the bound is refused");
+        assert!(error.contains("over the"));
+        assert!(error.contains("compilation bound"));
+    }
+
+    #[test]
+    fn something_that_is_not_a_regular_file_is_refused_without_being_read() {
+        let directory = tempfile::tempdir().expect("a temporary directory");
+        let packages = directory.path().join("packages");
+        std::fs::create_dir_all(&packages).expect("the packages directory");
+        // A directory where a payload should be. On a Unix host this opens and then reads nothing
+        // useful; a named pipe would wait for a writer that never comes. Neither is a component,
+        // and the file kind is what says so before anything is read.
+        let not_a_payload = packages.join("component.wasm");
+        std::fs::create_dir(&not_a_payload).expect("a directory");
+
+        let error = read_component(
+            &packages,
+            &ComponentSource {
+                path: not_a_payload.display().to_string(),
+                digest: PayloadDigest::of(b""),
+                bytes: 0,
+            },
+        )
+        .expect_err("a directory is not a component payload");
+        assert!(
+            error.contains("not a regular file"),
+            "the refusal was {error}"
+        );
+    }
+
+    #[test]
+    fn a_document_is_split_into_frames_that_can_be_delivered() {
+        let binding = BindingId::new(Uuid::from_bytes([4; 16]));
+        // Four nodes, each a third of a frame: more than one frame holds, so more than one notice.
+        let big = usize::try_from(MAX_NODE_BYTES / 3).expect("a usize bound");
+        let nodes: Vec<crate::runtime::host::EmittedNode> = (0..4)
+            .map(|index| crate::runtime::host::EmittedNode {
+                node_id: format!("n{index}"),
+                node_revision: 1,
+                body_json: "x".repeat(big),
+            })
+            .collect();
+        let notices = notices_of(
+            binding,
+            BindingEvent::Document {
+                call: CallKind::Snapshot,
+                nodes,
+            },
+        );
+        assert!(notices.len() > 1, "the document was not split");
+        let mut carried = 0;
+        for notice in &notices {
+            let Notice::Document { nodes, .. } = notice else {
+                panic!("a document became {notice:?}");
+            };
+            let bytes: u64 = nodes.iter().map(node_bytes).sum();
+            assert!(bytes <= MAX_NODE_BYTES, "a frame would carry {bytes} bytes");
+            carried += nodes.len();
+        }
+        assert_eq!(carried, 4, "a node was lost in the splitting");
+    }
+
+    #[test]
+    fn one_node_is_one_notice_and_the_other_kinds_are_left_alone() {
+        let binding = BindingId::new(Uuid::from_bytes([5; 16]));
+        let notices = notices_of(
+            binding,
+            BindingEvent::Document {
+                call: CallKind::Observe,
+                nodes: vec![crate::runtime::host::EmittedNode {
+                    node_id: "n0".to_owned(),
+                    node_revision: 3,
+                    body_json: "{}".to_owned(),
+                }],
+            },
+        );
+        assert_eq!(notices.len(), 1);
+        let faults = notices_of(
+            binding,
+            BindingEvent::Fault {
+                call: CallKind::Observe,
+                detail: "the component trapped".to_owned(),
+                faults_in_window: 2,
+            },
+        );
+        assert_eq!(faults.len(), 1);
+        assert!(matches!(faults[0], Notice::Fault { .. }));
+    }
+
+    #[test]
+    fn an_observation_is_answered_without_entering_a_component() {
+        let binding_id = Uuid::from_bytes([6; 16]);
+        assert!(immediate(&RequestBody::Event {
+            binding_id,
+            event: WireSourceEvent {
+                handle: kr_protocol::ids::SourceEventHandle::new("se-1").expect("a bounded handle"),
+                provenance: "terminal_scrape".to_owned(),
+                observed_at_ms: 0,
+                request_id: None,
+                bytes: Vec::new(),
+            },
+        }));
+        assert!(immediate(&RequestBody::Health));
+        // And everything that can enter one is not: those run in a task of their own so that the
+        // observation above never queues behind them.
+        assert!(!immediate(&RequestBody::Snapshot {
+            binding_id,
+            deadline_ms: 100,
+        }));
+        assert!(!immediate(&RequestBody::Unbind { binding_id }));
+    }
+
+    #[test]
+    fn a_connection_holds_the_bindings_it_may_hold_and_no_more() {
+        let places = BindingPlaces::default();
+        let mut kept = Vec::new();
+        for _ in 0..MAX_BINDINGS_PER_CONNECTION {
+            kept.push(places.admit().expect("a place"));
+        }
+        assert_eq!(places.taken(), MAX_BINDINGS_PER_CONNECTION);
+        let (detail, _disabled) = places.admit().err().expect("the places are all taken");
+        assert!(detail.contains("may hold"));
+
+        // A registration that did not finish gives its place back.
+        kept.pop();
+        assert_eq!(places.taken(), MAX_BINDINGS_PER_CONNECTION - 1);
+        let taken = places.admit().expect("the place came back");
+        // And one that did keeps it.
+        taken.keep();
+        assert_eq!(places.taken(), MAX_BINDINGS_PER_CONNECTION);
+        for place in kept {
+            place.keep();
+        }
+        // Unbinding is what gives a kept place back.
+        places.give_back();
+        assert_eq!(places.taken(), MAX_BINDINGS_PER_CONNECTION - 1);
     }
 }

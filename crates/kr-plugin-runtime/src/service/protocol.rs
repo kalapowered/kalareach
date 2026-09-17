@@ -102,6 +102,25 @@ pub fn rendezvous_elements(
     ])
 }
 
+/// What a launcher sends back once it has accepted a claim and published the descriptor.
+///
+/// It carries no signature and needs none. The rendezvous endpoint is inside the owner-only runtime
+/// directory and the host checked the peer's credentials before it wrote its claim, so the only
+/// process that can answer on that connection is one running as this user with a descriptor of the
+/// launcher's own. What the acknowledgement settles is ordering, not identity: a host that starts
+/// serving before the launcher has accepted it would be answering workers as a process the daemon
+/// may still refuse.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RendezvousAccepted {
+    /// The reservation the claim was accepted for.
+    pub reservation_id: ReservationId,
+    /// The environment it serves.
+    pub environment_id: EnvironmentId,
+    /// The endpoint the launcher published for it.
+    pub endpoint: String,
+}
+
 /// The plugin host's answer to a verification challenge.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -390,6 +409,11 @@ pub enum ResponseBody {
         lost_bytes: u64,
     },
     /// A call answered.
+    ///
+    /// The document the call drew is not here. Nodes travel as [`Notice::Document`] frames, chunked
+    /// so each fits one frame, because one call may draw a mebibyte and a control frame carries a
+    /// mebibyte including its envelope. A caller reads the notices for the document and this for
+    /// the answer.
     Called {
         /// The component's answer, where it answered.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -397,8 +421,6 @@ pub enum ResponseBody {
         /// The fault the component declared, where it declared one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         fault: Option<String>,
-        /// The nodes it emitted while answering.
-        nodes: Vec<WireNode>,
     },
     /// The binding is gone.
     Unbound {
@@ -432,8 +454,18 @@ pub enum CallValue {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostHealth {
-    /// How many bindings are live.
+    /// How many bindings are live, across every connection.
     pub live_bindings: u64,
+    /// How many bindings this connection holds.
+    pub connection_bindings: u64,
+    /// How many one connection may hold.
+    pub binding_bound: u64,
+    /// How many compiled components the cache is holding in memory.
+    pub resident_components: u64,
+    /// How many bytes of notices this connection has waiting to be written.
+    pub queued_notice_bytes: u64,
+    /// How many documents this connection has dropped for want of room.
+    pub dropped_documents: u64,
     /// The engine version.
     pub engine_version: String,
     /// The target it compiles machine code for.
@@ -619,13 +651,19 @@ mod tests {
             body: ResponseBody::Called {
                 value: Some(CallValue::State(b"resumable".to_vec())),
                 fault: None,
-                nodes: vec![WireNode {
-                    node_id: "n0".to_owned(),
-                    node_revision: 2,
-                    body_json: "{}".to_owned(),
-                }],
             },
         });
+        // The document a call drew travels as its own frames, so a caller reads it from the
+        // notices rather than from the answer.
+        round_trip(&Frame::Notice(Notice::Document {
+            binding_id: kr_protocol::scalars::Uuid::from_bytes([7; 16]),
+            call: "snapshot".to_owned(),
+            nodes: vec![WireNode {
+                node_id: "n0".to_owned(),
+                node_revision: 2,
+                body_json: "{}".to_owned(),
+            }],
+        }));
         round_trip(&Frame::Response {
             reply_to: 2,
             body: ResponseBody::Refused {
@@ -696,6 +734,16 @@ mod tests {
         )
         .expect("the transcript encodes");
         assert_ne!(rendezvous, other);
+    }
+
+    #[test]
+    fn a_launcher_acknowledges_the_claim_it_accepted() {
+        let accepted = RendezvousAccepted {
+            reservation_id: ReservationId::new(kr_protocol::scalars::Uuid::from_bytes([8; 16])),
+            environment_id: EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
+            endpoint: "/run/kr/p.sock".to_owned(),
+        };
+        assert_eq!(round_trip(&accepted), accepted);
     }
 
     #[test]
