@@ -104,6 +104,14 @@ const MAX_OUTSTANDING_CALLS: usize = 64;
 /// nothing else can replace. Four kibibytes is more than any failure needs to be legible.
 const MAX_FAULT_DETAIL_BYTES: usize = 4 * 1024;
 
+/// How many places in the event channel presentation may not take.
+///
+/// A fault and a disabled notice have to arrive, and a component drawing documents faster than a
+/// caller reads them must not be able to leave no room for one. Three faults disable a binding, so
+/// four must-arrive events is the most one binding ever produces; this is twice that, and it is
+/// what makes reliable delivery independent of how much presentation is waiting.
+const FAULT_RESERVE: usize = 8;
+
 /// How long the binding's thread waits for room to report a fault.
 ///
 /// A fault and a disabled notice are the two a caller cannot infer from anything else, so they are
@@ -1502,7 +1510,7 @@ impl BindingWorker {
             let dropped = BindingEvent::PresentationDropped {
                 documents: self.dropped_documents,
             };
-            if self.events.try_send(dropped).is_ok() {
+            if self.events.capacity() > FAULT_RESERVE && self.events.try_send(dropped).is_ok() {
                 self.dropped_documents = 0;
             }
         }
@@ -1511,7 +1519,9 @@ impl BindingWorker {
             BindingEvent::Fault { .. } | BindingEvent::Disabled { .. }
         );
         if !must_arrive {
-            if self.events.try_send(event).is_err() {
+            // The reserve is not presentation's to take: a document that filled the last places
+            // would be a document that left no room for the fault that followed it.
+            if self.events.capacity() <= FAULT_RESERVE || self.events.try_send(event).is_err() {
                 self.dropped_documents = self.dropped_documents.saturating_add(1);
                 if let Ok(mut queue) = self.queue.lock() {
                     queue.require_snapshot();
@@ -1716,6 +1726,41 @@ mod tests {
         let wide = "\u{2014}".repeat(MAX_FAULT_DETAIL_BYTES);
         let cut = clipped(wide, MAX_FAULT_DETAIL_BYTES);
         assert!(cut.chars().count() > 0);
+    }
+
+    #[tokio::test]
+    async fn a_fault_has_room_however_much_presentation_is_waiting() {
+        // A caller that stopped reading, and a component that kept drawing. The channel fills with
+        // documents; what must not happen is that the fault behind them finds no room.
+        let (events, mut received) = tokio::sync::mpsc::channel(DEFAULT_EVENT_QUEUE);
+        let mut sent = 0;
+        while events.capacity() > FAULT_RESERVE {
+            events
+                .try_send(BindingEvent::Document {
+                    call: CallKind::Observe,
+                    nodes: Vec::new(),
+                })
+                .expect("there is room");
+            sent += 1;
+        }
+        assert!(sent > 0);
+
+        // The reserve is what is left, and it is only ever the must-arrive events' to use.
+        assert_eq!(events.capacity(), FAULT_RESERVE);
+        for index in 0..FAULT_RESERVE {
+            events
+                .try_send(BindingEvent::Fault {
+                    call: CallKind::Observe,
+                    detail: format!("fault {index}"),
+                    faults_in_window: 1,
+                })
+                .expect("a fault always has room");
+        }
+        assert_eq!(events.capacity(), 0);
+
+        // And four is the most one binding ever produces: three faults and the disabling.
+        assert!(FAULT_RESERVE >= 2 * (kr_plugin_sdk::limits::FAULTS_BEFORE_DISABLE as usize + 1));
+        received.close();
     }
 
     #[test]
