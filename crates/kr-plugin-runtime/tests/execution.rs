@@ -1417,9 +1417,11 @@ async fn a_document_nobody_received_asks_the_component_to_draw_again() {
     assert!(!handle.snapshot_required());
 
     // Whoever was to read that document did not. Saying so is what puts the obligation back, and
-    // the pump discharges it with a fresh snapshot without anybody asking for one.
+    // the pump discharges it with a fresh snapshot without anybody asking for one. That the asking
+    // raises the obligation is the queue's own test,
+    // `queue::tests::a_snapshot_can_be_asked_for_without_anything_having_been_lost`; asserting it
+    // here would race the pump, which may already have discharged it by the next line.
     handle.require_snapshot();
-    assert!(handle.snapshot_required());
 
     let deadline = std::time::Instant::now() + core::time::Duration::from_secs(5);
     let mut drew = false;
