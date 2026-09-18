@@ -618,14 +618,57 @@ fn record(profile: &cap_std::fs::Dir, line: &str) -> Result<()> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
     use std::io::Write as _;
 
+    // Two invocations of this service write to the same record at the same time, and a line that
+    // reached the disk in halves would be a record the next start refuses to read. One at a time,
+    // and each one whole.
+    static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    let _writing = WRITING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let mut options = cap_std::fs::OpenOptions::new();
     options.create(true).append(true).follow(FollowSymlinks::No);
+    let existed = profile.exists(TEMPORARY_MANIFEST_FILE);
     let mut file = profile
         .open_with(TEMPORARY_MANIFEST_FILE, &options)
         .map_err(ProjectError::staging)?;
     file.write_all(format!("{line}\n").as_bytes())
         .map_err(ProjectError::staging)?;
-    file.sync_data().map_err(ProjectError::staging)
+    file.sync_data().map_err(ProjectError::staging)?;
+    if existed {
+        Ok(())
+    } else {
+        // The record's own name has to survive a power failure as much as its lines do, and a file
+        // is on the disk only once the directory that holds its name is.
+        durable(profile)
+    }
+}
+
+/// Makes a directory's own list of names durable.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::StagingUnavailable`] when the directory cannot be synchronised.
+#[cfg(unix)]
+fn durable(directory: &cap_std::fs::Dir) -> Result<()> {
+    rustix::fs::fsync(directory).map_err(|error| ProjectError::StagingUnavailable {
+        detail: format!(
+            "this host's record of its own temporary directory could not be made durable: {error}"
+        )
+        .into(),
+    })
+}
+
+/// Makes a directory's own list of names durable.
+///
+/// This platform runs no Git, so nothing reads that record back here.
+///
+/// # Errors
+///
+/// Never returns an error on this platform.
+#[cfg(not(unix))]
+fn durable(_directory: &cap_std::fs::Dir) -> Result<()> {
+    Ok(())
 }
 
 /// Reads the record back, or answers that it cannot be trusted.
@@ -713,8 +756,6 @@ fn remove_recorded(
     name: &str,
     entry: &Recorded,
 ) -> bool {
-    use cap_fs_ext::MetadataExt as _;
-
     let path = root_path.join(name);
     let Ok(handle) = root.open_dir(name) else {
         left_in_place(&path, "it could not be opened");
@@ -749,24 +790,20 @@ fn remove_recorded(
         return false;
     }
     if let Some(mark) = entry.mark {
-        let Ok(file) = handle.open(&entry.token) else {
+        let Ok(marked) = handle.open_dir(&entry.token) else {
             left_in_place(&path, "this host's own mark could not be opened");
             return false;
         };
-        let Ok(metadata) = file.metadata() else {
-            left_in_place(&path, "this host's own mark could not be identified");
-            return false;
-        };
-        let found = crate::boundary::ObjectIdentity {
-            device: metadata.dev(),
-            file_id: metadata.ino(),
-        };
-        if found != mark {
+        if !crate::boundary::identity_of_handle(environment_id, &marked)
+            .is_ok_and(|found| found == mark)
+        {
             left_in_place(&path, "this host's own mark is not the object it made");
             return false;
         }
     }
-    if handle.remove_file(&entry.token).is_err() {
+    // The mark is a directory, so this cannot take away anything anybody wrote: a name holding a
+    // file, or a directory with anything in it, is refused here rather than emptied.
+    if handle.remove_dir(&entry.token).is_err() {
         left_in_place(&path, "this host's own mark could not be taken out of it");
         return false;
     }
@@ -849,8 +886,12 @@ fn compact(profile: &cap_std::fs::Dir, text: &str) -> Result<()> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
     use std::io::Write as _;
 
-    let beside = format!("{TEMPORARY_MANIFEST_FILE}.new");
-    let _ = profile.remove_file(&beside);
+    // Under a name of its own that nothing else holds, rather than one beside the record that this
+    // host would have to take away first: what is at a name is never this host's to remove.
+    let mut beside = String::with_capacity(32);
+    for byte in uuid::Uuid::new_v4().as_bytes() {
+        beside.push_str(&format!("{byte:02x}"));
+    }
     let mut options = cap_std::fs::OpenOptions::new();
     options
         .write(true)
@@ -865,7 +906,8 @@ fn compact(profile: &cap_std::fs::Dir, text: &str) -> Result<()> {
     drop(file);
     profile
         .rename(&beside, profile, TEMPORARY_MANIFEST_FILE)
-        .map_err(ProjectError::staging)
+        .map_err(ProjectError::staging)?;
+    durable(profile)
 }
 
 /// Leaves a directory open to the account this service runs as and to nobody else.
@@ -2530,8 +2572,6 @@ impl PrivateTemporary {
         root_path: &Path,
         described: &str,
     ) -> Result<Self> {
-        use cap_fs_ext::MetadataExt as _;
-
         let mut name = String::with_capacity(32);
         for byte in uuid::Uuid::new_v4().as_bytes() {
             name.push_str(&format!("{byte:02x}"));
@@ -2566,12 +2606,11 @@ impl PrivateTemporary {
             )
             .into(),
         })?;
-        // Created rather than opened: a file already at that name is somebody else's, and this host
-        // neither shortens it nor writes over it.
-        let mut options = cap_std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        let mark = root
-            .open_with(format!("{name}/{token}"), &options)
+        // A directory rather than a file, and created rather than opened. Created, so that
+        // anything already at that name fails the invocation instead of being written over; a
+        // directory, so that taking the mark away again at the end cannot take away anything
+        // anybody wrote, because a directory with something in it does not go.
+        root.create_dir(format!("{name}/{token}"))
             .map_err(|error| ProjectError::StagingUnavailable {
                 detail: format!(
                     "{described}'s own temporary directory could not be marked as this host's: \
@@ -2579,19 +2618,24 @@ impl PrivateTemporary {
                 )
                 .into(),
             })?;
-        let mark = mark
-            .metadata()
-            .map(|metadata| crate::boundary::ObjectIdentity {
-                device: metadata.dev(),
-                file_id: metadata.ino(),
-            })
-            .map_err(|error| ProjectError::StagingUnavailable {
+        let mark = root.open_dir(format!("{name}/{token}")).map_err(|error| {
+            ProjectError::StagingUnavailable {
+                detail: format!(
+                    "{described}'s own mark inside its temporary directory could not be opened: \
+                     {error}"
+                )
+                .into(),
+            }
+        })?;
+        let mark = crate::boundary::identity_of_handle(environment_id, &mark).map_err(|error| {
+            ProjectError::StagingUnavailable {
                 detail: format!(
                     "{described}'s own mark inside its temporary directory could not be \
                      identified: {error}"
                 )
                 .into(),
-            })?;
+            }
+        })?;
         let handle = root
             .open_dir(&name)
             .map_err(|error| ProjectError::StagingUnavailable {
@@ -3362,10 +3406,9 @@ mod tests {
     fn a_sweep_takes_away_what_this_host_recorded_making_and_leaves_the_rest() {
         // What a daemon that died mid-invocation left is this host's to take away, because this
         // host wrote down that it was making it and put its own mark inside it. Everything else in
-        // there is somebody else's, and a directory holding anything besides that mark is not
-        // emptied to make it go.
-        use cap_fs_ext::MetadataExt as _;
-
+        // there is somebody else's. The mark is a directory, so nothing in this path can take away
+        // anything anybody wrote: a name holding a file, or a directory with something in it, is
+        // left where it is instead.
         let root = tempfile::tempdir().expect("a directory to sweep");
         let profile_path = root.path().join(PROFILE_DIRECTORY);
         let temporary = profile_path.join(TEMPORARY_DIRECTORY);
@@ -3377,42 +3420,46 @@ mod tests {
         let handle = cap_std::fs::Dir::open_ambient_dir(&temporary, cap_std::ambient_authority())
             .expect("the directory opens");
         let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
-        let identity_of = |name: &str| {
+        let identity_of = |path: &str| {
             crate::boundary::identity_of_handle(
                 environment_id,
-                &handle.open_dir(name).expect("the directory opens"),
+                &handle.open_dir(path).expect("the directory opens"),
             )
             .expect("the directory has an identity")
         };
-        let mark_of = |path: &str| {
-            let metadata = handle
-                .open(path)
-                .expect("the mark opens")
-                .metadata()
-                .expect("the mark has metadata");
-            crate::boundary::ObjectIdentity {
-                device: metadata.dev(),
-                file_id: metadata.ino(),
-            }
-        };
         let plant = |name: &str, token: &str| {
             handle.create_dir(name).expect("a directory");
-            handle.create(format!("{name}/{token}")).expect("a mark");
+            handle
+                .create_dir(format!("{name}/{token}"))
+                .expect("a mark");
         };
         // What somebody else put at the name this host's mark would have, which must still be
-        // there afterwards: a file at that name is not a licence to delete it.
+        // there afterwards with its bytes: a name is not a licence to delete what holds it.
         let theirs = "not this host's, and not to be removed\n";
+        let plant_theirs = |name: &str, token: &str| {
+            use std::io::Write as _;
+
+            handle.create_dir(name).expect("a directory");
+            let mut file = handle
+                .create(format!("{name}/{token}"))
+                .expect("somebody else's file");
+            file.write_all(theirs.as_bytes()).expect("their bytes");
+        };
         let elsewhere = crate::boundary::ObjectIdentity {
             device: 0,
             file_id: 0,
         };
 
-        // One this host made, recorded, identified, and marked.
+        // One this host made, recorded, identified and marked.
         plant("mine", "aaaa");
         record(&profile, "making mine aaaa").expect("the record");
         record(
             &profile,
-            &format!("made mine {} {}", identity_of("mine"), mark_of("mine/aaaa")),
+            &format!(
+                "made mine {} {}",
+                identity_of("mine"),
+                identity_of("mine/aaaa")
+            ),
         )
         .expect("the record");
         // One this host recorded making and never got to identify, holding its own mark.
@@ -3426,7 +3473,11 @@ mod tests {
         record(&profile, "making used cccc").expect("the record");
         record(
             &profile,
-            &format!("made used {} {}", identity_of("used"), mark_of("used/cccc")),
+            &format!(
+                "made used {} {}",
+                identity_of("used"),
+                identity_of("used/cccc")
+            ),
         )
         .expect("the record");
         handle.create("used/left-behind").expect("what Git left");
@@ -3434,21 +3485,19 @@ mod tests {
         plant("swapped", "dddd");
         record(&profile, "making swapped dddd").expect("the record");
         record(&profile, &format!("made swapped {elsewhere} {elsewhere}")).expect("the record");
-        // One whose mark is at the right name and is not the object this host made, holding
-        // somebody else's bytes.
-        handle.create_dir("foreign").expect("a directory");
-        {
-            use std::io::Write as _;
-
-            let mut file = handle.create("foreign/eeee").expect("somebody else's file");
-            file.write_all(theirs.as_bytes()).expect("their bytes");
-        }
+        // One whose mark is at the right name and is not the object this host made.
+        plant("foreign", "eeee");
         record(&profile, "making foreign eeee").expect("the record");
         record(
             &profile,
             &format!("made foreign {} {elsewhere}", identity_of("foreign")),
         )
         .expect("the record");
+        // And the one the record alone would not tell apart: this host wrote down that it was
+        // making a directory, somebody else took the mark's name first with a file of their own,
+        // and the invocation failed before it could identify anything.
+        plant_theirs("collided", "ffff");
+        record(&profile, "making collided ffff").expect("the record");
 
         sweep(environment_id, &profile, &handle, &temporary, &manifest);
 
@@ -3457,7 +3506,7 @@ mod tests {
             !temporary.join("half").exists(),
             "and so is the one holding nothing but this host's own mark"
         );
-        for left in ["theirs", "used", "swapped", "foreign"] {
+        for left in ["theirs", "used", "swapped", "foreign", "collided"] {
             assert!(
                 temporary.join(left).exists(),
                 "{left} is not this host's to take away"
@@ -3468,12 +3517,16 @@ mod tests {
             "and nothing inside it was taken away either"
         );
         assert_eq!(
-            std::fs::read_to_string(temporary.join("foreign/eeee")).expect("their file is there"),
+            std::fs::read_to_string(temporary.join("collided/ffff")).expect("their file is there"),
             theirs,
             "a file at the name this host's own mark would have is not this host's to remove"
         );
+        assert!(
+            temporary.join("foreign/eeee").exists(),
+            "and neither is a directory at that name that this host did not make"
+        );
         let kept = recorded(&profile).expect("the record reads");
-        for name in ["used", "swapped", "foreign"] {
+        for name in ["used", "swapped", "foreign", "collided"] {
             assert!(
                 kept.contains_key(name),
                 "the record keeps {name}, which is still there, so a later start tries again"
