@@ -543,3 +543,259 @@ fn the_built_packages_are_qualified_where_this_run_has_them() {
         );
     }
 }
+
+// --------------------------------------------------------------------------------------------
+// Section 7 paragraph 4: a worker proves nothing for a session whose integration has never
+// qualified, and the session is found again when it does.
+// --------------------------------------------------------------------------------------------
+
+/// A daemon that restarts mid-qualification finds the session again once the reader comes up.
+///
+/// The worker's endpoint is open before its integration is live, so a session still being created
+/// is reachable. What it will not do is answer a daemon's proof: a worker that has never qualified
+/// would otherwise be published as a live session before its reader existed. That refusal leaves
+/// the claim unresolved, so the next request that goes looking for the session looks again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_worker_that_has_not_qualified_proves_nothing_and_is_found_when_it_does() {
+    use kr_controller::registry::{LaunchPhase, Registry};
+    use kr_protocol::hello::PROTOCOL_VERSION;
+    use kr_protocol::ids::{ActorId, SessionEpoch};
+    use kr_protocol::scalars::Digest256;
+    use kr_protocol::session::SessionState;
+    use kr_shell_integration::contract::events::{BridgeEvent, EofGesture, HooksActivated};
+    use kr_shell_integration::contract::fence::LeaseView;
+    use kr_shell_integration::contract::transport::{HandshakeOutcome, WorkerExpectation};
+    use kr_shell_integration::host::endpoint::HostEndpoint;
+    use kr_shell_integration::host::scripted::{ReferenceShell, ScriptedBridge, qualified_hello};
+    use kr_worker::fence::FenceDriver;
+    use kr_worker::runtime::SessionRuntime;
+    use kr_worker::service::{ServiceBinding, WorkerService};
+    use kr_worker::session::{Session, SessionConfig};
+
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+
+    // What a create that got as far as the claim leaves behind: a reservation this daemon will find
+    // when it starts, naming a worker it has not adopted.
+    let actor_id = ActorId::new("local:test").expect("a principal");
+    let reservation = {
+        let mut registry =
+            Registry::open(environment.registry_database(), environment_id).expect("a registry");
+        let admission = registry
+            .reserve(
+                &actor_id,
+                kr_ipc::new_uuid(),
+                Digest256::from_bytes([0x5c; 32]),
+                b"an intent",
+                kr_ipc::now_ms(),
+            )
+            .expect("reserves");
+        let reservation_id = admission.reservation.reservation_id;
+        registry
+            .record_launch(reservation_id, &process)
+            .expect("records the launcher");
+        registry
+            .set_phase(reservation_id, LaunchPhase::Spawned)
+            .expect("spawned");
+        admission.reservation
+    };
+    let session_id = reservation.session_id;
+    // The endpoint the daemon will look for this worker on is the one its own reservation names.
+    let display = reservation.display_number;
+
+    // The worker: a managed session whose bridge has registered and whose hooks are not live yet.
+    let identity = Arc::new(
+        kr_ipc::verify::WorkerIdentity::generate(
+            session_id,
+            SessionEpoch::V1,
+            boot.clone(),
+            process.clone(),
+            PROTOCOL_VERSION,
+        )
+        .expect("a session key"),
+    );
+    {
+        let mut registry =
+            Registry::open(environment.registry_database(), environment_id).expect("a registry");
+        registry
+            .claim_rendezvous(reservation.reservation_id, *identity.public_key())
+            .expect("claims");
+    }
+    let host_endpoint = HostEndpoint::open_for_session(
+        environment.runtime_root(),
+        environment.runtime_dir(),
+        session_id,
+    )
+    .expect("binds the bridge");
+    let address = host_endpoint.address().clone();
+    let secret = host_endpoint.secret().clone();
+    let mut session = Session::open(SessionConfig {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id,
+        display_number: display,
+        shell: kr_worker::pty::ShellCommand {
+            program: "/bin/cat".to_owned(),
+            arguments: Vec::new(),
+            cwd: "/".to_owned(),
+            environment: Vec::new(),
+        },
+        shell_mode: ShellMode::Managed,
+        worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        desktop: kr_protocol::identity::DesktopBinding::none(),
+        dimensions: kr_protocol::session::Dimensions::new(80, 24),
+        journal_path: Some(environment.journal_database(session_id)),
+        spool_directory: Some(environment.session_spool(session_id)),
+        send_queue_bytes: 8 * 1024 * 1024,
+        resident_bytes: 1024 * 1024,
+    })
+    .expect("opens the session");
+    session.launch().expect("launches the shell");
+    session.install_fence(FenceDriver::new(
+        session_id,
+        LeaseView::unheld(kr_protocol::ids::InputLeaseEpoch::new(0)),
+        Arc::new(kr_transport::clock::SystemContinuousClock::new()),
+    ));
+    let runtime = Arc::new(
+        SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
+            .expect("starts the runtime"),
+    );
+    let worker_endpoint = environment.worker_endpoint(display).expect("an endpoint");
+    let worker_listener = Listener::bind(&worker_endpoint).expect("binds the worker endpoint");
+    let bridge_task = tokio::spawn(
+        kr_worker::fence::bridge::BridgeServer::new(
+            Arc::clone(&runtime),
+            host_endpoint,
+            WorkerExpectation {
+                session_id,
+                root_process: process.clone(),
+                supported_editor_abis: vec!["zle-5.9".to_owned()],
+                supported_integration_versions: vec!["1".to_owned()],
+                already_registered: false,
+                gesture: EofGesture::default(),
+            },
+        )
+        .serve(),
+    );
+    let controller_identity = {
+        let secrets = environment.secrets_dir();
+        let store = open_store(CONTROLLER_SECRET_SERVICE, &secrets).expect("a secret store");
+        ControllerIdentity::open(store.store.as_ref(), environment_id, false).expect("an identity")
+    };
+    let service = Arc::new(
+        WorkerService::new(
+            Arc::clone(&runtime),
+            identity,
+            worker_endpoint.clone(),
+            ServiceBinding {
+                environment_id,
+                boot_identity: boot,
+                controller_public_key: *controller_identity.public_key(),
+                controller_generation: kr_protocol::ids::ControllerGeneration::new(1),
+                build_id: build(),
+            },
+        )
+        .expect("a service"),
+    );
+    let serving = tokio::spawn(Arc::clone(&service).serve(worker_listener));
+
+    let hello = qualified_hello(
+        &ReferenceShell::new(ShellKind::Zsh, "/bin/cat", "5.9", "zle-5.9"),
+        session_id,
+        &address,
+        process,
+        &secret,
+    )
+    .expect("a hello");
+    let (mut bridge, outcome) = ScriptedBridge::connect(&address, &hello)
+        .await
+        .expect("connects");
+    assert!(
+        matches!(outcome, HandshakeOutcome::Accepted(_)),
+        "{outcome:?}"
+    );
+
+    // The daemon starts on this environment and finds the claim. The worker has registered and has
+    // not qualified, so it proves nothing and the claim stays where it was.
+    let controller = Controller::start(ControllerSetup {
+        paths: environment.clone(),
+        environment_id,
+        identity: Box::new({
+            let secrets = environment.secrets_dir();
+            move || {
+                let store =
+                    open_store(CONTROLLER_SECRET_SERVICE, &secrets).expect("a secret store");
+                Ok(
+                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                        .expect("an identity"),
+                )
+            }
+        }),
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        supervisor: Box::new(NoWorkers),
+        worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
+        build_id: build(),
+        release: "0".to_owned(),
+        shell_packages: None,
+    })
+    .await
+    .expect("the daemon starts");
+    let controller_client_endpoint = environment.controller_endpoint().expect("an endpoint");
+    let clients = Listener::bind(&controller_client_endpoint).expect("binds the client endpoint");
+    let controller_serving = tokio::spawn(Arc::clone(&controller).serve_clients(clients));
+    let mut client =
+        LocalClient::connect(&controller_client_endpoint, LocalClientKind::Cli, build())
+            .await
+            .expect("connects");
+    let unknown = client
+        .request(
+            Method::SessionRead,
+            &kr_protocol::session::SessionReadParams { session_id },
+        )
+        .await
+        .expect("reaches the daemon")
+        .expect_err("a session whose worker proves nothing is not published");
+    assert_eq!(unknown.code, ErrorCode::UnknownSession, "{unknown}");
+
+    // The user's startup files finish and the reader's hooks come up. The next read looks again.
+    bridge
+        .send_event(BridgeEvent::HooksActivated(HooksActivated {
+            session_id,
+            prompt_generation: kr_protocol::root::PromptGeneration::new(1),
+        }))
+        .await
+        .expect("reports");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    let found = loop {
+        let answer = client
+            .request(
+                Method::SessionRead,
+                &kr_protocol::session::SessionReadParams { session_id },
+            )
+            .await
+            .expect("reaches the daemon");
+        if let Ok(value) = answer {
+            break value;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the qualified session was never found again"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    };
+    let read: kr_protocol::session::SessionReadResult = found.to_typed().expect("decodes");
+    assert_eq!(read.session.session_id, session_id);
+    assert_eq!(read.session.state, SessionState::Live);
+
+    runtime
+        .close(kr_protocol::session::ClosureReason::CloseRequested)
+        .1
+        .release();
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(30), runtime.wait_closed()).await;
+    bridge_task.abort();
+    serving.abort();
+    controller_serving.abort();
+}

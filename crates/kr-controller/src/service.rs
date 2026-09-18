@@ -571,12 +571,9 @@ impl Controller {
             registry.reservations_in(LaunchPhase::Claimed)?
         };
         for reservation in claimed {
-            if self.creating(reservation.reservation_id).await {
-                continue;
-            }
             // One session's failure is not another's, and a list asks about every session. A
             // reservation that cannot be recovered now is left claimed for the next look.
-            let _ = self.recover_claim(&reservation).await;
+            let _ = self.recover_unresolved(reservation.reservation_id).await;
         }
         Ok(())
     }
@@ -594,22 +591,39 @@ impl Controller {
         let Some(reservation) = reservation else {
             return Ok(());
         };
+        self.recover_unresolved(reservation.reservation_id).await
+    }
+
+    /// Recovers one claim, after asking again whether it is still this daemon's to recover.
+    ///
+    /// The reservation is read here rather than trusted from whatever the caller saw, because a
+    /// challenge takes time and the answer can be stale by the time its turn comes: a create that
+    /// finished during an earlier challenge in the same scan has already resolved its own claim and
+    /// published its worker, and challenging that worker again would present a second generation
+    /// token and fence the connection this daemon is already using.
+    ///
+    /// Three things say it is not this daemon's to recover: a reservation that is no longer
+    /// claimed, a create this daemon is still running, and a worker already in the directory.
+    async fn recover_unresolved(&self, reservation_id: ReservationId) -> Result<()> {
+        let reservation = {
+            let registry = self.registry.lock().await;
+            registry.reservation(reservation_id)?
+        };
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
         if reservation.phase != LaunchPhase::Claimed
-            || self.creating(reservation.reservation_id).await
+            || self.pending.lock().await.contains_key(&reservation_id)
+            || self
+                .directory
+                .lock()
+                .await
+                .get(reservation.session_id)
+                .is_some()
         {
             return Ok(());
         }
         self.recover_claim(&reservation).await
-    }
-
-    /// Returns whether this daemon is still running the create that made one reservation.
-    ///
-    /// Its claim is recorded for as long as it takes the worker to report itself. Adopting it here
-    /// would resolve the claim from the wrong side: the worker's own report would then find a
-    /// reservation the registry had already moved past, and the caller that asked for the session
-    /// would wait out its whole deadline for a session that exists.
-    async fn creating(&self, reservation_id: ReservationId) -> bool {
-        self.pending.lock().await.contains_key(&reservation_id)
     }
 
     /// Restores the directory entry of every worker the registry records.
