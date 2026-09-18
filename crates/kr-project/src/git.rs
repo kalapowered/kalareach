@@ -503,9 +503,10 @@ pub struct RestrictedProfile {
     template: PathBuf,
     home: PathBuf,
     temporary: PathBuf,
-    /// The record of what this host made inside that directory, which is the only thing it ever
-    /// takes away from it.
-    temporary_manifest: PathBuf,
+    /// The profile's own directory, opened once. The record lives in it, and going through this
+    /// rather than through a path is what keeps a link put at the record's name from deciding
+    /// where this host writes.
+    profile_root: Arc<cap_std::fs::Dir>,
     /// The directory each invocation's own temporary directory is made inside, opened once. Making
     /// one goes through this handle rather than through the path, so the directory an invocation
     /// gets is one this host made inside the object it opened.
@@ -575,78 +576,103 @@ impl std::fmt::Debug for Interposition {
 /// What this host recorded about one directory it made inside the profile's temporary directory.
 #[derive(Clone, Debug)]
 struct Recorded {
-    /// The name written inside it before it was opened, which is what a directory made and never
-    /// confirmed is recognised by.
+    /// The name of the mark written inside it, which is the one entry it may hold.
     token: String,
-    /// The object, once there was one to identify.
+    /// The directory, once there was one to identify.
     identity: Option<crate::boundary::ObjectIdentity>,
+    /// The mark inside it, once there was one to identify.
+    mark: Option<crate::boundary::ObjectIdentity>,
 }
 
 impl Recorded {
     /// Returns the lines that say this again to the next start.
     fn lines(&self, name: &str) -> Vec<String> {
         let mut lines = vec![format!("making {name} {}", self.token)];
-        if let Some(identity) = self.identity {
-            lines.push(format!("made {name} {identity}"));
+        if let (Some(identity), Some(mark)) = (self.identity, self.mark) {
+            lines.push(format!("made {name} {identity} {mark}"));
         }
         lines
     }
+}
+
+/// Opens the record for reading, without following a link at its name.
+fn open_record(profile: &cap_std::fs::Dir) -> std::io::Result<cap_std::fs::File> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.read(true).follow(FollowSymlinks::No);
+    profile.open_with(TEMPORARY_MANIFEST_FILE, &options)
 }
 
 /// Adds one line to the record, and makes sure it is on the disk before the caller goes on.
 ///
 /// The order matters in one direction only: a name that reached the disk and was never created
 /// costs the next start a line of its own, and a directory created before its name reached the disk
-/// would be one nothing could account for.
+/// would be one nothing could account for. The line is written whole in one call, because two
+/// invocations of this service append to the same record.
 ///
 /// # Errors
 ///
 /// Returns [`ProjectError::StagingUnavailable`] when the record cannot be written.
-fn record(manifest: &Path, line: &str) -> Result<()> {
+fn record(profile: &cap_std::fs::Dir, line: &str) -> Result<()> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
     use std::io::Write as _;
 
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(manifest)
+    let mut options = cap_std::fs::OpenOptions::new();
+    options.create(true).append(true).follow(FollowSymlinks::No);
+    let mut file = profile
+        .open_with(TEMPORARY_MANIFEST_FILE, &options)
         .map_err(ProjectError::staging)?;
-    writeln!(file, "{line}").map_err(ProjectError::staging)?;
+    file.write_all(format!("{line}\n").as_bytes())
+        .map_err(ProjectError::staging)?;
     file.sync_data().map_err(ProjectError::staging)
 }
 
-/// Reads the record back.
+/// Reads the record back, or answers that it cannot be trusted.
 ///
-/// A file that cannot be read is an empty record, which leaves everything in place rather than
-/// removing something this host cannot account for.
-fn recorded(manifest: &Path) -> std::collections::BTreeMap<String, Recorded> {
+/// A record with no file yet is an empty one. Anything else that goes wrong — a file that cannot be
+/// read, a line that is not one of the three this host writes, a `made` for a name no `making`
+/// introduced, an identity that is not a pair of numbers — returns nothing at all, and nothing is
+/// taken away on the strength of a record this host cannot read.
+fn recorded(profile: &cap_std::fs::Dir) -> Option<std::collections::BTreeMap<String, Recorded>> {
+    use std::io::Read as _;
+
     let mut entries = std::collections::BTreeMap::new();
-    let Ok(text) = std::fs::read_to_string(manifest) else {
-        return entries;
-    };
+    let mut text = String::new();
+    match open_record(profile) {
+        Ok(mut file) => {
+            if file.read_to_string(&mut text).is_err() {
+                return None;
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(entries),
+        Err(_) => return None,
+    }
     for line in text.lines() {
-        let mut words = line.split_whitespace();
-        match (words.next(), words.next(), words.next()) {
-            (Some("making"), Some(name), Some(token)) => {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        match words.as_slice() {
+            ["making", name, token] => {
                 entries.insert(
-                    name.to_owned(),
+                    (*name).to_owned(),
                     Recorded {
-                        token: token.to_owned(),
+                        token: (*token).to_owned(),
                         identity: None,
+                        mark: None,
                     },
                 );
             }
-            (Some("made"), Some(name), Some(identity)) => {
-                if let Some(entry) = entries.get_mut(name) {
-                    entry.identity = parse_identity(identity);
-                }
+            ["made", name, identity, mark] => {
+                let entry = entries.get_mut(*name)?;
+                entry.identity = Some(parse_identity(identity)?);
+                entry.mark = Some(parse_identity(mark)?);
             }
-            (Some("gone"), Some(name), _) => {
-                entries.remove(name);
+            ["gone", name] => {
+                entries.remove(*name);
             }
-            _ => {}
+            _ => return None,
         }
     }
-    entries
+    Some(entries)
 }
 
 /// Reads back an object's identity as the record writes it.
@@ -668,11 +694,18 @@ fn left_in_place(path: &Path, why: &str) {
 
 /// Takes away one directory this host recorded making, and only that.
 ///
-/// Nothing here descends. The name is opened, the object it resolves to is required to be the one
-/// the record names, this host's own mark is taken out of it if it is still there, and then the
-/// directory itself is removed only if nothing else is in it. Anything else is left where it is and
-/// said so, because a directory holding what this host did not put there is not this host's to
-/// delete.
+/// Nothing here descends. The name is opened; the object it resolves to is required to be the one
+/// the record names; the directory is required to hold this host's own mark and nothing besides;
+/// the mark is required to be the object the record names too, so that a file somebody put at that
+/// name is not the file this host unlinks; and only then is the mark taken out and the directory
+/// itself removed, which the kernel will not do unless it is empty. Anything else is left where it
+/// is and said so, because a directory holding what this host did not put there is not this host's
+/// to delete.
+///
+/// One act is still by name rather than by object: removing the directory. No interface on either
+/// platform removes a directory an open handle names, so an empty directory a same-account writer
+/// puts at that name in the instant between the check and the removal is one this host would
+/// remove. It cannot remove anything that is not empty, and `README.md` in this crate says so.
 fn remove_recorded(
     environment_id: EnvironmentId,
     root: &cap_std::fs::Dir,
@@ -680,36 +713,62 @@ fn remove_recorded(
     name: &str,
     entry: &Recorded,
 ) -> bool {
+    use cap_fs_ext::MetadataExt as _;
+
     let path = root_path.join(name);
     let Ok(handle) = root.open_dir(name) else {
         left_in_place(&path, "it could not be opened");
         return false;
     };
-    match entry.identity {
-        Some(identity) => {
-            if !crate::boundary::identity_of_handle(environment_id, &handle)
-                .is_ok_and(|found| found == identity)
-            {
-                left_in_place(&path, "it is not the object this host made");
-                return false;
-            }
+    if let Some(identity) = entry.identity
+        && !crate::boundary::identity_of_handle(environment_id, &handle)
+            .is_ok_and(|found| found == identity)
+    {
+        left_in_place(&path, "it is not the object this host made");
+        return false;
+    }
+    // Exactly this host's own mark, and nothing besides. An empty directory is not one this host
+    // made either: the mark went in before the record said the directory existed.
+    let Ok(entries) = handle.entries() else {
+        left_in_place(&path, "it could not be read");
+        return false;
+    };
+    let mut held = Vec::new();
+    for found in entries {
+        let Ok(found) = found else {
+            left_in_place(&path, "it could not be read");
+            return false;
+        };
+        held.push(found.file_name().to_string_lossy().into_owned());
+    }
+    if held != vec![entry.token.clone()] {
+        left_in_place(
+            &path,
+            "it does not hold this host's own mark and nothing besides",
+        );
+        return false;
+    }
+    if let Some(mark) = entry.mark {
+        let Ok(file) = handle.open(&entry.token) else {
+            left_in_place(&path, "this host's own mark could not be opened");
+            return false;
+        };
+        let Ok(metadata) = file.metadata() else {
+            left_in_place(&path, "this host's own mark could not be identified");
+            return false;
+        };
+        let found = crate::boundary::ObjectIdentity {
+            device: metadata.dev(),
+            file_id: metadata.ino(),
+        };
+        if found != mark {
+            left_in_place(&path, "this host's own mark is not the object it made");
+            return false;
         }
-        None => {
-            // Made, and this host stopped before it could say which object it got. What it holds
-            // is the only thing left to go on: this host's own mark and nothing besides, or the
-            // directory stays.
-            let Ok(entries) = handle.entries() else {
-                left_in_place(&path, "it could not be read");
-                return false;
-            };
-            for held in entries.flatten() {
-                if held.file_name().to_string_lossy() != entry.token {
-                    left_in_place(&path, "it holds something this host did not put there");
-                    return false;
-                }
-            }
-            let _ = handle.remove_file(&entry.token);
-        }
+    }
+    if handle.remove_file(&entry.token).is_err() {
+        left_in_place(&path, "this host's own mark could not be taken out of it");
+        return false;
     }
     drop(handle);
     if root.remove_dir(name).is_err() {
@@ -722,20 +781,33 @@ fn remove_recorded(
 /// Takes away what a daemon that died mid-invocation left, and nothing else.
 ///
 /// One daemon owns this environment's state directory, so nothing else is using what is in here.
-/// That is what makes a sweep at the start right; it is not what makes it unconditional, and a
-/// directory this host has no record of making is left where it is.
+/// That is what makes a sweep at the start right; it is not what makes it unconditional. A
+/// directory this host has no record of making is left where it is, and a record this host cannot
+/// read leaves everything where it is.
 fn sweep(
     environment_id: EnvironmentId,
+    profile: &cap_std::fs::Dir,
     root: &cap_std::fs::Dir,
     root_path: &Path,
-    manifest: &Path,
+    manifest_path: &Path,
 ) {
-    let mut entries = recorded(manifest);
+    let Some(mut entries) = recorded(profile) else {
+        left_in_place(
+            manifest_path,
+            "this host's record of its own temporary directory cannot be read, so nothing in it \
+             was taken away",
+        );
+        return;
+    };
     let Ok(held) = root.entries() else {
         return;
     };
-    for name in held.flatten() {
-        let name = name.file_name().to_string_lossy().into_owned();
+    for found in held {
+        let Ok(found) = found else {
+            left_in_place(root_path, "it could not be read");
+            return;
+        };
+        let name = found.file_name().to_string_lossy().into_owned();
         let Some(entry) = entries.get(&name) else {
             left_in_place(
                 &root_path.join(&name),
@@ -748,17 +820,52 @@ fn sweep(
         }
     }
     // What is left is what is still there, so a later start tries again rather than losing the
-    // record of a directory this host did make.
+    // record of a directory this host did make. The record is replaced whole rather than cut short
+    // in place: a record half written is one the next start would refuse to read.
     let mut lines: Vec<String> = Vec::new();
     for (name, entry) in &entries {
         lines.extend(entry.lines(name));
     }
-    if lines.is_empty() {
-        let _ = std::fs::remove_file(manifest);
-    } else {
-        lines.push(String::new());
-        let _ = std::fs::write(manifest, lines.join("\n"));
+    let mut text = lines.join("\n");
+    if !text.is_empty() {
+        text.push('\n');
     }
+    if compact(profile, &text).is_err() {
+        left_in_place(
+            manifest_path,
+            "this host's record of its own temporary directory could not be written again, so it \
+             still names what has gone",
+        );
+    }
+}
+
+/// Replaces the record with what is still true, in one act.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::StagingUnavailable`] when the replacement cannot be written or put in
+/// place.
+fn compact(profile: &cap_std::fs::Dir, text: &str) -> Result<()> {
+    use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
+    use std::io::Write as _;
+
+    let beside = format!("{TEMPORARY_MANIFEST_FILE}.new");
+    let _ = profile.remove_file(&beside);
+    let mut options = cap_std::fs::OpenOptions::new();
+    options
+        .write(true)
+        .create_new(true)
+        .follow(FollowSymlinks::No);
+    let mut file = profile
+        .open_with(&beside, &options)
+        .map_err(ProjectError::staging)?;
+    file.write_all(text.as_bytes())
+        .map_err(ProjectError::staging)?;
+    file.sync_data().map_err(ProjectError::staging)?;
+    drop(file);
+    profile
+        .rename(&beside, profile, TEMPORARY_MANIFEST_FILE)
+        .map_err(ProjectError::staging)
 }
 
 /// Leaves a directory open to the account this service runs as and to nobody else.
@@ -885,16 +992,20 @@ impl RestrictedProfile {
         let temporary = profile.join(TEMPORARY_DIRECTORY);
         std::fs::create_dir_all(&temporary).map_err(ProjectError::staging)?;
         private(&temporary)?;
-        let temporary_manifest = profile.join(TEMPORARY_MANIFEST_FILE);
+        let profile_root = Arc::new(
+            cap_std::fs::Dir::open_ambient_dir(&profile, cap_std::ambient_authority())
+                .map_err(ProjectError::staging)?,
+        );
         let temporary_root = Arc::new(
             cap_std::fs::Dir::open_ambient_dir(&temporary, cap_std::ambient_authority())
                 .map_err(ProjectError::staging)?,
         );
         sweep(
             environment_id,
+            &profile_root,
             &temporary_root,
             &temporary,
-            &temporary_manifest,
+            &profile.join(TEMPORARY_MANIFEST_FILE),
         );
         Ok(Self {
             git,
@@ -904,7 +1015,7 @@ impl RestrictedProfile {
             template,
             home,
             temporary,
-            temporary_manifest,
+            profile_root,
             temporary_root,
             #[cfg(feature = "git-fixtures")]
             interposition: None,
@@ -992,9 +1103,9 @@ impl RestrictedProfile {
         // reach for a shared directory it is not confined to.
         let temporary = PrivateTemporary::create(
             self.environment_id,
+            &self.profile_root,
             &self.temporary_root,
             &self.temporary,
-            &self.temporary_manifest,
             &request.describe(),
         )?;
         let confinement = self.confinement(request, working, &temporary)?;
@@ -2394,13 +2505,16 @@ struct PrivateTemporary {
     identity: crate::boundary::ObjectIdentity,
     /// The name it was given, which is what the record calls it.
     name: String,
+    /// What this host wrote inside it, and which object that was: the one entry it may hold when
+    /// this host comes to take it away.
+    entry: Recorded,
+    /// The profile's own directory, where the record is.
+    profile: Arc<cap_std::fs::Dir>,
     /// The directory it was made in, held open so that taking it away is one act inside an object
     /// this host opened rather than a walk down a path.
     root: Arc<cap_std::fs::Dir>,
-    /// Where that directory's own record is.
+    /// Where that directory is, for the lines a person reads.
     root_path: PathBuf,
-    /// The record itself, which decides what may be taken away.
-    manifest: PathBuf,
 }
 
 impl PrivateTemporary {
@@ -2408,32 +2522,34 @@ impl PrivateTemporary {
     ///
     /// Made and opened through the handle this host holds on their parent rather than through a
     /// path, and the object that comes back is what every later rule and every removal is written
-    /// against.
+    /// against. Nothing is created before this host's record says it is about to be.
     fn create(
         environment_id: EnvironmentId,
+        profile: &Arc<cap_std::fs::Dir>,
         root: &Arc<cap_std::fs::Dir>,
         root_path: &Path,
-        manifest: &Path,
         described: &str,
     ) -> Result<Self> {
+        use cap_fs_ext::MetadataExt as _;
+
         let mut name = String::with_capacity(32);
         for byte in uuid::Uuid::new_v4().as_bytes() {
             name.push_str(&format!("{byte:02x}"));
         }
         // A name only this process knows, written inside the directory once it exists, and named in
         // this host's record before the directory exists at all. It is written by name, so a
-        // directory put at the name between the making and the writing receives it as readily as
-        // the one this host made: what the mark establishes is that the directory that opens below
-        // is one object holding this host's mark and nothing besides, not that this host is what
-        // created it. No interface here makes creating and opening one act, and `README.md` in this
-        // crate says so where the limits are listed rather than leaving it to be inferred.
+        // directory put at the name between the making and the writing would receive it as readily
+        // as the one this host made: what the mark establishes is that the directory that opens
+        // below is one object holding this host's mark and nothing besides, not that this host is
+        // what created it. No interface here makes creating and opening one act, and `README.md` in
+        // this crate says so where the limits are listed rather than leaving it to be inferred.
         let mut token = String::with_capacity(32);
         for byte in uuid::Uuid::new_v4().as_bytes() {
             token.push_str(&format!("{byte:02x}"));
         }
         // Before anything is created, so that nothing in there is ever a thing this host cannot
         // account for afterwards.
-        record(manifest, &format!("making {name} {token}"))?;
+        record(profile, &format!("making {name} {token}"))?;
         #[cfg(unix)]
         let made = {
             use cap_std::fs::DirBuilderExt as _;
@@ -2450,15 +2566,32 @@ impl PrivateTemporary {
             )
             .into(),
         })?;
-        root.create(format!("{name}/{token}")).map_err(|error| {
-            ProjectError::StagingUnavailable {
+        // Created rather than opened: a file already at that name is somebody else's, and this host
+        // neither shortens it nor writes over it.
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mark = root
+            .open_with(format!("{name}/{token}"), &options)
+            .map_err(|error| ProjectError::StagingUnavailable {
                 detail: format!(
                     "{described}'s own temporary directory could not be marked as this host's: \
                      {error}"
                 )
                 .into(),
-            }
-        })?;
+            })?;
+        let mark = mark
+            .metadata()
+            .map(|metadata| crate::boundary::ObjectIdentity {
+                device: metadata.dev(),
+                file_id: metadata.ino(),
+            })
+            .map_err(|error| ProjectError::StagingUnavailable {
+                detail: format!(
+                    "{described}'s own mark inside its temporary directory could not be \
+                     identified: {error}"
+                )
+                .into(),
+            })?;
         let handle = root
             .open_dir(&name)
             .map_err(|error| ProjectError::StagingUnavailable {
@@ -2473,7 +2606,8 @@ impl PrivateTemporary {
         // be a different one. The name itself is thirty-two random characters, so reaching it at
         // all means watching for it. What is left is a directory substituted before the mark was
         // written, and a substitution made and undone between two readings, which is the limit
-        // every identity check here has.
+        // every identity check here has. The mark stays where it is until this host takes the
+        // directory away, so that a start after a crash has something to recognise it by.
         let entries = handle
             .entries()
             .map_err(|error| ProjectError::StagingUnavailable {
@@ -2496,14 +2630,6 @@ impl PrivateTemporary {
                 .into(),
             });
         }
-        handle
-            .remove_file(&token)
-            .map_err(|error| ProjectError::StagingUnavailable {
-                detail: format!(
-                    "{described}'s own temporary directory could not be emptied again: {error}"
-                )
-                .into(),
-            })?;
         let again = root
             .open_dir(&name)
             .map_err(|error| ProjectError::StagingUnavailable {
@@ -2542,15 +2668,20 @@ impl PrivateTemporary {
                 }
             })?;
         drop(handle);
-        record(manifest, &format!("made {name} {identity}"))?;
+        record(profile, &format!("made {name} {identity} {mark}"))?;
         Ok(Self {
             environment_id,
             path,
             identity,
             name,
+            entry: Recorded {
+                token,
+                identity: Some(identity),
+                mark: Some(mark),
+            },
+            profile: Arc::clone(profile),
             root: Arc::clone(root),
             root_path: root_path.to_owned(),
-            manifest: manifest.to_owned(),
         })
     }
 
@@ -2571,18 +2702,14 @@ impl Drop for PrivateTemporary {
         // left inside it is not this host's to delete without descending into a tree it did not
         // build, so a directory that is not empty is left where it is and said so, and the record
         // keeps it for the next start to try again.
-        let entry = Recorded {
-            token: String::new(),
-            identity: Some(self.identity),
-        };
         if remove_recorded(
             self.environment_id,
             &self.root,
             &self.root_path,
             &self.name,
-            &entry,
+            &self.entry,
         ) {
-            let _ = record(&self.manifest, &format!("gone {}", self.name));
+            let _ = record(&self.profile, &format!("gone {}", self.name));
         }
     }
 }
@@ -3234,12 +3361,19 @@ mod tests {
     #[test]
     fn a_sweep_takes_away_what_this_host_recorded_making_and_leaves_the_rest() {
         // What a daemon that died mid-invocation left is this host's to take away, because this
-        // host wrote down that it was making it. Everything else in there is somebody else's, and
-        // a directory holding something this host did not put there is not emptied to make it go.
+        // host wrote down that it was making it and put its own mark inside it. Everything else in
+        // there is somebody else's, and a directory holding anything besides that mark is not
+        // emptied to make it go.
+        use cap_fs_ext::MetadataExt as _;
+
         let root = tempfile::tempdir().expect("a directory to sweep");
-        let temporary = root.path().join(TEMPORARY_DIRECTORY);
+        let profile_path = root.path().join(PROFILE_DIRECTORY);
+        let temporary = profile_path.join(TEMPORARY_DIRECTORY);
         std::fs::create_dir_all(&temporary).expect("the directory to sweep");
-        let manifest = root.path().join(TEMPORARY_MANIFEST_FILE);
+        let manifest = profile_path.join(TEMPORARY_MANIFEST_FILE);
+        let profile =
+            cap_std::fs::Dir::open_ambient_dir(&profile_path, cap_std::ambient_authority())
+                .expect("the profile's own directory opens");
         let handle = cap_std::fs::Dir::open_ambient_dir(&temporary, cap_std::ambient_authority())
             .expect("the directory opens");
         let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
@@ -3250,50 +3384,70 @@ mod tests {
             )
             .expect("the directory has an identity")
         };
+        let mark_of = |path: &str| {
+            let metadata = handle
+                .open(path)
+                .expect("the mark opens")
+                .metadata()
+                .expect("the mark has metadata");
+            crate::boundary::ObjectIdentity {
+                device: metadata.dev(),
+                file_id: metadata.ino(),
+            }
+        };
+        let plant = |name: &str, token: &str| {
+            handle.create_dir(name).expect("a directory");
+            handle.create(format!("{name}/{token}")).expect("a mark");
+        };
+        let elsewhere = crate::boundary::ObjectIdentity {
+            device: 0,
+            file_id: 0,
+        };
 
-        // One this host made, recorded, and identified.
-        handle
-            .create_dir("mine")
-            .expect("a directory this host made");
-        record(&manifest, "making mine aaaa").expect("the record");
-        record(&manifest, &format!("made mine {}", identity_of("mine"))).expect("the record");
+        // One this host made, recorded, identified, and marked.
+        plant("mine", "aaaa");
+        record(&profile, "making mine aaaa").expect("the record");
+        record(
+            &profile,
+            &format!("made mine {} {}", identity_of("mine"), mark_of("mine/aaaa")),
+        )
+        .expect("the record");
         // One this host recorded making and never got to identify, holding its own mark.
-        handle
-            .create_dir("half")
-            .expect("a directory this host made");
-        handle.create("half/bbbb").expect("this host's own mark");
-        record(&manifest, "making half bbbb").expect("the record");
+        plant("half", "bbbb");
+        record(&profile, "making half bbbb").expect("the record");
         // One this host never made.
-        handle
-            .create_dir("theirs")
-            .expect("somebody else's directory");
-        handle
-            .create("theirs/theirs.txt")
-            .expect("somebody else's file");
+        handle.create_dir("theirs").expect("somebody else's");
+        handle.create("theirs/theirs.txt").expect("their file");
         // One this host recorded, which now holds something it did not put there.
-        handle
-            .create_dir("used")
-            .expect("a directory this host made");
-        record(&manifest, "making used cccc").expect("the record");
-        record(&manifest, &format!("made used {}", identity_of("used"))).expect("the record");
-        handle
-            .create("used/left-behind")
-            .expect("what an invocation left");
+        plant("used", "cccc");
+        record(&profile, "making used cccc").expect("the record");
+        record(
+            &profile,
+            &format!("made used {} {}", identity_of("used"), mark_of("used/cccc")),
+        )
+        .expect("the record");
+        handle.create("used/left-behind").expect("what Git left");
         // One this host recorded, which is no longer the object it recorded.
-        handle
-            .create_dir("swapped")
-            .expect("a directory this host made");
-        record(&manifest, "making swapped dddd").expect("the record");
-        record(&manifest, "made swapped 0:0").expect("the record");
+        plant("swapped", "dddd");
+        record(&profile, "making swapped dddd").expect("the record");
+        record(&profile, &format!("made swapped {elsewhere} {elsewhere}")).expect("the record");
+        // One whose mark is at the right name and is not the object this host made.
+        plant("foreign", "eeee");
+        record(&profile, "making foreign eeee").expect("the record");
+        record(
+            &profile,
+            &format!("made foreign {} {elsewhere}", identity_of("foreign")),
+        )
+        .expect("the record");
 
-        sweep(environment_id, &handle, &temporary, &manifest);
+        sweep(environment_id, &profile, &handle, &temporary, &manifest);
 
         assert!(!temporary.join("mine").exists(), "the recorded one is gone");
         assert!(
             !temporary.join("half").exists(),
             "and so is the one holding nothing but this host's own mark"
         );
-        for left in ["theirs", "used", "swapped"] {
+        for left in ["theirs", "used", "swapped", "foreign"] {
             assert!(
                 temporary.join(left).exists(),
                 "{left} is not this host's to take away"
@@ -3303,14 +3457,44 @@ mod tests {
             temporary.join("used/left-behind").exists(),
             "and nothing inside it was taken away either"
         );
-        let kept = recorded(&manifest);
-        assert!(
-            kept.contains_key("used") && kept.contains_key("swapped"),
-            "the record keeps what is still there, so a later start tries again"
-        );
+        let kept = recorded(&profile).expect("the record reads");
+        for name in ["used", "swapped", "foreign"] {
+            assert!(
+                kept.contains_key(name),
+                "the record keeps {name}, which is still there, so a later start tries again"
+            );
+        }
         assert!(
             !kept.contains_key("mine") && !kept.contains_key("half"),
             "and forgets what is gone"
+        );
+    }
+
+    #[test]
+    fn a_record_this_host_cannot_read_takes_nothing_away() {
+        // The record decides what may be removed, so a record that is not this host's own writing
+        // decides nothing at all.
+        let root = tempfile::tempdir().expect("a directory to sweep");
+        let profile_path = root.path().join(PROFILE_DIRECTORY);
+        let temporary = profile_path.join(TEMPORARY_DIRECTORY);
+        std::fs::create_dir_all(&temporary).expect("the directory to sweep");
+        let manifest = profile_path.join(TEMPORARY_MANIFEST_FILE);
+        let profile =
+            cap_std::fs::Dir::open_ambient_dir(&profile_path, cap_std::ambient_authority())
+                .expect("the profile's own directory opens");
+        let handle = cap_std::fs::Dir::open_ambient_dir(&temporary, cap_std::ambient_authority())
+            .expect("the directory opens");
+        let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+        handle.create_dir("mine").expect("a directory");
+        handle.create("mine/aaaa").expect("a mark");
+        record(&profile, "making mine aaaa").expect("the record");
+        record(&profile, "something this host does not write").expect("the record");
+
+        assert!(recorded(&profile).is_none(), "the record is not readable");
+        sweep(environment_id, &profile, &handle, &temporary, &manifest);
+        assert!(
+            temporary.join("mine").exists(),
+            "and nothing is taken away on the strength of it"
         );
     }
 
@@ -3329,7 +3513,13 @@ mod tests {
             template: PathBuf::from("/state/git-profile/template"),
             home: PathBuf::from("/state/git-profile/home"),
             temporary: PathBuf::from("/state/git-profile/temporary"),
-            temporary_manifest: PathBuf::from("/state/git-profile/temporary-entries"),
+            profile_root: Arc::new(
+                cap_std::fs::Dir::open_ambient_dir(
+                    std::env::temp_dir(),
+                    cap_std::ambient_authority(),
+                )
+                .expect("the system's temporary directory opens"),
+            ),
             temporary_root: Arc::new(
                 cap_std::fs::Dir::open_ambient_dir(
                     std::env::temp_dir(),

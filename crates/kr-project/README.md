@@ -51,9 +51,11 @@ resolve the remote's name over the same kind of connection. Nothing may listen t
 
 **Only this operation's directories are written.** The repository's working tree and its Git common
 directory, the destination the operation reserved, and one temporary directory created for this
-invocation and removed with it. Git's temporary files go in that directory rather than in one shared
-with everything else on the machine, and it is taken away through the handle this service opened
-when it made it rather than through the name it gave it.
+invocation. Git's temporary files go in that directory rather than in one shared with everything
+else on the machine. When the invocation ends the directory is taken away by the record this service
+wrote before it made it, and only if it is empty but for this service's own mark; what is not is
+left where it is, with a line saying so. The paragraph on it below says what that does and does not
+establish.
 
 **Directories, not names.** Every directory the boundary is built from is opened first and required
 to be the object its record names: the working tree by the identity the repository's record carries,
@@ -172,12 +174,19 @@ nobody else, so putting anything at a name in there is already that account's ow
 
 **Nothing in there is removed that this service has no record of making, and nothing is removed by
 descending.** When an invocation ends, and again when the service starts and sweeps what a daemon
-that died mid-invocation left, each name is matched against that record and against the object's
-identity, this service's own mark is taken out, and the directory itself is removed only if nothing
-else is in it. A directory holding what Git left behind, a directory that is no longer the object
-the record names, and a directory this service never recorded making are all left where they are,
-each with a line saying which and why. What was left stays in the record, so the next start tries
-again rather than forgetting it.
+that died mid-invocation left, the name is opened, the object is required to be the one the record
+names, the directory is required to hold this service's own mark and nothing besides, the mark is
+required to be the object the record names as well, and only then is the mark taken out and the
+directory removed. A directory holding what Git left behind, a directory that is no longer the
+object the record names, a mark that is not the file this service made, and a directory this service
+never recorded making are all left where they are, each with a line saying which and why. What was
+left stays in the record, so the next start tries again rather than forgetting it. A record this
+service cannot read takes nothing away at all.
+
+One act in that is still by name: removing the directory itself. Neither platform removes a
+directory that an open handle names, so an empty directory a same-account writer puts at that name
+in the instant between the check and the removal is one this service would remove. It cannot remove
+anything that is not empty.
 
 **The port list would not be enforced on Windows.** An application container's capability permits
 reaching the network or nothing at all; bounding which ports it reaches needs a system-wide filtering

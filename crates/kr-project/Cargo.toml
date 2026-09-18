@@ -9,6 +9,9 @@ repository.workspace = true
 publish.workspace = true
 
 [dependencies]
+# The record of what this service made in its own temporary directory is opened without following a
+# link, which `cap-std` offers only through this trait.
+cap-fs-ext.workspace = true
 cap-std.workspace = true
 kr-cbor.workspace = true
 kr-ipc.workspace = true
