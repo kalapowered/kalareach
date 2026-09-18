@@ -6,7 +6,14 @@
 //! sentinel file means a helper ran, and no sentinel may exist.
 //!
 //! KR-ACC-030, KR-REQ-14.23 and KR-REQ-14.24.
+//!
+//! Every test here asks the project service to run Git. On Windows it runs none: an application
+//! container cannot keep a repository from being executed from and cannot bound which ports a
+//! remote operation reaches, so the service refuses there rather than claiming a boundary it does
+//! not have. These tests therefore describe the platforms where Git runs; the refusal itself is in
+//! `tests/boundary.rs`.
 
+#![cfg(not(windows))]
 #![cfg(feature = "git-fixtures")]
 
 mod support;

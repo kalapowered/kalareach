@@ -15,9 +15,21 @@
 //! the same connection is made on a port the transport names and must arrive where the other did
 //! not.
 //!
+//! On Windows the service runs no Git at all, so what this file establishes there is the refusal
+//! itself and the name of the mechanism; everything the other tests build is left unbuilt.
+//!
 //! KR-ACC-030, KR-REQ-14.06, KR-REQ-14.21, KR-REQ-14.23 and KR-REQ-14.24.
 
 #![cfg(feature = "git-fixtures")]
+#![cfg_attr(
+    windows,
+    expect(
+        unused_imports,
+        dead_code,
+        reason = "this platform runs no Git, so only the refusal and the name of the mechanism are \
+                  exercised here"
+    )
+)]
 
 mod support;
 
