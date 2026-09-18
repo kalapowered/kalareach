@@ -443,60 +443,73 @@ fn filter(remote: bool) -> Result<Vec<libc::sock_filter>> {
         instruction(ANSWER, 0, 0, REFUSED),
     ]);
     if remote {
-        // A socket is made only of what this boundary can account for. A pair of sockets has no
-        // address to reach anything by, so a pair of local ones is made; a *named* local socket is
-        // not, because the kernel's rules say nothing about where one of those goes and a program
-        // on the other end of it can reach anything it likes on this child's behalf. What is left
-        // is the kernel's own answer about this machine's addresses, which a name resolution needs,
-        // and the internet families, on which the only socket is a stream one of the protocol the
-        // port rules govern. Nothing may listen.
+        // A socket is made only of what this boundary can account for. A *connected pair* of local
+        // sockets has no address to reach anything by, so a pair of those is made; a local socket
+        // that can still be given a destination is not, whether that is a single one or a pair of
+        // the kind that carries an address on every message, because the kernel's rules say nothing
+        // about where one of those goes and a program on the other end of it can reach anything it
+        // likes on this child's behalf. What is left is the kernel's own answer about this machine's
+        // addresses, which a name resolution needs, and the internet families, on which the only
+        // socket is a stream one of the protocol the port rules govern. Nothing may listen.
         program.extend([
-            // Index 9, 10, 11: which call this is. A pair of sockets is judged by its family
-            // alone; a single socket by everything below; `listen` is refused; anything else is
-            // the ordinary work of running Git.
+            // Index 9, 10, 11: which call this is. A pair goes to the rules at 12, a single socket
+            // to those at 19, `listen` is refused, and anything else is the ordinary work of
+            // running Git.
             instruction(COMPARE, 2, 0, SYS_SOCKETPAIR),
-            instruction(COMPARE, 3, 0, SYS_SOCKET),
-            instruction(COMPARE, 14, 15, SYS_LISTEN),
-            // 12, 13: a pair of sockets is a local pair or it is not made.
+            instruction(COMPARE, 8, 0, SYS_SOCKET),
+            instruction(COMPARE, 19, 20, SYS_LISTEN),
+            // 12 to 18: a pair is a local one, of the kind that is connected to its other half and
+            // to nothing else, and of no protocol besides.
             instruction(LOAD, 0, 0, FIRST_ARGUMENT),
-            instruction(COMPARE, 13, 12, libc::AF_UNIX as u32),
-            // 14, 15: the kernel answers a C library's questions about this machine's own
-            // addresses on its own family, which is where a name resolution begins.
+            instruction(COMPARE, 0, 17, libc::AF_UNIX as u32),
+            instruction(LOAD, 0, 0, SECOND_ARGUMENT),
+            instruction(MASK, 0, 0, KIND),
+            instruction(COMPARE, 0, 14, libc::SOCK_STREAM as u32),
+            instruction(LOAD, 0, 0, THIRD_ARGUMENT),
+            instruction(COMPARE, 13, 12, 0),
+            // 19, 20: the kernel answers a C library's questions about this machine's own addresses
+            // on its own family, which is where a name resolution begins.
             instruction(LOAD, 0, 0, FIRST_ARGUMENT),
             instruction(COMPARE, 8, 0, libc::AF_NETLINK as u32),
-            // 16, 17: an internet family is the one the rules below are about, and a family this
+            // 21, 22: an internet family is the one the rules below are about, and a family this
             // filter does not name is refused rather than left alone.
             instruction(COMPARE, 1, 0, libc::AF_INET as u32),
             instruction(COMPARE, 0, 8, libc::AF_INET6 as u32),
-            // 18, 19, 20: an internet socket is a stream one, whatever flags travel beside its kind.
+            // 23, 24, 25: an internet socket is a stream one, whatever flags travel beside its kind.
             instruction(LOAD, 0, 0, SECOND_ARGUMENT),
             instruction(MASK, 0, 0, KIND),
             instruction(COMPARE, 0, 5, libc::SOCK_STREAM as u32),
-            // 21, 22, 23: and its protocol is the one the kernel's own address rules are about.
+            // 26, 27, 28: and its protocol is the one the kernel's own address rules are about.
             // A stream socket of another protocol is a stream socket those rules say nothing about.
             instruction(LOAD, 0, 0, THIRD_ARGUMENT),
             instruction(COMPARE, 4, 0, 0),
             instruction(COMPARE, 3, 2, libc::IPPROTO_TCP as u32),
-            // 24, 25: and the kernel's own family answers about addresses and nothing else.
+            // 29, 30: and the kernel's own family answers about addresses and nothing else.
             instruction(LOAD, 0, 0, THIRD_ARGUMENT),
             instruction(COMPARE, 1, 0, libc::NETLINK_ROUTE as u32),
-            // 26, 27.
+            // 31, 32.
             instruction(ANSWER, 0, 0, REFUSED),
             instruction(ANSWER, 0, 0, PERMITTED),
         ]);
     } else {
         // No socket with an address at all, and nothing may listen. A local operation resolves no
-        // name, so it has no reason for the kernel's own family either; what is left is a pair of
-        // local sockets, which has no address to reach anything by.
+        // name, so it has no reason for the kernel's own family either; what is left is a connected
+        // pair of local sockets, which has no address to reach anything by.
         program.extend([
             // Index 9, 10, 11: which call this is.
             instruction(COMPARE, 2, 0, SYS_SOCKETPAIR),
-            instruction(COMPARE, 3, 0, SYS_SOCKET),
-            instruction(COMPARE, 2, 3, SYS_LISTEN),
-            // 12, 13: a pair of sockets is a local pair or it is not made.
+            instruction(COMPARE, 8, 0, SYS_SOCKET),
+            instruction(COMPARE, 7, 8, SYS_LISTEN),
+            // 12 to 18: a pair is a local one, of the kind that is connected to its other half and
+            // to nothing else, and of no protocol besides.
             instruction(LOAD, 0, 0, FIRST_ARGUMENT),
-            instruction(COMPARE, 1, 0, libc::AF_UNIX as u32),
-            // 14, 15.
+            instruction(COMPARE, 0, 5, libc::AF_UNIX as u32),
+            instruction(LOAD, 0, 0, SECOND_ARGUMENT),
+            instruction(MASK, 0, 0, KIND),
+            instruction(COMPARE, 0, 2, libc::SOCK_STREAM as u32),
+            instruction(LOAD, 0, 0, THIRD_ARGUMENT),
+            instruction(COMPARE, 1, 0, 0),
+            // 19, 20.
             instruction(ANSWER, 0, 0, REFUSED),
             instruction(ANSWER, 0, 0, PERMITTED),
         ]);
@@ -733,7 +746,8 @@ mod tests {
             REFUSED
         );
         // A single local socket is how a program reaches another by name, and where that one goes
-        // is not something any rule here could bound. A pair has no address at all.
+        // is not something any rule here could bound. A connected pair has no address at all, and
+        // a pair of the kind that carries a destination on every message is not a pair like that.
         assert_eq!(
             judge(
                 &program,
@@ -751,6 +765,29 @@ mod tests {
                 )
             ),
             PERMITTED
+        );
+        for kind in [libc::SOCK_DGRAM, libc::SOCK_SEQPACKET] {
+            assert_eq!(
+                judge(
+                    &program,
+                    call(SYS_SOCKETPAIR, libc::AF_UNIX as u32, kind as u32)
+                ),
+                REFUSED,
+                "a pair of kind {kind} carries a destination on every message"
+            );
+        }
+        assert_eq!(
+            judge(
+                &program,
+                call_with(
+                    SYS_SOCKETPAIR,
+                    libc::AF_UNIX as u32,
+                    libc::SOCK_STREAM as u32,
+                    libc::IPPROTO_TCP as u32
+                )
+            ),
+            REFUSED,
+            "and a pair of a protocol this filter does not name is not one"
         );
         // A family this filter does not name is refused rather than left alone, whichever call
         // makes it: the machine this one runs inside is reached on a stream socket whose ports
