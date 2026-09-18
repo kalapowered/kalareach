@@ -383,6 +383,8 @@ kr_zle_enter(void)
     kr_pending_quoted = kr_pending_numeric = kr_pending_paste_open = 0;
     kr_cancel_requested = kr_cancel_consumed = kr_in_key_wait = 0;
     kr_key_selected = kr_idle_reported = 0;
+    /* A reader that is starting is not inside anything a cancellation has to unwind. */
+    kr_bridge_cancel_settled();
     kr_inside_reader = 1;
     kr_bridge_editor_enter();
 }
@@ -407,6 +409,8 @@ kr_zle_leave(int eof_sent)
     }
     kr_inside_reader = 0;
     kr_installed_chars = 0;
+    kr_cancel_requested = kr_cancel_consumed = 0;
+    kr_bridge_cancel_settled();
     if (reason == KR_LEAVE_COMMAND_ACCEPTED) {
         /* The accepted line is reported from the reader, inside the fence, before the leave: a
          * record sent after it could only ever say that nothing could be established. */
@@ -499,13 +503,17 @@ kr_zle_fd(void)
 void
 kr_zle_pass_end(void)
 {
-    if (kr_cancel_consumed) {
-        kr_bridge_cancel_settled();
-    }
-    kr_cancel_consumed = 0;
+    /*
+     * One pass of the read loop is over, so whatever a cancellation ended has ended: the reader is
+     * back here, whether the wait returned or the binding ran. Anything that was waiting behind
+     * the cancellation is read now, at this boundary, rather than at the next keystroke.
+     */
+    kr_cancel_requested = kr_cancel_consumed = 0;
+    kr_bridge_cancel_settled();
     /* Whatever the pass did, the reader's queues may have changed, so the next wait reports
      * itself idle again and the worker gets its retry point. */
     kr_idle_reported = 0;
+    kr_bridge_service();
 }
 
 void

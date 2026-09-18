@@ -1288,6 +1288,9 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
         "the text typed before the sequence is still in the buffer"
     );
 
+    // Everything the reader said before this point is dropped, so the idle report asserted below
+    // is the one the cancellation produced rather than one from the entry.
+    session.forget_events();
     let id = session.ask(WorkerRequest::Cancel(CancelKeyWait {
         session_id: session.session_id,
         sequence: U64::new(1),
@@ -1315,7 +1318,12 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
     // And the reader recovers at the same prompt: it reports itself idle again, which is the
     // retry point a withheld fence needs, and its queues are clear.
     assert!(
-        session.saw_event(REPLY, |event| matches!(event, BridgeEvent::ReaderIdle(_))),
+        session.saw_event(REPLY, |event| matches!(
+            event,
+            BridgeEvent::ReaderIdle(idle)
+                if idle.prompt_generation == enter.prompt_generation
+                    && idle.reader_revision == enter.reader_revision
+        )),
         "the reader did not report itself idle again after the cancellation"
     );
     let recovered = session.fence_exchange(&enter, fence_id(17));

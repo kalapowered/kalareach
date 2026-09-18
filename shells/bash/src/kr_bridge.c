@@ -51,7 +51,7 @@
 #define KR_HANDSHAKE_WAIT_MS 2000
 #define KR_REVOKED_MAX 64
 /* How many separate reads' arrival times are remembered for the bytes still buffered. */
-#define KR_MARKS_MAX 16
+#define KR_MARKS_MAX 64
 /* What may wait to go out before the endpoint is treated as gone. */
 #define KR_OUT_MAX (4u * 1024u * 1024u)
 #define KR_FRAME_HEADER 4
@@ -121,7 +121,6 @@ static struct {
      * step is one that step has to see, whichever read took it off the endpoint. */
     unsigned char revoked[KR_REVOKED_MAX][KR_UUID_LEN];
     size_t revoked_count;
-    size_t revoked_next;
 
     /* Set while a cancellation this bridge asked for has not yet unwound the reader. Nothing else
      * is read or answered until it has, so a fence that follows sees what the reader has. */
@@ -378,7 +377,12 @@ kr_fill(void)
                 kr.marks[kr.mark_count].at_ms = kr_now_ms();
                 kr.mark_count++;
             } else {
+                /* With no room for another mark the last one takes this read's reach and its
+                 * time. A frame that was already waiting is then credited with a newer arrival
+                 * than it had, which can only make a budget look longer; the alternative would
+                 * time out a request that has just arrived. */
                 kr.marks[KR_MARKS_MAX - 1].ends_at = kr.in_len;
+                kr.marks[KR_MARKS_MAX - 1].at_ms = kr_now_ms();
             }
             continue;
         }
@@ -1150,6 +1154,9 @@ kr_bridge_lost(int loss, const char *detail)
     kr_flush();
 }
 
+/* Declared here because the answering code below releases a transaction's place in the record. */
+static void kr_forget_revocation(const unsigned char transaction[KR_UUID_LEN]);
+
 /* ---- the pre-EOF decision -------------------------------------------------------------------- */
 
 /* `detach_eligibility`, in the contract's own order. Returns 1 when the gesture is eligible. */
@@ -1375,6 +1382,8 @@ kr_reject_launch(unsigned long long id, const unsigned char transaction[KR_UUID_
     kr_cbor_map_end(&writer);
     kr_cbor_variant_end(&writer);
     kr_send(&writer);
+    /* The transaction is answered and over, so its place in the record goes back. */
+    kr_forget_revocation(transaction);
 }
 
 /* Builds the line the reader installs: an argument vector quoted for this shell, or a command the
@@ -1596,6 +1605,7 @@ kr_answer_launch(unsigned long long id, const kr_cbor_doc *doc, int request, int
      * leaves, because a revocation that arrives in that window still has text to take back out.
      */
     kr_shell_accept_line();
+    kr_forget_revocation(transaction);
 }
 
 static void
@@ -1736,22 +1746,50 @@ kr_is_revoked(const unsigned char transaction[KR_UUID_LEN])
     return 0;
 }
 
-static void
+/*
+ * Remembers one revoked transaction until the launch it names is answered.
+ *
+ * Nothing is ever pushed out to make room: a revocation the reader had already read but had
+ * forgotten would let a launch be answered `accepted` under it, which is the one thing this record
+ * exists to prevent. A record that is full is a worker outside anything the contract describes,
+ * and the caller ends the connection instead.
+ *
+ * Returns zero when there is no room.
+ */
+static int
 kr_remember_revocation(const kr_cbor_doc *doc, int frame)
 {
     unsigned char transaction[KR_UUID_LEN];
 
     if (!kr_cbor_bytes_exact(doc, kr_cbor_get(doc, frame, "transaction"), transaction,
                              KR_UUID_LEN)) {
-        return;
+        return 1;
     }
     if (kr_is_revoked(transaction)) {
-        return;
+        return 1;
     }
-    memcpy(kr.revoked[kr.revoked_next], transaction, KR_UUID_LEN);
-    kr.revoked_next = (kr.revoked_next + 1) % KR_REVOKED_MAX;
-    if (kr.revoked_count < KR_REVOKED_MAX) {
-        kr.revoked_count++;
+    if (kr.revoked_count >= KR_REVOKED_MAX) {
+        return 0;
+    }
+    memcpy(kr.revoked[kr.revoked_count], transaction, KR_UUID_LEN);
+    kr.revoked_count++;
+    return 1;
+}
+
+/* A transaction that has been answered is over, so its revocation is no longer needed. */
+static void
+kr_forget_revocation(const unsigned char transaction[KR_UUID_LEN])
+{
+    size_t i;
+
+    for (i = 0; i < kr.revoked_count; i++) {
+        if (memcmp(kr.revoked[i], transaction, KR_UUID_LEN) == 0) {
+            kr.revoked_count--;
+            if (i != kr.revoked_count) {
+                memcpy(kr.revoked[i], kr.revoked[kr.revoked_count], KR_UUID_LEN);
+            }
+            return;
+        }
     }
 }
 
@@ -1764,7 +1802,10 @@ kr_take_revocation(const kr_cbor_doc *doc, int frame)
                              KR_UUID_LEN)) {
         return;
     }
-    kr_remember_revocation(doc, frame);
+    if (!kr_remember_revocation(doc, frame)) {
+        kr_disconnect(KR_LOSS_BRIDGE_DISCONNECTED);
+        return;
+    }
     if (kr.launch_pending && memcmp(kr.launch_transaction, transaction, KR_UUID_LEN) == 0) {
         /* Installed but not accepted: the text comes out, so a revoked launch leaves nothing
          * behind. */
@@ -1856,7 +1897,7 @@ static int
 kr_take_batch_revocations(void)
 {
     size_t at = 0;
-    size_t found = 0;
+    int found = 1;
 
     while (kr.in_len - at >= KR_FRAME_HEADER) {
         unsigned long length = ((unsigned long)kr.in[at] << 24) |
@@ -1875,18 +1916,16 @@ kr_take_batch_revocations(void)
         root = kr_cbor_parse(&doc, kr.in + at + KR_FRAME_HEADER, (size_t)length);
         payload = kr_cbor_variant_of(&doc, root, &name, &name_len);
         if (payload >= 0 && name_len == 14 && memcmp(name, "launch_revoked", 14) == 0) {
-            kr_remember_revocation(&doc, payload);
-            found++;
+            found = kr_remember_revocation(&doc, payload);
         }
         kr_cbor_doc_free(&doc);
+        if (!found) {
+            /* No room left, so a revocation this read carried would be forgotten before the launch
+             * it belongs to is decided. Nothing from this read is acted on. */
+            kr_disconnect(KR_LOSS_BRIDGE_DISCONNECTED);
+            return 0;
+        }
         at += KR_FRAME_HEADER + length;
-    }
-    if (found > KR_REVOKED_MAX) {
-        /* More revocations in one read than this bridge can remember would push one of them out
-         * before the launch it belongs to is decided, and a launch answered `accepted` under a
-         * revocation the reader had already read is exactly what must not happen. */
-        kr_disconnect(KR_LOSS_BRIDGE_DISCONNECTED);
-        return 0;
     }
     return 1;
 }

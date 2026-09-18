@@ -404,6 +404,8 @@ kr_rl_enter (void)
   kr_gathering = 0;
   kr_pending_quoted = kr_pending_paste_open = 0;
   kr_idle_reported = 0;
+  /* A reader that is starting is not inside anything a cancellation has to unwind. */
+  kr_bridge_cancel_settled ();
   kr_last_source = KR_SOURCE_TERMINAL;
   kr_inside_reader = 1;
   kr_bridge_editor_enter ();
@@ -419,6 +421,8 @@ kr_rl_leave (int accepted)
     }
   kr_inside_reader = 0;
   kr_installed_chars = 0;
+  kr_cancel_requested = 0;
+  kr_bridge_cancel_settled ();
   if (accepted)
     {
       /* The accepted line is reported from the reader, inside the fence, before the leave: a
