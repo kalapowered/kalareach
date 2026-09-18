@@ -1665,8 +1665,9 @@ fn is_digest_name(text: &str) -> bool {
 /// what is there, and the agent's own command adds the server until the Windows qualification
 /// supplies a durable barrier.
 fn supported_platform() -> Result<()> {
-    #[cfg(windows)]
-    {
+    // A compile-time value rather than a conditional body, so both answers are checked on every
+    // platform this crate builds for.
+    if cfg!(windows) {
         return Err(ControllerError::PermissionDenied {
             detail: format!(
                 "this host cannot yet install or remove {SKILL_NAME} on Windows, because it has no \
@@ -1675,7 +1676,6 @@ fn supported_platform() -> Result<()> {
             ),
         });
     }
-    #[cfg(not(windows))]
     Ok(())
 }
 
@@ -1718,13 +1718,13 @@ fn extended_access_controls(path: &Path) -> Result<bool> {
 fn extended_access_controls(path: &Path) -> Result<bool> {
     // This platform keeps a POSIX access-control list in one extended attribute, and a file without
     // that attribute is described by its mode bits alone.
-    match rustix::fs::getxattr(path, "system.posix_acl_access", &mut []) {
-        Ok(_) => Ok(true),
-        // The attribute is there and longer than the nothing offered for it.
-        Err(rustix::io::Errno::RANGE) => Ok(true),
+    let mut probe = [0_u8; 1];
+    match rustix::fs::getxattr(path, "system.posix_acl_access", &mut probe[..]) {
+        // There is a list. One byte of it is as much as this needs to know.
+        Ok(_) | Err(rustix::io::Errno::RANGE) => Ok(true),
         Err(rustix::io::Errno::NODATA) => Ok(false),
         // A filesystem that cannot hold an extended attribute cannot hold a list either.
-        Err(rustix::io::Errno::NOTSUP) | Err(rustix::io::Errno::OPNOTSUPP) => Ok(false),
+        Err(rustix::io::Errno::NOTSUP) => Ok(false),
         Err(error) => Err(storage(std::io::Error::from(error))),
     }
 }
