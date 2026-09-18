@@ -231,3 +231,130 @@ async fn write_outbound(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+    use kr_protocol::ids::{SessionEpoch, SessionId};
+    use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
+    use kr_shell_integration::contract::events::EofGesture;
+    use kr_shell_integration::contract::fence::LeaseView;
+    use kr_shell_integration::contract::qualification::ShellKind;
+    use kr_transport::clock::SystemContinuousClock;
+
+    use crate::fence::FenceDriver;
+    use crate::pty::ShellCommand;
+    use crate::session::{Session, SessionConfig};
+
+    use super::*;
+
+    /// A session with a managed editor, on a shell that says nothing.
+    fn session(host: &kr_ipc::testing::TempHost) -> Session {
+        let session_id = SessionId::new(kr_ipc::new_uuid());
+        let mut session = Session::open(SessionConfig {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            environment_id: host.environment_id(),
+            display_number: DisplayNumber::new(1),
+            shell: ShellCommand {
+                program: "/bin/cat".to_owned(),
+                arguments: Vec::new(),
+                cwd: "/".to_owned(),
+                environment: Vec::new(),
+            },
+            shell_mode: ShellMode::Managed,
+            worker_profile: WorkerProfile::HeadlessUser,
+            desktop: DesktopBinding::none(),
+            dimensions: Dimensions::new(80, 24),
+            journal_path: Some(host.environment().journal_database(session_id)),
+            spool_directory: Some(host.environment().session_spool(session_id)),
+            send_queue_bytes: 8 * 1024 * 1024,
+            resident_bytes: 1024 * 1024,
+        })
+        .expect("opens the session");
+        session.launch().expect("launches the shell");
+        let mut driver = FenceDriver::new(
+            session_id,
+            LeaseView::unheld(kr_protocol::ids::InputLeaseEpoch::new(0)),
+            Arc::new(SystemContinuousClock::new()),
+        );
+        assert!(driver.registered(ShellKind::Zsh));
+        session.install_fence(driver);
+        session
+    }
+
+    /// A writer that fails ends the connection, even while the read is still waiting.
+    ///
+    /// A peer can close the side it reads from and leave the side it writes to open. The worker's
+    /// write fails; its read waits for a frame that is never coming. Nothing else would report the
+    /// loss, so every caller waiting on a launch would wait with it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_read_ends_when_the_writer_it_shares_a_connection_with_does() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let environment = temp.environment();
+        let session = session(&temp);
+        let session_id = session.id();
+        let runtime = Arc::new(
+            crate::runtime::SessionRuntime::start(
+                session,
+                Arc::new(kr_ipc::clock::SystemSharedClock),
+            )
+            .expect("starts the runtime"),
+        );
+        let endpoint = HostEndpoint::open_for_session(
+            environment.runtime_root(),
+            environment.runtime_dir(),
+            session_id,
+        )
+        .expect("binds the bridge");
+
+        // A real connection on that endpoint, so the read below is a read of a socket rather than
+        // of something this test is pretending with. Nothing is ever sent on it.
+        let address =
+            kr_ipc::paths::Endpoint::from_path(std::path::Path::new(&endpoint.address().path))
+                .expect("an address");
+        let connecting =
+            tokio::spawn(async move { kr_ipc::endpoint::Connection::connect(&address).await });
+        let (served, _peer) = endpoint.listener().accept().await.expect("accepts");
+        let _client = connecting.await.expect("joins").expect("connects");
+        let (mut reader, _writer) = accept(served);
+
+        let server = BridgeServer::new(
+            Arc::clone(&runtime),
+            endpoint,
+            WorkerExpectation {
+                session_id,
+                root_process: kr_ipc::identity::current_process_start_identity()
+                    .expect("this process"),
+                supported_editor_abis: vec!["zle-5.9".to_owned()],
+                supported_integration_versions: vec!["1".to_owned()],
+                already_registered: false,
+                gesture: EofGesture::default(),
+            },
+        );
+
+        // The writer's task ends the way a failed write ends it. The read has nothing to read.
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let mut writing = tokio::spawn(async move {
+            let _ = stopped.await;
+        });
+        let pumping = tokio::spawn(async move {
+            server.pump(&mut reader, &mut writing).await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!pumping.is_finished(), "the read is still waiting");
+        let _ = stop.send(());
+        tokio::time::timeout(Duration::from_secs(5), pumping)
+            .await
+            .expect("the read ends with the writer")
+            .expect("the task did not panic");
+
+        runtime
+            .close(kr_protocol::session::ClosureReason::CloseRequested)
+            .1
+            .release();
+        let _ = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed()).await;
+    }
+}

@@ -160,6 +160,127 @@ impl Wired {
     }
 }
 
+/// A session with a fence on a clock this test moves, and no bridge reading it.
+///
+/// Nothing sweeps the machine's deadlines here except the stimuli this test sends, which is the
+/// point: what a client's own request releases has to reach the terminal on that request's own
+/// boundary, and a bridge timer running beside it would hide whether it did.
+struct Unpumped {
+    _temp: kr_ipc::testing::TempHost,
+    _service: Arc<WorkerService>,
+    _serving: tokio::task::JoinHandle<kr_worker::Result<()>>,
+    runtime: Arc<SessionRuntime>,
+    session_id: SessionId,
+    environment_id: kr_protocol::ids::EnvironmentId,
+    endpoint: kr_ipc::paths::Endpoint,
+    clock: Arc<kr_transport::clock::ManualClock>,
+}
+
+impl Unpumped {
+    fn target(&self) -> ActionTarget {
+        ActionTarget {
+            environment_id: self.environment_id,
+            session_id: Nullable::some(self.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        }
+    }
+
+    async fn close(self) {
+        self.runtime
+            .close(ClosureReason::CloseRequested)
+            .1
+            .release();
+        let _ = tokio::time::timeout(Duration::from_secs(30), self.runtime.wait_closed()).await;
+        self._serving.abort();
+    }
+}
+
+async fn unpumped() -> Unpumped {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let config = configuration(&temp, ShellMode::Managed);
+    let session_id = config.session_id;
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+    let identity = Arc::new(
+        WorkerIdentity::generate(
+            session_id,
+            SessionEpoch::V1,
+            boot.clone(),
+            process,
+            PROTOCOL_VERSION,
+        )
+        .expect("a session key"),
+    );
+    let controller_public_key = *kr_crypto::keys::AuthorisationKeyPair::generate()
+        .expect("an authorisation key")
+        .public();
+
+    let clock = Arc::new(kr_transport::clock::ManualClock::new());
+    let mut session = Session::open(config).expect("opens the session");
+    session.launch().expect("launches the shell");
+    session.install_fence(FenceDriver::new(
+        session_id,
+        LeaseView::unheld(InputLeaseEpoch::new(0)),
+        Arc::clone(&clock) as Arc<_>,
+    ));
+    // Registered and qualified without a bridge: the phases are the driver's own, and what this
+    // test needs from them is a session that accepts input and holds it for a reader.
+    {
+        let driver = session.fence_mut().expect("a driver");
+        assert!(driver.registered(ShellKind::Zsh));
+        let _ = driver.bridge_event(
+            kr_protocol::ids::RequestId::new(1),
+            &BridgeEvent::HooksActivated(HooksActivated {
+                session_id,
+                prompt_generation: PromptGeneration::new(1),
+            }),
+        );
+        assert!(driver.phase().reports_ready());
+    }
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts the runtime"),
+    );
+
+    let endpoint = environment
+        .worker_endpoint(DisplayNumber::new(1))
+        .expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+    let service = Arc::new(
+        WorkerService::new(
+            Arc::clone(&runtime),
+            identity,
+            endpoint.clone(),
+            ServiceBinding {
+                environment_id,
+                boot_identity: boot,
+                controller_public_key,
+                controller_generation: ControllerGeneration::new(1),
+                build_id: build(),
+            },
+        )
+        .expect("a service"),
+    );
+    let serving = tokio::spawn(Arc::clone(&service).serve(listener));
+    Unpumped {
+        _temp: temp,
+        _service: service,
+        _serving: serving,
+        runtime,
+        session_id,
+        environment_id,
+        endpoint,
+        clock,
+    }
+}
+
 /// Reads everything the session has retained.
 fn retained(session: &Session) -> Vec<u8> {
     let mut seen = Vec::new();
@@ -1268,6 +1389,107 @@ async fn a_live_session_that_loses_its_hooks_stops_attributing_and_stops_install
             .is_none(),
         "and publishes no fence"
     );
+    wired.close().await;
+}
+
+/// A-17: input a client's own request released reaches the terminal on that request's boundary.
+///
+/// The hold has a deadline, and every stimulus sweeps it. A request from a client can therefore be
+/// what expires a hold, and the batches it releases are the application's from that moment: a
+/// session that queued them and then waited for something else to come along would be holding
+/// input nobody is holding it for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_request_that_expires_a_hold_delivers_what_it_released() {
+    let wired = unpumped().await;
+    // One client, which holds the keys and later asks for the launch: a launch belongs to the
+    // attachment that holds the lease, and a second attachment taking the keys would discard what
+    // the first one had handed over rather than release it.
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let attached: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &terminal(wired.session_id),
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("attaches")
+        .to_typed()
+        .expect("decodes");
+    let holder = attached.attachment.attachment_id;
+    client
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &kr_protocol::input::InputAcquireParams {
+                session_id: wired.session_id,
+                attachment_id: holder,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("takes the keys");
+
+    let epoch = wired.runtime.session().lease().epoch.get();
+    {
+        // A reader enters, which starts an exchange nothing will answer: this session has no bridge.
+        let mut session = wired.runtime.session();
+        let driver = session.fence_mut().expect("a driver");
+        let _ = driver.bridge_event(
+            kr_protocol::ids::RequestId::new(2),
+            &enter(wired.session_id, 1, 1),
+        );
+        session
+            .write_input(holder, epoch, 0, b"held\n", None, std::time::Instant::now())
+            .expect("accepted");
+        assert_eq!(
+            session.fence().expect("a driver").held().len(),
+            1,
+            "the exchange is in flight, so the batch waits"
+        );
+    }
+    assert!(
+        !contains(&retained(&wired.runtime.session()), b"held"),
+        "and nothing has reached the terminal"
+    );
+
+    // The deadline passes with nothing else running. The next stimulus is this client's own launch,
+    // which the machine refuses because no fence was ever published.
+    wired.clock.advance(Duration::from_millis(400));
+    let refused = client
+        .mutate(
+            Method::ShellLaunch,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &kr_protocol::root::ShellLaunchParams {
+                session_id: wired.session_id,
+                command: kr_protocol::root::LaunchCommand::Arguments(vec!["ls".to_owned()]),
+                expected_prompt_generation: PromptGeneration::new(1),
+                expected_buffer_revision: EditorBufferRevision::new(1),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("no fence is published, so nothing is installed");
+    assert_eq!(refused.code, ErrorCode::EditorBusy, "{refused}");
+
+    // What the machine let go of on that boundary is the application's, with nothing else running.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if contains(&retained(&wired.runtime.session()), b"held") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the released input never reached the terminal"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     wired.close().await;
 }
 

@@ -546,6 +546,28 @@ impl Controller {
         Ok(())
     }
 
+    /// Looks again for a worker whose claim this daemon has not resolved.
+    ///
+    /// A daemon that restarts while a managed session is still qualifying is refused its own
+    /// startup challenge, because a worker whose root integration has never qualified proves
+    /// nothing for the session it is still making. That worker qualifies a moment later, and
+    /// nothing would look again until the next restart. So every request that goes looking for a
+    /// session looks here too: a reservation still recorded as claimed is a live process this
+    /// daemon has not adopted yet.
+    ///
+    /// A claim whose worker is gone is resolved the same way it is at startup, and one whose worker
+    /// is alive and still unqualified is simply left for the next look.
+    async fn recover_claims(&self) -> Result<()> {
+        let claimed = {
+            let registry = self.registry.lock().await;
+            registry.reservations_in(LaunchPhase::Claimed)?
+        };
+        for reservation in claimed {
+            self.recover_claim(&reservation).await?;
+        }
+        Ok(())
+    }
+
     /// Restores the directory entry of every worker the registry records.
     ///
     /// A daemon that crashed between recording a worker and publishing its descriptor left a row
@@ -2801,7 +2823,9 @@ impl Controller {
     async fn session_list(self: &Arc<Self>, params: &ParamsValue) -> Result<ParamsValue> {
         let params: SessionListParams = parse(params)?;
         // Any worker that has started answering since the last attempt rejoins the directory here,
-        // so a list is the current picture rather than the picture at startup.
+        // so a list is the current picture rather than the picture at startup. A claim this daemon
+        // could not resolve when it started is looked at again for the same reason.
+        let _ = self.recover_claims().await;
         let _ = self.recover_workers().await;
         let mut sessions = Vec::new();
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
@@ -2835,6 +2859,7 @@ impl Controller {
         // A worker that did not answer at startup is not gone; it was busy, or it started slowly.
         // Trying again here is what keeps a session readable without another daemon restart.
         if self.directory.lock().await.get(params.session_id).is_none() {
+            let _ = self.recover_claims().await;
             let _ = self.recover_workers().await;
         }
         let worker = self.directory.lock().await.get(params.session_id).cloned();
@@ -3233,6 +3258,17 @@ impl Controller {
         &self,
         reservation: &crate::registry::Reservation,
     ) -> Result<ParamsValue> {
+        // A retry can arrive before this daemon has adopted the worker its first attempt started,
+        // which is what happens when a restart landed while the session was still qualifying.
+        if self
+            .directory
+            .lock()
+            .await
+            .get(reservation.session_id)
+            .is_none()
+        {
+            let _ = self.recover_claims().await;
+        }
         let worker = self
             .directory
             .lock()

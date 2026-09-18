@@ -21,6 +21,19 @@ use crate::error::{CliError, Result};
 pub struct ShellReport {
     /// Which managed shell this is.
     pub kind: ShellKind,
+    /// What the installed package says, when this operation resolved one.
+    ///
+    /// Removal resolves none: it takes out the lines it put in, which are in the file whether or
+    /// not a package is still installed. A report with none says so rather than printing blanks
+    /// that read like answers.
+    pub package: Option<PackageReport>,
+    /// Where its guarded entry goes, and whether it is there.
+    pub entries: Vec<EntryReport>,
+}
+
+/// What the installed package for one shell resolved to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PackageReport {
     /// The executable a managed session would launch.
     pub executable: String,
     /// The flags that package declares an interactive root shell is launched with.
@@ -31,8 +44,6 @@ pub struct ShellReport {
     pub editor_abi: String,
     /// The integration version of the package.
     pub integration_version: String,
-    /// Where its guarded entry goes, and whether it is there.
-    pub entries: Vec<EntryReport>,
 }
 
 /// One startup file, and what is in it.
@@ -88,20 +99,22 @@ pub fn selected<'a>(set: &'a PackageSet, shell: Option<&str>) -> Result<Vec<&'a 
 #[must_use]
 pub fn report(package: &ShellPackage, layout: &HomeLayout) -> ShellReport {
     ShellReport {
-        executable: package.executable().display().to_string(),
-        flags: package.interactive_flags(),
-        version: package.manifest.upstream_version.clone(),
-        editor_abi: package.manifest.editor_abi.clone(),
-        integration_version: package.manifest.integration_version.clone(),
+        package: Some(PackageReport {
+            executable: package.executable().display().to_string(),
+            flags: package.interactive_flags(),
+            version: package.manifest.upstream_version.clone(),
+            editor_abi: package.manifest.editor_abi.clone(),
+            integration_version: package.manifest.integration_version.clone(),
+        }),
         ..entries_only(package.manifest.shell, layout)
     }
 }
 
 /// Reports where one shell's entries go, with nothing a package would have said about it.
 ///
-/// What is left blank is exactly what an installed package answers: which executable a session
-/// would launch and what it was built from. An operation that needs none of that says so by
-/// leaving them empty rather than by inventing them.
+/// What is left out is exactly what an installed package answers: which executable a session would
+/// launch and what it was built from. An operation that needs none of that says so rather than
+/// printing a blank where an answer belongs.
 fn entries_only(kind: ShellKind, layout: &HomeLayout) -> ShellReport {
     let entries = layout
         .targets(kind)
@@ -115,11 +128,7 @@ fn entries_only(kind: ShellKind, layout: &HomeLayout) -> ShellReport {
         .collect();
     ShellReport {
         kind,
-        executable: String::new(),
-        flags: Vec::new(),
-        version: String::new(),
-        editor_abi: String::new(),
-        integration_version: String::new(),
+        package: None,
         entries,
     }
 }
@@ -228,12 +237,17 @@ pub fn to_json(reports: &[ShellReport]) -> Value {
             .iter()
             .map(|report| json!({
                 "shell": report.kind.as_str(),
-                "executable": report.executable,
-                "flags": report.flags,
-                "version": report.version,
-                "editor_abi": report.editor_abi,
-                "integration_version": report.integration_version,
-                "integration_mode": "managed",
+                // Null rather than empty where no package was resolved: a reader can tell "this
+                // operation did not ask" from "the package says nothing".
+                "executable": report.package.as_ref().map(|package| package.executable.clone()),
+                "flags": report.package.as_ref().map(|package| package.flags.clone()),
+                "version": report.package.as_ref().map(|package| package.version.clone()),
+                "editor_abi": report.package.as_ref().map(|package| package.editor_abi.clone()),
+                "integration_version": report
+                    .package
+                    .as_ref()
+                    .map(|package| package.integration_version.clone()),
+                "integration_mode": report.package.as_ref().map(|_| "managed"),
                 "entries": report
                     .entries
                     .iter()
@@ -258,19 +272,22 @@ pub fn print(reports: &[ShellReport]) {
         return;
     }
     for report in reports {
-        println!(
-            "{} {}: {} ({}), editor ABI {}, integration {}, mode managed",
-            report.kind,
-            report.version,
-            report.executable,
-            if report.flags.is_empty() {
-                "no flags".to_owned()
-            } else {
-                report.flags.join(" ")
-            },
-            report.editor_abi,
-            report.integration_version,
-        );
+        match &report.package {
+            Some(package) => println!(
+                "{} {}: {} ({}), editor ABI {}, integration {}, mode managed",
+                report.kind,
+                package.version,
+                package.executable,
+                if package.flags.is_empty() {
+                    "no flags".to_owned()
+                } else {
+                    package.flags.join(" ")
+                },
+                package.editor_abi,
+                package.integration_version,
+            ),
+            None => println!("{}", report.kind),
+        }
         for entry in &report.entries {
             let state = entry.change.map_or_else(
                 || {

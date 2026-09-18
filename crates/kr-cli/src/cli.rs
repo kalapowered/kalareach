@@ -144,7 +144,7 @@ pub struct ShellInstallArguments {
 /// `kr shell remove`.
 #[derive(Debug, Args)]
 pub struct ShellRemoveArguments {
-    /// Remove the entry for one shell rather than every installed package.
+    /// Remove the entry for one shell rather than every shell KalaReach qualifies.
     #[arg(long)]
     pub shell: Option<String>,
     /// Report what would change without writing anything.
