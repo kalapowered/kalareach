@@ -3664,13 +3664,6 @@ impl Controller {
         let mut registry = self.registry.lock().await;
         registry.record_closure(record)?;
         drop(registry);
-        // The closure is now recorded, which is the moment a session stops being work this host
-        // counts. Every path that records one reaches this line, and the look at the setting
-        // happens here rather than at each of them, so a path that ends in an error below, or one
-        // added later, cannot leave an assertion held for a session that has finished.
-        if let Some(controller) = self.me.upgrade() {
-            controller.review_power_soon();
-        }
         // This daemon's own view of the session goes as soon as the closure is recorded, before
         // the published descriptor is removed and whether or not that succeeds. The closure is
         // the fact; a worker kept in the directory after it would be a session this daemon still
@@ -3682,6 +3675,14 @@ impl Controller {
         // retired worker would stay pending for every later revocation, because nothing would be
         // left to say that it ended.
         self.leases.worker_ended(record.session_id);
+        // The session has stopped being work this host counts, and this is the line where that
+        // became true of everything the counting reads: the record is written and the session has
+        // left the directory a demand scan takes its list from. Every path that records a closure
+        // reaches here, so the look at the setting happens here rather than at each of them, and
+        // it happens before the tidying below, which can fail.
+        if let Some(controller) = self.me.upgrade() {
+            controller.review_power_soon();
+        }
         // The directory the worker ran in goes with the session. It holds nothing the closure
         // record needs, and one per session that nothing removes would outlive every session this
         // host has ever run. A worker still on its way out may be holding it; on the platforms
