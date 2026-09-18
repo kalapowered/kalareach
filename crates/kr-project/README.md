@@ -156,27 +156,35 @@ round would permit everything it had not heard of, the sockets that reach the ma
 inside among them. What may be made is short.
 
 * A **connected pair of local sockets**, for either kind of operation, of the stream kind and of no
-  protocol besides. Such a pair is joined to its own other half and has no address.
-* For a **remote** operation, the family the kernel answers questions about this machine's own
-  addresses on, and only for that; and the internet families, and on those only a stream socket of
-  the protocol the port rules govern, because a stream socket of another protocol is one those
-  rules would say nothing about.
+  protocol besides. Such a pair is joined to its own other half, cannot be connected again and
+  cannot be given a destination, so it has no way to reach anything.
+* For a **remote** operation, the internet families, and on those only a stream socket of the
+  protocol the port rules govern, because a stream socket of another protocol is one those rules
+  would say nothing about.
 
 Everything else is refused, listening included: a single local socket, a pair of the kind that
 carries a destination on every message, and every family this list does not name. A local socket
 with an address is the one a program reaches another program on this machine by name with, and a
-proxy on one — or a connection handed over one already made — would be a way past every port rule
-here.
+proxy on one, or a connection handed over one already made, would be a way past every port rule
+here. The family the kernel answers questions about this machine's own addresses on is refused for
+the same reason: on a host that lets an ordinary account make a network namespace of its own, a
+socket of that family reaches another program rather than the kernel.
 
 What that costs is what a C library asks over a local socket or over that family: its name service
 cache, a resolver's own interface, and the kernel's list of this machine's addresses. Each is a step
 a C library falls back from — to the files, to the resolver itself over TCP, and to asking about
 both kinds of address — and the child is told to use that connection (`RES_OPTIONS=use-vc`), with
 the port a resolver answers on added to the rules on any address, because which machine answers a
-name is not this service's to decide. An address written out in full, and a name the files answer,
-are reached either way. **A host whose name service has no fallback to the resolver, or whose
-resolver will not take that instruction, cannot turn a name that needs the resolver into an address
-inside this boundary**, and the operation fails saying so.
+name is not this service's to decide. **A host whose name service has no fallback to the resolver,
+or whose resolver will not take that instruction, cannot turn a name that needs the resolver into an
+address inside this boundary**, and the operation fails saying so.
+
+**A remote reached over https is reached over IPv4.** The library Git fetches with asks whether this
+machine has IPv6 by making a datagram socket and throwing it away, and a datagram socket is the one
+thing this filter cannot bound; refused that question, the library answers it "no" and asks only for
+IPv4 addresses. A remote that has only an IPv6 address is therefore not reached over https inside
+this boundary, and an address written out in full is reached either way. Git's own transport over
+ssh does not ask that question and is not bounded to one kind of address by it.
 
 A credential broker that would reach an agent or a secret service over a local socket cannot do so
 inside the boundary either. That is a real limit and not a theoretical one:

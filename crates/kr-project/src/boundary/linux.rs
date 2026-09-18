@@ -69,8 +69,13 @@
 //! answers a name is not this host's to decide. **A host whose name service has no fallback to the
 //! resolver, or whose resolver does not take that instruction, cannot turn a name into an address
 //! inside this boundary**, and the operation fails saying so rather than being given a socket
-//! nothing can bound. An address written out in full, and a name the files answer, are reached
-//! either way.
+//! nothing can bound. An address written out in full is reached either way.
+//!
+//! One more thing follows from refusing a datagram socket, on this platform only. The library Git
+//! fetches over https with asks whether this machine has IPv6 by making a datagram socket and
+//! throwing it away; refused that question, it answers it "no" and asks the resolver for IPv4
+//! addresses alone. A remote whose name has only an IPv6 address is therefore not reached over
+//! https inside this boundary. Git's own transport over ssh does not ask that question.
 //!
 //! The filter is built for this machine's own instruction set, and an architecture whose call
 //! numbers this host does not hold refuses the invocation rather than installing a filter that
