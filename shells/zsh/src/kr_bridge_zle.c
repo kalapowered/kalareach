@@ -514,6 +514,11 @@ kr_zle_pass_end(void)
      * itself idle again and the worker gets its retry point. */
     kr_idle_reported = 0;
     kr_bridge_service();
+    /* Reading the endpoint there can itself have ended something, and at a pass boundary that has
+     * ended too, so whatever came behind it is read now rather than at the next keystroke. */
+    kr_cancel_requested = kr_cancel_consumed = 0;
+    kr_bridge_cancel_settled();
+    kr_bridge_service();
 }
 
 void
