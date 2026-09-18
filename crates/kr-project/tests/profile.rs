@@ -139,18 +139,12 @@ fn no_planted_helper_runs_during_a_clone_of_the_planted_repository_or_an_adoptio
 
     // A clone copies the template's hooks into the new repository, so the new one has none.
     let hooks = fixture.work().join("cloned/.git/hooks");
-    let installed: Vec<String> = std::fs::read_dir(&hooks)
-        .map(|entries| {
-            entries
-                .filter_map(|entry| {
-                    entry
-                        .ok()
-                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                })
-                .filter(|name| !name.ends_with(".sample"))
-                .collect()
-        })
-        .unwrap_or_default();
+    // An absent hooks directory is a clone with no hooks; a directory this test cannot read is not
+    // an answer at all, so it fails rather than passing as empty.
+    let installed: Vec<String> = support::names_in_if_any(&hooks)
+        .into_iter()
+        .filter(|name| !name.ends_with(".sample"))
+        .collect();
     assert_eq!(
         installed,
         Vec::<String>::new(),
@@ -1043,11 +1037,9 @@ fn a_git_invocation_names_an_absolute_directory_and_leaves_the_profiles_own_one_
         root_refusal.to_string().contains("absolute directory"),
         "and says why: {root_refusal}"
     );
-    assert!(
-        std::fs::read_dir(profile.home_directory())
-            .expect("the child's own directory reads")
-            .next()
-            .is_none(),
+    assert_eq!(
+        support::names_in(profile.home_directory()),
+        Vec::<String>::new(),
         "a refusal leaves the directory every Git child starts in empty"
     );
 
@@ -1061,11 +1053,9 @@ fn a_git_invocation_names_an_absolute_directory_and_leaves_the_profiles_own_one_
         std::fs::canonicalize(&path).expect("the repository"),
     );
     let home = profile.home_directory();
-    assert!(
-        std::fs::read_dir(home)
-            .expect("the child's own directory reads")
-            .next()
-            .is_none(),
+    assert_eq!(
+        support::names_in(home),
+        Vec::<String>::new(),
         "the directory every Git child starts in is still empty: {}",
         home.display()
     );

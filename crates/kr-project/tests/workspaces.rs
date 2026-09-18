@@ -61,14 +61,7 @@ fn count(preview: &kr_protocol::project::InclusionPreview, class: InclusionClass
 fn a_preview_names_what_a_reviewer_would_see_and_creates_nothing() {
     let fixture = Fixture::create();
     let project = adopted_with_changes(&fixture, "previewed");
-    let before: Vec<String> = std::fs::read_dir(fixture.work())
-        .expect("the parent is readable")
-        .filter_map(|entry| {
-            entry
-                .ok()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        })
-        .collect();
+    let before = support::names_in(fixture.work());
     let result = fixture
         .service()
         .workspace_create(
@@ -143,15 +136,7 @@ fn a_preview_names_what_a_reviewer_would_see_and_creates_nothing() {
             .any(|line| line.contains("not a security sandbox"))
     );
     // Nothing was created.
-    let after: Vec<String> = std::fs::read_dir(fixture.work())
-        .expect("the parent is readable")
-        .filter_map(|entry| {
-            entry
-                .ok()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        })
-        .collect();
-    assert_eq!(before.len(), after.len());
+    assert_eq!(before, support::names_in(fixture.work()));
     assert!(
         fixture
             .service()
@@ -1450,10 +1435,8 @@ fn an_included_executable_arrives_executable_and_a_failed_copy_leaves_the_base_i
         "a copy that could not land does not write over what is at the name"
     );
     // And nothing of this host's own is left behind in the user's workspace.
-    let strays: Vec<String> = std::fs::read_dir(&tree)
-        .expect("the workspace lists")
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+    let strays: Vec<String> = support::names_in(&tree)
+        .into_iter()
         .filter(|name| name.starts_with(".kr-copy-"))
         .collect();
     assert!(strays.is_empty(), "no copy in progress is left: {strays:?}");

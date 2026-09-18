@@ -63,16 +63,7 @@ fn an_initialised_repository_is_published_from_a_private_sibling_and_nothing_is_
     assert!(!Path::new(staged).exists(), "the sibling is gone");
     // The published repository is a repository, and the parent holds nothing else.
     assert!(fixture.work().join("fresh/.git").is_dir());
-    let mut entries: Vec<String> = std::fs::read_dir(fixture.work())
-        .expect("the parent is readable")
-        .filter_map(|entry| {
-            entry
-                .ok()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        })
-        .collect();
-    entries.sort();
-    assert_eq!(entries, vec!["fresh".to_owned()]);
+    assert_eq!(support::names_in(fixture.work()), vec!["fresh".to_owned()]);
     // And the record's identity is the object rather than the path.
     let read = fixture
         .service()
@@ -365,15 +356,7 @@ fn a_credential_in_a_url_is_refused_before_anything_is_staged() {
         );
     }
     // Nothing was created and nothing was staged: the parent is empty.
-    let entries: Vec<String> = std::fs::read_dir(fixture.work())
-        .expect("the parent is readable")
-        .filter_map(|entry| {
-            entry
-                .ok()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        })
-        .collect();
-    assert_eq!(entries, Vec::<String>::new());
+    assert_eq!(support::names_in(fixture.work()), Vec::<String>::new());
 }
 
 #[test]

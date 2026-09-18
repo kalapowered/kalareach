@@ -1004,13 +1004,8 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
         !work.path().join("hanging").exists(),
         "the destination is untouched"
     );
-    let leftovers: Vec<String> = std::fs::read_dir(work.path())
-        .expect("the parent is readable")
-        .filter_map(|entry| {
-            entry
-                .ok()
-                .map(|entry| entry.file_name().to_string_lossy().into_owned())
-        })
+    let leftovers: Vec<String> = names_in(work.path())
+        .into_iter()
         .filter(|name| name.starts_with(kr_project::operation::STAGING_PREFIX))
         .collect();
     assert_eq!(
@@ -1201,6 +1196,27 @@ impl Drop for EnvironmentSecrets {
         // Best effort on the way out an assertion takes. The successful path checks the result.
         let _ = self.remove();
     }
+}
+
+/// Returns the names one directory holds, sorted, failing the test on anything it could not read.
+///
+/// A listing that turns a failure into an empty list says "there is nothing here" when it means
+/// "I could not look", and an assertion built on it then passes for the wrong reason.
+fn names_in(directory: &Path) -> Vec<String> {
+    let entries = std::fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("{} could not be read: {error}", directory.display()));
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| {
+            panic!(
+                "an entry of {} could not be read: {error}",
+                directory.display()
+            )
+        });
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    names
 }
 
 /// Starts the copied daemon on this test's own directories, with no worker program.

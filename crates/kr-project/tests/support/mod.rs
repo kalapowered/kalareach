@@ -17,6 +17,48 @@ use kr_ipc::testing::TempHost;
 use kr_project::ProjectService;
 use kr_project::credential::{BrokerRegistry, OS_SECRET_STORE};
 
+/// Returns the names one directory holds, sorted, and fails the test on anything it could not read.
+///
+/// A listing that turns a failure into an empty list is a listing that says "there is nothing here"
+/// when it means "I could not look", and an assertion built on it then passes for the wrong reason.
+/// Every error is the test's answer: the directory could not be opened, or one entry could not be
+/// read, and either way what is in there is not established.
+///
+/// # Panics
+///
+/// Panics when the directory or any entry in it cannot be read.
+#[must_use]
+pub fn names_in(directory: &Path) -> Vec<String> {
+    let entries = std::fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("{} could not be read: {error}", directory.display()));
+    let mut names = Vec::new();
+    for entry in entries {
+        let entry = entry.unwrap_or_else(|error| {
+            panic!(
+                "an entry of {} could not be read: {error}",
+                directory.display()
+            )
+        });
+        names.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    names.sort();
+    names
+}
+
+/// The same, where an absent directory is a valid answer and nothing else is.
+///
+/// # Panics
+///
+/// Panics when the directory exists and it or any entry in it cannot be read.
+#[must_use]
+pub fn names_in_if_any(directory: &Path) -> Vec<String> {
+    match std::fs::read_dir(directory) {
+        Ok(_) => names_in(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(error) => panic!("{} could not be read: {error}", directory.display()),
+    }
+}
+
 /// The fixture document the restricted-profile tests are built from.
 #[must_use]
 pub fn fixture_path() -> PathBuf {
@@ -231,21 +273,7 @@ impl Planted {
     /// Panics when the sentinel directory cannot be read for a reason other than its absence.
     #[must_use]
     pub fn escaped(&self) -> Vec<String> {
-        match std::fs::read_dir(&self.sentinels) {
-            Ok(entries) => {
-                let mut names: Vec<String> = entries
-                    .filter_map(|entry| {
-                        entry
-                            .ok()
-                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                    })
-                    .collect();
-                names.sort();
-                names
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => panic!("the sentinel directory could not be read: {error}"),
-        }
+        names_in_if_any(&self.sentinels)
     }
 }
 
@@ -370,21 +398,7 @@ impl PlantedSubmodule {
     /// Panics when the sentinel directory cannot be read for a reason other than its absence.
     #[must_use]
     pub fn escaped(&self) -> Vec<String> {
-        match std::fs::read_dir(&self.sentinels) {
-            Ok(entries) => {
-                let mut names: Vec<String> = entries
-                    .filter_map(|entry| {
-                        entry
-                            .ok()
-                            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-                    })
-                    .collect();
-                names.sort();
-                names
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => panic!("the sentinel directory could not be read: {error}"),
-        }
+        names_in_if_any(&self.sentinels)
     }
 }
 
