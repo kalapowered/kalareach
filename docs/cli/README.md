@@ -110,9 +110,11 @@ so a terminal that may not type can still read what is above the live page. A st
 less the line that joins the two pages, and several keys in one read move the window once, because
 a window is in one place.
 
-They are this terminal's keys only while the shell's buffer is showing. A full-screen application
-runs on a buffer that keeps no history and has its own use for those keys, so there they are the
-application's. Inside a bracketed paste nothing is a key at all: pasted text reaches the session
+They are this terminal's keys only where this terminal has no history of its own. A terminal being
+handed the session's bytes has them, so its own scrollback holds what scrolled past and the command
+takes none of its keys; a terminal drawing a projection was never sent them, and the session's
+window is the only way above its screen. They are also the application's while a full-screen
+program is running, because its buffer keeps no history and it has its own use for those keys. Inside a bracketed paste nothing is a key at all: pasted text reaches the session
 byte for byte, whatever it happens to contain. An unshifted Page Up is the application's, as it
 always was, and a lone Escape is never held back waiting for a key that might follow it.
 

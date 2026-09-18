@@ -966,17 +966,26 @@ async fn drive(
                     // The terminal's own input ended. Nothing is left to forward.
                     return AttachOutcome::Detached;
                 };
-                // The scroll-back keys first. They belong to this terminal's own presentation:
-                // they move the window it is looking through and never reach the session, so an
-                // attachment that may not type can still read what is above the live page. A
-                // full-screen application has its own use for these keys and its buffer keeps no
+                // The scroll-back keys first, where they are this terminal's at all. They move the
+                // window it is looking through and never reach the session, so an attachment that
+                // may not type can still read what is above the live page.
+                //
+                // Two things decide whether they are this terminal's. A terminal being handed the
+                // session's own bytes has those bytes, so its own scrollback holds the history and
+                // the command takes none of its keys; a terminal drawing a projection was never
+                // sent them, so there is nothing above its screen but the session's window. And a
+                // full-screen application has its own use for these keys on a buffer that keeps no
                 // history, so they are this terminal's only while the shell's buffer is showing.
-                let split = if display.showing_history_buffer() {
+                let mine = display.holds_screen() && display.showing_history_buffer();
+                let split = if mine {
                     keys.take(&bytes)
                 } else {
+                    // Anything the reader was holding goes first, in the order it was typed.
+                    let mut input = keys.release();
+                    input.extend_from_slice(&bytes);
                     Split {
                         steps: 0,
-                        input: bytes,
+                        input,
                         holding: false,
                     }
                 };
