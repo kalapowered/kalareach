@@ -41,33 +41,36 @@
 //! had not heard of. A socket is made only of what this boundary can account for, and the list is
 //! short.
 //!
-//! * **A pair of sockets**, of the local family, for either kind of operation. A pair has no
-//!   address, so it is not a way to reach anything; it is how a program talks to a child of its
-//!   own.
-//! * **A single socket of the local family is not made at all.** That is the one a program reaches
-//!   another program on this machine by name with, and the kernel's rules say nothing about where
-//!   the program on the other end goes. A proxy on a local socket, or a connection handed over one
-//!   already made, would be a way past every port rule here. What it costs is the caches a C
-//!   library asks over one — the name service cache, a resolver's own interface — and the answer to
-//!   that is that a C library falls back to the files and to the resolver itself, which the rules
-//!   below do bound.
-//! * **The kernel's own family**, for a remote operation only, and only for the protocol that
-//!   answers about this machine's own addresses, which is where resolving a name begins. It reaches
-//!   this kernel and no machine.
+//! * **A connected pair of local sockets**, for either kind of operation, of the stream kind and of
+//!   no protocol besides. Such a pair is joined to its own other half, cannot be connected again
+//!   and cannot be given a destination, so it is not a way to reach anything; it is how a program
+//!   talks to a child of its own.
 //! * **The internet families**, for a remote operation only, and on those only a stream socket,
 //!   which is what every transport here uses and what Landlock's port rules govern. A stream socket
 //!   is not the same thing as the protocol those rules are about, so the protocol is checked too: a
 //!   stream socket of another protocol is one they would say nothing about and is not made.
 //!
-//! Nothing may listen, and a local operation gets no socket with an address of any kind.
+//! Nothing else is made at all. Not a single local socket, nor a pair of the kind that carries a
+//! destination on every message: those are what a program reaches another program on this machine
+//! by name with, and a proxy on one, or a connection handed over one already made, would be a way
+//! past every port rule here. Not the family the kernel answers questions about this machine's own
+//! addresses on either, because a host that lets an ordinary account make a network namespace of
+//! its own gives that account the right to talk over that family to another *program* rather than
+//! to the kernel, which is the same way past. Nothing may listen, and a local operation gets no
+//! socket with an address of any kind.
 //!
-//! What that costs besides is name resolution, which ordinarily sends datagrams. The child is told
-//! to resolve over the same kind of connection it fetches over (`RES_OPTIONS=use-vc`, which the
-//! usual C library reads), and the port a resolver answers on is added to the connect rules for a
-//! remote operation — on any address, because which machine answers a name is not this host's to
-//! decide. A system whose resolver does not take that instruction cannot turn a host name into an
-//! address inside this boundary, and the operation fails saying so rather than being given a
-//! datagram socket nothing can bound.
+//! What that costs is what a C library asks over a local socket or over that family: its name
+//! service cache, a resolver's own interface, and the kernel's list of this machine's addresses. A
+//! C library falls back from each of them — to the files, to the resolver itself, and to assuming
+//! both kinds of address are worth asking about — so a name still resolves over the connection the
+//! rules below bound. The child is told to resolve over the same kind of connection it fetches over
+//! (`RES_OPTIONS=use-vc`, which the usual C library reads), and the port a resolver answers on is
+//! added to the connect rules for a remote operation — on any address, because which machine
+//! answers a name is not this host's to decide. **A host whose name service has no fallback to the
+//! resolver, or whose resolver does not take that instruction, cannot turn a name into an address
+//! inside this boundary**, and the operation fails saying so rather than being given a socket
+//! nothing can bound. An address written out in full, and a name the files answer, are reached
+//! either way.
 //!
 //! The filter is built for this machine's own instruction set, and an architecture whose call
 //! numbers this host does not hold refuses the invocation rather than installing a filter that
@@ -448,8 +451,7 @@ fn filter(remote: bool) -> Result<Vec<libc::sock_filter>> {
         // that can still be given a destination is not, whether that is a single one or a pair of
         // the kind that carries an address on every message, because the kernel's rules say nothing
         // about where one of those goes and a program on the other end of it can reach anything it
-        // likes on this child's behalf. What is left is the kernel's own answer about this machine's
-        // addresses, which a name resolution needs, and the internet families, on which the only
+        // likes on this child's behalf. What is left is the internet families, on which the only
         // socket is a stream one of the protocol the port rules govern. Nothing may listen.
         program.extend([
             // Index 9, 10, 11: which call this is. A pair goes to the rules at 12, a single socket
@@ -457,37 +459,31 @@ fn filter(remote: bool) -> Result<Vec<libc::sock_filter>> {
             // running Git.
             instruction(COMPARE, 2, 0, SYS_SOCKETPAIR),
             instruction(COMPARE, 8, 0, SYS_SOCKET),
-            instruction(COMPARE, 19, 20, SYS_LISTEN),
+            instruction(COMPARE, 16, 17, SYS_LISTEN),
             // 12 to 18: a pair is a local one, of the kind that is connected to its other half and
             // to nothing else, and of no protocol besides.
             instruction(LOAD, 0, 0, FIRST_ARGUMENT),
-            instruction(COMPARE, 0, 17, libc::AF_UNIX as u32),
+            instruction(COMPARE, 0, 14, libc::AF_UNIX as u32),
             instruction(LOAD, 0, 0, SECOND_ARGUMENT),
             instruction(MASK, 0, 0, KIND),
-            instruction(COMPARE, 0, 14, libc::SOCK_STREAM as u32),
+            instruction(COMPARE, 0, 11, libc::SOCK_STREAM as u32),
             instruction(LOAD, 0, 0, THIRD_ARGUMENT),
-            instruction(COMPARE, 13, 12, 0),
-            // 19, 20: the kernel answers a C library's questions about this machine's own addresses
-            // on its own family, which is where a name resolution begins.
+            instruction(COMPARE, 10, 9, 0),
+            // 19, 20, 21: an internet family is the one the rules below are about, and a family
+            // this filter does not name is refused rather than left alone.
             instruction(LOAD, 0, 0, FIRST_ARGUMENT),
-            instruction(COMPARE, 8, 0, libc::AF_NETLINK as u32),
-            // 21, 22: an internet family is the one the rules below are about, and a family this
-            // filter does not name is refused rather than left alone.
             instruction(COMPARE, 1, 0, libc::AF_INET as u32),
-            instruction(COMPARE, 0, 8, libc::AF_INET6 as u32),
-            // 23, 24, 25: an internet socket is a stream one, whatever flags travel beside its kind.
+            instruction(COMPARE, 0, 6, libc::AF_INET6 as u32),
+            // 22, 23, 24: an internet socket is a stream one, whatever flags travel beside its kind.
             instruction(LOAD, 0, 0, SECOND_ARGUMENT),
             instruction(MASK, 0, 0, KIND),
-            instruction(COMPARE, 0, 5, libc::SOCK_STREAM as u32),
-            // 26, 27, 28: and its protocol is the one the kernel's own address rules are about.
+            instruction(COMPARE, 0, 3, libc::SOCK_STREAM as u32),
+            // 25, 26, 27: and its protocol is the one the kernel's own address rules are about.
             // A stream socket of another protocol is a stream socket those rules say nothing about.
             instruction(LOAD, 0, 0, THIRD_ARGUMENT),
-            instruction(COMPARE, 4, 0, 0),
-            instruction(COMPARE, 3, 2, libc::IPPROTO_TCP as u32),
-            // 29, 30: and the kernel's own family answers about addresses and nothing else.
-            instruction(LOAD, 0, 0, THIRD_ARGUMENT),
-            instruction(COMPARE, 1, 0, libc::NETLINK_ROUTE as u32),
-            // 31, 32.
+            instruction(COMPARE, 2, 0, 0),
+            instruction(COMPARE, 1, 0, libc::IPPROTO_TCP as u32),
+            // 28, 29.
             instruction(ANSWER, 0, 0, REFUSED),
             instruction(ANSWER, 0, 0, PERMITTED),
         ]);
@@ -719,32 +715,24 @@ mod tests {
             ),
             PERMITTED
         );
-        // The kernel answers about this machine's own addresses on its own family, which is where
-        // resolving a name begins, and answers nothing else there.
-        assert_eq!(
-            judge(
-                &program,
-                call_with(
-                    SYS_SOCKET,
-                    libc::AF_NETLINK as u32,
-                    libc::SOCK_RAW as u32,
-                    libc::NETLINK_ROUTE as u32
-                )
-            ),
-            PERMITTED
-        );
-        assert_eq!(
-            judge(
-                &program,
-                call_with(
-                    SYS_SOCKET,
-                    libc::AF_NETLINK as u32,
-                    libc::SOCK_RAW as u32,
-                    libc::NETLINK_KOBJECT_UEVENT as u32
-                )
-            ),
-            REFUSED
-        );
+        // The family the kernel answers questions about this machine's own addresses on is not
+        // made either: on a host that lets an ordinary account make a network namespace of its
+        // own, a socket of that family reaches another program rather than the kernel.
+        for protocol in [libc::NETLINK_ROUTE, libc::NETLINK_KOBJECT_UEVENT] {
+            assert_eq!(
+                judge(
+                    &program,
+                    call_with(
+                        SYS_SOCKET,
+                        libc::AF_NETLINK as u32,
+                        libc::SOCK_RAW as u32,
+                        protocol as u32
+                    )
+                ),
+                REFUSED,
+                "a remote operation makes no socket of the kernel's own family, protocol {protocol}"
+            );
+        }
         // A single local socket is how a program reaches another by name, and where that one goes
         // is not something any rule here could bound. A connected pair has no address at all, and
         // a pair of the kind that carries a destination on every message is not a pair like that.
@@ -797,6 +785,7 @@ mod tests {
             libc::AF_BLUETOOTH,
             libc::AF_ALG,
             libc::AF_PACKET,
+            libc::AF_NETLINK,
         ] {
             for number in [SYS_SOCKET, SYS_SOCKETPAIR] {
                 assert_eq!(
