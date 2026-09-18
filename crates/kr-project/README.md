@@ -64,14 +64,18 @@ returned. A directory substituted at one of those names is refused before anythi
 then does not start at a path either: it moves into the open working directory before the boundary
 is applied and before Git runs, with `-C .` as its only directory argument.
 
-What the kernel then enforces is this: a write lands only inside the subtree of one of those granted
-root objects, as the kernel works that out at the moment of the write — by the object itself on
-Linux, where the rules are attached to the opened directories, and by the resolved path on macOS,
-where the profile names them. After the child has gone, each granted root is required to still be
-the object it was before its result reaches a caller, and a root that is not ends the run with this
-service's declared honest result. That second reading is **detection** and is described as such: it
-says that a root changed, it does not keep one from changing, it is on those roots and not on every
-descendant of them, and two readings cannot tell a change made and undone from no change at all.
+What the kernel then enforces is this: a file is opened for writing only inside the subtree of one of
+those granted root objects, as the kernel works that out **when the file is opened** — by the object
+itself on Linux, where the rules are attached to the opened directories, and by the resolved path on
+macOS, where the profile names them. Neither kernel asks again on each write through a descriptor
+already open, so a file opened inside a granted subtree and then moved out of it is still written
+through that descriptor.
+
+After the child has gone, each granted root is required to still be the object it was before its
+result reaches a caller, and a root that is not ends the run with this service's declared honest
+result. That second reading is **detection** and is described as such: it says that a root changed,
+it does not keep one from changing, it is on those roots and not on every descendant of them, and
+two readings cannot tell a change made and undone from no change at all.
 
 **Reads are not confined on macOS or Linux.** Git reads the system's shared libraries, its locale
 data and its certificate store, and a read confinement that missed one of those would fail an

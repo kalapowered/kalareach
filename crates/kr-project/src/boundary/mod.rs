@@ -45,14 +45,18 @@
 //! boundary was built around.
 //!
 //! What the kernel enforces is narrower than the sentence above, and is stated as what it is: a
-//! write lands only inside the subtree of one of the granted root objects, as the kernel works that
-//! out at the moment of the write — by the object itself on Linux, where the rules are attached to
-//! the opened directories, and by the resolved path on macOS, where the profile names them. The
-//! granted roots are confirmed by identity twice, before the child starts and after it has gone,
-//! and a root that is no longer the object it was ends the run with this service's declared honest
-//! result. That second reading is **detection**: it says that a root changed, it does not keep one
-//! from changing. Two readings cannot tell a change made and undone from no change at all, and
-//! waiting for Git establishes that Git has gone rather than that everything it started has.
+//! file is opened for writing only inside the subtree of one of the granted root objects, as the
+//! kernel works that out **when the file is opened** — by the object itself on Linux, where the
+//! rules are attached to the opened directories, and by the resolved path on macOS, where the
+//! profile names them. Neither kernel asks again on each write through a descriptor already open,
+//! so a file opened inside a granted subtree and then moved out of it is still written through that
+//! descriptor. That is the mechanism's rule rather than a choice made here.
+//!
+//! The granted roots are confirmed by identity twice, before the child starts and after it has
+//! gone, and a root that is no longer the object it was ends the run with this service's declared
+//! honest result. That second reading is **detection**: it says that a root changed, it does not
+//! keep one from changing. Two readings cannot tell a change made and undone from no change at all,
+//! and waiting for Git establishes that Git has gone rather than that everything it started has.
 //!
 //! Inside a granted subtree the kernel draws no further line, and this host does not pretend to.
 //! A directory put at an unrecorded name *inside* a tree the operation owns is written to as the

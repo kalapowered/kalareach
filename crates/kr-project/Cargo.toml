@@ -56,7 +56,9 @@ tempfile.workspace = true
 [features]
 # The tests that build real repositories with installed Git, including the restricted-profile
 # fixtures whose planted helpers must never run. On by default so a plain `cargo test` runs them;
-# a host without Git turns them off rather than reporting a failure it cannot fix.
+# a host without Git turns them off rather than reporting a failure it cannot fix. It also compiles
+# the seam those tests act in, which nothing in the service ever sets and which a shipped build has
+# no use for: a binary that ships this crate turns default features off.
 default = ["git-fixtures"]
 git-fixtures = []
 
