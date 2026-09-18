@@ -869,25 +869,22 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
         "and its modifyOtherKeys level",
     );
 
-    // Whatever stack operations reached this terminal are the application's own. None of them is
-    // one of this attachment's, so the entry an outer program had pushed before `kr` ran is still
-    // on the stack and its own pop will find it.
+    // Not one stack operation reached this terminal, the application's own included. The entry an
+    // outer program had pushed before `kr` ran is still on the stack and its own pop will find it,
+    // and that is true of the application's `CSI < 65535 u` as much as of anything this attachment
+    // might have written: it emptied the session's stack, not this terminal's. A terminal that had
+    // been sent it would have lost entries that no restoration of the current flags could bring
+    // back, so counting it as "the application's own" would be counting a fault as a pass.
     assert_eq!(
-        output.count(b"\x1b[>0u"),
+        stack_operations(output.text().as_bytes()),
         0,
-        "no entry of this attachment's was opened: {}",
-        output.text().escape_debug()
-    );
-    assert_eq!(
-        output.count(b"\x1b[<1u"),
-        0,
-        "and none was taken off: {}",
+        "no stack operation of any kind reached this terminal: {}",
         output.text().escape_debug()
     );
     assert_eq!(
         output.count(b"\x1b[<65535u"),
-        stack_operations(output.text().as_bytes()),
-        "every stack operation this terminal saw is the application's own: {}",
+        0,
+        "the application's own emptying of the stack stopped at the session: {}",
         output.text().escape_debug()
     );
     let _ = shell.kill();
