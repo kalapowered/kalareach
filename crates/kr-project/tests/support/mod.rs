@@ -199,6 +199,20 @@ pub fn named_broker() -> BrokerRegistry {
     )])
 }
 
+/// A broker that lends an ssh program and no credential helper, which is the ordinary Linux host.
+///
+/// Git ships `git-credential-osxkeychain` on Apple platforms and `git-credential-libsecret` is a
+/// separate package on most Linux distributions, so a host that has ssh and no credential helper is
+/// the common case rather than a contrived one.
+#[must_use]
+pub fn broker_without_a_credential_helper() -> BrokerRegistry {
+    BrokerRegistry::from_brokers(vec![BrokerRegistry::broker(
+        OS_SECRET_STORE,
+        None,
+        Some(std::ffi::OsString::from("/usr/bin/ssh")),
+    )])
+}
+
 /// Runs installed Git directly, for building a fixture.
 ///
 /// No user or system configuration is read, so a signing key or a template directory in the

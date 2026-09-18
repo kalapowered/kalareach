@@ -221,47 +221,48 @@ impl BrokerRegistry {
                 .into(),
             });
         }
-        let broker =
-            match parsed.transport {
-                // A local path reaches no network and needs no credential, so it names no broker.
-                RemoteTransport::LocalPath => {
-                    if !requested.credential_broker.is_empty() {
-                        return Err(ProjectError::RemoteRejected {
-                            detail:
-                                "a local-path remote reaches no network, so it names no credential \
+        let broker = match parsed.transport {
+            // A local path reaches no network and needs no credential, so it names no broker.
+            RemoteTransport::LocalPath => {
+                if !requested.credential_broker.is_empty() {
+                    return Err(ProjectError::RemoteRejected {
+                        detail:
+                            "a local-path remote reaches no network, so it names no credential \
                                  broker"
-                                    .to_owned()
-                                    .into(),
-                        });
-                    }
-                    None
+                                .to_owned()
+                                .into(),
+                    });
                 }
-                RemoteTransport::Https | RemoteTransport::Ssh => {
-                    let broker = self.approved(&requested.credential_broker)?;
-                    match parsed.transport {
-                        RemoteTransport::Https if broker.helper.is_none() => {
-                            return Err(ProjectError::RemoteRejected {
-                            detail: format!(
-                                "the broker {} has no credential helper on this host, so an https \
-                                 remote cannot be authenticated",
-                                broker.name
-                            ).into(),
-                        });
-                        }
-                        RemoteTransport::Ssh if broker.ssh_command.is_none() => {
-                            return Err(ProjectError::RemoteRejected {
+                None
+            }
+            RemoteTransport::Https | RemoteTransport::Ssh => {
+                let broker = self.approved(&requested.credential_broker)?;
+                match parsed.transport {
+                    // An https remote whose broker lends no credential helper is *not* refused.
+                    // The helper is how a credential is fetched, and a repository that needs
+                    // none is an ordinary thing to clone; the host whose Git ships no platform
+                    // helper is the ordinary Linux host, and refusing there would put every
+                    // https remote out of reach. What the profile guarantees either way is that
+                    // no credential of the user's is used without the broker: the helper list is
+                    // emptied, `core.askPass` and `GIT_ASKPASS` are empty and
+                    // `GIT_TERMINAL_PROMPT` is zero, so a remote that does need a credential
+                    // fails saying so rather than reading one from somewhere this host did not
+                    // grant. The operation says which of the two it was.
+                    RemoteTransport::Ssh if broker.ssh_command.is_none() => {
+                        return Err(ProjectError::RemoteRejected {
                             detail: format!(
                                 "the broker {} has no ssh program on this host, so an ssh remote \
                                  cannot be reached",
                                 broker.name
-                            ).into(),
+                            )
+                            .into(),
                         });
-                        }
-                        _ => {}
                     }
-                    Some(broker.clone())
+                    _ => {}
                 }
-            };
+                Some(broker.clone())
+            }
+        };
         Ok(ValidatedRemote {
             specification: RemoteSpecification {
                 remote_name: requested.remote_name.clone(),
@@ -292,6 +293,18 @@ impl ValidatedRemote {
             .as_ref()
             .and_then(CredentialBroker::helper)
             .map(Path::as_os_str)
+    }
+
+    /// Returns whether this remote reaches its network without a credential.
+    ///
+    /// An https remote whose approved broker lends no credential helper on this host is fetched
+    /// unauthenticated: a public repository comes across, and one that wants a credential refuses
+    /// the fetch rather than reading a credential from anywhere this host did not grant. What says
+    /// which of the two happened is the operation, which carries this beside whatever Git said.
+    #[must_use]
+    pub fn unauthenticated(&self) -> bool {
+        matches!(self.specification.transport, RemoteTransport::Https)
+            && self.credential_helper().is_none()
     }
 
     /// Returns the ssh program Git runs, when the transport is ssh.
@@ -700,6 +713,74 @@ mod tests {
     }
 
     #[test]
+    fn an_https_remote_is_fetched_unauthenticated_where_the_broker_lends_no_helper() {
+        // Git ships a credential helper for the platform's own secret store on some hosts and not
+        // on others: an ordinary Linux installation has none. Refusing there would put every https
+        // remote out of reach, including a public repository that needs no credential at all, so
+        // the fetch goes ahead with none and says which it was. An ssh remote is different: the ssh
+        // program *is* the transport, and without one the remote cannot be reached at all.
+        let registry = BrokerRegistry::from_brokers(vec![BrokerRegistry::broker(
+            OS_SECRET_STORE,
+            None,
+            Some(OsString::from("/usr/bin/ssh")),
+        )]);
+        let fetched = registry
+            .validate(&RemoteSpecification {
+                remote_name: "origin".to_owned(),
+                transport: RemoteTransport::Https,
+                url: "https://example.invalid/x.git".to_owned(),
+                provider: String::new(),
+                credential_broker: OS_SECRET_STORE.to_owned(),
+            })
+            .expect("an https remote with no helper is fetched rather than refused");
+        assert!(fetched.credential_helper().is_none());
+        assert!(fetched.unauthenticated());
+        assert_eq!(fetched.specification.credential_broker, OS_SECRET_STORE);
+
+        let refusal = registry
+            .validate(&RemoteSpecification {
+                remote_name: "origin".to_owned(),
+                transport: RemoteTransport::Ssh,
+                url: "ssh://example.invalid/x.git".to_owned(),
+                provider: String::new(),
+                credential_broker: OS_SECRET_STORE.to_owned(),
+            })
+            .expect("an ssh remote with an ssh program is reachable");
+        assert!(
+            !refusal.unauthenticated(),
+            "ssh is not the unauthenticated case"
+        );
+
+        let without_ssh = BrokerRegistry::from_brokers(vec![BrokerRegistry::broker(
+            OS_SECRET_STORE,
+            Some(PathBuf::from(
+                "/usr/libexec/git-core/git-credential-osxkeychain",
+            )),
+            None,
+        )]);
+        let refused = without_ssh
+            .validate(&RemoteSpecification {
+                remote_name: "origin".to_owned(),
+                transport: RemoteTransport::Ssh,
+                url: "ssh://example.invalid/x.git".to_owned(),
+                provider: String::new(),
+                credential_broker: OS_SECRET_STORE.to_owned(),
+            })
+            .expect_err("an ssh remote with no ssh program cannot be reached");
+        assert!(refused.to_string().contains("no ssh program"));
+        let authenticated = without_ssh
+            .validate(&RemoteSpecification {
+                remote_name: "origin".to_owned(),
+                transport: RemoteTransport::Https,
+                url: "https://example.invalid/x.git".to_owned(),
+                provider: String::new(),
+                credential_broker: OS_SECRET_STORE.to_owned(),
+            })
+            .expect("an https remote with a helper is authenticated");
+        assert!(!authenticated.unauthenticated());
+    }
+
+    #[test]
     fn a_local_path_remote_names_no_broker_and_naming_one_is_refused() {
         let registry = BrokerRegistry::from_brokers(vec![BrokerRegistry::broker(
             OS_SECRET_STORE,
@@ -759,20 +840,27 @@ mod tests {
 
     #[test]
     fn a_broker_with_no_program_for_the_transport_is_refused_rather_than_tried() {
+        // The transport's own program is the one a broker must lend: without ssh there is no way
+        // to reach an ssh remote at all, so the remote is refused rather than attempted. A missing
+        // *credential* helper is not that case, and
+        // `an_https_remote_is_fetched_unauthenticated_where_the_broker_lends_no_helper` is where
+        // the difference is stated.
         let registry = BrokerRegistry::from_brokers(vec![BrokerRegistry::broker(
             OS_SECRET_STORE,
+            Some(PathBuf::from(
+                "/usr/libexec/git-core/git-credential-osxkeychain",
+            )),
             None,
-            Some(OsString::from("/usr/bin/ssh")),
         )]);
         let refusal = registry
             .validate(&RemoteSpecification {
                 remote_name: "origin".to_owned(),
-                transport: RemoteTransport::Https,
-                url: "https://example.invalid/x.git".to_owned(),
+                transport: RemoteTransport::Ssh,
+                url: "ssh://example.invalid/x.git".to_owned(),
                 provider: String::new(),
                 credential_broker: OS_SECRET_STORE.to_owned(),
             })
-            .expect_err("no helper means no https");
-        assert!(refusal.to_string().contains("no credential helper"));
+            .expect_err("no ssh program means no ssh remote");
+        assert!(refusal.to_string().contains("no ssh program"));
     }
 }

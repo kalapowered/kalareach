@@ -1301,7 +1301,12 @@ impl ProjectService {
                 self.record_staging(row, &name, &destination.parent_path().join(&name))?;
                 let staging = StagingSibling::create(destination, &name)?;
                 self.record_staging_identity(row, &staging)?;
-                stage_clone(&self.profile, &staging, remote, cancel)?;
+                // A fetch this host could not authenticate says so beside whatever Git said,
+                // because what Git says is not repeated: a person told only that the remote
+                // refused, on a host whose Git ships no credential helper, has no way to find out
+                // why. A fetch that succeeded needed no credential, and says nothing.
+                stage_clone(&self.profile, &staging, remote, cancel)
+                    .map_err(|error| unauthenticated_fetch(error, remote))?;
                 let staged = staging.staged_witness()?;
                 self.locked()?.set_operation_state(
                     row.action_id,
@@ -2631,6 +2636,25 @@ fn origin_of_method(method: &str) -> ProjectOrigin {
         "project.init" => ProjectOrigin::Initialised,
         "project.clone" => ProjectOrigin::Cloned,
         _ => ProjectOrigin::Adopted,
+    }
+}
+
+/// Says that a failed fetch was one this host could not authenticate, where that is so.
+///
+/// The broker a caller named is approved and lends no credential helper on this host, so the fetch
+/// reached the remote with no credential at all. A repository that wanted one refuses, and Git's own
+/// words about it are not repeated, so the reason is this host's to give.
+fn unauthenticated_fetch(error: ProjectError, remote: &ValidatedRemote) -> ProjectError {
+    if !remote.unauthenticated() || !matches!(error, ProjectError::GitFailed { .. }) {
+        return error;
+    }
+    ProjectError::GitFailed {
+        detail: format!(
+            "{error}; the approved broker {} lends no credential helper on this host, so this \
+             fetch carried no credential, and a remote that wants one refuses it",
+            crate::git::redact(&remote.specification.credential_broker)
+        )
+        .into(),
     }
 }
 

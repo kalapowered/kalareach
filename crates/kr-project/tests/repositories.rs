@@ -1619,3 +1619,55 @@ fn a_destination_a_caller_named_does_not_reach_the_journal() {
         "nor in what a repeat is told: {refusal}"
     );
 }
+
+#[test]
+fn an_https_clone_reaches_the_remote_where_the_broker_lends_no_credential_helper() {
+    // Git ships a credential helper for the platform's secret store on some hosts and not on
+    // others, and an ordinary Linux installation has none. A host that refused an https remote
+    // there would put every one of them out of reach, a public repository included, so the fetch
+    // goes ahead without a credential: the failure below is the remote's, reached over the network,
+    // rather than this host's refusal to try. What the profile still guarantees is that no
+    // credential of the user's is used: the helper list is empty and no prompt can be answered.
+    let fixture = Fixture::with_brokers(support::broker_without_a_credential_helper());
+    // A port nothing is listening on, so the attempt ends at once and nothing leaves this machine.
+    let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
+    let port = closed.local_addr().expect("its address").port();
+    drop(closed);
+    let refusal = fixture
+        .service()
+        .project_clone(
+            &actor(),
+            &ProjectCloneParams {
+                destination: destination(
+                    fixture.environment_id(),
+                    fixture.work(),
+                    "unauthenticated",
+                ),
+                label: "unauthenticated".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::Https,
+                    url: format!("https://127.0.0.1:{port}/repository.git"),
+                    provider: String::new(),
+                    credential_broker: "os-secret-store".to_owned(),
+                },
+            },
+            Some(&action("project.clone", 41)),
+        )
+        .expect_err("nothing is listening, so the clone fails at the remote");
+    assert_eq!(
+        refusal.code(),
+        ErrorCode::UpstreamUnavailable,
+        "the failure is the remote's rather than a refusal to try: {refusal}"
+    );
+    assert!(
+        refusal.to_string().contains("lends no credential helper"),
+        "and it says the fetch carried no credential, because Git's own words are not repeated: \
+         {refusal}"
+    );
+    // The staged sibling is gone and the destination was never made.
+    support::assert_absent(
+        &fixture.work().join("unauthenticated"),
+        "a clone that failed published nothing",
+    );
+}

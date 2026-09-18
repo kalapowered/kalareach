@@ -140,8 +140,17 @@ A network operation names three things and carries no fourth.
    receipt says which service was reached.
 4. **The broker** is one this host has. It supplies a *program* — a credential helper, and an ssh
    command for the ssh transport — resolved to an absolute path inside Git's own helper directory.
-   The host never sees the credential itself. A broker with no program for the transport in question
-   is a refusal rather than an attempt.
+   The host never sees the credential itself. A broker with no **transport** program is a refusal
+   rather than an attempt: without ssh there is no way to reach an ssh remote at all.
+
+   A broker with no **credential helper** is not that case. Git ships one for the platform's own
+   secret store on some hosts and not on others, and an https remote that needs no credential is an
+   ordinary thing to fetch, so the fetch goes ahead carrying none. What the profile guarantees
+   either way is that no credential of the user's is used without the broker: the helper list is
+   emptied, the ask-pass programs are empty and the terminal prompt is off, so a remote that does
+   want a credential refuses the fetch rather than finding one somewhere this host did not grant.
+   A fetch that failed that way says so, because Git's own words are not repeated and a person told
+   only that the remote refused would have nothing else to go on.
 
 After a clone the stored `remote.<name>.url` is read back and compared with the URL this host
 passed. A rewrite, a helper or a version of Git that stored something else would be a credential in
