@@ -2102,29 +2102,57 @@ impl WorkerService {
                 Self::check_attachment(state, params.attachment_id)
             }
             // Every question method names the session it acts in, and this endpoint serves one
-            // session. What admits the *caller* is checked in the effect: a source is bound to
-            // this session from what the kernel says, and an answering actor's rights were
-            // checked before the request was forwarded here.
+            // session. Everything else a question can be refused for is checked here too, because
+            // this runs *before* the dispatch marker: an unbound caller, a malformed form, a
+            // reused request identifier and a question somebody else already answered are all
+            // refusals, and a refusal recorded after the marker would say the effect might have
+            // happened when nothing did.
             Method::QuestionCreate => {
                 let params: kr_protocol::question::QuestionCreateParams = parse(&mutation.params)?;
-                Self::check_session(session, params.session_id)
+                Self::check_session(session, params.session_id)?;
+                let source = Self::bind_source_in(session, state)?;
+                Ok(self.questions.check_create(&source, &params)?)
             }
             Method::QuestionCancelOwn => {
                 let params: kr_protocol::question::QuestionCancelOwnParams =
                     parse(&mutation.params)?;
-                Self::check_session(session, params.session_id)
+                Self::check_session(session, params.session_id)?;
+                let source = Self::bind_source_in(session, state)?;
+                self.questions
+                    .check_own(&source, params.question_id, &params.caller_token)?;
+                let revision = self.questions.question(params.question_id)?.revision;
+                Ok(self.questions.check_resolvable(
+                    params.question_id,
+                    revision,
+                    None,
+                    self.question_clock(),
+                )?)
             }
             Method::AlertCreate => {
                 let params: kr_protocol::question::AlertCreateParams = parse(&mutation.params)?;
-                Self::check_session(session, params.session_id)
+                Self::check_session(session, params.session_id)?;
+                Self::bind_source_in(session, state)?;
+                Ok(())
             }
             Method::QuestionAnswer => {
                 let params: kr_protocol::question::QuestionAnswerParams = parse(&mutation.params)?;
-                Self::check_session(session, params.session_id)
+                Self::check_session(session, params.session_id)?;
+                Ok(self.questions.check_resolvable(
+                    params.question_id,
+                    params.expected_revision,
+                    Some(&params.answer),
+                    self.question_clock(),
+                )?)
             }
             Method::QuestionCancel => {
                 let params: kr_protocol::question::QuestionCancelParams = parse(&mutation.params)?;
-                Self::check_session(session, params.session_id)
+                Self::check_session(session, params.session_id)?;
+                Ok(self.questions.check_resolvable(
+                    params.question_id,
+                    params.expected_revision,
+                    None,
+                    self.question_clock(),
+                )?)
             }
             // An action belongs to the actor that submitted it. Nothing else about the request
             // decides whether it may be cancelled, because the receipt itself is the subject.
@@ -2333,6 +2361,10 @@ impl WorkerService {
         params: &ParamsValue,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::question::QuestionReadOwnParams = parse(params)?;
+        {
+            let session = self.runtime.session();
+            Self::check_session(&session, params.session_id)?;
+        }
         let source = self.bind_source(state)?;
         let (result, _) = self
             .questions

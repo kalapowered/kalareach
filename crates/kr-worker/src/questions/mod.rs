@@ -112,6 +112,87 @@ impl Questions {
         ))
     }
 
+    /// Checks everything a creation can be refused for, before anything durable happens.
+    ///
+    /// The worker calls this inside the serial path and *before* it commits a dispatch marker. A
+    /// refusal recorded after that marker would say the effect might have happened, and for a
+    /// malformed form, an unbound caller or a reused request identifier nothing happened at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuestionError::Invalid`] for a form that breaks the contract and
+    /// [`QuestionError::IdConflict`] for a request identifier that already carries a different
+    /// payload.
+    pub fn check_create(
+        &self,
+        source: &VerifiedSource,
+        params: &QuestionCreateParams,
+    ) -> Result<()> {
+        check_text(params)?;
+        let choices = build_choices(params.kind, &params.choices)?;
+        self.locked()?
+            .check_request(&source.key(), params, &choices)
+    }
+
+    /// Checks that a question can still be resolved, and that the answer fits its form.
+    ///
+    /// Called for the same reason as [`Self::check_create`]: an answer to a question somebody else
+    /// has already answered is a refusal, not an uncertain outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuestionError::Resolved`], [`QuestionError::Expired`],
+    /// [`QuestionError::StaleRevision`] or [`QuestionError::Invalid`].
+    pub fn check_resolvable(
+        &self,
+        question_id: kr_protocol::ids::QuestionId,
+        expected: kr_protocol::ids::QuestionRevision,
+        answer: Option<&QuestionAnswer>,
+        now: Now,
+    ) -> Result<()> {
+        let mut store = self.locked()?;
+        let expired = store.expire_due(now)?;
+        publish(&mut store, &expiry_events(expired, now))?;
+        let question = store.read(question_id)?;
+        if let Some(answer) = answer {
+            check_answer(&question, answer)?;
+        }
+        match question.state {
+            QuestionState::Expired => Err(QuestionError::Expired {
+                at_ms: question
+                    .resolved_at_ms
+                    .as_ref()
+                    .map_or_else(|| question.expires_at_ms.get(), |at| at.get()),
+            }),
+            QuestionState::Answered | QuestionState::Cancelled => Err(QuestionError::Resolved {
+                state: question.state,
+            }),
+            QuestionState::Pending if question.revision != expected => {
+                Err(QuestionError::StaleRevision {
+                    named: expected.get(),
+                    current: question.revision.get(),
+                })
+            }
+            QuestionState::Pending => Ok(()),
+        }
+    }
+
+    /// Checks that the source of this call still owns the question it names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuestionError::TokenRejected`] when the token or the application does not match.
+    pub fn check_own(
+        &self,
+        source: &VerifiedSource,
+        question_id: kr_protocol::ids::QuestionId,
+        caller_token: &kr_protocol::question::CallerToken,
+    ) -> Result<()> {
+        let store = self.locked()?;
+        let row = store.read_row(question_id)?;
+        store.check_token(&row, source, caller_token)
+    }
+
     /// Reads one question back to the source that created it.
     ///
     /// # Errors

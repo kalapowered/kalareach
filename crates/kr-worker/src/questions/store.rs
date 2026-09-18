@@ -361,6 +361,33 @@ impl Store {
         })
     }
 
+    /// Refuses a creation whose request identifier already carries a different payload.
+    ///
+    /// This is the same comparison [`Self::create`] makes, offered separately so a worker can make
+    /// it before it commits a dispatch marker: a conflict is a refusal, and a refusal recorded
+    /// after the marker would claim the effect might have happened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`QuestionError::IdConflict`] when the identifier was used with a different
+    /// payload.
+    pub fn check_request(
+        &self,
+        source_key: &str,
+        params: &QuestionCreateParams,
+        choices: &[QuestionChoice],
+    ) -> Result<()> {
+        let Some(existing) = self.by_request(source_key, &params.request_id)? else {
+            return Ok(());
+        };
+        if existing.digest == payload_digest(params, choices) {
+            return Ok(());
+        }
+        Err(QuestionError::IdConflict {
+            request_id: params.request_id.clone(),
+        })
+    }
+
     /// Reads one question, whatever its state.
     ///
     /// # Errors
