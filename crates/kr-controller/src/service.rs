@@ -2929,23 +2929,28 @@ impl Controller {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         // The action identifier is the create token. One identifier, one session; a retry with the
         // same payload resolves to the same reservation rather than launching a second shell.
+        // A managed session needs a KalaReach-qualified shell package, and this is the one place
+        // every ingress passes through: the local endpoint reaches it through its own dispatch and
+        // a caller on the network reaches it directly. The answer is worked out here, before the
+        // registry is locked, because finding a package reads directories and opens files and a
+        // filesystem that answers slowly must not hold up every other request in this environment.
+        let qualified = (create.shell_mode == kr_protocol::session::ShellMode::Managed)
+            .then(|| self.check_qualified_package(create.shell.0.as_deref()));
         let admission = {
             let mut registry = self.registry.lock().await;
-            // A managed session needs a KalaReach-qualified shell package, and this is the one
-            // place every ingress passes through: the local endpoint reaches it through its own
-            // dispatch and a caller on the network reaches it directly. The refusal costs the
-            // caller a named error rather than a session that closes itself a moment later,
-            // because nothing is reserved and nothing is spawned before it.
-            //
-            // The token is looked at first, under the same lock the reservation is taken under. A
-            // create this actor already made is a retry, and section 9 says a retry is answered
-            // from what its first attempt produced. Refusing one because the package went away in
-            // between would be refusing an action that already has an outcome.
+            // The token is looked at under the same lock the reservation is taken under, and the
+            // refusal above is applied only to a token this registry has never seen. A create this
+            // actor already made is a retry, and section 9 says a retry is answered from what its
+            // first attempt produced; refusing one because the package went away in between would
+            // be refusing an action that already has an outcome.
             let known = registry
                 .reservation_for_token(actor_id, mutation.action_id.get())?
                 .is_some();
-            if !known && create.shell_mode == kr_protocol::session::ShellMode::Managed {
-                self.check_qualified_package(create.shell.0.as_deref())?;
+            if !known && let Some(qualified) = qualified {
+                // Nothing is reserved and nothing is spawned before this, so an unsupported shell
+                // costs the caller a named error rather than a session that closes itself a moment
+                // later.
+                qualified?;
             }
             registry.reserve(
                 actor_id,
@@ -4796,10 +4801,11 @@ mod a_create_that_launches_nothing {
 
     /// A create token that already has a reservation is answered from it, not refused again.
     ///
-    /// Section 9: a retry resolves to what its first attempt produced. A duplicate that arrives
-    /// after the package it was admitted under was removed must therefore still find its own
-    /// reservation, which is why the token is looked at under the registry lock before the package
-    /// is. The reservation here is the one a first attempt left behind.
+    /// Section 9: a retry resolves to what its first attempt produced. What this pins is that the
+    /// package check has no say over a token the registry already knows, whatever that check would
+    /// answer now: an installation whose package was removed, replaced or made unreadable between
+    /// the two attempts must not turn a recorded action into a refusal. The reservation here is
+    /// recorded through the registry's own method, which is what a first attempt leaves behind.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_retry_of_an_admitted_create_is_not_refused_because_its_package_went_away() {
         let temp = kr_ipc::testing::TempHost::create();
@@ -4811,9 +4817,9 @@ mod a_create_that_launches_nothing {
         let (connection_id, actor_id) = admitted(&controller).await;
         let request = managed_request(environment_id);
 
-        // What the first attempt left: a reservation under this token, made while the package was
-        // still there. The package root is empty now, so a create that checked it first would
-        // refuse this retry.
+        // What a first attempt leaves: a reservation under this token. The package root is empty,
+        // so a create that let the package check speak before reading the token would refuse this
+        // retry instead of answering it.
         let create: SessionCreateParams = super::parse(&request.params).expect("decodes");
         let digest =
             kr_protocol::digest::mutation_digest(&request, &actor_id).expect("a mutation digest");
