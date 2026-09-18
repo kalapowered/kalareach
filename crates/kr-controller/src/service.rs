@@ -2412,10 +2412,16 @@ impl Controller {
     /// Takes or releases the assertion for what this host currently has outstanding, and settles
     /// who is reviewing it.
     ///
-    /// The evaluation and the review decision happen in one hold of the inhibitor's lock. Two
-    /// holds would let a review that has just decided to stop clear the mark while another caller
-    /// is taking an assertion, and that assertion would then have nothing watching it.
+    /// Reading what is outstanding, deciding from it and settling who reviews next all happen in
+    /// one hold of the inhibitor's lock. Two holds would let a review that has just decided to
+    /// stop clear the mark while another caller is taking an assertion, and that assertion would
+    /// then have nothing watching it; and a reading taken before the lock could be applied after a
+    /// later one, which is how an assertion outlives the work it was taken for: the closure that
+    /// ended the work would have been counted by the older reading and released by the newer, and
+    /// then taken again by the older. The cost is that one evaluation waits for another, which is
+    /// bounded by what the scan is allowed, and no caller's own answer waits for either.
     async fn evaluate_power(self: &Arc<Self>, claim: Claim) -> (SleepInhibitionState, Review) {
+        let mut inhibitor = self.inhibitor.lock().await;
         let setting = power::read(&self.paths);
         let off = setting == kr_protocol::desktop::SleepInhibitionSetting::Off;
         // A host whose owner has not chosen this pays nothing for it: no worker is asked and no
@@ -2431,7 +2437,6 @@ impl Controller {
         } else {
             power::power_source()
         };
-        let mut inhibitor = self.inhibitor.lock().await;
         let state = inhibitor.evaluate(setting, demand, source);
         let wanted = state.active || !off;
         let review = match claim {
