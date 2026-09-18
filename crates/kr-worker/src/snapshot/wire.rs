@@ -236,6 +236,52 @@ pub fn keyboard(value: &KeyboardSnapshot) -> ProjectedKeyboard {
     }
 }
 
+/// Converts the keyboard state one client's authority reaches.
+///
+/// Section 10's live-screen exception is the screen that is showing. The Kitty protocol keeps a
+/// flag set and a stack *per buffer*, so a client narrowed to the live screen is sent the state of
+/// the buffer it is looking at and nothing of the other one. A rendered restoration never installs
+/// the other buffer's negotiation either - there is no sequence for it that does not switch buffers
+/// - so what a projection may say about it is nothing.
+#[must_use]
+pub fn keyboard_within(
+    value: &KeyboardSnapshot,
+    active: ActiveBuffer,
+    scope: crate::render::Scope,
+) -> ProjectedKeyboard {
+    let mut projected = keyboard(value);
+    if scope == crate::render::Scope::LiveScreen {
+        let withheld = kr_protocol::projection::KittyKeyboardState {
+            flags: Nullable(None),
+            stack: Vec::new(),
+        };
+        match active {
+            ActiveBuffer::Primary => projected.alternate = withheld,
+            ActiveBuffer::Alternate => projected.primary = withheld,
+        }
+    }
+    projected
+}
+
+/// Converts the saved cursors one client's authority reaches.
+///
+/// A saved cursor belongs to a buffer and carries that buffer's rendition, its character sets and
+/// the hyperlink the pen was inside. A client narrowed to the live screen is sent the one that
+/// belongs to the screen it is looking at.
+#[must_use]
+pub fn saved_cursors_within(
+    values: &[Option<SavedCursor>; 2],
+    active: ActiveBuffer,
+    scope: crate::render::Scope,
+) -> Vec<SavedCursorState> {
+    values
+        .iter()
+        .flatten()
+        .filter(|cursor| scope == crate::render::Scope::WholeScreen || cursor.buffer == active)
+        .map(saved_cursor)
+        .collect()
+}
+
 /// Converts the palette and its provenance.
 #[must_use]
 pub fn palette(value: &PaletteSnapshot) -> PaletteState {

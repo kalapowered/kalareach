@@ -321,7 +321,11 @@ pub fn install(
             ),
             viewport: wire::viewport(viewport)?,
             cursor: wire::cursor(snapshot.cursor),
-            saved_cursors: wire::saved_cursors(&snapshot.saved_cursors),
+            saved_cursors: wire::saved_cursors_within(
+                &snapshot.saved_cursors,
+                snapshot.active_buffer,
+                scope,
+            ),
             margins: wire::margins(snapshot.margins),
             rendition: wire::rendition(snapshot.rendition),
             tab_stops: snapshot
@@ -336,7 +340,7 @@ pub fn install(
                 .map(|entry| wire::mode(*entry))
                 .collect(),
             keypad_application: snapshot.keypad_application,
-            keyboard: wire::keyboard(&snapshot.keyboard),
+            keyboard: wire::keyboard_within(&snapshot.keyboard, snapshot.active_buffer, scope),
             title: wire::title(&snapshot.title),
             title_stack: snapshot.title_stack.iter().map(wire::saved_title).collect(),
             hyperlink: Nullable(snapshot.hyperlink.clone()),
@@ -648,6 +652,12 @@ pub enum Owed {
 /// # Errors
 ///
 /// Returns an error when a row's stable identifier is not a forward count.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "a bounded update is the engine's change, the buffer it belongs to, the window it is \
+              drawn for, the retention that came with it, how much of it this client may see and \
+              what that client already holds; every one of those decides part of the answer"
+)]
 pub fn advance(
     delta: &Delta,
     buffer: ActiveBuffer,
@@ -655,6 +665,7 @@ pub fn advance(
     oldest_retained_row: i64,
     evicted: bool,
     degraded: bool,
+    scope: crate::render::Scope,
     held_viewport: Option<Viewport>,
 ) -> Result<Owed> {
     let mut rows = wire::rows(&delta.rows)?;
@@ -702,12 +713,22 @@ pub fn advance(
                 .as_ref()
                 .map(|stack| stack.iter().map(wire::saved_title).collect()),
         ),
-        keyboard: Nullable(delta.keyboard.as_ref().map(wire::keyboard)),
+        keyboard: Nullable(
+            delta
+                .keyboard
+                .as_ref()
+                .map(|keyboard| wire::keyboard_within(keyboard, buffer, scope)),
+        ),
         palette: Nullable(delta.palette.as_ref().map(wire::palette)),
         dimensions: Nullable(delta.dimensions.map(|size| {
             kr_protocol::session::Dimensions::new(u64::from(size.cols), u64::from(size.rows))
         })),
-        saved_cursors: Nullable(delta.saved_cursors.as_ref().map(wire::saved_cursors)),
+        saved_cursors: Nullable(
+            delta
+                .saved_cursors
+                .as_ref()
+                .map(|cursors| wire::saved_cursors_within(cursors, buffer, scope)),
+        ),
         oldest_retained_row: wire::row_id(oldest_retained_row)?,
         evicted,
         degraded,
@@ -1078,6 +1099,7 @@ mod tests {
                 0,
                 false,
                 false,
+                crate::render::Scope::WholeScreen,
                 Some(window)
             )
             .expect("an answer"),
@@ -1137,6 +1159,7 @@ mod tests {
                 0,
                 false,
                 false,
+                crate::render::Scope::WholeScreen,
                 Some(window)
             )
             .expect("an answer"),

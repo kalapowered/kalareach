@@ -1816,11 +1816,12 @@ impl Session {
     ) -> bool {
         let held = self.projections.held(attachment_id);
         let owed = match held {
-            Some(held) if reset.is_none() => {
-                self.engine.projection_advance(held, dimensions).unwrap_or(
-                    crate::snapshot::Owed::Snapshot(ProjectionResetReason::ReplayGap),
-                )
-            }
+            Some(held) if reset.is_none() => self
+                .engine
+                .projection_advance(held, dimensions, self.content_scope(attachment_id))
+                .unwrap_or(crate::snapshot::Owed::Snapshot(
+                    ProjectionResetReason::ReplayGap,
+                )),
             // The engine said what replaced the screen, so the client is told that rather than
             // being left to infer it. An attachment holding nothing is being installed for the
             // first time.

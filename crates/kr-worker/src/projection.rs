@@ -495,6 +495,7 @@ impl TerminalEngine {
         &self,
         held: crate::snapshot::Held,
         dimensions: Dimensions,
+        scope: crate::render::Scope,
     ) -> Result<crate::snapshot::Owed> {
         let Ok(delta) = self.engine.delta(held.base.cursor, held.base.generation) else {
             // The base is outside the engine's replay window, or the projection was reset since
@@ -511,6 +512,7 @@ impl TerminalEngine {
             oldest,
             oldest > 0,
             self.resident_state_truncated(),
+            scope,
             Some(held.viewport),
         )
     }
@@ -871,13 +873,145 @@ mod projection_tests {
                 buffers.contains(&kr_protocol::projection::ProjectedBuffer::Alternate),
                 "the buffer that is showing is always paged: {buffers:?}"
             );
+            // And the state that describes the other buffer travels with its rows. A saved cursor
+            // belongs to a buffer and carries that buffer's rendition, its character sets and the
+            // link its pen was inside; the Kitty keyboard protocol keeps its flags and its stack per
+            // buffer. A client that may not see the buffer may not be told about it either.
+            let header = update
+                .events
+                .iter()
+                .find_map(|outgoing| match &outgoing.event {
+                    kr_protocol::projection::ProjectionEvent::Snapshot(header) => Some(header),
+                    _ => None,
+                })
+                .expect("the installation carries a header");
+            let described: std::collections::BTreeSet<kr_protocol::projection::ProjectedBuffer> =
+                header
+                    .saved_cursors
+                    .iter()
+                    .map(|cursor| cursor.buffer)
+                    .collect();
             if scope == crate::render::Scope::LiveScreen {
                 assert!(
                     !buffers.contains(&kr_protocol::projection::ProjectedBuffer::Primary),
                     "and what the shell left behind is not: {buffers:?}"
                 );
+                assert!(
+                    !described.contains(&kr_protocol::projection::ProjectedBuffer::Primary),
+                    "nor the saved cursor of the buffer it may not see: {described:?}"
+                );
+                assert!(
+                    header.keyboard.primary.flags.0.is_none()
+                        && header.keyboard.primary.stack.is_empty(),
+                    "nor that buffer's keyboard negotiation: {:?}",
+                    header.keyboard.primary
+                );
+            } else {
+                assert!(
+                    described.contains(&kr_protocol::projection::ProjectedBuffer::Primary),
+                    "a client drawn the whole screen is told both buffers' saved cursors: \
+                     {described:?}"
+                );
             }
         }
+
+        // The same rule on the path that carries a change rather than a screen. The alternate
+        // buffer is showing, so a narrowed client is told about its saved cursor and nothing of the
+        // primary's.
+        let mut delta = kr_term::snapshot::Delta {
+            base_cursor: 0,
+            next_cursor: 1,
+            projection_generation: 1,
+            rows: Vec::new(),
+            cursor: kr_term::snapshot::CursorState {
+                col: 0,
+                row: 0,
+                visible: true,
+                style: 1,
+                pending_wrap: false,
+            },
+            modes: Vec::new(),
+            hyperlinks: Vec::new(),
+            margins: None,
+            rendition: None,
+            tab_stops: None,
+            charsets: None,
+            title: None,
+            title_stack: None,
+            keyboard: None,
+            palette: None,
+            dimensions: None,
+            saved_cursors: None,
+            hyperlink: None,
+        };
+        delta.saved_cursors = Some([
+            Some(kr_term::snapshot::SavedCursor {
+                buffer: kr_term::snapshot::ActiveBuffer::Primary,
+                col: 0,
+                row: 0,
+                pending_wrap: false,
+                rendition: kr_term::grid::Rendition::default(),
+                charsets: kr_term::snapshot::Designations {
+                    g0: "B".to_owned(),
+                    g1: "B".to_owned(),
+                },
+                origin_mode: false,
+                style: 1,
+                hyperlink: Some("https://example.invalid/what-the-shell-was-in".to_owned()),
+            }),
+            Some(kr_term::snapshot::SavedCursor {
+                buffer: kr_term::snapshot::ActiveBuffer::Alternate,
+                col: 1,
+                row: 1,
+                pending_wrap: false,
+                rendition: kr_term::grid::Rendition::default(),
+                charsets: kr_term::snapshot::Designations {
+                    g0: "B".to_owned(),
+                    g1: "B".to_owned(),
+                },
+                origin_mode: false,
+                style: 1,
+                hyperlink: None,
+            }),
+        ]);
+        let window = engine.anchored_viewport(dimensions(80, 24));
+        let Ok(crate::snapshot::Owed::Update(update)) = crate::snapshot::advance(
+            &delta,
+            kr_term::snapshot::ActiveBuffer::Alternate,
+            window,
+            0,
+            false,
+            false,
+            crate::render::Scope::LiveScreen,
+            None,
+        ) else {
+            panic!("a delta that changes a saved cursor is an update");
+        };
+        let carried = update
+            .events
+            .iter()
+            .find_map(|outgoing| match &outgoing.event {
+                kr_protocol::projection::ProjectionEvent::Delta(delta) => Some(delta),
+                _ => None,
+            })
+            .expect("the update carries a delta");
+        let described: Vec<kr_protocol::projection::ProjectedBuffer> = carried
+            .saved_cursors
+            .0
+            .iter()
+            .flatten()
+            .map(|cursor| cursor.buffer)
+            .collect();
+        assert_eq!(
+            described,
+            vec![kr_protocol::projection::ProjectedBuffer::Alternate],
+            "a delta tells a narrowed client about the buffer it is looking at and no other"
+        );
+        let text = format!("{carried:?}");
+        assert!(
+            !text.contains("what-the-shell-was-in"),
+            "and nothing of the other buffer's saved cursor reaches it: {text}"
+        );
     }
 
     /// KR-REQ-08.79: a screen that fits arrives whole, however unevenly its content is spread.
@@ -1114,7 +1248,7 @@ mod projection_tests {
         assert!(
             matches!(
                 engine
-                    .projection_advance(held, dimensions(40, 10))
+                    .projection_advance(held, dimensions(40, 10), crate::render::Scope::WholeScreen)
                     .expect("an answer"),
                 Owed::Update(_)
             ),
@@ -1129,7 +1263,7 @@ mod projection_tests {
         }
         assert_eq!(
             engine
-                .projection_advance(held, dimensions(40, 10))
+                .projection_advance(held, dimensions(40, 10), crate::render::Scope::WholeScreen)
                 .expect("an answer"),
             Owed::Snapshot(ProjectionResetReason::ReplayGap),
             "and a base past the window is a gap, which discards what the client holds"
@@ -1214,7 +1348,7 @@ mod projection_tests {
         };
         assert_eq!(
             engine
-                .projection_advance(held, dimensions(40, 10))
+                .projection_advance(held, dimensions(40, 10), crate::render::Scope::WholeScreen)
                 .expect("an answer"),
             Owed::Nothing,
             "a quiet stream is not an update"
@@ -1244,7 +1378,7 @@ mod projection_tests {
         };
         assert_eq!(
             engine
-                .projection_advance(stale, dimensions(40, 10))
+                .projection_advance(stale, dimensions(40, 10), crate::render::Scope::WholeScreen)
                 .expect("an answer"),
             Owed::Snapshot(ProjectionResetReason::ReplayGap),
             "the same cursor in another generation is another screen"
