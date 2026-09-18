@@ -377,10 +377,13 @@ kr_fill(void)
                 kr.marks[kr.mark_count].ends_at = kr.in_len;
                 kr.marks[kr.mark_count].at_ms = kr_now_ms();
                 kr.mark_count++;
+            } else {
+                /* With no room for another mark these bytes join the stretch before them, which
+                 * came off the endpoint earlier. Every byte buffered still has an arrival time,
+                 * and a frame among these is charged for more waiting than it did rather than
+                 * less, so a budget can only run out sooner than it should. */
+                kr.marks[kr.mark_count - 1].ends_at = kr.in_len;
             }
-            /* With no room for another mark nothing already recorded is rewritten: a frame past
-             * the last mark is treated as having just arrived, which can only make a budget look
-             * longer, and every frame a mark reaches keeps the time it really came in at. */
             continue;
         }
         if (taken == 0) {
@@ -431,6 +434,12 @@ kr_frame_arrival(size_t length)
         if (kr.marks[i].ends_at >= total) {
             return kr.marks[i].at_ms;
         }
+    }
+    /* Bytes reach this buffer only by being read, so a complete frame always ends inside a mark.
+     * If one ever does not, the oldest time anything here came off the endpoint is the answer that
+     * cannot make a budget look longer than it is. */
+    if (kr.mark_count > 0) {
+        return kr.marks[0].at_ms;
     }
     return kr_now_ms();
 }
