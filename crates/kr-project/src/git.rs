@@ -1031,13 +1031,14 @@ impl RestrictedProfile {
         if let Some(helper) = request.credential_helper {
             settings.push(("credential.helper".to_owned(), helper.to_owned()));
         }
-        // The program the other end of a connection is started as. A clone creates its destination's
-        // configuration and then reads it, so a writer racing the clone could put a command of their
-        // own in `remote.<name>.uploadpack` and Git would start it through the shell this invocation
-        // has. It is fixed here to Git's own program, in the form no configuration file can undo.
-        // The command line cannot carry it: `--upload-pack` is one of the arguments this service
-        // refuses, because naming a program is the profile's business rather than a caller's, and
-        // this is the profile doing it.
+        // The program the other end of a connection is started as, named rather than left to a
+        // configuration this host did not write. A clone creates its destination's configuration
+        // and then reads it, so `remote.<name>.uploadpack` is a key a writer racing the clone can
+        // reach; Git's own clone sets its upload-pack option after it has built the transport,
+        // which replaces whatever that key held, so what is here is the same answer said twice
+        // rather than the only thing saying it. The command line cannot carry it: `--upload-pack`
+        // is one of the arguments this service refuses, because naming a program is the profile's
+        // business rather than a caller's.
         if let Some(name) = request.remote_name.filter(|name| plain_name(name)) {
             settings.push((
                 format!("remote.{name}.uploadpack"),
@@ -2162,10 +2163,12 @@ impl PrivateTemporary {
                 )
                 .into(),
             })?;
-        // Made and opened are two calls, and no interface here makes them one. What the second one
-        // opened is required to be empty, because this host had just made it: a directory somebody
-        // else put at the name between the two is one with something in it, or one this invocation
-        // uses and takes away again having put nothing of anybody else's in it.
+        // Made and opened are two calls, and no interface here makes them one, so what the second
+        // one opened is checked twice over: it is empty, because this host had just made it, and
+        // the name still resolves to the same object, because a directory put there in between
+        // would be a different one. The name itself is thirty-two random characters, so reaching
+        // it at all means watching for it. What is left is a substitution made and undone between
+        // two readings, which is the limit every identity check here has.
         let mut entries = handle
             .entries()
             .map_err(|error| ProjectError::StagingUnavailable {
@@ -2176,6 +2179,24 @@ impl PrivateTemporary {
             return Err(ProjectError::StagingUnavailable {
                 detail: format!(
                     "{described}'s own temporary directory is not the empty one this host made"
+                )
+                .into(),
+            });
+        }
+        let again = root
+            .open_dir(&name)
+            .map_err(|error| ProjectError::StagingUnavailable {
+                detail: format!(
+                    "{described}'s own temporary directory could not be opened again: {error}"
+                )
+                .into(),
+            })?;
+        if crate::boundary::identity_of_handle(environment_id, &again)?
+            != crate::boundary::identity_of_handle(environment_id, &handle)?
+        {
+            return Err(ProjectError::StagingUnavailable {
+                detail: format!(
+                    "{described}'s own temporary directory is not the one this host made"
                 )
                 .into(),
             });
@@ -2925,8 +2946,12 @@ mod tests {
         assert_eq!(fixed.len(), 1, "the program is named exactly once");
         assert_eq!(
             fixed[0],
-            &OsString::from("/usr/libexec/git-core/git-upload-pack"),
+            &upload_pack(profile.git()).into_os_string(),
             "and it is Git's own, under Git's own helper directory"
+        );
+        assert!(
+            Path::new(fixed[0]).starts_with(profile.git().exec_path()),
+            "which is where the boundary's execution list already reaches"
         );
 
         // A remote whose name is not one this host can put in a key gets no override, and the name

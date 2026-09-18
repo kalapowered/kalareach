@@ -67,7 +67,11 @@ directories the operation owns is granted by name.
 
 ## Which mechanism holds which guarantee
 
-| | macOS | Linux | Windows |
+**Windows runs no Git at all.** Its mechanisms cannot hold two of the three guarantees, so the
+service refuses there rather than claiming a boundary it does not have; the last section says which
+two and why. The table below describes what is written for that platform, not what it enforces.
+
+| | macOS | Linux | Windows (refused) |
 | --- | --- | --- | --- |
 | Execution | A sandbox profile permitting `process-exec` on this invocation's own execution list and nothing else, applied by the system's own launcher before it runs Git | Landlock, with the execute right on this invocation's own execution list, on Git's helper directory and on the system's program loader, and nowhere else | An application container granted read and write on the repository, and **refused** the execute right there, so a permission inherited from the same directory cannot add it back, though one written on a file itself can |
 | Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that refuses a local one an internet socket at all and refuses every one of them a listening or raw socket | The container's capabilities: none at all for a local operation, and the client capability for a remote one. **The port list is not enforced here**; see below |
@@ -80,11 +84,9 @@ Where a guarantee cannot be enforced from outside Git, the operation that needs 
 of these falls back to reading the configuration and hoping.
 
 * **A kernel older than Linux 6.2** cannot mediate truncation, so a process could shorten a file the
-  boundary never made writable. No Git is run there, and that is the whole of it: a bubblewrap
-  container around the service would give an operator the same confinement from one level up, and
-  this service would still refuse inside one, because the refusal is about what this kernel can
-  enforce rather than about what is around the process. Supporting such a kernel means a different
-  mechanism, not a wrapper.
+  boundary never made writable. No Git is run there, and a bubblewrap container around the service
+  does not change that: the refusal is about what this kernel can enforce rather than about what
+  surrounds the process. Supporting such a kernel means a different mechanism, not a wrapper.
 * **A kernel older than Linux 6.7** has no rules for which addresses a process reaches, so an
   operation that needs a remote is refused there. Local operations still run: their filesystem
   confinement is the same, and the system-call filter that refuses them an internet socket does not
@@ -93,46 +95,52 @@ of these falls back to reading the configuration and hoping.
   invocation rather than installing a filter that would not mean what it says.
 * **A host with no launcher to apply a sandbox profile with**, or **no shell for an invocation that
   has to reach a repository**, refuses that invocation rather than running it unenclosed.
-* **A Windows host where Git is installed somewhere only an administrator may change** — the
-  ordinary `C:\Program Files\Git` among them — cannot have the container granted read and execute
-  there, so the grant fails and the invocation is refused. That is a real limit of this mechanism on
-  an ordinary installation rather than a corner case.
+* **Windows, every invocation.** Two of the three guarantees are not things an application container
+  can hold: a permission written on a file itself beats the refusal this service writes on the
+  directory above it, and a container's capability permits reaching the network or nothing without
+  bounding which ports. So the service refuses there, says which guarantee it cannot make, and the
+  platform task that qualifies this host on Windows is what changes the mechanism. A third limit
+  would have mattered had the first two not: on an ordinary installation Git lives somewhere only an
+  administrator may change the permissions of, so the container could not have been granted read and
+  execute on it either.
 * **A platform with none of these mechanisms** runs no Git at all.
 
 ## What is left
 
 Stated rather than implied.
 
-**A substitution while Git runs is refused rather than prevented.** Two of the three mechanisms
-write their rules against paths, because that is what they take, so a directory put at one of those
-names while Git ran is one the rules still permitted; and a directory put *inside* a tree the
-operation owns is inside a tree the operation owns, which no confinement that grants a tree can
-refuse part of. The object the child works in is still the one this service opened, and every
-directory the boundary was built around is required to still be that object before anything the
-child produced is used. So the answer is a refusal that names what changed. Landlock is the
-exception for the first of the two: its rules are attached to the opened objects themselves.
+**A substitution while Git runs is refused rather than prevented.** The tree Git works in is the
+object this service opened, so nothing can redirect that. What a substitution can reach is a
+directory Git was *given by name* — a reserved worktree destination — and a directory put *inside* a
+tree the operation owns, which no confinement that grants a tree can refuse part of. On macOS both
+are still permitted by the path rules the profile was built with, so Git can write there; on Linux
+the rules are attached to the opened objects and only the second arises. Either way every directory
+the boundary was built around is required to still be that object before the result reaches a
+caller, so the answer is a refusal that names what changed rather than a result nobody can account
+for. Two readings cannot tell a change made and undone from no change at all, and waiting for Git
+establishes that Git has gone rather than that everything it started has.
 
-**On Windows the execution refusal rests on permissions a repository can carry its own.** The
-container is refused the execute right on the directories the operation owns, and a refusal beats
-every grant that reaches the object the same way. What it does not beat is a grant written directly
-on a file inside that directory, which Windows consults before it reaches an inherited refusal. A
-writer who can create files in the repository can write such a grant. This is a property of the
-mechanism rather than of the code, and it is one reason the platform is not qualified.
+**On Windows the execution refusal would rest on permissions a repository can carry its own.** The
+container is refused the execute right on the directories the operation owns, and that refusal beats
+every permission that reaches those files the way it does. What it does not beat is one written on a
+file itself, which Windows consults first, and a writer who can create files in the repository can
+write one. That is why the service refuses on Windows rather than claiming the guarantee.
 
-**A remote operation's non-TCP traffic on Linux is not bounded by address.** Landlock's rules cover
-TCP, and a system-call filter reads scalar arguments while an address is behind a pointer. Turning a
-host name into an address is what needs it. So for a remote operation on Linux the port list is a
-TCP guarantee; a local operation has no internet socket at all and the question does not arise.
+**A remote operation's traffic below TCP on Linux is not bounded.** Landlock's rules cover TCP, and a
+system-call filter reads scalar arguments while an address is behind a pointer; the socket a name
+resolution needs is the same socket anything else would use. So on Linux the port list is a
+guarantee about TCP, which is what every transport here uses, and "nothing may listen" is one too: a
+UDP socket can be bound and read from. A local operation has no internet socket at all and none of
+this arises.
 
-**The port list is not enforced on Windows.** An application container's capability permits reaching
-the network or nothing at all; bounding which ports it reaches needs a system-wide filtering policy
-an ordinary account cannot set. A local operation there still reaches no address, which is the half
-of the guarantee the capability does express.
+**The port list would not be enforced on Windows.** An application container's capability permits
+reaching the network or nothing at all; bounding which ports it reaches needs a system-wide filtering
+policy an ordinary account cannot set. That is the second of the two reasons the service refuses
+there.
 
-**A Windows grant whose removal fails is left behind.** Each is taken away when the invocation ends
-and the container profile is deleted with it. Neither the removal nor the deletion is checked,
-because there is nothing left to do about a failure at that point, so what may remain is a grant
-naming a container that may still exist. One invocation at a time changes a path's permissions, so
+**A Windows grant whose removal fails would be left behind.** Each is taken away when the invocation
+ends and the container profile is deleted with it, and neither is checked, because there is nothing
+left to do about a failure at that point. One invocation at a time changes a path's permissions, so
 two of this service's own invocations cannot lose each other's entries; another program editing the
 same permissions at the same time still can.
 

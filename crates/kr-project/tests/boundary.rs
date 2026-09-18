@@ -687,11 +687,15 @@ fn a_write_outside_the_directories_an_operation_owns_is_refused() {
     assert!(outside.join("README.md").is_file());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_destination_substituted_before_the_spawn_is_not_one_this_operation_owns() {
     // The reserved destination is opened and required to be the object the reservation returned,
     // so a directory somebody puts at that name in between is refused before anything starts
-    // rather than becoming a directory the boundary lets Git write in.
+    // rather than becoming a directory the boundary lets Git write in. The substitute is made
+    // somewhere else and moved in, because a directory made at the same name a moment after the
+    // first one was taken away can be the same object again: an identity a filesystem has reused
+    // is what this host records as a limit rather than a thing it can see through.
     let fixture = Fixture::create();
     let source = ordinary_repository(fixture.work(), "reserved");
     let repository = OpenedRepository::open(
@@ -701,13 +705,14 @@ fn a_destination_substituted_before_the_spawn_is_not_one_this_operation_owns() {
     )
     .expect("the repository opens");
     let reserved = fixture.work().join("reserved-destination");
+    let theirs = fixture.work().join("reserved-theirs");
+    let aside = fixture.work().join("reserved-aside");
     std::fs::create_dir_all(&reserved).expect("the destination this operation reserves");
+    std::fs::create_dir_all(&theirs).expect("the directory somebody else made");
     let identity =
         identity_of(fixture.environment_id(), &reserved).expect("the destination's own object");
-    // Somebody replaces it with a directory of their own.
-    std::fs::remove_dir(&reserved).expect("the reserved destination is taken away");
-    std::fs::create_dir_all(&reserved).expect("and another put at the name");
-    write(&reserved, "theirs.txt", "not this operation's\n");
+    std::fs::rename(&reserved, &aside).expect("the reserved destination moves aside");
+    std::fs::rename(&theirs, &reserved).expect("another takes its name");
 
     let arguments: [&OsStr; 5] = [
         OsStr::new("worktree"),
@@ -732,8 +737,8 @@ fn a_destination_substituted_before_the_spawn_is_not_one_this_operation_owns() {
     );
     assert_eq!(
         names_in(&reserved),
-        vec!["theirs.txt".to_owned()],
-        "nothing was written into it"
+        Vec::<String>::new(),
+        "and nothing was written into the directory that took the name"
     );
 }
 
@@ -802,15 +807,18 @@ fn a_destination_substituted_after_the_boundary_was_built_is_the_declared_refusa
     let reserved = fixture.work().join("reserved-late-destination");
     let theirs = fixture.work().join("theirs");
     std::fs::create_dir_all(&reserved).expect("the destination this operation reserves");
+    // Empty, so that nothing but this host's own answer decides the outcome: Git refuses a
+    // destination that holds something, and a test where it did that would say nothing about the
+    // boundary.
     std::fs::create_dir_all(&theirs).expect("the directory somebody else made");
-    write(&theirs, "theirs.txt", "not this operation's\n");
     let identity =
         identity_of(fixture.environment_id(), &reserved).expect("the destination's own object");
+    let aside = fixture.work().join("reserved-late-aside");
 
     let swap = {
         let reserved = reserved.clone();
         let theirs = theirs.clone();
-        let aside = fixture.work().join("reserved-late-aside");
+        let aside = aside.clone();
         let done = AtomicUsize::new(0);
         Interposition::new(Arc::new(
             move |described: &str, _working: &Path, _temporary: &Path| {
@@ -846,10 +854,15 @@ fn a_destination_substituted_after_the_boundary_was_built_is_the_declared_refusa
         kr_protocol::error::ErrorCode::SourceChanged,
         "and it is refused as an identity that changed: {refusal}"
     );
+    // What this does not say is that nothing was written into the directory that took the name.
+    // The rules two of the three mechanisms take are written against paths, so a directory put at
+    // one of those names while Git ran is one those rules still permitted, and Git was given that
+    // name as an argument. The declared refusal is the answer to that, and it is what this asserts;
+    // `crates/kr-project/README.md` says the same in its own words.
     assert_eq!(
-        names_in(&reserved),
-        vec!["theirs.txt".to_owned()],
-        "and nothing this host recorded was written into the directory that took the name"
+        names_in(&aside),
+        Vec::<String>::new(),
+        "and the object this host reserved, wherever its name went, holds nothing new"
     );
 }
 

@@ -584,8 +584,7 @@ repository while Git is running.
   credential helper as command strings for it. A driver, filter, hook, credential helper, pager or
   filesystem monitor planted anywhere else cannot be executed, whether it was planted before this
   host read the configuration, between that reading and the moment Git started, or while Git was
-  running. On Windows that rests on permissions a repository can carry its own, which is weaker;
-  `crates/kr-project/README.md` says how much weaker and why the platform is not qualified.
+  running.
 * **Only this operation's network.** A local operation reaches no address at all and nothing may
   listen. An operation that reaches a remote may open outbound connections on the ports its
   transport uses and resolve the remote's name, and nothing may listen there either. Which part of
@@ -611,10 +610,12 @@ with safety. What a repository can reach by reading is what the account this hos
 exactly as before.
 
 Where a guarantee cannot be enforced from outside Git, the operation that needs it is refused rather
-than run under checks that notice afterwards: a kernel too old to mediate the filesystem rights this
-rests on runs no Git, one too old to say which addresses a process may reach runs no remote
-operation, and a Windows host whose Git is installed somewhere an ordinary account may not change
-runs neither.
+than run under checks that notice afterwards. A kernel too old to mediate the filesystem rights this
+rests on runs no Git; one too old to say which addresses a process may reach runs no remote
+operation; and **Windows runs no Git at all**, because an application container cannot keep a
+repository from being executed from and cannot bound which ports a remote operation reaches. The
+platform task that qualifies this host on Windows is what changes that.
+`crates/kr-project/README.md` says exactly what each platform enforces and what it leaves.
 
 `docs/project/` and `crates/kr-project/README.md` say which mechanism holds which guarantee on each
 platform, and what a platform refuses rather than pretends.

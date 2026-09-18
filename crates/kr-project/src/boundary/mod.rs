@@ -248,7 +248,16 @@ impl OpenedDirectory {
     ///
     /// Returns [`ProjectError::IdentityChanged`] when the object or its creation instant differs.
     pub fn confirm_path(&self) -> Result<()> {
-        let now = AuthorisedDirectory::open_root(self.environment_id, &self.path)?;
+        // A name that no longer opens at all is the same answer as a name that opens on something
+        // else, and it is said the same way rather than as whatever the open failed with.
+        let Ok(now) = AuthorisedDirectory::open_root(self.environment_id, &self.path) else {
+            return Err(ProjectError::IdentityChanged {
+                detail: "the directory this invocation ran in is no longer there, so what it \
+                         produced is not served"
+                    .to_owned()
+                    .into(),
+            });
+        };
         if now.identity() != self.identity || created_at_ms(now.handle()) != self.created_at_ms {
             return Err(ProjectError::IdentityChanged {
                 detail: "the directory this invocation ran in is not the object it was started \
@@ -315,19 +324,21 @@ impl Confinement {
     /// Refuses when a directory this invocation was enclosed around is no longer the object it was
     /// enclosed around.
     ///
-    /// Called after the child has gone and before anything it produced is used. Two of the three
+    /// Called after the child has gone and before its result is given to a caller. Two of the three
     /// mechanisms write their rules against paths, so a directory substituted at one of those names
-    /// while Git ran is a directory the rules still permitted; what this does is make that the
-    /// declared refusal rather than a result nobody can account for. The invocation's own temporary
-    /// directory is not in the list: this host made it and holds it open, and it is taken away
-    /// through that handle.
+    /// while Git ran is a directory the rules still permitted, and Git given that name by an
+    /// argument would have written there; what this does is make that the declared refusal rather
+    /// than a result nobody can account for.
+    ///
+    /// What it does not do is prevent that write, and two readings cannot tell a change made and
+    /// undone from no change at all. Nor does waiting for Git establish that every process it
+    /// started has gone. Both are stated in `crates/kr-project/README.md` rather than implied.
     ///
     /// # Errors
     ///
     /// Returns [`ProjectError::IdentityChanged`] when any of them differs.
     pub fn confirm(&self) -> Result<()> {
-        self.working.confirm_path()?;
-        for directory in &self.reserved {
+        for directory in self.written() {
             directory.confirm_path()?;
         }
         Ok(())

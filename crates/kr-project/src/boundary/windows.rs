@@ -20,6 +20,28 @@
 //!   and the job ending everything in it when this host lets go. That is what makes a cancellation
 //!   here end the remote helper, the ssh process and the credential helper rather than only Git.
 //!
+//! ## Why no Git runs here yet
+//!
+//! Two of the three guarantees cannot be enforced by these mechanisms, and the rule this service
+//! follows is that a guarantee which cannot be enforced from outside Git refuses the operation that
+//! needs it rather than being claimed.
+//!
+//! * **Execution.** A container reaches a file where that file's permissions name it, name every
+//!   application package, or name a group it is in. The refusal this host writes on the directories
+//!   an operation owns beats every permission that reaches those files the same way it does — every
+//!   one inherited from the same directory — and does not beat a permission written on a file
+//!   itself, which this platform consults first. Somebody who can create a file in the repository
+//!   can write one. So "only Git executes" is not something this mechanism establishes.
+//! * **The network.** A container's capability permits reaching the network or nothing at all. It
+//!   does not bound which ports are reached, and bounding them needs a system-wide filtering policy
+//!   an ordinary account cannot set.
+//!
+//! So [`start`] refuses, every time, and says which guarantee it cannot make. Everything below it is
+//! written and type-checked and has never been executed: the platform task that qualifies this host
+//! on Windows is what finishes it, and what it has to change is the mechanism rather than the
+//! spelling. A write-restricted token with a child-process policy, inside the same job object, is
+//! the shape that fits the platform.
+//!
 //! ## What this costs, and what it refuses
 //!
 //! Granting a container read and execute on Git's own installation is a change to that
@@ -99,8 +121,15 @@ use super::{Confinement, Invocation, OpenedDirectory, Reach};
 use crate::error::{ProjectError, Result};
 
 /// What the boundary is, for a person reading a record.
-pub const MECHANISM: &str = "a per-invocation application container whose grants on the repository carry no execute right, \
-     inside a job object that ends every process it started";
+pub const MECHANISM: &str = "none yet: a per-invocation application container cannot hold the execution and port \
+     guarantees this service makes, so no Git is run on this platform";
+
+/// Whether this platform's mechanisms hold the guarantees the boundary makes.
+///
+/// They do not, and the module documentation says which two and why. While this is false every
+/// invocation is refused; the platform task that qualifies this host is what changes the mechanism
+/// and then this.
+const ENFORCED: bool = false;
 
 /// The rights a container is given on a directory an operation owns.
 ///
@@ -247,6 +276,17 @@ impl Drop for OwnedSid {
 /// made, the job cannot be built or the process cannot be started. Nothing here starts Git outside
 /// its container.
 pub fn start(invocation: &Invocation<'_>, confinement: &Confinement) -> Result<Spawned> {
+    if !ENFORCED {
+        return Err(ProjectError::GitFailed {
+            detail: format!(
+                "{} is not run: an application container on this platform cannot keep a repository \
+                 from being executed from, and cannot bound which ports a remote operation reaches, \
+                 so this host refuses rather than claiming a boundary it does not have",
+                invocation.described
+            )
+            .into(),
+        });
+    }
     let container = build(confinement)?;
     let job = job_object()?;
     let (out_read, out_write) = pipe()?;
@@ -421,9 +461,10 @@ fn build(confinement: &Confinement) -> Result<Container> {
             .push(well_known(WinCapabilityInternetClientSid)?);
     }
     // Read and write on the directories this operation owns, and the execute right refused to the
-    // same container: a refusal beats every grant, including one a repository already carries for
-    // every application package, so a program planted in the repository cannot be executed whatever
-    // else its permissions say.
+    // same container. The refusal beats every permission that reaches those files the way it does —
+    // every one inherited from the same directory — and not one written on a file itself, which is
+    // why the module documentation says this mechanism does not establish the execution guarantee
+    // and why `start` refuses before any of this runs.
     for directory in confinement.written() {
         grant(
             &mut container,

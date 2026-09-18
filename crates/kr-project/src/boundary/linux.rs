@@ -25,9 +25,10 @@
 //!
 //! * The filesystem confinement requires Landlock's **third** interface version, Linux 6.2. Before
 //!   it the kernel does not mediate truncation at all, so a process could shorten a file this
-//!   boundary never made writable. An older kernel therefore runs no Git; a host in that position
-//!   runs the service inside a bubblewrap container, which gives the same confinement one level up
-//!   and is not something this crate builds.
+//!   boundary never made writable. An older kernel therefore runs no Git, and putting the service
+//!   inside a bubblewrap container does not change that: the refusal is about what this kernel can
+//!   enforce rather than about what surrounds the process, so a host on such a kernel needs a
+//!   different mechanism rather than a wrapper.
 //! * A remote operation requires the **fourth**, Linux 6.7, which is where Landlock gained the
 //!   rules that say which addresses a process may reach. Below it a remote operation is refused and
 //!   a local one still runs, because a local one reaches nothing through a different mechanism.
@@ -39,11 +40,13 @@
 //! UDP, no raw socket and no TCP to reach anything through; for **every** operation it refuses a
 //! listening socket and a raw or packet socket.
 //!
-//! What the filter cannot do is bound a remote operation's UDP by address, because a filter reads
-//! scalar arguments and an address is behind a pointer. A remote operation can therefore send UDP
-//! where its name resolution can, which is how a host name becomes an address on most Linux
-//! systems. That is the one part of the network guarantee that is TCP-only here, and it is stated
-//! rather than implied.
+//! What the filter cannot do is bound a remote operation's traffic below TCP. A filter reads scalar
+//! arguments and an address is behind a pointer, and the same socket a name resolution needs is the
+//! one anything else would use. So for a remote operation the port list is a guarantee about TCP,
+//! which is what every transport here uses; UDP can go anywhere, and a UDP socket can be bound and
+//! read from, which "nothing may listen" therefore covers for TCP alone. A local operation has no
+//! internet socket at all and none of this arises. Both limits are stated here and in
+//! `crates/kr-project/README.md` rather than implied.
 //!
 //! The filter is built for this machine's own instruction set, and an architecture whose call
 //! numbers this host does not hold refuses the invocation rather than installing a filter that
