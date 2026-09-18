@@ -2920,13 +2920,6 @@ impl Controller {
         if let Some(refusal) = create.palette_refusal() {
             return Err(ControllerError::InvalidArgument(refusal));
         }
-        // A managed session needs a KalaReach-qualified shell package, and this is the one place
-        // every ingress passes through. Refusing here refuses before a reservation is recorded and
-        // before anything is spawned, so an unsupported shell costs the caller a named error rather
-        // than a session that closes itself a moment later.
-        if create.shell_mode == kr_protocol::session::ShellMode::Managed {
-            self.check_qualified_package(create.shell.0.as_deref())?;
-        }
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         // The create request itself is recorded with the reservation, before anything is spawned.
@@ -2938,6 +2931,22 @@ impl Controller {
         // same payload resolves to the same reservation rather than launching a second shell.
         let admission = {
             let mut registry = self.registry.lock().await;
+            // A managed session needs a KalaReach-qualified shell package, and this is the one
+            // place every ingress passes through: the local endpoint reaches it through its own
+            // dispatch and a caller on the network reaches it directly. The refusal costs the
+            // caller a named error rather than a session that closes itself a moment later,
+            // because nothing is reserved and nothing is spawned before it.
+            //
+            // The token is looked at first, under the same lock the reservation is taken under. A
+            // create this actor already made is a retry, and section 9 says a retry is answered
+            // from what its first attempt produced. Refusing one because the package went away in
+            // between would be refusing an action that already has an outcome.
+            let known = registry
+                .reservation_for_token(actor_id, mutation.action_id.get())?
+                .is_some();
+            if !known && create.shell_mode == kr_protocol::session::ShellMode::Managed {
+                self.check_qualified_package(create.shell.0.as_deref())?;
+            }
             registry.reserve(
                 actor_id,
                 mutation.action_id.get(),
@@ -4356,14 +4365,19 @@ mod a_create_that_launches_nothing {
     ) {
         let temp = kr_ipc::testing::TempHost::create();
         let program = temp.root().join("kr-worker");
-        let (controller, asked) = daemon_running(&temp, program).await;
+        let (controller, asked) = daemon_running(&temp, program, None).await;
         (temp, controller, asked)
     }
 
     /// Starts a daemon told to launch `program`, which may be a relative name.
+    ///
+    /// `shell_packages` is where the daemon looks for qualified shell packages. A test that says
+    /// where they are describes an installation of its own rather than reading the one this machine
+    /// happens to have.
     async fn daemon_running(
         temp: &kr_ipc::testing::TempHost,
         program: std::path::PathBuf,
+        shell_packages: Option<std::path::PathBuf>,
     ) -> (Arc<Controller>, Arc<Mutex<Vec<WorkerLaunch>>>) {
         let environment = temp.environment();
         let environment_id = temp.environment_id();
@@ -4387,7 +4401,7 @@ mod a_create_that_launches_nothing {
             worker_program: program,
             build_id: BuildId::new("kr-test/0").expect("a build identifier"),
             release: "0".to_owned(),
-            shell_packages: None,
+            shell_packages,
         })
         .await
         .expect("the daemon starts");
@@ -4745,29 +4759,21 @@ mod a_create_that_launches_nothing {
     /// nothing reserved and nothing started.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_managed_create_that_did_not_pass_a_local_envelope_is_refused_the_same_way() {
-        let (temp, controller, asked) = daemon().await;
+        let temp = kr_ipc::testing::TempHost::create();
+        // An installation of this test's own, with no package in it, so the refusal is this
+        // request's shell rather than whatever this machine happens to have installed.
+        let packages = temp.root().join("packages");
+        std::fs::create_dir_all(&packages).expect("creates the package root");
+        let (controller, asked) =
+            daemon_running(&temp, temp.root().join("kr-worker"), Some(packages)).await;
         let environment_id = temp.environment_id();
         let (connection_id, actor_id) = admitted(&controller).await;
-        let accepted = AcceptedDeadline {
-            deadline: controller
-                .clock
-                .now()
-                .checked_add(Duration::from_secs(30))
-                .expect("a deadline half a minute out"),
-            bound: DeadlineBound::RequestedTtl,
-        };
-
-        let mut request = create_request(environment_id);
-        let mut params = create_params(environment_id);
-        params.shell_mode = ShellMode::Managed;
-        params.shell = Nullable::some("/bin/ksh".to_owned());
-        request.params = ParamsValue::from_typed(&params).expect("encodes");
 
         let error = controller
             .session_create(
                 &actor_id,
-                &request,
-                carried(&controller, connection_id, accepted),
+                &managed_request(environment_id),
+                carried(&controller, connection_id, half_a_minute(&controller)),
             )
             .await
             .expect_err("a shell no package qualifies is refused");
@@ -4786,6 +4792,88 @@ mod a_create_that_launches_nothing {
             0,
             "and nothing is reserved either"
         );
+    }
+
+    /// A create token that already has a reservation is answered from it, not refused again.
+    ///
+    /// Section 9: a retry resolves to what its first attempt produced. A duplicate that arrives
+    /// after the package it was admitted under was removed must therefore still find its own
+    /// reservation, which is why the token is looked at under the registry lock before the package
+    /// is. The reservation here is the one a first attempt left behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_retry_of_an_admitted_create_is_not_refused_because_its_package_went_away() {
+        let temp = kr_ipc::testing::TempHost::create();
+        let packages = temp.root().join("packages");
+        std::fs::create_dir_all(&packages).expect("creates the package root");
+        let (controller, asked) =
+            daemon_running(&temp, temp.root().join("kr-worker"), Some(packages)).await;
+        let environment_id = temp.environment_id();
+        let (connection_id, actor_id) = admitted(&controller).await;
+        let request = managed_request(environment_id);
+
+        // What the first attempt left: a reservation under this token, made while the package was
+        // still there. The package root is empty now, so a create that checked it first would
+        // refuse this retry.
+        let create: SessionCreateParams = super::parse(&request.params).expect("decodes");
+        let digest =
+            kr_protocol::digest::mutation_digest(&request, &actor_id).expect("a mutation digest");
+        let intent = kr_cbor::to_canonical_vec(&create).expect("encodes the intent");
+        {
+            let mut registry = controller.registry.lock().await;
+            registry
+                .reserve(
+                    &actor_id,
+                    request.action_id.get(),
+                    digest,
+                    &intent,
+                    kr_ipc::now_ms(),
+                )
+                .expect("records the first attempt's reservation");
+        }
+
+        let error = controller
+            .session_create(
+                &actor_id,
+                &request,
+                carried(&controller, connection_id, half_a_minute(&controller)),
+            )
+            .await
+            .expect_err("the reservation has no worker behind it in this test");
+        assert_ne!(
+            error.code(),
+            kr_protocol::error::ErrorCode::ShellIntegrationUnsupported,
+            "a retry is answered from its own reservation rather than refused again: {error}"
+        );
+        assert!(
+            error.to_string().contains("already recorded"),
+            "and the answer is the recorded one: {error}"
+        );
+        assert!(
+            asked.lock().expect("the record is not poisoned").is_empty(),
+            "a retry starts nothing of its own"
+        );
+    }
+
+    /// A create request for a managed session whose shell no package can qualify.
+    fn managed_request(environment_id: kr_protocol::ids::EnvironmentId) -> MutationRequest {
+        let mut request = create_request(environment_id);
+        let mut params = create_params(environment_id);
+        params.shell_mode = ShellMode::Managed;
+        params.shell = Nullable::some("/bin/ksh".to_owned());
+        request.params = ParamsValue::from_typed(&params).expect("encodes");
+        request
+    }
+
+    /// An accepted deadline half a minute out, which nothing in these tests reaches.
+    fn half_a_minute(controller: &Controller) -> AcceptedDeadline {
+        AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_secs(30))
+                .expect("a deadline half a minute out"),
+            bound: DeadlineBound::RequestedTtl,
+        }
     }
 
     /// What the launch needs is prepared before the create is admitted, and a preparation that
@@ -4984,7 +5072,7 @@ mod a_create_that_launches_nothing {
     async fn a_launch_carries_paths_the_worker_can_use_from_its_own_directory() {
         let temp = kr_ipc::testing::TempHost::create();
         let (controller, asked) =
-            daemon_running(&temp, std::path::PathBuf::from("kr-worker-relative")).await;
+            daemon_running(&temp, std::path::PathBuf::from("kr-worker-relative"), None).await;
         let environment_id = temp.environment_id();
         let (connection_id, actor_id) = admitted(&controller).await;
         let accepted = AcceptedDeadline {
