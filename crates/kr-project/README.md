@@ -60,11 +60,16 @@ to be the object its record names: the working tree by the identity the reposito
 the Git common directory by its own, the reserved destination by the identity the reservation
 returned. A directory substituted at one of those names is refused before anything starts. The child
 then does not start at a path either: it moves into the open working directory before the boundary
-is applied and before Git runs, with `-C .` as its only directory argument. And after the child has
-gone, every one of those directories is required to still be that object before its result reaches a
-caller: a substitution made while Git ran is this service's declared refusal rather than a result
-nobody can account for. That check is on those directories and not on every descendant of them, and
-two readings cannot tell a change made and undone from no change at all.
+is applied and before Git runs, with `-C .` as its only directory argument.
+
+What the kernel then enforces is this: a write lands only inside the subtree of one of those granted
+root objects, as the kernel works that out at the moment of the write — by the object itself on
+Linux, where the rules are attached to the opened directories, and by the resolved path on macOS,
+where the profile names them. After the child has gone, each granted root is required to still be
+the object it was before its result reaches a caller, and a root that is not ends the run with this
+service's declared honest result. That second reading is **detection** and is described as such: it
+says that a root changed, it does not keep one from changing, it is on those roots and not on every
+descendant of them, and two readings cannot tell a change made and undone from no change at all.
 
 **Reads are not confined on macOS or Linux.** Git reads the system's shared libraries, its locale
 data and its certificate store, and a read confinement that missed one of those would fail an
@@ -82,7 +87,7 @@ two and why. The table below describes what is written for that platform, not wh
 | | macOS | Linux | Windows (refused) |
 | --- | --- | --- | --- |
 | Execution | A sandbox profile permitting `process-exec` on this invocation's own execution list and nothing else, applied by the system's own launcher before it runs Git | Landlock, with the execute right on this invocation's own execution list, on Git's helper directory and on the system's program loader, and nowhere else | An application container granted read and write on the repository, and **refused** the execute right there, so a permission inherited from the same directory cannot add it back, though one written on a file itself can |
-| Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that refuses a local one an internet socket at all, refuses a remote one anything but a stream socket, and refuses both a listening socket | The container's capabilities: none at all for a local operation, and the client capability for a remote one, which does not bound ports — one of the two reasons the service refuses here |
+| Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that makes a socket only of a family the boundary accounts for: the two that reach no machine but this one for any operation, the internet ones for a remote operation and only as a stream socket, and nothing else at all, listening included | The container's capabilities: none at all for a local operation, and the client capability for a remote one, which does not bound ports — one of the two reasons the service refuses here |
 | Writes | The same profile, which permits `file-write` under the operation's own directories and nowhere else | Landlock's write rights, attached to the opened objects rather than to their names, and never carrying the execute right | The container's grants on those directories |
 | Descendants | The child leads its own process group, and ending it ends the group | The same | A job object the process is created inside, which it cannot leave and which ends everything in it |
 
@@ -117,16 +122,17 @@ of these falls back to reading the configuration and hoping.
 
 Stated rather than implied.
 
-**A substitution while Git runs is refused rather than prevented.** The tree Git works in is the
-object this service opened, so nothing can redirect that. What a substitution can reach is a
-directory Git was *given by name* — a reserved worktree destination — and a directory put *inside* a
-tree the operation owns, which no confinement that grants a tree can refuse part of. On macOS both
-are still permitted by the path rules the profile was built with, so Git can write there; on Linux
-the rules are attached to the opened objects and only the second arises. Either way every directory
-the boundary was built around is required to still be that object before the result reaches a
-caller, so the answer is a refusal that names what changed rather than a result nobody can account
-for. Two readings cannot tell a change made and undone from no change at all, and waiting for Git
-establishes that Git has gone rather than that everything it started has.
+**A substitution inside a granted subtree is outside the guarantee.** The tree Git works in is the
+object this service opened, so nothing can redirect that. What a substitution can still reach is a
+directory Git was *given by name* — a reserved worktree destination, which on macOS the path rules
+still permit and which on Linux does not arise, because the rules there are attached to the opened
+objects — and a directory put at an unrecorded name *inside* a tree the operation owns, which no
+confinement that grants a tree can refuse part of. The first ends the run with the declared honest
+result, because the destination is a granted root and its identity is read again. The second is a
+limit rather than a guarantee: the only writer who could put a directory there is a writer under
+this same account, who could write those files directly and needs no substitution to do it. What
+that writer still cannot get is anything executed, or any address the operation was not given.
+Waiting for Git establishes that Git has gone rather than that everything it started has.
 
 **On Windows the execution refusal would rest on permissions a repository can carry its own.** The
 container is refused the execute right on the directories the operation owns, and that refusal beats
@@ -134,16 +140,44 @@ every permission that reaches those files the way it does. What it does not beat
 file itself, which Windows consults first, and a writer who can create files in the repository can
 write one. That is why the service refuses on Windows rather than claiming the guarantee.
 
-**On Linux a remote operation can make only a stream socket.** Landlock's rules are about TCP, and a
-system-call filter reads scalar arguments while an address is behind a pointer, so nothing there
-could bound where a datagram goes. Rather than permit one, the boundary refuses it: an internet
-socket is a stream socket, which is what every transport here uses and what the port rules govern.
-An internet stream socket is also required to be of the protocol those rules are about, because a
-stream socket of another protocol is one they would say nothing about. Turning a name into an
-address goes over the same kind of connection, which the child is told to do and for which the port
-a resolver answers on is added to the rules, on any address, because which machine answers a name is
-not this service's to decide. A system whose resolver will not take that instruction cannot resolve
-a name inside the boundary, and the operation fails saying so.
+**On Linux a socket is made only of a family the boundary accounts for.** Landlock's rules are about
+TCP, and a system-call filter reads scalar arguments while an address is behind a pointer, so
+nothing there could bound where a datagram goes. Rather than permit one, the boundary refuses it,
+and it refuses by naming what may be made rather than what may not: a filter written the other way
+round would permit every family it had not heard of, the ones that reach the machine this one runs
+inside among them. Two families are accounted for whatever the operation is — the one that reaches
+this machine's own services by a path rather than an address, and the one a C library asks the
+kernel about this machine's own addresses on. A remote operation adds the internet families, on
+which the only socket is a stream socket of the protocol Landlock's port rules govern, because a
+stream socket of another protocol is one those rules would say nothing about. Everything else is
+refused, listening included, and the call that makes a pair of sockets is judged by the same
+families as the one that makes a single socket. Turning a name into an address goes over the same
+kind of connection, which the child is told to do and for which the port a resolver answers on is
+added to the rules, on any address, because which machine answers a name is not this service's to
+decide. A system whose resolver will not take that instruction cannot resolve a name inside the
+boundary, and the operation fails saying so.
+
+**An invocation's temporary directory is this service's mark, not its birth certificate.** Neither
+macOS nor Linux offers a call that creates a directory and hands back the object it created, so
+creating one and opening it are two acts and nothing can prove the object that opened is the object
+that was made. What this service does instead: the name goes into a record of its own *before*
+anything of that name is created; the directory is made through the handle this service holds on the
+directory above it, under a name of thirty-two random characters; a second such name is written
+inside it as a mark; and the directory is then opened and required to hold that mark and nothing
+else and to be one object across two opens. What that establishes is that the directory the
+invocation gets is one object carrying this service's own mark — not that this service created it,
+because a directory put at the name before the mark was written would be marked as readily. The
+directory they are all made in is the service's own, open to the account the service runs as and to
+nobody else, so putting anything at a name in there is already that account's own doing.
+
+**Nothing in there is removed that this service has no record of making, and nothing is removed by
+descending.** When an invocation ends, and again when the service starts and sweeps what a daemon
+that died mid-invocation left, each name is matched against that record and against the object's
+identity, this service's own mark is taken out, and the directory itself is removed only if nothing
+else is in it. A directory holding what Git left behind, a directory that is no longer the object
+the record names, and a directory this service never recorded making are all left where they are,
+each with a line saying which and why. What was left stays in the record, so the next start tries
+again rather than forgetting it.
 
 **The port list would not be enforced on Windows.** An application container's capability permits
 reaching the network or nothing at all; bounding which ports it reaches needs a system-wide filtering

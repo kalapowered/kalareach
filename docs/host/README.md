@@ -589,8 +589,9 @@ repository while Git is running.
   listen. An operation that reaches a remote may open outbound connections on the ports its
   transport uses and resolve the remote's name, and nothing may listen there either. Which part of
   that each platform enforces, and what it leaves, is in `crates/kr-project/README.md`: the ports
-  are enforced on two of the three platforms, and on Linux they are a guarantee about the protocol
-  the transports use rather than about every packet a name resolution sends.
+  are enforced on two of the three platforms, and on Linux a socket is made only of a family this
+  host accounts for, so the ports are a guarantee about the protocol the transports use rather than
+  about every packet a name resolution sends.
 * **Only this operation's directories are written.** The repository's working tree and its Git
   directory, the destination the operation reserved, and one temporary directory that exists for the
   length of the invocation and is taken away with it. Everything else is read-only.
@@ -599,9 +600,14 @@ The enclosure is what makes the checks around it sufficient rather than advisory
 repository's configuration before it runs Git and reads it again afterwards, and it always could; a
 writer racing the two readings is what those checks could notice and not prevent. Now the child
 starts inside the directory this host opened rather than at a name, so a tree put at that name
-afterwards is not the tree Git works in; and every directory the enclosure was built around is
-required to still be that object before anything the child produced is used, so a substitution made
-while Git ran is this host's declared refusal rather than a result nobody can account for.
+afterwards is not the tree Git works in, and a write lands only inside the subtree of one of the
+granted root objects as the kernel works that out at the moment of the write. Each granted root is
+read again by identity after the child has gone, and a root that is no longer the object it was ends
+the run with this host's declared honest result. That second reading is detection: it says a root
+changed, it does not keep one from changing. Inside a granted subtree the kernel draws no further
+line, so a directory put at an unrecorded name in a tree the operation owns is written to as the
+tree is; the only writer who could put it there is a writer under this same account, who could write
+those files directly.
 
 What it does not confine, on the two platforms whose mechanism separates the two, is reading. Git
 reads the system's shared libraries, its locale data and its certificate store, and a read
@@ -611,13 +617,14 @@ exactly as before.
 
 Where a guarantee cannot be enforced from outside Git at all, the operation that needs it is refused
 rather than run under checks that notice afterwards. Two cases are the exception, and
-`crates/kr-project/README.md` names them: a directory Git is given by name, and a directory put
-inside a tree the operation owns, are answered by a refusal after the fact rather than prevented,
-because no filesystem confinement that grants a tree can refuse part of it. A kernel too old to mediate the filesystem rights this
+`crates/kr-project/README.md` names them: a directory Git is given by name is answered by the
+declared honest result after the fact rather than prevented, and a directory put at an unrecorded
+name inside a tree the operation owns is outside the guarantee, because no filesystem confinement
+that grants a tree can refuse part of it. A kernel too old to mediate the filesystem rights this
 rests on runs no Git; one too old to say which addresses a process may reach runs no remote
-operation; and **Windows runs no repository operation at all**, because an application container cannot keep a
-repository from being executed from and cannot bound which ports a remote operation reaches. The
-platform task that qualifies this host on Windows is what changes that.
+operation; and **Windows runs no repository operation at all**, because an application container
+cannot keep a repository from being executed from and cannot bound which ports a remote operation
+reaches. The platform task that qualifies this host on Windows is what changes that.
 `crates/kr-project/README.md` says exactly what each platform enforces and what it leaves.
 
 `docs/project/` and `crates/kr-project/README.md` say which mechanism holds which guarantee on each

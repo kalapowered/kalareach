@@ -44,17 +44,23 @@
 //! substituted at a name afterwards is therefore neither the tree Git works in nor a tree the
 //! boundary was built around.
 //!
-//! Two things remain, and they are why every directory an invocation was enclosed around is
-//! required to still be that object before its result reaches a caller. A directory Git is given
-//! *by name*, such as a reserved worktree destination, is named in the rules the path-based
-//! mechanisms take, so a directory substituted there while Git ran is one those rules still
-//! permitted. And a directory substituted *inside* a tree the operation owns is inside a tree the
-//! operation owns: no confinement that grants a tree can refuse part of it. Neither is prevented;
-//! both are the declared refusal, decided by the identity check after the run, which covers the
-//! directories the boundary was built from and not every descendant of them. Two readings cannot
-//! tell a change made and undone from no change at all, and waiting for Git establishes that Git
-//! has gone rather than that everything it started has. On Linux the rules are attached to the
-//! opened objects, so the first of the two does not arise there.
+//! What the kernel enforces is narrower than the sentence above, and is stated as what it is: a
+//! write lands only inside the subtree of one of the granted root objects, as the kernel works that
+//! out at the moment of the write — by the object itself on Linux, where the rules are attached to
+//! the opened directories, and by the resolved path on macOS, where the profile names them. The
+//! granted roots are confirmed by identity twice, before the child starts and after it has gone,
+//! and a root that is no longer the object it was ends the run with this service's declared honest
+//! result. That second reading is **detection**: it says that a root changed, it does not keep one
+//! from changing. Two readings cannot tell a change made and undone from no change at all, and
+//! waiting for Git establishes that Git has gone rather than that everything it started has.
+//!
+//! Inside a granted subtree the kernel draws no further line, and this host does not pretend to.
+//! A directory put at an unrecorded name *inside* a tree the operation owns is written to as the
+//! rest of that tree is, and it is outside the guarantee rather than inside it by accident: the
+//! only writer who could put it there is a writer under this same account, who could write those
+//! files directly and needs no substitution to do it. What that writer still cannot get is anything
+//! executed — the execution list is Git and the helpers under its own exec-path, whatever is
+//! planted — or any address the operation was not given.
 //!
 //! ## What enforces what
 //!
@@ -323,18 +329,21 @@ impl Confinement {
             .chain(std::iter::once(&self.temporary))
     }
 
-    /// Refuses when a directory this invocation was enclosed around is no longer the object it was
-    /// enclosed around.
+    /// Refuses when a granted root this invocation was enclosed around is no longer the object it
+    /// was enclosed around.
     ///
-    /// Called after the child has gone and before its result is given to a caller. Two of the three
+    /// This is detection, and the name for it here is detection. It is called after the child has
+    /// gone and before its result is given to a caller, and what it produces is this service's
+    /// declared honest result rather than a result nobody can account for. Two of the three
     /// mechanisms write their rules against paths, so a directory substituted at one of those names
     /// while Git ran is a directory the rules still permitted, and Git given that name by an
-    /// argument would have written there; what this does is make that the declared refusal rather
-    /// than a result nobody can account for.
+    /// argument would have written there. Reading the identity afterwards says that; it does not
+    /// prevent it.
     ///
-    /// What it does not do is prevent that write, and two readings cannot tell a change made and
-    /// undone from no change at all. Nor does waiting for Git establish that every process it
-    /// started has gone. Both are stated in `crates/kr-project/README.md` rather than implied.
+    /// Two readings cannot tell a change made and undone from no change at all, this covers the
+    /// granted roots and not every descendant of them, and waiting for Git does not establish that
+    /// every process it started has gone. All three are stated in `crates/kr-project/README.md`
+    /// rather than implied.
     ///
     /// # Errors
     ///
