@@ -273,6 +273,11 @@ pub struct AgentToolsInstallResult {
     pub manifest: ChangeManifest,
     /// True when the installation was already present and unchanged.
     pub already_installed: bool,
+    /// What an earlier attempt may have written and this one could not account for.
+    ///
+    /// Empty in the ordinary case. A line here means the installation is not finished: the change
+    /// it names is neither owned nor undone, and somebody has to look at it.
+    pub unresolved: Vec<String>,
 }
 
 /// The result of `agent_tools.status`.

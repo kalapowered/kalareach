@@ -32,6 +32,9 @@ thiserror.workspace = true
 toml_edit.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+exacl.workspace = true
+
 [dev-dependencies]
 iroh-relay = { workspace = true, features = ["server", "test-utils"] }
 kr-cbor.workspace = true

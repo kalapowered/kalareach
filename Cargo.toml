@@ -35,6 +35,10 @@ cap-fs-ext = "=4.0.3"
 cap-std = "=4.0.3"
 ciborium = "=0.2.2"
 clap = { version = "=4.6.7", features = ["derive"] }
+# Reads a file's access-control list on macOS, where the mode bits do not describe it. Used to
+# refuse replacing a document whose protection this host cannot carry across, rather than to grant
+# anything.
+exacl = { version = "=0.13.0", default-features = false }
 hex = "=0.4.3"
 hkdf = "=0.13.0"
 hmac = { version = "=0.13.0", features = ["zeroize"] }

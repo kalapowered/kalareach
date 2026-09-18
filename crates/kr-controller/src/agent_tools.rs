@@ -151,6 +151,9 @@ impl Installer {
     pub fn install(&self, params: &AgentToolsParams) -> Result<AgentToolsInstallResult> {
         let layout = self.layout(params)?;
         self.check(params)?;
+        // A record an earlier build named differently is carried onto the name this one gives it,
+        // here rather than in a read, so it happens once and under this mutation's own lock.
+        self.migrate_records(params)?;
         let existing = self.recorded(params)?;
         if let Some(existing) = existing.as_ref()
             && existing.is_complete()
@@ -159,6 +162,7 @@ impl Installer {
             return Ok(AgentToolsInstallResult {
                 manifest: existing.manifest.clone(),
                 already_installed: true,
+                unresolved: Vec::new(),
             });
         }
         let root = layout.skills.clone();
@@ -215,6 +219,14 @@ impl Installer {
             write_atomically(&path, contents.as_bytes(), READABLE)?;
             self.finish(params, &mut record, operation)?;
         }
+        // A note about a directory this run did not create resolves to nothing: the directory is
+        // either there, in which case something else made it and this host does not claim it, or
+        // it is not, in which case there is nothing to claim. Either way a removal would leave it,
+        // so the note says nothing a reader needs and is dropped rather than carried for ever.
+        record
+            .pending
+            .retain(|noted| !matches!(noted, ChangeOperation::CreateDirectory { .. }));
+        self.write(params, &record)?;
         if let Some(configuration) = layout.configuration.as_ref() {
             // The directory the document lives in is part of the installation when this host has
             // to create it, so it is recorded like any other change.
@@ -241,11 +253,31 @@ impl Installer {
             let written = self.keep_provenance(&record, written, &configuration.path);
             self.finish(params, &mut record, written)?;
         }
-        record.state = InstallationRecord::INSTALLED.to_owned();
+        // What this run could not account for. Every change it made resolved its own note, and a
+        // note about a directory was dropped above, so anything still here belongs to an earlier
+        // attempt and names something this installation no longer touches. It is reported, and the
+        // record stays open, because claiming an installation finished while something it may have
+        // written is unaccounted for is the claim this whole record exists to avoid.
+        let unresolved: Vec<String> = record
+            .pending
+            .iter()
+            .map(|operation| {
+                format!(
+                    "{} may or may not have been written by an earlier attempt; this host does \
+                     not claim it, `kr skill remove` will not undo it, and it has to be looked at \
+                     by hand",
+                    operation.path()
+                )
+            })
+            .collect();
+        if unresolved.is_empty() {
+            record.state = InstallationRecord::INSTALLED.to_owned();
+        }
         self.write(params, &record)?;
         Ok(AgentToolsInstallResult {
             manifest: record.manifest,
             already_installed: false,
+            unresolved,
         })
     }
 
@@ -435,6 +467,8 @@ impl Installer {
     ///
     /// Returns an error when the record cannot be read or a file cannot be removed.
     pub fn remove(&self, params: &AgentToolsParams) -> Result<AgentToolsRemoveResult> {
+        supported_platform()?;
+        self.migrate_records(params)?;
         let Some(record) = self.recorded(params)? else {
             return Ok(AgentToolsRemoveResult {
                 agent: params.agent,
@@ -446,6 +480,14 @@ impl Installer {
                 )],
             });
         };
+        // Every document this removal would rewrite, checked before the first file goes. A
+        // removal that took the package and then refused the document would leave the agent with
+        // an entry pointing at a skill that is no longer there.
+        for operation in &record.manifest.operations {
+            if let ChangeOperation::AddConfigurationEntry { path, .. } = operation {
+                guard_access_controls(Path::new(path))?;
+            }
+        }
         let mut removed = Vec::new();
         let mut retained: Vec<String> = record
             .pending
@@ -700,6 +742,7 @@ impl Installer {
     /// there and this host did not write it, and [`ControllerError::InvalidArgument`] when the
     /// scope needs a project directory that was not given.
     pub fn check(&self, params: &AgentToolsParams) -> Result<()> {
+        supported_platform()?;
         let layout = self.layout(params)?;
         let root = layout.skills.clone();
         self.check_before_writing(params, &layout, &root)
@@ -719,10 +762,14 @@ impl Installer {
             };
             let wanted = display(&path);
             // A file this host wrote, or one it was in the middle of writing when an installation
-            // stopped, at exactly the content the record names. The in-flight note counts because
-            // the content proves the claim: writing the same bytes again changes nothing, and
-            // refusing here would make an interrupted installation unrepairable. Anything else at
-            // that path is somebody's own file, and an installation does not write over one.
+            // stopped, holding exactly the content that record names. The in-flight note counts
+            // because the content is evidence for the note: this host was writing those bytes to
+            // that path, so what is there is its own unfinished work, and refusing here would
+            // leave an interrupted installation unrepairable. The content it names is not always
+            // the content this build would write — an interrupted installation of an earlier
+            // package version says so — and repairing then replaces this host's own file.
+            // Anything else at that path is somebody's own file, and an installation does not
+            // write over one.
             let ours = recorded.as_ref().is_some_and(|record| {
                 record
                     .manifest
@@ -753,23 +800,9 @@ impl Installer {
             // container is something other than a table is refused here rather than after the
             // skill files have been written.
             self.check_container(configuration)?;
-            // Replacing a document by renaming another over it gives the replacement the new
-            // file's own access control. On Unix the mode is carried across; Windows protects a
-            // file with a security descriptor this crate cannot read or reapply without platform
-            // calls it does not make. Rather than quietly weakening a document somebody
-            // restricted, an existing one is not replaced there at all — and the refusal happens
-            // here, before anything else is written. This host's own files carry no such risk:
-            // they are its records and the package it wrote.
-            #[cfg(windows)]
-            if configuration.path.exists() {
-                return Err(ControllerError::PermissionDenied {
-                    detail: format!(
-                        "{} already exists, and replacing it here cannot carry its access control \
-                         across; add the server with the agent's own command instead",
-                        display(&configuration.path)
-                    ),
-                });
-            }
+            // The document's own protection, before anything is written. This host's own files
+            // carry no such risk: they are its records and the package it wrote.
+            guard_access_controls(&configuration.path)?;
         }
         Ok(())
     }
@@ -888,19 +921,28 @@ impl Installer {
                 operation: "read an installation record",
                 detail: format!("{}: {error}", display(&entry.path())),
             })?;
-            let claims = record.manifest.operations.iter().any(|operation| {
-                matches!(
-                    operation,
-                    ChangeOperation::AddConfigurationEntry {
-                        path: recorded_path,
-                        entry: recorded_entry,
-                        digest: recorded,
-                        ..
-                    } if recorded_path == &wanted
-                        && recorded_entry == &entry_name
-                        && recorded == digest
-                )
-            });
+            // A claim this record made, or one it may have made and could not confirm. Both
+            // count, in both directions: a removal must not take an entry another installation may
+            // own, and a repair must be able to finish writing the entry it was interrupted
+            // writing.
+            let claims = record
+                .manifest
+                .operations
+                .iter()
+                .chain(record.pending.iter())
+                .any(|operation| {
+                    matches!(
+                        operation,
+                        ChangeOperation::AddConfigurationEntry {
+                            path: recorded_path,
+                            entry: recorded_entry,
+                            digest: recorded,
+                            ..
+                        } if recorded_path == &wanted
+                            && recorded_entry == &entry_name
+                            && recorded == digest
+                    )
+                });
             if claims {
                 found.push(entry.path());
             }
@@ -1192,39 +1234,88 @@ impl Installer {
         self.records.join(format!("{}-{scope}.json", params.agent))
     }
 
-    /// Returns the name an earlier build would have given this record, when it differs.
-    fn legacy_record_path(&self, params: &AgentToolsParams) -> Option<PathBuf> {
-        let directory = params.project_dir.as_ref()?;
-        (params.scope == kr_protocol::skill::InstallScope::User).then(|| {
-            self.records.join(format!(
-                "{}-{}-{}.json",
+    /// Returns the records an earlier build wrote for this installation under a name this build
+    /// does not give one.
+    ///
+    /// That build named a user record after a project directory the request happened to carry.
+    /// An ordinary request carries none, so the name cannot be worked out again; it is recognised
+    /// by its shape instead.
+    fn legacy_records(&self, params: &AgentToolsParams) -> Result<Vec<PathBuf>> {
+        if params.scope != kr_protocol::skill::InstallScope::User {
+            return Ok(Vec::new());
+        }
+        let prefix = format!("{}-{}-", params.agent, params.scope);
+        let listing = match std::fs::read_dir(&self.records) {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(storage(error)),
+        };
+        let mut found = Vec::new();
+        for entry in listing {
+            let entry = entry.map_err(storage)?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if entry.path().is_file() && is_legacy_user_record(&name, &prefix) {
+                found.push(entry.path());
+            }
+        }
+        found.sort();
+        Ok(found)
+    }
+
+    /// Returns the file this installation's record is in, whatever name it wears.
+    fn record_source(&self, params: &AgentToolsParams) -> Result<Option<PathBuf>> {
+        let path = self.record_path(params);
+        if path.is_file() {
+            return Ok(Some(path));
+        }
+        let legacy = self.legacy_records(params)?;
+        match legacy.as_slice() {
+            [] => Ok(None),
+            [only] => Ok(Some(only.clone())),
+            several => Err(ControllerError::InvalidArgument(format!(
+                "an earlier build left {} records of installing {SKILL_NAME} for {} at {} scope \
+                 ({}); only one of them describes this host, so keep that one and move the others \
+                 aside",
+                several.len(),
                 params.agent,
                 params.scope,
-                hex(&kr_cbor::sha256(directory.as_bytes())[..8])
-            ))
-        })
+                several
+                    .iter()
+                    .map(|path| display(path))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))),
+        }
+    }
+
+    /// Moves a record an earlier build named after a project directory onto the name this build
+    /// gives it.
+    ///
+    /// Nothing is overwritten. Where both names exist they are both left alone, and both keep
+    /// counting towards the claims on a shared document. This runs with the installation it
+    /// belongs to, under the same lock, and never during a read.
+    fn migrate_records(&self, params: &AgentToolsParams) -> Result<()> {
+        let path = self.record_path(params);
+        if path.exists() {
+            return Ok(());
+        }
+        let legacy = self.legacy_records(params)?;
+        let [only] = legacy.as_slice() else {
+            return Ok(());
+        };
+        std::fs::rename(only, &path).map_err(storage)?;
+        sync_directory(&self.records)
     }
 
     fn recorded(&self, params: &AgentToolsParams) -> Result<Option<InstallationRecord>> {
-        let path = self.record_path(params);
-        if !path.exists()
-            && let Some(legacy) = self.legacy_record_path(params)
-            && legacy.exists()
-        {
-            // An earlier build named a user record after a project directory it was given, which
-            // the reader no longer recognises. Move it to the name it should have had, so the
-            // claims in it keep counting.
-            std::fs::rename(&legacy, &path).map_err(storage)?;
-            sync_directory(&self.records)?;
-        }
+        let Some(path) = self.record_source(params)? else {
+            return Ok(None);
+        };
         let Some(text) = read_to_string(&path)? else {
             return Ok(None);
         };
         read_record(&text).map(Some).map_err(|error| {
-            ControllerError::InvalidArgument(format!(
-                "{}: {error}",
-                display(&self.record_path(params))
-            ))
+            ControllerError::InvalidArgument(format!("{}: {error}", display(&path)))
         })
     }
 
@@ -1442,36 +1533,57 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 /// was written but not whether the installation finished, so it is read as unfinished: repairing an
 /// installation that was in fact complete writes the same files again, while claiming a completion
 /// that may not have happened would leave a half-installed agent looking installed.
-fn read_record(text: &str) -> std::result::Result<InstallationRecord, serde_json::Error> {
-    if let Ok(record) = serde_json::from_str::<InstallationRecord>(text) {
-        if record.version == InstallationRecord::VERSION {
-            return Ok(record);
-        }
+fn read_record(text: &str) -> std::result::Result<InstallationRecord, String> {
+    let value: Value = serde_json::from_str(text).map_err(|error| error.to_string())?;
+    let Some(version) = value.get("manifest").map(|_| {
+        value
+            .get("version")
+            .and_then(Value::as_u64)
+            .unwrap_or(UNVERSIONED)
+    }) else {
+        // The first shape: the manifest alone. That build recorded each change after making it, so
+        // its operations are things that happened; what it does not say is whether the
+        // installation finished, and a completion that may not have happened is never claimed.
+        let manifest: ChangeManifest =
+            serde_json::from_value(value).map_err(|error| error.to_string())?;
+        return Ok(InstallationRecord {
+            version: InstallationRecord::VERSION,
+            state: InstallationRecord::INSTALLING.to_owned(),
+            manifest,
+            pending: Vec::new(),
+        });
+    };
+    // An unversioned record is one of two shapes, and only the record itself can say which: the
+    // journal wrote a `pending` list, the plan before it had no such thing. Serde's default would
+    // erase that difference, so it is read from the document.
+    let predicted = version == UNVERSIONED && value.get("pending").is_none();
+    if version != UNVERSIONED && version != u64::from(InstallationRecord::VERSION) {
+        return Err(format!(
+            "this record was written in version {version}, which this build does not read; a \
+             newer build wrote it and only that one should change it"
+        ));
+    }
+    let mut record: InstallationRecord =
+        serde_json::from_value(value).map_err(|error| error.to_string())?;
+    record.version = InstallationRecord::VERSION;
+    if predicted {
         // A record from the build that wrote its intentions rather than its effects. Those
         // operations may or may not have happened, so they become evidence of uncertainty: a
         // removal reports them and leaves them alone, because removing something this host may
         // never have written would delete somebody else's.
-        let mut migrated = record;
-        migrated.pending = migrated
+        record.pending = record
             .manifest
             .operations
             .drain(..)
-            .chain(migrated.pending)
+            .chain(record.pending)
             .collect();
-        migrated.state = InstallationRecord::INSTALLING.to_owned();
-        migrated.version = InstallationRecord::VERSION;
-        return Ok(migrated);
+        record.state = InstallationRecord::INSTALLING.to_owned();
     }
-    // The first shape: the manifest alone. That build recorded each change after making it, so
-    // those operations are things that happened; what it does not say is whether the installation
-    // finished, and a completion that may not have happened is never claimed.
-    serde_json::from_str::<ChangeManifest>(text).map(|manifest| InstallationRecord {
-        version: InstallationRecord::VERSION,
-        state: InstallationRecord::INSTALLING.to_owned(),
-        manifest,
-        pending: Vec::new(),
-    })
+    Ok(record)
 }
+
+/// The version an earlier build's record has, because it wrote none.
+const UNVERSIONED: u64 = 0;
 
 /// Returns the recorded operations in the order a removal undoes them.
 ///
@@ -1510,9 +1622,11 @@ fn create_directory_durably(path: &Path) -> Result<bool> {
     Ok(created)
 }
 
-/// Returns true when this file name is one this host gives an installation record.
+/// Returns true when this file name is one a build of this host gives an installation record.
 ///
-/// The name is `<agent>-<scope>.json`, or `<agent>-<scope>-<digest>.json` for a project.
+/// The name is `<agent>-<scope>.json`, or `<agent>-<scope>-<digest>.json` for a project. An
+/// earlier build also gave a *user* record a digest, and those records still hold claims, so the
+/// name it used is recognised here as well.
 fn is_record_name(name: &str) -> bool {
     let Some(stem) = name.strip_suffix(".json") else {
         return false;
@@ -1523,11 +1637,104 @@ fn is_record_name(name: &str) -> bool {
             .is_some_and(|rest| {
                 rest == "user"
                     || rest == "project"
-                    || rest.strip_prefix("project-").is_some_and(|hash| {
-                        !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
-                    })
+                    || rest
+                        .strip_prefix("project-")
+                        .or_else(|| rest.strip_prefix("user-"))
+                        .is_some_and(is_digest_name)
             })
     })
+}
+
+/// Returns true when this file name is the one an earlier build gave a user record.
+fn is_legacy_user_record(name: &str, prefix: &str) -> bool {
+    name.strip_prefix(prefix)
+        .and_then(|rest| rest.strip_suffix(".json"))
+        .is_some_and(is_digest_name)
+}
+
+fn is_digest_name(text: &str) -> bool {
+    !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// Refuses a change to an agent's installation on a platform this host cannot make one safely on.
+///
+/// Section 24 asks an effect to be durable before the record that accounts for it, and section 9
+/// asks a dispatch marker to survive the crash it exists for. Both rest on making a directory's own
+/// entries durable, which this host cannot do on Windows (see [`sync_directory`]). Rather than make
+/// a change it cannot account for after a crash, it makes none: `kr skill status` still reports
+/// what is there, and the agent's own command adds the server until the Windows qualification
+/// supplies a durable barrier.
+fn supported_platform() -> Result<()> {
+    #[cfg(windows)]
+    {
+        return Err(ControllerError::PermissionDenied {
+            detail: format!(
+                "this host cannot yet install or remove {SKILL_NAME} on Windows, because it has no \
+                 way to make the directory entries behind an installation durable; add the server \
+                 with the agent's own command instead"
+            ),
+        });
+    }
+    #[cfg(not(windows))]
+    Ok(())
+}
+
+/// Refuses to replace a document whose protection this host cannot carry across.
+///
+/// A replacement by rename gives the new file its own access control. The mode bits are carried
+/// across; an access-control list is not, and reapplying one needs the platform's own calls. An
+/// agent's configuration can hold a credential, and somebody who restricted it beyond the mode bits
+/// meant it, so a document carrying one is refused before anything is written rather than quietly
+/// weakened.
+fn guard_access_controls(path: &Path) -> Result<()> {
+    if !path.exists() || !extended_access_controls(path)? {
+        return Ok(());
+    }
+    Err(ControllerError::PermissionDenied {
+        detail: format!(
+            "{} is protected by an access-control list, and changing it here would not carry that \
+             across; add or remove the server with the agent's own command instead",
+            display(path)
+        ),
+    })
+}
+
+/// Returns true when the file carries access controls its mode bits do not describe.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::Storage`] when the file's access controls cannot be read, because a
+/// protection this host cannot read is one it cannot promise to keep.
+#[cfg(target_os = "macos")]
+fn extended_access_controls(path: &Path) -> Result<bool> {
+    // A file with no list of its own has an empty one here: this platform keeps no mode bits in it,
+    // so anything in it is an extra grant or an extra restriction somebody added.
+    exacl::getfacl(path, None)
+        .map(|entries| !entries.is_empty())
+        .map_err(storage)
+}
+
+#[cfg(target_os = "linux")]
+fn extended_access_controls(path: &Path) -> Result<bool> {
+    // This platform keeps a POSIX access-control list in one extended attribute, and a file without
+    // that attribute is described by its mode bits alone.
+    match rustix::fs::getxattr(path, "system.posix_acl_access", &mut []) {
+        Ok(_) => Ok(true),
+        // The attribute is there and longer than the nothing offered for it.
+        Err(rustix::io::Errno::RANGE) => Ok(true),
+        Err(rustix::io::Errno::NODATA) => Ok(false),
+        // A filesystem that cannot hold an extended attribute cannot hold a list either.
+        Err(rustix::io::Errno::NOTSUP) | Err(rustix::io::Errno::OPNOTSUPP) => Ok(false),
+        Err(error) => Err(storage(std::io::Error::from(error))),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn extended_access_controls(path: &Path) -> Result<bool> {
+    // Nothing here can read this platform's access controls, so nothing here can promise to keep
+    // them. An existing document is refused rather than replaced.
+    let _ = path;
+    Ok(true)
 }
 
 /// Makes a directory's own entries durable.
@@ -1846,6 +2053,24 @@ mod tests {
             scope,
             project_dir: Nullable::null(),
         }
+    }
+
+    /// One record's manifest, as a record from any build serialises it.
+    fn manifest_value() -> Value {
+        serde_json::json!({
+            "skill_version": SKILL_VERSION,
+            "agent": "codex",
+            "scope": "user",
+            "root": "/somewhere",
+            "entry_point": ["kr"],
+            "operations": [{
+                "operation": "add_configuration_entry",
+                "path": "/somewhere/config.toml",
+                "entry": "mcp_servers.kalareach",
+                "digest": serde_json::to_value(digest_of(b"an entry")).expect("a digest"),
+                "created_document": false,
+            }],
+        })
     }
 
     /// The digests the fixture records, and the digests the manifest carries.
@@ -2347,26 +2572,187 @@ mod tests {
     }
 
     #[test]
+    fn an_interrupted_configuration_entry_is_finished_by_installing_again() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::Codex, InstallScope::User);
+        installer.install(&params).expect("installs");
+
+        // What a crash between writing the entry and recording it leaves: the entry is in the
+        // document, and the record only says it may be.
+        let path = installer.record_path(&params);
+        let mut record =
+            read_record(&std::fs::read_to_string(&path).expect("the record")).expect("reads");
+        let written = record
+            .manifest
+            .operations
+            .iter()
+            .position(|operation| {
+                matches!(operation, ChangeOperation::AddConfigurationEntry { .. })
+            })
+            .expect("an entry was written");
+        record.pending = vec![record.manifest.operations.remove(written)];
+        record.state = InstallationRecord::INSTALLING.to_owned();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&record).expect("encodes"),
+        )
+        .expect("writes");
+
+        let repaired = installer.install(&params).expect("repairs");
+
+        assert!(repaired.unresolved.is_empty(), "{:?}", repaired.unresolved);
+        let recorded = installer
+            .recorded(&params)
+            .expect("reads")
+            .expect("a record");
+        assert!(recorded.is_complete());
+        assert!(recorded.pending.is_empty());
+        assert!(
+            recorded
+                .manifest
+                .operations
+                .iter()
+                .any(|operation| matches!(
+                    operation,
+                    ChangeOperation::AddConfigurationEntry { .. }
+                )),
+            "the entry is owned again"
+        );
+    }
+
+    #[test]
+    fn an_unaccounted_change_keeps_an_installation_open() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        installer.install(&params).expect("installs");
+
+        // A note about something this installation no longer touches. Nothing this run does can
+        // resolve it, and nothing may claim it.
+        let path = installer.record_path(&params);
+        let mut record =
+            read_record(&std::fs::read_to_string(&path).expect("the record")).expect("reads");
+        let stranded = tree.home().join("something-else.md");
+        std::fs::write(&stranded, "who wrote this?").expect("writes");
+        record.pending = vec![ChangeOperation::WriteFile {
+            path: display(&stranded),
+            digest: digest_of(b"who wrote this?"),
+            replaced_digest: Nullable::null(),
+        }];
+        record.state = InstallationRecord::INSTALLING.to_owned();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&record).expect("encodes"),
+        )
+        .expect("writes");
+
+        let installed = installer.install(&params).expect("installs what it can");
+
+        assert_eq!(installed.unresolved.len(), 1, "{:?}", installed.unresolved);
+        assert!(installed.unresolved[0].contains("by hand"));
+        let status = installer.status(&params).expect("reads");
+        assert!(!status.installed, "it is not finished");
+        assert!(
+            status
+                .drift
+                .iter()
+                .any(|note| note.contains("may or may not have been written")),
+            "{:?}",
+            status.drift
+        );
+        assert!(stranded.is_file(), "and it is left alone");
+    }
+
+    #[test]
+    fn a_directory_an_earlier_attempt_was_unsure_of_does_not_hold_an_installation_open() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        installer.install(&params).expect("installs");
+
+        let path = installer.record_path(&params);
+        let mut record =
+            read_record(&std::fs::read_to_string(&path).expect("the record")).expect("reads");
+        // A directory that is there, which this host may or may not have made. Not claiming it and
+        // forgetting the note come to the same thing: a removal leaves it either way.
+        let directory = tree.home().join(".claude");
+        record.pending = vec![ChangeOperation::CreateDirectory {
+            path: display(&directory),
+        }];
+        record.state = InstallationRecord::INSTALLING.to_owned();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&record).expect("encodes"),
+        )
+        .expect("writes");
+
+        let repaired = installer.install(&params).expect("repairs");
+
+        assert!(repaired.unresolved.is_empty(), "{:?}", repaired.unresolved);
+        let recorded = installer
+            .recorded(&params)
+            .expect("reads")
+            .expect("a record");
+        assert!(recorded.is_complete(), "it finished");
+        assert!(recorded.pending.is_empty(), "and left nothing uncertain");
+    }
+
+    /// A document somebody restricted beyond its mode bits is not replaced.
+    ///
+    /// Only this platform can be tested here: it is the one whose access controls this build can
+    /// read without the platform calls this crate does not make.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_configuration_protected_by_an_access_control_list_is_refused() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::Codex, InstallScope::User);
+        installer.install(&params).expect("installs");
+        let document = tree.home().join(".codex/config.toml");
+        exacl::setfacl(
+            &[&document],
+            &[exacl::AclEntry::deny_group(
+                "everyone",
+                exacl::Perm::DELETE,
+                None,
+            )],
+            None,
+        )
+        .expect("restricts the document");
+
+        let refused = installer
+            .install(&params)
+            .expect_err("refuses to replace it");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains("access-control list")),
+            "{refused:?}"
+        );
+
+        let refused = installer
+            .remove(&params)
+            .expect_err("refuses to rewrite it");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains("access-control list")),
+            "{refused:?}"
+        );
+        assert!(
+            tree.home()
+                .join(".agents/skills/kalareach-contact/SKILL.md")
+                .is_file(),
+            "and nothing was taken before the refusal"
+        );
+    }
+
+    #[test]
     fn a_predicted_record_from_an_earlier_build_becomes_uncertain_rather_than_owned() {
         // The shape that recorded what an installation *meant* to do. Those operations may or may
         // not have happened, so they become evidence of uncertainty instead of ownership.
         let text = serde_json::json!({
             "state": "installing",
-            "manifest": {
-                "skill_version": SKILL_VERSION,
-                "agent": "codex",
-                "scope": "user",
-                "root": "/somewhere",
-                "entry_point": ["kr"],
-                "operations": [{
-                    "operation": "add_configuration_entry",
-                    "path": "/somewhere/config.toml",
-                    "entry": "mcp_servers.kalareach",
-                    "digest": serde_json::to_value(digest_of(b"predicted"))
-                        .expect("a digest"),
-                    "created_document": false,
-                }],
-            },
+            "manifest": manifest_value(),
         })
         .to_string();
         let record = read_record(&text).expect("reads the earlier shape");
@@ -2379,26 +2765,94 @@ mod tests {
     fn a_user_record_an_earlier_build_named_after_a_project_is_still_found() {
         let tree = Tree::create();
         let installer = tree.installer();
-        // A user installation asked for while a project directory happened to be in the request.
-        // An earlier build put that directory in the record's name.
-        let mut params = params(AgentTarget::Codex, InstallScope::User);
-        params.project_dir = Nullable::from(Some("/work/somewhere".to_owned()));
+        // An ordinary user request: no project directory, which is what the command line sends.
+        let params = params(AgentTarget::Codex, InstallScope::User);
         installer.install(&params).expect("installs");
         let modern = installer.record_path(&params);
-        let legacy = installer
-            .legacy_record_path(&params)
-            .expect("the earlier name");
+        // The name an earlier build gave it, after a project directory that request happened to
+        // carry. Nothing in an ordinary request can work that name out again.
+        let legacy =
+            installer
+                .records
+                .join(format!("{}-user-{}.json", params.agent, hex(&[0xab, 0xcd])));
         std::fs::rename(&modern, &legacy).expect("wears the earlier name");
 
         let record = installer
             .recorded(&params)
             .expect("reads")
             .expect("a record");
-
         assert!(record.is_complete(), "the claim still counts");
-        assert!(modern.is_file(), "it wears the name the reader knows");
-        assert!(!legacy.exists(), "and only that one");
+        assert!(
+            is_record_name(&legacy.file_name().expect("a name").to_string_lossy()),
+            "and a shared document still sees it"
+        );
+
+        // A removal is a mutation, so it carries the record onto the name this build gives one.
         installer.remove(&params).expect("removes");
+        assert!(!legacy.exists(), "the earlier name is gone");
+        assert!(!modern.exists(), "and so is the record it became");
+    }
+
+    #[test]
+    fn two_records_from_an_earlier_build_are_reported_rather_than_guessed_between() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::Codex, InstallScope::User);
+        std::fs::create_dir_all(&installer.records).expect("a records directory");
+        for hash in ["aa", "bb"] {
+            std::fs::write(
+                installer
+                    .records
+                    .join(format!("{}-user-{hash}.json", params.agent)),
+                "{}",
+            )
+            .expect("writes");
+        }
+
+        let error = installer
+            .recorded(&params)
+            .expect_err("reports the ambiguity");
+
+        assert!(
+            matches!(error, ControllerError::InvalidArgument(ref detail) if detail.contains("move the others")),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn a_record_from_a_newer_build_is_refused_rather_than_migrated() {
+        let text = serde_json::json!({
+            "version": 2,
+            "state": "installed",
+            "manifest": manifest_value(),
+            "pending": [],
+        })
+        .to_string();
+
+        let error = read_record(&text).expect_err("refuses");
+
+        assert!(error.contains("version 2"), "{error}");
+    }
+
+    #[test]
+    fn a_journal_from_an_earlier_build_keeps_what_it_confirmed() {
+        // The shape before the version field: the same journal, without a version to name it.
+        let text = serde_json::json!({
+            "state": "installed",
+            "manifest": manifest_value(),
+            "pending": [],
+        })
+        .to_string();
+
+        let record = read_record(&text).expect("reads the earlier journal");
+
+        assert!(record.is_complete(), "it finished, and still says so");
+        assert_eq!(
+            record.manifest.operations.len(),
+            1,
+            "what it did is its own"
+        );
+        assert!(record.pending.is_empty());
     }
 
     #[test]

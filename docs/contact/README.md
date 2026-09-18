@@ -184,18 +184,21 @@ Three properties make an installation safe to undo:
   editor, so ordering and comments are untouched. A JSON configuration is reparsed and rewritten:
   every setting survives, and the document's key order and indentation are normalised. The
   replacement keeps the permission bits of the document it replaces, because an agent's
-  configuration can hold a credential. It does **not** carry an access-control list across that
-  replacement, and on Windows, where a security descriptor is how a file is protected at all, an
-  existing document is not replaced: the installation refuses and says to add the server with the
-  agent's own command. On Unix an extended access-control list beyond the mode bits is likewise not
-  carried.
+  configuration can hold a credential. What it cannot keep, it will not take: a document protected
+  by an access-control list beyond those bits is refused, by both installation and removal, before
+  anything is written, with the advice to add or remove the server with the agent's own command.
+  Reapplying such a list needs calls this host does not make, and somebody who restricted a file
+  meant it.
 
 A directory the installation created is removed only when it is empty, and a directory that was
 already there is never claimed. A project's `.mcp.json` is read by more than one agent, so the entry
 in one is written identically whichever installation wrote it and is removed only when no other
-recorded installation still names it. A JSON document this host created goes with the entry when
-nothing else was ever put in it; a TOML one does not, because a format-preserving editor keeps
-comments and spacing this host cannot read as its own.
+recorded installation still names it. Removal does not undo every object an installation brought
+into being: a JSON document this host created goes with the entry when nothing else was ever put in
+it, but a TOML one stays, because a format-preserving editor keeps comments and spacing this host
+cannot read as its own, and a shared document outlives the record of whoever created it when that
+installation is removed first. What is left behind is empty and inert, and a later installation
+writes into it rather than around it.
 
 Installing and removing are mutations, and they carry section 9's receipt contract: the same action
 retried returns what it produced the first time rather than changing anything again, the same
@@ -204,6 +207,14 @@ whose outcome was not is reported as unknown rather than repeated. One installat
 on a host, and the authority behind it and the deadline it was admitted under are checked again
 immediately before anything durable happens.
 
+That contract rests on a change reaching the disk before the record that accounts for it, which
+rests in turn on making a directory's own entries durable. This host has no way to do that on
+Windows: flushing a directory there needs write access to a handle that cannot be opened for
+writing. So `kr skill install` and `kr skill remove` refuse on Windows, before anything is changed,
+and say to add the server with the agent's own command. `kr skill status` still reports whatever is
+there. The refusal goes when the Windows qualification supplies a durable barrier; until then this
+host does not make a change it could not account for after a crash.
+
 Each change is noted in the record before it happens and recorded after it, and the record is marked
 complete only when the last one is. An installation interrupted part way through is therefore not
 mistaken for a finished one: `kr skill status` says it did not finish, and `kr skill remove` undoes
@@ -211,11 +222,18 @@ what was recorded. The one change that was in flight is named and left alone: a 
 file contains, not who wrote it, and removing something this host may never have written would
 delete somebody else's file.
 
-Installing again carries on from there. A skill file whose content is what the record names, whether
-it was recorded or still in flight, is written again and claimed; a file at that path holding
-anything else is somebody's own, and the installation refuses and says to move it aside. So a
-repair finishes an interrupted installation, except where somebody has since put their own file
-where one of its files goes.
+Installing again carries on from there. A skill file or a server entry holding exactly what the
+record names, whether that was recorded or still in flight, is this host's own unfinished work: the
+repair writes it again and claims it. Anything else at that path is somebody's own, and the
+installation refuses and says to move it aside.
+
+Two things a repair cannot finish, and both are reported rather than glossed over. A file or an
+entry that no longer holds what the record names has to be looked at by hand: this host will not
+adopt it from a digest, because a digest proves content and not authorship. And a note about
+something the installation no longer touches at all cannot be resolved by installing again; the
+installation stays open, `kr skill install` lists it under `unresolved`, `kr skill status` repeats it
+and says the installation did not finish, and `kr skill remove` leaves it alone. Removing the
+installation clears the record, after which a fresh installation starts from nothing.
 
 ## What contact is not
 

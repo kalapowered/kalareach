@@ -102,6 +102,8 @@ pub fn installed(result: &AgentToolsInstallResult) -> Value {
         "skill_version": result.manifest.skill_version,
         "entry_point": result.manifest.entry_point,
         "already_installed": result.already_installed,
+        "finished": result.unresolved.is_empty(),
+        "unresolved": result.unresolved,
         "operations": result.manifest.operations.iter().map(operation).collect::<Vec<_>>(),
     })
 }
@@ -161,6 +163,12 @@ pub fn install_lines(result: &AgentToolsInstallResult) -> String {
         result.manifest.entry_point.join(" ")
     ));
     text.push_str(&manifest_lines(&result.manifest));
+    for note in &result.unresolved {
+        text.push_str(&format!("  unresolved {note}\n"));
+    }
+    if !result.unresolved.is_empty() {
+        text.push_str("this installation is not finished while anything above is unresolved\n");
+    }
     text
 }
 
@@ -178,12 +186,18 @@ pub fn manifest_lines(manifest: &ChangeManifest) -> String {
 #[must_use]
 pub fn status_lines(result: &AgentToolsStatusResult) -> String {
     if !result.installed {
-        return format!(
+        let mut text = format!(
             "{} is not installed for {} at {} scope\n",
             kr_protocol::skill::SKILL_NAME,
             result.agent,
             result.scope
         );
+        // What this host knows about the place it is not installed in. An installation that began
+        // and did not finish says so here, and so does every change it may have left behind.
+        for note in &result.drift {
+            text.push_str(&format!("  {note}\n"));
+        }
+        return text;
     }
     let mut text = format!(
         "{} {} is installed for {} at {} scope in {}\n",
