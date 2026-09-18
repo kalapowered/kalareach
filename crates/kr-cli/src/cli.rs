@@ -45,8 +45,112 @@ pub enum Command {
     /// Show a session's connection, process and adapter state.
     #[command(visible_alias = "s")]
     Status(StatusArguments),
+    /// Read and answer the questions agents in this host's sessions are waiting on.
+    #[command(subcommand)]
+    Question(QuestionCommand),
+    /// Install the contact skill and its tool configuration for an agent.
+    #[command(subcommand)]
+    Skill(SkillCommand),
+    /// Run the contact tools for the agent that launched this process.
+    AgentTools(AgentToolsArguments),
     /// Run read-only diagnostics.
     Doctor(DoctorArguments),
+}
+
+/// `kr question`.
+#[derive(Debug, Subcommand)]
+pub enum QuestionCommand {
+    /// List the questions waiting for an answer.
+    List(QuestionListArguments),
+    /// Show one question in full, including the application identity the host verified.
+    Show(QuestionShowArguments),
+    /// Answer one question.
+    Answer(QuestionAnswerArguments),
+    /// Withdraw one question without answering it.
+    Cancel(QuestionShowArguments),
+}
+
+/// `kr question list`.
+#[derive(Debug, Args)]
+pub struct QuestionListArguments {
+    /// One session, by display number or identifier. Every session by default.
+    #[arg(long)]
+    pub session: Option<String>,
+    /// Include questions that have already been answered, cancelled or expired.
+    #[arg(long)]
+    pub include_resolved: bool,
+}
+
+/// `kr question show` and `kr question cancel`.
+#[derive(Debug, Args)]
+pub struct QuestionShowArguments {
+    /// The question identifier.
+    pub question: String,
+}
+
+/// How one question is answered. Exactly one of these is required.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+pub struct AnswerForm {
+    /// Free text, for an `input` question.
+    #[arg(long)]
+    pub text: Option<String>,
+    /// One of the listed choices, for a `select` question.
+    #[arg(long)]
+    pub choice: Option<String>,
+    /// Yes, for a `confirm` question.
+    #[arg(long)]
+    pub yes: bool,
+    /// No, for a `confirm` question.
+    #[arg(long)]
+    pub no: bool,
+    /// Free text instead of the listed choices. Every select and confirm offers it, and it is
+    /// never folded into a choice or into yes.
+    #[arg(long)]
+    pub other: Option<String>,
+}
+
+/// `kr question answer`.
+#[derive(Debug, Args)]
+pub struct QuestionAnswerArguments {
+    /// The question identifier.
+    pub question: String,
+    /// The answer.
+    #[command(flatten)]
+    pub form: AnswerForm,
+}
+
+/// `kr skill`.
+#[derive(Debug, Subcommand)]
+pub enum SkillCommand {
+    /// Install the skill and register the tool server.
+    Install(SkillArguments),
+    /// Report what is installed, and what no longer matches what was written.
+    Status(SkillArguments),
+    /// Undo exactly what an installation recorded.
+    Remove(SkillArguments),
+}
+
+/// `kr skill install`, `kr skill status` and `kr skill remove`.
+#[derive(Debug, Args)]
+pub struct SkillArguments {
+    /// The agent: codex, claude-code, opencode, gemini-cli, kimi-code-cli or qoder-cli.
+    #[arg(long)]
+    pub agent: String,
+    /// user or project.
+    #[arg(long)]
+    pub scope: String,
+    /// The project directory, for project scope. The working directory by default.
+    #[arg(long)]
+    pub project_dir: Option<String>,
+}
+
+/// `kr agent-tools`.
+#[derive(Debug, Args)]
+pub struct AgentToolsArguments {
+    /// Speak the Model Context Protocol over this process's standard input and output.
+    #[arg(long)]
+    pub stdio: bool,
 }
 
 /// How a new session is presented.

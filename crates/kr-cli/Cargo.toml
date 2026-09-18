@@ -21,12 +21,15 @@ clap.workspace = true
 kr-cbor.workspace = true
 kr-ipc.workspace = true
 kr-protocol.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
 rustix = { workspace = true, features = ["stdio", "termios"] }
 serde.workspace = true
 serde_json.workspace = true
 signal-hook.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util.workspace = true
 
 [dev-dependencies]
 # The attach tests host a real session and run `kr` against it on a real pseudo-terminal. Both
@@ -35,6 +38,10 @@ kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 kr-worker.workspace = true
 portable-pty.workspace = true
+# The contact tests drive `kr agent-tools --stdio` the way an installed agent does: as a child
+# process speaking the Model Context Protocol over its standard streams.
+rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

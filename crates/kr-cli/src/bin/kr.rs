@@ -373,6 +373,20 @@ async fn run(cli: Cli) -> Result<Completion> {
             }
             Ok(Completion::Done)
         }
+        Command::Question(command) => question(&paths, command, cli.json).await,
+        Command::Skill(command) => skill(&paths, command, cli.json).await,
+        Command::AgentTools(arguments) => {
+            if !arguments.stdio {
+                return Err(CliError::Usage(
+                    "the tool server speaks over standard input and output: pass --stdio"
+                        .to_owned(),
+                ));
+            }
+            // Nothing is printed here. Standard output is the protocol's own stream from this
+            // point, and one stray line on it would be a frame the client cannot parse.
+            kr_cli::contact::run_stdio(build_id()).await?;
+            Ok(Completion::Done)
+        }
         Command::Doctor(arguments) => {
             let environment = kr_cli::resolve::select(&paths, None)?;
             let mut client = open_controller(&environment.paths, build_id()).await?;
@@ -691,6 +705,172 @@ fn snapshot() -> Vec<kr_protocol::session::EnvironmentVariable> {
     std::env::vars()
         .map(|(name, value)| kr_protocol::session::EnvironmentVariable { name, value })
         .collect()
+}
+
+/// Runs `kr question`.
+async fn question(
+    paths: &HostPaths,
+    command: kr_cli::cli::QuestionCommand,
+    json: bool,
+) -> Result<Completion> {
+    use kr_cli::cli::QuestionCommand;
+    use kr_cli::question;
+
+    match command {
+        QuestionCommand::List(arguments) => {
+            let scope = match arguments.session.as_deref() {
+                Some(session) => question::Scope::Session(SessionSelector::parse(session)?),
+                None => question::Scope::Everything,
+            };
+            let found =
+                question::list(paths, &scope, arguments.include_resolved, build_id()).await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "ok": true,
+                    "questions": found
+                        .iter()
+                        .map(|(descriptor, item)| question::rendered(descriptor, item))
+                        .collect::<Vec<_>>(),
+                }));
+            } else if found.is_empty() {
+                println!("no questions are waiting");
+            } else {
+                for (descriptor, item) in &found {
+                    println!("{}", question::line(descriptor, item));
+                }
+            }
+            Ok(Completion::Done)
+        }
+        QuestionCommand::Show(arguments) => {
+            let question_id = parse_question(&arguments.question)?;
+            let (descriptor, item) = question::show(paths, question_id, build_id()).await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "ok": true,
+                    "question": question::rendered(&descriptor, &item),
+                }));
+            } else {
+                print!("{}", question::detail(&descriptor, &item));
+            }
+            Ok(Completion::Done)
+        }
+        QuestionCommand::Answer(arguments) => {
+            let question_id = parse_question(&arguments.question)?;
+            let answer = answer_form(&arguments.form)?;
+            let item = question::answer(paths, question_id, answer, build_id()).await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "ok": true,
+                    "state": item.state.as_str(),
+                    "revision": item.revision.get(),
+                    "question_id": item.question_id.to_string(),
+                }));
+            } else {
+                println!("{} is {}", item.question_id, item.state.as_str());
+            }
+            Ok(Completion::Done)
+        }
+        QuestionCommand::Cancel(arguments) => {
+            let question_id = parse_question(&arguments.question)?;
+            let item = question::cancel(paths, question_id, build_id()).await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "ok": true,
+                    "state": item.state.as_str(),
+                    "question_id": item.question_id.to_string(),
+                }));
+            } else {
+                println!("{} is {}", item.question_id, item.state.as_str());
+            }
+            Ok(Completion::Done)
+        }
+    }
+}
+
+/// Reads the one answer form a command gave.
+fn answer_form(form: &kr_cli::cli::AnswerForm) -> Result<kr_protocol::question::QuestionAnswer> {
+    use kr_protocol::question::QuestionAnswer;
+
+    // Free text stays free text. `--other` is the answer every select and confirm offers, and it
+    // is never folded into a listed choice or into yes.
+    if let Some(text) = form.other.as_ref() {
+        return Ok(QuestionAnswer::Other { text: text.clone() });
+    }
+    if let Some(text) = form.text.as_ref() {
+        return Ok(QuestionAnswer::Input { text: text.clone() });
+    }
+    if let Some(choice_id) = form.choice.as_ref() {
+        return Ok(QuestionAnswer::Choice {
+            choice_id: choice_id.clone(),
+        });
+    }
+    if form.yes {
+        return Ok(QuestionAnswer::Decision { decided: true });
+    }
+    if form.no {
+        return Ok(QuestionAnswer::Decision { decided: false });
+    }
+    Err(CliError::Usage(
+        "give one of --text, --choice, --yes, --no or --other".to_owned(),
+    ))
+}
+
+fn parse_question(text: &str) -> Result<kr_protocol::ids::QuestionId> {
+    text.parse()
+        .map_err(|_| CliError::Usage(format!("{text} is not a question identifier")))
+}
+
+/// Runs `kr skill`.
+async fn skill(
+    paths: &HostPaths,
+    command: kr_cli::cli::SkillCommand,
+    json: bool,
+) -> Result<Completion> {
+    use kr_cli::cli::SkillCommand;
+    use kr_cli::skill;
+
+    let arguments = match &command {
+        SkillCommand::Install(arguments)
+        | SkillCommand::Status(arguments)
+        | SkillCommand::Remove(arguments) => arguments,
+    };
+    let params = skill::parse(
+        &arguments.agent,
+        &arguments.scope,
+        arguments.project_dir.as_deref(),
+    )?;
+    let environment = kr_cli::resolve::select(paths, None)?;
+    let mut client = open_controller(&environment.paths, build_id()).await?;
+    match command {
+        SkillCommand::Install(_) => {
+            let result = skill::install(&mut client, environment.environment_id, &params).await?;
+            if json {
+                print_json(&serde_json::json!({"ok": true, "install": skill::installed(&result)}));
+            } else {
+                print!("{}", skill::install_lines(&result));
+            }
+        }
+        SkillCommand::Status(_) => {
+            let result = skill::status(&mut client, &params).await?;
+            if json {
+                print_json(&serde_json::json!({
+                    "ok": skill::is_intact(&result),
+                    "status": skill::reported(&result),
+                }));
+            } else {
+                print!("{}", skill::status_lines(&result));
+            }
+        }
+        SkillCommand::Remove(_) => {
+            let result = skill::remove(&mut client, environment.environment_id, &params).await?;
+            if json {
+                print_json(&serde_json::json!({"ok": true, "remove": skill::removed(&result)}));
+            } else {
+                print!("{}", skill::remove_lines(&result));
+            }
+        }
+    }
+    Ok(Completion::Done)
 }
 
 fn stdio_is_terminal() -> bool {

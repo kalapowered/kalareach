@@ -79,6 +79,14 @@ pub enum ControllerError {
     /// The request is not valid.
     #[error("{0}")]
     InvalidArgument(String),
+    /// A file this daemon had to read or write could not be reached.
+    #[error("could not {operation}: {detail}")]
+    Storage {
+        /// What was being attempted.
+        operation: &'static str,
+        /// What went wrong.
+        detail: String,
+    },
     /// What became of the action is not known.
     ///
     /// Section 9 makes this its own answer rather than a failure: the intent may have been
@@ -157,7 +165,9 @@ impl ControllerError {
     #[must_use]
     pub fn code(&self) -> ErrorCode {
         match self {
-            Self::RegistryUnavailable { .. } => ErrorCode::StorageUnavailable,
+            Self::RegistryUnavailable { .. } | Self::Storage { .. } => {
+                ErrorCode::StorageUnavailable
+            }
             Self::AlreadyRunning { .. } => ErrorCode::ResourceUnavailable,
             Self::SessionLimit { .. } => ErrorCode::SessionLimit,
             Self::Supervision { .. } => ErrorCode::ResourceUnavailable,

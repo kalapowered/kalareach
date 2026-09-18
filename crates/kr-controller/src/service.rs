@@ -1165,6 +1165,17 @@ impl Controller {
                     ));
                 }
             }
+            // A skill installation is the host's, not a session's, so its target names the
+            // environment and nothing else. A request that named a session here would be asking
+            // for an installation scoped to something installations do not have.
+            Method::AgentToolsInstall | Method::AgentToolsRemove => {
+                if mutation.target.session_id.as_ref().is_some() {
+                    return Err(ControllerError::InvalidArgument(
+                        "an installation belongs to this host, not to a session".to_owned(),
+                    ));
+                }
+                let _: kr_protocol::skill::AgentToolsParams = parse(&mutation.params)?;
+            }
             _ if crate::transfer::TransferModule::serves(method) => {
                 crate::transfer::TransferModule::check_subject(method, mutation)?;
             }
@@ -1480,6 +1491,7 @@ impl Controller {
             Method::HostDoctor => self.host_doctor().await,
             Method::SessionList => self.session_list(&request.params).await,
             Method::SessionRead => self.session_read(&request.params).await,
+            Method::AgentToolsStatus => self.agent_tools_status(&request.params),
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a read this daemon serves",
                 method.as_str()
@@ -1565,12 +1577,40 @@ impl Controller {
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
                 self.session_close(mutation, &actor, accepted).await
             }
+            Method::AgentToolsInstall | Method::AgentToolsRemove => {
+                self.agent_tools_change(method, &mutation.params)
+            }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
                 method.as_str()
             ))),
         };
         respond(mutation.request_id, outcome)
+    }
+
+    /// Reports what is installed for one agent.
+    fn agent_tools_status(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::skill::AgentToolsParams = parse(params)?;
+        encode(&self.installer()?.status(&params)?)
+    }
+
+    /// Installs or removes the contact skill for one agent.
+    fn agent_tools_change(&self, method: Method, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::skill::AgentToolsParams = parse(params)?;
+        let installer = self.installer()?;
+        match method {
+            Method::AgentToolsInstall => encode(&installer.install(&params)?),
+            Method::AgentToolsRemove => encode(&installer.remove(&params)?),
+            _ => Err(ControllerError::InvalidArgument(format!(
+                "{} is not an installation this daemon serves",
+                method.as_str()
+            ))),
+        }
+    }
+
+    /// Returns the installer, which keeps this host's record of what it wrote.
+    fn installer(&self) -> Result<crate::agent_tools::Installer> {
+        crate::agent_tools::Installer::discover(self.paths.state_dir())
     }
 
     async fn host_info(&self) -> Result<ParamsValue> {

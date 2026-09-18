@@ -11,6 +11,7 @@
 //!
 //! | Module | What it owns |
 //! | --- | --- |
+//! | [`agent_tools`] | Installing the contact skill for an agent, and undoing exactly what it wrote |
 //! | [`registry`] | Reservations, display-number allocation, worker records and closure tombstones |
 //! | [`singleton`] | The per-environment lock and the persistent generation |
 //! | [`supervision`] | Starting a worker through the platform's own service manager |
@@ -20,6 +21,7 @@
 //! | [`project`] | The environment's project service: repositories, workspaces and the restricted Git profile |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
+pub mod agent_tools;
 pub mod directory;
 pub mod error;
 pub mod project;

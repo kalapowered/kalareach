@@ -9,6 +9,9 @@
 //! | --- | --- |
 //! | [`cli`] | The command surface: the commands, their short forms and the standard options |
 //! | [`resolve`] | Finding a session by number or identifier, and reaching its worker |
+//! | [`contact`] | The contact tools an agent reaches its person through, over the Model Context Protocol |
+//! | [`question`] | Reading and answering an agent's questions from the terminal |
+//! | [`skill`] | Installing the contact skill and its tool configuration for an agent |
 //! | [`attach`] | Attaching a terminal, forwarding bytes, and the restoration guard |
 //! | [`session`] | Driving one attachment's input, output and connection in a single loop |
 //! | [`terminal`] | Raw mode, terminal size and the saved state the guard holds |
@@ -18,11 +21,14 @@
 
 pub mod attach;
 pub mod cli;
+pub mod contact;
 pub mod error;
 pub mod platform;
+pub mod question;
 pub mod report;
 pub mod resolve;
 pub mod session;
+pub mod skill;
 pub mod terminal;
 
 pub use crate::error::{CliError, Result};
