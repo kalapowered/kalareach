@@ -4387,6 +4387,7 @@ mod a_create_that_launches_nothing {
             worker_program: program,
             build_id: BuildId::new("kr-test/0").expect("a build identifier"),
             release: "0".to_owned(),
+            shell_packages: None,
         })
         .await
         .expect("the daemon starts");
@@ -5213,6 +5214,7 @@ mod a_close_a_worker_never_answers {
             worker_program: temp.root().join("kr-worker"),
             build_id: BuildId::new("kr-test/0").expect("a build identifier"),
             release: "0".to_owned(),
+            shell_packages: None,
         })
         .await
         .expect("the daemon starts");

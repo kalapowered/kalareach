@@ -277,7 +277,13 @@ async fn wired_with(mode: ShellMode, register: bool) -> Wired {
             Arc::new(SystemContinuousClock::new()),
         ));
     }
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts the runtime"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts the runtime"),
+    );
 
     let expectation = WorkerExpectation {
         session_id,
@@ -1079,7 +1085,13 @@ async fn a_stock_shell_session_claims_no_managed_editor() {
     );
     assert!(!ShellMode::NativeCompat.claims_managed_editor());
     assert!(ShellMode::Managed.claims_managed_editor());
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
     let _ = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed()).await;
 }
@@ -1119,6 +1131,7 @@ async fn a_managed_session_takes_no_input_before_its_bridge_has_authenticated() 
                 epoch,
                 sequence as u64,
                 bytes,
+                None,
                 std::time::Instant::now(),
             )
             .expect_err("refused before the bridge authenticated");
@@ -1140,7 +1153,13 @@ async fn a_managed_session_takes_no_input_before_its_bridge_has_authenticated() 
         "the recogniser is holding nothing, so no prefix is waiting on a timer"
     );
 
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
     runtime.close(ClosureReason::CloseRequested).1.release();
     let _ = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed()).await;
 }
@@ -1371,6 +1390,7 @@ async fn held_input_reaches_the_terminal_in_order_and_the_client_hears_why_it_wa
                 epoch,
                 sequence as u64,
                 bytes,
+                None,
                 std::time::Instant::now(),
             )
             .expect("accepted");
