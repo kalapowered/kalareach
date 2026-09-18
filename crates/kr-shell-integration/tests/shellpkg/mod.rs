@@ -193,6 +193,8 @@ pub struct Session {
     pub accepted: BridgeAccepted,
     pub prompt: String,
     stream: UnixStream,
+    /// True once the worker's end has gone, after which nothing is written or read.
+    closed: bool,
     pending: Vec<u8>,
     events: VecDeque<(RequestId, BridgeEvent)>,
     answers: HashMap<RequestId, BridgeAnswer>,
@@ -315,6 +317,7 @@ impl Session {
             accepted: placeholder_accept(session_id),
             prompt,
             stream,
+            closed: false,
             pending: Vec::new(),
             events: VecDeque::new(),
             answers: HashMap::new(),
@@ -395,6 +398,7 @@ impl Session {
 
     /// Sends several frames in one write, so the reader takes them off the endpoint together.
     pub fn write_frames(&mut self, frames: &[BridgeFrame]) {
+        assert!(!self.closed, "the endpoint has been closed");
         let mut bytes = Vec::new();
         for frame in frames {
             let body = kr_cbor::to_canonical_vec(frame).expect("a frame encodes");
@@ -426,6 +430,9 @@ impl Session {
     }
 
     fn read_frame(&mut self, within: Duration) -> Option<BridgeFrame> {
+        if self.closed {
+            return None;
+        }
         let deadline = Instant::now() + within;
         loop {
             if self.pending.len() >= 4 {
@@ -670,10 +677,14 @@ impl Session {
     }
 
     /// Ends the endpoint the way a worker that has gone would.
+    ///
+    /// Nothing is written or read afterwards: the worker is gone, and what the shell does from
+    /// here is what it does on its own.
     pub fn close_endpoint(&mut self) {
         self.stream
             .shutdown(std::net::Shutdown::Both)
             .expect("the endpoint closes");
+        self.closed = true;
     }
 }
 
