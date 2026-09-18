@@ -36,10 +36,16 @@
 //! ## What the system-call filter adds
 //!
 //! Landlock's rules are about TCP, and a filter reads scalar arguments while an address is behind a
-//! pointer, so nothing here could bound where a datagram goes. The answer is not to allow one: a
-//! **local** operation cannot create an internet socket at all, and a **remote** one can create only
-//! a stream socket, which is what every transport here uses and what Landlock's port rules govern.
-//! Neither may listen, and neither may open a raw or packet socket.
+//! pointer, so nothing here could bound where a datagram goes. The answer is not to allow one, and
+//! not to name the families to refuse either: a filter that named those would permit whatever it
+//! had not heard of, and the family that reaches the machine this one runs inside is exactly such a
+//! thing. A socket is made only of a family this boundary can account for. Two of them are
+//! accounted for whatever the operation is: the one that reaches this machine's own services by a
+//! path rather than an address, and the one a C library asks this kernel about its own addresses
+//! on. A **remote** operation adds the internet families, and on those the only socket is a stream
+//! socket, which is what every transport here uses and what Landlock's port rules govern; a
+//! **local** operation cannot make an internet socket at all. Nothing may listen, and the call that
+//! makes a pair of sockets is judged by the same families as the one that makes a single socket.
 //!
 //! A stream socket is not the same thing as the protocol the kernel's address rules are about, so
 //! the protocol is checked too: an internet stream socket is the one those rules bound, and a stream
@@ -348,6 +354,24 @@ const SYS_SOCKET: u32 = 198;
 /// The `listen` call's number on this instruction set.
 #[cfg(target_arch = "aarch64")]
 const SYS_LISTEN: u32 = 201;
+/// The `socketpair` call's number on this instruction set.
+///
+/// A pair of sockets is made with a family like any other socket, so it is judged by the same
+/// families rather than left to a call the family rules never see.
+#[cfg(target_arch = "x86_64")]
+const SYS_SOCKETPAIR: u32 = 53;
+/// The `socketpair` call's number on this instruction set.
+#[cfg(target_arch = "aarch64")]
+const SYS_SOCKETPAIR: u32 = 199;
+
+/// This filter reads the low half of each of the call's arguments, which is where the half that
+/// matters is on a machine that stores the low half first.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+const _: () = assert!(
+    cfg!(target_endian = "little"),
+    "this filter reads the low half of each argument at the argument's own offset, which is only \
+     where it is on a machine that stores the low half first"
+);
 
 /// Loads a word from the call this filter is judging.
 const LOAD: u16 = 0x20;
@@ -409,43 +433,52 @@ fn filter(remote: bool) -> Result<Vec<libc::sock_filter>> {
         instruction(ANSWER, 0, 0, REFUSED),
     ]);
     if remote {
-        // Nothing may listen, and the only socket an internet address can be reached through is a
-        // stream one, which is what every transport here uses and what Landlock's port rules
-        // govern. A datagram is the one thing nothing here could bound, so there is not one.
+        // Nothing may listen, and a socket is made only of a family this boundary can account for:
+        // the two that reach no machine but this one, and the internet ones, on which the only
+        // socket is a stream one of the protocol Landlock's port rules govern. Every other family
+        // is refused, a datagram among them, because nothing here could bound where one goes.
         program.extend([
             // Index 9: `listen` is refused outright.
-            instruction(COMPARE, 11, 0, SYS_LISTEN),
-            // 10: anything that is not `socket` is the ordinary work of running Git.
-            instruction(COMPARE, 0, 11, SYS_SOCKET),
-            // 11, 12: a packet socket is not something any transport needs.
+            instruction(COMPARE, 13, 0, SYS_LISTEN),
+            // 10, 11: the two calls that make a socket are judged alike; anything else is the
+            // ordinary work of running Git.
+            instruction(COMPARE, 1, 0, SYS_SOCKET),
+            instruction(COMPARE, 0, 12, SYS_SOCKETPAIR),
+            // 12, 13, 14: a socket that reaches this machine's own services by a path, and the one
+            // a C library asks this kernel about its own addresses on, reach no address.
             instruction(LOAD, 0, 0, FIRST_ARGUMENT),
-            instruction(COMPARE, 8, 0, libc::AF_PACKET as u32),
-            // 13, 14: a family that is not an internet one reaches this machine's own services and
-            // not an address, so it is left alone.
+            instruction(COMPARE, 10, 0, libc::AF_UNIX as u32),
+            instruction(COMPARE, 9, 0, libc::AF_NETLINK as u32),
+            // 15, 16: an internet family is the one the rules below are about, and a family this
+            // filter does not name is refused rather than left alone.
             instruction(COMPARE, 1, 0, libc::AF_INET as u32),
-            instruction(COMPARE, 0, 7, libc::AF_INET6 as u32),
-            // 15, 16, 17: an internet socket is a stream one, whatever flags travel beside its kind.
+            instruction(COMPARE, 0, 6, libc::AF_INET6 as u32),
+            // 17, 18, 19: an internet socket is a stream one, whatever flags travel beside its kind.
             instruction(LOAD, 0, 0, SECOND_ARGUMENT),
             instruction(MASK, 0, 0, KIND),
             instruction(COMPARE, 0, 3, libc::SOCK_STREAM as u32),
-            // 18, 19, 20: and its protocol is the one the kernel's own address rules are about.
+            // 20, 21, 22: and its protocol is the one the kernel's own address rules are about.
             // A stream socket of another protocol is a stream socket those rules say nothing about.
             instruction(LOAD, 0, 0, THIRD_ARGUMENT),
             instruction(COMPARE, 2, 0, 0),
             instruction(COMPARE, 1, 0, libc::IPPROTO_TCP as u32),
-            // 21, 22.
+            // 23, 24.
             instruction(ANSWER, 0, 0, REFUSED),
             instruction(ANSWER, 0, 0, PERMITTED),
         ]);
     } else {
-        // No internet socket at all, and nothing may listen.
+        // No internet socket at all, and nothing may listen: a local operation reaches this
+        // machine's own services and this kernel, and no address anywhere.
         program.extend([
+            // Index 9: `listen`. 10, 11: the two calls that make a socket.
             instruction(COMPARE, 5, 0, SYS_LISTEN),
-            instruction(COMPARE, 0, 5, SYS_SOCKET),
+            instruction(COMPARE, 1, 0, SYS_SOCKET),
+            instruction(COMPARE, 0, 4, SYS_SOCKETPAIR),
+            // 12, 13, 14: the two families that reach no machine but this one, and nothing else.
             instruction(LOAD, 0, 0, FIRST_ARGUMENT),
-            instruction(COMPARE, 2, 0, libc::AF_INET as u32),
-            instruction(COMPARE, 1, 0, libc::AF_INET6 as u32),
-            instruction(COMPARE, 0, 1, libc::AF_PACKET as u32),
+            instruction(COMPARE, 2, 0, libc::AF_UNIX as u32),
+            instruction(COMPARE, 1, 0, libc::AF_NETLINK as u32),
+            // 15, 16.
             instruction(ANSWER, 0, 0, REFUSED),
             instruction(ANSWER, 0, 0, PERMITTED),
         ]);
@@ -548,19 +581,40 @@ mod tests {
     #[test]
     fn a_local_invocation_cannot_make_an_internet_socket_or_listen() {
         let program = filter(false).expect("a filter for this machine");
-        for family in [libc::AF_INET, libc::AF_INET6, libc::AF_PACKET] {
+        // An internet family, a packet one, and the family that reaches the machine this one runs
+        // inside: none of them is a family a local operation has any business in.
+        for family in [
+            libc::AF_INET,
+            libc::AF_INET6,
+            libc::AF_PACKET,
+            libc::AF_VSOCK,
+            libc::AF_BLUETOOTH,
+        ] {
             assert_eq!(
                 judge(&program, call(SYS_SOCKET, family as u32, 1)),
                 REFUSED,
                 "a local operation makes no socket of family {family}"
             );
+            assert_eq!(
+                judge(&program, call(SYS_SOCKETPAIR, family as u32, 1)),
+                REFUSED,
+                "a local operation makes no pair of sockets of family {family}"
+            );
         }
         assert_eq!(judge(&program, call(SYS_LISTEN, 0, 0)), REFUSED);
-        // A local socket is how this machine's own services are reached, and it is not a network.
-        assert_eq!(
-            judge(&program, call(SYS_SOCKET, libc::AF_UNIX as u32, 1)),
-            PERMITTED
-        );
+        // A local socket is how this machine's own services are reached, and it is not a network;
+        // the kernel answers a C library's questions about this machine's addresses on the other.
+        for family in [libc::AF_UNIX, libc::AF_NETLINK] {
+            assert_eq!(
+                judge(&program, call(SYS_SOCKET, family as u32, 1)),
+                PERMITTED,
+                "a local operation reaches this machine on family {family}"
+            );
+            assert_eq!(
+                judge(&program, call(SYS_SOCKETPAIR, family as u32, 1)),
+                PERMITTED
+            );
+        }
         // Everything else is the ordinary work of running Git.
         assert_eq!(judge(&program, call(1, 0, 0)), PERMITTED);
     }
@@ -591,11 +645,42 @@ mod tests {
             ),
             REFUSED
         );
-        // This machine's own services are reached through a socket that has no address at all.
+        // This machine's own services are reached through a socket that has no address at all, and
+        // the kernel answers a C library's questions about this machine's addresses on the other.
+        for family in [libc::AF_UNIX, libc::AF_NETLINK] {
+            assert_eq!(
+                judge(
+                    &program,
+                    call(SYS_SOCKET, family as u32, libc::SOCK_STREAM as u32)
+                ),
+                PERMITTED,
+                "a remote operation reaches this machine on family {family}"
+            );
+        }
+        // A family this filter does not name is refused rather than left alone, whichever call
+        // makes it: the machine this one runs inside is reached on a stream socket whose ports
+        // have nothing to do with the ports a remote operation is bounded to.
+        for family in [libc::AF_VSOCK, libc::AF_BLUETOOTH, libc::AF_ALG] {
+            for number in [SYS_SOCKET, SYS_SOCKETPAIR] {
+                assert_eq!(
+                    judge(
+                        &program,
+                        call(number, family as u32, libc::SOCK_STREAM as u32)
+                    ),
+                    REFUSED,
+                    "a remote operation makes no socket of family {family}"
+                );
+            }
+        }
+        // A pair of sockets is judged by the same families as a single one.
         assert_eq!(
             judge(
                 &program,
-                call(SYS_SOCKET, libc::AF_UNIX as u32, libc::SOCK_STREAM as u32)
+                call(
+                    SYS_SOCKETPAIR,
+                    libc::AF_UNIX as u32,
+                    libc::SOCK_STREAM as u32
+                )
             ),
             PERMITTED
         );
@@ -673,6 +758,36 @@ mod tests {
                 PERMITTED
             );
         }
+    }
+
+    /// The walk above reads the call through the same constants the program does, so a constant
+    /// that named the wrong place would agree with itself. These are checked against the structure
+    /// the kernel hands a filter and the numbers this machine's C library holds.
+    #[test]
+    fn the_filter_reads_the_call_where_the_kernel_puts_it() {
+        use std::mem::offset_of;
+
+        assert_eq!(
+            usize::try_from(NUMBER),
+            Ok(offset_of!(libc::seccomp_data, nr))
+        );
+        assert_eq!(
+            usize::try_from(MACHINE),
+            Ok(offset_of!(libc::seccomp_data, arch))
+        );
+        let arguments = offset_of!(libc::seccomp_data, args);
+        assert_eq!(usize::try_from(FIRST_ARGUMENT), Ok(arguments));
+        assert_eq!(usize::try_from(SECOND_ARGUMENT), Ok(arguments + 8));
+        assert_eq!(usize::try_from(THIRD_ARGUMENT), Ok(arguments + 16));
+
+        assert_eq!(Ok(SYS_SOCKET), u32::try_from(libc::SYS_socket));
+        assert_eq!(Ok(SYS_SOCKETPAIR), u32::try_from(libc::SYS_socketpair));
+        assert_eq!(Ok(SYS_LISTEN), u32::try_from(libc::SYS_listen));
+        assert_eq!(Ok(SYS_QUEUED_WORK), u32::try_from(libc::SYS_io_uring_setup));
+        assert_eq!(
+            Ok(SYS_QUEUED_WORK_LAST),
+            u32::try_from(libc::SYS_io_uring_register)
+        );
     }
 
     #[test]
