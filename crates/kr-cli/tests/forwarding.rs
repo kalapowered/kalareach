@@ -87,6 +87,11 @@ fn kr() -> std::path::PathBuf {
 }
 
 async fn hosted(script: &str) -> Hosted {
+    // Before the application starts, not between its start and the attachment. Copying the command
+    // binaries and running each once happens once per test process, and a test that paid it after
+    // its own session had begun would be letting the application run while nothing was attached.
+    // What such a test then sees in its first screen is output it expected to watch arrive.
+    let _ = command_binaries();
     let temp = kr_ipc::testing::TempHost::create();
     let environment = temp.environment();
     let environment_id = temp.environment_id();
