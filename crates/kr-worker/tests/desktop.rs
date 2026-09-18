@@ -622,7 +622,11 @@ async fn a_desktop_bound_session_closes_with_desktop_lost_when_its_login_ends() 
     };
     let mut session = Session::open(config).expect("opens");
     session.launch().expect("launches");
-    let runtime = SessionRuntime::start(session).expect("starts");
+    let runtime = SessionRuntime::start(
+        session,
+        std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+    )
+    .expect("starts");
 
     let record = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed())
         .await
