@@ -11,9 +11,12 @@ use std::time::Duration;
 
 use iroh::{Endpoint, EndpointAddr};
 use kr_client::cursors::{Restoration, RestorationStep};
+use kr_client::drafts::{
+    Associations, DraftSealer, DraftStore, DraftSync, DraftTarget, Published, draft_collection,
+};
 use kr_client::error::ClientError;
 use kr_client::retry::{Recovery, RequestClass, UserAction};
-use kr_client::services::{NullService, RelayLeaseService, ServiceClients};
+use kr_client::services::{NullService, RelayLeaseService, ServiceClients, SyncBackupService};
 use kr_client::session::Session;
 use kr_client::transport::NetworkTransport;
 use kr_crypto::connect::{ChallengeLedger, PairedPeer};
@@ -23,13 +26,14 @@ use kr_protocol::envelope::{
 };
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
-    AttachmentId, BootEpoch, BuildId, ClockEpoch, DeviceId, DeviceKeyRevision, EnvironmentId,
-    EventSequence, EventType, SessionId, StreamId,
+    AgentBindingRevision, ApplicationInstanceId, AttachmentId, BootEpoch, BuildId, ClockEpoch,
+    DeviceId, DeviceKeyRevision, EnvironmentId, EventSequence, EventType, SessionId, StreamId,
 };
 use kr_protocol::method::Method;
 use kr_protocol::receipt::{Receipt, ReceiptState};
 use kr_protocol::recovery::EventStream;
 use kr_protocol::scalars::{Digest256, DurationMs, EndpointKey, Nullable, TimestampMs, U64, Uuid};
+use kr_protocol::transfer::DraftState;
 use kr_transport::clock::{ContinuousClock, ManualClock};
 use kr_transport::config::EndpointConfig;
 use kr_transport::handshake::{self, Admitted, HostEpochs, LocalIdentity, PairedDirectory};
@@ -872,6 +876,189 @@ async fn an_unknown_outcome_is_never_retried_and_names_the_action_to_ask_about()
     assert_eq!(submitted.len(), 1);
     assert_eq!(submitted[0].action_id, script.actions.lock().await[0]);
 
+    session.close();
+    serving.abort();
+}
+
+/// A synchronisation service that holds one generation and one object per collection.
+///
+/// It is the service's half of section 20's compare and swap, and nothing else: it stores opaque
+/// bytes, refuses a write whose expected generation is not the one it holds, and never decides
+/// which of two writers was right.
+#[derive(Debug, Default)]
+struct RemoteObjects {
+    objects: Mutex<std::collections::HashMap<String, (u64, Vec<u8>)>>,
+}
+
+impl kr_client::services::SyncBackupService for RemoteObjects {
+    fn compare_exchange<'a>(
+        &'a self,
+        collection: &'a str,
+        expected_generation: u64,
+        ciphertext: &'a [u8],
+    ) -> kr_client::services::ServiceFuture<'a, u64> {
+        Box::pin(async move {
+            let mut objects = self.objects.lock().await;
+            let current = objects
+                .get(collection)
+                .map_or(0, |(generation, _)| *generation);
+            if current != expected_generation {
+                return Err(ClientError::Host(ProtocolError::new(
+                    ErrorCode::DraftConflict,
+                    "another writer got there first",
+                )));
+            }
+            let next = current + 1;
+            objects.insert(collection.to_owned(), (next, ciphertext.to_vec()));
+            Ok(next)
+        })
+    }
+
+    fn fetch<'a>(&'a self, collection: &'a str) -> kr_client::services::ServiceFuture<'a, Vec<u8>> {
+        Box::pin(async move {
+            self.objects
+                .lock()
+                .await
+                .get(collection)
+                .map(|(_, ciphertext)| ciphertext.clone())
+                .ok_or_else(|| {
+                    ClientError::Host(ProtocolError::new(
+                        ErrorCode::InvalidArgument,
+                        "no such object",
+                    ))
+                })
+        })
+    }
+}
+
+/// A stand-in for a device's own sealing, so the test exercises the seam rather than a cipher.
+///
+/// It is not encryption and does not pretend to be: what it establishes is that the service only
+/// ever sees bytes this device transformed, and that the same device reads them back.
+#[derive(Debug)]
+struct ReversingSealer;
+
+impl DraftSealer for ReversingSealer {
+    fn seal(&self, plaintext: &[u8]) -> kr_client::Result<Vec<u8>> {
+        Ok(plaintext.iter().rev().copied().collect())
+    }
+
+    fn open(&self, ciphertext: &[u8]) -> kr_client::Result<Vec<u8>> {
+        Ok(ciphertext.iter().rev().copied().collect())
+    }
+}
+
+#[tokio::test]
+async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_write() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+
+    let directory = tempfile::tempdir().expect("a directory");
+    let device = DeviceId::new(Uuid::from_bytes([2; 16]));
+    let store = DraftStore::open(directory.path().join("mine"), device).expect("a store");
+    let session_id = SessionId::new(Uuid::from_bytes([3; 16]));
+    let target = DraftTarget::session(session_id).in_application(
+        ApplicationInstanceId::new(Uuid::from_bytes([4; 16])),
+        AgentBindingRevision::new(1),
+    );
+    let draft = store
+        .create(
+            target.clone(),
+            "the message I have not sent".to_owned(),
+            TimestampMs::new(1),
+        )
+        .expect("a draft");
+
+    // A connection, and an attachment presenting the draft.
+    let session = connect(&client, &host).await;
+    let mut associations = Associations::new();
+    let first = AttachmentId::new(Uuid::from_bytes([11; 16]));
+    associations.bind(draft.draft_id, first);
+
+    // The attachment is replaced. The association moves; the draft does not.
+    let second = AttachmentId::new(Uuid::from_bytes([12; 16]));
+    assert_eq!(associations.bind(draft.draft_id, second), Some(first));
+    assert_eq!(store.load(draft.draft_id).expect("the draft"), draft);
+
+    // The connection goes. Every association goes with it, and the draft is untouched on disk.
+    session.close();
+    associations.connection_lost();
+    assert!(associations.is_empty());
+    assert_eq!(store.load(draft.draft_id).expect("the draft"), draft);
+
+    // The same device reconnects and binds the draft to a new attachment. Nothing is submitted.
+    let session = connect(&client, &host).await;
+    let third = AttachmentId::new(Uuid::from_bytes([13; 16]));
+    assert_eq!(associations.bind(draft.draft_id, third), None);
+    let mut rebound = store.load(draft.draft_id).expect("the draft");
+    assert_eq!(rebound.rebind(Some(&target)), DraftState::Open);
+    assert_eq!(rebound, draft, "a rebind changes nothing about the draft");
+    assert!(
+        script.actions.lock().await.is_empty(),
+        "no action reached the host: a draft is submitted by a person, not by a reconnect"
+    );
+
+    // Another device wrote to the shared object first. This device's write loses the comparison.
+    let remote_store = DraftStore::open(
+        directory.path().join("theirs"),
+        DeviceId::new(Uuid::from_bytes([9; 16])),
+    )
+    .expect("a store");
+    let theirs = remote_store
+        .create(
+            target.clone(),
+            "what the other device had".to_owned(),
+            TimestampMs::new(2),
+        )
+        .expect("a draft");
+    let service = Arc::new(RemoteObjects::default());
+    let sealer = ReversingSealer;
+    let sealed = sealer
+        .seal(&DraftStore::encode(&theirs).expect("canonical bytes"))
+        .expect("sealed");
+    service
+        .compare_exchange(&draft_collection(draft.draft_id), 0, &sealed)
+        .await
+        .expect("the other device's write");
+
+    let sync = DraftSync::new(Arc::clone(&service) as Arc<_>, Arc::new(ReversingSealer));
+    let published = sync
+        .publish(&store, &draft, TimestampMs::new(3))
+        .await
+        .expect("an answer");
+    let Published::Conflicted {
+        copy,
+        current_revision,
+    } = published
+    else {
+        panic!("this device was overtaken: {published:?}");
+    };
+    assert_eq!(current_revision, theirs.revision);
+
+    // The person's own draft is exactly as it was, and the other device's content is beside it.
+    assert_eq!(store.load(draft.draft_id).expect("the draft"), draft);
+    let kept = store.load(copy).expect("the copy");
+    assert_eq!(kept.text, "what the other device had");
+    assert_eq!(kept.conflict_of, Nullable::some(draft.draft_id));
+    assert_ne!(kept.draft_id, draft.draft_id);
+    assert_eq!(store.list().expect("a listing").len(), 2);
+
+    // A publication that is not overtaken is accepted at the revision it named.
+    let fresh = store
+        .create(target, "a second draft".to_owned(), TimestampMs::new(4))
+        .expect("a draft");
+    assert_eq!(
+        sync.publish(&store, &fresh, TimestampMs::new(5))
+            .await
+            .expect("an answer"),
+        Published::Accepted {
+            revision: fresh.revision
+        }
+    );
+
+    assert!(script.actions.lock().await.is_empty());
     session.close();
     serving.abort();
 }

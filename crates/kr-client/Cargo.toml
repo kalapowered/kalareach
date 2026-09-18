@@ -24,6 +24,8 @@ tracing.workspace = true
 
 [dev-dependencies]
 iroh = { workspace = true, features = ["test-utils"] }
+# The draft store writes to a caller-supplied directory, so its tests supply a disposable one.
+tempfile.workspace = true
 
 [lints]
 workspace = true

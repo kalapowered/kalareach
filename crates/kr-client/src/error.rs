@@ -91,6 +91,12 @@ pub enum ClientError {
     /// No implementation of a managed service is configured.
     #[error("no managed service is configured for {0}")]
     ServiceNotConfigured(&'static str),
+    /// This device's draft store refused.
+    ///
+    /// Boxed because it carries a path and an operating-system failure, which would otherwise make
+    /// every client failure as large as the largest one.
+    #[error("{0}")]
+    Draft(Box<crate::drafts::DraftError>),
 }
 
 impl ClientError {
@@ -110,6 +116,7 @@ impl ClientError {
             Self::SubmissionUncertain { .. } => ErrorCode::OutcomeUnknown,
             Self::ResyncRequired => ErrorCode::ResyncRequired,
             Self::ServiceNotConfigured(_) => ErrorCode::HostNotConfigured,
+            Self::Draft(error) => error.code(),
         }
     }
 
