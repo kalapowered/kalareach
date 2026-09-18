@@ -41,6 +41,23 @@ Without a terminal and without a flag the command stops and asks for one, rather
 the creating terminal's size is registered before the shell starts, so the first prompt is drawn at
 the real geometry. An invisible session starts at 120x40.
 
+`--palette` chooses the colours the session starts with, and creation is the only moment it can be
+chosen: afterwards the palette is the session's own, and an attachment joining from a differently
+themed terminal is shown what the session has rather than what it has itself.
+
+| Value | What the session records |
+| --- | --- |
+| `light` | The light preset |
+| `dark` | The dark preset |
+| `probe` | This terminal's own default foreground and background, as a client preference |
+| absent | The profile default |
+
+`probe` asks this terminal through the same bounded exchange an attach uses: one second for the
+whole of it, the replies never reach an application, and what the person typed around them comes
+back. A terminal that does not report both colours has shared no palette, and the command says so
+rather than recording a provenance nothing measured. `--invisible --palette probe` is refused for
+the same reason: there is no terminal to ask.
+
 ### Shell mode
 
 This host implements the explicitly selected `native_compat` mode: the stock shell you name, run as
@@ -80,6 +97,19 @@ built to do and this one must not:
 | Turns the wheel | the mouse report their terminal produced, never an arrow key |
 | Clicks or drags | the mouse report, in whichever protocol the application enabled |
 | Moves the window's focus | a focus event, and only while this attachment holds the input lease |
+
+Shift and Page Up, and Shift and Page Down, are the exception, and they are not input: they move
+the window this terminal is looking through and never reach the session. The command reports the
+new position through `attachment.viewport`, the host installs the pages that cover it, and the
+input lease does not move — section 8 puts passive scrollback among the things that never seize it,
+so a terminal that may not type can still read what is above the live page. A step is one window
+less the line that joins the two pages. An unshifted Page Up is the application's, as it always
+was.
+
+A window stays where the person put it while the session goes on writing underneath. `--follow-live`
+brings it back to the live screen as soon as the session writes something, for a person who would
+rather not be left behind; it is this command's own choice and nothing on the wire follows or does
+not follow.
 
 A terminal that may not type at all is told so once, on standard error, and goes on watching. That
 is what happens under `--no-probe`: the host checks that a controller can supply the encoding the

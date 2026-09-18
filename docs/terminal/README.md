@@ -597,6 +597,37 @@ carry its own cutoff. A client that has not received a
 page with `more` cleared does not hold a whole screen and does not draw one: mixing live output with
 an incomplete repaint is the thing the paging exists to prevent.
 
+### Looking above the live page
+
+A client reads its scrollback through the report it already makes about its window. `attachment.
+viewport` carries a `position` beside the physical dimensions: `{"row": …}`, a stable identifier
+from the pages the client holds, or `{"above": …}`, how many rows above the live screen's first row
+the window starts. No position at all is the live screen, which is where every attachment starts.
+There is no history method; section 23's table is closed.
+
+An `above` distance is resolved once, against the live screen as it stands at the moment of the
+report, and the answer says which row the window landed on. That is what a client keeps: a distance
+would slide away from what the person is reading as soon as the application printed another line,
+while a row identifier stays over the same text.
+
+The host then installs the pages that cover the window, through the subscription the client already
+holds and charged to its own send queue: the same reset, header and bounded pages a live screen
+arrives as, and the same refusal for a queue too small to carry the smallest of them. The rows come
+from the retained rows the session still holds, a bounded run at a time, so a window above the live
+page costs what a window on it costs.
+
+A window that names a row the session has given up is answered with the oldest row there is, and
+its pages carry that cutoff and the eviction marker. It is never an error: the rows are gone, and
+saying so is the answer. While the window stays above the live page it does not move, because the
+rows it holds keep their identifiers however much the application writes; the one thing that moves
+it is the session giving up rows below it, and that installs the window again with
+`history_evicted` as the reason rather than sending an update naming rows the client has dropped.
+
+Live output goes on arriving the whole time. A client parked in its history is still sent every
+bounded update, and what it draws is its own decision. Moving the window is not input: section 8
+puts passive scrollback with focus events and terminal replies among the things that never seize
+the input lease, and nothing on this path touches it.
+
 Ordinary output is one delta per batch, and never a repaint. A row larger than a page bound is cut
 and marked truncated rather than dropped, so a reader can get past it, and the marker is what makes
 the degradation explicit rather than a short row that looks like the application's.
@@ -1040,6 +1071,20 @@ can say where the colours it is drawing came from. It is fixed at creation: the 
 before the session has produced anything, and an attachment joining later is shown the session's
 palette rather than its own. Attachment succession therefore changes neither the colours nor their
 source, and a second attachment from a differently themed terminal is shown what the first one was.
+
+`session.create` is where the choice is made. Its `palette` field names either a preset,
+`{"preset": "light"}` or `{"preset": "dark"}`, or the colours a client learned from its own bounded
+probe of the terminal the person is sitting at, `{"probe": {"foreground": …, "background": …}}`. A
+request that names nothing takes the profile default. The host carries the field to the worker in
+the launch specification and applies it between opening the session and starting its shell, which
+is the only moment it can be applied honestly: the first byte the shell writes is already a screen
+somebody could be looking at, and a palette chosen then would be a change rather than a provenance.
+
+An invisible creation cannot name probed colours. It has no terminal, so a provenance recorded as a
+client's measurement would be a measurement nobody took; the host refuses it with
+`INVALID_ARGUMENT` before it reserves anything, and such a session selects a preset instead. After
+creation this path is closed: only `terminal.palette.set`, with its own explicit right, moves a
+session's palette, and that change is a terminal mutation that broadcasts the new canonical state.
 
 ## Diagnostics
 
