@@ -54,8 +54,8 @@ kr-client.workspace = true
 # tests, so the two crates do not depend on each other at build time.
 kr-controller.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
-# The committed time fixture is JSON, because it records what three operating systems report and a
-# person reads it beside their own machine's answer.
+# The committed time fixture is JSON, and so is the shell package manifest the host tests describe:
+# one records what three operating systems report, the other an installation of their own.
 serde_json.workspace = true
 # What an earlier build of this host wrote is a stored shape, so the tests that prove a journal
 # migrates and that retention keeps what it must write those rows themselves.

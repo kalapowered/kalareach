@@ -38,6 +38,8 @@ struct Host {
     temp: kr_ipc::testing::TempHost,
     worker: PathBuf,
     environment_id: EnvironmentId,
+    /// Where this daemon looks for qualified shell packages, when a test gives it an installation.
+    shell_packages: Option<PathBuf>,
 }
 
 impl Host {
@@ -53,7 +55,48 @@ impl Host {
             temp,
             worker,
             environment_id,
+            shell_packages: None,
         }
+    }
+
+    /// Installs a qualified Zsh package and tells the daemon where it is.
+    ///
+    /// The daemon is told; the worker it launches is not, and a worker resolves its own package
+    /// from its own environment. A managed create is therefore admitted here and refused there,
+    /// which is the only way to make a worker start, claim its reservation and then report that it
+    /// cannot serve what it was asked for.
+    fn with_shell_package(mut self) -> Self {
+        use kr_shell_integration::contract::qualification::ShellKind;
+        use kr_shell_integration::host::package::{MANIFEST_BASENAME, PackageManifest};
+
+        let root = self.temp.root().join("packages");
+        let directory = root.join(ShellKind::Zsh.as_str()).join("identity-1");
+        std::fs::create_dir_all(directory.join("bin")).expect("creates the package");
+        std::fs::copy("/bin/cat", directory.join("bin/shell")).expect("copies a program");
+        std::fs::create_dir_all(directory.join("share")).expect("creates the entry directory");
+        std::fs::write(
+            directory.join("share/entry"),
+            b"# the package's own entry\n",
+        )
+        .expect("writes the entry");
+        let manifest = PackageManifest {
+            shell: ShellKind::Zsh,
+            executable: "bin/shell".to_owned(),
+            upstream_version: "5.9".to_owned(),
+            editor_abi: "zle-5.9".to_owned(),
+            integration_version: "1".to_owned(),
+            interactive_flags: vec!["-l".to_owned(), "-i".to_owned()],
+            patches: Vec::new(),
+            modules: Vec::new(),
+            startup_entry: "share/entry".to_owned(),
+        };
+        std::fs::write(
+            directory.join(MANIFEST_BASENAME),
+            serde_json::to_string(&manifest).expect("encodes"),
+        )
+        .expect("writes the manifest");
+        self.shell_packages = Some(root);
+        self
     }
 
     fn paths(&self) -> kr_ipc::paths::EnvironmentPaths {
@@ -82,7 +125,7 @@ impl Host {
                 worker_program: self.worker.clone(),
                 build_id: build(),
                 release: "0".to_owned(),
-                shell_packages: None,
+                shell_packages: self.shell_packages.clone(),
             })
             .await;
             match outcome {
@@ -373,15 +416,17 @@ async fn a_daemon_restart_keeps_the_session_and_its_shell() {
 /// host prepared for it goes back.
 ///
 /// Managed shell mode is the one thing a worker can be asked for and refuse before it has a
-/// session: it needs a qualified shell package, and this host launches the stock shell. So the
-/// worker starts, claims its reservation, says it cannot go on, and exits.
+/// session: it needs a qualified shell package resolved from its own environment. The daemon is
+/// told where this installation's packages are, so the create is admitted; the worker is not, so it
+/// starts, claims its reservation, says it cannot go on, and exits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_worker_that_reports_it_could_not_start_leaves_no_directory() {
-    let host = Host::create();
+    let host = Host::create().with_shell_package();
     let _controller = host.start().await;
     let mut client = host.client().await;
     let mut params = create_params(host.environment_id, host.temp.root());
     params.shell_mode = ShellMode::Managed;
+    params.shell = Nullable::some("zsh".to_owned());
 
     let refused = client
         .mutate(
