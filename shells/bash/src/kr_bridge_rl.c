@@ -277,7 +277,11 @@ kr_shell_cancel_key_wait (kr_cancellation *out)
 void
 kr_rl_cancel_observed (void)
 {
+  /* The read that the cancellation ended has returned, so the reader is out of whatever it was in
+     and the endpoint can be read again. */
   kr_cancel_requested = 0;
+  kr_gathering = 0;
+  kr_bridge_cancel_settled ();
   /* The reader's queues have changed, so the next wait reports itself idle again and the worker
      gets its retry point. */
   kr_idle_reported = 0;
@@ -357,7 +361,10 @@ kr_rl_setup (void)
 void
 kr_rl_key_taken (void)
 {
-  /* The reader has a key, so the next wait is a fresh chance to be idle. */
+  /* The reader has a key, so it is not filling its own buffer and the next wait is a fresh chance
+     to be idle. Clearing the guard here is what keeps a gather that a signal cut short from
+     leaving the mailbox unread. */
+  kr_gathering = 0;
   kr_idle_reported = 0;
 }
 
@@ -394,6 +401,7 @@ kr_rl_enter (void)
   kr_buffer_revision++;
   kr_installed_chars = 0;
   kr_cancel_requested = 0;
+  kr_gathering = 0;
   kr_pending_quoted = kr_pending_paste_open = 0;
   kr_idle_reported = 0;
   kr_last_source = KR_SOURCE_TERMINAL;

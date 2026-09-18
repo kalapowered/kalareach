@@ -479,9 +479,12 @@ kr_zle_wait(void)
     kr_bridge_service();
     kr_in_key_wait = 0;
     if (kr_cancel_requested) {
+        /* The wait is over, so the reader is out of whatever the cancellation ended and the
+         * endpoint can be read again. */
         kr_cancel_requested = 0;
         kr_cancel_consumed = 1;
         kr_idle_reported = 0;
+        kr_bridge_cancel_settled();
         return 1;
     }
     return done != 0;
@@ -496,6 +499,9 @@ kr_zle_fd(void)
 void
 kr_zle_pass_end(void)
 {
+    if (kr_cancel_consumed) {
+        kr_bridge_cancel_settled();
+    }
     kr_cancel_consumed = 0;
     /* Whatever the pass did, the reader's queues may have changed, so the next wait reports
      * itself idle again and the worker gets its retry point. */

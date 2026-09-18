@@ -104,6 +104,10 @@ int kr_cbor_get(const kr_cbor_doc *doc, int index, const char *key);
 /* Returns the item at `position` of the array at `index`, or -1. */
 int kr_cbor_at(const kr_cbor_doc *doc, int index, size_t position);
 
+/* Walks a collection's items once: the first, then each next one, or -1. */
+int kr_cbor_first(const kr_cbor_doc *doc, int index);
+int kr_cbor_next(const kr_cbor_doc *doc, int index);
+
 /* Returns the single entry of an externally tagged variant, and names it. */
 int kr_cbor_variant_of(const kr_cbor_doc *doc, int index, const char **name, size_t *name_len);
 

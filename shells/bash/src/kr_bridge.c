@@ -50,6 +50,8 @@
 #define KR_HINT_MAX 256
 #define KR_HANDSHAKE_WAIT_MS 2000
 #define KR_REVOKED_MAX 64
+/* How many separate reads' arrival times are remembered for the bytes still buffered. */
+#define KR_MARKS_MAX 16
 /* What may wait to go out before the endpoint is treated as gone. */
 #define KR_OUT_MAX (4u * 1024u * 1024u)
 #define KR_FRAME_HEADER 4
@@ -121,11 +123,22 @@ static struct {
     size_t revoked_count;
     size_t revoked_next;
 
-    /* Set when the batch must stop: a cancellation has to unwind before anything else is read. */
-    int pause_dispatch;
+    /* Set while a cancellation this bridge asked for has not yet unwound the reader. Nothing else
+     * is read or answered until it has, so a fence that follows sees what the reader has. */
+    int cancel_in_flight;
 
     unsigned long long event_counter;
-    /* When the frame being handled came off the endpoint, on this reader's own clock. */
+    /*
+     * When each stretch of buffered input came off the endpoint, on this reader's own clock.
+     *
+     * A frame that waited in the buffer for its remaining bytes keeps its own arrival time, and a
+     * request that arrived with those bytes is not charged for the wait.
+     */
+    struct {
+        size_t ends_at;
+        unsigned long long at_ms;
+    } marks[KR_MARKS_MAX];
+    size_t mark_count;
     unsigned long long frame_at_ms;
 } kr = {
     /* Not connected. Static storage starts at zero, which is a descriptor. */
@@ -358,12 +371,15 @@ kr_fill(void)
         }
         taken = read(kr.fd, kr.in + kr.in_len, kr.in_capacity - kr.in_len);
         if (taken > 0) {
-            if (kr.in_len == 0) {
-                /* The reader's own clock for everything this read brought in, so a request that
-                 * waited behind an earlier frame is not credited with that time. */
-                kr.frame_at_ms = kr_now_ms();
-            }
             kr.in_len += (size_t)taken;
+            /* Mark where this read reached, with the time it reached it. */
+            if (kr.mark_count < KR_MARKS_MAX) {
+                kr.marks[kr.mark_count].ends_at = kr.in_len;
+                kr.marks[kr.mark_count].at_ms = kr_now_ms();
+                kr.mark_count++;
+            } else {
+                kr.marks[KR_MARKS_MAX - 1].ends_at = kr.in_len;
+            }
             continue;
         }
         if (taken == 0) {
@@ -403,12 +419,38 @@ kr_take_frame(const unsigned char **frame)
     return (size_t)length;
 }
 
+/* The time the read that completed a frame of `length` bytes happened. */
+static unsigned long long
+kr_frame_arrival(size_t length)
+{
+    size_t total = KR_FRAME_HEADER + length;
+    size_t i;
+
+    for (i = 0; i < kr.mark_count; i++) {
+        if (kr.marks[i].ends_at >= total) {
+            return kr.marks[i].at_ms;
+        }
+    }
+    return kr_now_ms();
+}
+
 static void
 kr_drop_frame(size_t length)
 {
     size_t total = KR_FRAME_HEADER + length;
+    size_t kept = 0;
+    size_t i;
+
     memmove(kr.in, kr.in + total, kr.in_len - total);
     kr.in_len -= total;
+    for (i = 0; i < kr.mark_count; i++) {
+        if (kr.marks[i].ends_at > total) {
+            kr.marks[kept].ends_at = kr.marks[i].ends_at - total;
+            kr.marks[kept].at_ms = kr.marks[i].at_ms;
+            kept++;
+        }
+    }
+    kr.mark_count = kept;
 }
 
 /* ---- writing the contract's own shapes ------------------------------------------------------- */
@@ -872,6 +914,12 @@ int
 kr_bridge_wants_write(void)
 {
     return kr.registered && kr.out_len > 0;
+}
+
+void
+kr_bridge_cancel_settled(void)
+{
+    kr.cancel_in_flight = 0;
 }
 
 int
@@ -1340,7 +1388,7 @@ kr_launch_text(const kr_cbor_doc *doc, int command, size_t *length)
     char *text = NULL;
     size_t used = 0;
     size_t capacity = 0;
-    size_t i;
+    int item;
 
     if (payload < 0) {
         return NULL;
@@ -1362,14 +1410,13 @@ kr_launch_text(const kr_cbor_doc *doc, int command, size_t *length)
         doc->values[payload].kind != KR_CBOR_ARRAY) {
         return NULL;
     }
-    for (i = 0; i < doc->values[payload].count; i++) {
-        int item = kr_cbor_at(doc, payload, i);
+    for (item = kr_cbor_first(doc, payload); item >= 0; item = kr_cbor_next(doc, item)) {
         char *raw;
         char *quoted;
         size_t quoted_len;
         char *grown;
 
-        if (item < 0 || doc->values[item].kind != KR_CBOR_TSTR) {
+        if (doc->values[item].kind != KR_CBOR_TSTR) {
             free(text);
             return NULL;
         }
@@ -1498,7 +1545,18 @@ kr_answer_launch(unsigned long long id, const kr_cbor_doc *doc, int request, int
     }
 
     text = kr_launch_text(doc, command, &text_len);
-    if (text == NULL || !kr_shell_install_command(text, text_len)) {
+    if (text == NULL) {
+        kr_reject_launch(id, transaction, fence_id, "buffer_not_empty", &state);
+        return;
+    }
+    /* Building the line took time of its own. Past the budget nothing is installed, which is what
+     * makes "install no command" a fact rather than a hope. */
+    if (kr_now_ms() - kr.frame_at_ms >= deadline_ms) {
+        free(text);
+        kr_reject_launch(id, transaction, fence_id, "timeout", &state);
+        return;
+    }
+    if (!kr_shell_install_command(text, text_len)) {
         free(text);
         kr_reject_launch(id, transaction, fence_id, "buffer_not_empty", &state);
         return;
@@ -1565,10 +1623,13 @@ kr_answer_cancel(unsigned long long id, const kr_cbor_doc *doc, int params)
      * cancelled.
      */
     if (prompt != state.prompt_generation || reader != state.reader_revision) {
+        /* A cancellation for a reader that is not the one running ends nothing, so nothing has to
+         * unwind before the next request is answered. */
         ended.discarded_bytes = 0;
     } else {
         kr_shell_cancel_key_wait(&ended);
         kr_shell_reader_state(&state);
+        kr.cancel_in_flight = 1;
     }
 
     kr_open_answer(&writer, id, "cancel");
@@ -1603,9 +1664,6 @@ kr_answer_cancel(unsigned long long id, const kr_cbor_doc *doc, int params)
     kr_cbor_map_end(&writer);
     kr_cbor_variant_end(&writer);
     kr_send(&writer);
-    /* Nothing else in this batch is answered until the reader has come out of the operation this
-     * ended, so a fence that follows sees what the reader actually has. */
-    kr.pause_dispatch = 1;
 }
 
 /* ---- reading the mailbox ---------------------------------------------------------------------- */
@@ -1794,10 +1852,11 @@ kr_handle_frame(const unsigned char *frame, size_t length)
  * The contract asks whether a revocation for this transaction was in the frames this step read,
  * not whether it came before the launch in them. A worker that dispatched a launch and revoked it
  * in the same breath has revoked it. */
-static void
+static int
 kr_take_batch_revocations(void)
 {
     size_t at = 0;
+    size_t found = 0;
 
     while (kr.in_len - at >= KR_FRAME_HEADER) {
         unsigned long length = ((unsigned long)kr.in[at] << 24) |
@@ -1811,16 +1870,25 @@ kr_take_batch_revocations(void)
 
         if (length == 0 || length > KR_CBOR_MAX_FRAME ||
             kr.in_len - at < KR_FRAME_HEADER + length) {
-            return;
+            return 1;
         }
         root = kr_cbor_parse(&doc, kr.in + at + KR_FRAME_HEADER, (size_t)length);
         payload = kr_cbor_variant_of(&doc, root, &name, &name_len);
         if (payload >= 0 && name_len == 14 && memcmp(name, "launch_revoked", 14) == 0) {
             kr_remember_revocation(&doc, payload);
+            found++;
         }
         kr_cbor_doc_free(&doc);
         at += KR_FRAME_HEADER + length;
     }
+    if (found > KR_REVOKED_MAX) {
+        /* More revocations in one read than this bridge can remember would push one of them out
+         * before the launch it belongs to is decided, and a launch answered `accepted` under a
+         * revocation the reader had already read is exactly what must not happen. */
+        kr_disconnect(KR_LOSS_BRIDGE_DISCONNECTED);
+        return 0;
+    }
+    return 1;
 }
 
 void
@@ -1830,10 +1898,17 @@ kr_bridge_service(void)
         return;
     }
     kr_flush();
+    if (kr.cancel_in_flight) {
+        /* The reader has not come out of the operation the last cancellation ended. Whatever is
+         * waiting stays on the endpoint until it has. */
+        return;
+    }
     if (!kr_fill()) {
         return;
     }
-    kr_take_batch_revocations();
+    if (!kr_take_batch_revocations()) {
+        return;
+    }
     for (;;) {
         const unsigned char *frame;
         size_t length = kr_take_frame(&frame);
@@ -1852,10 +1927,10 @@ kr_bridge_service(void)
             kr.frame_capacity = length;
         }
         memcpy(kr.frame, frame, length);
+        kr.frame_at_ms = kr_frame_arrival(length);
         kr_drop_frame(length);
         kr_handle_frame(kr.frame, length);
-        if (kr.pause_dispatch) {
-            kr.pause_dispatch = 0;
+        if (kr.cancel_in_flight) {
             break;
         }
     }

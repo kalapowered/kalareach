@@ -180,6 +180,14 @@ int kr_bridge_fd(void);
 /* Non-zero while an answer is waiting to go out, so the reader's own wait can watch for room. */
 int kr_bridge_wants_write(void);
 
+/*
+ * The reader has come out of the operation a cancellation ended.
+ *
+ * Until it does, the bridge reads and answers nothing, so a request that follows a cancellation is
+ * answered against the reader's real state rather than the one it was leaving.
+ */
+void kr_bridge_cancel_settled(void);
+
 /* Reports that the ground the integration stood on has gone. */
 void kr_bridge_lost(int loss, const char *detail);
 

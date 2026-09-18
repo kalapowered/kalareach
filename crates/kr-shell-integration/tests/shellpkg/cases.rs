@@ -1312,6 +1312,21 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
         report.cancelled
     );
 
+    // And the reader recovers at the same prompt: it reports itself idle again, which is the
+    // retry point a withheld fence needs, and its queues are clear.
+    assert!(
+        session.saw_event(REPLY, |event| matches!(event, BridgeEvent::ReaderIdle(_))),
+        "the reader did not report itself idle again after the cancellation"
+    );
+    let recovered = session.fence_exchange(&enter, fence_id(17));
+    assert!(
+        recovered.queues.partial_key_drained
+            && recovered.queues.tty_typeahead_drained
+            && recovered.queues.macro_input_drained,
+        "the reader's queues did not come back after the cancellation: {:?}",
+        recovered.queues
+    );
+
     // A quoted insertion waits for its character in the same way, and ends the same way.
     session.type_bytes(CTRL_V);
     std::thread::sleep(Duration::from_millis(150));
@@ -1347,21 +1362,6 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
         !report.cancelled.any(),
         "a cancellation for another reader ended this one's work: {:?}",
         report.cancelled
-    );
-
-    // And the reader recovers at the same prompt: its queues are clear again and it says so, so
-    // the worker has the retry point a withheld fence needs.
-    let recovered = session.fence_exchange(&enter, fence_id(17));
-    assert!(
-        recovered.queues.partial_key_drained
-            && recovered.queues.tty_typeahead_drained
-            && recovered.queues.macro_input_drained,
-        "the reader's queues did not come back after the cancellation: {:?}",
-        recovered.queues
-    );
-    assert!(
-        session.saw_event(REPLY, |event| matches!(event, BridgeEvent::ReaderIdle(_))),
-        "the reader did not report itself idle again after the cancellation"
     );
 
     // The buffer survived all of it: the rest of the line is typed and the whole command runs.

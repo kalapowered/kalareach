@@ -563,6 +563,24 @@ kr_cbor_at(const kr_cbor_doc *doc, int index, size_t position)
 }
 
 int
+kr_cbor_first(const kr_cbor_doc *doc, int index)
+{
+    if (index < 0 || index >= doc->used) {
+        return -1;
+    }
+    return doc->values[index].first_child;
+}
+
+int
+kr_cbor_next(const kr_cbor_doc *doc, int index)
+{
+    if (index < 0 || index >= doc->used) {
+        return -1;
+    }
+    return doc->values[index].next_sibling;
+}
+
+int
 kr_cbor_variant_of(const kr_cbor_doc *doc, int index, const char **name, size_t *name_len)
 {
     int key;
