@@ -35,18 +35,18 @@
 //!
 //! ## What the system-call filter adds
 //!
-//! Landlock covers TCP and says nothing about the rest. A small fixed filter closes what matters:
-//! for a **local** operation the kernel refuses to create an internet socket at all, so there is no
-//! UDP, no raw socket and no TCP to reach anything through; for **every** operation it refuses a
-//! listening socket and a raw or packet socket.
+//! Landlock's rules are about TCP, and a filter reads scalar arguments while an address is behind a
+//! pointer, so nothing here could bound where a datagram goes. The answer is not to allow one: a
+//! **local** operation cannot create an internet socket at all, and a **remote** one can create only
+//! a stream socket, which is what every transport here uses and what Landlock's port rules govern.
+//! Neither may listen, and neither may open a raw or packet socket.
 //!
-//! What the filter cannot do is bound a remote operation's traffic below TCP. A filter reads scalar
-//! arguments and an address is behind a pointer, and the same socket a name resolution needs is the
-//! one anything else would use. So for a remote operation the port list is a guarantee about TCP,
-//! which is what every transport here uses; UDP can go anywhere, and a UDP socket can be bound and
-//! read from, which "nothing may listen" therefore covers for TCP alone. A local operation has no
-//! internet socket at all and none of this arises. Both limits are stated here and in
-//! `crates/kr-project/README.md` rather than implied.
+//! What that costs is name resolution, which ordinarily sends datagrams. The child is told to
+//! resolve over the same kind of connection it fetches over (`RES_OPTIONS=use-vc`, which the usual
+//! C library reads), and the port a resolver answers on is in the connect rules for a remote
+//! operation. A system whose resolver does not take that instruction cannot turn a host name into an
+//! address inside this boundary, and the operation fails saying so rather than being given a
+//! datagram socket nothing can bound.
 //!
 //! The filter is built for this machine's own instruction set, and an architecture whose call
 //! numbers this host does not hold refuses the invocation rather than installing a filter that
@@ -84,6 +84,13 @@ const NETWORK_ABI: ABI = ABI::V4;
 
 /// The device files a process needs to run at all.
 const DEVICES: &[&str] = &["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"];
+
+/// The port a resolver answers a name on.
+///
+/// A remote operation has to turn its remote's name into an address, and inside this boundary it
+/// does that over the same kind of connection it fetches over, because a datagram is the one thing
+/// here that nothing can bound.
+const RESOLVER_PORT: u16 = 53;
 
 /// The program loaders a dynamically linked program is started through.
 ///
@@ -260,7 +267,7 @@ pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
         }
     }
     if let Reach::Outbound(ports) = &confinement.reach {
-        for port in ports {
+        for port in ports.iter().chain(std::iter::once(&RESOLVER_PORT)) {
             created = created
                 .add_rule(NetPort::new(*port, AccessNet::ConnectTcp))
                 .map_err(rules)?;
@@ -395,24 +402,26 @@ fn filter(remote: bool) -> Result<Vec<libc::sock_filter>> {
         instruction(ANSWER, 0, 0, REFUSED),
     ]);
     if remote {
-        // Nothing may listen, and nothing may reach the network below its protocols. Creating an
-        // ordinary socket and connecting out is what the transport does, and which addresses it
-        // reaches is Landlock's rule rather than this one's.
+        // Nothing may listen, and the only socket an internet address can be reached through is a
+        // stream one, which is what every transport here uses and what Landlock's port rules
+        // govern. A datagram is the one thing nothing here could bound, so there is not one.
         program.extend([
             // Index 9: `listen` is refused outright.
-            instruction(COMPARE, 7, 0, SYS_LISTEN),
+            instruction(COMPARE, 8, 0, SYS_LISTEN),
             // 10: anything that is not `socket` is the ordinary work of running Git.
-            instruction(COMPARE, 0, 7, SYS_SOCKET),
+            instruction(COMPARE, 0, 8, SYS_SOCKET),
             // 11, 12: a packet socket is not something any transport needs.
             instruction(LOAD, 0, 0, FIRST_ARGUMENT),
-            instruction(COMPARE, 4, 0, libc::AF_PACKET as u32),
-            // 13, 14, 15: nor is a raw one, whatever flags travel beside its kind.
+            instruction(COMPARE, 5, 0, libc::AF_PACKET as u32),
+            // 13, 14: a family that is not an internet one reaches this machine's own services and
+            // not an address, so it is left alone.
+            instruction(COMPARE, 1, 0, libc::AF_INET as u32),
+            instruction(COMPARE, 0, 4, libc::AF_INET6 as u32),
+            // 15, 16, 17: an internet socket is a stream one, whatever flags travel beside its kind.
             instruction(LOAD, 0, 0, SECOND_ARGUMENT),
             instruction(MASK, 0, 0, KIND),
-            instruction(COMPARE, 1, 0, libc::SOCK_RAW as u32),
-            // 16: everything else is permitted, and Landlock decides where it may go.
-            instruction(ANSWER, 0, 0, PERMITTED),
-            // 17, 18.
+            instruction(COMPARE, 1, 0, libc::SOCK_STREAM as u32),
+            // 18, 19.
             instruction(ANSWER, 0, 0, REFUSED),
             instruction(ANSWER, 0, 0, PERMITTED),
         ]);
@@ -544,12 +553,27 @@ mod tests {
             ),
             PERMITTED
         );
-        // Name resolution is why an ordinary socket of another kind is permitted; the module
-        // documentation says what that leaves and what it does not.
+        // A datagram is the one thing nothing here could bound, so there is not one; the module
+        // documentation says what that costs and what it is answered with.
         assert_eq!(
             judge(
                 &program,
                 call(SYS_SOCKET, libc::AF_INET as u32, libc::SOCK_DGRAM as u32)
+            ),
+            REFUSED
+        );
+        assert_eq!(
+            judge(
+                &program,
+                call(SYS_SOCKET, libc::AF_INET6 as u32, libc::SOCK_DGRAM as u32)
+            ),
+            REFUSED
+        );
+        // This machine's own services are reached through a socket that has no address at all.
+        assert_eq!(
+            judge(
+                &program,
+                call(SYS_SOCKET, libc::AF_UNIX as u32, libc::SOCK_STREAM as u32)
             ),
             PERMITTED
         );

@@ -612,7 +612,7 @@ exactly as before.
 Where a guarantee cannot be enforced from outside Git, the operation that needs it is refused rather
 than run under checks that notice afterwards. A kernel too old to mediate the filesystem rights this
 rests on runs no Git; one too old to say which addresses a process may reach runs no remote
-operation; and **Windows runs no Git at all**, because an application container cannot keep a
+operation; and **Windows runs no repository operation at all**, because an application container cannot keep a
 repository from being executed from and cannot bound which ports a remote operation reaches. The
 platform task that qualifies this host on Windows is what changes that.
 `crates/kr-project/README.md` says exactly what each platform enforces and what it leaves.

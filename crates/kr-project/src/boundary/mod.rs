@@ -45,14 +45,16 @@
 //! boundary was built around.
 //!
 //! Two things remain, and they are why every directory an invocation was enclosed around is
-//! required to still be that object before anything the child produced is used. Two of the three
-//! mechanisms write their rules against paths, because that is what they take, so a directory
-//! substituted at one of those names while Git ran is one those rules still permitted. And a
-//! directory substituted *inside* a tree the operation owns is inside a tree the operation owns:
-//! no confinement that grants a tree can refuse part of it. Neither is prevented; both are the
-//! declared refusal, and the identity check after the run is where that is decided. On Linux the
-//! rules themselves are attached to the opened objects, so the first of the two does not arise
-//! there.
+//! required to still be that object before its result reaches a caller. A directory Git is given
+//! *by name*, such as a reserved worktree destination, is named in the rules the path-based
+//! mechanisms take, so a directory substituted there while Git ran is one those rules still
+//! permitted. And a directory substituted *inside* a tree the operation owns is inside a tree the
+//! operation owns: no confinement that grants a tree can refuse part of it. Neither is prevented;
+//! both are the declared refusal, decided by the identity check after the run, which covers the
+//! directories the boundary was built from and not every descendant of them. Two readings cannot
+//! tell a change made and undone from no change at all, and waiting for Git establishes that Git
+//! has gone rather than that everything it started has. On Linux the rules are attached to the
+//! opened objects, so the first of the two does not arise there.
 //!
 //! ## What enforces what
 //!
@@ -252,8 +254,8 @@ impl OpenedDirectory {
         // else, and it is said the same way rather than as whatever the open failed with.
         let Ok(now) = AuthorisedDirectory::open_root(self.environment_id, &self.path) else {
             return Err(ProjectError::IdentityChanged {
-                detail: "the directory this invocation ran in is no longer there, so what it \
-                         produced is not served"
+                detail: "the directory this invocation ran in could not be confirmed to be the \
+                         object it was started against, so what it produced is not served"
                     .to_owned()
                     .into(),
             });

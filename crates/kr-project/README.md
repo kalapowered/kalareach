@@ -5,6 +5,10 @@ Git invocation KalaReach makes. `docs/project/` describes the ten methods, the i
 staged publication and the credential rule. This file describes one thing: the boundary each Git
 invocation runs inside, and exactly which mechanism holds which guarantee on each platform.
 
+One Git runs outside all of this, once: the one that says which Git this host has. Resolving the
+program asks it for its version and its own helper directory, with an environment of nothing and no
+repository anywhere near it, before any of the rest exists.
+
 ## Why there is one
 
 The service reads a repository's configuration before it runs Git, blanks every driver the
@@ -42,8 +46,7 @@ holds no shell at all, and it is the one that consults the repository's attribut
 **Only this operation's network.** A local operation reaches no address and nothing may listen. An
 operation that reaches a remote may open outbound connections on the ports its transport uses — 443
 and 80 for https, 22 for ssh, and the port the validated remote URL named where it named one — and
-resolve the remote's name. Nothing may listen there either. The table below says where the port list
-is enforced and where it is not.
+resolve the remote's name over the same kind of connection. Nothing may listen there either.
 
 **Only this operation's directories are written.** The repository's working tree and its Git common
 directory, the destination the operation reserved, and one temporary directory created for this
@@ -77,7 +80,7 @@ two and why. The table below describes what is written for that platform, not wh
 | | macOS | Linux | Windows (refused) |
 | --- | --- | --- | --- |
 | Execution | A sandbox profile permitting `process-exec` on this invocation's own execution list and nothing else, applied by the system's own launcher before it runs Git | Landlock, with the execute right on this invocation's own execution list, on Git's helper directory and on the system's program loader, and nowhere else | An application container granted read and write on the repository, and **refused** the execute right there, so a permission inherited from the same directory cannot add it back, though one written on a file itself can |
-| Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that refuses a local one an internet socket at all and refuses every one of them a listening or raw socket | The container's capabilities: none at all for a local operation, and the client capability for a remote one. **The port list is not enforced here**; see below |
+| Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that refuses a local one an internet socket at all, refuses a remote one anything but a stream socket, and refuses both a listening socket | The container's capabilities: none at all for a local operation, and the client capability for a remote one, which does not bound ports — one of the two reasons the service refuses here |
 | Writes | The same profile, which permits `file-write` under the operation's own directories and nowhere else | Landlock's write rights, attached to the opened objects rather than to their names, and never carrying the execute right | The container's grants on those directories |
 | Descendants | The child leads its own process group, and ending it ends the group | The same | A job object the process is created inside, which it cannot leave and which ends everything in it |
 
@@ -129,12 +132,13 @@ every permission that reaches those files the way it does. What it does not beat
 file itself, which Windows consults first, and a writer who can create files in the repository can
 write one. That is why the service refuses on Windows rather than claiming the guarantee.
 
-**A remote operation's traffic below TCP on Linux is not bounded.** Landlock's rules cover TCP, and a
-system-call filter reads scalar arguments while an address is behind a pointer; the socket a name
-resolution needs is the same socket anything else would use. So on Linux the port list is a
-guarantee about TCP, which is what every transport here uses, and "nothing may listen" is one too: a
-UDP socket can be bound and read from. A local operation has no internet socket at all and none of
-this arises.
+**On Linux a remote operation can make only a stream socket.** Landlock's rules are about TCP, and a
+system-call filter reads scalar arguments while an address is behind a pointer, so nothing there
+could bound where a datagram goes. Rather than permit one, the boundary refuses it: an internet
+socket is a stream socket, which is what every transport here uses and what the port rules govern.
+Turning a name into an address goes over the same kind of connection, which the child is told to do
+and which the port a resolver answers on is in the rules for. A system whose resolver will not take
+that instruction cannot resolve a name inside the boundary, and the operation fails saying so.
 
 **The port list would not be enforced on Windows.** An application container's capability permits
 reaching the network or nothing at all; bounding which ports it reaches needs a system-wide filtering

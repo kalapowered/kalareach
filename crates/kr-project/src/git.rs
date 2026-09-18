@@ -1124,6 +1124,11 @@ impl RestrictedProfile {
             (OsString::from("TZ"), OsString::from("UTC")),
             (OsString::from("HOME"), self.home.as_os_str().to_owned()),
             (OsString::from("TMPDIR"), temporary.as_os_str().to_owned()),
+            // A name is turned into an address over the same kind of connection the transport uses,
+            // rather than over datagrams. A datagram is the one thing a boundary here cannot bound
+            // by address, so an operation that reaches a remote is given none and is told to resolve
+            // this way instead. It is inert where the transport reaches no remote.
+            (OsString::from("RES_OPTIONS"), OsString::from("use-vc")),
             (OsString::from("TEMP"), temporary.as_os_str().to_owned()),
             (OsString::from("TMP"), temporary.as_os_str().to_owned()),
             // The transport allowlist, stated in the environment as well as in the configuration,
@@ -2155,6 +2160,23 @@ impl PrivateTemporary {
             )
             .into(),
         })?;
+        // A name only this process knows, written inside the directory through the parent handle
+        // before the directory is opened. A directory somebody else put at the name would have to
+        // hold it too, which means predicting it; without it the two opens below would agree on a
+        // directory this host did not make.
+        let mut token = String::with_capacity(32);
+        for byte in uuid::Uuid::new_v4().as_bytes() {
+            token.push_str(&format!("{byte:02x}"));
+        }
+        root.create(format!("{name}/{token}")).map_err(|error| {
+            ProjectError::StagingUnavailable {
+                detail: format!(
+                    "{described}'s own temporary directory could not be marked as this host's: \
+                     {error}"
+                )
+                .into(),
+            }
+        })?;
         let handle = root
             .open_dir(&name)
             .map_err(|error| ProjectError::StagingUnavailable {
@@ -2169,20 +2191,36 @@ impl PrivateTemporary {
         // would be a different one. The name itself is thirty-two random characters, so reaching
         // it at all means watching for it. What is left is a substitution made and undone between
         // two readings, which is the limit every identity check here has.
-        let mut entries = handle
+        let entries = handle
             .entries()
             .map_err(|error| ProjectError::StagingUnavailable {
                 detail: format!("{described}'s own temporary directory could not be read: {error}")
                     .into(),
             })?;
-        if entries.next().is_some() {
+        let mut held: Vec<String> = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(|error| ProjectError::StagingUnavailable {
+                detail: format!("{described}'s own temporary directory could not be read: {error}")
+                    .into(),
+            })?;
+            held.push(entry.file_name().to_string_lossy().into_owned());
+        }
+        if held != vec![token.clone()] {
             return Err(ProjectError::StagingUnavailable {
                 detail: format!(
-                    "{described}'s own temporary directory is not the empty one this host made"
+                    "{described}'s own temporary directory is not the one this host made"
                 )
                 .into(),
             });
         }
+        handle
+            .remove_file(&token)
+            .map_err(|error| ProjectError::StagingUnavailable {
+                detail: format!(
+                    "{described}'s own temporary directory could not be emptied again: {error}"
+                )
+                .into(),
+            })?;
         let again = root
             .open_dir(&name)
             .map_err(|error| ProjectError::StagingUnavailable {

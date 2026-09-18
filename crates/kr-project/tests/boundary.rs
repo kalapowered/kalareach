@@ -213,6 +213,9 @@ fn planting_before(before: &'static [&'static str]) -> (Interposition, Planting)
     (interposition, Planting { times, into })
 }
 
+// The boundary runs on the platforms that can hold its guarantees; where it refuses, a Git
+// invocation is the refusal and there is nothing here to observe.
+#[cfg(unix)]
 #[test]
 fn a_driver_planted_after_the_audit_never_runs_during_a_status_or_a_review_refresh() {
     let mut fixture = Fixture::create();
@@ -284,6 +287,9 @@ fn a_driver_planted_after_the_audit_never_runs_during_a_status_or_a_review_refre
     require_the_planting_would_have_run(&repository_path);
 }
 
+// The boundary runs on the platforms that can hold its guarantees; where it refuses, a Git
+// invocation is the refusal and there is nothing here to observe.
+#[cfg(unix)]
 #[test]
 fn a_driver_planted_after_the_audit_never_runs_during_a_worktree() {
     let mut fixture = Fixture::create();
@@ -344,6 +350,9 @@ fn a_driver_planted_after_the_audit_never_runs_during_a_worktree() {
     require_the_planting_would_have_run(&repository_path);
 }
 
+// The boundary runs on the platforms that can hold its guarantees; where it refuses, a Git
+// invocation is the refusal and there is nothing here to observe.
+#[cfg(unix)]
 #[test]
 fn a_driver_planted_into_a_clones_own_destination_never_runs_during_its_checkout() {
     // The clone is the one invocation whose boundary holds the shell Git starts its connection
@@ -570,6 +579,9 @@ fn tree_state(path: &Path) -> (Vec<String>, Vec<String>, String, String) {
     (names, administrative, identifying, head)
 }
 
+// The boundary runs on the platforms that can hold its guarantees; where it refuses, a Git
+// invocation is the refusal and there is nothing here to observe.
+#[cfg(unix)]
 #[test]
 fn an_invocation_reaches_only_the_ports_its_own_transport_uses() {
     let fixture = Fixture::create();
@@ -635,6 +647,9 @@ fn an_invocation_reaches_only_the_ports_its_own_transport_uses() {
     );
 }
 
+// The boundary runs on the platforms that can hold its guarantees; where it refuses, a Git
+// invocation is the refusal and there is nothing here to observe.
+#[cfg(unix)]
 #[test]
 fn a_write_outside_the_directories_an_operation_owns_is_refused() {
     let fixture = Fixture::create();
@@ -864,6 +879,114 @@ fn a_destination_substituted_after_the_boundary_was_built_is_the_declared_refusa
         Vec::<String>::new(),
         "and the object this host reserved, wherever its name went, holds nothing new"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_git_directory_replaced_inside_the_tree_is_the_declared_refusal() {
+    // A directory put *inside* a tree the operation owns is inside a tree the operation owns, and
+    // no confinement that grants a tree can refuse part of it. So this is not a case the boundary
+    // prevents; it is one the identity checks answer. What the test establishes is that the answer
+    // is this host's declared refusal rather than a result taken from a repository nobody recorded.
+    let mut fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "replaced-git");
+    let theirs = ordinary_repository(fixture.work(), "replaced-git-theirs");
+    let repository =
+        OpenedRepository::open(fixture.service().profile(), fixture.environment_id(), &path)
+            .expect("the repository opens");
+
+    let swap = {
+        let ours = path.join(".git");
+        let aside = fixture.work().join("replaced-git-aside");
+        let theirs = theirs.join(".git");
+        let done = AtomicUsize::new(0);
+        Interposition::new(Arc::new(
+            move |described: &str, _working: &Path, _temporary: &Path| {
+                if !described.starts_with("git status") || done.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return;
+                }
+                std::fs::rename(&ours, &aside).expect("the repository's own directory moves aside");
+                std::fs::rename(&theirs, &ours).expect("another takes its name");
+            },
+        ))
+    };
+    fixture.interpose(swap);
+
+    let arguments: [&OsStr; 2] = [OsStr::new("status"), OsStr::new("--porcelain=v2")];
+    let refusal = fixture
+        .service()
+        .profile()
+        .run(&repository.read(&arguments))
+        .expect_err("a result taken against a repository nobody recorded is not served");
+    assert_eq!(
+        refusal.code(),
+        kr_protocol::error::ErrorCode::SourceChanged,
+        "and it is refused as an identity that changed: {refusal}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_substitution_put_back_before_the_check_is_a_limit_this_host_states() {
+    // Two readings cannot tell a change made and undone from no change at all. This is that case,
+    // written down: the tree is moved aside and put back while Git runs, and the result is served,
+    // because every identity this host recorded is the identity it finds. Nothing here is a
+    // guarantee; it is the shape of the limit, so that a later change which closed it would fail
+    // this test and say so.
+    let mut fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "restored");
+    let repository =
+        OpenedRepository::open(fixture.service().profile(), fixture.environment_id(), &path)
+            .expect("the repository opens");
+
+    let swap = {
+        let ours = path.clone();
+        let aside = fixture.work().join("restored-aside");
+        let done = AtomicUsize::new(0);
+        Interposition::new(Arc::new(
+            move |described: &str, _working: &Path, _temporary: &Path| {
+                if !described.starts_with("git status") || done.fetch_add(1, Ordering::SeqCst) > 0 {
+                    return;
+                }
+                std::fs::rename(&ours, &aside).expect("the tree moves aside");
+                std::fs::rename(&aside, &ours).expect("and comes straight back");
+            },
+        ))
+    };
+    fixture.interpose(swap);
+
+    let arguments: [&OsStr; 2] = [OsStr::new("status"), OsStr::new("--porcelain=v2")];
+    let served = fixture
+        .service()
+        .profile()
+        .run(&repository.read(&arguments))
+        .expect("a tree that went away and came back is the same object, so the result is served");
+    assert!(
+        served.success,
+        "and it is Git's own answer: {}",
+        served.stderr
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn a_platform_whose_mechanisms_cannot_hold_the_guarantees_runs_no_git() {
+    // This platform's application container cannot keep a repository from being executed from, and
+    // cannot bound which ports a remote operation reaches. So the service refuses rather than
+    // claiming a boundary it does not have, and says which guarantee it cannot make.
+    let fixture = Fixture::create();
+    let arguments: [&OsStr; 2] = [OsStr::new("status"), OsStr::new("--porcelain=v2")];
+    let refusal = fixture
+        .service()
+        .profile()
+        .run(&GitRequest::read(fixture.work(), &arguments))
+        .expect_err("no repository operation runs on this platform");
+    let said = refusal.to_string();
+    assert!(
+        said.contains("executed") && said.contains("ports"),
+        "and it names both guarantees it cannot make: {said}"
+    );
+    assert!(kr_project::boundary::MECHANISM.starts_with("none"));
 }
 
 #[test]
