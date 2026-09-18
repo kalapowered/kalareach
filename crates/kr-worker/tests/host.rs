@@ -59,15 +59,18 @@ impl Host {
         }
     }
 
-    /// Installs a qualified Zsh package and tells the daemon where it is.
+    /// Installs a qualified Zsh package for the daemon, and none for the worker.
     ///
-    /// The daemon is told; the worker it launches is not, and a worker resolves its own package
-    /// from its own environment. A managed create is therefore admitted here and refused there,
-    /// which is the only way to make a worker start, claim its reservation and then report that it
-    /// cannot serve what it was asked for.
+    /// The daemon is told where this installation's packages are, so a managed create naming that
+    /// shell is admitted. The worker is pointed at a directory that holds none, so it starts,
+    /// claims its reservation, finds nothing it can serve and says so. That is the only way to
+    /// make a worker report that it could not start, and both halves are this test's own: neither
+    /// depends on what the machine happens to have installed.
     fn with_shell_package(mut self) -> Self {
         use kr_shell_integration::contract::qualification::ShellKind;
-        use kr_shell_integration::host::package::{MANIFEST_BASENAME, PackageManifest};
+        use kr_shell_integration::host::package::{
+            MANIFEST_BASENAME, PACKAGE_ROOT_VARIABLE, PackageManifest,
+        };
 
         let root = self.temp.root().join("packages");
         let directory = root.join(ShellKind::Zsh.as_str()).join("identity-1");
@@ -95,6 +98,33 @@ impl Host {
             serde_json::to_string(&manifest).expect("encodes"),
         )
         .expect("writes the manifest");
+
+        // What the worker is launched as: the worker itself, with its own package root named as a
+        // directory this test made and left empty. The daemon passes its environment on to the
+        // process it starts, and this test process's own environment is shared with every other
+        // test in this binary, so the value is set on the child rather than here. Without it the
+        // worker would read the installation's own root, and whether it found a package there
+        // would depend on the machine rather than on the test.
+        let empty = self.temp.root().join("no-packages");
+        std::fs::create_dir_all(&empty).expect("creates an empty package root");
+        let launcher = self.temp.root().join("kr-worker-without-packages");
+        std::fs::write(
+            &launcher,
+            format!(
+                "#!/bin/sh\n{PACKAGE_ROOT_VARIABLE}='{}'\nexport {PACKAGE_ROOT_VARIABLE}\nexec '{}' \"$@\"\n",
+                empty.display(),
+                self.worker.display()
+            ),
+        )
+        .expect("writes the launcher");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+
+            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+                .expect("makes the launcher executable");
+        }
+        self.worker = launcher;
         self.shell_packages = Some(root);
         self
     }
