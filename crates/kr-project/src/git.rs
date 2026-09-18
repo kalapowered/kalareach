@@ -695,10 +695,13 @@ fn durable(directory: &cap_std::fs::Dir) -> Result<()> {
     })
 }
 
-/// Makes a directory's own list of names durable.
+/// Leaves a directory's own list of names as the platform left it.
 ///
-/// This platform runs no Git, so nothing reads that record back here, and an ordinary open of a
-/// directory is not something it does.
+/// This platform has no ordinary open of a directory to synchronise, and it runs no Git: an
+/// invocation makes its temporary directory and writes the record, and then the boundary refuses
+/// before Git exists. The record is still read and rewritten when the service starts. What is not
+/// done here is making the record's *name* survive a power failure, and that is the difference to
+/// close when this platform runs Git.
 ///
 /// # Errors
 ///

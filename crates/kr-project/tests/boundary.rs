@@ -702,9 +702,9 @@ fn a_remote_operation_reaches_a_listener_at_a_name_rather_than_an_address() {
         });
     let _ = fixture.service().profile().run(&request);
 
-    connections
-        .recv_timeout(Duration::from_secs(30))
-        .expect("a name this machine answers from its own files is turned into an address");
+    connections.recv_timeout(Duration::from_secs(30)).expect(
+        "a remote named rather than numbered reaches its listener from inside the boundary",
+    );
 }
 
 // The boundary runs on the platforms that can hold its guarantees; where it refuses, a Git
