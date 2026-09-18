@@ -659,13 +659,16 @@ fn an_invocation_reaches_only_the_ports_its_own_transport_uses() {
     );
 }
 
+#[cfg(unix)]
 #[test]
-fn a_remote_operation_turns_a_name_this_machine_answers_into_an_address() {
+fn a_remote_operation_reaches_a_listener_at_a_name_rather_than_an_address() {
     // The boundary refuses every way of reaching another program on this machine, which is how a
     // name service cache and a resolver's own interface are reached. What is left is the files and
-    // the resolver itself, and this is the first of those: a name every machine answers from its
-    // own files, resolved inside the boundary, reaching a listener this test owns. A failure here
-    // is the boundary having taken away more than it meant to.
+    // the resolver itself. This establishes that a remote *named* rather than numbered still
+    // reaches its listener from inside the boundary — a failure here is the boundary having taken
+    // away more than it meant to — and no more than that: the library Git fetches with answers
+    // `localhost` out of its own head rather than asking anything, so which resolver would have
+    // answered is not what this test decides. The handoff records that gap.
     let fixture = Fixture::create();
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener on this machine");
     let port = listener.local_addr().expect("the bound address").port();

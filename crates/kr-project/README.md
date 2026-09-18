@@ -95,7 +95,7 @@ two and why. The table below describes what is written for that platform, not wh
 | | macOS | Linux | Windows (refused) |
 | --- | --- | --- | --- |
 | Execution | A sandbox profile permitting `process-exec` on this invocation's own execution list and nothing else, applied by the system's own launcher before it runs Git | Landlock, with the execute right on this invocation's own execution list, on Git's helper directory and on the system's program loader, and nowhere else | An application container granted read and write on the repository, and **refused** the execute right there, so a permission inherited from the same directory cannot add it back, though one written on a file itself can |
-| Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that makes a socket only of what the boundary can account for: a connected pair of local ones for any operation, the kernel's own address answers and the internet families for a remote one and on those only a TCP stream socket, and nothing else at all, listening included | The container's capabilities: none at all for a local operation, and the client capability for a remote one, which does not bound ports — one of the two reasons the service refuses here |
+| Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that makes a socket only of what the boundary can account for: a connected pair of local ones for any operation, the internet families for a remote one and on those only a TCP stream socket, and nothing else at all, listening included | The container's capabilities: none at all for a local operation, and the client capability for a remote one, which does not bound ports — one of the two reasons the service refuses here |
 | Writes | The same profile, which permits `file-write` under the operation's own directories and nowhere else | Landlock's write rights, attached to the opened objects rather than to their names, and never carrying the execute right | The container's grants on those directories |
 | Descendants | The child leads its own process group, and ending it ends the group | The same | A job object the process is created inside, which it cannot leave and which ends everything in it |
 
@@ -179,12 +179,15 @@ name is not this service's to decide. **A host whose name service has no fallbac
 or whose resolver will not take that instruction, cannot turn a name that needs the resolver into an
 address inside this boundary**, and the operation fails saying so.
 
-**A remote reached over https is reached over IPv4.** The library Git fetches with asks whether this
-machine has IPv6 by making a datagram socket and throwing it away, and a datagram socket is the one
-thing this filter cannot bound; refused that question, the library answers it "no" and asks only for
-IPv4 addresses. A remote that has only an IPv6 address is therefore not reached over https inside
-this boundary, and an address written out in full is reached either way. Git's own transport over
-ssh does not ask that question and is not bounded to one kind of address by it.
+**An https remote named rather than numbered is looked up over IPv4.** The library Git fetches with
+asks whether this machine has IPv6 by making a datagram socket and throwing it away, and a datagram
+socket is the one thing this filter cannot bound; refused that question, the affected builds of that
+library answer it "no" and ask the resolver for IPv4 addresses alone. **A name that has only an IPv6
+address therefore fails that lookup inside this boundary.** An address written out in full does not
+go through it, and neither does `localhost`, which that library answers out of its own head; both
+need saying separately because neither is evidence about the other. Git's own transport over ssh
+does not ask the question at all. Closing this without permitting a datagram socket means a build of
+that library whose question is asked on a stream socket, which this filter already permits.
 
 A credential broker that would reach an agent or a secret service over a local socket cannot do so
 inside the boundary either. That is a real limit and not a theoretical one:

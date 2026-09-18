@@ -73,9 +73,11 @@
 //!
 //! One more thing follows from refusing a datagram socket, on this platform only. The library Git
 //! fetches over https with asks whether this machine has IPv6 by making a datagram socket and
-//! throwing it away; refused that question, it answers it "no" and asks the resolver for IPv4
-//! addresses alone. A remote whose name has only an IPv6 address is therefore not reached over
-//! https inside this boundary. Git's own transport over ssh does not ask that question.
+//! throwing it away; refused that question, the affected builds answer it "no" and ask the resolver
+//! for IPv4 addresses alone, so a name that has only an IPv6 address fails that lookup inside this
+//! boundary. An address written out in full does not go through it, and neither does `localhost`,
+//! which that library answers out of its own head. Git's own transport over ssh does not ask the
+//! question at all, and a build whose question is asked on a stream socket would not be refused.
 //!
 //! The filter is built for this machine's own instruction set, and an architecture whose call
 //! numbers this host does not hold refuses the invocation rather than installing a filter that
