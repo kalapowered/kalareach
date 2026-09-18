@@ -929,42 +929,78 @@ fn a_git_directory_replaced_inside_the_tree_is_the_declared_refusal() {
 #[test]
 fn a_substitution_put_back_before_the_check_is_a_limit_this_host_states() {
     // Two readings cannot tell a change made and undone from no change at all. This is that case,
-    // written down: the tree is moved aside and put back while Git runs, and the result is served,
-    // because every identity this host recorded is the identity it finds. Nothing here is a
-    // guarantee; it is the shape of the limit, so that a later change which closed it would fail
-    // this test and say so.
+    // written down, and it is the whole of it: another repository holds the name `.git` for the
+    // entire run, so the answer served is that repository's, and it is put back before this host
+    // looks again, so nothing is refused. Nothing here is a guarantee; it is the shape of the
+    // limit, so that a later change which closed it would fail this test and say so.
     let mut fixture = Fixture::create();
     let path = ordinary_repository(fixture.work(), "restored");
+    let theirs = ordinary_repository(fixture.work(), "restored-theirs");
+    // Their repository is one commit further on, which is how the answer served can be told apart
+    // from the one this repository would have given.
+    write(&theirs, "theirs.txt", "not in the other repository\n");
+    git_raw(&theirs, ["add", "-A"]);
+    git_raw(
+        &theirs,
+        ["commit", "-m", "the other repository's own commit"],
+    );
+    let ours_head = git_raw(&path, ["rev-parse", "HEAD"]).trim().to_owned();
+    let theirs_head = git_raw(&theirs, ["rev-parse", "HEAD"]).trim().to_owned();
+    assert_ne!(ours_head, theirs_head, "the two repositories differ");
+
     let repository =
         OpenedRepository::open(fixture.service().profile(), fixture.environment_id(), &path)
             .expect("the repository opens");
 
+    let ours_git = path.join(".git");
+    let aside = fixture.work().join("restored-aside");
+    let theirs_git = theirs.join(".git");
     let swap = {
-        let ours = path.clone();
-        let aside = fixture.work().join("restored-aside");
+        let (ours, moved, other) = (ours_git.clone(), aside.clone(), theirs_git.clone());
         let done = AtomicUsize::new(0);
-        Interposition::new(Arc::new(
+        let before = Interposition::new(Arc::new(
             move |described: &str, _working: &Path, _temporary: &Path| {
-                if !described.starts_with("git status") || done.fetch_add(1, Ordering::SeqCst) > 0 {
+                if !described.starts_with("git rev-parse")
+                    || done.fetch_add(1, Ordering::SeqCst) > 0
+                {
                     return;
                 }
-                std::fs::rename(&ours, &aside).expect("the tree moves aside");
-                std::fs::rename(&aside, &ours).expect("and comes straight back");
+                std::fs::rename(&ours, &moved).expect("the repository's own directory moves aside");
+                std::fs::rename(&other, &ours).expect("another takes its name");
+            },
+        ));
+        let (ours, moved, other) = (ours_git.clone(), aside.clone(), theirs_git.clone());
+        before.and_after(Arc::new(
+            move |_described: &str, _working: &Path, _temporary: &Path| {
+                if !moved.exists() {
+                    return;
+                }
+                std::fs::rename(&ours, &other).expect("the other repository goes back to its own");
+                std::fs::rename(&moved, &ours).expect("and this one comes back to its name");
             },
         ))
     };
     fixture.interpose(swap);
 
-    let arguments: [&OsStr; 2] = [OsStr::new("status"), OsStr::new("--porcelain=v2")];
+    let arguments: [&OsStr; 2] = [OsStr::new("rev-parse"), OsStr::new("HEAD")];
     let served = fixture
         .service()
         .profile()
         .run(&repository.read(&arguments))
-        .expect("a tree that went away and came back is the same object, so the result is served");
-    assert!(
-        served.success,
-        "and it is Git's own answer: {}",
+        .expect(
+            "every identity this host recorded is the identity it finds, so nothing is refused",
+        );
+    assert_eq!(
+        String::from_utf8_lossy(&served.stdout).trim(),
+        theirs_head,
+        "and the answer served is the other repository's, which is the limit: {}",
         served.stderr
+    );
+    // The repository is back at its own name, which is why the reading after the run saw nothing.
+    assert_eq!(
+        git_raw(&path, ["rev-parse", "HEAD"]).trim(),
+        ours_head,
+        "and the tree on disk is this repository's again"
     );
 }
 

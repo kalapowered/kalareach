@@ -515,14 +515,20 @@ pub struct RestrictedProfile {
 }
 
 /// Something the fixtures do to a repository between the moment its configuration was read and the
-/// moment Git starts.
+/// moment Git starts, and again after the child has gone.
 ///
-/// The window between those two is what the boundary exists for, and a test that could not reach
-/// into it could only prove that a repository planted *before* the reading is neutralised, which is
-/// the weaker claim. It is compiled with the fixtures and is never set by the service.
+/// The window between the reading and the start is what the boundary exists for, and a test that
+/// could not reach into it could only prove that a repository planted *before* the reading is
+/// neutralised, which is the weaker claim. The second window, between the child's last breath and
+/// the moment this host looks at every directory again, is where a substitution put back leaves no
+/// trace, and a test that cannot act in it cannot show the shape of that limit. Both are compiled
+/// with the fixtures and are never set by the service.
 #[cfg(feature = "git-fixtures")]
 #[derive(Clone)]
-pub struct Interposition(Interposed);
+pub struct Interposition {
+    before: Interposed,
+    after: Option<Interposed>,
+}
 
 /// What an interposition does, as the fixtures hand it over.
 ///
@@ -540,7 +546,22 @@ impl Interposition {
     /// so that it can act on the repository the invocation is actually for.
     #[must_use]
     pub fn new(act: Interposed) -> Self {
-        Self(act)
+        Self {
+            before: act,
+            after: None,
+        }
+    }
+
+    /// Adds what happens after the child has gone and before this host looks at its directories.
+    ///
+    /// That is the only window in which a substitution can be undone without being seen, so it is
+    /// the window a test of that limit has to act in.
+    #[must_use]
+    pub fn and_after(self, act: Interposed) -> Self {
+        Self {
+            after: Some(act),
+            ..self
+        }
     }
 }
 
@@ -982,7 +1003,7 @@ impl RestrictedProfile {
         let described = request.describe();
         #[cfg(feature = "git-fixtures")]
         if let Some(interposition) = self.interposition.as_ref() {
-            interposition.0(&described, confinement.working.path(), temporary.path());
+            (interposition.before)(&described, confinement.working.path(), temporary.path());
         }
         let mut child = crate::boundary::start(
             &crate::boundary::Invocation {
@@ -1049,6 +1070,14 @@ impl RestrictedProfile {
             }
             std::thread::sleep(Duration::from_millis(5));
         };
+        #[cfg(feature = "git-fixtures")]
+        if let Some(act) = self
+            .interposition
+            .as_ref()
+            .and_then(|interposition| interposition.after.as_ref())
+        {
+            act(&described, confinement.working.path(), temporary.path());
+        }
         // Before anything the child produced is used: every directory this invocation was enclosed
         // around is still the object it was enclosed around, or this is a refusal rather than a
         // result.
