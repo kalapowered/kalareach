@@ -602,7 +602,8 @@ an incomplete repaint is the thing the paging exists to prevent.
 A client reads its scrollback through the report it already makes about its window. `attachment.
 viewport` carries a `position` beside the physical dimensions: `{"row": …}`, a stable identifier
 from the pages the client holds, or `{"above": …}`, how many rows above the live screen's first row
-the window starts. No position at all is the live screen, which is where every attachment starts.
+the window starts. A null position is the live screen, which is where every attachment starts, and
+the field is always present.
 The retained rows of a terminal come this way, through the window that shows them, rather than
 through a request for rows on their own.
 
@@ -625,9 +626,10 @@ it is the session giving up rows below it, and that installs the window again wi
 `history_evicted` as the reason rather than sending an update naming rows the client has dropped.
 
 Live output goes on arriving the whole time. A client parked in its history is still sent every
-bounded update, and what it draws is its own decision. What its pages carry is the window: rows
-outside it are not maintained while the window is elsewhere, and every move of the window installs
-the rows it now covers, so a client never draws a row it was not sent for where it is looking.
+bounded update, and what it draws is its own decision. A screen installed for such a window carries
+two runs of rows: the window's own, from the rows the session retained, and the live screen's
+behind them. The window comes first because order decides what a queue too small for both gives up,
+and what should be lost is the part nobody is looking at.
 
 Two origins travel with every window, because two different things are measured from them. The
 rows a client draws are named by the window's own first row; the cursor's row is a line of the
@@ -643,8 +645,8 @@ any other.
 
 A window above the live page is not the live byte stream, whatever this terminal's size is. An
 equal-size terminal that was being handed the session's own bytes is therefore served the canonical
-grid while it is reading its history, and returns to the byte stream — at a parser-ground boundary,
-like every other transition into forwarding — when its window comes back to the live screen.
+grid while it is reading its history, and returns to the byte stream when its window comes back to
+the live screen, at a parser-ground boundary like every other transition into forwarding.
 
 An attachment that is shown the live screen and no retained content beyond it cannot place its
 window in the history at all. That is section 10's live-screen exception: the rows above the screen
@@ -1101,7 +1103,7 @@ source, and a second attachment from a differently themed terminal is shown what
 `session.create` is where the choice is made. Its `palette` field names either a preset,
 `{"preset": "light"}` or `{"preset": "dark"}`, or the colours a client learned from its own bounded
 probe of the terminal the person is sitting at, `{"probe": {"foreground": …, "background": …}}`. A
-request that names nothing takes the profile default. The host carries the field to the worker in
+request whose `palette` is null takes the profile default; the field is always present. The host carries the field to the worker in
 the launch specification and applies it between opening the session and starting its shell, which
 is the only moment it can be applied honestly: the first byte the shell writes is already a screen
 somebody could be looking at, and a palette chosen then would be a change rather than a provenance.
@@ -1110,7 +1112,7 @@ An invisible creation cannot name probed colours. It has no terminal, so a prove
 client's measurement would be a measurement nobody took; the host refuses it with
 `INVALID_ARGUMENT` before it reserves anything, and such a session selects a preset instead. After
 creation this path is closed: the seam refuses a palette once the session has produced anything,
-and moving a live session's colours is a different thing altogether — an authorised, explicit
+and moving a live session's colours is a different thing altogether: an authorised, explicit
 palette change, which carries its own right and broadcasts the new canonical state.
 
 ## Diagnostics

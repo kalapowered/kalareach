@@ -560,6 +560,7 @@ impl TerminalEngine {
                 crate::snapshot::wire::buffer(snapshot.active_buffer),
                 viewport.top_row,
                 viewport.rows as usize,
+                live,
             );
             crate::snapshot::install(
                 &snapshot, viewport, live, reason, degraded, budget, scope, &rows,
@@ -606,6 +607,7 @@ impl TerminalEngine {
                 crate::snapshot::wire::buffer(state.active_buffer),
                 viewport.top_row,
                 viewport.rows as usize,
+                live,
             );
             return crate::snapshot::minimum_install(&state, viewport, live, scope, &rows);
         }

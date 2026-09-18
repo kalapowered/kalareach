@@ -123,11 +123,19 @@ fn probed() -> Result<Chosen> {
         &terminal,
         &crate::terminal::SavedModes::from_state(&saved),
     )?;
-    let asked = terminal.probe_asking(context, QUESTIONS);
-    // Whatever the exchange did, the guard is released here: the terminal is the person's again
-    // the moment the questions are over, and a guard left holding it would outlive the answer.
-    guard.release();
-    let probe = asked?;
+    let probe = match terminal.probe_asking(context, QUESTIONS) {
+        Ok(probe) => {
+            // The exchange put the terminal back itself, so the guard owes only the keyboard.
+            guard.release();
+            probe
+        }
+        Err(error) => {
+            // It did not, or could not say whether it did. The guard puts the whole terminal back,
+            // and this waits for it rather than leaving a person to find out.
+            guard.hand_back();
+            return Err(error);
+        }
+    };
     let Some((foreground, background)) = probe.palette else {
         return Err(CliError::TerminalProbeFailed(
             "this terminal did not report both its default foreground and its default background, \

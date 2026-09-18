@@ -105,7 +105,7 @@ built to do and this one must not:
 Shift and Page Up, and Shift and Page Down, are the exception, and they are not input: they move
 the window this terminal is looking through and never reach the session. The command reports the
 new position through `attachment.viewport`, the host installs the pages that cover it, and the
-input lease does not move — section 8 puts passive scrollback among the things that never seize it,
+input lease does not move: section 8 puts passive scrollback among the things that never seize it,
 so a terminal that may not type can still read what is above the live page. A step is one window
 less the line that joins the two pages, and several keys in one read move the window once, because
 a window is in one place.

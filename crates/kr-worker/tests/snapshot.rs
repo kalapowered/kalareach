@@ -1282,8 +1282,12 @@ async fn the_palette_source_is_recorded_at_creation_and_succession_does_not_chan
     );
 }
 
-/// KR-REQ-08.44: each form a creation can name records its own provenance, and a palette query
-/// answers with the session's canonical palette rather than the terminal a client is sitting at.
+/// KR-REQ-08.44: each form a creation can name records its own provenance, and every client is
+/// shown the session's canonical palette rather than its own terminal's.
+///
+/// The palette is chosen through the seam a launch applies it at, and read from the screen every
+/// client is installed with. `kr-worker/tests/session.rs` carries the other half: that a create
+/// request's own field reaches that seam.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_palette_a_creation_can_name_is_recorded_as_what_it_was() {
     let shared = (

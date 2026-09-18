@@ -261,32 +261,51 @@ impl RowSource for kr_term::engine::Engine {
 ///
 /// A client looking through its scrollback is installed exactly as one looking at the live page
 /// is: the same pages, the same bounds, the same subscriber's queue. What changes is where the
-/// active buffer's rows come from - the retained rows the session still holds, from the window's
-/// own first row - and how many of them there are, which is the window's height and no more. The
-/// buffer that is not showing keeps no scrollback, so it is read exactly as it is for a live
+/// active buffer's rows come from and how many there are.
+///
+/// Two runs of rows, in this order. The window's own, from the retained rows the session still
+/// holds, which is what the person is looking at; and then the live screen's, which is what the
+/// session goes on writing and what this client draws the moment its window comes back. The window
+/// comes first because order decides what a queue too small for both gives up: a screen is cut
+/// from the end, so what is lost is the part nobody is looking at. Rows the window already covers
+/// are not read twice.
+///
+/// The buffer that is not showing keeps no scrollback, so it is read exactly as it is for a live
 /// window.
 pub struct HistoryWindow<'a> {
     engine: &'a kr_term::engine::Engine,
     active: ProjectedBuffer,
     top_row: i64,
     rows: usize,
+    live_top_row: i64,
 }
 
 impl<'a> HistoryWindow<'a> {
-    /// A window of `rows` rows starting at the stable row `top_row`.
+    /// A window of `rows` rows starting at the stable row `top_row`, above `live_top_row`.
     #[must_use]
     pub const fn new(
         engine: &'a kr_term::engine::Engine,
         active: ProjectedBuffer,
         top_row: i64,
         rows: usize,
+        live_top_row: i64,
     ) -> Self {
         Self {
             engine,
             active,
             top_row,
             rows,
+            live_top_row,
         }
+    }
+
+    /// The first line of the live screen this window does not already cover.
+    fn first_live_line(&self) -> usize {
+        let past = self
+            .top_row
+            .saturating_add(i64::try_from(self.rows).unwrap_or(i64::MAX))
+            .saturating_sub(self.live_top_row);
+        usize::try_from(past).unwrap_or(0)
     }
 }
 
@@ -297,10 +316,16 @@ impl RowSource for HistoryWindow<'_> {
                 .engine
                 .rows_within(wire::active_buffer(buffer), first, max_rows);
         }
-        let remaining = self.rows.saturating_sub(first);
-        if remaining == 0 {
-            return Vec::new();
+        if let Some(past_the_window) = first.checked_sub(self.rows) {
+            // The window's rows are behind us. What follows is the live screen, from the first
+            // line the window did not already cover.
+            return self.engine.rows_within(
+                wire::active_buffer(buffer),
+                past_the_window.saturating_add(self.first_live_line()),
+                max_rows,
+            );
         }
+        let remaining = self.rows.saturating_sub(first);
         let from = self
             .top_row
             .saturating_add(i64::try_from(first).unwrap_or(i64::MAX));

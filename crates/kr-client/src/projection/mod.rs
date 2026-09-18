@@ -431,7 +431,11 @@ impl Projection {
         // The viewport is applied before the rows. A scroll moves which identifiers are shown
         // without changing one of them, so a client that drew the rows against the old window
         // would put every one of them on the wrong line.
-        let scrolled = screen.viewport != delta.viewport;
+        // Which rows the window holds, rather than everything the window says. The live screen's
+        // own first row travels with it and moves whenever the session writes; a window above the
+        // live page has not moved because of that, and redrawing every line of somebody's history
+        // for it would be redrawing rows that did not change.
+        let scrolled = !same_window(&screen.viewport, &delta.viewport);
         screen.viewport = delta.viewport;
         screen.active_buffer = delta.buffer;
         for row in delta.rows {
@@ -533,6 +537,17 @@ impl Projection {
             state,
         })
     }
+}
+
+/// Whether two viewports hold the same rows and columns.
+///
+/// The live screen's first row is not part of the answer: it is the origin the cursor's own row is
+/// measured from, and it moves with every scroll of a screen the window may not even be showing.
+fn same_window(held: &ProjectedViewport, next: &ProjectedViewport) -> bool {
+    held.top_row == next.top_row
+        && held.rows == next.rows
+        && held.left_column == next.left_column
+        && held.columns == next.columns
 }
 
 fn screen_of(installing: Installing) -> Screen {

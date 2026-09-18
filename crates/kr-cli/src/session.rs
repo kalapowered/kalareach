@@ -136,10 +136,12 @@ const PREFIX_DEADLINE: std::time::Duration = std::time::Duration::from_millis(25
 /// terminal replies among the things that do not seize the input lease, so these keys are answered
 /// by reporting where this window is looking and never by writing input.
 ///
-/// Two things it will not do. It never looks inside a bracketed paste: pasted text arrives byte
-/// for byte whatever it happens to contain, which is the whole promise of a paste. And it holds
-/// back at most the beginning of one sequence, never a lone Escape, so the one key an editor
-/// cannot wait for is never waited on.
+/// Three things it will not do. It never looks inside a bracketed paste: pasted text arrives byte
+/// for byte whatever it happens to contain. It never takes a key that is not this terminal's to
+/// take, which `mine` decides for each batch, and it goes on recognising delimiters either way so
+/// a paste that began while the keys were the application's is still a paste when they are not.
+/// And it holds the beginning of a sequence for at most one deadline, so nothing waits on a key
+/// the person never pressed.
 #[derive(Debug, Default)]
 struct ScrollbackKeys {
     /// The beginning of a sequence, waiting for the rest of it.
@@ -151,18 +153,44 @@ struct ScrollbackKeys {
 /// What the reader took out of one batch, and what is left for the session.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Split {
-    /// How far the window moves: positive back through the history, negative towards the live
-    /// screen. Several keys in one batch are one movement, because a window is in one place.
+    /// How far the window moves in the end: positive back through the history, negative towards
+    /// the live screen. Several keys in one batch are one movement, because a window is in one
+    /// place.
     steps: i64,
+    /// The furthest the movement ever went towards the live screen inside the batch.
+    ///
+    /// A window already on the live screen cannot go further forward, so a batch that went forward
+    /// and then back again has moved back: the floor is what says by how much.
+    lowest: i64,
     /// The bytes that belong to the session, in the order the person typed them.
     input: Vec<u8>,
     /// Whether anything is being held back, which the loop answers with a deadline.
     holding: bool,
 }
 
+impl Split {
+    /// How far the window actually moves from `parked`.
+    ///
+    /// The live screen is a floor. A window on it that is asked to go forward and then back has
+    /// gone back, and one asked to go forward twice has not moved, because there was nowhere
+    /// forward to go.
+    const fn movement(&self, parked: Option<u64>) -> i64 {
+        if parked.is_none() {
+            return self
+                .steps
+                .saturating_sub(if self.lowest < 0 { self.lowest } else { 0 });
+        }
+        self.steps
+    }
+}
+
 impl ScrollbackKeys {
     /// Reads one batch from the terminal.
-    fn take(&mut self, bytes: &[u8]) -> Split {
+    ///
+    /// `mine` says whether the scroll-back keys belong to this terminal in this batch. When they do
+    /// not, a recognised key is passed on as the bytes it is; the delimiters are still tracked,
+    /// because a paste and a half-arrived sequence both outlive one batch.
+    fn take(&mut self, bytes: &[u8], mine: bool) -> Split {
         let mut split = Split::default();
         let mut buffer = std::mem::take(&mut self.held);
         buffer.extend_from_slice(bytes);
@@ -177,7 +205,7 @@ impl ScrollbackKeys {
                     at += PASTE_END.len();
                     continue;
                 }
-                if PASTE_END.starts_with(rest) && rest.len() > 1 {
+                if PASTE_END.starts_with(rest) {
                     break;
                 }
                 split.input.push(buffer[at]);
@@ -191,23 +219,32 @@ impl ScrollbackKeys {
                 continue;
             }
             if rest.starts_with(SCROLL_BACK_KEY) {
-                split.steps = split.steps.saturating_add(1);
+                if mine {
+                    split.steps = split.steps.saturating_add(1);
+                } else {
+                    split.input.extend_from_slice(SCROLL_BACK_KEY);
+                }
                 at += SCROLL_BACK_KEY.len();
                 continue;
             }
             if rest.starts_with(SCROLL_FORWARD_KEY) {
-                split.steps = split.steps.saturating_sub(1);
+                if mine {
+                    split.steps = split.steps.saturating_sub(1);
+                    split.lowest = split.lowest.min(split.steps);
+                } else {
+                    split.input.extend_from_slice(SCROLL_FORWARD_KEY);
+                }
                 at += SCROLL_FORWARD_KEY.len();
                 continue;
             }
-            // The beginning of one of these and nothing more yet. It is held for the next read,
-            // but never a lone Escape: an editor reads that as the key it is, and a person waiting
-            // for it to arrive is a person whose terminal feels broken.
-            let partial = rest.len() > 1
-                && (SCROLL_BACK_KEY.starts_with(rest)
-                    || SCROLL_FORWARD_KEY.starts_with(rest)
-                    || PASTE_START.starts_with(rest));
-            if partial {
+            // The beginning of one of these and nothing more yet. It waits for the rest of it, and
+            // for no longer than one deadline: section 8 runs that timer independently of what
+            // arrives next, so a lone Escape is the person's Escape within the deadline whether or
+            // not they press anything else.
+            if SCROLL_BACK_KEY.starts_with(rest)
+                || SCROLL_FORWARD_KEY.starts_with(rest)
+                || PASTE_START.starts_with(rest)
+            {
                 break;
             }
             split.input.push(buffer[at]);
@@ -224,12 +261,51 @@ impl ScrollbackKeys {
     }
 }
 
-/// Waits out the prefix deadline, or for ever when nothing is being held.
-async fn hold_expiry(holding: bool) {
-    if holding {
-        tokio::time::sleep(PREFIX_DEADLINE).await;
-    } else {
-        std::future::pending().await
+/// Whether this batch is a mouse report, which addresses a cell of the live screen.
+///
+/// A window above the live page is showing rows the application's grid does not have, so a click
+/// in it addresses no cell the application could act on. Section 8 gives that case its answer:
+/// input outside the visible grid has no application effect.
+fn is_mouse_report(bytes: &[u8]) -> bool {
+    // The two encodings this host advertises: xterm's SGR reports and the legacy form.
+    bytes.starts_with(b"\x1b[<") || bytes.starts_with(b"\x1b[M")
+}
+
+/// Takes the mouse reports out of a batch, leaving the rest for the session.
+fn without_mouse_reports(bytes: Vec<u8>) -> Vec<u8> {
+    let mut kept = Vec::with_capacity(bytes.len());
+    let mut at = 0_usize;
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        if rest.starts_with(b"\x1b[<") {
+            // Up to and including the press or release that ends it.
+            let end = rest
+                .iter()
+                .position(|byte| *byte == b'M' || *byte == b'm')
+                .map_or(rest.len(), |at| at + 1);
+            at += end;
+            continue;
+        }
+        if rest.starts_with(b"\x1b[M") {
+            at += rest.len().min(6);
+            continue;
+        }
+        kept.push(bytes[at]);
+        at += 1;
+    }
+    kept
+}
+
+/// Waits until a held prefix's own deadline, or for ever when nothing is being held.
+///
+/// The deadline is the moment the prefix arrived plus the window, not a fresh window each time
+/// this is asked. Section 8 runs that timer independently of what arrives next, and a timer that
+/// restarted on every byte of output would hold a person's Escape for as long as the session kept
+/// printing.
+async fn hold_expiry(until: Option<tokio::time::Instant>) {
+    match until {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 
@@ -545,10 +621,10 @@ async fn drive(
     // This terminal's own scroll-back keys, and whatever beginning of a sequence the last read
     // ended inside.
     let mut keys = ScrollbackKeys::default();
-    // Whether the reader is holding the beginning of a sequence. While it is, the loop watches a
-    // deadline as well, so a prefix nothing completes reaches the session rather than waiting for
-    // a key the person never pressed.
-    let mut holding_prefix = false;
+    // When a held beginning of a sequence stops waiting. While one is held the loop watches this
+    // as well, so a prefix nothing completes reaches the session rather than waiting for a key the
+    // person never pressed.
+    let mut prefix_deadline: Option<tokio::time::Instant> = None;
 
     // What the person typed while the host was asking the terminal what it was. It was buffered
     // rather than discarded, and it is the first thing the application receives, in the order it
@@ -632,7 +708,12 @@ async fn drive(
                             // Where the window actually is, which is not always where this
                             // terminal last asked for: the session gives up its oldest rows, and a
                             // window that was over them is moved to the oldest ones that survive.
+                            // Only from the buffer the history belongs to: a full-screen
+                            // application's screen numbers its rows from its own beginning, and
+                            // taking that number for the shell's history would move the window to
+                            // a row of another screen.
                             if parked.is_some()
+                                && display.showing_history_buffer()
                                 && let Some(top) = display.window_top_row()
                             {
                                 parked = Some(top);
@@ -697,10 +778,49 @@ async fn drive(
                         // a window would lose their session — so the marker is answered by asking
                         // for the screen again, which is what the marker is for.
                         if notification.event_type.as_str() == "session.resync" {
+                            // A marker means this terminal fell behind or was moved, which is the
+                            // session having gone on without it. A person following the live
+                            // screen is taken back to it; the fresh screen that follows is then
+                            // the live one rather than the window they had left.
                             // Whatever this terminal was holding is no longer the session's screen.
                             // It is discarded before the fresh one is asked for, so nothing is
                             // drawn from it in between.
                             display.discard();
+                            // A marker means this terminal fell behind or was moved, which is the
+                            // session having gone on without it. A person following the live
+                            // screen is taken back to it, before the fresh screen is asked for, so
+                            // what arrives is the live one rather than the window they had left.
+                            if follow_live
+                                && parked.is_some()
+                                && let Ok(size) = terminal.size()
+                                && size.columns > 0
+                                && size.rows > 0
+                            {
+                                let request_id = kr_protocol::ids::RequestId::new(next_request);
+                                next_request += 1;
+                                let params =
+                                    kr_protocol::attachment::AttachmentViewportParams {
+                                        attachment_id,
+                                        dimensions: Dimensions::new(
+                                            u64::from(size.columns),
+                                            u64::from(size.rows),
+                                        ),
+                                        position: Nullable(None),
+                                    };
+                                if !send_geometry(
+                                    client,
+                                    descriptor,
+                                    request_id,
+                                    Method::AttachmentViewport,
+                                    &params,
+                                )
+                                .await
+                                {
+                                    return AttachOutcome::Disconnected;
+                                }
+                                outstanding.insert(request_id, Outstanding::Scrollback);
+                                parked = None;
+                            }
                             let request_id = kr_protocol::ids::RequestId::new(next_request);
                             next_request += 1;
                             if !resubscribe(client, descriptor, request_id, attachment_id).await {
@@ -935,9 +1055,9 @@ async fn drive(
                 }
                 outstanding.insert(request_id, what);
             }
-            () = hold_expiry(holding_prefix) => {
+            () = hold_expiry(prefix_deadline) => {
                 // Nothing came to finish it. What was held is the person's, and it goes now.
-                holding_prefix = false;
+                prefix_deadline = None;
                 let held = keys.release();
                 if !held.is_empty()
                     && let Some(epoch) = epoch
@@ -979,27 +1099,24 @@ async fn drive(
                 // full-screen application has its own use for these keys on a buffer that keeps no
                 // history, so they are this terminal's only while the shell's buffer is showing.
                 let mine = display.holds_screen() && display.showing_history_buffer();
-                let split = if mine {
-                    keys.take(&bytes)
+                let split = keys.take(&bytes, mine);
+                // The deadline belongs to the prefix, not to the read: one that is still waiting
+                // keeps the moment it started waiting, because a window that began again with
+                // every keystroke would never end.
+                prefix_deadline = if split.holding {
+                    prefix_deadline.or_else(|| Some(tokio::time::Instant::now() + PREFIX_DEADLINE))
                 } else {
-                    // Anything the reader was holding goes first, in the order it was typed.
-                    let mut input = keys.release();
-                    input.extend_from_slice(&bytes);
-                    Split {
-                        steps: 0,
-                        input,
-                        holding: false,
-                    }
+                    None
                 };
-                holding_prefix = split.holding;
                 // Several keys in one read are one movement, because a window is in one place: a
                 // request built from a position an earlier key had already moved would ask for
                 // somewhere nobody is.
-                if split.steps != 0
+                let movement = split.movement(parked);
+                if movement != 0
                     && let Ok(size) = terminal.size()
                     && size.columns > 0
                     && size.rows > 0
-                    && let Some(position) = scrolled(parked, split.steps, scroll_step(size.rows))
+                    && let Some(position) = scrolled(parked, movement, scroll_step(size.rows))
                 {
                     let request_id = kr_protocol::ids::RequestId::new(next_request);
                     next_request += 1;
@@ -1023,8 +1140,19 @@ async fn drive(
                         return AttachOutcome::Disconnected;
                     }
                     outstanding.insert(request_id, Outstanding::Scrollback);
+                    // Where this window is about to be, so a second key in the next read moves on
+                    // from here rather than from where the window was two keys ago. The answer
+                    // corrects it, because the session decides where a window actually lands.
+                    parked = landed(position);
                 }
-                let bytes = split.input;
+                // A click addresses a cell of the live screen, and a window above it is showing
+                // rows the application's grid does not have. Section 8 gives that its answer:
+                // input outside the visible grid has no application effect.
+                let bytes = if parked.is_some() && is_mouse_report(&split.input) {
+                    without_mouse_reports(split.input)
+                } else {
+                    split.input
+                };
                 if bytes.is_empty() {
                     continue;
                 }
@@ -1206,8 +1334,8 @@ async fn wait_for_resize(_resized: &mut Option<&mut WindowChanges>) {
 #[cfg(test)]
 mod tests {
     use super::{
-        PASTE_END, PASTE_START, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY, ScrollbackKeys, landed,
-        scroll_step, scrolled,
+        PASTE_END, PASTE_START, SCROLL_BACK_KEY, SCROLL_FORWARD_KEY, ScrollbackKeys,
+        is_mouse_report, landed, scroll_step, scrolled, without_mouse_reports,
     };
     use kr_protocol::attachment::ViewportPosition;
 
@@ -1215,16 +1343,28 @@ mod tests {
     #[test]
     fn the_scroll_back_keys_never_reach_the_session() {
         let mut keys = ScrollbackKeys::default();
-        let split = keys.take(SCROLL_BACK_KEY);
+        let split = keys.take(SCROLL_BACK_KEY, true);
         assert_eq!(split.steps, 1);
         assert!(
             split.input.is_empty(),
             "nothing of it is written into the application: {:?}",
             split.input
         );
-        let split = keys.take(SCROLL_FORWARD_KEY);
+        let split = keys.take(SCROLL_FORWARD_KEY, true);
         assert_eq!(split.steps, -1);
         assert!(split.input.is_empty());
+    }
+
+    /// And where they are not this terminal's, they are the application's, byte for byte.
+    #[test]
+    fn a_key_this_terminal_may_not_take_reaches_the_application() {
+        let mut keys = ScrollbackKeys::default();
+        let split = keys.take(SCROLL_BACK_KEY, false);
+        assert_eq!(split.steps, 0, "nothing moves");
+        assert_eq!(
+            split.input, SCROLL_BACK_KEY,
+            "and the key arrives as the key it is"
+        );
     }
 
     #[test]
@@ -1233,40 +1373,54 @@ mod tests {
         typed.extend_from_slice(SCROLL_BACK_KEY);
         typed.extend_from_slice(b"\r");
         typed.extend_from_slice(SCROLL_FORWARD_KEY);
-        typed.extend_from_slice(b"\x1b[5~\x1b");
+        typed.extend_from_slice(b"\x1b[5~x");
         let mut keys = ScrollbackKeys::default();
-        let split = keys.take(&typed);
+        let split = keys.take(&typed, true);
         assert_eq!(split.steps, 0, "one back and one forward is no movement");
         assert_eq!(
-            split.input, b"ls -l\r\x1b[5~\x1b",
-            "an unshifted Page Up and a lone Escape are the application's"
+            split.input, b"ls -l\r\x1b[5~x",
+            "an unshifted Page Up is the application's"
         );
-        assert!(
-            !split.holding,
-            "and a lone Escape is never held back: {:?}",
-            split.input
-        );
+        assert!(!split.holding);
     }
 
     /// A key split across two reads is still that key.
     #[test]
     fn a_sequence_split_across_two_reads_is_still_one_key() {
         let mut keys = ScrollbackKeys::default();
-        let first = keys.take(b"ls\x1b[5;");
+        let first = keys.take(b"ls\x1b[5;", true);
         assert_eq!(first.input, b"ls", "what was whole goes on");
         assert_eq!(first.steps, 0);
         assert!(first.holding, "and the beginning of the key waits");
-        let second = keys.take(b"2~");
+        let second = keys.take(b"2~", true);
         assert_eq!(second.steps, 1, "the two halves are one key");
         assert!(second.input.is_empty());
         assert!(!second.holding);
+    }
+
+    /// Including a split that falls after the escape, which is where a paste can begin.
+    #[test]
+    fn a_paste_that_begins_across_two_reads_is_still_a_paste() {
+        let mut keys = ScrollbackKeys::default();
+        let first = keys.take(b"\x1b", true);
+        assert!(first.holding, "an escape alone may be the start of a paste");
+        assert!(first.input.is_empty());
+        let mut rest = b"[200~".to_vec();
+        rest.extend_from_slice(SCROLL_BACK_KEY);
+        rest.extend_from_slice(PASTE_END);
+        let second = keys.take(&rest, true);
+        assert_eq!(second.steps, 0, "nothing inside a paste is a key");
+        let mut expected = PASTE_START.to_vec();
+        expected.extend_from_slice(SCROLL_BACK_KEY);
+        expected.extend_from_slice(PASTE_END);
+        assert_eq!(second.input, expected, "and the paste arrives whole");
     }
 
     /// And a beginning nothing completes is the person's, in the order they typed it.
     #[test]
     fn a_beginning_nothing_completes_is_given_back() {
         let mut keys = ScrollbackKeys::default();
-        let held = keys.take(b"\x1b[5;");
+        let held = keys.take(b"\x1b[5;", true);
         assert!(held.holding);
         assert_eq!(
             keys.release(),
@@ -1288,15 +1442,29 @@ mod tests {
         pasted.extend_from_slice(b"after");
         pasted.extend_from_slice(PASTE_END);
         let mut keys = ScrollbackKeys::default();
-        let split = keys.take(&pasted);
+        let split = keys.take(&pasted, true);
         assert_eq!(split.steps, 0, "nothing inside a paste is a key");
         assert_eq!(
             split.input, pasted,
             "and the paste reaches the session exactly as it arrived"
         );
-        // The key after the paste is a key again.
-        let after = keys.take(SCROLL_BACK_KEY);
-        assert_eq!(after.steps, 1);
+        let after = keys.take(SCROLL_BACK_KEY, true);
+        assert_eq!(after.steps, 1, "the key after the paste is a key again");
+    }
+
+    /// A paste that began while the keys were the application's is still a paste afterwards.
+    #[test]
+    fn a_paste_survives_the_keys_changing_hands() {
+        let mut keys = ScrollbackKeys::default();
+        let mut opened = PASTE_START.to_vec();
+        opened.extend_from_slice(b"first");
+        let split = keys.take(&opened, false);
+        assert_eq!(split.input, opened);
+        let mut rest = SCROLL_BACK_KEY.to_vec();
+        rest.extend_from_slice(PASTE_END);
+        let split = keys.take(&rest, true);
+        assert_eq!(split.steps, 0, "the paste is still open");
+        assert_eq!(split.input, rest, "so its bytes are still its own");
     }
 
     #[test]
@@ -1316,7 +1484,6 @@ mod tests {
             matches!(first, ViewportPosition::Above(rows) if rows.get() == 23),
             "a client with no row identifier above its page asks by distance: {first:?}"
         );
-        // The host answered with the row it landed on, and from there the window names it.
         let next = scrolled(Some(500), 1, 23)
             .expect("and keeps going back")
             .expect("somewhere");
@@ -1349,14 +1516,51 @@ mod tests {
         let mut typed = SCROLL_BACK_KEY.to_vec();
         typed.extend_from_slice(SCROLL_BACK_KEY);
         typed.extend_from_slice(SCROLL_BACK_KEY);
-        let split = keys.take(&typed);
-        assert_eq!(split.steps, 3);
-        let asked = scrolled(Some(500), split.steps, 23)
+        let split = keys.take(&typed, true);
+        assert_eq!(split.movement(Some(500)), 3);
+        let asked = scrolled(Some(500), split.movement(Some(500)), 23)
             .expect("three pages back is a movement")
             .expect("somewhere");
         assert!(
             matches!(asked, ViewportPosition::Row(row) if row.get() == 500 - 69),
             "three pages back from row 500, not one: {asked:?}"
+        );
+    }
+
+    /// The live screen is a floor: a window on it cannot go forward, so going back afterwards does.
+    #[test]
+    fn going_forward_from_the_live_screen_and_then_back_goes_back() {
+        let mut keys = ScrollbackKeys::default();
+        let mut typed = SCROLL_FORWARD_KEY.to_vec();
+        typed.extend_from_slice(SCROLL_BACK_KEY);
+        let split = keys.take(&typed, true);
+        assert_eq!(split.steps, 0, "the two cancel as a sum");
+        assert_eq!(
+            split.movement(None),
+            1,
+            "but a window on the live screen had nowhere forward to go, so it goes back one page"
+        );
+        assert_eq!(
+            split.movement(Some(500)),
+            0,
+            "while a window above it went forward and came back to where it was"
+        );
+    }
+
+    /// Section 8: input outside the visible grid has no application effect.
+    #[test]
+    fn a_click_on_a_history_row_reaches_no_application() {
+        assert!(is_mouse_report(b"\x1b[<0;10;4M"));
+        assert!(is_mouse_report(b"\x1b[M !!"));
+        assert!(!is_mouse_report(b"ls -l"));
+        let mut typed = b"ab".to_vec();
+        typed.extend_from_slice(b"\x1b[<0;10;4M");
+        typed.extend_from_slice(b"cd");
+        typed.extend_from_slice(b"\x1b[<0;10;4m");
+        assert_eq!(
+            without_mouse_reports(typed),
+            b"abcd",
+            "the reports go and the typing stays"
         );
     }
 

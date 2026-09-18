@@ -315,6 +315,18 @@ impl RestorationGuard {
         }
         let _ = self.child.wait();
     }
+
+    /// Hands the terminal back to the guard, which restores every part of it.
+    ///
+    /// For the caller whose own restoration failed, or never happened. Releasing tells the guard
+    /// the modes are already back and only the keyboard is owed; this says nothing of the kind, so
+    /// the guard puts back the modes, the screen modes and the keyboard, and this waits for it.
+    pub fn hand_back(mut self) {
+        // Closing the pipe is what the guard reads as the attach process being gone, which is the
+        // case it exists for.
+        self.release = None;
+        let _ = self.child.wait();
+    }
 }
 
 #[cfg(unix)]
