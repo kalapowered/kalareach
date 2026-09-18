@@ -315,7 +315,7 @@ impl OpenedRepository {
     pub fn read<'a>(&'a self, arguments: &'a [&'a OsStr]) -> GitRequest<'a> {
         GitRequest::read(&self.top_level, arguments)
             .with_drivers(self.audit.drivers.clone())
-            .writing(&[self.git_dir_path.as_path()])
+            .writing(&[(self.git_dir_path.as_path(), self.identity.git_dir)])
             .expecting(self.identity.work_tree)
     }
 
@@ -324,7 +324,7 @@ impl OpenedRepository {
     pub fn write<'a>(&'a self, arguments: &'a [&'a OsStr]) -> GitRequest<'a> {
         GitRequest::write(&self.top_level, arguments)
             .with_drivers(self.audit.drivers.clone())
-            .writing(&[self.git_dir_path.as_path()])
+            .writing(&[(self.git_dir_path.as_path(), self.identity.git_dir)])
             .expecting(self.identity.work_tree)
     }
 

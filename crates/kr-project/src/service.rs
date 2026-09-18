@@ -1726,7 +1726,7 @@ impl ProjectService {
                                 // the worktree goes. Nothing else outside the repository is
                                 // writable, so a `core.worktree` or an argument naming somewhere
                                 // else is refused by the boundary rather than noticed afterwards.
-                                .writing(&[reserved.display_path()])
+                                .writing(&[(reserved.display_path(), reserved.identity())])
                                 .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
                                 .with_cancellation(Arc::clone(&cancel)),
                         )?;

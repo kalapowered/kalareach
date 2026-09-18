@@ -578,11 +578,13 @@ and the enclosure is built from the directories this host opened rather than fro
 given. Three things it holds, whatever the repository's configuration says and whoever writes to the
 repository while Git is running.
 
-* **Only Git executes.** Git's own program and the helpers under Git's own directory, and the
-  approved broker's ssh program for a remote that needs one. A driver, filter, hook, credential
-  helper, pager or filesystem monitor planted anywhere else cannot be executed, whether it was
-  planted before this host read the configuration, between that reading and the moment Git started,
-  or while Git was running.
+* **Only Git executes.** Git's own program and the helpers under Git's own directory, the approved
+  broker's ssh program for a remote that needs one, and the system shell for an invocation that
+  reaches a repository over Git's own transport, because Git builds its connection and its call to a
+  credential helper as command strings for it. A driver, filter, hook, credential helper, pager or
+  filesystem monitor planted anywhere else cannot be executed, whether it was planted before this
+  host read the configuration, between that reading and the moment Git started, or while Git was
+  running.
 * **Only this operation's network.** A local operation reaches no address at all and nothing may
   listen. An operation that reaches a remote may open outbound connections on the ports its
   transport uses and resolve the remote's name, and nothing may listen there either.
@@ -597,10 +599,17 @@ starts inside the directory this host opened rather than at a name, so a tree pu
 afterwards is not the tree Git works in and is never written to, and the invocation either produces
 the verified tree's result or fails with this host's declared answer.
 
-What it does not confine is reading. Git reads the system's shared libraries, its locale data and
-its certificate store, and a read confinement that missed one of those would fail an operation for a
-reason that has nothing to do with safety. What a repository can reach by reading is what the account
-this host runs as can reach, exactly as before.
+What it does not confine, on the two platforms whose mechanism separates the two, is reading. Git
+reads the system's shared libraries, its locale data and its certificate store, and a read
+confinement that missed one of those would fail an operation for a reason that has nothing to do
+with safety. What a repository can reach by reading is what the account this host runs as can reach,
+exactly as before.
+
+Where a guarantee cannot be enforced from outside Git, the operation that needs it is refused rather
+than run under checks that notice afterwards: a kernel too old to mediate the filesystem rights this
+rests on runs no Git, one too old to say which addresses a process may reach runs no remote
+operation, and a Windows host whose Git is installed somewhere an ordinary account may not change
+runs neither.
 
 `docs/project/` and `crates/kr-project/README.md` say which mechanism holds which guarantee on each
 platform, and what a platform refuses rather than pretends.

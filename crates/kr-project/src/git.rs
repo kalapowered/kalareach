@@ -54,9 +54,8 @@ use std::time::{Duration, Instant};
 
 use kr_protocol::ids::EnvironmentId;
 use kr_protocol::project::{GIT_READ_DEADLINE, MAX_GIT_OUTPUT_BYTES, RemoteTransport};
-use kr_transfer::ObjectIdentity;
 
-use crate::boundary::{Confinement, Reach, WorkingDirectory};
+use crate::boundary::{Confinement, ObjectIdentity, OpenedDirectory, Reach};
 use crate::error::{ProjectError, Result};
 
 /// The minimum Git version this host will use.
@@ -510,16 +509,19 @@ pub struct RestrictedProfile {
 pub struct Interposition(Interposed);
 
 /// What an interposition does, as the fixtures hand it over.
+///
+/// It is given the invocation as [`GitRequest::describe`] reads it, the directory that invocation
+/// runs in, and its private temporary directory.
 #[cfg(feature = "git-fixtures")]
-pub type Interposed = Arc<dyn Fn(&str, &Path) + Send + Sync>;
+pub type Interposed = Arc<dyn Fn(&str, &Path, &Path) + Send + Sync>;
 
 #[cfg(feature = "git-fixtures")]
 impl Interposition {
     /// Builds one from what it does.
     ///
-    /// It is given the invocation as [`GitRequest::describe`] reads it and this invocation's
-    /// private temporary directory, so a fixture can act before one particular spawn rather than
-    /// before all of them, which is what makes the window it acts in the real one.
+    /// A fixture can act before one particular spawn rather than before all of them, which is what
+    /// makes the window it acts in the real one, and it is told which directory that spawn runs in
+    /// so that it can act on the repository the invocation is actually for.
     #[must_use]
     pub fn new(act: Interposed) -> Self {
         Self(act)
@@ -641,6 +643,19 @@ impl RestrictedProfile {
         })
     }
 
+    /// Returns every program one invocation may execute, besides the helpers under Git's own
+    /// directory.
+    ///
+    /// Compiled with the fixtures, so a test can state what an invocation's execution list is
+    /// without starting one.
+    #[cfg(feature = "git-fixtures")]
+    #[must_use]
+    pub fn execution_list(&self, request: &GitRequest<'_>) -> Vec<PathBuf> {
+        let mut programs = vec![self.git.executable().to_owned()];
+        programs.extend(helpers(request, self.git.exec_path()));
+        programs
+    }
+
     /// Runs something between the reading of a repository's configuration and the start of a Git
     /// child, which is the window the boundary exists for.
     ///
@@ -703,18 +718,18 @@ impl RestrictedProfile {
         // Opened once, here, and handed to the child. Everything the boundary is built from is
         // resolved in this moment rather than one after another.
         let working =
-            WorkingDirectory::open(self.environment_id, request.directory, request.expected)?;
+            OpenedDirectory::open(self.environment_id, request.directory, request.expected)?;
         // One directory per invocation, which nothing else can reach and which goes away with the
         // invocation. It is where Git puts its temporary files, so a Git that needed one does not
         // reach for a shared directory it is not confined to.
         let temporary = PrivateTemporary::create(&self.temporary, &request.describe())?;
-        let confinement = self.confinement(request, &working, temporary.path())?;
+        let confinement = self.confinement(request, working, temporary.path())?;
         let arguments = self.argument_vector(request);
         let environment = self.environment(request, temporary.path());
         let described = request.describe();
         #[cfg(feature = "git-fixtures")]
         if let Some(interposition) = self.interposition.as_ref() {
-            interposition.0(&described, temporary.path());
+            interposition.0(&described, confinement.working.path(), temporary.path());
         }
         let mut child = crate::boundary::start(
             &crate::boundary::Invocation {
@@ -724,7 +739,6 @@ impl RestrictedProfile {
                 described: &described,
             },
             &confinement,
-            &working,
         )?;
         let out = child.stdout().map(read_bounded);
         let err = child.stderr().map(read_bounded);
@@ -809,30 +823,39 @@ impl RestrictedProfile {
     fn confinement(
         &self,
         request: &GitRequest<'_>,
-        working: &WorkingDirectory,
+        working: OpenedDirectory,
         temporary: &Path,
     ) -> Result<Confinement> {
-        let mut writable = vec![working.path().to_owned()];
-        for directory in &request.writable {
-            let resolved =
-                std::fs::canonicalize(directory).map_err(|error| ProjectError::Destination {
-                    detail: format!(
-                        "{} could not be resolved as a directory this invocation may write in: \
-                         {error}",
-                        redact(&directory.display().to_string())
-                    )
-                    .into(),
-                })?;
-            if !writable.contains(&resolved) {
-                writable.push(resolved);
+        let mut reserved = Vec::new();
+        for (directory, identity) in &request.writable {
+            if *directory == working.path() {
+                continue;
             }
+            reserved.push(OpenedDirectory::open(
+                self.environment_id,
+                directory,
+                Some(*identity),
+            )?);
         }
+        // This host made it a moment ago inside its own state directory, so there is no earlier
+        // record for it to be required to match.
+        let temporary = OpenedDirectory::open(self.environment_id, temporary, None)?;
         Ok(Confinement {
             program: self.git.executable().to_owned(),
             exec_path: self.git.exec_path().to_owned(),
-            helpers: helpers(request),
-            writable,
-            temporary: temporary.to_owned(),
+            helpers: helpers(request, self.git.exec_path()),
+            working,
+            reserved,
+            temporary,
+            // Where a platform's mechanism confines reading as well as writing, these are what Git
+            // reads that lie outside the directories the operation owns.
+            readable: vec![
+                self.git.program().to_owned(),
+                self.empty_config.clone(),
+                self.hooks.clone(),
+                self.template.clone(),
+                self.home.clone(),
+            ],
             reach: Reach::for_transport(request.transport, request.remote_port),
         })
     }
@@ -1204,12 +1227,15 @@ pub struct GitRequest<'a> {
     pub ssh_program: Option<&'a Path>,
     /// The port the validated remote named, when it named one of its own.
     pub remote_port: Option<u16>,
-    /// The directories this invocation may write in besides the one it runs in.
+    /// The directories this invocation may write in besides the one it runs in, each with the
+    /// object it must still be.
     ///
-    /// The repository's Git common directory for a linked worktree, and the destination an
-    /// operation reserved. Everything else is outside the boundary, so a write there is refused by
-    /// the operating system rather than noticed afterwards.
-    pub writable: Vec<&'a Path>,
+    /// The repository's Git common directory, and the destination an operation reserved. Each is
+    /// opened and required to be that object before the boundary is built around it, so a
+    /// directory substituted at one of those names is not something this invocation may write in.
+    /// Everything else is outside the boundary, so a write there is refused by the operating system
+    /// rather than noticed afterwards.
+    pub writable: Vec<(&'a Path, ObjectIdentity)>,
     /// The object the directory must still be, when the caller recorded one.
     pub expected: Option<ObjectIdentity>,
     /// The driver sections and names the audit found, each blanked by name.
@@ -1295,10 +1321,10 @@ impl<'a> GitRequest<'a> {
 
     /// Adds directories this invocation may write in besides the one it runs in.
     #[must_use]
-    pub fn writing(mut self, writable: &[&'a Path]) -> Self {
+    pub fn writing(mut self, writable: &[(&'a Path, ObjectIdentity)]) -> Self {
         for directory in writable {
             if !self.writable.contains(directory) {
-                self.writable.push(directory);
+                self.writable.push(*directory);
             }
         }
         self
@@ -1971,19 +1997,17 @@ fn search_path(file_name: &str) -> Option<PathBuf> {
 /// a clone that checks nothing out, so nothing in it consults a repository's attributes and there
 /// is no driver, filter or hook for a repository to reach either program through. Every other
 /// invocation executes Git and the helpers under Git's own directory and nothing else at all.
-fn helpers(request: &GitRequest<'_>) -> Vec<PathBuf> {
+fn helpers(request: &GitRequest<'_>, exec_path: &Path) -> Vec<PathBuf> {
     let mut helpers = Vec::new();
     if let Some(program) = request.ssh_program {
         helpers.push(program.to_owned());
     }
-    if request.transport.is_some_and(|transport| {
-        matches!(transport, RemoteTransport::LocalPath | RemoteTransport::Ssh)
-    }) {
-        // An https remote needs none: Git executes its own `git-remote-https` directly. A local
-        // path and an ssh remote are both started as a command string, which is the shell.
-        for shell in crate::boundary::CONNECTION_SHELL {
-            helpers.push(PathBuf::from(shell));
-        }
+    if request.transport.is_some() {
+        // Git builds two things as command strings and starts them through the system shell: its
+        // connection to a repository, and its call to a credential helper. Both belong to an
+        // invocation that reaches a remote or another repository, and every one of those is a clone
+        // that checks nothing out.
+        helpers.extend(crate::boundary::connection_shell(exec_path));
     }
     helpers
 }
@@ -1997,6 +2021,9 @@ fn helpers(request: &GitRequest<'_>) -> Vec<PathBuf> {
 #[derive(Debug)]
 struct PrivateTemporary {
     path: PathBuf,
+    /// The directory itself, opened when it was made. Taking it away goes through this rather than
+    /// through the name, so a directory somebody put at the name afterwards is not what is removed.
+    handle: Option<cap_std::fs::Dir>,
 }
 
 impl PrivateTemporary {
@@ -2025,6 +2052,13 @@ impl PrivateTemporary {
                 )
                 .into(),
             })?;
+        let handle = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())
+            .map_err(|error| ProjectError::StagingUnavailable {
+                detail: format!(
+                    "{described}'s own temporary directory could not be opened: {error}"
+                )
+                .into(),
+            })?;
         // The boundary's rules are written against a path with no link left in it, and the state
         // directory above this one may reach it through one.
         let path =
@@ -2034,7 +2068,10 @@ impl PrivateTemporary {
                 )
                 .into(),
             })?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            handle: Some(handle),
+        })
     }
 
     /// Returns where it is.
@@ -2045,9 +2082,12 @@ impl PrivateTemporary {
 
 impl Drop for PrivateTemporary {
     fn drop(&mut self) {
-        // Nothing but this invocation's Git could have written here, because nothing else was ever
-        // told where it is and the boundary let nothing else in.
-        let _ = std::fs::remove_dir_all(&self.path);
+        // Through the handle this host opened when it made the directory, rather than through the
+        // name it gave it. A same-account writer can move a directory aside and put another at the
+        // name; what this removes is the object, so the substitute is left where it is.
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.remove_open_dir_all();
+        }
     }
 }
 

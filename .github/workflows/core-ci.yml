@@ -70,6 +70,16 @@ jobs:
       - name: Test
         run: cargo test --locked --workspace
 
+      # The project service encloses every Git invocation in a boundary the kernel applies, and what
+      # that boundary is differs by platform. This runs its tests again on their own and prints what
+      # this runner's kernel and Git are, so a pass or a failure here names the system it happened
+      # on rather than leaving it to be inferred.
+      - name: Repository boundary
+        run: |
+          uname -srm
+          git --version
+          cargo test --locked -p kr-project --test boundary -- --nocapture
+
       - name: Generated protocol schema is current
         run: cargo run --locked -p kr-protocol --bin kr-protocol-gen -- --check
 

@@ -5,7 +5,10 @@
 //! rule stated once: where a guarantee cannot be enforced from outside Git, the operation that
 //! needs it is refused rather than run under checks that notice afterwards.
 
-use super::Confinement;
+use std::ffi::OsString;
+use std::path::PathBuf;
+
+use super::{Confinement, Invocation};
 use crate::error::{ProjectError, Result};
 
 /// What the boundary is, for a person reading a record.
@@ -18,6 +21,15 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    /// Returns the program the child executes and the arguments it runs with.
+    ///
+    /// # Panics
+    ///
+    /// Never: no value of this type exists.
+    pub fn command(&self, _invocation: &Invocation<'_>) -> (PathBuf, Vec<OsString>) {
+        match self.never {}
+    }
+
     /// Applies the boundary to this process.
     ///
     /// # Errors

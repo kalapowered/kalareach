@@ -16,8 +16,8 @@ path, in between. Reading again notices that afterwards. It does not undo a help
 write that landed in the wrong tree.
 
 So the invocation is also enclosed, by the operating system, from outside Git. The enclosure is
-built from the directories this service opened, applied to the child before Git exists, and gone
-when the invocation ends.
+built from the objects this service opened, applied to the child before Git exists, and gone when
+the invocation ends.
 
 ## What it holds
 
@@ -27,42 +27,50 @@ helper, pager, filesystem monitor or `core.sshCommand` planted anywhere else —
 the staging directory, in the invocation's own temporary directory — cannot be executed, whenever it
 was planted.
 
-One addition, and it is exactly bounded. Git starts its connection to a repository over its own
-transport as a command string, which the system shell runs, so an invocation that clones from a
-local path or over ssh has that shell in its list as well. Every such invocation is a clone that
-checks nothing out: nothing in one consults a repository's attributes, so nothing in one looks for a
-driver, filter or hook, so there is nothing in one for a repository to reach the shell through. The
-checkout that follows is a separate invocation whose list holds no shell at all.
+One addition, and it is exactly bounded. Git builds two things as command strings and starts them
+through the system shell: its connection to a repository over its own transport, and its call to a
+credential helper. So an invocation that clones — from a local path, over ssh or over https — has
+that shell in its execution list as well. Every such invocation is a clone that checks nothing out:
+no attribute is consulted, so no driver, filter or text conversion is looked for, and a hook is
+looked for in a directory this service owns and keeps empty, which is a fixed override rather than
+anything the clone decides. The checkout that follows is a separate invocation whose execution list
+holds no shell at all, and it is the one that consults the repository's attributes.
 
 **Only this operation's network.** A local operation reaches no address and nothing may listen. An
 operation that reaches a remote may open outbound connections on the ports its transport uses — 443
 and 80 for https, 22 for ssh, and the port the validated remote URL named where it named one — and
-resolve the remote's name. Nothing may listen there either.
+resolve the remote's name. Nothing may listen there either. The table below says where the port list
+is enforced and where it is not.
 
 **Only this operation's directories are written.** The repository's working tree and its Git common
 directory, the destination the operation reserved, and one temporary directory created for this
 invocation and removed with it. Git's temporary files go in that directory rather than in one shared
-with everything else on the machine.
+with everything else on the machine, and it is taken away through the handle this service opened
+when it made it rather than through the name it gave it.
 
-**The child starts in a directory rather than at a name.** This service opens the directory, records
-the object it opened, and the child moves into that open directory before the boundary is applied and
-before Git runs, with `-C .` as its only directory argument. A tree substituted at the name
-afterwards is therefore not the tree Git works in. The boundary's own rules name paths, because that
-is what the mechanisms take, so a substitution moves the verified tree out from under them: the
-invocation fails with this service's declared answer and the substituted tree is never written.
+**Directories, not names.** Every directory the boundary is built from is opened first and required
+to be the object its record names: the working tree by the identity the repository's record carries,
+the Git common directory by its own, the reserved destination by the identity the reservation
+returned. A directory substituted at one of those names is refused before anything starts. The child
+then does not start at a path either: it moves into the open working directory before the boundary
+is applied and before Git runs, with `-C .` as its only directory argument. A tree substituted at
+the name afterwards is not the tree Git works in; the invocation fails with this service's declared
+answer and the substituted tree is never written.
 
-**Reads are not confined.** Git reads the system's shared libraries, its locale data and its
-certificate store, and a read confinement that missed one of those would fail an operation for a
-reason that has nothing to do with safety. What a repository can reach by reading is what the account
-the service runs as can reach, as it was before.
+**Reads are not confined on macOS or Linux.** Git reads the system's shared libraries, its locale
+data and its certificate store, and a read confinement that missed one of those would fail an
+operation for a reason that has nothing to do with safety. What a repository can reach by reading is
+what the account the service runs as can reach, as it was before. Windows is the exception: its
+mechanism confines reading with everything else, and what an invocation reads outside the
+directories the operation owns is granted by name.
 
 ## Which mechanism holds which guarantee
 
 | | macOS | Linux | Windows |
 | --- | --- | --- | --- |
-| Execution | A sandbox profile compiled into the child before it runs Git, permitting `process-exec` on Git's program and helper directory and nothing else | Landlock, with the execute right on Git's program and helper directory and nowhere else | An application container whose grants on the repository carry read and write and no execute right, and read and execute on Git's own installation |
-| Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP rules for a remote operation, and a system-call filter that refuses a local one an internet socket at all and refuses every one of them a listening socket | The container's capabilities: the client capability for a remote operation and none at all for a local one |
-| Writes | The same profile, which permits `file-write` under the operation's own directories and nowhere else | Landlock's write rights on those directories, never with the execute right | The container's grants on those directories |
+| Execution | A sandbox profile permitting `process-exec` on Git's program and helper directory and nothing else, applied by the system's own launcher before it runs Git | Landlock, with the execute right on Git's program and helper directory and nowhere else | An application container granted read and write on the repository, and **refused** the execute right there, so no other permission the repository carries can add it back |
+| Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that refuses a local one an internet socket at all and refuses every one of them a listening or raw socket | The container's capabilities: none at all for a local operation, and the client capability for a remote one. **The port list is not enforced here**; see below |
+| Writes | The same profile, which permits `file-write` under the operation's own directories and nowhere else | Landlock's write rights, attached to the opened objects rather than to their names, and never carrying the execute right | The container's grants on those directories |
 | Descendants | The child leads its own process group, and ending it ends the group | The same | A job object the process is created inside, which it cannot leave and which ends everything in it |
 
 ## What a platform refuses rather than pretends
@@ -70,29 +78,47 @@ the service runs as can reach, as it was before.
 Where a guarantee cannot be enforced from outside Git, the operation that needs it is refused. None
 of these falls back to reading the configuration and hoping.
 
-* **A kernel with no Landlock** cannot enclose an invocation at all, and none is run. A host in that
-  position runs the service inside a bubblewrap container, which gives the same confinement from one
-  level up.
-* **A kernel whose Landlock cannot restrict which addresses a process reaches** (before the fourth
-  interface version, which arrived in Linux 6.7) refuses an operation that needs a remote. Local
-  operations still run: their filesystem confinement is the same, and the system-call filter that
-  refuses them an internet socket does not depend on the kernel's Landlock version.
+* **A kernel older than Linux 6.2** cannot mediate truncation, so a process could shorten a file the
+  boundary never made writable. No Git is run there. A host in that position runs the service inside
+  a bubblewrap container, which gives the same confinement one level up; that container is something
+  an operator builds, not something this service starts.
+* **A kernel older than Linux 6.7** has no rules for which addresses a process reaches, so an
+  operation that needs a remote is refused there. Local operations still run: their filesystem
+  confinement is the same, and the system-call filter that refuses them an internet socket does not
+  depend on the kernel's Landlock version.
 * **A machine whose system calls this service does not hold the numbers for** refuses every
   invocation rather than installing a filter that would not mean what it says.
-* **A Windows host where Git is installed somewhere only an administrator may change** cannot be
-  granted to the container, so the grant fails and the invocation is refused. Every grant this
-  service makes is attempted before anything starts and taken away again when the invocation ends.
+* **A host with no launcher to apply a sandbox profile with**, or **no shell for an invocation that
+  has to reach a repository**, refuses that invocation rather than running it unenclosed.
+* **A Windows host where Git is installed somewhere only an administrator may change** — the
+  ordinary `C:\Program Files\Git` among them — cannot have the container granted read and execute
+  there, so the grant fails and the invocation is refused. That is a real limit of this mechanism on
+  an ordinary installation rather than a corner case.
 * **A platform with none of these mechanisms** runs no Git at all.
 
 ## What is left
 
-Two things, stated rather than implied.
+Stated rather than implied.
 
-The boundary's rules name paths, because every platform's mechanism takes paths. The object the
-child works in is the one this service opened, so a substitution cannot redirect it; what a
-substitution can do is make the invocation fail, which is the declared answer rather than a silent
-one.
+**Two of the three mechanisms write their rules against paths**, because that is what they take. The
+object the child works in is the one this service opened, so a substitution cannot redirect it; what
+a substitution can do is make the invocation fail, which is the declared answer rather than a silent
+one. Landlock is the exception: its rules are attached to the opened objects themselves.
 
-A repository's configuration can still make Git refuse to do something, produce a limitation or
+**A remote operation's non-TCP traffic on Linux is not bounded by address.** Landlock's rules cover
+TCP, and a system-call filter reads scalar arguments while an address is behind a pointer. Turning a
+host name into an address is what needs it. So for a remote operation on Linux the port list is a
+TCP guarantee; a local operation has no internet socket at all and the question does not arise.
+
+**The port list is not enforced on Windows.** An application container's capability permits reaching
+the network or nothing at all; bounding which ports it reaches needs a system-wide filtering policy
+an ordinary account cannot set. A local operation there still reaches no address, which is the half
+of the guarantee the capability does express.
+
+**A Windows grant whose removal fails is left behind.** Each is taken away when the invocation ends
+and the container profile is deleted with it, and a removal that fails is not pretended otherwise:
+what remains names a container that no longer exists.
+
+**A repository's configuration can still make Git refuse to do something**, produce a limitation or
 name a helper this service will not run. That is the restricted profile's business and it is
 unchanged: the boundary is in addition to the configuration neutralisation, not instead of it.

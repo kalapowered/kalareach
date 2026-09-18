@@ -12,12 +12,14 @@
 //! outside Git, and it holds whatever the repository's configuration says and whoever writes to the
 //! repository while Git is running. It enforces three things.
 //!
-//! 1. **Only Git executes.** The Git program, the helpers under Git's own `--exec-path`, and the
-//!    approved broker's ssh program for a remote that needs one. A driver, filter, hook, credential
-//!    helper, pager, fsmonitor or `core.sshCommand` anywhere else — in the repository, in the
-//!    staging directory, in this invocation's private temporary directory — cannot be executed,
-//!    whether it was planted before the configuration was read, between the reading and the spawn,
-//!    or while Git is running.
+//! 1. **Only Git executes.** The Git program, the helpers under Git's own `--exec-path`, the
+//!    approved broker's ssh program for a remote that needs one, and — only for an invocation that
+//!    reaches a repository over Git's own transport, whatever that transport is — the shell Git
+//!    builds its connection and its call to a credential helper as a command string for.
+//!    A driver, filter, hook, credential helper, pager or fsmonitor anywhere else — in the
+//!    repository, in the staging directory, in this invocation's private temporary directory —
+//!    cannot be executed, whether it was planted before the configuration was read, between the
+//!    reading and the spawn, or while Git is running.
 //! 2. **Only this operation's network.** A local operation reaches nothing at all. A remote
 //!    operation may open outbound connections to the ports its transport uses and resolve the
 //!    remote's name, and nothing may listen.
@@ -25,36 +27,46 @@
 //!    common directory, the destination this operation reserved, and one private temporary
 //!    directory that exists for the length of the invocation. Everything else is read-only.
 //!
-//! Reads are not confined, and this is deliberate: Git reads the system's shared libraries, its
-//! locale data and its certificate store, and a read confinement that missed one of those would
-//! fail an operation for a reason that has nothing to do with safety. What a repository can reach
-//! by reading is bounded by the account the service runs as, exactly as it was before.
+//! Reads are not confined on macOS or Linux, and this is deliberate: Git reads the system's shared
+//! libraries, its locale data and its certificate store, and a read confinement that missed one of
+//! those would fail an operation for a reason that has nothing to do with safety. What a repository
+//! can reach by reading is bounded by the account the service runs as, exactly as it was before.
+//! Windows is the exception, because the mechanism there confines reading with everything else, and
+//! what an invocation reads outside the directories the operation owns is granted by name.
 //!
-//! ## The tree the child is given
+//! ## Directories, not names
 //!
-//! The child does not start at a path. The parent opens the directory, records the object it
-//! opened, and the child moves into that open directory before the boundary is applied and before
-//! Git runs, with `-C .` as its only directory argument. A tree substituted at the path afterwards
-//! is therefore not the tree Git works in. The boundary's own rules do name paths, because that is
-//! what the platforms' mechanisms take, so a substitution moves the verified tree out from under
-//! them and its writes are refused: the run fails with this host's declared result and the
-//! substituted tree is never written.
+//! Every directory the boundary is built from is opened first and required to be the object the
+//! record names: the working tree by the identity the repository's record carries, the Git common
+//! directory by its own, the reserved destination by the identity the reservation returned. The
+//! child then does not start at a path either: it moves into the open working directory before the
+//! boundary is applied and before Git runs, with `-C .` as its only directory argument. A tree
+//! substituted at a name afterwards is therefore neither the tree Git works in nor a tree the
+//! boundary was built around.
+//!
+//! What remains is that two of the three mechanisms write their rules against paths, because that
+//! is what they take. A substitution after the rules are built moves the verified tree out from
+//! under them, so its writes are refused and the run fails with this host's declared result; the
+//! substituted tree is not written either, because Git never names it. On Linux the rules are
+//! attached to the opened objects themselves, so nothing is left there at all.
 //!
 //! ## What enforces what
 //!
 //! | Platform | Execution | Network | Writes |
 //! | --- | --- | --- | --- |
-//! | macOS | A per-invocation sandbox profile compiled in the child before `exec` | The same profile | The same profile |
-//! | Linux | Landlock, with the execute right only on Git's own program and helper directory | Landlock's TCP rules for a remote operation, and a seccomp filter that refuses an IP socket to a local one | Landlock |
-//! | Windows | An AppContainer whose grants on the repository carry no execute right | The AppContainer's capabilities: none at all for a local operation | The AppContainer's grants, inside a job object that ends every descendant |
+//! | macOS | A per-invocation sandbox profile, applied by the system's own launcher before it runs Git | The same profile | The same profile |
+//! | Linux | Landlock, with the execute right only on Git's own program and helper directory | Landlock's TCP rules for a remote operation, and a system-call filter that refuses a local one an internet socket | Landlock, from the opened directory handles |
+//! | Windows | An application container whose grants on the repository carry no execute right | The container's capabilities: none at all for a local operation | The container's grants, inside a job object that ends every descendant |
 //!
 //! A platform that cannot establish its boundary refuses the invocation. Nothing here falls back to
 //! reading the configuration and hoping.
 
 use std::path::{Path, PathBuf};
 
+use kr_protocol::ids::EnvironmentId;
 use kr_protocol::project::RemoteTransport;
-use kr_transfer::{AuthorisedDirectory, ObjectIdentity};
+use kr_transfer::AuthorisedDirectory;
+pub use kr_transfer::ObjectIdentity;
 
 use crate::error::{ProjectError, Result};
 
@@ -78,10 +90,12 @@ use self::unsupported as platform;
 #[cfg(windows)]
 use self::windows as platform;
 
+#[cfg(all(target_os = "macos", any(test, feature = "git-fixtures")))]
+pub use self::macos::profile_text;
 #[cfg(unix)]
-pub use self::unix::Spawned;
+pub use self::unix::{Spawned, start};
 #[cfg(windows)]
-pub use self::windows::Spawned;
+pub use self::windows::{Spawned, start};
 
 /// What mechanism encloses an invocation on this platform, for a person reading a record.
 pub const MECHANISM: &str = platform::MECHANISM;
@@ -95,23 +109,6 @@ pub const HTTPS_PORTS: &[u16] = &[80, 443];
 
 /// The port an ssh remote is reached on.
 pub const SSH_PORTS: &[u16] = &[22];
-
-/// The shell Git starts a connection through, and what that shell itself hands off to.
-///
-/// Git builds its connection to a repository as one command string and starts it through the
-/// system shell, so an invocation that reaches a repository over Git's own transport cannot run
-/// without one. It is in the execution list for exactly those invocations, and every one of them is
-/// a clone that does not check anything out: no attribute is consulted, so no driver, filter or
-/// hook is looked for, so there is nothing in one for a repository to reach the shell through. The
-/// checkout that follows is a separate invocation, and its list holds no shell at all.
-///
-/// On this platform `/bin/sh` re-executes the shell it is a variant of, so both are named.
-#[cfg(target_os = "macos")]
-pub const CONNECTION_SHELL: &[&str] = &["/bin/sh", "/bin/bash"];
-
-/// The shell Git starts a connection through.
-#[cfg(not(target_os = "macos"))]
-pub const CONNECTION_SHELL: &[&str] = &["/bin/sh"];
 
 /// What one invocation may reach over the network.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -158,20 +155,20 @@ impl Reach {
 
 /// An opened directory, the object it was opened on, and the path that object had.
 ///
-/// The handle is the authority. The path is what the boundary's own rules are written against,
-/// because every platform's mechanism takes paths, and it is recorded here so that the two are
-/// resolved at the same moment rather than one after the other.
+/// The handle is the authority. The path is what two of the three mechanisms write their rules
+/// against, because that is what they take, and it is resolved here beside the handle rather than
+/// separately from it.
 #[derive(Debug)]
-pub struct WorkingDirectory {
-    environment_id: kr_protocol::ids::EnvironmentId,
+pub struct OpenedDirectory {
+    environment_id: EnvironmentId,
     directory: AuthorisedDirectory,
     path: PathBuf,
     identity: ObjectIdentity,
     created_at_ms: Option<u64>,
 }
 
-impl WorkingDirectory {
-    /// Opens the directory an invocation runs in and records the object that was opened.
+impl OpenedDirectory {
+    /// Opens one directory and requires it to be the object a record names.
     ///
     /// # Errors
     ///
@@ -179,7 +176,7 @@ impl WorkingDirectory {
     /// cannot be resolved, and [`ProjectError::IdentityChanged`] when the caller recorded an
     /// identity and the object at the path is a different one.
     pub fn open(
-        environment_id: kr_protocol::ids::EnvironmentId,
+        environment_id: EnvironmentId,
         path: &Path,
         expected: Option<ObjectIdentity>,
     ) -> Result<Self> {
@@ -191,7 +188,7 @@ impl WorkingDirectory {
             return Err(ProjectError::IdentityChanged {
                 detail: format!(
                     "this record names the directory {expected}, and {} holds {identity}; the \
-                     invocation is not started against it",
+                     invocation is not enclosed around it",
                     crate::git::redact(&path.display().to_string())
                 )
                 .into(),
@@ -201,7 +198,7 @@ impl WorkingDirectory {
         // is resolved once, here, beside the handle rather than at each rule.
         let resolved = std::fs::canonicalize(path).map_err(|error| ProjectError::Destination {
             detail: format!(
-                "{} could not be resolved to the directory the invocation runs in: {error}",
+                "{} could not be resolved to a directory this invocation may use: {error}",
                 crate::git::redact(&path.display().to_string())
             )
             .into(),
@@ -216,7 +213,7 @@ impl WorkingDirectory {
         })
     }
 
-    /// Returns the handle the child is started in.
+    /// Returns the handle. On Linux it is what the rules themselves are attached to.
     #[must_use]
     pub const fn handle(&self) -> &AuthorisedDirectory {
         &self.directory
@@ -281,36 +278,37 @@ fn created_at_ms(directory: &cap_std::fs::Dir) -> Option<u64> {
 }
 
 /// Everything one invocation is allowed to do, as the boundary is built from it.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Confinement {
     /// The Git program the child executes.
     pub program: PathBuf,
     /// Git's own helper directory. Everything Git runs for itself lives under it.
     pub exec_path: PathBuf,
-    /// A program the approved broker lends this operation, such as ssh for an ssh remote.
+    /// The programs outside Git's own installation this one invocation may execute.
     pub helpers: Vec<PathBuf>,
-    /// The directories this invocation may write in, resolved.
-    pub writable: Vec<PathBuf>,
-    /// The private temporary directory this invocation owns, resolved.
-    pub temporary: PathBuf,
+    /// The directory the child starts in, as the object this host opened.
+    pub working: OpenedDirectory,
+    /// The other directories this operation owns: a repository's Git common directory, a
+    /// destination the operation reserved. Each is the object its record names.
+    pub reserved: Vec<OpenedDirectory>,
+    /// The private temporary directory this invocation owns for its own length.
+    pub temporary: OpenedDirectory,
+    /// Directories the invocation must be able to read where the platform's mechanism confines
+    /// reading as well as writing.
+    pub readable: Vec<PathBuf>,
     /// What it may reach over the network.
     pub reach: Reach,
 }
 
 impl Confinement {
-    /// Returns every directory the invocation may write in, the temporary one included.
-    #[must_use]
-    pub fn written(&self) -> Vec<&Path> {
-        let mut written: Vec<&Path> = self
-            .writable
-            .iter()
-            .map(std::path::PathBuf::as_path)
-            .collect();
-        written.push(&self.temporary);
-        written
+    /// Returns every directory the invocation may write in, in the order the rules are made.
+    pub fn written(&self) -> impl Iterator<Item = &OpenedDirectory> {
+        std::iter::once(&self.working)
+            .chain(self.reserved.iter())
+            .chain(std::iter::once(&self.temporary))
     }
 
-    /// Returns every program the invocation may execute.
+    /// Returns every program the invocation may execute, besides Git's own helper directory.
     #[must_use]
     pub fn executables(&self) -> Vec<&Path> {
         let mut programs: Vec<&Path> = vec![&self.program];
@@ -332,19 +330,51 @@ pub struct Invocation<'a> {
     pub described: &'a str,
 }
 
-/// Starts one Git invocation inside its boundary.
+/// Returns the shell Git starts a connection through on this platform.
+///
+/// Git builds its connection to a repository, and its call to a credential helper, as one command
+/// string and starts it through the system shell, so an invocation that reaches a repository over
+/// Git's own transport cannot run without one. It is in the execution list for exactly those
+/// invocations, and every one of them is a clone that does not check anything out: no attribute is
+/// consulted, so no driver, filter or text conversion is looked for, and a hook is looked for in a
+/// directory this host owns and keeps empty, which is a fixed override rather than anything the
+/// clone decides. So there is nothing in one of those invocations for a repository to reach the
+/// shell through. The checkout that follows is a separate invocation, and its list holds no shell
+/// at all.
+///
+/// Every candidate that exists is named, because which of them the system uses is the system's
+/// decision rather than this host's: on Apple platforms `/bin/sh` re-executes the shell it is a
+/// variant of, and on Windows the shell is the one inside Git's own installation rather than a
+/// path this host could write down.
+#[must_use]
+pub fn connection_shell(exec_path: &Path) -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if cfg!(windows) {
+        // Git for Windows ships its own shell beside its helper directory, under the installation
+        // root that `--exec-path` sits inside.
+        let root = exec_path.parent().and_then(Path::parent);
+        for relative in ["usr/bin/sh.exe", "bin/sh.exe"] {
+            if let Some(root) = root {
+                candidates.push(root.join(relative));
+            }
+        }
+    } else {
+        candidates.push(PathBuf::from("/bin/sh"));
+        if cfg!(target_os = "macos") {
+            candidates.push(PathBuf::from("/bin/bash"));
+        }
+    }
+    candidates.retain(|candidate| candidate.is_file());
+    candidates
+}
+
+/// Returns the object one path names now, for a caller that needs to record it.
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::GitFailed`] when the boundary cannot be established or the child cannot
-/// be started. A platform with no boundary of its own refuses here rather than starting Git
-/// without one.
-pub fn start(
-    invocation: &Invocation<'_>,
-    confinement: &Confinement,
-    working: &WorkingDirectory,
-) -> Result<Spawned> {
-    platform::start(invocation, confinement, working)
+/// Returns [`ProjectError::Destination`] when the directory cannot be opened.
+pub fn identity_of(environment_id: EnvironmentId, path: &Path) -> Result<ObjectIdentity> {
+    Ok(AuthorisedDirectory::open_root(environment_id, path)?.identity())
 }
 
 #[cfg(test)]
@@ -391,29 +421,11 @@ mod tests {
     }
 
     #[test]
-    fn what_is_written_is_the_directories_plus_this_invocations_own_temporary_one() {
-        let confinement = Confinement {
-            program: PathBuf::from("/usr/bin/git"),
-            exec_path: PathBuf::from("/usr/lib/git-core"),
-            helpers: vec![PathBuf::from("/usr/bin/ssh")],
-            writable: vec![
-                PathBuf::from("/work/tree"),
-                PathBuf::from("/work/tree/.git"),
-            ],
-            temporary: PathBuf::from("/state/git-profile/temporary/one"),
-            reach: Reach::Nothing,
-        };
-        assert_eq!(
-            confinement.written(),
-            vec![
-                Path::new("/work/tree"),
-                Path::new("/work/tree/.git"),
-                Path::new("/state/git-profile/temporary/one"),
-            ]
-        );
-        assert_eq!(
-            confinement.executables(),
-            vec![Path::new("/usr/bin/git"), Path::new("/usr/bin/ssh")]
-        );
+    fn the_connection_shell_is_one_this_machine_has() {
+        // A machine with no shell at all is one where a local or ssh clone is refused rather than
+        // run without its connection; nothing here invents a path.
+        for shell in connection_shell(Path::new("/usr/libexec/git-core")) {
+            assert!(shell.is_file(), "{} is a program", shell.display());
+        }
     }
 }

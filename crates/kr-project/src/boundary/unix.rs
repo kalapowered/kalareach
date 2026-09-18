@@ -3,23 +3,24 @@
 //! One shape serves macOS and Linux, because the sequence is the same on both and only the
 //! mechanism differs. The parent builds the child's whole environment and prepares whatever the
 //! platform's boundary needs while it is still an ordinary process. The child then, in order:
-//! moves into the directory handle the parent opened, applies the boundary, and executes Git. Every
-//! one of those happens before Git exists, so there is no moment in which Git is running and the
-//! boundary is not.
+//! moves into the directory handle the parent opened, applies whatever the platform leaves for it,
+//! and executes what the platform named — Git, or the launcher that applies the boundary and then
+//! executes Git. Every one of those happens before Git exists, so there is no moment in which Git
+//! is running and the boundary is not.
 //!
 //! The child also leads its own process group, so ending it ends everything it started: a remote
 //! helper, an ssh process, a credential helper.
 
 #![expect(
     unsafe_code,
-    reason = "a child that must enter a directory handle and apply a boundary before it execs has \
-              no safe form: std's pre-exec hook is unsafe because only the caller can promise the \
-              work it does is what a forked child may do"
+    reason = "a child that must enter a directory handle before it execs has no safe form: std's \
+              pre-exec hook is unsafe because only the caller can promise the work it does is what \
+              a forked child may do"
 )]
 
 use std::process::{Child, Command, Stdio};
 
-use super::{Confinement, Invocation, WorkingDirectory, platform};
+use super::{Confinement, Invocation, platform};
 use crate::error::{ProjectError, Result};
 
 /// One enclosed Git child.
@@ -80,18 +81,15 @@ impl Spawned {
 /// Returns [`ProjectError::GitFailed`] when the boundary cannot be prepared or the child cannot be
 /// started. A child whose boundary could not be applied never reaches `exec`: the failure comes
 /// back here as a start failure, so there is no case in which Git runs unenclosed.
-pub fn start(
-    invocation: &Invocation<'_>,
-    confinement: &Confinement,
-    working: &WorkingDirectory,
-) -> Result<Spawned> {
-    // Everything the boundary needs is prepared while this is still an ordinary process: compiling
-    // a profile, opening the directories rules are attached to, building a filter program. What is
+pub fn start(invocation: &Invocation<'_>, confinement: &Confinement) -> Result<Spawned> {
+    // Everything the boundary needs is prepared while this is still an ordinary process: writing a
+    // profile, opening the objects the rules are attached to, building a filter program. What is
     // left for the child is the work that can only be done there.
     let mut prepared = platform::prepare(confinement)?;
+    let (program, arguments) = prepared.command(invocation);
     // The handle the child moves into, duplicated so the closure owns one. The duplicate is closed
     // when the closure is dropped, which the parent does as soon as the child is started.
-    let directory = std::os::fd::AsFd::as_fd(working.handle().handle())
+    let directory = std::os::fd::AsFd::as_fd(confinement.working.handle().handle())
         .try_clone_to_owned()
         .map_err(|error| ProjectError::GitFailed {
             detail: format!(
@@ -100,16 +98,17 @@ pub fn start(
             )
             .into(),
         })?;
-    let mut command = Command::new(invocation.program);
+    let mut command = Command::new(&program);
     command.env_clear();
     for (name, value) in invocation.environment {
         command.env(name, value);
     }
-    command.args(invocation.arguments);
+    command.args(&arguments);
     // The path is where the child starts; the handle below is where it ends up. Both are set
-    // because the first is what the platform's own rules are written against and the second is the
-    // object this host opened, and a substitution between them is exactly what the handle answers.
-    command.current_dir(working.path());
+    // because the first is what two of the three mechanisms write their rules against and the
+    // second is the object this host opened, and a substitution between them is exactly what the
+    // handle answers.
+    command.current_dir(confinement.working.path());
     // A Git subprocess never gets a terminal: it cannot prompt, it cannot page, and a helper that
     // wanted to read from one finds nothing to read.
     command
@@ -121,9 +120,10 @@ pub fn start(
 
         command.process_group(0);
         // SAFETY: the hook runs in the forked child before `exec`. It moves into an already-open
-        // directory and applies the platform's boundary, and each platform's `apply` is written to
-        // do nothing else: no allocation of its own, no lock this process holds, no call back into
-        // this crate.
+        // directory and applies whatever the platform left for it, and each platform's `apply` is
+        // written for that state: no allocation of its own, no lock this process holds, no call
+        // back into this crate. On macOS it does nothing at all, because the launcher the child
+        // executes applies the boundary itself.
         unsafe {
             command.pre_exec(move || {
                 rustix::process::fchdir(&directory)?;

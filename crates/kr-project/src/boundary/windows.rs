@@ -10,9 +10,12 @@
 //!   hook or credential helper planted in the repository, in the staging directory or in this
 //!   invocation's own temporary directory cannot be executed however it came to be there; and it is
 //!   granted read and execute on Git's own installation, which is the only thing that may run.
-//! * **The network** comes from the same container's capabilities. A remote operation is given the
-//!   client capability and a local one is given nothing at all, so a local operation reaches no
-//!   address whatever its configuration says.
+//! * **The network** comes from the same container's capabilities. A local operation is given none
+//!   at all, so it reaches no address whatever its configuration says. A remote one is given the
+//!   client capability, which permits reaching the network and does **not** bound which ports it
+//!   reaches: the port list this host builds is enforced on the other two platforms and not on this
+//!   one, and bounding it here would need a system-wide filtering policy an ordinary account cannot
+//!   set. That difference is stated rather than implied, here and in `crates/kr-project/README.md`.
 //! * **Descendants** come from a job object the process is created inside, with breakaway refused
 //!   and the job ending everything in it when this host lets go. That is what makes a cancellation
 //!   here end the remote helper, the ssh process and the credential helper rather than only Git.
@@ -21,12 +24,20 @@
 //!
 //! Granting a container read and execute on Git's own installation is a change to that
 //! installation's permissions, and where Git is installed somewhere only an administrator may
-//! change, this host cannot make it. It does not run Git anyway: every grant is attempted before
-//! anything starts, and a grant this host cannot make refuses the invocation and says so. Nothing
-//! here falls back to running Git outside its container.
+//! change — `C:\Program Files\Git` is the ordinary case — this host cannot make it. It does not run
+//! Git anyway: every grant is attempted before anything starts, and a grant this host cannot make
+//! refuses the invocation and says so. Nothing here falls back to running Git outside its
+//! container.
+//!
+//! A container also reaches a file only where that file's permissions name it **or** name every
+//! application package, and this host cannot know which other permissions a repository already
+//! carries. So the grants this host makes on the directories an operation owns are paired with a
+//! refusal of the execute right to the same container, which no other permission can add back.
 //!
 //! Every grant this host makes is taken away again when the invocation ends, and the container
-//! profile is deleted with it.
+//! profile is deleted with it. A grant whose removal fails is left, and this host does not pretend
+//! otherwise: the profile is per-invocation and named after nothing, so what is left names a
+//! container that no longer exists.
 
 #![expect(
     unsafe_code,
@@ -45,22 +56,21 @@ use windows_sys::Win32::Foundation::{
     SetHandleInformation, WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Security::Authorization::{
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE, REVOKE_ACCESS,
-    SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_GROUP, TRUSTEE_IS_SID,
-    TRUSTEE_W,
+    DENY_ACCESS, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, NO_MULTIPLE_TRUSTEE,
+    REVOKE_ACCESS, SE_FILE_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, TRUSTEE_IS_GROUP,
+    TRUSTEE_IS_SID, TRUSTEE_W,
 };
 use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile,
 };
 use windows_sys::Win32::Security::{
-    ACL, CONTAINER_INHERIT_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION, OBJECT_INHERIT_ACE,
-    PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
-    WinCapabilityInternetClientSid,
+    ACL, CONTAINER_INHERIT_ACE, CreateWellKnownSid, DACL_SECURITY_INFORMATION, FreeSid,
+    OBJECT_INHERIT_ACE, PSECURITY_DESCRIPTOR, PSID, SECURITY_CAPABILITIES, SECURITY_MAX_SID_SIZE,
+    SID_AND_ATTRIBUTES, WinCapabilityInternetClientSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_EXECUTE, FILE_FLAG_BACKUP_SEMANTICS,
-    FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    GetFinalPathNameByHandleW, OPEN_EXISTING,
+    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
+    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFinalPathNameByHandleW, OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -69,14 +79,15 @@ use windows_sys::Win32::System::JobObjects::{
 use windows_sys::Win32::System::Pipes::CreatePipe;
 use windows_sys::Win32::System::SystemServices::SE_GROUP_ENABLED;
 use windows_sys::Win32::System::Threading::{
-    CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
-    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
-    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_JOB_LIST,
-    PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_INFORMATION, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
+    CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+    EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList, ResumeThread,
+    LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+    PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+    PROCESS_INFORMATION, STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
+    WaitForSingleObject,
 };
 
-use super::{Confinement, Invocation, Reach, WorkingDirectory};
+use super::{Confinement, Invocation, OpenedDirectory, Reach};
 use crate::error::{ProjectError, Result};
 
 /// What the boundary is, for a person reading a record.
@@ -167,6 +178,15 @@ struct Container {
     granted: Vec<PathBuf>,
 }
 
+impl Container {
+    /// Records one path the container was given an entry on, once.
+    fn record(&mut self, path: &Path) {
+        if !self.granted.iter().any(|held| held == path) {
+            self.granted.push(path.to_owned());
+        }
+    }
+}
+
 impl Drop for Container {
     fn drop(&mut self) {
         for path in &self.granted {
@@ -179,12 +199,16 @@ impl Drop for Container {
     }
 }
 
-/// A security identifier this process allocated and frees.
+/// A security identifier this process holds a copy of.
+///
+/// The copy is what every call here points at, because a `Vec` this process owns has a lifetime
+/// this code can reason about. Where the identifier also came from a call that allocated one, that
+/// original pointer is kept beside the copy and freed the way its own call requires.
 #[derive(Debug)]
 struct OwnedSid {
     bytes: Vec<u8>,
-    /// Set when the identifier came from a call that allocates it and wants `FreeSid`.
-    local: bool,
+    /// The pointer the platform allocated, when one was allocated, so it can be freed as itself.
+    allocated: Option<PSID>,
 }
 
 impl OwnedSid {
@@ -195,10 +219,11 @@ impl OwnedSid {
 
 impl Drop for OwnedSid {
     fn drop(&mut self) {
-        if self.local {
-            // SAFETY: the buffer came from a call that allocated it in the local heap.
+        if let Some(allocated) = self.allocated {
+            // SAFETY: the pointer came from a call that allocated an identifier and nothing else
+            // holds it; the copy beside it is an ordinary Rust allocation and is not touched here.
             unsafe {
-                LocalFree(self.bytes.as_mut_ptr().cast());
+                FreeSid(allocated);
             }
         }
     }
@@ -211,11 +236,7 @@ impl Drop for OwnedSid {
 /// Returns [`ProjectError::GitFailed`] when the container cannot be created, a grant cannot be
 /// made, the job cannot be built or the process cannot be started. Nothing here starts Git outside
 /// its container.
-pub fn start(
-    invocation: &Invocation<'_>,
-    confinement: &Confinement,
-    working: &WorkingDirectory,
-) -> Result<Spawned> {
+pub fn start(invocation: &Invocation<'_>, confinement: &Confinement) -> Result<Spawned> {
     let container = build(confinement)?;
     let job = job_object()?;
     let (out_read, out_write) = pipe()?;
@@ -242,7 +263,12 @@ pub fn start(
     };
     let mut jobs: [HANDLE; 1] = [job.as_raw_handle() as HANDLE];
 
-    let mut attributes = AttributeList::create(2)?;
+    let mut inheritable: [HANDLE; 3] = [
+        nul.as_raw_handle() as HANDLE,
+        out_write.as_raw_handle() as HANDLE,
+        err_write.as_raw_handle() as HANDLE,
+    ];
+    let mut attributes = AttributeList::create(3)?;
     attributes.set(
         PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES as usize,
         std::ptr::from_mut(&mut security).cast(),
@@ -252,6 +278,15 @@ pub fn start(
         PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
         jobs.as_mut_ptr().cast(),
         std::mem::size_of::<HANDLE>(),
+    )?;
+    // Exactly these three. Without the list a child inherits every inheritable handle this process
+    // holds, which during two invocations at once is the other one's pipes: its output would then
+    // stay open after its own Git had gone, and this host would read a complete result as a
+    // truncated one.
+    attributes.set(
+        PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
+        inheritable.as_mut_ptr().cast(),
+        std::mem::size_of::<HANDLE>() * inheritable.len(),
     )?;
 
     let mut startup: STARTUPINFOEXW = unsafe { std::mem::zeroed() };
@@ -267,7 +302,7 @@ pub fn start(
     // The directory the handle names, rather than the path the caller gave: the two are resolved in
     // the same moment and the identity is confirmed below before anything the child produced is
     // read.
-    let directory = wide(final_path(working)?.as_os_str());
+    let directory = wide(final_path(&confinement.working)?.as_os_str());
     let program = wide(invocation.program.as_os_str());
     let mut information: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: every pointer is to a buffer this call owns for its duration, and the command line is
@@ -279,7 +314,7 @@ pub fn start(
             std::ptr::null(),
             std::ptr::null(),
             1,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
             environment.as_ptr().cast(),
             directory.as_ptr(),
             std::ptr::from_mut(&mut startup).cast(),
@@ -298,15 +333,31 @@ pub fn start(
     }
     // SAFETY: both handles came from the call above and are this process's to own.
     let process = unsafe { OwnedHandle::from_raw_handle(information.hProcess.cast()) };
-    unsafe {
-        CloseHandle(information.hThread);
-    }
     drop(out_write);
     drop(err_write);
     drop(nul);
-    // The process was given a path. This is where that path is answered for: the object at it is
-    // opened again and required to be the one this host opened before the spawn.
-    working.confirm_path()?;
+    // The process was given a path, and it is not running yet. This is where that path is answered
+    // for, before the process can do anything at all: the object at the name is opened again and
+    // required to be the one this host opened before the spawn. A refusal here leaves a process
+    // that never ran, and the job it was created in ends it when this host lets go of the handle.
+    let confirmed = confinement.working.confirm_path();
+    // SAFETY: the thread handle came from the call above and nothing else holds it.
+    let resumed = unsafe {
+        let resumed = confirmed.is_ok() && ResumeThread(information.hThread) != u32::MAX;
+        CloseHandle(information.hThread);
+        resumed
+    };
+    confirmed?;
+    if !resumed {
+        return Err(ProjectError::GitFailed {
+            detail: format!(
+                "{} was created inside its boundary and could not be started: {}",
+                invocation.described,
+                std::io::Error::last_os_error()
+            )
+            .into(),
+        });
+    }
     Ok(Spawned {
         process,
         _job: job,
@@ -345,7 +396,7 @@ fn build(confinement: &Confinement) -> Result<Container> {
     }
     let sid = OwnedSid {
         bytes: sid_bytes(sid),
-        local: true,
+        allocated: Some(sid),
     };
     let mut capabilities = Vec::new();
     if matches!(confinement.reach, Reach::Outbound(_)) {
@@ -357,22 +408,36 @@ fn build(confinement: &Confinement) -> Result<Container> {
         capabilities,
         granted: Vec::new(),
     };
-    // Read and write, and no execute right at all, on the directories this operation owns.
+    // Read and write on the directories this operation owns, and the execute right refused to the
+    // same container: a refusal beats every grant, including one a repository already carries for
+    // every application package, so a program planted in the repository cannot be executed whatever
+    // else its permissions say.
     for directory in confinement.written() {
-        grant(&mut container, directory, OWNED_DIRECTORY_RIGHTS)?;
+        grant(
+            &mut container,
+            directory.path(),
+            OWNED_DIRECTORY_RIGHTS,
+            GRANT_ACCESS,
+        )?;
+        grant(&mut container, directory.path(), FILE_EXECUTE, DENY_ACCESS)?;
     }
     // Read and execute on Git's own installation, which is the only thing that may run.
     for program in confinement.executables() {
-        grant(&mut container, program, PROGRAM_RIGHTS)?;
+        grant(&mut container, program, PROGRAM_RIGHTS, GRANT_ACCESS)?;
     }
     let exec_path = confinement.exec_path.clone();
-    grant(&mut container, &exec_path, PROGRAM_RIGHTS)?;
+    grant(&mut container, &exec_path, PROGRAM_RIGHTS, GRANT_ACCESS)?;
+    // A container's reads are confined too, so what Git reads outside the directories this
+    // operation owns is granted by name rather than assumed.
+    for readable in &confinement.readable {
+        grant(&mut container, readable, FILE_GENERIC_READ, GRANT_ACCESS)?;
+    }
     Ok(container)
 }
 
-/// Grants the container one set of rights on one path, and records it for removal.
-fn grant(container: &mut Container, path: &Path, rights: u32) -> Result<()> {
-    set_access(path, container.sid.as_psid(), rights, GRANT_ACCESS).map_err(|error| {
+/// Adds one entry for the container on one path, and records it for removal.
+fn grant(container: &mut Container, path: &Path, rights: u32, mode: i32) -> Result<()> {
+    set_access(path, container.sid.as_psid(), rights, mode).map_err(|error| {
         ProjectError::GitFailed {
             detail: format!(
                 "{} could not be made reachable by this invocation's container, so Git is not run: \
@@ -382,7 +447,7 @@ fn grant(container: &mut Container, path: &Path, rights: u32) -> Result<()> {
             .into(),
         }
     })?;
-    container.granted.push(path.to_owned());
+    container.record(path);
     Ok(())
 }
 
@@ -485,7 +550,7 @@ fn well_known(kind: i32) -> Result<OwnedSid> {
     bytes.truncate(length as usize);
     Ok(OwnedSid {
         bytes,
-        local: false,
+        allocated: None,
     })
 }
 
@@ -662,10 +727,13 @@ impl Drop for AttributeList {
 }
 
 /// Returns the path the working directory's handle names, with nothing left to resolve.
-fn final_path(working: &WorkingDirectory) -> Result<PathBuf> {
-    let handle = opened(working.path())?;
+fn final_path(working: &OpenedDirectory) -> Result<PathBuf> {
+    // The handle this host already opened and verified, rather than the name opened again: opening
+    // the name again is the very thing a substitution would answer differently.
+    let handle = std::os::windows::io::AsHandle::as_handle(working.handle().handle());
     let mut buffer = vec![0_u16; 32_768];
-    // SAFETY: the handle and the buffer are this process's own for the call.
+    // SAFETY: the handle is borrowed from the directory this invocation holds open, and the buffer
+    // is this process's own for the call.
     let length = unsafe {
         GetFinalPathNameByHandleW(
             handle.as_raw_handle() as HANDLE,
@@ -682,34 +750,6 @@ fn final_path(working: &WorkingDirectory) -> Result<PathBuf> {
     }
     buffer.truncate(length as usize);
     Ok(PathBuf::from(OsString::from_wide(&buffer)))
-}
-
-/// Opens one directory for reading its identity.
-fn opened(path: &Path) -> Result<OwnedHandle> {
-    let name = wide(path.as_os_str());
-    // SAFETY: the name is this process's own NUL-terminated buffer.
-    let handle = unsafe {
-        CreateFileW(
-            name.as_ptr(),
-            GENERIC_READ,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            std::ptr::null(),
-            OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS,
-            std::ptr::null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(ProjectError::Destination {
-            detail: format!(
-                "{} could not be opened for this invocation",
-                crate::git::redact(&path.display().to_string())
-            )
-            .into(),
-        });
-    }
-    // SAFETY: the handle came from the call above and is this process's to own.
-    Ok(unsafe { OwnedHandle::from_raw_handle(handle.cast()) })
 }
 
 /// Returns one string as the wide, NUL-terminated form every call here takes.

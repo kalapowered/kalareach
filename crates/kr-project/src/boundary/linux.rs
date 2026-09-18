@@ -1,29 +1,53 @@
 //! The Linux boundary: Landlock for the filesystem and the ports, a small filter for the rest.
 //!
-//! Landlock is a kernel feature a process uses on itself: it builds a ruleset out of directory
-//! handles it already holds, applies it, and from then on nothing it or its descendants do can get
-//! back out. That is exactly the shape this needs, because the ruleset is built by the parent from
-//! the directories it opened and applied by the child before Git exists.
+//! Landlock is a kernel feature a process uses on itself: it builds a ruleset out of handles it
+//! already holds, applies it, and from then on nothing it or its descendants do can get back out.
+//! That is exactly the shape this needs, and it is the one mechanism here whose rules are attached
+//! to the **objects** this host opened rather than to the names they had, so a tree substituted at
+//! a name is not covered by them at all.
 //!
 //! * **Execution.** The execute right is granted on Git's own program and on Git's helper
-//!   directory, and on the approved broker's ssh program for a remote that needs one. It is granted
-//!   nowhere else, so a driver in the repository, in the staging directory or in this invocation's
-//!   own temporary directory cannot be executed however it came to be there.
-//! * **Writes.** The write rights are granted on the repository's tree, its Git common directory,
-//!   the destination this operation reserved and this invocation's temporary directory, and they
-//!   never include the execute right. Reads are granted on the whole filesystem, which the module
-//!   documentation in [`super`] explains.
+//!   directory, and on the approved broker's ssh program and the connection shell for an invocation
+//!   that needs them. It is granted nowhere else, so a driver in the repository, in the staging
+//!   directory or in this invocation's own temporary directory cannot be executed however it came
+//!   to be there.
+//! * **Writes.** The write rights are granted on the objects this operation owns and never include
+//!   the execute right. Reads are granted on the whole filesystem, which the module documentation
+//!   in [`super`] explains.
 //! * **Network.** A remote operation gets a connect rule per port its transport uses and no bind
-//!   rule at all, so nothing can listen. Landlock's network rules arrived in its fourth interface
-//!   version, so a kernel older than that cannot enforce them: a remote operation is **refused**
-//!   there rather than run with the ports unenforced.
+//!   rule at all, so nothing can listen.
 //!
-//! Landlock covers TCP and says nothing about the rest, so a local operation would still be able to
-//! open a UDP or raw socket and talk through it. A seccomp filter closes that: for a local
-//! operation the kernel refuses to create an internet socket at all, and for every operation it
-//! refuses to make one listen. The filter is a fixed program built for this machine's own
-//! instruction set, and an architecture whose numbers this host does not hold refuses the
-//! invocation rather than installing a filter that would not mean what it says.
+//! ## What this kernel has to have
+//!
+//! The rights are required rather than asked for: the ruleset is built as a hard requirement, so a
+//! kernel that cannot enforce one of them refuses the invocation instead of enforcing less than
+//! this says.
+//!
+//! * The filesystem confinement requires Landlock's **third** interface version, Linux 6.2. Before
+//!   it the kernel does not mediate truncation at all, so a process could shorten a file this
+//!   boundary never made writable. An older kernel therefore runs no Git; a host in that position
+//!   runs the service inside a bubblewrap container, which gives the same confinement one level up
+//!   and is not something this crate builds.
+//! * A remote operation requires the **fourth**, Linux 6.7, which is where Landlock gained the
+//!   rules that say which addresses a process may reach. Below it a remote operation is refused and
+//!   a local one still runs, because a local one reaches nothing through a different mechanism.
+//!
+//! ## What the system-call filter adds
+//!
+//! Landlock covers TCP and says nothing about the rest. A small fixed filter closes what matters:
+//! for a **local** operation the kernel refuses to create an internet socket at all, so there is no
+//! UDP, no raw socket and no TCP to reach anything through; for **every** operation it refuses a
+//! listening socket and a raw or packet socket.
+//!
+//! What the filter cannot do is bound a remote operation's UDP by address, because a filter reads
+//! scalar arguments and an address is behind a pointer. A remote operation can therefore send UDP
+//! where its name resolution can, which is how a host name becomes an address on most Linux
+//! systems. That is the one part of the network guarantee that is TCP-only here, and it is stated
+//! rather than implied.
+//!
+//! The filter is built for this machine's own instruction set, and an architecture whose call
+//! numbers this host does not hold refuses the invocation rather than installing a filter that
+//! would not mean what it says.
 
 #![expect(
     unsafe_code,
@@ -31,21 +55,28 @@
               safe form; this module holds that one call and the constants it needs"
 )]
 
-use std::path::Path;
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
 
 use landlock::{
     ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
     Ruleset, RulesetAttr, RulesetCreated, RulesetCreatedAttr, RulesetStatus,
 };
 
-use super::{Confinement, Reach};
+use super::{Confinement, Invocation, Reach};
 use crate::error::{ProjectError, Result};
 
 /// What the boundary is, for a person reading a record.
-pub const MECHANISM: &str = "Landlock rules built from opened directory handles, with a system-call filter for the \
-     sockets Landlock does not cover";
+pub const MECHANISM: &str = "Landlock rules attached to the directory handles this host opened, \
+                             with a system-call filter for the sockets Landlock does not cover";
 
-/// The interface version at which Landlock can restrict TCP.
+/// The interface version the filesystem confinement is built against.
+///
+/// Truncation arrived here. Below it a process could shorten a file this boundary never made
+/// writable, so this is the floor rather than a preference.
+const FILESYSTEM_ABI: ABI = ABI::V3;
+
+/// The interface version at which Landlock can restrict which addresses a process reaches.
 const NETWORK_ABI: ABI = ABI::V4;
 
 /// The device files a process needs to run at all.
@@ -59,6 +90,17 @@ pub struct Prepared {
 }
 
 impl Prepared {
+    /// Returns the program the child executes and the arguments it runs with.
+    ///
+    /// Git itself: this platform's boundary is applied by the child to itself, so there is nothing
+    /// between the two.
+    pub fn command(&self, invocation: &Invocation<'_>) -> (PathBuf, Vec<OsString>) {
+        (
+            invocation.program.to_owned(),
+            invocation.arguments.to_owned(),
+        )
+    }
+
     /// Applies the boundary to this process.
     ///
     /// Runs in the forked child. A failure returns an error rather than continuing, and the child
@@ -109,39 +151,30 @@ impl Prepared {
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::GitFailed`] when this kernel has no Landlock at all, when a remote
-/// operation asks for ports a kernel this old cannot enforce, or when a directory the rules are
-/// built from cannot be opened.
+/// Returns [`ProjectError::GitFailed`] when this kernel cannot enforce the rights this boundary is
+/// made of, when a remote operation asks for rules a kernel this old does not have, or when an
+/// object the rules are attached to cannot be opened.
 pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
-    let abi = ABI::new_current();
-    if abi < ABI::V1 {
-        return Err(ProjectError::GitFailed {
-            detail: "this kernel has no Landlock, so a Git invocation cannot be enclosed and is \
-                     not run; a host without it runs the service inside a bubblewrap container \
-                     instead"
-                .into(),
-        });
-    }
     let remote = !matches!(confinement.reach, Reach::Nothing);
-    if remote && abi < NETWORK_ABI {
-        return Err(ProjectError::GitFailed {
-            detail: "this kernel's Landlock cannot restrict which addresses a process reaches, so \
-                     an operation that needs a remote is refused rather than run with its network \
-                     unenclosed"
-                .into(),
-        });
-    }
     // Nothing degrades quietly: a right this kernel does not have is a refusal here rather than a
     // ruleset that enforces less than it says.
-    let mut ruleset = Ruleset::default();
-    ruleset.set_compatibility(CompatLevel::HardRequirement);
-    let mut ruleset = ruleset
-        .handle_access(AccessFs::from_all(abi))
-        .map_err(rules)?;
+    let mut ruleset = Ruleset::default()
+        .set_compatibility(CompatLevel::HardRequirement)
+        .handle_access(AccessFs::from_all(FILESYSTEM_ABI))
+        .map_err(|error| {
+            refused(
+                "this kernel cannot enclose a Git invocation's filesystem access, so none is run",
+                &error,
+            )
+        })?;
     if remote {
         ruleset = ruleset
             .handle_access(AccessNet::from_all(NETWORK_ABI))
-            .map_err(rules)?;
+            .map_err(|error| refused(
+                "this kernel cannot restrict which addresses a process reaches, so an operation \
+                 that needs a remote is refused rather than run with its network unenclosed",
+                &error,
+            ))?;
     }
     let mut created = ruleset.create().map_err(rules)?;
     // Reads everywhere, and the execute right nowhere: this rule is what makes every later rule an
@@ -166,21 +199,27 @@ pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
             AccessFs::Execute | AccessFs::ReadFile | AccessFs::ReadDir,
         ))
         .map_err(rules)?;
-    let written = AccessFs::from_write(abi) | AccessFs::ReadFile | AccessFs::ReadDir;
+    let written = AccessFs::from_write(FILESYSTEM_ABI) | AccessFs::ReadFile | AccessFs::ReadDir;
     for directory in confinement.written() {
+        // The rule is attached to the object this host opened and verified, not to the name it had:
+        // a directory put at that name afterwards is a different object and this rule does not
+        // reach it.
         created = created
-            .add_rule(PathBeneath::new(opened(directory)?, written))
+            .add_rule(PathBeneath::new(
+                std::os::fd::AsFd::as_fd(directory.handle().handle()),
+                written,
+            ))
             .map_err(rules)?;
     }
     for device in DEVICES {
         let device = Path::new(device);
-        // A machine without one of these is not a machine Git runs on, but the rule is skipped
-        // rather than refused: what matters is that nothing else was added.
+        // The rights a file can carry, and only those: a directory's rights on something that is
+        // not a directory are refused by the kernel and would refuse the whole invocation.
         if let Ok(handle) = PathFd::new(device) {
             created = created
                 .add_rule(PathBeneath::new(
                     handle,
-                    AccessFs::from_write(abi) | AccessFs::ReadFile,
+                    AccessFs::ReadFile | AccessFs::WriteFile | AccessFs::Truncate,
                 ))
                 .map_err(rules)?;
         }
@@ -198,10 +237,7 @@ pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
     })
 }
 
-/// Starts one Git invocation inside its boundary.
-pub use super::unix::start;
-
-/// Returns the handle a rule is attached to, refusing a directory that cannot be opened.
+/// Returns the handle a rule is attached to, refusing a path that cannot be opened.
 fn opened(path: &Path) -> Result<PathFd> {
     PathFd::new(path).map_err(|error| ProjectError::GitFailed {
         detail: format!(
@@ -210,6 +246,13 @@ fn opened(path: &Path) -> Result<PathFd> {
         )
         .into(),
     })
+}
+
+/// Returns a refusal this host states in its own words, with the kernel's reason beside it.
+fn refused<E: std::fmt::Display>(what: &str, error: &E) -> ProjectError {
+    ProjectError::GitFailed {
+        detail: format!("{what}: {error}").into(),
+    }
 }
 
 /// Returns a ruleset failure as this host's own.
@@ -225,6 +268,17 @@ const ARCHITECTURE: u32 = 0xc000_003e;
 /// The instruction set this filter is written for, as the kernel reports it to a filter.
 #[cfg(target_arch = "aarch64")]
 const ARCHITECTURE: u32 = 0xc000_00b7;
+
+/// The bit a call number carries when it is the other calling convention of this instruction set.
+///
+/// One architecture value covers two conventions here, and their call numbers are different. A
+/// filter that compared only the numbers would judge one convention's calls by the other's meanings,
+/// so a number carrying this bit is refused outright.
+#[cfg(target_arch = "x86_64")]
+const OTHER_CONVENTION: u32 = 0x4000_0000;
+/// The bit a call number carries when it is the other calling convention of this instruction set.
+#[cfg(target_arch = "aarch64")]
+const OTHER_CONVENTION: u32 = 0x4000_0000;
 
 /// The `socket` call's number on this instruction set.
 #[cfg(target_arch = "x86_64")]
@@ -243,10 +297,30 @@ const SYS_LISTEN: u32 = 201;
 const LOAD: u16 = 0x20;
 /// Compares the loaded word with a constant.
 const COMPARE: u16 = 0x15;
+/// Compares the loaded word with a constant, for greater or equal.
+const AT_LEAST: u16 = 0x35;
+/// Keeps only the bits of a constant.
+const MASK: u16 = 0x54;
 /// Answers.
 const ANSWER: u16 = 0x06;
 
+/// Where in the call this filter is judging each thing is.
+const NUMBER: u32 = 0;
+/// Where in the call this filter is judging each thing is.
+const MACHINE: u32 = 4;
+/// Where in the call this filter is judging each thing is.
+const FIRST_ARGUMENT: u32 = 16;
+/// Where in the call this filter is judging each thing is.
+const SECOND_ARGUMENT: u32 = 24;
+
+/// The bits of a socket's kind that name the kind, without the flags that travel beside it.
+const KIND: u32 = 0xff;
+
 /// The answer for a call this filter will not let happen: the caller is refused permission.
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "the error number is a small positive constant"
+)]
 const REFUSED: u32 = 0x0005_0000 | (libc::EACCES as u32);
 /// The answer for a call this filter permits.
 const PERMITTED: u32 = 0x7fff_0000;
@@ -262,29 +336,55 @@ const UNKNOWN_MACHINE: u32 = 0x8000_0000;
 ///
 /// Returns [`ProjectError::GitFailed`] on an instruction set this host holds no call numbers for.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[expect(
+    clippy::cast_sign_loss,
+    reason = "the address families and socket kinds are small positive constants"
+)]
 fn filter(remote: bool) -> Result<Vec<libc::sock_filter>> {
     let mut program = vec![
-        instruction(LOAD, 0, 0, 4),
+        instruction(LOAD, 0, 0, MACHINE),
+        // A machine this filter does not describe, or the other calling convention of this one,
+        // ends the process rather than being judged by numbers that mean something else.
         instruction(COMPARE, 1, 0, ARCHITECTURE),
         instruction(ANSWER, 0, 0, UNKNOWN_MACHINE),
-        instruction(LOAD, 0, 0, 0),
+        instruction(LOAD, 0, 0, NUMBER),
+        instruction(AT_LEAST, 0, 1, OTHER_CONVENTION),
+        instruction(ANSWER, 0, 0, UNKNOWN_MACHINE),
     ];
     if remote {
-        // Nothing may listen. Creating a socket and connecting out is what the transport does, and
-        // which addresses it reaches is Landlock's rule rather than this one's.
-        program.push(instruction(COMPARE, 0, 1, SYS_LISTEN));
-        program.push(instruction(ANSWER, 0, 0, REFUSED));
-        program.push(instruction(ANSWER, 0, 0, PERMITTED));
+        // Nothing may listen, and nothing may reach the network below its protocols. Creating an
+        // ordinary socket and connecting out is what the transport does, and which addresses it
+        // reaches is Landlock's rule rather than this one's.
+        program.extend([
+            // Index 6: `listen` is refused outright.
+            instruction(COMPARE, 7, 0, SYS_LISTEN),
+            // 7: anything that is not `socket` is the ordinary work of running Git.
+            instruction(COMPARE, 0, 7, SYS_SOCKET),
+            // 8, 9: a packet socket is not something any transport needs.
+            instruction(LOAD, 0, 0, FIRST_ARGUMENT),
+            instruction(COMPARE, 4, 0, libc::AF_PACKET as u32),
+            // 10, 11, 12: nor is a raw one, whatever flags travel beside its kind.
+            instruction(LOAD, 0, 0, SECOND_ARGUMENT),
+            instruction(MASK, 0, 0, KIND),
+            instruction(COMPARE, 1, 0, libc::SOCK_RAW as u32),
+            // 13: everything else is permitted, and Landlock decides where it may go.
+            instruction(ANSWER, 0, 0, PERMITTED),
+            // 14, 15.
+            instruction(ANSWER, 0, 0, REFUSED),
+            instruction(ANSWER, 0, 0, PERMITTED),
+        ]);
     } else {
         // No internet socket at all, and nothing may listen.
-        program.push(instruction(COMPARE, 5, 0, SYS_LISTEN));
-        program.push(instruction(COMPARE, 0, 5, SYS_SOCKET));
-        program.push(instruction(LOAD, 0, 0, 16));
-        program.push(instruction(COMPARE, 2, 0, libc::AF_INET as u32));
-        program.push(instruction(COMPARE, 1, 0, libc::AF_INET6 as u32));
-        program.push(instruction(COMPARE, 0, 1, libc::AF_PACKET as u32));
-        program.push(instruction(ANSWER, 0, 0, REFUSED));
-        program.push(instruction(ANSWER, 0, 0, PERMITTED));
+        program.extend([
+            instruction(COMPARE, 5, 0, SYS_LISTEN),
+            instruction(COMPARE, 0, 5, SYS_SOCKET),
+            instruction(LOAD, 0, 0, FIRST_ARGUMENT),
+            instruction(COMPARE, 2, 0, libc::AF_INET as u32),
+            instruction(COMPARE, 1, 0, libc::AF_INET6 as u32),
+            instruction(COMPARE, 0, 1, libc::AF_PACKET as u32),
+            instruction(ANSWER, 0, 0, REFUSED),
+            instruction(ANSWER, 0, 0, PERMITTED),
+        ]);
     }
     Ok(program)
 }
@@ -293,8 +393,8 @@ fn filter(remote: bool) -> Result<Vec<libc::sock_filter>> {
 ///
 /// # Errors
 ///
-/// Returns [`ProjectError::GitFailed`], because this host holds no call numbers for this
-/// instruction set and will not install a filter that does not mean what it says.
+/// Always returns [`ProjectError::GitFailed`]: this host holds no call numbers for this instruction
+/// set and will not install a filter that does not mean what it says.
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 fn filter(_remote: bool) -> Result<Vec<libc::sock_filter>> {
     Err(ProjectError::GitFailed {
@@ -313,8 +413,17 @@ const fn instruction(code: u16, jt: u8, jf: u8, k: u32) -> libc::sock_filter {
 mod tests {
     use super::*;
 
+    /// One call, as the kernel would hand it to the filter.
+    #[derive(Clone, Copy)]
+    struct Call {
+        machine: u32,
+        number: u32,
+        family: u32,
+        kind: u32,
+    }
+
     /// Runs the filter over one call and returns the answer it gives.
-    fn judge(program: &[libc::sock_filter], architecture: u32, number: u32, domain: u32) -> u32 {
+    fn judge(program: &[libc::sock_filter], call: Call) -> u32 {
         let mut at = 0_usize;
         let mut accumulator = 0_u32;
         loop {
@@ -322,15 +431,25 @@ mod tests {
             match instruction.code {
                 LOAD => {
                     accumulator = match instruction.k {
-                        0 => number,
-                        4 => architecture,
-                        16 => domain,
+                        NUMBER => call.number,
+                        MACHINE => call.machine,
+                        FIRST_ARGUMENT => call.family,
+                        SECOND_ARGUMENT => call.kind,
                         other => panic!("the filter loaded {other}, which nothing here means"),
                     };
                     at += 1;
                 }
-                COMPARE => {
-                    let taken = if accumulator == instruction.k {
+                MASK => {
+                    accumulator &= instruction.k;
+                    at += 1;
+                }
+                COMPARE | AT_LEAST => {
+                    let matched = if instruction.code == COMPARE {
+                        accumulator == instruction.k
+                    } else {
+                        accumulator >= instruction.k
+                    };
+                    let taken = if matched {
                         usize::from(instruction.jt)
                     } else {
                         usize::from(instruction.jf)
@@ -343,47 +462,103 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_local_invocation_cannot_make_an_internet_socket_or_listen() {
-        let program = filter(false).expect("a filter for this machine");
-        assert_eq!(
-            judge(&program, ARCHITECTURE, SYS_SOCKET, libc::AF_INET as u32),
-            REFUSED
-        );
-        assert_eq!(
-            judge(&program, ARCHITECTURE, SYS_SOCKET, libc::AF_INET6 as u32),
-            REFUSED
-        );
-        assert_eq!(
-            judge(&program, ARCHITECTURE, SYS_SOCKET, libc::AF_PACKET as u32),
-            REFUSED
-        );
-        assert_eq!(judge(&program, ARCHITECTURE, SYS_LISTEN, 0), REFUSED);
-        // A local socket is how this machine's own services are reached, and it is not a network.
-        assert_eq!(
-            judge(&program, ARCHITECTURE, SYS_SOCKET, libc::AF_UNIX as u32),
-            PERMITTED
-        );
-        // Everything else is the ordinary work of running Git.
-        assert_eq!(judge(&program, ARCHITECTURE, 1, 0), PERMITTED);
+    fn call(number: u32, family: u32, kind: u32) -> Call {
+        Call {
+            machine: ARCHITECTURE,
+            number,
+            family,
+            kind,
+        }
     }
 
     #[test]
-    fn a_remote_invocation_may_connect_out_and_still_cannot_listen() {
-        let program = filter(true).expect("a filter for this machine");
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "the address families and socket kinds are small positive constants"
+    )]
+    fn a_local_invocation_cannot_make_an_internet_socket_or_listen() {
+        let program = filter(false).expect("a filter for this machine");
+        for family in [libc::AF_INET, libc::AF_INET6, libc::AF_PACKET] {
+            assert_eq!(
+                judge(&program, call(SYS_SOCKET, family as u32, 1)),
+                REFUSED,
+                "a local operation makes no socket of family {family}"
+            );
+        }
+        assert_eq!(judge(&program, call(SYS_LISTEN, 0, 0)), REFUSED);
+        // A local socket is how this machine's own services are reached, and it is not a network.
         assert_eq!(
-            judge(&program, ARCHITECTURE, SYS_SOCKET, libc::AF_INET as u32),
+            judge(&program, call(SYS_SOCKET, libc::AF_UNIX as u32, 1)),
             PERMITTED
         );
-        assert_eq!(judge(&program, ARCHITECTURE, SYS_LISTEN, 0), REFUSED);
-        assert_eq!(judge(&program, ARCHITECTURE, 1, 0), PERMITTED);
+        // Everything else is the ordinary work of running Git.
+        assert_eq!(judge(&program, call(1, 0, 0)), PERMITTED);
+    }
+
+    #[test]
+    #[expect(
+        clippy::cast_sign_loss,
+        reason = "the address families and socket kinds are small positive constants"
+    )]
+    fn a_remote_invocation_may_connect_out_and_still_cannot_listen_or_go_below_its_protocol() {
+        let program = filter(true).expect("a filter for this machine");
+        assert_eq!(
+            judge(
+                &program,
+                call(SYS_SOCKET, libc::AF_INET as u32, libc::SOCK_STREAM as u32)
+            ),
+            PERMITTED
+        );
+        // Name resolution is why an ordinary socket of another kind is permitted; the module
+        // documentation says what that leaves and what it does not.
+        assert_eq!(
+            judge(
+                &program,
+                call(SYS_SOCKET, libc::AF_INET as u32, libc::SOCK_DGRAM as u32)
+            ),
+            PERMITTED
+        );
+        assert_eq!(
+            judge(
+                &program,
+                call(SYS_SOCKET, libc::AF_INET as u32, libc::SOCK_RAW as u32)
+            ),
+            REFUSED
+        );
+        assert_eq!(
+            judge(
+                &program,
+                call(SYS_SOCKET, libc::AF_PACKET as u32, libc::SOCK_DGRAM as u32)
+            ),
+            REFUSED
+        );
+        // The flags a socket carries beside its kind do not change what kind it is.
+        assert_eq!(
+            judge(
+                &program,
+                call(
+                    SYS_SOCKET,
+                    libc::AF_INET as u32,
+                    libc::SOCK_RAW as u32 | 0o4000
+                )
+            ),
+            REFUSED
+        );
+        assert_eq!(judge(&program, call(SYS_LISTEN, 0, 0)), REFUSED);
+        assert_eq!(judge(&program, call(1, 0, 0)), PERMITTED);
     }
 
     #[test]
     fn a_machine_this_filter_does_not_describe_ends_the_process() {
         for remote in [false, true] {
             let program = filter(remote).expect("a filter for this machine");
-            assert_eq!(judge(&program, 0, SYS_SOCKET, 0), UNKNOWN_MACHINE);
+            let mut other = call(SYS_SOCKET, 0, 0);
+            other.machine = 0;
+            assert_eq!(judge(&program, other), UNKNOWN_MACHINE);
+            // The other calling convention of this same machine, whose numbers mean other calls.
+            let mut convention = call(SYS_SOCKET | OTHER_CONVENTION, 0, 0);
+            convention.machine = ARCHITECTURE;
+            assert_eq!(judge(&program, convention), UNKNOWN_MACHINE);
         }
     }
 }
