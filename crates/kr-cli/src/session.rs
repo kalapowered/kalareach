@@ -1040,3 +1040,83 @@ async fn wait_for_resize(resized: &mut Option<&mut WindowChanges>) {
 async fn wait_for_resize(_resized: &mut Option<&mut WindowChanges>) {
     std::future::pending().await
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        SCROLL_BACK_KEY, SCROLL_FORWARD_KEY, Scroll, landed, scroll_step, scrolled,
+        split_scrollback,
+    };
+    use kr_protocol::attachment::ViewportPosition;
+
+    /// Section 8 line 459: a scroll-back key is this terminal's own, and never the session's.
+    #[test]
+    fn the_scroll_back_keys_never_reach_the_session() {
+        let (scrolls, input) = split_scrollback(SCROLL_BACK_KEY);
+        assert_eq!(scrolls, vec![Scroll::Back]);
+        assert!(
+            input.is_empty(),
+            "nothing of it is written into the application: {input:?}"
+        );
+        let (scrolls, input) = split_scrollback(SCROLL_FORWARD_KEY);
+        assert_eq!(scrolls, vec![Scroll::Forward]);
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn everything_else_the_person_typed_is_theirs() {
+        let mut typed = b"ls -l".to_vec();
+        typed.extend_from_slice(SCROLL_BACK_KEY);
+        typed.extend_from_slice(b"\r");
+        typed.extend_from_slice(SCROLL_FORWARD_KEY);
+        typed.extend_from_slice(b"\x1b[5~\x1b");
+        let (scrolls, input) = split_scrollback(&typed);
+        assert_eq!(scrolls, vec![Scroll::Back, Scroll::Forward]);
+        assert_eq!(
+            input, b"ls -l\r\x1b[5~\x1b",
+            "an unshifted Page Up and a lone Escape are the application's"
+        );
+    }
+
+    #[test]
+    fn a_step_is_a_window_less_the_line_that_joins_the_two_pages() {
+        assert_eq!(scroll_step(24), 23);
+        assert_eq!(scroll_step(2), 1);
+        assert_eq!(scroll_step(1), 1, "a window of one row still moves");
+        assert_eq!(scroll_step(0), 1);
+    }
+
+    #[test]
+    fn a_window_on_the_live_screen_asks_by_distance_and_then_by_row() {
+        let first = scrolled(None, Scroll::Back, 23).expect("a window can go back from live");
+        assert!(
+            matches!(first, ViewportPosition::Above(rows) if rows.get() == 23),
+            "a client with no row identifier above its page asks by distance: {first:?}"
+        );
+        // The host answered with the row it landed on, and from there the window names it.
+        let next = scrolled(Some(500), Scroll::Back, 23).expect("and keeps going back");
+        assert!(matches!(next, ViewportPosition::Row(row) if row.get() == 477));
+        let forward = scrolled(Some(477), Scroll::Forward, 23).expect("and comes back down");
+        assert!(matches!(forward, ViewportPosition::Row(row) if row.get() == 500));
+        assert!(
+            scrolled(None, Scroll::Forward, 23).is_none(),
+            "the live screen is as far forward as a window goes"
+        );
+        let floor = scrolled(Some(10), Scroll::Back, 23).expect("a window near the beginning");
+        assert!(
+            matches!(floor, ViewportPosition::Row(row) if row.get() == 0),
+            "which asks for the first row rather than for one below it: {floor:?}"
+        );
+    }
+
+    #[test]
+    fn where_the_window_landed_is_read_from_the_answer() {
+        assert_eq!(landed(None), None, "no position at all is the live screen");
+        assert_eq!(
+            landed(Some(ViewportPosition::Row(kr_protocol::scalars::U64::new(
+                42
+            )))),
+            Some(42)
+        );
+    }
+}

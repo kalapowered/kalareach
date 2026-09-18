@@ -287,6 +287,19 @@ pub struct GeometryResult {
 mod tests {
     use super::*;
 
+    /// A window is named either by a row it holds or by how far above the live page it starts.
+    #[test]
+    fn a_viewport_position_is_a_row_or_a_distance_above_the_live_page() {
+        assert_eq!(
+            serde_json::to_value(ViewportPosition::Row(U64::new(4_096))).expect("encodes"),
+            serde_json::json!({ "row": "4096" })
+        );
+        assert_eq!(
+            serde_json::to_value(ViewportPosition::Above(U64::new(23))).expect("encodes"),
+            serde_json::json!({ "above": "23" })
+        );
+    }
+
     #[test]
     fn semantic_attachments_cannot_claim_geometry() {
         assert!(!AttachMode::Semantic.may_claim_geometry());

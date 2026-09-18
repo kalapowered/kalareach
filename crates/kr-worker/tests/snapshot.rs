@@ -295,6 +295,60 @@ async fn attach_claiming(host: &Host, dimensions: Dimensions, profile: Option<&s
     }
 }
 
+/// Attaches a client that may type, which is what holding the input lease needs.
+async fn attach_with_input(host: &Host, dimensions: Dimensions) -> Attached {
+    let mut client = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let mut requested = CanonicalSet::new();
+    requested.insert(AttachmentCapability::ObserveTerminal);
+    requested.insert(AttachmentCapability::Input);
+    let attached: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(host),
+            &SessionAttachParams {
+                session_id: host.session_id,
+                mode: AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(dimensions),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the attach succeeds")
+        .to_typed()
+        .expect("decodes");
+    let presentation = attached.attachment.presentation.as_ref().copied();
+    let attachment_id = attached.attachment.attachment_id;
+    let mut streams = CanonicalSet::new();
+    streams.insert(EventStream::Output);
+    let subscribed: EventsSubscribeResult = client
+        .request(
+            Method::EventsSubscribe,
+            &EventsSubscribeParams {
+                session_id: host.session_id,
+                attachment_id,
+                streams,
+                from_cursor: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the subscription succeeds")
+        .to_typed()
+        .expect("decodes");
+    Attached {
+        client,
+        attachment_id,
+        presentation,
+        subscribed,
+    }
+}
+
 /// One thing a projected client received, decoded.
 #[derive(Debug)]
 enum Event {
@@ -1228,6 +1282,76 @@ async fn the_palette_source_is_recorded_at_creation_and_succession_does_not_chan
     );
 }
 
+/// KR-REQ-08.44: each form a creation can name records its own provenance, and a palette query
+/// answers with the session's canonical palette rather than the terminal a client is sitting at.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn each_palette_a_creation_can_name_is_recorded_as_what_it_was() {
+    let shared = (
+        kr_term::palette::Rgb::new(0xd0, 0xd4, 0xd8),
+        kr_term::palette::Rgb::new(0x10, 0x12, 0x18),
+    );
+    for (choice, expected) in [
+        (PaletteChoice::LightPreset, PaletteProvenance::LightPreset),
+        (PaletteChoice::DarkPreset, PaletteProvenance::DarkPreset),
+        (
+            PaletteChoice::Shared {
+                foreground: shared.0,
+                background: shared.1,
+            },
+            PaletteProvenance::ClientPreference,
+        ),
+        (
+            PaletteChoice::ProfileDefault,
+            PaletteProvenance::ProfileDefault,
+        ),
+    ] {
+        let host = host_with(
+            "sleep 20",
+            Dimensions::new(CANONICAL.0, CANONICAL.1),
+            Some(choice),
+            1024 * 1024,
+        )
+        .await;
+        let mut watcher = attach(
+            &host,
+            Dimensions::new(SMALLER.0, SMALLER.1),
+            Some("xterm-256color"),
+        )
+        .await;
+        let seen = collect_until_installed(&mut watcher.client, Duration::from_secs(5)).await;
+        let palette = seen
+            .iter()
+            .find_map(|event| match event {
+                Event::Snapshot(header) => Some(header.palette.clone()),
+                _ => None,
+            })
+            .expect("a snapshot");
+        assert_eq!(
+            palette.source, expected,
+            "the form the creation named is the provenance the session records"
+        );
+        if matches!(choice, PaletteChoice::Shared { .. }) {
+            assert_eq!(
+                (
+                    palette.foreground.red,
+                    palette.foreground.green,
+                    palette.foreground.blue
+                ),
+                (shared.0.r, shared.0.g, shared.0.b),
+                "and the colours the client shared are the session's own"
+            );
+            assert_eq!(
+                (
+                    palette.background.red,
+                    palette.background.green,
+                    palette.background.blue
+                ),
+                (shared.1.r, shared.1.g, shared.1.b)
+            );
+        }
+    }
+}
+
 /// KR-ACC-007 and KR-REQ-08.80: a slow projected client resynchronises and holds nothing up.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() {
@@ -1703,4 +1827,443 @@ async fn a_queue_too_small_for_any_screen_is_refused_when_it_is_asked_for() {
     session
         .subscribe_within(projected, minimum)
         .expect("a queue of exactly the smallest screen is enough");
+}
+
+/// Reports where one attachment's window is looking, and returns where the host put it.
+///
+/// The same method a terminal reports its size through: section 23's method table is closed, and a
+/// window's position is part of what a viewport report is.
+async fn report_viewport(
+    host: &Host,
+    attached: &mut Attached,
+    dimensions: Dimensions,
+    position: Option<kr_protocol::attachment::ViewportPosition>,
+) -> kr_protocol::attachment::AttachmentViewportResult {
+    attached
+        .client
+        .mutate(
+            Method::AttachmentViewport,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(host),
+            &kr_protocol::attachment::AttachmentViewportParams {
+                attachment_id: attached.attachment_id,
+                dimensions,
+                position: Nullable(position),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("a viewport report is not refused")
+        .to_typed()
+        .expect("decodes")
+}
+
+/// The stable row a completed installation says its window starts at.
+fn installed_top_row(events: &[Event]) -> u64 {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            Event::Snapshot(header) => Some(header.viewport.top_row.get()),
+            _ => None,
+        })
+        .expect("a snapshot")
+}
+
+/// Every row of the active buffer a completed installation carried, by stable identifier.
+fn installed_rows(events: &[Event], buffer: ProjectedBuffer) -> Vec<(u64, String)> {
+    let mut rows: Vec<(u64, String)> = events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Rows(page) if page.buffer == buffer => Some(page),
+            _ => None,
+        })
+        .flat_map(|page| {
+            page.rows.iter().map(|row| {
+                let text: String = row.runs.iter().map(|run| run.text.as_str()).collect();
+                (row.row.get(), text)
+            })
+        })
+        .collect();
+    rows.sort_by_key(|(id, _)| *id);
+    rows.dedup_by_key(|(id, _)| *id);
+    rows
+}
+
+/// A session that has printed `lines` numbered lines and is then idle.
+fn numbered(lines: u32) -> String {
+    format!(
+        "i=0; while [ $i -lt {lines} ]; do printf 'line %d\\r\\n' $i; i=$((i+1)); done; sleep 20"
+    )
+}
+
+/// KR-REQ-08.79, KR-REQ-08.83: a window above the live page is installed with the pages that
+/// cover it, inside the same bounds and the same subscriber's queue as any other screen.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_viewport_above_the_live_page_installs_the_pages_that_cover_it() {
+    let host = host_with(
+        &numbered(400),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    assert_eq!(
+        watcher.presentation,
+        Some(TerminalPresentationMode::Viewport),
+        "a terminal of another size is projected"
+    );
+    let live = collect_until_installed(&mut watcher.client, Duration::from_secs(5)).await;
+    let live_top = installed_top_row(&live);
+    assert!(
+        live_top > 200,
+        "the session has scrolled well past its first screen: {live_top}"
+    );
+
+    // Back one hundred rows, named as a distance because this client has not been given a row
+    // identifier above the page it is looking at.
+    let answer = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(100),
+        )),
+    )
+    .await;
+    let landed = match answer.position.0 {
+        Some(kr_protocol::attachment::ViewportPosition::Row(row)) => row.get(),
+        other => panic!("a window above the live page lands on a row: {other:?}"),
+    };
+    assert_eq!(
+        landed,
+        live_top - 100,
+        "and it lands where it asked, a hundred rows above the live page"
+    );
+
+    // The pages that cover it arrive through the subscription this attachment already holds,
+    // charged to its own queue, and the installation completes: a client holding part of a screen
+    // holds none of it, so a last page proves the whole window crossed the queue.
+    let history = collect_until_installed(&mut watcher.client, Duration::from_secs(5)).await;
+    assert_eq!(
+        installed_top_row(&history),
+        landed,
+        "the screen it is given is drawn for the window it asked for"
+    );
+    assert!(
+        history.iter().any(|event| matches!(event, Event::Rows(page)
+            if !page.more && page.buffer == ProjectedBuffer::Primary)),
+        "the installation completes rather than leaving the client holding part of a screen"
+    );
+    for event in &history {
+        if let Event::Rows(page) = event {
+            assert!(
+                page.rows.len() as u64 <= MAX_PROJECTION_PAGE_ROWS,
+                "every page stays inside section 8's row bound: {}",
+                page.rows.len()
+            );
+        }
+    }
+
+    let rows = installed_rows(&history, ProjectedBuffer::Primary);
+    let shown: Vec<&(u64, String)> = rows
+        .iter()
+        .filter(|(id, _)| *id >= landed && *id < landed + SMALLER.1)
+        .collect();
+    assert_eq!(
+        shown.len() as u64,
+        SMALLER.1,
+        "the window's own rows are all there: {rows:?}"
+    );
+    assert!(
+        shown[0].1.starts_with("line "),
+        "and they are the session's retained rows rather than blanks: {:?}",
+        shown[0]
+    );
+    // Historical rows are what the window is: the first row it holds is a hundred rows older than
+    // the live page's first row, and the numbering says so.
+    let first_of_window: u32 = shown[0].1["line ".len()..]
+        .trim()
+        .parse()
+        .expect("the line carries its own number");
+    let first_of_live: Vec<&(u64, String)> =
+        rows.iter().filter(|(id, _)| *id == landed + 100).collect();
+    if let Some((_, text)) = first_of_live.first() {
+        let live_number: u32 = text["line ".len()..]
+            .trim()
+            .parse()
+            .expect("the line carries its own number");
+        assert_eq!(
+            live_number - first_of_window,
+            100,
+            "a hundred rows above is a hundred lines earlier"
+        );
+    }
+
+    // And back to the live screen, which is what no position at all means.
+    let back = report_viewport(&host, &mut watcher, window, None).await;
+    assert!(
+        back.position.0.is_none(),
+        "a report with no position is the live screen: {:?}",
+        back.position.0
+    );
+    let again = collect_until_installed(&mut watcher.client, Duration::from_secs(5)).await;
+    assert!(
+        installed_top_row(&again) >= live_top,
+        "and the window follows the session again"
+    );
+}
+
+/// KR-REQ-08.79, KR-REQ-08.83: a window naming a row the session gave up is shown the oldest page
+/// there is, with the marker, rather than being refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_viewport_that_names_an_evicted_row_is_given_the_oldest_page_and_the_marker() {
+    // Past the grid's own retention, so the oldest rows this session held are gone.
+    let host = host_with(
+        &numbered(4_500),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(6)).await;
+
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let live = collect_until_installed(&mut watcher.client, Duration::from_secs(10)).await;
+    let oldest = live
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            Event::Snapshot(header) => Some((header.oldest_retained_row.get(), header.evicted)),
+            _ => None,
+        })
+        .expect("a snapshot");
+    assert!(
+        oldest.0 > 0 && oldest.1,
+        "this session has given up its oldest rows: {oldest:?}"
+    );
+
+    // Row zero is gone. The window is put where the rows begin instead.
+    let answer = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Row(
+            kr_protocol::scalars::U64::new(0),
+        )),
+    )
+    .await;
+    let landed = match answer.position.0 {
+        Some(kr_protocol::attachment::ViewportPosition::Row(row)) => row.get(),
+        other => panic!("an evicted row is answered with the oldest one there is: {other:?}"),
+    };
+    assert_eq!(
+        landed, oldest.0,
+        "which is the oldest row the session still retains"
+    );
+
+    let history = collect_until_installed(&mut watcher.client, Duration::from_secs(10)).await;
+    assert_eq!(
+        installed_top_row(&history),
+        landed,
+        "and the screen it is given starts there"
+    );
+    for event in &history {
+        match event {
+            Event::Snapshot(header) => {
+                assert_eq!(header.oldest_retained_row.get(), oldest.0);
+                assert!(header.evicted, "the header states the eviction");
+            }
+            Event::Rows(page) if page.buffer == ProjectedBuffer::Primary => {
+                assert_eq!(
+                    page.oldest_retained_row.get(),
+                    oldest.0,
+                    "every page states the oldest row it could have carried"
+                );
+                assert!(page.evicted, "and that rows below it are gone");
+                assert!(
+                    page.rows.iter().all(|row| row.row.get() >= oldest.0),
+                    "no page carries a row the session no longer holds"
+                );
+            }
+            _ => {}
+        }
+    }
+}
+
+/// KR-ACC-002 and section 8 line 495: the link ranges and the exact cells of a history page are
+/// the same after a reconnection, which is what activation and a copy selection each need.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hyperlink_and_a_selection_in_history_survive_a_reconnection() {
+    let host = host_with(
+        "printf '\\033]8;;https://example.invalid/deep\\033\\\\the deep link\\033]8;;\\033\\\\\\r\\n'; \
+         i=0; while [ $i -lt 200 ]; do printf 'line %d\\r\\n' $i; i=$((i+1)); done; sleep 20",
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // Everything one page carries about its cells: the row, each run's column, its width and its
+    // text, and the link over it. A copy selection reads exactly this.
+    let cells_of = |events: &[Event]| -> Vec<(u64, u64, u64, String, Option<String>)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Rows(page) if page.buffer == ProjectedBuffer::Primary => Some(page),
+                _ => None,
+            })
+            .flat_map(|page| {
+                page.rows.iter().flat_map(|row| {
+                    let id = row.row.get();
+                    row.runs.iter().map(move |run| {
+                        (
+                            id,
+                            run.column.get(),
+                            run.cells.get(),
+                            run.text.clone(),
+                            run.hyperlink.0.clone(),
+                        )
+                    })
+                })
+            })
+            .filter(|(_, _, _, text, _)| text.contains("deep link"))
+            .collect()
+    };
+
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut first = attach(&host, window, Some("xterm-256color")).await;
+    let live = collect_until_installed(&mut first.client, Duration::from_secs(5)).await;
+    let live_top = installed_top_row(&live);
+    assert!(
+        live_top > 0,
+        "the link has scrolled above the live page: {live_top}"
+    );
+
+    // The link is on the session's first row, so the window goes to the oldest rows there are.
+    let answer = report_viewport(
+        &host,
+        &mut first,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Row(
+            kr_protocol::scalars::U64::new(0),
+        )),
+    )
+    .await;
+    let landed = match answer.position.0 {
+        Some(kr_protocol::attachment::ViewportPosition::Row(row)) => row.get(),
+        other => panic!("a window at the first row is above the live page: {other:?}"),
+    };
+    let before = collect_until_installed(&mut first.client, Duration::from_secs(5)).await;
+    let cells = cells_of(&before);
+    assert_eq!(
+        cells.len(),
+        1,
+        "the link's own run is in the page that covers it: {cells:?}"
+    );
+    assert_eq!(
+        cells[0].4.as_deref(),
+        Some("https://example.invalid/deep"),
+        "with its target, as inert metadata"
+    );
+    drop(first);
+
+    // A new connection, a new attachment, and the same window: the reconnection.
+    let mut second = attach(&host, window, Some("xterm-256color")).await;
+    let _ = collect_until_installed(&mut second.client, Duration::from_secs(5)).await;
+    let answer = report_viewport(
+        &host,
+        &mut second,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Row(
+            kr_protocol::scalars::U64::new(landed),
+        )),
+    )
+    .await;
+    assert!(
+        matches!(
+            answer.position.0,
+            Some(kr_protocol::attachment::ViewportPosition::Row(row)) if row.get() == landed
+        ),
+        "the same window: {:?}",
+        answer.position.0
+    );
+    let after = collect_until_installed(&mut second.client, Duration::from_secs(5)).await;
+    assert_eq!(
+        cells_of(&after),
+        cells,
+        "the same cells, in the same columns of the same row, under the same target"
+    );
+}
+
+/// Section 8 line 459: passive scrollback does not seize the input lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scrolling_back_does_not_seize_the_input_lease() {
+    let host = host_with(
+        &numbered(300),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // One attachment that types, and one that watches. The watcher scrolls.
+    let mut typist = attach_with_input(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
+    let lease: kr_protocol::input::InputAcquireResult = typist
+        .client
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::input::InputAcquireParams {
+                session_id: host.session_id,
+                attachment_id: typist.attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .expect("the lease is granted")
+        .to_typed()
+        .expect("decodes");
+    let held = lease.lease;
+    assert_eq!(
+        held.holder.0,
+        Some(typist.attachment_id),
+        "the typist holds the lease"
+    );
+
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let _ = collect_until_installed(&mut watcher.client, Duration::from_secs(5)).await;
+    for step in [40_u64, 80] {
+        let _ = report_viewport(
+            &host,
+            &mut watcher,
+            window,
+            Some(kr_protocol::attachment::ViewportPosition::Above(
+                kr_protocol::scalars::U64::new(step),
+            )),
+        )
+        .await;
+    }
+    let _ = report_viewport(&host, &mut watcher, window, None).await;
+
+    let after = host.runtime.session().lease();
+    assert_eq!(
+        after.holder.0,
+        Some(typist.attachment_id),
+        "scrolling took nothing: the lease is where it was"
+    );
+    assert_eq!(
+        after.epoch, held.epoch,
+        "and its epoch did not move, so nothing was taken over"
+    );
 }

@@ -1251,6 +1251,55 @@ mod tests {
         );
     }
 
+    /// KR-REQ-08.44: each form a creation can name records its own provenance.
+    #[test]
+    fn a_create_requests_palette_becomes_the_choice_that_records_it() {
+        use kr_protocol::projection::Rgb as WireRgb;
+        use kr_protocol::session::{PalettePreset, PaletteRequest, ProbedPalette};
+
+        assert_eq!(
+            PaletteChoice::from_request(None),
+            PaletteChoice::ProfileDefault
+        );
+        assert_eq!(
+            PaletteChoice::from_request(Some(PaletteRequest::Preset(PalettePreset::Light))),
+            PaletteChoice::LightPreset
+        );
+        assert_eq!(
+            PaletteChoice::from_request(Some(PaletteRequest::Preset(PalettePreset::Dark))),
+            PaletteChoice::DarkPreset
+        );
+        let shared = PaletteChoice::from_request(Some(PaletteRequest::Probe(ProbedPalette {
+            foreground: WireRgb {
+                red: 0xd0,
+                green: 0xd4,
+                blue: 0xd8,
+            },
+            background: WireRgb {
+                red: 0x10,
+                green: 0x12,
+                blue: 0x18,
+            },
+        })));
+        assert_eq!(
+            shared,
+            PaletteChoice::Shared {
+                foreground: Rgb::new(0xd0, 0xd4, 0xd8),
+                background: Rgb::new(0x10, 0x12, 0x18),
+            }
+        );
+        let palette = shared.palette();
+        assert_eq!(palette.source(), PaletteSource::ClientPreference);
+        assert_eq!(
+            palette.dynamic(kr_term::palette::DynamicColour::Foreground),
+            Rgb::new(0xd0, 0xd4, 0xd8)
+        );
+        assert_eq!(
+            palette.dynamic(kr_term::palette::DynamicColour::Background),
+            Rgb::new(0x10, 0x12, 0x18)
+        );
+    }
+
     #[test]
     fn a_palette_choice_records_where_the_colours_came_from() {
         assert_eq!(

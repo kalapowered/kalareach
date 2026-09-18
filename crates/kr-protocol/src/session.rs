@@ -765,6 +765,117 @@ pub struct SessionCloseResult {
 
 #[cfg(test)]
 mod tests {
+    /// KR-REQ-08.44: the two forms a creation can name, spelled the way section 8 describes them.
+    #[test]
+    fn a_palette_request_is_either_a_preset_or_the_colours_a_probe_found() {
+        use super::{PalettePreset, PaletteRequest, ProbedPalette};
+
+        let preset = serde_json::to_value(PaletteRequest::Preset(PalettePreset::Light))
+            .expect("a preset encodes");
+        assert_eq!(preset, serde_json::json!({ "preset": "light" }));
+        let probe = serde_json::to_value(PaletteRequest::Probe(ProbedPalette {
+            foreground: crate::projection::Rgb {
+                red: 0xd0,
+                green: 0xd4,
+                blue: 0xd8,
+            },
+            background: crate::projection::Rgb {
+                red: 0x10,
+                green: 0x12,
+                blue: 0x18,
+            },
+        }))
+        .expect("probed colours encode");
+        assert_eq!(
+            probe,
+            serde_json::json!({
+                "probe": {
+                    "foreground": { "red": 208, "green": 212, "blue": 216 },
+                    "background": { "red": 16, "green": 18, "blue": 24 },
+                }
+            })
+        );
+        assert!(
+            PaletteRequest::Probe(ProbedPalette {
+                foreground: crate::projection::Rgb {
+                    red: 0,
+                    green: 0,
+                    blue: 0
+                },
+                background: crate::projection::Rgb {
+                    red: 0,
+                    green: 0,
+                    blue: 0
+                },
+            })
+            .needs_a_terminal()
+        );
+        assert!(!PaletteRequest::Preset(PalettePreset::Dark).needs_a_terminal());
+    }
+
+    /// KR-REQ-08.44: an invisible creation selects a preset, because it has nothing to probe.
+    #[test]
+    fn only_an_invisible_creation_refuses_a_probed_palette() {
+        use super::{
+            EnvironmentVariable, Nullable, PalettePreset, PaletteRequest, Presentation,
+            ProbedPalette, SessionCreateParams, ShellMode,
+        };
+
+        let request = |presentation, palette| SessionCreateParams {
+            environment_id: crate::ids::EnvironmentId::new(crate::scalars::Uuid::from_bytes(
+                [7; 16],
+            )),
+            presentation,
+            shell: Nullable::null(),
+            shell_mode: ShellMode::NativeCompat,
+            cwd: Nullable::null(),
+            dimensions: Nullable::null(),
+            worker_profile: crate::identity::WorkerProfile::HeadlessUser,
+            environment_snapshot: Vec::<EnvironmentVariable>::new(),
+            palette,
+        };
+        let probed = Nullable::some(PaletteRequest::Probe(ProbedPalette {
+            foreground: crate::projection::Rgb {
+                red: 1,
+                green: 2,
+                blue: 3,
+            },
+            background: crate::projection::Rgb {
+                red: 4,
+                green: 5,
+                blue: 6,
+            },
+        }));
+        assert!(
+            request(Presentation::Invisible, probed.clone())
+                .palette_refusal()
+                .is_some()
+        );
+        assert!(
+            request(Presentation::Attach, probed.clone())
+                .palette_refusal()
+                .is_none()
+        );
+        assert!(
+            request(Presentation::Terminal, probed)
+                .palette_refusal()
+                .is_none()
+        );
+        assert!(
+            request(
+                Presentation::Invisible,
+                Nullable::some(PaletteRequest::Preset(PalettePreset::Light))
+            )
+            .palette_refusal()
+            .is_none()
+        );
+        assert!(
+            request(Presentation::Invisible, Nullable::null())
+                .palette_refusal()
+                .is_none()
+        );
+    }
+
     /// KR-REQ-08.71: a request can break more than one constraint, and all of them are reportable.
     #[test]
     fn every_violated_constraint_is_reportable_and_the_error_carries_the_first() {

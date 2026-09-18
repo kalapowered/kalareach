@@ -3524,6 +3524,92 @@ mod a_create_that_launches_nothing {
         }
     }
 
+    /// KR-REQ-08.44: an invisible session has no terminal, so probed colours are refused.
+    ///
+    /// Before the reservation, because this is a request the host can never serve rather than one
+    /// the environment happens to have no room for: nothing is started, nothing is reserved, and
+    /// the caller is told which of its own fields disagree.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_invisible_creation_cannot_adopt_a_probed_palette() {
+        use kr_protocol::projection::Rgb;
+        use kr_protocol::session::{PalettePreset, PaletteRequest, ProbedPalette};
+
+        let (temp, controller, asked) = daemon().await;
+        let environment_id = temp.environment_id();
+        let (connection_id, actor_id) = admitted(&controller).await;
+        let accepted = AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_secs(30))
+                .expect("a deadline half a minute out"),
+            bound: DeadlineBound::RequestedTtl,
+        };
+
+        let mut probed = create_request(environment_id);
+        probed.params = ParamsValue::from_typed(&SessionCreateParams {
+            palette: Nullable::some(PaletteRequest::Probe(ProbedPalette {
+                foreground: Rgb {
+                    red: 0xd0,
+                    green: 0xd0,
+                    blue: 0xd0,
+                },
+                background: Rgb {
+                    red: 0x10,
+                    green: 0x10,
+                    blue: 0x18,
+                },
+            })),
+            ..create_params(environment_id)
+        })
+        .expect("encodes");
+        let error = controller
+            .session_create(&actor_id, &probed, connection_id, accepted)
+            .await
+            .expect_err("an invisible session has no terminal to have probed");
+        assert_eq!(
+            error.code(),
+            ErrorCode::InvalidArgument,
+            "the refusal is about the request rather than about this host: {error}"
+        );
+        assert!(
+            error.to_string().contains("no terminal to probe"),
+            "and it says which field disagrees with which: {error}"
+        );
+        assert!(
+            asked.lock().expect("the record is not poisoned").is_empty(),
+            "no worker is started for a create the host refused"
+        );
+        let registry = controller.registry.lock().await;
+        assert_eq!(
+            registry.occupancy().expect("counts"),
+            0,
+            "and the refusal takes no reservation at all"
+        );
+        drop(registry);
+
+        // The same session, with a preset, is exactly what section 8 says an invisible creation
+        // selects. It reaches the launch, which this supervisor refuses for its own reasons.
+        let mut preset = create_request(environment_id);
+        preset.params = ParamsValue::from_typed(&SessionCreateParams {
+            palette: Nullable::some(PaletteRequest::Preset(PalettePreset::Dark)),
+            ..create_params(environment_id)
+        })
+        .expect("encodes");
+        let outcome = controller
+            .session_create(&actor_id, &preset, connection_id, accepted)
+            .await;
+        assert!(
+            outcome.is_err(),
+            "this test's supervisor starts nothing, so the create cannot succeed"
+        );
+        let launches = asked.lock().expect("the record is not poisoned").len();
+        assert_eq!(
+            launches, 1,
+            "but a preset is admitted and reaches the launch"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_create_that_waited_across_a_revocation_launches_nothing() {
         let (temp, controller, asked) = daemon().await;
