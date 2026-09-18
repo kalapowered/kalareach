@@ -266,9 +266,9 @@ impl RowSource for kr_term::engine::Engine {
 /// Two runs of rows, in this order. The window's own, from the retained rows the session still
 /// holds, which is what the person is looking at; and then the live screen's, which is what the
 /// session goes on writing and what this client draws the moment its window comes back. The window
-/// comes first because order decides what a queue too small for both gives up: a screen is cut
-/// from the end, so what is lost is the part nobody is looking at. Rows the window already covers
-/// are not read twice.
+/// comes first because the rows are converted in order against a running total of the queue: a
+/// queue that runs out part way through leaves the window whole and the live screen behind it
+/// emptied. Rows the window already covers are not read twice.
 ///
 /// The buffer that is not showing keeps no scrollback, so it is read exactly as it is for a live
 /// window.

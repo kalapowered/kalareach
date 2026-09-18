@@ -107,16 +107,21 @@ the window this terminal is looking through and never reach the session. The com
 new position through `attachment.viewport`, the host installs the pages that cover it, and the
 input lease does not move: section 8 puts passive scrollback among the things that never seize it,
 so a terminal that may not type can still read what is above the live page. A step is one window
-less the line that joins the two pages, and several keys in one read move the window once, because
-a window is in one place.
+less the line that joins the two pages, and holding the key down goes back a page for each repeat.
+
+A read is one of those keys or it is the session's, whole and unchanged. That is the rule rather
+than a reader that looks inside a batch, because looking inside is how a command starts altering
+what somebody typed: it would have to know where a bracketed paste began, hold back the beginning
+of a sequence a read boundary cut in half, and decide what a key means among bytes it did not
+recognise. A terminal writes one key in one go, so a key pressed on its own arrives on its own; a
+key among other bytes is forwarded like every other byte, and a pasted one is pasted text.
 
 They are this terminal's keys only where this terminal has no history of its own. A terminal being
 handed the session's bytes has them, so its own scrollback holds what scrolled past and the command
 takes none of its keys; a terminal drawing a projection was never sent them, and the session's
 window is the only way above its screen. They are also the application's while a full-screen
-program is running, because its buffer keeps no history and it has its own use for those keys. Inside a bracketed paste nothing is a key at all: pasted text reaches the session
-byte for byte, whatever it happens to contain. An unshifted Page Up is the application's, as it
-always was, and a lone Escape is never held back waiting for a key that might follow it.
+program is running, because its buffer keeps no history and it has its own use for those keys; the
+window comes back to the live screen with the screen that program took.
 
 A window stays where the person put it while the session goes on writing underneath. `--follow-live`
 brings it back to the live screen as soon as the session writes something, for a person who would

@@ -628,8 +628,11 @@ it is the session giving up rows below it, and that installs the window again wi
 Live output goes on arriving the whole time. A client parked in its history is still sent every
 bounded update, and what it draws is its own decision. A screen installed for such a window carries
 two runs of rows: the window's own, from the rows the session retained, and the live screen's
-behind them. The window comes first because order decides what a queue too small for both gives up,
-and what should be lost is the part nobody is looking at.
+behind them, so a client that has to be drawn again while it is reading its history is still sent
+what the session has written. The window's rows are converted first, so a queue that runs out part
+way through arrives with the window whole and the live screen behind it emptied. A screen that is
+still too large once its pages are built is shortened row by row, every row to the same share of
+what is left, and it says so.
 
 Two origins travel with every window, because two different things are measured from them. The
 rows a client draws are named by the window's own first row; the cursor's row is a line of the

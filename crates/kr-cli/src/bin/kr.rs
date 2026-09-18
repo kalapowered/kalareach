@@ -142,7 +142,7 @@ async fn run(cli: Cli) -> Result<Completion> {
             // From here to the attachment, anything the person typed while this terminal was
             // being asked for its colours has nowhere to go but that attachment. A creation that
             // fails on the way owes them the count rather than losing it in silence.
-            let undelivered = UndeliveredTyping::new(typed_while_asking.len());
+            let mut undelivered = kr_cli::session::UndeliveredTyping::new(typed_while_asking.len());
             let mut client = open_controller(&environment.paths, build_id()).await?;
             let outcome = client
                 .mutate(
@@ -158,9 +158,9 @@ async fn run(cli: Cli) -> Result<Completion> {
             // The session exists. Presenting it is a separate step, and a presentation that fails
             // never produces a second session: the failure is reported against the one that was
             // created.
-            let presented = present(&paths, &created, presentation, typed_while_asking).await;
-            // It reached an attachment, or it was reported there. Either way nothing more is owed.
+            // The attachment takes them, and says so itself. Nothing is owed here any more.
             undelivered.delivered();
+            let presented = present(&paths, &created, presentation, typed_while_asking).await;
             if cli.json {
                 let mut document = report::session(&created.session);
                 if let Some(object) = document.as_object_mut() {
@@ -492,46 +492,11 @@ async fn present(
         Presentation::Terminal => {
             // Nothing here forwards input, so anything the person typed while the terminal was
             // being asked for its colours has nowhere to go. They are owed the number rather than
-            // left to wonder where those keystrokes went.
-            report_undelivered(typed_before.len());
+            // left to wonder where those keystrokes went, which is what this reports on its way
+            // out of scope.
+            let _owed = kr_cli::session::UndeliveredTyping::new(typed_before.len());
             open_terminal_application(created.session.session_id, created.session.environment_id)
         }
-    }
-}
-
-/// Says how many bytes the person typed that nothing could deliver.
-fn report_undelivered(bytes: usize) {
-    if bytes > 0 {
-        eprintln!(
-            "kr: {bytes} bytes typed while this terminal was asked for its colours could not be \
-             delivered to the session"
-        );
-    }
-}
-
-/// What the person typed before a session existed, until something delivers it.
-///
-/// A creation that fails between the question and the attachment leaves those keystrokes with
-/// nowhere to go, and every way out of that path passes through this: the count is reported unless
-/// something says it arrived.
-struct UndeliveredTyping {
-    bytes: usize,
-}
-
-impl UndeliveredTyping {
-    const fn new(bytes: usize) -> Self {
-        Self { bytes }
-    }
-
-    /// Something took them, so nothing is owed.
-    fn delivered(mut self) {
-        self.bytes = 0;
-    }
-}
-
-impl Drop for UndeliveredTyping {
-    fn drop(&mut self) {
-        report_undelivered(self.bytes);
     }
 }
 

@@ -1100,6 +1100,27 @@ impl Session {
         // Resolved against the session as it stands now: an offset above the live screen is a
         // place, and the row it names is what the attachment holds from here.
         let top_row = self.engine.resolve_position(position);
+        // And the screen that window needs has to cross the queue this attachment already has. A
+        // window above the live page carries the rows it shows and the live screen behind them, so
+        // it can be a larger screen than the one this subscriber was admitted for; being told the
+        // window moved and then that the queue is full is two answers where there should be one.
+        if top_row.is_some() && top_row != before_top_row {
+            let limit = self.hub.limit_of(attachment_id);
+            let minimum = self.engine.minimum_projection_install(
+                crate::projection::Window {
+                    dimensions,
+                    anchor: crate::projection::ViewportAnchor::of(top_row),
+                },
+                self.content_scope(attachment_id),
+            )?;
+            if limit > 0 && limit < minimum {
+                return Err(WorkerError::InvalidArgument(format!(
+                    "a send queue of {limit} bytes cannot carry this window: the smallest screen \
+                     it can be installed with is {minimum} bytes, and a client holding part of a \
+                     screen holds none of it"
+                )));
+            }
+        }
         let presentation = self
             .attachments
             .viewport(attachment_id, dimensions, top_row)?;
