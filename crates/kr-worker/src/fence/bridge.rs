@@ -119,8 +119,8 @@ impl BridgeServer {
                     observed,
                 ));
             }
-            let writing = tokio::spawn(write_outbound(writer, receiving));
-            self.pump(&mut reader).await;
+            let mut writing = tokio::spawn(write_outbound(writer, receiving));
+            self.pump(&mut reader, &mut writing).await;
             // The connection has ended. The driver stops queueing for it and the session hears that
             // its integration has gone, before the writer is waited on at all: a peer that has
             // stopped reading its own socket must not be able to hold up the loss that releases
@@ -143,9 +143,12 @@ impl BridgeServer {
 
     /// Reads and times one registered connection.
     ///
-    /// Two things happen here and nothing else: a frame arrives, or the machine's one timer fires.
-    /// Writing is the other task's, so neither can hold the other up.
-    async fn pump(&self, reader: &mut BridgeReader) {
+    /// Three things happen here and nothing else: a frame arrives, the machine's one timer fires,
+    /// or the writer's task ends. Writing is the other task's, so neither can hold the other up,
+    /// but a writer that has failed is this connection over: a peer can close the side it reads
+    /// from and leave the side it writes to open, and a read that waited for a frame that will
+    /// never come would leave the loss unreported and every caller waiting on a launch unanswered.
+    async fn pump(&self, reader: &mut BridgeReader, writing: &mut tokio::task::JoinHandle<()>) {
         loop {
             let (wake, deadline) = {
                 let session = self.runtime.session();
@@ -161,12 +164,20 @@ impl BridgeServer {
                 Some(left) => tokio::select! {
                     biased;
                     frame = reader.recv() => Some(frame),
+                    _ = &mut *writing => {
+                        reader.finish();
+                        return;
+                    }
                     () = tokio::time::sleep(left) => None,
                     () = notified => continue,
                 },
                 None => tokio::select! {
                     biased;
                     frame = reader.recv() => Some(frame),
+                    _ = &mut *writing => {
+                        reader.finish();
+                        return;
+                    }
                     () = notified => continue,
                 },
             };
@@ -212,8 +223,9 @@ async fn write_outbound(
             } => writer.send_revocation(transaction, reason).await,
         };
         if sent.is_err() {
-            // The peer has gone or the frame was cut in half. Either way this connection is over,
-            // and the reader's side finds out on its own next read.
+            // The peer has gone or the frame was cut in half. Either way this connection is over.
+            // Ending this task is what says so: the read loop is waiting on it as well as on the
+            // socket, because a read already in progress hears nothing from the flag alone.
             writer.finish();
             return;
         }

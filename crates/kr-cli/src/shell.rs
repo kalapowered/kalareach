@@ -87,8 +87,24 @@ pub fn selected<'a>(set: &'a PackageSet, shell: Option<&str>) -> Result<Vec<&'a 
 /// Reports one package without changing anything.
 #[must_use]
 pub fn report(package: &ShellPackage, layout: &HomeLayout) -> ShellReport {
+    ShellReport {
+        executable: package.executable().display().to_string(),
+        flags: package.interactive_flags(),
+        version: package.manifest.upstream_version.clone(),
+        editor_abi: package.manifest.editor_abi.clone(),
+        integration_version: package.manifest.integration_version.clone(),
+        ..entries_only(package.manifest.shell, layout)
+    }
+}
+
+/// Reports where one shell's entries go, with nothing a package would have said about it.
+///
+/// What is left blank is exactly what an installed package answers: which executable a session
+/// would launch and what it was built from. An operation that needs none of that says so by
+/// leaving them empty rather than by inventing them.
+fn entries_only(kind: ShellKind, layout: &HomeLayout) -> ShellReport {
     let entries = layout
-        .targets(package.manifest.shell)
+        .targets(kind)
         .into_iter()
         .map(|target| EntryReport {
             installed: startup::installed(&target.path),
@@ -98,12 +114,12 @@ pub fn report(package: &ShellPackage, layout: &HomeLayout) -> ShellReport {
         })
         .collect();
     ShellReport {
-        kind: package.manifest.shell,
-        executable: package.executable().display().to_string(),
-        flags: package.interactive_flags(),
-        version: package.manifest.upstream_version.clone(),
-        editor_abi: package.manifest.editor_abi.clone(),
-        integration_version: package.manifest.integration_version.clone(),
+        kind,
+        executable: String::new(),
+        flags: Vec::new(),
+        version: String::new(),
+        editor_abi: String::new(),
+        integration_version: String::new(),
         entries,
     }
 }
@@ -144,13 +160,42 @@ pub fn install(
     Ok(reported)
 }
 
-/// Deletes one package's guarded entry, and nothing else.
+/// Returns the shells a selector names, for an operation that needs no package.
+///
+/// Every shell KalaReach qualifies, or the one the selector names. The set of installed packages
+/// says nothing here: a marked entry is in a file whether or not the package it points at is still
+/// there, and an entry that outlived its package is exactly the one a person needs to remove.
+///
+/// # Errors
+///
+/// Returns a usage failure when the selector names a shell KalaReach does not qualify.
+pub fn shells(selector: Option<&str>) -> Result<Vec<ShellKind>> {
+    let Some(requested) = selector else {
+        return Ok(ShellKind::ALL.to_vec());
+    };
+    ShellKind::ALL
+        .iter()
+        .copied()
+        .find(|kind| kind.as_str() == requested)
+        .map(|kind| vec![kind])
+        .ok_or_else(|| {
+            CliError::Usage(format!(
+                "{requested} is not a shell KalaReach qualifies; it qualifies zsh, bash, fish and powershell"
+            ))
+        })
+}
+
+/// Deletes one shell's guarded entry, and nothing else.
+///
+/// It takes the shell rather than the package, because removal needs neither the executable nor the
+/// manifest: the markers say what to take out, and a person whose package was uninstalled or whose
+/// manifest no longer parses still has entries to remove.
 ///
 /// # Errors
 ///
 /// Returns a resource failure when a startup file cannot be read or written.
-pub fn remove(package: &ShellPackage, layout: &HomeLayout, dry_run: bool) -> Result<ShellReport> {
-    let mut reported = report(package, layout);
+pub fn remove(kind: ShellKind, layout: &HomeLayout, dry_run: bool) -> Result<ShellReport> {
+    let mut reported = entries_only(kind, layout);
     for entry in &mut reported.entries {
         let path = std::path::Path::new(&entry.path);
         let change = if dry_run {
@@ -287,5 +332,54 @@ mod tests {
             "{error}"
         );
         assert!(selected(&set, None).expect("every package").is_empty());
+    }
+
+    #[test]
+    fn an_entry_is_removed_from_an_installation_that_has_no_package_left() {
+        // Removal takes out the lines it put in. A person whose package was uninstalled, or whose
+        // manifest no longer reads, still has those lines in their own configuration, and they are
+        // exactly the ones they are trying to be rid of.
+        let home = tempfile::tempdir().expect("a directory");
+        let layout = HomeLayout {
+            home: home.path().to_path_buf(),
+            zdotdir: None,
+            xdg_config_home: None,
+        };
+        let theirs = "export EDITOR=vim\n";
+        let zshrc = home.path().join(".zshrc");
+        std::fs::write(&zshrc, theirs).expect("writes");
+        let body = startup::entry(
+            ShellKind::Zsh,
+            std::path::Path::new("/gone/entry.zsh"),
+            false,
+        );
+        assert_eq!(
+            startup::install(&zshrc, &body).expect("installs"),
+            Change::Added
+        );
+
+        // No package set is consulted, and none exists.
+        assert_eq!(shells(Some("zsh")).expect("a shell"), vec![ShellKind::Zsh]);
+        assert_eq!(
+            shells(None).expect("every shell").len(),
+            ShellKind::ALL.len()
+        );
+        let report = remove(ShellKind::Zsh, &layout, false).expect("removes");
+        assert_eq!(report.kind, ShellKind::Zsh);
+        assert!(
+            report
+                .entries
+                .iter()
+                .any(|entry| entry.change == Some(Change::Removed)),
+            "{report:?}"
+        );
+        assert_eq!(std::fs::read_to_string(&zshrc).expect("reads"), theirs);
+        assert!(!startup::installed(&zshrc));
+
+        // And a selector KalaReach does not qualify is still a usage failure.
+        assert!(matches!(
+            shells(Some("ksh")).expect_err("refused"),
+            CliError::Usage(_)
+        ));
     }
 }

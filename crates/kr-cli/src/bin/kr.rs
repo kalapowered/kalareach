@@ -599,28 +599,37 @@ async fn run(cli: Cli) -> Result<Completion> {
             // Nothing here reaches the host: setup configures this user's own shell, and the
             // diagnostics read the installed packages and the files those shells actually read.
             let layout = HomeLayout::from_environment();
-            let packages = kr_cli::shell::packages()?;
-            let selected = kr_cli::shell::selected(&packages, shell_selector(&arguments))?;
+            let selector = shell_selector(&arguments);
             let reports = match &arguments.command {
-                ShellCommand::Status(_) => selected
-                    .iter()
-                    .map(|package| kr_cli::shell::report(package, &layout))
-                    .collect::<Vec<_>>(),
-                ShellCommand::Install(install) => selected
-                    .iter()
-                    .map(|package| {
-                        kr_cli::shell::install(
-                            package,
-                            &layout,
-                            install.nsh_bypass,
-                            install.dry_run,
-                        )
-                    })
+                // Removal is the one operation that needs no package: it takes out the marked lines
+                // it put in, and an entry whose package was uninstalled is exactly the one somebody
+                // is trying to get rid of.
+                ShellCommand::Remove(remove) => kr_cli::shell::shells(selector)?
+                    .into_iter()
+                    .map(|kind| kr_cli::shell::remove(kind, &layout, remove.dry_run))
                     .collect::<Result<Vec<_>>>()?,
-                ShellCommand::Remove(remove) => selected
-                    .iter()
-                    .map(|package| kr_cli::shell::remove(package, &layout, remove.dry_run))
-                    .collect::<Result<Vec<_>>>()?,
+                command => {
+                    let packages = kr_cli::shell::packages()?;
+                    let selected = kr_cli::shell::selected(&packages, selector)?;
+                    match command {
+                        ShellCommand::Status(_) => selected
+                            .iter()
+                            .map(|package| kr_cli::shell::report(package, &layout))
+                            .collect::<Vec<_>>(),
+                        ShellCommand::Install(install) => selected
+                            .iter()
+                            .map(|package| {
+                                kr_cli::shell::install(
+                                    package,
+                                    &layout,
+                                    install.nsh_bypass,
+                                    install.dry_run,
+                                )
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                        ShellCommand::Remove(_) => unreachable!("removal is answered above"),
+                    }
+                }
             };
             if cli.json {
                 print_json(&kr_cli::shell::to_json(&reports));

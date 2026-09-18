@@ -185,6 +185,22 @@ impl PhaseGate {
         self.phase.reports_ready()
     }
 
+    /// Returns true when this session's integration has qualified at least once.
+    ///
+    /// Not the same question as [`Self::reports_ready`]. A session that qualified and then lost its
+    /// hooks is degraded rather than unqualified: it is a session somebody is using, and whoever
+    /// asks this is asking whether it ever became one, not whether everything still works. A
+    /// session that never got there answers false whatever happens to it afterwards.
+    #[must_use]
+    pub const fn ever_qualified(&self) -> bool {
+        matches!(
+            self.phase,
+            IntegrationPhase::Qualified
+                | IntegrationPhase::Degraded
+                | IntegrationPhase::TerminalOnly
+        )
+    }
+
     /// Returns true when a launch may be admitted at all.
     #[must_use]
     pub const fn permits_launch(&self) -> bool {
@@ -259,6 +275,45 @@ mod tests {
         assert!(!gate.permits_attribution());
         assert!(!gate.retains_fence());
         assert!(gate.consumes_eligible_eof());
+    }
+
+    #[test]
+    fn a_session_that_never_qualified_says_so_and_one_that_degraded_does_not() {
+        // Two different questions. A worker answers a daemon's proof for a session somebody is
+        // using, and a session that lost its hooks is one of those; a session whose reader never
+        // came up is not one yet, whatever it is doing.
+        let mut gate = PhaseGate::unauthenticated();
+        assert!(!gate.ever_qualified(), "nothing has authenticated yet");
+        assert!(gate.authenticated(ShellKind::Zsh));
+        assert!(
+            !gate.ever_qualified(),
+            "the startup files are still running"
+        );
+        assert!(gate.qualified());
+        assert!(gate.ever_qualified());
+
+        for loss in [
+            IntegrationLoss::SemanticHookLoss,
+            IntegrationLoss::BridgeDisconnected,
+            IntegrationLoss::PostStartupFailure,
+            IntegrationLoss::UnqualifiedRootReplacement,
+        ] {
+            let mut degraded = PhaseGate::unauthenticated();
+            assert!(degraded.authenticated(ShellKind::Zsh));
+            assert!(degraded.qualified());
+            let _ = degraded.lost(loss);
+            assert!(
+                degraded.ever_qualified(),
+                "{loss:?} leaves a session that was live"
+            );
+            assert!(!degraded.reports_ready(), "and one that is not ready");
+        }
+
+        // A session that never qualified stays unqualified through a loss as well.
+        let mut early = PhaseGate::unauthenticated();
+        assert!(early.authenticated(ShellKind::Bash));
+        let _ = early.lost(IntegrationLoss::PostStartupFailure);
+        assert!(!early.ever_qualified());
     }
 
     #[test]

@@ -826,6 +826,23 @@ impl WorkerService {
         Ok(())
     }
 
+    /// Returns the refusal a session owes while its managed integration has never qualified.
+    ///
+    /// A session with no managed editor is never unqualified: it claims none of this contract, and
+    /// whether it started is its own launch's answer.
+    fn unqualified(&self) -> Option<kr_protocol::error::ProtocolError> {
+        let session = self.runtime.session();
+        let driver = session.fence()?;
+        if driver.phase().ever_qualified() {
+            return None;
+        }
+        Some(kr_protocol::error::ProtocolError::new(
+            kr_protocol::error::ErrorCode::ResourceUnavailable,
+            "this session's root integration has not qualified yet, so this worker proves nothing \
+             for it",
+        ))
+    }
+
     async fn handle(
         &self,
         state: &mut ConnectionState,
@@ -835,6 +852,15 @@ impl WorkerService {
         match message {
             ControlFrame::Hello(hello) => Some(self.hello(state, peer, &hello)),
             ControlFrame::VerifyChallenge(challenge) => {
+                // A managed session that has never qualified proves nothing. The endpoint is open
+                // before the integration is live so that a session still being created is
+                // reachable, and a daemon that restarted in that moment would otherwise take this
+                // proof, publish the worker and answer the create as a live session before the
+                // reader's hooks ever came up. A session that qualified and then degraded still
+                // proves itself: it is a session somebody is using.
+                if let Some(error) = self.unqualified() {
+                    return Some(failure(state.next_request_id(), &error));
+                }
                 match self.identity.answer(&challenge, &self.endpoint.as_text()) {
                     Ok(proof) => Some(ControlFrame::VerifyProof(proof)),
                     Err(error) => Some(failure(
@@ -3466,7 +3492,13 @@ impl WorkerService {
                             .to_owned(),
                     ));
                 }
-                session.interrupt(params.attachment_id, params.epoch.get())?;
+                // Every stimulus can sweep the machine's own deadlines, so a request from a client
+                // can be what releases a hold that had already expired. The batches it released go
+                // out on this boundary, whether or not the interrupt itself was admitted: nothing
+                // else is due to run, and bytes the machine has let go of are the application's.
+                let interrupted = session.interrupt(params.attachment_id, params.epoch.get());
+                self.runtime.flush_locked(session);
+                interrupted?;
                 Ok((
                     encode(&InputLeaseResult {
                         lease: session.lease(),
@@ -3494,6 +3526,9 @@ impl WorkerService {
                 })?;
                 let effects = driver.launch_requested(params, attachment_id, transaction);
                 let outcome = session.apply_fence_effects(effects);
+                // The same sweep, and the same reason: a launch request can expire a hold that
+                // arrived before it, and what the machine released belongs to the application now.
+                self.runtime.flush_locked(session);
                 // A refusal the machine could take on its own arrives here: nothing was sent to the
                 // reader, so there is nothing to wait for.
                 if let Some((_, answer)) = outcome.launch_answers.into_iter().next() {
