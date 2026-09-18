@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use kr_controller::registry::Registry;
 use kr_controller::service::{Controller, ControllerSetup};
-use kr_controller::supervision::DetachedSupervisor;
+use kr_controller::supervision::{
+    DetachedSupervisor, LaunchOutcome, WorkerLaunch, WorkerSupervisor, settle,
+};
 use kr_crypto::store::{StoreSelection, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
@@ -34,12 +36,57 @@ use kr_protocol::session::{
 };
 
 /// A host tree on the internal disk, with the worker beside it.
+/// Starts the worker the way this host's own supervisor does, and names its package root.
+///
+/// The daemon passes its own environment on to the process it starts, so a test that wants the
+/// worker to look somewhere else has to say so on the child. Everything else is what
+/// `DetachedSupervisor` does: the worker's own process group, the working directory the daemon
+/// prepared, and no descriptor of this test's.
+#[derive(Debug)]
+struct WorkerWithPackageRoot {
+    packages: PathBuf,
+}
+
+impl WorkerSupervisor for WorkerWithPackageRoot {
+    fn start(&self, launch: &WorkerLaunch) -> LaunchOutcome {
+        let mut command = std::process::Command::new(&launch.program);
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+
+            command.process_group(0);
+        }
+        command.args(launch.arguments());
+        command.current_dir(&launch.working_directory);
+        command.env(
+            kr_shell_integration::host::package::PACKAGE_ROOT_VARIABLE,
+            &self.packages,
+        );
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        match command.spawn() {
+            Ok(child) => settle(child.id()),
+            Err(error) => LaunchOutcome::NotStarted {
+                detail: error.to_string(),
+            },
+        }
+    }
+
+    fn describe(&self) -> String {
+        "a detached process told where this test's packages are".to_owned()
+    }
+}
+
 struct Host {
     temp: kr_ipc::testing::TempHost,
     worker: PathBuf,
     environment_id: EnvironmentId,
     /// Where this daemon looks for qualified shell packages, when a test gives it an installation.
     shell_packages: Option<PathBuf>,
+    /// Where the worker this daemon starts looks for its own, when a test gives it one.
+    worker_packages: Option<PathBuf>,
 }
 
 impl Host {
@@ -56,6 +103,7 @@ impl Host {
             worker,
             environment_id,
             shell_packages: None,
+            worker_packages: None,
         }
     }
 
@@ -68,9 +116,7 @@ impl Host {
     /// depends on what the machine happens to have installed.
     fn with_shell_package(mut self) -> Self {
         use kr_shell_integration::contract::qualification::ShellKind;
-        use kr_shell_integration::host::package::{
-            MANIFEST_BASENAME, PACKAGE_ROOT_VARIABLE, PackageManifest,
-        };
+        use kr_shell_integration::host::package::{MANIFEST_BASENAME, PackageManifest};
 
         let root = self.temp.root().join("packages");
         let directory = root.join(ShellKind::Zsh.as_str()).join("identity-1");
@@ -99,32 +145,14 @@ impl Host {
         )
         .expect("writes the manifest");
 
-        // What the worker is launched as: the worker itself, with its own package root named as a
-        // directory this test made and left empty. The daemon passes its environment on to the
-        // process it starts, and this test process's own environment is shared with every other
-        // test in this binary, so the value is set on the child rather than here. Without it the
-        // worker would read the installation's own root, and whether it found a package there
-        // would depend on the machine rather than on the test.
+        // Where the worker this daemon starts looks for its own packages: a directory this test
+        // made and left empty. The value is set on the child rather than on this process, whose
+        // environment every other test in this binary shares. Without it the worker would read the
+        // installation's own root, and whether it found a package there would depend on the
+        // machine rather than on the test.
         let empty = self.temp.root().join("no-packages");
         std::fs::create_dir_all(&empty).expect("creates an empty package root");
-        let launcher = self.temp.root().join("kr-worker-without-packages");
-        std::fs::write(
-            &launcher,
-            format!(
-                "#!/bin/sh\n{PACKAGE_ROOT_VARIABLE}='{}'\nexport {PACKAGE_ROOT_VARIABLE}\nexec '{}' \"$@\"\n",
-                empty.display(),
-                self.worker.display()
-            ),
-        )
-        .expect("writes the launcher");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-
-            std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
-                .expect("makes the launcher executable");
-        }
-        self.worker = launcher;
+        self.worker_packages = Some(empty);
         self.shell_packages = Some(root);
         self
     }
@@ -151,7 +179,10 @@ impl Host {
                 }),
                 secret_store: StoreSelection::File,
                 boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
-                supervisor: Box::new(DetachedSupervisor::new()),
+                supervisor: match self.worker_packages.clone() {
+                    None => Box::new(DetachedSupervisor::new()),
+                    Some(packages) => Box::new(WorkerWithPackageRoot { packages }),
+                },
                 worker_program: self.worker.clone(),
                 build_id: build(),
                 release: "0".to_owned(),
@@ -473,6 +504,12 @@ async fn a_worker_that_reports_it_could_not_start_leaves_no_directory() {
     assert!(
         refused.message.contains("SHELL_INTEGRATION_UNSUPPORTED"),
         "the worker's own words reach the caller: {refused}"
+    );
+    assert!(
+        refused
+            .message
+            .contains("zsh has no qualified KalaReach package"),
+        "and they are the report this test arranged, made before the shell was started: {refused}"
     );
     // The reservation the report resolved stops occupying the environment, and what was prepared
     // for that worker is given back with it.
