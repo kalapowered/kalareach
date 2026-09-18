@@ -1003,6 +1003,13 @@ impl RestrictedProfile {
             ("fetch.fsckObjects".to_owned(), OsString::from("true")),
             ("http.sslVerify".to_owned(), OsString::from("true")),
             ("advice.detachedHead".to_owned(), OsString::from("false")),
+            // Which remote a clone creates when it is not told. It matters because the program the
+            // other end of a connection runs is fixed below under the remote's own name, and a
+            // configuration that renamed the remote would move that key out from under it.
+            (
+                "clone.defaultRemoteName".to_owned(),
+                OsString::from("origin"),
+            ),
             // The credential list is emptied here. The broker's helper is appended below, so a
             // helper the repository or a user file named is gone and only an approved one remains.
             ("credential.helper".to_owned(), OsString::new()),
