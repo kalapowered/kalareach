@@ -1614,7 +1614,11 @@ impl Controller {
         if let Some(retained) = installer.retained(actor_id, mutation.action_id, &digest)? {
             return Ok(retained);
         }
-        installer.check(&params)?;
+        // Only an installation has something to refuse before it writes. A removal reads its own
+        // record and leaves alone whatever changed, which is not a refusal.
+        if method == Method::AgentToolsInstall {
+            installer.check(&params)?;
+        }
         installer.mark_dispatching(actor_id, mutation.action_id, &digest)?;
         let result = match method {
             Method::AgentToolsInstall => encode(&installer.install(&params)?)?,

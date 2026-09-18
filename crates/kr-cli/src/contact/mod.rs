@@ -401,11 +401,29 @@ impl Contact {
                     u64::try_from(step.as_millis()).unwrap_or(0),
                 )),
             };
-            let result: QuestionOwnResult =
-                bind::read(client, Method::QuestionReadOwn, &params).await?;
+            // The client giving up ends the wait at once rather than at the end of the current
+            // renewal. A wait that ends this way changes nothing: the question is durable, and
+            // calling again resumes waiting on the same one.
+            let ending = QuestionReadOwnParams {
+                wait_ms: Nullable::null(),
+                ..params.clone()
+            };
+            let result: QuestionOwnResult = tokio::select! {
+                biased;
+                () = cancelled.cancelled() => {
+                    // The read in flight is abandoned part way through its exchange, so this
+                    // connection is not used again: its answer would arrive as the answer to
+                    // whatever asked next on it. A fresh connection reads the question one last
+                    // time, and the question itself is untouched either way.
+                    let mut fresh = bind::open(bound, self.build_id.clone()).await?;
+                    let final_read: QuestionOwnResult =
+                        bind::read(&mut fresh, Method::QuestionReadOwn, &ending).await?;
+                    return Ok(final_read.question);
+                }
+                result = bind::read(client, Method::QuestionReadOwn, &params) => result?,
+            };
             if result.question.state.is_resolved()
                 || step.is_zero()
-                || cancelled.is_cancelled()
                 || tokio::time::Instant::now() >= deadline
             {
                 return Ok(result.question);

@@ -161,7 +161,7 @@ impl Installer {
         for (name, contents) in files() {
             let path = root.join(name);
             let replaced = read_digest(&path)?;
-            write_atomically(&path, contents.as_bytes())?;
+            write_atomically(&path, contents.as_bytes(), READABLE)?;
             operations.push(ChangeOperation::WriteFile {
                 path: display(&path),
                 digest: digest_of(contents.as_bytes()),
@@ -413,7 +413,7 @@ impl Installer {
             entry[field] = toml_edit::value(seconds);
         }
         table.insert(SERVER_NAME, toml_edit::Item::Table(entry));
-        write_atomically(path, document.to_string().as_bytes())?;
+        write_atomically(path, document.to_string().as_bytes(), PRIVATE)?;
         self.entry_digest(path)?.ok_or_else(|| {
             ControllerError::InvalidArgument(format!("{} did not keep the entry", display(path)))
         })
@@ -445,7 +445,7 @@ impl Installer {
         servers.insert(SERVER_NAME.to_owned(), self.entry_value(format, agent));
         let text = serde_json::to_string_pretty(&document)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        write_atomically(path, format!("{text}\n").as_bytes())?;
+        write_atomically(path, format!("{text}\n").as_bytes(), PRIVATE)?;
         self.entry_digest(path)?.ok_or_else(|| {
             ControllerError::InvalidArgument(format!("{} did not keep the entry", display(path)))
         })
@@ -661,7 +661,7 @@ impl Installer {
             {
                 servers.remove(SERVER_NAME);
             }
-            write_atomically(path, document.to_string().as_bytes())?;
+            write_atomically(path, document.to_string().as_bytes(), PRIVATE)?;
         } else {
             let mut document = read_json(path)?;
             if let Some(root) = document.as_object_mut()
@@ -681,7 +681,7 @@ impl Installer {
             }
             let text = serde_json::to_string_pretty(&document)
                 .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-            write_atomically(path, format!("{text}\n").as_bytes())?;
+            write_atomically(path, format!("{text}\n").as_bytes(), PRIVATE)?;
         }
         Ok(Removal::Removed)
     }
@@ -859,7 +859,11 @@ impl Installer {
         std::fs::create_dir_all(&self.records).map_err(storage)?;
         let text = serde_json::to_string_pretty(manifest)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        write_atomically(&self.record_path(params), format!("{text}\n").as_bytes())
+        write_atomically(
+            &self.record_path(params),
+            format!("{text}\n").as_bytes(),
+            PRIVATE,
+        )
     }
 }
 
@@ -972,7 +976,7 @@ impl Installer {
         }
         let text = serde_json::to_string_pretty(record)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        write_atomically(&path, format!("{text}\n").as_bytes())
+        write_atomically(&path, format!("{text}\n").as_bytes(), PRIVATE)
     }
 
     fn action_path(
@@ -1091,13 +1095,20 @@ fn digest_of(bytes: &[u8]) -> Digest256 {
     Digest256::from_bytes(kr_cbor::sha256(bytes))
 }
 
+/// The permissions a skill file is created with. It is documentation an agent reads.
+const READABLE: u32 = 0o644;
+
+/// The permissions a configuration document or a host record is created with.
+///
+/// An agent's configuration can hold a credential, so one this host creates is the owner's alone.
+const PRIVATE: u32 = 0o600;
+
 /// Writes a file so a failure part way through cannot truncate what was there.
 ///
-/// The replacement carries the permissions of what it replaces. An agent's configuration can hold
-/// a credential, and a document somebody kept private must not become world-readable because this
-/// host rewrote it under its own umask. A file that did not exist is written owner-only for the
-/// same reason.
-fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
+/// The replacement carries the permissions of what it replaces: a document somebody kept private
+/// must not become world-readable because this host rewrote it under its own umask. A file that
+/// did not exist is created with `default_mode`.
+fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     let temporary = parent.join(format!(".{}.kalareach", file_name(path)));
     std::fs::write(&temporary, bytes).map_err(storage)?;
@@ -1107,13 +1118,17 @@ fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
 
         let mode = std::fs::metadata(path)
             .ok()
-            .map_or(0o600, |existing| existing.permissions().mode() & 0o777);
+            .map_or(default_mode, |existing| {
+                existing.permissions().mode() & 0o777
+            });
         let mut permissions = std::fs::metadata(&temporary)
             .map_err(storage)?
             .permissions();
         permissions.set_mode(mode);
         std::fs::set_permissions(&temporary, permissions).map_err(storage)?;
     }
+    #[cfg(not(unix))]
+    let _ = default_mode;
     std::fs::rename(&temporary, path).map_err(storage)
 }
 
