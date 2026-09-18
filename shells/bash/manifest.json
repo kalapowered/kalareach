@@ -18,6 +18,7 @@
   "cflags": [
     "-g",
     "-O2",
+    "-std=gnu17",
     "-Wno-implicit-int",
     "-Wno-implicit-function-declaration"
   ],
@@ -42,7 +43,7 @@
       "name": "bash-bridge-activation",
       "file": "patches/0003-bash-bridge-activation.patch",
       "revision": "1",
-      "purpose": "The bridge loads before the user's startup files and before the first primary reader; the `read` builtin says when it is the one reading through the editor; and the `kr-bridge` builtin the guarded startup entry activates the user-facing hooks through."
+      "purpose": "The bridge loads before the user's startup files and before the first primary reader, and the `kr-bridge` builtin the guarded startup entry activates the user-facing hooks through."
     }
   ],
   "sources": [

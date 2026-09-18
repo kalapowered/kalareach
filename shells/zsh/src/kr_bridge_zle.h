@@ -27,6 +27,14 @@ int kr_zle_boundary(void);
 /* Reads the mailbox while the reader waits for a key. Returns non-zero when the wait must end. */
 int kr_zle_wait(void);
 
+/*
+ * The end of one pass of the read loop.
+ *
+ * A cancellation that ended a widget's own key wait has already done its work there, so it does
+ * not survive into the next pass and take the person's next key with it.
+ */
+void kr_zle_pass_end(void);
+
 /* The bridge's descriptor for the reader's own wait, or -1. */
 int kr_zle_fd(void);
 

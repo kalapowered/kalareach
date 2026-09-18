@@ -313,10 +313,9 @@ build_package() {
     local inputs
     inputs="kr-shell-package/1
 shell=$m_shell
-integration=$m_integration_version
+manifest=$(digest "$package/manifest.json")
+script=$(digest "$root/scripts/build-shells.sh")
 upstream=$m_sha256 $m_archive
-configure=$m_configure
-cflags=$m_cflags
 "
     local patch_file
     for patch_file in $m_patches; do
@@ -341,6 +340,15 @@ startup=$(digest "$package/$m_startup") $m_startup"
     local module_directory="$destination/$m_module_directory"
 
     if [ "$check_patches_only" -eq 0 ] && [ "$force" -eq 0 ] && [ -f "$record" ] && [ -x "$executable" ]; then
+        if [ "$require_upstream_tests" -eq 1 ]; then
+            # A cached package satisfies the requirement only if the suite passed when it was built.
+            local recorded
+            recorded="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["build"]["upstream_tests"])' "$record")"
+            if [ "$recorded" != "passed" ]; then
+                echo "build-shells: $shell_name $identity was built with upstream tests \"$recorded\"" >&2
+                exit 1
+            fi
+        fi
         echo "build-shells: $shell_name $identity is current, nothing changed"
         printf '%s\n' "$identity" > "$prefix/$shell_name/current"
         return 0
@@ -426,9 +434,18 @@ startup=$(digest "$package/$m_startup") $m_startup"
         done
         if kill -0 "$runner" 2>/dev/null; then
             kill -- -"$runner" 2>/dev/null || true
+            local grace=0
+            while [ "$grace" -lt 10 ] && kill -0 "$runner" 2>/dev/null; do
+                sleep 1
+                grace=$((grace + 1))
+            done
+            kill -9 -- -"$runner" 2>/dev/null || true
             wait "$runner" 2>/dev/null || true
             tests_result="did not finish within ${test_timeout}s"
             echo "build-shells: the $shell_name test suite did not finish within ${test_timeout}s" >&2
+            if [ "$require_upstream_tests" -eq 1 ]; then
+                exit 1
+            fi
             echo "build-shells: the identity record says so; the package is still built" >&2
         else
             wait "$runner" 2>/dev/null || true
@@ -452,6 +469,10 @@ startup=$(digest "$package/$m_startup") $m_startup"
         fi
     elif [ -z "$m_test_command" ]; then
         tests_result="not run: $m_test_reason"
+    fi
+    if [ "$require_upstream_tests" -eq 1 ] && [ "$tests_result" != "passed" ]; then
+        echo "build-shells: $shell_name upstream tests were \"$tests_result\"" >&2
+        exit 1
     fi
 
     rm -rf "$destination"

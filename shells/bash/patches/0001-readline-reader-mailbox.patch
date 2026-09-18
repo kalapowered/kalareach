@@ -50,10 +50,12 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  /* What kind of non-blocking I/O do we have? */
  #if !defined (O_NDELAY) && defined (O_NONBLOCK)
  #  define O_NDELAY O_NONBLOCK	/* Posix style */
-@@ -192,6 +195,19 @@
+@@ -190,6 +193,19 @@
+ _rl_pushed_input_available (void)
+ {
    return (push_index != pop_index);
- }
- 
++}
++
 +/* How many bytes this reader has already taken and not yet used.  A fence rests on the reader's
 +   own state, so the count has to come from the reader rather than from the kernel's idea of what
 +   is readable. */
@@ -65,12 +67,26 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
 +  if (held < 0)
 +    held += ibuffer_len;
 +  return held;
-+}
-+
+ }
+ 
  /* Return the amount of space available in the buffer for stuffing
-    characters. */
- static int
-@@ -759,12 +775,16 @@
+@@ -331,6 +347,7 @@
+ 
+   if (result != -1)
+     {
++      kr_rl_gathering (1);
+       while (chars_avail--)
+ 	{
+ 	  RL_CHECK_SIGNALS ();
+@@ -340,6 +357,7 @@
+ 	  if (k == NEWLINE || k == RETURN)
+ 	    break;
+ 	}
++      kr_rl_gathering (0);
+     }
+   else
+     {
+@@ -759,12 +777,16 @@
      {
        c = rl_pending_input;	/* XXX - cast to unsigned char if > 0? */
        rl_clear_pending_input ();
@@ -88,7 +104,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  
        /* If the user has an event function, then call it periodically. */
        if (rl_event_hook)
-@@ -786,13 +806,25 @@
+@@ -786,13 +808,25 @@
  	      RL_CHECK_SIGNALS ();
  	      if (rl_done)		/* XXX - experimental */
  		return ('\n');
@@ -115,7 +131,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  /* fprintf(stderr, "rl_read_key: calling RL_CHECK_SIGNALS: _rl_caught_signal = %d\r\n", _rl_caught_signal); */
  	  RL_CHECK_SIGNALS ();
  	}
-@@ -810,9 +842,17 @@
+@@ -810,9 +844,17 @@
  #if defined (HAVE_PSELECT) || defined (HAVE_SELECT)
    sigset_t empty_set;
    fd_set readfds;
@@ -133,7 +149,7 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
    while (1)
      {
        RL_CHECK_SIGNALS ();
-@@ -829,15 +869,30 @@
+@@ -829,15 +871,30 @@
  	 timeouts. We handled MinGW above. */
        FD_ZERO (&readfds);
        FD_SET (fd, &readfds);

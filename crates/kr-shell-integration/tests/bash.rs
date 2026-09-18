@@ -94,6 +94,24 @@ fn a_revoked_launch_installs_nothing() {
 
 /// KR-REQ-07.35
 #[test]
+fn a_revocation_that_arrives_after_the_install_takes_the_text_back_out() {
+    shellpkg::a_revocation_after_the_install_takes_the_text_back_out(BASH);
+}
+
+/// KR-REQ-07.35
+#[test]
+fn the_reader_reports_itself_idle_so_a_withheld_fence_can_be_retried() {
+    shellpkg::the_reader_reports_itself_idle(BASH);
+}
+
+/// KR-REQ-07.35
+#[test]
+fn a_shell_whose_bridge_has_gone_still_consumes_an_eligible_gesture() {
+    shellpkg::a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(BASH);
+}
+
+/// KR-REQ-07.35
+#[test]
 fn a_takeover_ends_a_pending_key_wait_and_keeps_the_edit_buffer() {
     shellpkg::a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(BASH);
 }

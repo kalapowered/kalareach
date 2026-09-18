@@ -885,18 +885,37 @@ pub fn the_reader_refuses_a_launch_its_own_state_does_not_match(kind: ShellKind)
     );
     session.clear_line();
 
-    // Every reason the corpus names is either driven above or belongs to the worker's own side.
-    let corpus = launch_rejection_reasons();
-    for reason in corpus {
+    // Something the person had half-typed is theirs too: the reader is waiting for the rest of an
+    // escape sequence, so the launch waits behind it.
+    session.type_bytes(ESCAPE);
+    std::thread::sleep(Duration::from_millis(150));
+    refuse(
+        &mut session,
+        base.clone(),
+        LaunchRejectionReason::QueuedPriorInput,
+    );
+    let cancel = session.ask(WorkerRequest::Cancel(CancelKeyWait {
+        session_id: session.session_id,
+        sequence: U64::new(2),
+        epoch: epoch(4),
+        prompt_generation: enter.prompt_generation,
+        reader_revision: enter.reader_revision,
+    }));
+    let _ = session.answer(cancel);
+
+    // Every reason the corpus names is driven above, or is one the worker decides rather than the
+    // reader, or needs a reader this session cannot reach.
+    for reason in launch_rejection_reasons() {
         assert!(
-            reader_side(reason) || !reader_side(reason),
-            "{} is unaccounted for",
+            driven_here(reason) || worker_side(reason),
+            "{} is in the corpus and neither driven nor accounted for",
             reason.as_str()
         );
     }
 }
 
-fn reader_side(reason: LaunchRejectionReason) -> bool {
+/// The reasons the cases above put a real reader into.
+fn driven_here(reason: LaunchRejectionReason) -> bool {
     matches!(
         reason,
         LaunchRejectionReason::FenceInvalid
@@ -905,9 +924,23 @@ fn reader_side(reason: LaunchRejectionReason) -> bool {
             | LaunchRejectionReason::CwdRevisionMismatch
             | LaunchRejectionReason::BufferRevisionMismatch
             | LaunchRejectionReason::BufferNotEmpty
-            | LaunchRejectionReason::Revoked
-            | LaunchRejectionReason::NotPrimaryReader
             | LaunchRejectionReason::QueuedPriorInput
+    )
+}
+
+/// The reasons that are the worker's own answer rather than the reader's, or that name a reader a
+/// session cannot be driven into from the terminal.
+fn worker_side(reason: LaunchRejectionReason) -> bool {
+    matches!(
+        reason,
+        // `revoked` has its own case; the rest are the worker's answers when the reader is gone,
+        // has left, or is not the one the transaction was reserved against.
+        LaunchRejectionReason::Revoked
+            | LaunchRejectionReason::ConfirmationLost
+            | LaunchRejectionReason::SessionClosing
+            | LaunchRejectionReason::EditorLeft
+            | LaunchRejectionReason::LeaseChanged
+            | LaunchRejectionReason::NotPrimaryReader
     )
 }
 
@@ -984,6 +1017,133 @@ pub fn a_revoked_launch_installs_nothing(kind: ShellKind) {
     assert!(!session.terminal_output().contains("kr-revoked"));
 }
 
+/// A-17: a revocation that arrives after the reader installed takes the text back out.
+pub fn a_revocation_after_the_install_takes_the_text_back_out(kind: ShellKind) {
+    let Some(package) = Package::found(kind) else {
+        return;
+    };
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    session.type_line("echo kr-ready");
+    assert!(session.wait_for_output("kr-ready", REPLY));
+
+    let (enter, fence) = session.fenced_prompt(15);
+    let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x74; 16]));
+    let id = RequestId::new(9001);
+
+    // The launch and its revocation reach the reader in one read, in that order, so the reader
+    // installs and accepts before it sees the revocation. What is left is text in the editor that
+    // the person has not accepted, and it comes back out.
+    session.write_frames(&[
+        BridgeFrame::Request {
+            id,
+            request: WorkerRequest::Launch(LaunchMailboxRequest {
+                session_id: session.session_id,
+                transaction,
+                fence_id: fence.fence_id,
+                command: LaunchCommand::Arguments(vec![
+                    "echo".to_owned(),
+                    "kr-late-revoked".to_owned(),
+                ]),
+                expected_prompt_generation: enter.prompt_generation,
+                expected_buffer_revision: enter.editor.buffer_revision,
+                expected_cwd_revision: enter.cwd_revision,
+                deadline_ms: LAUNCH_READER_BUDGET,
+            }),
+        },
+        BridgeFrame::LaunchRevoked {
+            transaction,
+            reason: LaunchRejectionReason::Timeout,
+        },
+    ]);
+
+    // The reader's word is what the caller gets, and it installed.
+    let BridgeAnswer::Launch(decision) = session.answer(id) else {
+        panic!("the reader answered a launch with something else")
+    };
+    assert!(
+        decision.rejection().is_none(),
+        "the reader saw a revocation it could not have seen yet: {:?}",
+        decision.rejection()
+    );
+
+    // And the editor is empty again: the command never ran.
+    std::thread::sleep(Duration::from_millis(300));
+    let acknowledgement = session.fence_exchange(&enter, fence_id(16));
+    assert!(
+        acknowledgement.editor.buffer_empty,
+        "a revoked launch left its text in the editor"
+    );
+    assert!(
+        !session.terminal_output().contains("kr-late-revoked"),
+        "a revoked launch ran anyway:\n{}",
+        session.terminal_output()
+    );
+    assert!(session.alive());
+}
+
+/// The reader reports itself idle, which is one of the three points a withheld fence is retried at.
+pub fn the_reader_reports_itself_idle(kind: ShellKind) {
+    let Some(package) = Package::found(kind) else {
+        return;
+    };
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    let (_, event) = session.expect_event("reader_idle", |event| {
+        matches!(event, BridgeEvent::ReaderIdle(_))
+    });
+    let BridgeEvent::ReaderIdle(idle) = event else {
+        unreachable!()
+    };
+    assert_eq!(
+        idle.reader_context,
+        kr_protocol::root::ReaderContext::Primary
+    );
+    assert!(
+        idle.editor.buffer_empty,
+        "an idle empty prompt has no buffer"
+    );
+    assert!(
+        idle.snapshot.queued_keys == U64::new(0) && idle.snapshot.pending_bytes == U64::new(0),
+        "an idle reader reported input it has not read: {:?}",
+        idle.snapshot
+    );
+}
+
+/// A session that loses its bridge keeps the fail-safe answer to an eligible gesture.
+pub fn a_lost_bridge_does_not_restore_a_native_empty_prompt_end_of_file(kind: ShellKind) {
+    let Some(package) = Package::found(kind) else {
+        return;
+    };
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    session.type_line("echo kr-ready");
+    assert!(session.wait_for_output("kr-ready", REPLY));
+    let before = session.terminal_output().matches(DETACH_HINT).count();
+
+    // The worker goes. Nothing can attribute a gesture any more, which is exactly when turning one
+    // into a native end of file would close somebody's shell.
+    session.close_endpoint();
+    std::thread::sleep(Duration::from_millis(300));
+
+    session.type_bytes(CTRL_D);
+    assert!(
+        session.wait_for_output(DETACH_HINT, REPLY),
+        "a shell whose bridge has gone printed no hint:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        session.terminal_output().matches(DETACH_HINT).count() > before,
+        "the hint was the one from before the bridge went"
+    );
+    assert!(
+        session.alive(),
+        "an eligible gesture ended a shell whose bridge had gone"
+    );
+}
+
 /// `takeover-partial-escape` and `takeover-quoted-insertion`: the cancellation the contract needs.
 pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) {
     let Some(package) = Package::found(kind) else {
@@ -1042,7 +1202,44 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
         report.cancelled
     );
 
-    // The buffer survived: the rest of the line is typed and the whole command runs.
+    // A quoted insertion waits for its character in the same way, and ends the same way.
+    session.type_bytes(CTRL_V);
+    std::thread::sleep(Duration::from_millis(150));
+    let quoted = session.ask(WorkerRequest::Cancel(CancelKeyWait {
+        session_id: session.session_id,
+        sequence: U64::new(2),
+        epoch: epoch(4),
+        prompt_generation: enter.prompt_generation,
+        reader_revision: enter.reader_revision,
+    }));
+    let BridgeAnswer::Cancel(report) = session.answer(quoted) else {
+        panic!("the reader answered a cancellation with something else")
+    };
+    assert!(report.buffer_preserved);
+    assert!(
+        report.cancelled.quoted_insertion,
+        "the cancellation did not name the quoted insertion it ended: {:?}",
+        report.cancelled
+    );
+
+    // A cancellation for a reader the worker is not looking at ends nothing.
+    let stale = session.ask(WorkerRequest::Cancel(CancelKeyWait {
+        session_id: session.session_id,
+        sequence: U64::new(3),
+        epoch: epoch(4),
+        prompt_generation: PromptGeneration::new(enter.prompt_generation.get() + 9),
+        reader_revision: enter.reader_revision,
+    }));
+    let BridgeAnswer::Cancel(report) = session.answer(stale) else {
+        panic!("the reader answered a cancellation with something else")
+    };
+    assert!(
+        !report.cancelled.any(),
+        "a cancellation for another reader ended this one's work: {:?}",
+        report.cancelled
+    );
+
+    // The buffer survived all of it: the rest of the line is typed and the whole command runs.
     session.type_line("takeover-ok");
     assert!(
         session.wait_for_output("kr-takeover-ok", REPLY),
@@ -1164,7 +1361,10 @@ fn record_evidence(kind: ShellKind, package: &Package) {
     );
 }
 
-/// Every committed scenario that names this shell holds against the contract both sides share.
+/// The corpus this package's own cases take their expectations from is itself sound.
+///
+/// This replays the committed scenarios against the contract, which is the worker's side; the
+/// cases above are what drives the package. Both read the same files, which is the point.
 pub fn every_scenario_naming_this_shell_holds(kind: ShellKind) {
     let scenarios = scenarios_for(kind);
     assert!(

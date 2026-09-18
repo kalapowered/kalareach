@@ -226,6 +226,7 @@ kr_cbor_take_head(kr_cbor_parser *parser, unsigned int *major, unsigned long lon
     unsigned char initial;
     unsigned int additional;
     unsigned long long number = 0;
+    unsigned long long floor;
     size_t width;
     size_t i;
 
@@ -240,10 +241,10 @@ kr_cbor_take_head(kr_cbor_parser *parser, unsigned int *major, unsigned long lon
         return 1;
     }
     switch (additional) {
-    case 24: width = 1; break;
-    case 25: width = 2; break;
-    case 26: width = 4; break;
-    case 27: width = 8; break;
+    case 24: width = 1; floor = 24ull; break;
+    case 25: width = 2; floor = 0x100ull; break;
+    case 26: width = 4; floor = 0x10000ull; break;
+    case 27: width = 8; floor = 0x100000000ull; break;
     default: return 0; /* indefinite lengths and reserved values are outside the profile */
     }
     if (parser->len - parser->at < width) {
@@ -251,6 +252,10 @@ kr_cbor_take_head(kr_cbor_parser *parser, unsigned int *major, unsigned long lon
     }
     for (i = 0; i < width; i++) {
         number = (number << 8) | parser->bytes[parser->at + i];
+    }
+    /* Shortest form: a value that fits a narrower head was not encoded canonically. */
+    if (number < floor) {
+        return 0;
     }
     parser->at += width;
     *value = number;
@@ -260,17 +265,71 @@ kr_cbor_take_head(kr_cbor_parser *parser, unsigned int *major, unsigned long lon
 static int
 kr_cbor_take_value(kr_cbor_parser *parser)
 {
+    kr_cbor_doc *doc = parser->doc;
     int index;
 
-    if (parser->doc->used >= KR_CBOR_MAX_VALUES) {
-        parser->doc->failed = 1;
-        return -1;
+    if (doc->used >= doc->capacity) {
+        int wanted = doc->capacity ? doc->capacity * 2 : 64;
+        kr_cbor_value *grown;
+        if (wanted > KR_CBOR_MAX_VALUES) {
+            wanted = KR_CBOR_MAX_VALUES;
+        }
+        if (doc->used >= wanted) {
+            doc->failed = 1;
+            return -1;
+        }
+        grown = (kr_cbor_value *)realloc(doc->values, (size_t)wanted * sizeof(kr_cbor_value));
+        if (grown == NULL) {
+            doc->failed = 1;
+            return -1;
+        }
+        doc->values = grown;
+        doc->capacity = wanted;
     }
-    index = parser->doc->used++;
-    memset(&parser->doc->values[index], 0, sizeof(kr_cbor_value));
-    parser->doc->values[index].first_child = -1;
-    parser->doc->values[index].next_sibling = -1;
+    index = doc->used++;
+    memset(&doc->values[index], 0, sizeof(kr_cbor_value));
+    doc->values[index].first_child = -1;
+    doc->values[index].next_sibling = -1;
     return index;
+}
+
+/* The complete encoded key's order, which for a text key is (length, bytes). */
+static int
+kr_cbor_key_precedes(const kr_cbor_value *left, const kr_cbor_value *right)
+{
+    size_t shortest;
+    int order;
+
+    if (left->payload_len != right->payload_len) {
+        return left->payload_len < right->payload_len;
+    }
+    shortest = left->payload_len;
+    order = shortest == 0 ? 0 : memcmp(left->payload, right->payload, shortest);
+    return order < 0;
+}
+
+/* Map keys are text and strictly ascending, which is what makes the encoding canonical. */
+static int
+kr_cbor_keys_ordered(const kr_cbor_doc *doc, int parent)
+{
+    int key = doc->values[parent].first_child;
+    int previous = -1;
+
+    while (key >= 0) {
+        int value = doc->values[key].next_sibling;
+        if (doc->values[key].kind != KR_CBOR_TSTR) {
+            return 0;
+        }
+        if (previous >= 0 && !kr_cbor_key_precedes(&doc->values[previous], &doc->values[key])) {
+            return 0;
+        }
+        if (value < 0) {
+            return 0;
+        }
+        previous = key;
+        key = doc->values[value].next_sibling;
+    }
+    return 1;
 }
 
 static int
@@ -334,7 +393,14 @@ kr_cbor_value_parse(kr_cbor_parser *parser)
         break;
     case 4:
     case 5: {
-        size_t items = (size_t)number * ((major == 5) ? 2u : 1u);
+        size_t items;
+        /* Every item costs at least one byte, so a collection larger than what is left cannot be
+         * there. The check also keeps the doubling below from wrapping. */
+        if (number > (unsigned long long)(parser->len - parser->at)) {
+            parser->doc->failed = 1;
+            return -1;
+        }
+        items = (size_t)number * ((major == 5) ? 2u : 1u);
         parser->doc->values[index].kind = (major == 4) ? KR_CBOR_ARRAY : KR_CBOR_MAP;
         parser->doc->values[index].count = (size_t)number;
         parser->depth++;
@@ -343,6 +409,10 @@ kr_cbor_value_parse(kr_cbor_parser *parser)
             return -1;
         }
         parser->depth--;
+        if (major == 5 && !kr_cbor_keys_ordered(parser->doc, index)) {
+            parser->doc->failed = 1;
+            return -1;
+        }
         break;
     }
     case 7:
@@ -364,6 +434,15 @@ kr_cbor_value_parse(kr_cbor_parser *parser)
     }
     parser->doc->values[index].encoded_len = parser->at - start;
     return index;
+}
+
+void
+kr_cbor_doc_free(kr_cbor_doc *doc)
+{
+    free(doc->values);
+    doc->values = NULL;
+    doc->capacity = 0;
+    doc->used = 0;
 }
 
 int

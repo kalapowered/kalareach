@@ -48,13 +48,29 @@
 #define KR_SECRET_MAX 64
 #define KR_HINT_MAX 256
 #define KR_HANDSHAKE_WAIT_MS 2000
-#define KR_REVOKED_MAX 16
+#define KR_REVOKED_MAX 64
+/* What may wait to go out before the endpoint is treated as gone. */
+#define KR_OUT_MAX (4u * 1024u * 1024u)
 #define KR_FRAME_HEADER 4
+
+#ifdef MSG_NOSIGNAL
+#define KR_SEND_FLAGS MSG_NOSIGNAL
+#else
+#define KR_SEND_FLAGS 0
+#endif
 
 /* The bridge's whole state. One root shell, one endpoint, one reader. */
 static struct {
     int fd;
     int registered;
+    /*
+     * True from the moment the handshake is accepted, and never cleared.
+     *
+     * Losing the transport does not turn a managed root shell back into an ordinary one: a
+     * session that cannot prove whose gesture it was still consumes an eligible one with the
+     * hint rather than turning it into a native empty-prompt end of file.
+     */
+    int managed;
     int lost;
 
     unsigned char session[KR_UUID_LEN];
@@ -103,6 +119,10 @@ static struct {
     unsigned char revoked[KR_REVOKED_MAX][KR_UUID_LEN];
     size_t revoked_count;
     size_t revoked_next;
+
+    /* The reader whose idle report has already gone out. */
+    unsigned long idle_prompt;
+    unsigned long idle_reader;
 
     unsigned long long event_counter;
     /* When the frame being handled came off the endpoint, on this reader's own clock. */
@@ -247,7 +267,9 @@ static int
 kr_flush(void)
 {
     while (kr.out_len > 0 && kr.fd >= 0) {
-        ssize_t written = write(kr.fd, kr.out, kr.out_len);
+        /* A shell must not take a signal because the worker went away mid-write. Where the
+         * platform has no send flag for it, the socket option set at connect covers it. */
+        ssize_t written = send(kr.fd, kr.out, kr.out_len, KR_SEND_FLAGS);
         if (written > 0) {
             memmove(kr.out, kr.out + written, kr.out_len - (size_t)written);
             kr.out_len -= (size_t)written;
@@ -283,6 +305,12 @@ kr_send(kr_cbor_writer *writer)
     header[3] = (unsigned char)(writer->len & 0xffu);
 
     needed = kr.out_len + KR_FRAME_HEADER + writer->len;
+    if (needed > KR_OUT_MAX) {
+        /* A peer that asks and never reads cannot make this shell grow without limit. */
+        kr_cbor_writer_free(writer);
+        kr_disconnect(KR_LOSS_BRIDGE_DISCONNECTED);
+        return;
+    }
     if (needed > kr.out_capacity) {
         size_t wanted = kr.out_capacity ? kr.out_capacity : 4096;
         while (wanted < needed) {
@@ -330,6 +358,11 @@ kr_fill(void)
         }
         taken = read(kr.fd, kr.in + kr.in_len, kr.in_capacity - kr.in_len);
         if (taken > 0) {
+            if (kr.in_len == 0) {
+                /* The reader's own clock for everything this read brought in, so a request that
+                 * waited behind an earlier frame is not credited with that time. */
+                kr.frame_at_ms = kr_now_ms();
+            }
             kr.in_len += (size_t)taken;
             continue;
         }
@@ -677,6 +710,7 @@ kr_await_handshake(void)
                     result = 1;
                 }
             }
+            kr_cbor_doc_free(&doc);
             kr_drop_frame(length);
             return result;
         }
@@ -730,6 +764,12 @@ kr_connect(const char *path)
     if (flags >= 0) {
         fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
     }
+#ifdef SO_NOSIGPIPE
+    {
+        int on = 1;
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+    }
+#endif
     flags = fcntl(fd, F_GETFL, 0);
     if (flags >= 0) {
         fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -802,6 +842,8 @@ kr_bridge_activate(void)
      * child process and a user's startup file cannot reach it. The integration keeps it because a
      * reader re-established inside the same shell needs it again.
      */
+    kr.managed = 1;
+
     kr_shell_unexport(KR_ENDPOINT_VARIABLE);
     kr_shell_unexport(KR_SECRET_VARIABLE);
     unsetenv(KR_ENDPOINT_VARIABLE);
@@ -812,6 +854,12 @@ int
 kr_bridge_registered(void)
 {
     return kr.registered;
+}
+
+int
+kr_bridge_managed(void)
+{
+    return kr.managed;
 }
 
 int
@@ -956,6 +1004,13 @@ kr_bridge_reader_idle(void)
         return;
     }
     kr_shell_reader_state(&state);
+    if (kr.idle_prompt == state.prompt_generation && kr.idle_reader == state.reader_revision) {
+        /* One report per reader per prompt: the worker retries on it, and a report per wakeup
+         * would be a loop rather than a retry point. */
+        return;
+    }
+    kr.idle_prompt = state.prompt_generation;
+    kr.idle_reader = state.reader_revision;
 
     kr_open_event(&writer, "reader_idle");
     kr_cbor_map(&writer, 7);
@@ -1120,11 +1175,13 @@ kr_bridge_pre_eof(int key, int source)
     kr_reader_state state;
     kr_cbor_writer writer;
 
-    if (!kr.registered) {
+    if (!kr.managed) {
         return KR_NATIVE;
     }
     /* The mailbox has already been read through this package's own mechanism, so the fence this
-     * decision is taken against is the one the worker last published. */
+     * decision is taken against is the one the worker last published. A shell whose bridge has
+     * gone holds no fence, so an eligible gesture is consumed with the hint rather than becoming
+     * a native end of file. */
     kr_shell_reader_state(&state);
     kr_promote_gesture(state.prompt_generation);
 
@@ -1477,8 +1534,11 @@ kr_answer_launch(unsigned long long id, const kr_cbor_doc *doc, int request, int
     kr_cbor_variant_end(&writer);
     kr_send(&writer);
 
+    /*
+     * Installed and accepted. The transaction stays this bridge's own until the reader actually
+     * leaves, because a revocation that arrives in that window still has text to take back out.
+     */
     kr_shell_accept_line();
-    kr.launch_pending = 0;
 }
 
 static void
@@ -1499,8 +1559,19 @@ kr_answer_cancel(unsigned long long id, const kr_cbor_doc *doc, int params)
 
     memset(&ended, 0, sizeof(ended));
     ended.buffer_preserved = 1;
-    kr_shell_cancel_key_wait(&ended);
     kr_shell_reader_state(&state);
+    /*
+     * A cancellation for a reader that is not the one running would end an operation the worker
+     * never asked about. It is answered, so the worker can match and discard it, and nothing is
+     * cancelled.
+     */
+    if ((prompt != 0 && prompt != state.prompt_generation) ||
+        (reader != 0 && reader != state.reader_revision)) {
+        ended.discarded_bytes = 0;
+    } else {
+        kr_shell_cancel_key_wait(&ended);
+        kr_shell_reader_state(&state);
+    }
 
     kr_open_answer(&writer, id, "cancel");
     kr_cbor_map(&writer, 7);
@@ -1641,23 +1712,29 @@ kr_handle_frame(const unsigned char *frame, size_t length)
     int payload;
 
     if (root < 0) {
+        kr_cbor_doc_free(&doc);
         kr_disconnect(KR_LOSS_BRIDGE_DISCONNECTED);
         return;
     }
     payload = kr_cbor_variant_of(&doc, root, &name, &name_len);
     if (payload < 0) {
+        kr_cbor_doc_free(&doc);
+        kr_disconnect(KR_LOSS_BRIDGE_DISCONNECTED);
         return;
     }
     if (name_len == 15 && memcmp(name, "fence_published", 15) == 0) {
         kr_take_publication(&doc, payload);
+        kr_cbor_doc_free(&doc);
         return;
     }
     if (name_len == 14 && memcmp(name, "launch_revoked", 14) == 0) {
         kr_take_revocation(&doc, payload);
+        kr_cbor_doc_free(&doc);
         return;
     }
     if (name_len == 12 && memcmp(name, "event_result", 12) == 0) {
         kr_take_event_result(&doc, kr_cbor_get(&doc, payload, "result"));
+        kr_cbor_doc_free(&doc);
         return;
     }
     if (name_len == 7 && memcmp(name, "request", 7) == 0) {
@@ -1668,11 +1745,13 @@ kr_handle_frame(const unsigned char *frame, size_t length)
         int id_value = kr_cbor_get(&doc, payload, "id");
 
         if (id_value < 0 || doc.values[id_value].kind != KR_CBOR_UINT) {
+            kr_cbor_doc_free(&doc);
             return;
         }
         id = doc.values[id_value].number;
         request = kr_cbor_variant_of(&doc, kr_cbor_get(&doc, payload, "request"), &kind, &kind_len);
         if (request < 0) {
+            kr_cbor_doc_free(&doc);
             return;
         }
         if (kind_len == 5 && memcmp(kind, "fence", 5) == 0) {
@@ -1687,10 +1766,12 @@ kr_handle_frame(const unsigned char *frame, size_t length)
         } else if (kind_len == 6 && memcmp(kind, "cancel", 6) == 0) {
             kr_answer_cancel(id, &doc, request);
         }
+        kr_cbor_doc_free(&doc);
         return;
     }
     /* A worker never sends a hello, an event or an answer. A frame that does not belong on this
      * endpoint ends the connection rather than being ignored. */
+    kr_cbor_doc_free(&doc);
     kr_disconnect(KR_LOSS_BRIDGE_DISCONNECTED);
 }
 
@@ -1723,7 +1804,6 @@ kr_bridge_service(void)
         }
         memcpy(kr.frame, frame, length);
         kr_drop_frame(length);
-        kr.frame_at_ms = kr_now_ms();
         kr_handle_frame(kr.frame, length);
     }
     kr_flush();

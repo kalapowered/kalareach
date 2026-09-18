@@ -30,16 +30,16 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  
 --- a/Src/Zle/zle_main.c
 +++ b/Src/Zle/zle_main.c
-@@ -29,6 +29,9 @@
- 
+@@ -30,6 +30,9 @@
  #include "zle.mdh"
  #include "zle_main.pro"
-+
+ 
 +#include "kr_bridge.h"
 +#include "kr_bridge_zle.h"
- 
++
  #ifdef HAVE_POLL_H
  # include <poll.h>
+ #endif
 @@ -530,9 +533,10 @@
       * timeouts may be external, so we may have both a permanent watched
       * fd and a long-term timeout.
@@ -69,30 +69,30 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  	/* First pollfd is SHTTY, following are the nwatch fds */
  	fds = zalloc(sizeof(struct pollfd) * nfds);
  	fds[0].fd = SHTTY;
-@@ -575,6 +586,10 @@
- 	for (i = 0; i < nwatch; i++) {
+@@ -576,6 +587,10 @@
  	    fds[i+1].fd = watch_fds[i].fd;
  	    fds[i+1].events = POLLIN;
-+	}
+ 	}
 +	if (kr_fd >= 0) {
 +	    fds[nfds-1].fd = kr_fd;
 +	    fds[nfds-1].events = POLLIN;
- 	}
++	}
  # endif
  	for (;;) {
-@@ -605,6 +620,11 @@
+ # ifdef HAVE_POLL
+@@ -604,6 +619,11 @@
+ 		    FD_SET(fd, &foofd);
  		    if (fd > fdmax)
  			fdmax = fd;
- 		}
++		}
 +		if (kr_fd >= 0) {
 +		    FD_SET(kr_fd, &foofd);
 +		    if (kr_fd > fdmax)
 +			fdmax = kr_fd;
-+		}
+ 		}
  	    }
  	    FD_ZERO(&errfd);
- 
-@@ -714,6 +734,26 @@
+@@ -714,6 +734,32 @@
  # endif
  		 )
  		break;
@@ -112,14 +112,37 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
 +		    selret = -2;
 +		    break;
 +		}
++		/* Servicing can end the connection, so the descriptor is taken again. */
++		kr_fd = kr_zle_fd();
 +# ifdef HAVE_POLL
 +		fds[nfds-1].revents = 0;
++		if (kr_fd < 0)
++		    fds[nfds-1].events = 0;
++		else
++		    fds[nfds-1].fd = kr_fd;
 +# endif
 +	    }
  	    if (nwatch && !errtry) {
  		/*
  		 * Copy the details of the watch fds in case the
-@@ -875,9 +915,11 @@
+@@ -790,9 +836,15 @@
+ 
+ # ifdef HAVE_POLL
+ 		/* Function may have added or removed handlers */
+-		nfds = 1 + nwatch;
++		kr_fd = kr_zle_fd();
++		nfds = 1 + nwatch + (kr_fd >= 0 ? 1 : 0);
+ 		if (nfds > 1) {
+ 		    fds = zrealloc(fds, sizeof(struct pollfd) * nfds);
++		    if (kr_fd >= 0) {
++			fds[nfds-1].fd = kr_fd;
++			fds[nfds-1].events = POLLIN;
++			fds[nfds-1].revents = 0;
++		    }
+ 		    for (i = 0; i < nwatch; i++) {
+ 			/*
+ 			 * This is imperfect because it assumes fds[] and
+@@ -875,9 +927,11 @@
      lastchar_wide_valid = 0;
  #endif
  
@@ -133,7 +156,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  	for (;;) {
  	    int q = queue_signal_level();
  	    dont_queue_signals();
-@@ -1133,7 +1175,15 @@
+@@ -1133,7 +1187,15 @@
  	    ? km : NULL);
  	bindk = getkeycmd();
  	selectlocalmap(NULL);
@@ -150,7 +173,15 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  	    if (!zlell && isfirstln && !(zlereadflags & ZLRF_IGNOREEOF) &&
  		lastchar == eofchar) {
  		/*
-@@ -1353,8 +1403,12 @@
+@@ -1162,6 +1224,7 @@
+ 	    break;
+ 	}
+ 
++	kr_zle_pass_end();
+ 	redrawhook();
+ #ifdef HAVE_POLL
+ 	if (baud && !(lastcmd & ZLE_MENUCMP)) {
+@@ -1353,8 +1416,12 @@
  
      zrefresh();
  
@@ -163,7 +194,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
      if (errflag)
  	setsparam((zlecontext == ZLCON_VARED) ?
  		  "ZLE_VARED_ABORTED" :
-@@ -2180,6 +2234,7 @@
+@@ -2180,6 +2247,7 @@
  
  static struct builtin bintab[] = {
      BUILTIN("bindkey", 0, bin_bindkey, 0, -1, 0, "evaM:ldDANmrsLRp", NULL),
@@ -171,7 +202,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
      BUILTIN("vared",   0, bin_vared,   1,  1, 0, "aAcef:ghi:M:m:p:r:t:", NULL),
      BUILTIN("zle",     0, bin_zle,     0, -1, 0, "aAcCDfFgGIKlLmMNrRTUw", NULL),
  };
-@@ -2247,6 +2302,8 @@
+@@ -2247,6 +2315,8 @@
      /* Intended to be global, no WARNCREATEGLOBAL check. */
      assignaparam("zle_bracketed_paste", bpaste, 0);
  

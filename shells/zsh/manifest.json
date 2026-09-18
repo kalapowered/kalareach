@@ -22,6 +22,7 @@
     "-O2",
     "-Wall",
     "-Wmissing-prototypes",
+    "-std=gnu17",
     "-Wno-implicit-int",
     "-Wno-implicit-function-declaration"
   ],

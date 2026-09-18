@@ -49,8 +49,14 @@ static unsigned long kr_cwd_revision;
 static char kr_cwd_seen[4096];
 static int kr_inside_reader;
 
-static int kr_read_builtin;
 static int kr_last_source = KR_SOURCE_TERMINAL;
+
+/* True while Readline is filling its own buffer rather than waiting with nothing left to read.
+ * `rl_gather_tyi` calls the character function too, and that is not the reader's idle point. */
+static int kr_gathering;
+
+/* Whether this wait has already reported the reader idle. */
+static int kr_idle_reported;
 
 /* What the reader is in the middle of, where Readline keeps no state of its own for it. */
 static int kr_pending_quoted;
@@ -107,7 +113,30 @@ kr_track_cwd (void)
 static int
 kr_context (void)
 {
-  return kr_read_builtin ? KR_CONTEXT_READ_BUILTIN : kr_shell_prompt_context ();
+  return kr_shell_prompt_context ();
+}
+
+/* Whether the terminal has anything to give, without waiting for it.
+ *
+ * Readline's own `_rl_input_available` waits up to a tenth of a second, which is not something a
+ * reader answering a fence can afford.
+ */
+static int
+kr_terminal_ready (void)
+{
+#if defined (HAVE_SELECT)
+  fd_set readfds;
+  struct timeval nothing;
+  int fd = rl_instream ? fileno (rl_instream) : 0;
+
+  FD_ZERO (&readfds);
+  FD_SET (fd, &readfds);
+  nothing.tv_sec = 0;
+  nothing.tv_usec = 0;
+  return select (fd + 1, &readfds, (fd_set *)NULL, (fd_set *)NULL, &nothing) > 0;
+#else
+  return 0;
+#endif
 }
 
 static int
@@ -137,6 +166,9 @@ kr_shell_reader_state (kr_reader_state *out)
 
   memset (out, 0, sizeof (*out));
   kr_track_buffer ();
+  /* A `bind -x` command can change directory and return to the same prompt, so the revision is
+     read where it is reported rather than once at entry. */
+  kr_track_cwd ();
 
   out->prompt_generation = kr_prompt_generation;
   out->reader_revision = kr_reader_revision;
@@ -166,7 +198,7 @@ kr_shell_reader_state (kr_reader_state *out)
   out->queued_keys = (unsigned long) ((macro_left > 0 ? macro_left : 0)
                                       + (rl_pending_input ? 1 : 0));
 
-  out->tty_typeahead_drained = (buffered <= 0) && (_rl_input_available () <= 0);
+  out->tty_typeahead_drained = (buffered <= 0) && (kr_terminal_ready () == 0);
   out->macro_input_drained = (macro_left <= 0) && (rl_pending_input == 0);
   out->partial_key_drained = !RL_ISSTATE (RL_STATE_MULTIKEY | RL_STATE_METANEXT);
 
@@ -247,30 +279,21 @@ kr_rl_cancel_observed (void)
   kr_cancel_requested = 0;
 }
 
-/* Single quotes unless the argument needs nothing, which is what a shell's own quoting does. */
+/*
+ * Single quotes, always.
+ *
+ * An argument vector is installed as literal arguments. A bare word at command position would be
+ * a reserved word, an assignment or an alias rather than the name the caller asked to run, so
+ * every argument is quoted including the first.
+ */
 char *
 kr_shell_quote_argument (const char *argument)
 {
-  static const char safe[] =
-      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./:=@%+,-";
   size_t len = strlen (argument);
   size_t i;
-  int plain = (len > 0);
   char *quoted;
   size_t used = 0;
 
-  for (i = 0; plain && i < len; i++)
-    {
-      if (strchr (safe, argument[i]) == 0)
-        plain = 0;
-    }
-  if (plain)
-    {
-      quoted = (char *) malloc (len + 1);
-      if (quoted != 0)
-        memcpy (quoted, argument, len + 1);
-      return quoted;
-    }
   /* Worst case: every byte is a quote, which becomes four bytes. */
   quoted = (char *) malloc (len * 4 + 3);
   if (quoted == 0)
@@ -328,9 +351,10 @@ kr_rl_setup (void)
 }
 
 void
-kr_rl_read_builtin (int active)
+kr_rl_key_taken (void)
 {
-  kr_read_builtin = active;
+  /* The reader has a key, so the next wait is a fresh chance to be idle. */
+  kr_idle_reported = 0;
 }
 
 void
@@ -367,6 +391,7 @@ kr_rl_enter (void)
   kr_installed_chars = 0;
   kr_cancel_requested = 0;
   kr_pending_quoted = kr_pending_paste_open = 0;
+  kr_idle_reported = 0;
   kr_last_source = KR_SOURCE_TERMINAL;
   kr_inside_reader = 1;
   kr_bridge_editor_enter ();
@@ -396,10 +421,22 @@ kr_rl_leave (int accepted)
 void
 kr_rl_idle (void)
 {
-  if (kr_bridge_registered () == 0)
+  if (kr_bridge_registered () == 0 || kr_gathering)
     return;
   /* Everything Readline had buffered has been taken, so this is the reader's idle point. */
+  if (kr_idle_reported == 0 && _rl_kr_buffered () <= 0 && _rl_kr_macro_remaining () <= 0)
+    {
+      /* One of the three points the worker retries a withheld fence at. */
+      kr_idle_reported = 1;
+      kr_bridge_reader_idle ();
+    }
   kr_bridge_service ();
+}
+
+void
+kr_rl_gathering (int active)
+{
+  kr_gathering = active;
 }
 
 int
@@ -428,7 +465,8 @@ kr_rl_prompt_generation (void)
 int
 kr_rl_pre_eof (int key)
 {
-  if (kr_bridge_registered () == 0)
+  kr_rl_key_taken ();
+  if (kr_bridge_managed () == 0)
     return KR_NATIVE;
   return kr_bridge_pre_eof (key, kr_last_source);
 }

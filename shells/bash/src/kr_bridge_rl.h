@@ -43,12 +43,16 @@ void kr_rl_leave (int accepted);
 /* A cancellation the reader has now acted on. */
 void kr_rl_cancel_observed (void);
 
-/* The `read` builtin is reading through the line editor, which is not the root editor's prompt. */
-void kr_rl_read_builtin (int active);
+/* Readline is filling its own buffer rather than waiting with nothing left to read. */
+void kr_rl_gathering (int active);
+
+/* The reader has taken a key, so the next wait is a fresh chance to report itself idle. */
+void kr_rl_key_taken (void);
 
 /*
- * Which prompt the shell is at: its primary one, or a continuation line of a command its parser
- * has not finished. Only the shell knows, so the shell supplies it.
+ * Which reader is running: the shell's primary prompt, a continuation line of a command its
+ * parser has not finished, or its `read` builtin reading through the editor. Only the shell
+ * knows, so the shell supplies it.
  */
 int kr_shell_prompt_context (void);
 

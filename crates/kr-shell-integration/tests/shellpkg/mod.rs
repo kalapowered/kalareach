@@ -390,19 +390,26 @@ impl Session {
 
     /// Sends one frame.
     pub fn write_frame(&mut self, frame: &BridgeFrame) {
-        let body = kr_cbor::to_canonical_vec(frame).expect("a frame encodes");
-        assert!(
-            body.len() <= frame_codec().max_payload_len(),
-            "a frame of {} bytes is outside the stream's bound",
-            body.len()
-        );
-        let mut bytes = Vec::with_capacity(4 + body.len());
-        bytes.extend_from_slice(
-            &u32::try_from(body.len())
-                .expect("a bounded frame")
-                .to_be_bytes(),
-        );
-        bytes.extend_from_slice(&body);
+        self.write_frames(std::slice::from_ref(frame));
+    }
+
+    /// Sends several frames in one write, so the reader takes them off the endpoint together.
+    pub fn write_frames(&mut self, frames: &[BridgeFrame]) {
+        let mut bytes = Vec::new();
+        for frame in frames {
+            let body = kr_cbor::to_canonical_vec(frame).expect("a frame encodes");
+            assert!(
+                body.len() <= frame_codec().max_payload_len(),
+                "a frame of {} bytes is outside the stream's bound",
+                body.len()
+            );
+            bytes.extend_from_slice(
+                &u32::try_from(body.len())
+                    .expect("a bounded frame")
+                    .to_be_bytes(),
+            );
+            bytes.extend_from_slice(&body);
+        }
         let deadline = Instant::now() + REPLY;
         let mut written = 0;
         while written < bytes.len() {
@@ -661,6 +668,13 @@ impl Session {
     pub fn alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
+
+    /// Ends the endpoint the way a worker that has gone would.
+    pub fn close_endpoint(&mut self) {
+        self.stream
+            .shutdown(std::net::Shutdown::Both)
+            .expect("the endpoint closes");
+    }
 }
 
 impl Drop for Session {
@@ -790,12 +804,12 @@ pub fn fence_for(
 /// The identifiers the tests use, so a failure names something recognisable.
 #[must_use]
 pub fn fence_id(index: u8) -> FenceId {
-    FenceId::new(Uuid::from_bytes([0xF0 + index; 16]))
+    FenceId::new(Uuid::from_bytes([0xF0u8.wrapping_add(index); 16]))
 }
 
 #[must_use]
 pub fn attachment_id(index: u8) -> AttachmentId {
-    AttachmentId::new(Uuid::from_bytes([0xA0 + index; 16]))
+    AttachmentId::new(Uuid::from_bytes([0xA0u8.wrapping_add(index); 16]))
 }
 
 #[must_use]

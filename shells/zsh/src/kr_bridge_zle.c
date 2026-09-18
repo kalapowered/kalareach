@@ -53,6 +53,13 @@ static int kr_cancel_consumed;
  * $KEYS rather than anything the reader is still waiting for. */
 static int kr_in_key_wait;
 
+/* True while a complete key sequence has been selected and its binding has not run. The person
+ * typed it, so it is theirs and it goes before anything the worker asks for. */
+static int kr_key_selected;
+
+/* Whether this wait has already reported the reader idle. */
+static int kr_idle_reported;
+
 /* A launch this reader installed, so a revocation can take exactly that text back out. */
 static int kr_installed_chars;
 
@@ -138,6 +145,9 @@ kr_shell_reader_state(kr_reader_state *out)
 
     memset(out, 0, sizeof(*out));
     kr_track_buffer();
+    /* A widget can change directory and return to the same prompt, so the revision is read where
+     * it is reported rather than once at entry. */
+    kr_track_cwd();
 
     out->prompt_generation = kr_prompt_generation;
     out->reader_revision = kr_reader_revision;
@@ -164,7 +174,7 @@ kr_shell_reader_state(kr_reader_state *out)
     }
     memcpy(out->keys, keybuf, keys);
     out->keys_len = keys;
-    out->pending_bytes = (unsigned long)noquery(0);
+    out->pending_bytes = (unsigned long)noquery(0) + (kr_key_selected ? 1u : 0u);
     out->queued_keys = (unsigned long)kungetct;
 
     out->tty_typeahead_drained = (out->pending_bytes == 0);
@@ -187,11 +197,14 @@ kr_shell_install_command(const char *text, size_t len)
         unmetafy_line();
         metafied = 1;
     }
+    /* The editor's own representation: `setline` unmetafies what it is given, so raw bytes above
+     * 0x7f would change on the way in. */
     line = (char *)zalloc(len + 1);
     memcpy(line, text, len);
     line[len] = '\0';
+    line = metafy(line, (int)len, META_REALLOC);
     setline(line, ZSL_TOEND);
-    zfree(line, len + 1);
+    free(line);
     if (metafied) {
         metafy_line();
     }
@@ -256,19 +269,38 @@ kr_shell_cancel_key_wait(kr_cancellation *out)
 char *
 kr_shell_quote_argument(const char *argument)
 {
+    size_t len = strlen(argument);
+    char *metafied;
     char *quoted;
     char *copy = NULL;
+    int raw_len;
+
+    metafied = (char *)zalloc(len + 1);
+    memcpy(metafied, argument, len + 1);
+    metafied = metafy(metafied, (int)len, META_REALLOC);
 
     pushheap();
-    quoted = quotestring(argument, QT_SINGLE_OPTIONAL);
+    /*
+     * Every argument is quoted, including the first. An argument vector is installed as literal
+     * arguments, and a bare word at command position would be a reserved word, an assignment or
+     * an alias rather than the name the caller asked to run.
+     */
+    quoted = quotestring(metafied, QT_SINGLE);
     if (quoted != NULL) {
-        size_t len = strlen(quoted);
-        copy = (char *)malloc(len + 1);
+        size_t quoted_len = strlen(quoted);
+        char *unmetafied = (char *)zalloc(quoted_len + 1);
+        memcpy(unmetafied, quoted, quoted_len + 1);
+        raw_len = (int)quoted_len;
+        unmetafy(unmetafied, &raw_len);
+        copy = (char *)malloc((size_t)raw_len + 1);
         if (copy != NULL) {
-            memcpy(copy, quoted, len + 1);
+            memcpy(copy, unmetafied, (size_t)raw_len);
+            copy[raw_len] = '\0';
         }
+        zfree(unmetafied, quoted_len + 1);
     }
     popheap();
+    free(metafied);
     return copy;
 }
 
@@ -344,6 +376,7 @@ kr_zle_enter(void)
     kr_installed_chars = 0;
     kr_pending_quoted = kr_pending_numeric = kr_pending_paste_open = 0;
     kr_cancel_requested = kr_cancel_consumed = kr_in_key_wait = 0;
+    kr_key_selected = kr_idle_reported = 0;
     kr_inside_reader = 1;
     kr_bridge_editor_enter();
 }
@@ -380,8 +413,9 @@ int
 kr_zle_boundary(void)
 {
     int source;
+    int consumed;
 
-    if (!kr_bridge_registered()) {
+    if (!kr_bridge_managed()) {
         return 0;
     }
     if (kr_cancel_consumed) {
@@ -391,16 +425,24 @@ kr_zle_boundary(void)
         keybuf[0] = '\0';
         return 1;
     }
-    /* This is the key-sequence boundary: the reader has resolved one complete sequence and is
-     * between operations, which is where its mailbox is read. */
+    /*
+     * This is the key-sequence boundary: the reader has resolved one complete sequence and is
+     * between operations, which is where its mailbox is read. The sequence it has resolved has
+     * not run yet, so it is input of the person's that anything the mailbox holds waits behind.
+     */
+    kr_key_selected = 1;
     kr_bridge_service();
+    kr_key_selected = 0;
     if (done) {
         return 1;		/* a launch was installed and accepted */
     }
     source = kr_source_is_pushed_back ? KR_SOURCE_PUSHED_BACK
                                       : (kr_pending_paste_open ? KR_SOURCE_PASTE
                                                                : KR_SOURCE_TERMINAL);
-    return kr_bridge_pre_eof(lastchar, source) == KR_CONSUME;
+    consumed = kr_bridge_pre_eof(lastchar, source) == KR_CONSUME;
+    /* The next wait is a fresh chance to be idle. */
+    kr_idle_reported = 0;
+    return consumed;
 }
 
 int
@@ -411,6 +453,12 @@ kr_zle_wait(void)
     }
     /* Everything answered from here is answered by a reader that is waiting for another key. */
     kr_in_key_wait = 1;
+    if (!kr_idle_reported && keybuflen == 0 && kungetct == 0) {
+        /* Nothing buffered and nothing part-read: one of the three points the worker retries a
+         * withheld fence at. */
+        kr_idle_reported = 1;
+        kr_bridge_reader_idle();
+    }
     kr_bridge_service();
     kr_in_key_wait = 0;
     if (kr_cancel_requested) {
@@ -425,6 +473,12 @@ int
 kr_zle_fd(void)
 {
     return kr_bridge_fd();
+}
+
+void
+kr_zle_pass_end(void)
+{
+    kr_cancel_consumed = 0;
 }
 
 void
@@ -478,14 +532,19 @@ bin_kr_bridge(char *name, char **args, UNUSED(struct options *ops), UNUSED(int f
     }
     if (strcmp(args[0], "lost") == 0) {
         int loss = KR_LOSS_SEMANTIC_HOOK_LOSS;
+
+        const char *detail = "";
         if (args[1] != NULL) {
             if (strcmp(args[1], "post-startup-failure") == 0) {
                 loss = KR_LOSS_POST_STARTUP_FAILURE;
             } else if (strcmp(args[1], "unqualified-root-replacement") == 0) {
                 loss = KR_LOSS_UNQUALIFIED_ROOT_REPLACEMENT;
             }
+            if (args[2] != NULL) {
+                detail = args[2];
+            }
         }
-        kr_bridge_lost(loss, args[2] != NULL ? args[2] : "");
+        kr_bridge_lost(loss, detail);
         return 0;
     }
     zwarnnam(name, "unknown request: %s", args[0]);

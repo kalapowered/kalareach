@@ -18,22 +18,31 @@
 #include "bashtypes.h"
 #include "shell.h"
 #include "variables.h"
+#include "builtins.h"
+#include "builtins/common.h"
+
+/* The `read' builtin's own entry point, as the generated builtin table declares it. Declared here
+   rather than included, because that table is generated after this file is compiled. */
+extern int read_builtin PARAMS((WORD_LIST *));
 
 #include <readline/kr_bridge.h>
 #include <readline/kr_bridge_rl.h>
-
-/* Bash's own prompt state, which nothing outside the parser declares. */
-extern char *ps2_prompt;
-extern char *current_prompt_string;
 
 int
 kr_shell_prompt_context ()
 {
   /*
+   * The `read' builtin reading through the editor is not the root editor's prompt, and asking the
+   * shell which builtin is running answers that however the builtin is left, including through a
+   * signal or a timeout.
+   */
+  if (this_shell_builtin == read_builtin)
+    return KR_CONTEXT_READ_BUILTIN;
+  /*
    * The parser points the prompt at PS2 for every line of a command it has not finished, so a
    * reader started under that prompt is a continuation line rather than the root editor's own.
    */
-  if (current_prompt_string != 0 && current_prompt_string == ps2_prompt)
+  if (get_current_prompt_level () == 2)
     return KR_CONTEXT_CONTINUATION;
   return KR_CONTEXT_PRIMARY;
 }

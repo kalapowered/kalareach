@@ -169,14 +169,18 @@ jobs:
           grep -q 'zsh .* is current, nothing changed' /tmp/kr-shell-rebuild.log
           grep -q 'bash .* is current, nothing changed' /tmp/kr-shell-rebuild.log
 
-      # The published patch sets, the manifests and the identity records, kept with the run that
-      # produced them.
+      # Everything a person needs to rebuild the same package from the same upstream release: the
+      # patch set, the sources the patches bring with them, the startup entry, the manifest that
+      # pins and describes them, the licence, and the identity the run produced.
       - name: Collect the published patch sets and identities
         run: |
           mkdir -p /tmp/kr-shell-packages
+          cp scripts/build-shells.sh /tmp/kr-shell-packages/
+          cp docs/shell-integration/packages.md /tmp/kr-shell-packages/
           for shell in zsh bash; do
             mkdir -p "/tmp/kr-shell-packages/$shell"
-            cp -r "shells/$shell/patches" "/tmp/kr-shell-packages/$shell/patches"
+            cp -r "shells/$shell/patches" "shells/$shell/src" "shells/$shell/startup" \
+                  "/tmp/kr-shell-packages/$shell/"
             cp "shells/$shell/manifest.json" "shells/$shell/LICENSE" "/tmp/kr-shell-packages/$shell/"
             identity="$(cat "${XDG_CACHE_HOME:-$HOME/.cache}/kalareach/shells/$shell/current")"
             cp "${XDG_CACHE_HOME:-$HOME/.cache}/kalareach/shells/$shell/$identity/kr-shell-identity.json" \

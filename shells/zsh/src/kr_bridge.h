@@ -143,6 +143,14 @@ void kr_shell_unexport(const char *name);
 int kr_bridge_registered(void);
 
 /*
+ * Non-zero once this shell has ever been a managed root shell.
+ *
+ * It never returns to zero. A session that loses its bridge keeps the fail-safe answer to an
+ * eligible end-of-file gesture, which is to consume it with the hint.
+ */
+int kr_bridge_managed(void);
+
+/*
  * Attempts the handshake, unless the bootstrap variables say there is nothing to attempt.
  *
  * Called once, before the first primary reader. A shell that inherited nothing skips it, which is

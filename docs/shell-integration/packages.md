@@ -71,6 +71,11 @@ and returns from the read loop at the boundary it is already standing on. Cancel
 timeout path — the pending read ends, the longest complete prefix is dropped and the edit buffer is
 untouched.
 
+The boundary is also where a key the person has just typed is still theirs. `getkeycmd` has
+resolved a complete sequence and nothing has run it yet, so the reader reports that sequence as
+input it is holding, and a launch that arrives at that moment is refused with `queued_prior_input`
+rather than installed over it.
+
 ## What Bash changes
 
 Three patches, against `bash-5.2.37`, which bundles Readline 8.2.
@@ -104,14 +109,15 @@ callback therefore classifies typeahead wrongly. So:
   own buffer and the bytes left in an executing macro. A fence rests on the reader's state, so
   those counts have to come from the reader rather than from the kernel's idea of what is readable.
 
-Which prompt the reader is at is Bash's to say, not Readline's, so `kr_shell_prompt_context` reads
-the parser's own `current_prompt_string`: pointing at `PS2` means a continuation line. The `read`
-builtin says so explicitly around its call to `readline`. The bridge itself loads in `shell.c`
-before `run_startup_files`, so a startup file finds it already there.
+Which reader is running is Bash's to say, not Readline's, so `kr_shell_prompt_context` asks the
+shell: `get_current_prompt_level()` returns 2 for a continuation line, and `this_shell_builtin`
+names `read` while the `read` builtin is the one reading. Asking rather than tracking means the
+answer is right however a reader is left, including through a signal or a timeout. The bridge
+itself loads in `shell.c` before `run_startup_files`, so a startup file finds it already there.
 
 The patch leaves Bash's parser alone on purpose. Bash ships a generated `y.tab.c`, and touching
 `parse.y` makes the build regenerate it, which needs a Bison newer than several supported hosts
-carry. Reading the parser's variables from a new file costs nothing and keeps the build to a C
+carry. Calling the two functions Bash already exports costs nothing and keeps the build to a C
 compiler.
 
 ## What the packages add
@@ -124,7 +130,7 @@ adapter for that reader:
 | `kr_bridge.c`, `kr_bridge.h` | The endpoint, the frames, the handshake, the fence view, the pre-EOF decision and the reader's launch check |
 | `kr_bridge_cbor.c`, `kr_bridge_cbor.h` | KR-CBOR-1: canonical encoding with map keys checked into order as they are written, and a bounded decoder |
 | `kr_bridge_crypto.c`, `kr_bridge_crypto.h` | SHA-256, HMAC-SHA-256 and base64url, for the one proof taken at startup |
-| `kr_bridge_zle.c` / `kr_bridge_rl.c` | The reader's own state, read in one operation at one instant |
+| `kr_bridge_zle.c` / `kr_bridge_rl.c` | The reader's own state, read in one operation at one instant, and the shell's own string representation |
 | `kr_bridge_bash.c` (Bash only) | The two things only the shell itself can do: remove a variable from its exported environment, and say which prompt it is at |
 
 The first three files are the same source in both packages, and a test in
@@ -133,7 +139,17 @@ each patch set has to be publishable on its own, against its own upstream projec
 project's licence.
 
 Nothing in the bridge links against the rest of the host. It speaks to the worker over a socket,
-and the reader calls into it through fifteen functions.
+and the reader calls into it through a small set of functions.
+
+Two things the adapters do that are easy to get wrong. An argument vector is quoted a word at a
+time, *including the first*: a bare word at command position would be a reserved word, an
+assignment or an alias rather than the name the caller asked to run, so every word is quoted and
+installed literally. And on Zsh the text goes in through the editor's own string representation:
+`setline` unmetafies what it is handed, so raw bytes above 0x7f would change on the way in.
+
+Losing the bridge does not turn a managed root shell back into an ordinary one. The handshake
+leaves a mark that is never cleared, so a shell whose worker has gone holds no fence, consumes an
+eligible gesture with the hint, and does not end itself on an empty-prompt Ctrl-D.
 
 ## The guarded startup entry
 
@@ -173,10 +189,11 @@ scripts/build-shells.sh --bash           # one
 scripts/build-shells.sh --check-patches  # apply the patches and stop
 ```
 
-The identity is a SHA-256 over the inputs: the upstream archive's digest, every patch file, every
-added source, the startup entry and the configure flags. The first sixteen hex characters name the
-directory the package is installed in, so the same inputs land in the same place and a second run
-reports that nothing changed. Change one byte of one patch and the identity changes with it.
+The identity is a SHA-256 over the inputs: the upstream archive's digest, the manifest, this build
+script, every patch file, every added source and the startup entry. The first sixteen hex
+characters name the directory the package is installed in, so the same inputs land in the same
+place and a second run reports that nothing changed. Change one byte of any of them and the
+identity changes with it.
 
 Packages are installed outside the repository, under `~/Library/Caches/kalareach/shells/` on macOS
 and `${XDG_CACHE_HOME:-~/.cache}/kalareach/shells/` elsewhere. A process a service manager starts
@@ -189,6 +206,14 @@ the executable, the upstream version, the editor ABI, the integration version, e
 patch with the upstream revision it was rebased onto, the module tree with each module's ABI, the
 five declared mechanisms, and the build's own inputs. The record also states what the shell's own
 test suite did.
+
+The manifest's compilation flags are part of the package rather than a local preference. Zsh 5.9
+writes some of its configure probes in pre-C99 style, and a compiler that rejects implicit `int`
+answers "missing" where the truth is "did not compile": that is how a build ends up with
+`BROKEN_POSIX_SIGSUSPEND` and a shell that hangs on every command substitution. The manifest pins
+`-std=gnu17` and the two warning flags that keep those probes compiling, and `--with-tcsetpgrp=yes`
+states the platform assumption the probe cannot check without a controlling terminal. Both
+assumptions hold on the platforms these packages are built for.
 
 Two notes on that last field. Bash's `make tests` passes with these patches. Zsh's `make check`
 runs 64 scripts and one of them, `A04redirect`, fails on macOS on arm64 over `print foo >&-`,

@@ -21,8 +21,9 @@
 /* Every frame this bridge writes is far below the control stream's maximum. */
 #define KR_CBOR_MAX_FRAME (1024u * 1024u)
 
-/* The decoder's arena: the deepest frame the worker sends is a fence request inside a frame. */
-#define KR_CBOR_MAX_VALUES 512
+/* The decoder's bounds. The arena grows with the frame and is released with it; a value needs at
+ * least one byte on the wire, so a frame inside the stream's maximum cannot need more than this. */
+#define KR_CBOR_MAX_VALUES 65536
 #define KR_CBOR_MAX_DEPTH 16
 
 typedef struct {
@@ -80,13 +81,23 @@ typedef struct {
 } kr_cbor_value;
 
 typedef struct {
-    kr_cbor_value values[KR_CBOR_MAX_VALUES];
+    kr_cbor_value *values;
+    int capacity;
     int used;
     int failed;
 } kr_cbor_doc;
 
-/* Parses one canonical object. Returns the root index, or -1. */
+/*
+ * Parses one canonical object. Returns the root index, or -1.
+ *
+ * Strict: shortest-form heads, definite lengths, map keys that are text and strictly ascending in
+ * the bytewise order of their complete encoded keys, and nothing outside the profile. Anything
+ * else is a refusal rather than something to make sense of.
+ */
 int kr_cbor_parse(kr_cbor_doc *doc, const unsigned char *bytes, size_t len);
+
+/* Releases what one parse allocated. */
+void kr_cbor_doc_free(kr_cbor_doc *doc);
 
 /* Returns the value of `key` in the map at `index`, or -1. */
 int kr_cbor_get(const kr_cbor_doc *doc, int index, const char *key);

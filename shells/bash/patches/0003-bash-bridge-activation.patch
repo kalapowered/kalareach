@@ -73,26 +73,3 @@ or later; see shells/bash/LICENSE.
  
  CREATED_FILES = builtext.h builtins.c psize.aux pipesize.h tmpbuiltins.c \
  	tmpbuiltins.h
---- a/builtins/read.def
-+++ b/builtins/read.def
-@@ -92,6 +92,9 @@
- #include "../bashintl.h"
- 
- #include "../shell.h"
-+
-+#include <readline/kr_bridge.h>
-+#include <readline/kr_bridge_rl.h>
- #include "common.h"
- #include "bashgetopt.h"
- #include "trap.h"
-@@ -1188,7 +1191,10 @@
-       deftext = itext;
-     }
- 
-+  /* The `read' builtin reading through the line editor is not the root editor's own prompt. */
-+  kr_rl_read_builtin (1);
-   ret = readline (p);
-+  kr_rl_read_builtin (0);
- 
-   rl_attempted_completion_function = old_attempted_completion_function;
-   old_attempted_completion_function = (rl_completion_func_t *)NULL;
