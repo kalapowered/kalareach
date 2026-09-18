@@ -121,9 +121,8 @@ static struct {
     size_t revoked_count;
     size_t revoked_next;
 
-    /* The reader whose idle report has already gone out. */
-    unsigned long idle_prompt;
-    unsigned long idle_reader;
+    /* Set when the batch must stop: a cancellation has to unwind before anything else is read. */
+    int pause_dispatch;
 
     unsigned long long event_counter;
     /* When the frame being handled came off the endpoint, on this reader's own clock. */
@@ -870,6 +869,12 @@ kr_bridge_fd(void)
 }
 
 int
+kr_bridge_wants_write(void)
+{
+    return kr.registered && kr.out_len > 0;
+}
+
+int
 kr_bridge_launch_pending(void)
 {
     return kr.launch_pending;
@@ -1005,13 +1010,6 @@ kr_bridge_reader_idle(void)
         return;
     }
     kr_shell_reader_state(&state);
-    if (kr.idle_prompt == state.prompt_generation && kr.idle_reader == state.reader_revision) {
-        /* One report per reader per prompt: the worker retries on it, and a report per wakeup
-         * would be a loop rather than a retry point. */
-        return;
-    }
-    kr.idle_prompt = state.prompt_generation;
-    kr.idle_reader = state.reader_revision;
 
     kr_open_event(&writer, "reader_idle");
     kr_cbor_map(&writer, 7);
@@ -1566,8 +1564,7 @@ kr_answer_cancel(unsigned long long id, const kr_cbor_doc *doc, int params)
      * never asked about. It is answered, so the worker can match and discard it, and nothing is
      * cancelled.
      */
-    if ((prompt != 0 && prompt != state.prompt_generation) ||
-        (reader != 0 && reader != state.reader_revision)) {
+    if (prompt != state.prompt_generation || reader != state.reader_revision) {
         ended.discarded_bytes = 0;
     } else {
         kr_shell_cancel_key_wait(&ended);
@@ -1606,6 +1603,9 @@ kr_answer_cancel(unsigned long long id, const kr_cbor_doc *doc, int params)
     kr_cbor_map_end(&writer);
     kr_cbor_variant_end(&writer);
     kr_send(&writer);
+    /* Nothing else in this batch is answered until the reader has come out of the operation this
+     * ended, so a fence that follows sees what the reader actually has. */
+    kr.pause_dispatch = 1;
 }
 
 /* ---- reading the mailbox ---------------------------------------------------------------------- */
@@ -1679,6 +1679,25 @@ kr_is_revoked(const unsigned char transaction[KR_UUID_LEN])
 }
 
 static void
+kr_remember_revocation(const kr_cbor_doc *doc, int frame)
+{
+    unsigned char transaction[KR_UUID_LEN];
+
+    if (!kr_cbor_bytes_exact(doc, kr_cbor_get(doc, frame, "transaction"), transaction,
+                             KR_UUID_LEN)) {
+        return;
+    }
+    if (kr_is_revoked(transaction)) {
+        return;
+    }
+    memcpy(kr.revoked[kr.revoked_next], transaction, KR_UUID_LEN);
+    kr.revoked_next = (kr.revoked_next + 1) % KR_REVOKED_MAX;
+    if (kr.revoked_count < KR_REVOKED_MAX) {
+        kr.revoked_count++;
+    }
+}
+
+static void
 kr_take_revocation(const kr_cbor_doc *doc, int frame)
 {
     unsigned char transaction[KR_UUID_LEN];
@@ -1687,13 +1706,7 @@ kr_take_revocation(const kr_cbor_doc *doc, int frame)
                              KR_UUID_LEN)) {
         return;
     }
-    if (!kr_is_revoked(transaction)) {
-        memcpy(kr.revoked[kr.revoked_next], transaction, KR_UUID_LEN);
-        kr.revoked_next = (kr.revoked_next + 1) % KR_REVOKED_MAX;
-        if (kr.revoked_count < KR_REVOKED_MAX) {
-            kr.revoked_count++;
-        }
-    }
+    kr_remember_revocation(doc, frame);
     if (kr.launch_pending && memcmp(kr.launch_transaction, transaction, KR_UUID_LEN) == 0) {
         /* Installed but not accepted: the text comes out, so a revoked launch leaves nothing
          * behind. */
@@ -1776,6 +1789,40 @@ kr_handle_frame(const unsigned char *frame, size_t length)
     kr_disconnect(KR_LOSS_BRIDGE_DISCONNECTED);
 }
 
+/* Records every revocation among the frames already read, before any of them is acted on.
+ *
+ * The contract asks whether a revocation for this transaction was in the frames this step read,
+ * not whether it came before the launch in them. A worker that dispatched a launch and revoked it
+ * in the same breath has revoked it. */
+static void
+kr_take_batch_revocations(void)
+{
+    size_t at = 0;
+
+    while (kr.in_len - at >= KR_FRAME_HEADER) {
+        unsigned long length = ((unsigned long)kr.in[at] << 24) |
+                               ((unsigned long)kr.in[at + 1] << 16) |
+                               ((unsigned long)kr.in[at + 2] << 8) | (unsigned long)kr.in[at + 3];
+        const char *name;
+        size_t name_len;
+        kr_cbor_doc doc;
+        int root;
+        int payload;
+
+        if (length == 0 || length > KR_CBOR_MAX_FRAME ||
+            kr.in_len - at < KR_FRAME_HEADER + length) {
+            return;
+        }
+        root = kr_cbor_parse(&doc, kr.in + at + KR_FRAME_HEADER, (size_t)length);
+        payload = kr_cbor_variant_of(&doc, root, &name, &name_len);
+        if (payload >= 0 && name_len == 14 && memcmp(name, "launch_revoked", 14) == 0) {
+            kr_remember_revocation(&doc, payload);
+        }
+        kr_cbor_doc_free(&doc);
+        at += KR_FRAME_HEADER + length;
+    }
+}
+
 void
 kr_bridge_service(void)
 {
@@ -1786,6 +1833,7 @@ kr_bridge_service(void)
     if (!kr_fill()) {
         return;
     }
+    kr_take_batch_revocations();
     for (;;) {
         const unsigned char *frame;
         size_t length = kr_take_frame(&frame);
@@ -1806,6 +1854,10 @@ kr_bridge_service(void)
         memcpy(kr.frame, frame, length);
         kr_drop_frame(length);
         kr_handle_frame(kr.frame, length);
+        if (kr.pause_dispatch) {
+            kr.pause_dispatch = 0;
+            break;
+        }
     }
     kr_flush();
 }

@@ -142,10 +142,12 @@ Nothing in the bridge links against the rest of the host. It speaks to the worke
 and the reader calls into it through a small set of functions.
 
 Two things the adapters do that are easy to get wrong. An argument vector is quoted a word at a
-time, *including the first*: a bare word at command position would be a reserved word, an
-assignment or an alias rather than the name the caller asked to run, so every word is quoted and
-installed literally. And on Zsh the text goes in through the editor's own string representation:
-`setline` unmetafies what it is handed, so raw bytes above 0x7f would change on the way in.
+time, *including the first*, and with the enclosing single quotes: a bare word at command position
+would be a reserved word, an assignment or an alias rather than the name the caller asked to run,
+and an unquoted `$(...)` would run. Zsh's own `quotestring` escapes for the inside of single
+quotes and leaves the quotes to its caller, which is a trap worth naming. And on Zsh the text goes
+in through the editor's own string representation: `setline` unmetafies what it is handed, so raw
+bytes above 0x7f would change on the way in.
 
 Losing the bridge does not turn a managed root shell back into an ordinary one. The handshake
 leaves a mark that is never cleared, so a shell whose worker has gone holds no fence, consumes an
@@ -190,10 +192,11 @@ scripts/build-shells.sh --check-patches  # apply the patches and stop
 ```
 
 The identity is a SHA-256 over the inputs: the upstream archive's digest, the manifest, this build
-script, every patch file, every added source and the startup entry. The first sixteen hex
-characters name the directory the package is installed in, so the same inputs land in the same
-place and a second run reports that nothing changed. Change one byte of any of them and the
-identity changes with it.
+script, every patch file, every added source, the startup entry, and the compiler and environment
+the build honours. The first sixteen hex characters name the directory the package is installed
+in, so the same inputs land in the same place and a second run reports that nothing changed.
+Change one byte of any of them, or build with a different compiler, and the identity changes with
+it.
 
 Packages are installed outside the repository, under `~/Library/Caches/kalareach/shells/` on macOS
 and `${XDG_CACHE_HOME:-~/.cache}/kalareach/shells/` elsewhere. A process a service manager starts
@@ -204,8 +207,8 @@ where a session can start it without a dialog.
 Beside the binary is `kr-shell-identity.json`, which is what the package declares in its handshake:
 the executable, the upstream version, the editor ABI, the integration version, every published
 patch with the upstream revision it was rebased onto, the module tree with each module's ABI, the
-five declared mechanisms, and the build's own inputs. The record also states what the shell's own
-test suite did.
+five declared mechanisms, and the build's own inputs and compiler. The record also states what the
+shell's own test suite did.
 
 The manifest's compilation flags are part of the package rather than a local preference. Zsh 5.9
 writes some of its configure probes in pre-C99 style, and a compiler that rejects implicit `int`

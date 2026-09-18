@@ -284,20 +284,26 @@ kr_shell_quote_argument(const char *argument)
      * Every argument is quoted, including the first. An argument vector is installed as literal
      * arguments, and a bare word at command position would be a reserved word, an assignment or
      * an alias rather than the name the caller asked to run.
+     *
+     * `quotestring` escapes for the inside of single quotes and leaves the quotes themselves to
+     * its caller, so they are added here. Without them nothing would be quoted at all.
      */
     quoted = quotestring(metafied, QT_SINGLE);
     if (quoted != NULL) {
         size_t quoted_len = strlen(quoted);
-        char *unmetafied = (char *)zalloc(quoted_len + 1);
-        memcpy(unmetafied, quoted, quoted_len + 1);
-        raw_len = (int)quoted_len;
+        char *unmetafied = (char *)zalloc(quoted_len + 3);
+        unmetafied[0] = '\'';
+        memcpy(unmetafied + 1, quoted, quoted_len);
+        unmetafied[quoted_len + 1] = '\'';
+        unmetafied[quoted_len + 2] = '\0';
+        raw_len = (int)quoted_len + 2;
         unmetafy(unmetafied, &raw_len);
         copy = (char *)malloc((size_t)raw_len + 1);
         if (copy != NULL) {
             memcpy(copy, unmetafied, (size_t)raw_len);
             copy[raw_len] = '\0';
         }
-        zfree(unmetafied, quoted_len + 1);
+        zfree(unmetafied, quoted_len + 3);
     }
     popheap();
     free(metafied);
@@ -445,6 +451,23 @@ kr_zle_boundary(void)
     return consumed;
 }
 
+void
+kr_zle_before_wait(void)
+{
+    if (!kr_bridge_registered() || kr_idle_reported) {
+        return;
+    }
+    if (keybuflen != 0 || kungetct != 0) {
+        return;
+    }
+    /* Nothing buffered and nothing part-read, and the reader is about to wait: one of the three
+     * points the worker retries a withheld fence at. */
+    kr_idle_reported = 1;
+    kr_in_key_wait = 1;
+    kr_bridge_reader_idle();
+    kr_in_key_wait = 0;
+}
+
 int
 kr_zle_wait(void)
 {
@@ -453,17 +476,12 @@ kr_zle_wait(void)
     }
     /* Everything answered from here is answered by a reader that is waiting for another key. */
     kr_in_key_wait = 1;
-    if (!kr_idle_reported && keybuflen == 0 && kungetct == 0) {
-        /* Nothing buffered and nothing part-read: one of the three points the worker retries a
-         * withheld fence at. */
-        kr_idle_reported = 1;
-        kr_bridge_reader_idle();
-    }
     kr_bridge_service();
     kr_in_key_wait = 0;
     if (kr_cancel_requested) {
         kr_cancel_requested = 0;
         kr_cancel_consumed = 1;
+        kr_idle_reported = 0;
         return 1;
     }
     return done != 0;
@@ -479,6 +497,9 @@ void
 kr_zle_pass_end(void)
 {
     kr_cancel_consumed = 0;
+    /* Whatever the pass did, the reader's queues may have changed, so the next wait reports
+     * itself idle again and the worker gets its retry point. */
+    kr_idle_reported = 0;
 }
 
 void

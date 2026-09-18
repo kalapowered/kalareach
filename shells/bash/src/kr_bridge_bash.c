@@ -20,6 +20,7 @@
 #include "variables.h"
 #include "builtins.h"
 #include "builtins/common.h"
+#include "execute_cmd.h"
 
 /* The `read' builtin's own entry point, as the generated builtin table declares it. Declared here
    rather than included, because that table is generated after this file is compiled. */
@@ -32,11 +33,12 @@ int
 kr_shell_prompt_context ()
 {
   /*
-   * The `read' builtin reading through the editor is not the root editor's prompt, and asking the
-   * shell which builtin is running answers that however the builtin is left, including through a
-   * signal or a timeout.
+   * The `read' builtin reading through the editor is not the root editor's prompt. Asking which
+   * builtin is running answers that however the builtin is left, including through a signal or a
+   * timeout: `executing_builtin' is restored by Bash's own unwind protection, and
+   * `this_shell_builtin' only means anything while it is set.
    */
-  if (this_shell_builtin == read_builtin)
+  if (executing_builtin && this_shell_builtin == read_builtin)
     return KR_CONTEXT_READ_BUILTIN;
   /*
    * The parser points the prompt at PS2 for every line of a command it has not finished, so a

@@ -294,6 +294,55 @@ kr_cbor_take_value(kr_cbor_parser *parser)
     return index;
 }
 
+/* Well-formed UTF-8, which is what the profile says a text string is. */
+static int
+kr_cbor_utf8_valid(const unsigned char *bytes, size_t len)
+{
+    size_t at = 0;
+
+    while (at < len) {
+        unsigned char lead = bytes[at];
+        size_t extra;
+        unsigned long code;
+        size_t i;
+
+        if (lead < 0x80u) {
+            at++;
+            continue;
+        }
+        if (lead >= 0xc2u && lead <= 0xdfu) {
+            extra = 1;
+            code = lead & 0x1fu;
+        } else if (lead >= 0xe0u && lead <= 0xefu) {
+            extra = 2;
+            code = lead & 0x0fu;
+        } else if (lead >= 0xf0u && lead <= 0xf4u) {
+            extra = 3;
+            code = lead & 0x07u;
+        } else {
+            return 0;
+        }
+        if (len - at <= extra) {
+            return 0;
+        }
+        for (i = 1; i <= extra; i++) {
+            unsigned char next = bytes[at + i];
+            if (next < 0x80u || next > 0xbfu) {
+                return 0;
+            }
+            code = (code << 6) | (next & 0x3fu);
+        }
+        /* Shortest form, no surrogates, nothing above the last code point. */
+        if ((extra == 1 && code < 0x80ul) || (extra == 2 && code < 0x800ul) ||
+            (extra == 3 && code < 0x10000ul) || (code >= 0xd800ul && code <= 0xdffful) ||
+            code > 0x10fffful) {
+            return 0;
+        }
+        at += extra + 1;
+    }
+    return 1;
+}
+
 /* The complete encoded key's order, which for a text key is (length, bytes). */
 static int
 kr_cbor_key_precedes(const kr_cbor_value *left, const kr_cbor_value *right)
@@ -384,6 +433,11 @@ kr_cbor_value_parse(kr_cbor_parser *parser)
     case 2:
     case 3:
         if (number > (unsigned long long)(parser->len - parser->at)) {
+            parser->doc->failed = 1;
+            return -1;
+        }
+        if (major == 3 &&
+            !kr_cbor_utf8_valid(parser->bytes + parser->at, (size_t)number)) {
             parser->doc->failed = 1;
             return -1;
         }

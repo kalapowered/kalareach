@@ -174,17 +174,21 @@ jobs:
       # pins and describes them, the licence, and the identity the run produced.
       - name: Collect the published patch sets and identities
         run: |
-          mkdir -p /tmp/kr-shell-packages
-          cp scripts/build-shells.sh /tmp/kr-shell-packages/
-          cp docs/shell-integration/packages.md /tmp/kr-shell-packages/
+          # The same layout the build script and the document expect, so the archive can be
+          # unpacked and built without moving anything.
+          mkdir -p /tmp/kr-shell-packages/scripts /tmp/kr-shell-packages/docs/shell-integration
+          cp scripts/build-shells.sh /tmp/kr-shell-packages/scripts/
+          cp docs/shell-integration/packages.md /tmp/kr-shell-packages/docs/shell-integration/
+          cp LICENSE /tmp/kr-shell-packages/
           for shell in zsh bash; do
-            mkdir -p "/tmp/kr-shell-packages/$shell"
+            mkdir -p "/tmp/kr-shell-packages/shells/$shell"
             cp -r "shells/$shell/patches" "shells/$shell/src" "shells/$shell/startup" \
-                  "/tmp/kr-shell-packages/$shell/"
-            cp "shells/$shell/manifest.json" "shells/$shell/LICENSE" "/tmp/kr-shell-packages/$shell/"
+                  "/tmp/kr-shell-packages/shells/$shell/"
+            cp "shells/$shell/manifest.json" "shells/$shell/LICENSE" \
+               "/tmp/kr-shell-packages/shells/$shell/"
             identity="$(cat "${XDG_CACHE_HOME:-$HOME/.cache}/kalareach/shells/$shell/current")"
             cp "${XDG_CACHE_HOME:-$HOME/.cache}/kalareach/shells/$shell/$identity/kr-shell-identity.json" \
-               "/tmp/kr-shell-packages/$shell/"
+               "/tmp/kr-shell-packages/shells/$shell/"
           done
 
       - name: Publish the patch sets and identity records

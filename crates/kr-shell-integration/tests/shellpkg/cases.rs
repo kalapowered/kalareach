@@ -553,6 +553,85 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
         &[b"\x1b[201~"],
     );
 
+    // A vi motion waits for its target, and the gesture belongs to that wait. It needs the vi
+    // keymap, which is the person's own setting, so it is put back afterwards.
+    session.clear_line();
+    let vi_mode = match kind {
+        ShellKind::Zsh => "bindkey -v; echo kr-vi-on",
+        _ => "set -o vi; echo kr-vi-on",
+    };
+    session.type_line(vi_mode);
+    assert!(session.wait_for_output("kr-vi-on", REPLY));
+    std::thread::sleep(Duration::from_millis(300));
+    session.forget_events();
+    session.type_bytes(ESCAPE);
+    std::thread::sleep(Duration::from_millis(120));
+    session.type_bytes(b"d");
+    std::thread::sleep(Duration::from_millis(120));
+    session.type_bytes(CTRL_D);
+    assert!(
+        !session.saw_event(Duration::from_millis(600), |event| matches!(
+            event,
+            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+        )),
+        "a gesture a vi motion was waiting for was treated as a detach"
+    );
+    assert!(session.alive(), "a vi motion's gesture ended the shell");
+    driven.push(DetachExclusion::ViMotion);
+    session.type_bytes(&[0x03]);
+    std::thread::sleep(Duration::from_millis(150));
+    let emacs_mode = match kind {
+        ShellKind::Zsh => "bindkey -e; echo kr-vi-off",
+        _ => "set -o emacs; echo kr-vi-off",
+    };
+    session.type_line(emacs_mode);
+    assert!(session.wait_for_output("kr-vi-off", REPLY));
+
+    // A macro the reader is replaying is the reader's own input, not a gesture a person made, and
+    // a binding that feeds the gesture itself proves the source is what excludes it.
+    session.clear_line();
+    let bind_macro = match kind {
+        ShellKind::Zsh => "bindkey -s '^T' $'\\x04'; echo kr-macro-bound",
+        _ => "bind '\"\\C-t\": \"\\C-d\"' ; echo kr-macro-bound",
+    };
+    session.type_line(bind_macro);
+    assert!(session.wait_for_output("kr-macro-bound", REPLY));
+    std::thread::sleep(Duration::from_millis(300));
+    session.forget_events();
+    session.type_bytes(&[0x14]);
+    assert!(
+        !session.saw_event(Duration::from_millis(600), |event| matches!(
+            event,
+            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+        )),
+        "a gesture a macro produced was treated as one a person made"
+    );
+    assert!(session.alive(), "macro input ended the shell");
+    driven.push(DetachExclusion::MacroInput);
+    session.clear_line();
+
+    // The `read` builtin reading through the editor is not the root editor's prompt.
+    if matches!(kind, ShellKind::Bash) {
+        session.type_line("read -e -t 5 kr_read_var");
+        std::thread::sleep(Duration::from_millis(500));
+        session.forget_events();
+        session.type_bytes(CTRL_D);
+        assert!(
+            !session.saw_event(Duration::from_millis(600), |event| matches!(
+                event,
+                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+            )),
+            "a gesture inside the read builtin was treated as the root editor's"
+        );
+        assert!(
+            session.alive(),
+            "the read builtin's gesture ended the shell"
+        );
+        driven.push(DetachExclusion::ReadBuiltin);
+        session.type_line("echo kr-read-done");
+        assert!(session.wait_for_output("kr-read-done", REPLY));
+    }
+
     // A continuation line is a different reader, so the gesture is the editor's there too.
     session.clear_line();
     session.type_line("echo 'kr-exclusion");
@@ -577,13 +656,13 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
 
     for exclusion in &named {
         assert!(
-            driven.contains(exclusion) || not_constructible_here(*exclusion),
+            driven.contains(exclusion) || not_constructible_here(kind, *exclusion),
             "{} is in the corpus and neither driven nor accounted for",
             exclusion.as_str()
         );
     }
     assert!(
-        driven.len() >= 7,
+        driven.len() >= 9,
         "only {} exclusions were driven; this test has stopped proving anything",
         driven.len()
     );
@@ -598,16 +677,17 @@ fn ignore_eof_command(kind: ShellKind) -> &'static str {
 }
 
 /// The exclusions that need a state this harness cannot put a real reader into.
-fn not_constructible_here(exclusion: DetachExclusion) -> bool {
-    matches!(
-        exclusion,
-        // A vi motion and a macro both need a binding this harness does not install, and the
-        // `read` builtin's reader is covered by the reader-context assertions instead.
-        DetachExclusion::ViMotion
-            | DetachExclusion::MacroInput
-            | DetachExclusion::ReadBuiltin
-            | DetachExclusion::NotManagedRootEditor
-    )
+fn not_constructible_here(kind: ShellKind, exclusion: DetachExclusion) -> bool {
+    match exclusion {
+        // Not a state of a managed root editor at all, but the requirement that the contract
+        // applies to this reader: a reader that fails it is some other program.
+        DetachExclusion::NotManagedRootEditor => true,
+        // Zsh's `vared` is its reader through the editor, and it ends on the gesture rather than
+        // surviving it, so driving it here would end the session it is being observed in. Bash's
+        // `read -e` is driven above.
+        DetachExclusion::ReadBuiltin => matches!(kind, ShellKind::Zsh),
+        _ => false,
+    }
 }
 
 /// The exclusions the committed corpus names, read from the scenario rather than restated.
@@ -725,9 +805,16 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
 
     let (enter, fence) = session.fenced_prompt(8);
     let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x71; 16]));
-    // An argument vector no interpolation could survive: the integration quotes it for its own
-    // shell and installs those literal arguments.
-    let command = LaunchCommand::Arguments(vec!["echo".to_owned(), "kr launch ok".to_owned()]);
+    // An argument vector no interpolation could survive: a word with a space in it, which a split
+    // would break into two, and a word that is a command substitution, which an unquoted install
+    // would run. `printf` prints each argument followed by a bar, so the exact vector that ran is
+    // visible in the output.
+    let command = LaunchCommand::Arguments(vec![
+        "printf".to_owned(),
+        "%s|".to_owned(),
+        "kr launch ok".to_owned(),
+        "$(echo substituted)".to_owned(),
+    ]);
     let id = session.ask(WorkerRequest::Launch(LaunchMailboxRequest {
         session_id: session.session_id,
         transaction,
@@ -788,8 +875,13 @@ pub fn a_launch_is_installed_and_accepted_on_the_reader_thread(kind: ShellKind) 
     assert_eq!(left.reason, EditorLeaveReason::CommandAccepted);
 
     assert!(
-        session.wait_for_output("kr launch ok", REPLY),
-        "the installed command did not run as one argument:\n{}",
+        session.wait_for_output("kr launch ok|$(echo substituted)|", REPLY),
+        "the arguments that ran are not the arguments the caller named:\n{}",
+        session.terminal_output()
+    );
+    assert!(
+        !session.terminal_output().contains("substituted|"),
+        "an argument was expanded rather than installed literally:\n{}",
         session.terminal_output()
     );
 }
@@ -1017,8 +1109,11 @@ pub fn a_revoked_launch_installs_nothing(kind: ShellKind) {
     assert!(!session.terminal_output().contains("kr-revoked"));
 }
 
-/// A-17: a revocation that arrives after the reader installed takes the text back out.
-pub fn a_revocation_after_the_install_takes_the_text_back_out(kind: ShellKind) {
+/// A revocation in the same read binds the launch, in whichever order the two frames arrive.
+///
+/// `ReaderLaunchState::revoked` is "a revocation for this transaction was in the frames this step
+/// read", so a worker that dispatched a launch and revoked it in the same breath has revoked it.
+pub fn a_revocation_in_the_same_read_binds_the_launch(kind: ShellKind) {
     let Some(package) = Package::found(kind) else {
         return;
     };
@@ -1032,9 +1127,7 @@ pub fn a_revocation_after_the_install_takes_the_text_back_out(kind: ShellKind) {
     let transaction = LaunchTransactionId::new(Uuid::from_bytes([0x74; 16]));
     let id = RequestId::new(9001);
 
-    // The launch and its revocation reach the reader in one read, in that order, so the reader
-    // installs and accepts before it sees the revocation. What is left is text in the editor that
-    // the person has not accepted, and it comes back out.
+    // The launch first, its revocation second, in one write.
     session.write_frames(&[
         BridgeFrame::Request {
             id,
@@ -1058,18 +1151,15 @@ pub fn a_revocation_after_the_install_takes_the_text_back_out(kind: ShellKind) {
         },
     ]);
 
-    // The reader's word is what the caller gets, and it installed.
     let BridgeAnswer::Launch(decision) = session.answer(id) else {
         panic!("the reader answered a launch with something else")
     };
-    assert!(
-        decision.rejection().is_none(),
-        "the reader saw a revocation it could not have seen yet: {:?}",
-        decision.rejection()
+    assert_eq!(
+        decision.rejection(),
+        Some(LaunchRejectionReason::Revoked),
+        "a revocation the reader had already read did not bind its launch"
     );
 
-    // And the editor is empty again: the command never ran.
-    std::thread::sleep(Duration::from_millis(300));
     let acknowledgement = session.fence_exchange(&enter, fence_id(16));
     assert!(
         acknowledgement.editor.buffer_empty,
@@ -1078,6 +1168,26 @@ pub fn a_revocation_after_the_install_takes_the_text_back_out(kind: ShellKind) {
     assert!(
         !session.terminal_output().contains("kr-late-revoked"),
         "a revoked launch ran anyway:\n{}",
+        session.terminal_output()
+    );
+
+    // A revocation for a transaction that is long over touches nothing.
+    session.write_frame(&BridgeFrame::LaunchRevoked {
+        transaction,
+        reason: LaunchRejectionReason::Timeout,
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    session.type_bytes(b"kr-typed");
+    std::thread::sleep(Duration::from_millis(200));
+    session.write_frame(&BridgeFrame::LaunchRevoked {
+        transaction,
+        reason: LaunchRejectionReason::Timeout,
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    session.type_line("");
+    assert!(
+        session.wait_for_output("kr-typed", REPLY),
+        "a revocation for a finished transaction took the person's own text out:\n{}",
         session.terminal_output()
     );
     assert!(session.alive());
@@ -1237,6 +1347,21 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
         !report.cancelled.any(),
         "a cancellation for another reader ended this one's work: {:?}",
         report.cancelled
+    );
+
+    // And the reader recovers at the same prompt: its queues are clear again and it says so, so
+    // the worker has the retry point a withheld fence needs.
+    let recovered = session.fence_exchange(&enter, fence_id(17));
+    assert!(
+        recovered.queues.partial_key_drained
+            && recovered.queues.tty_typeahead_drained
+            && recovered.queues.macro_input_drained,
+        "the reader's queues did not come back after the cancellation: {:?}",
+        recovered.queues
+    );
+    assert!(
+        session.saw_event(REPLY, |event| matches!(event, BridgeEvent::ReaderIdle(_))),
+        "the reader did not report itself idle again after the cancellation"
     );
 
     // The buffer survived all of it: the rest of the line is typed and the whole command runs.

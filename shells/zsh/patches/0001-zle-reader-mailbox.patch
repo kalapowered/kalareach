@@ -30,16 +30,16 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  
 --- a/Src/Zle/zle_main.c
 +++ b/Src/Zle/zle_main.c
-@@ -30,6 +30,9 @@
+@@ -29,6 +29,9 @@
+ 
  #include "zle.mdh"
  #include "zle_main.pro"
- 
++
 +#include "kr_bridge.h"
 +#include "kr_bridge_zle.h"
-+
+ 
  #ifdef HAVE_POLL_H
  # include <poll.h>
- #endif
 @@ -530,9 +533,10 @@
       * timeouts may be external, so we may have both a permanent watched
       * fd and a long-term timeout.
@@ -80,25 +80,40 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  # endif
  	for (;;) {
  # ifdef HAVE_POLL
-@@ -604,6 +619,11 @@
- 		    FD_SET(fd, &foofd);
+@@ -586,6 +601,13 @@
+ 	    else
+ 		poll_timeout = -1;
+ 
++	    if (kr_fd >= 0) {
++		fds[nfds-1].fd = kr_fd;
++		fds[nfds-1].events = POLLIN;
++		if (kr_bridge_wants_write())
++		    fds[nfds-1].events |= POLLOUT;
++		kr_zle_before_wait();
++	    }
+ 	    winch_unblock();
+ 	    selret = poll(fds, errtry ? 1 : nfds, poll_timeout);
+ 	    winch_block();
+@@ -605,6 +627,12 @@
  		    if (fd > fdmax)
  			fdmax = fd;
-+		}
+ 		}
 +		if (kr_fd >= 0) {
 +		    FD_SET(kr_fd, &foofd);
 +		    if (kr_fd > fdmax)
 +			fdmax = kr_fd;
- 		}
++		    kr_zle_before_wait();
++		}
  	    }
  	    FD_ZERO(&errfd);
-@@ -714,6 +734,32 @@
+ 
+@@ -714,6 +742,39 @@
  # endif
  		 )
  		break;
 +	    if (kr_fd >= 0 && !errtry &&
 +# ifdef HAVE_POLL
-+		(fds[nfds-1].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL))
++		(fds[nfds-1].revents & (POLLIN|POLLOUT|POLLERR|POLLHUP|POLLNVAL))
 +# else
 +		FD_ISSET(kr_fd, &foofd)
 +# endif
@@ -116,16 +131,23 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
 +		kr_fd = kr_zle_fd();
 +# ifdef HAVE_POLL
 +		fds[nfds-1].revents = 0;
-+		if (kr_fd < 0)
++		if (kr_fd < 0) {
++		    /* A descriptor that has been closed is taken out of the set: an entry with
++		     * no events is still reported invalid on some systems. */
++		    fds[nfds-1].fd = -1;
 +		    fds[nfds-1].events = 0;
-+		else
++		} else {
 +		    fds[nfds-1].fd = kr_fd;
++		    fds[nfds-1].events = POLLIN;
++		    if (kr_bridge_wants_write())
++			fds[nfds-1].events |= POLLOUT;
++		}
 +# endif
 +	    }
  	    if (nwatch && !errtry) {
  		/*
  		 * Copy the details of the watch fds in case the
-@@ -790,9 +836,15 @@
+@@ -790,9 +851,15 @@
  
  # ifdef HAVE_POLL
  		/* Function may have added or removed handlers */
@@ -142,7 +164,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  		    for (i = 0; i < nwatch; i++) {
  			/*
  			 * This is imperfect because it assumes fds[] and
-@@ -875,9 +927,11 @@
+@@ -875,9 +942,11 @@
      lastchar_wide_valid = 0;
  #endif
  
@@ -156,7 +178,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  	for (;;) {
  	    int q = queue_signal_level();
  	    dont_queue_signals();
-@@ -1133,7 +1187,15 @@
+@@ -1133,7 +1202,15 @@
  	    ? km : NULL);
  	bindk = getkeycmd();
  	selectlocalmap(NULL);
@@ -173,7 +195,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  	    if (!zlell && isfirstln && !(zlereadflags & ZLRF_IGNOREEOF) &&
  		lastchar == eofchar) {
  		/*
-@@ -1162,6 +1224,7 @@
+@@ -1162,6 +1239,7 @@
  	    break;
  	}
  
@@ -181,7 +203,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
  	redrawhook();
  #ifdef HAVE_POLL
  	if (baud && !(lastcmd & ZLE_MENUCMP)) {
-@@ -1353,8 +1416,12 @@
+@@ -1353,8 +1431,12 @@
  
      zrefresh();
  
@@ -194,7 +216,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
      if (errflag)
  	setsparam((zlecontext == ZLCON_VARED) ?
  		  "ZLE_VARED_ABORTED" :
-@@ -2180,6 +2247,7 @@
+@@ -2180,6 +2262,7 @@
  
  static struct builtin bintab[] = {
      BUILTIN("bindkey", 0, bin_bindkey, 0, -1, 0, "evaM:ldDANmrsLRp", NULL),
@@ -202,7 +224,7 @@ This patch is a derivative work of Zsh and carries the Zsh licence; see shells/z
      BUILTIN("vared",   0, bin_vared,   1,  1, 0, "aAcef:ghi:M:m:p:r:t:", NULL),
      BUILTIN("zle",     0, bin_zle,     0, -1, 0, "aAcCDfFgGIKlLmMNrRTUw", NULL),
  };
-@@ -2247,6 +2315,8 @@
+@@ -2247,6 +2330,8 @@
      /* Intended to be global, no WARNCREATEGLOBAL check. */
      assignaparam("zle_bracketed_paste", bpaste, 0);
  

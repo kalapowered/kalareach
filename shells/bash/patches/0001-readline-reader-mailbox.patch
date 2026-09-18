@@ -50,12 +50,10 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  /* What kind of non-blocking I/O do we have? */
  #if !defined (O_NDELAY) && defined (O_NONBLOCK)
  #  define O_NDELAY O_NONBLOCK	/* Posix style */
-@@ -190,6 +193,19 @@
- _rl_pushed_input_available (void)
- {
+@@ -192,6 +195,19 @@
    return (push_index != pop_index);
-+}
-+
+ }
+ 
 +/* How many bytes this reader has already taken and not yet used.  A fence rests on the reader's
 +   own state, so the count has to come from the reader rather than from the kernel's idea of what
 +   is readable. */
@@ -67,9 +65,11 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
 +  if (held < 0)
 +    held += ibuffer_len;
 +  return held;
- }
- 
++}
++
  /* Return the amount of space available in the buffer for stuffing
+    characters. */
+ static int
 @@ -331,6 +347,7 @@
  
    if (result != -1)
@@ -131,10 +131,12 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
  /* fprintf(stderr, "rl_read_key: calling RL_CHECK_SIGNALS: _rl_caught_signal = %d\r\n", _rl_caught_signal); */
  	  RL_CHECK_SIGNALS ();
  	}
-@@ -810,9 +844,17 @@
+@@ -809,10 +843,22 @@
+   int fd;
  #if defined (HAVE_PSELECT) || defined (HAVE_SELECT)
    sigset_t empty_set;
-   fd_set readfds;
+-  fd_set readfds;
++  fd_set readfds, writefds;
 +  int kr_fd, kr_nfds;
  #endif
  
@@ -143,34 +145,46 @@ General Public Licence, version 3 or later; see shells/bash/LICENSE.
 +   * Everything this reader had buffered has been taken, so this is its idle point: the one place
 +   * where reading a private mailbox says something true about the reader's own queues.  Readline
 +   * returns pending and macro input without reaching here at all, which is exactly why the
-+   * mailbox is read here rather than from a character callback.
++   * mailbox is read here rather than from a character callback.  Answering can end this read, by
++   * accepting an installed line or by ending a pending key wait, and then there is nothing left
++   * to wait for.
 +   */
 +  kr_rl_idle ();
++  if (kr_rl_wait ())
++    return (KR_RL_CANCEL);
    while (1)
      {
        RL_CHECK_SIGNALS ();
-@@ -829,15 +871,30 @@
+@@ -828,16 +874,38 @@
+       /* At this point, if we have pselect, we're using select/pselect for the
  	 timeouts. We handled MinGW above. */
        FD_ZERO (&readfds);
++      FD_ZERO (&writefds);
        FD_SET (fd, &readfds);
 +      /* The reader waits on its own mailbox as well as the terminal, so a fence, a cancellation
-+	 or a launch reaches it without a keystroke. */
++	 or a launch reaches it without a keystroke, and an answer that did not fit the socket
++	 goes out as soon as there is room for it. */
 +      kr_fd = kr_rl_fd ();
 +      if (kr_fd >= 0)
-+	FD_SET (kr_fd, &readfds);
++	{
++	  FD_SET (kr_fd, &readfds);
++	  if (kr_bridge_wants_write ())
++	    FD_SET (kr_fd, &writefds);
++	}
 +      kr_nfds = (kr_fd > fd ? kr_fd : fd) + 1;
  #  if defined (HANDLE_SIGNALS)
 -      result = _rl_timeout_select (fd + 1, &readfds, NULL, NULL, NULL, &_rl_orig_sigset);
-+      result = _rl_timeout_select (kr_nfds, &readfds, NULL, NULL, NULL, &_rl_orig_sigset);
++      result = _rl_timeout_select (kr_nfds, &readfds, &writefds, NULL, NULL, &_rl_orig_sigset);
  #  else
        sigemptyset (&empty_set);
        sigprocmask (SIG_BLOCK, (sigset_t *)NULL, &empty_set);
 -      result = _rl_timeout_select (fd + 1, &readfds, NULL, NULL, NULL, &empty_set);
-+      result = _rl_timeout_select (kr_nfds, &readfds, NULL, NULL, NULL, &empty_set);
++      result = _rl_timeout_select (kr_nfds, &readfds, &writefds, NULL, NULL, &empty_set);
  #  endif /* HANDLE_SIGNALS */
        if (result == 0)
          _rl_timeout_handle ();		/* check the timeout */
-+      if (result > 0 && kr_fd >= 0 && FD_ISSET (kr_fd, &readfds))
++      if (result > 0 && kr_fd >= 0
++	  && (FD_ISSET (kr_fd, &readfds) || FD_ISSET (kr_fd, &writefds)))
 +	{
 +	  /* Answer what is in the mailbox.  A launch the reader installed and accepted, or a
 +	     takeover that ended this key wait, means this read is over. */

@@ -271,12 +271,16 @@ kr_shell_cancel_key_wait (kr_cancellation *out)
    * clears the pending input and resets the argument, and the edit buffer is left as it was.
    */
   kr_cancel_requested = 1;
+  kr_idle_reported = 0;
 }
 
 void
 kr_rl_cancel_observed (void)
 {
   kr_cancel_requested = 0;
+  /* The reader's queues have changed, so the next wait reports itself idle again and the worker
+     gets its retry point. */
+  kr_idle_reported = 0;
 }
 
 /*
@@ -442,7 +446,7 @@ kr_rl_gathering (int active)
 int
 kr_rl_wait (void)
 {
-  if (kr_bridge_registered () == 0)
+  if (kr_bridge_registered () == 0 || kr_gathering)
     return 0;
   kr_bridge_service ();
   if (kr_cancel_requested)

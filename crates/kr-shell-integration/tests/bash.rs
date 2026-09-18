@@ -94,8 +94,8 @@ fn a_revoked_launch_installs_nothing() {
 
 /// KR-REQ-07.35
 #[test]
-fn a_revocation_that_arrives_after_the_install_takes_the_text_back_out() {
-    shellpkg::a_revocation_after_the_install_takes_the_text_back_out(BASH);
+fn a_revocation_in_the_same_read_binds_its_launch_whichever_order_it_arrives_in() {
+    shellpkg::a_revocation_in_the_same_read_binds_the_launch(BASH);
 }
 
 /// KR-REQ-07.35

@@ -222,11 +222,13 @@ PYTHON
 }
 
 write_identity_record() {
-    python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" <<'PYTHON'
+    python3 - "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" <<'PYTHON'
 import json
 import sys
 
-manifest_path, destination, identity, executable, module_directory, inputs, tests = sys.argv[1:8]
+manifest_path, destination, identity, executable, module_directory, inputs, tests, toolchain = (
+    sys.argv[1:9]
+)
 with open(manifest_path, encoding="utf-8") as handle:
     manifest = json.load(handle)
 
@@ -271,6 +273,7 @@ record = {
         "configure": manifest["configure"],
         "cflags": manifest["cflags"],
         "inputs_sha256": inputs,
+        "toolchain": toolchain,
         "upstream_tests": tests,
     },
     "startup_entry": manifest["startup"],
@@ -311,11 +314,18 @@ build_package() {
     # The identity covers everything that goes into the binary, so the same inputs land in the same
     # place and a second run has nothing to do.
     local inputs
+    # The toolchain and the environment the build honours are part of what produced the binary, so
+    # they are part of what names it: a different compiler is a different package.
+    local toolchain
+    toolchain="$(${CC:-cc} --version 2>/dev/null | head -1)"
     inputs="kr-shell-package/1
 shell=$m_shell
 manifest=$(digest "$package/manifest.json")
 script=$(digest "$root/scripts/build-shells.sh")
 upstream=$m_sha256 $m_archive
+cc=${CC:-cc} $toolchain
+cppflags=${CPPFLAGS:-}
+ldflags=${LDFLAGS:-}
 "
     local patch_file
     for patch_file in $m_patches; do
@@ -492,7 +502,7 @@ startup=$(digest "$package/$m_startup") $m_startup"
     cp "$package/$m_startup" "$destination/startup/$(basename "$m_startup")"
 
     write_identity_record "$package/manifest.json" "$record" "$identity" "$executable" \
-        "$module_directory" "$inputs_digest" "$tests_result"
+        "$module_directory" "$inputs_digest" "$tests_result" "${CC:-cc} $toolchain"
     printf '%s\n' "$identity" > "$prefix/$shell_name/current"
 
     echo "build-shells: built $shell_name $m_upstream_version as $identity"

@@ -24,6 +24,9 @@ void kr_zle_leave(int eof_sent);
  */
 int kr_zle_boundary(void);
 
+/* Called just before the reader waits, so a reader with nothing left to read says so. */
+void kr_zle_before_wait(void);
+
 /* Reads the mailbox while the reader waits for a key. Returns non-zero when the wait must end. */
 int kr_zle_wait(void);
 

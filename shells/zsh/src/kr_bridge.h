@@ -177,6 +177,9 @@ void kr_bridge_service(void);
 /* The endpoint's descriptor, for the reader's own select set, or -1. */
 int kr_bridge_fd(void);
 
+/* Non-zero while an answer is waiting to go out, so the reader's own wait can watch for room. */
+int kr_bridge_wants_write(void);
+
 /* Reports that the ground the integration stood on has gone. */
 void kr_bridge_lost(int loss, const char *detail);
 
