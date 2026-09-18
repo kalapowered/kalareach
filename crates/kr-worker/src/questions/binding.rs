@@ -9,8 +9,10 @@
 //!    recycled identifier cannot pass as the process that called a moment ago.
 //! 3. **Session membership.** The process is looked for inside the boundary this session owns: the
 //!    control group or the controlling terminal and process group the root shell leads.
-//! 4. **Ancestry.** The parent chain is walked to the root shell, each link checked by start
-//!    identity.
+//! 4. **Ancestry.** The parent chain is walked to the root shell. Every link is read from the
+//!    kernel and checked for consistency: a parent that started *after* its child is not that
+//!    child's parent, whatever the identifier says, so an identifier reused since the child was
+//!    created does not complete a chain.
 //!
 //! Either of the last two admits a source, and both are recorded. Neither is a defence against
 //! arbitrary code running under the same operating-system account: section 11 places that inside
@@ -90,6 +92,7 @@ impl VerifiedSource {
 /// its process tree.
 pub fn verify(
     peer_pid: Option<u32>,
+    admitted: Option<&ProcessStartIdentity>,
     connection_id: ConnectionId,
     session: Option<&SessionBoundary>,
 ) -> Result<VerifiedSource> {
@@ -103,6 +106,17 @@ pub fn verify(
             "the calling process could not be identified: {error}"
         ))
     })?;
+    // The identity is the connection's, read when it was accepted. A process identifier the kernel
+    // recycles while this connection is open names a different program, and answering it as though
+    // it were the caller that opened the connection is exactly what pairing an identifier with its
+    // start value prevents.
+    if let Some(admitted) = admitted
+        && !process.matches(admitted)
+    {
+        return Err(QuestionError::unbound(
+            "the process on this connection is no longer the one that opened it",
+        ));
+    }
     let Some(session) = session else {
         return Err(QuestionError::unbound(
             "this session has no running root shell, so nothing is inside it",
@@ -159,16 +173,36 @@ fn contains(boundary: &OwnershipBoundary, pid: u32) -> bool {
 /// child was created does not complete the chain.
 fn descends_from(pid: u32, root: &ProcessStartIdentity) -> bool {
     let root_pid = u32::try_from(root.pid.get()).unwrap_or(u32::MAX);
-    let mut current = pid;
+    let Ok(mut current) = kr_ipc::identity::process_start_identity(pid) else {
+        return false;
+    };
     for _ in 0..MAX_ANCESTRY_DEPTH {
-        if current == root_pid {
-            return kr_ipc::identity::process_start_identity(current)
-                .is_ok_and(|identity| identity.matches(root));
+        let current_pid = u32::try_from(current.pid.get()).unwrap_or(u32::MAX);
+        if current_pid == root_pid {
+            return current.matches(root);
         }
-        match platform::parent(current) {
-            Some(parent) if parent != 0 && parent != current => current = parent,
-            _ => return false,
+        let Some(parent_pid) = platform::parent(current_pid) else {
+            return false;
+        };
+        if parent_pid == 0 || parent_pid == current_pid {
+            return false;
         }
+        let Ok(parent) = kr_ipc::identity::process_start_identity(parent_pid) else {
+            return false;
+        };
+        // A parent starts before its child. Every source's start value increases with time within
+        // one boot, so a candidate parent that started later is an identifier the kernel has
+        // handed to something else since this child was created, and the chain stops there rather
+        // than climbing through a stranger.
+        if parent.source != current.source || parent.start_value.get() > current.start_value.get() {
+            return false;
+        }
+        // The link is read again from the child's side: a parent that changed between the two
+        // reads is a process that exited, and its identifier now belongs to whatever replaced it.
+        if platform::parent(current_pid) != Some(parent_pid) {
+            return false;
+        }
+        current = parent;
     }
     false
 }
@@ -245,8 +279,13 @@ mod tests {
 
     #[test]
     fn a_connection_the_kernel_will_not_name_is_not_in_a_session() {
-        let error =
-            verify(None, ConnectionId::new(Uuid::from_bytes([1; 16])), None).expect_err("no");
+        let error = verify(
+            None,
+            None,
+            ConnectionId::new(Uuid::from_bytes([1; 16])),
+            None,
+        )
+        .expect_err("no");
         assert_eq!(error.code(), kr_protocol::error::ErrorCode::NotInKrSession);
         assert!(error.to_string().contains("kr new --attach"));
     }
@@ -255,6 +294,7 @@ mod tests {
     fn a_session_without_a_root_shell_holds_nothing() {
         let error = verify(
             Some(std::process::id()),
+            None,
             ConnectionId::new(Uuid::from_bytes([2; 16])),
             None,
         )
@@ -277,6 +317,26 @@ mod tests {
         // identifier but not the identity must not complete.
         identity.start_value = kr_protocol::scalars::U64::new(identity.start_value.get() ^ 0xFFFF);
         assert!(!descends_from(std::process::id(), &identity));
+    }
+
+    #[test]
+    fn a_process_that_is_not_the_one_that_connected_is_refused() {
+        let mut admitted =
+            kr_ipc::identity::process_start_identity(std::process::id()).expect("an identity");
+        admitted.start_value = kr_protocol::scalars::U64::new(admitted.start_value.get() ^ 0xFFFF);
+        let error = verify(
+            Some(std::process::id()),
+            Some(&admitted),
+            ConnectionId::new(Uuid::from_bytes([4; 16])),
+            None,
+        )
+        .expect_err("refused");
+        assert_eq!(error.code(), kr_protocol::error::ErrorCode::NotInKrSession);
+        assert!(
+            error
+                .to_string()
+                .contains("no longer the one that opened it")
+        );
     }
 
     #[test]

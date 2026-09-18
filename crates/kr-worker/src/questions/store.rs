@@ -29,7 +29,8 @@ use kr_protocol::ids::{
 };
 use kr_protocol::question::{
     Alert, AlertCreateParams, AnswerRecord, CallerToken, Question, QuestionAnswer, QuestionChoice,
-    QuestionCreateParams, QuestionEvent, QuestionKind, QuestionSource, QuestionState,
+    QuestionCreateParams, QuestionEvent, QuestionEventKind, QuestionKind, QuestionSource,
+    QuestionState,
 };
 use kr_protocol::scalars::{Nullable, TimestampMs, Uuid};
 use rusqlite::{Connection, OptionalExtension as _, params};
@@ -323,7 +324,11 @@ impl Store {
             answer: Nullable::null(),
             resolved_at_ms: Nullable::null(),
         };
-        self.connection
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(QuestionError::unavailable)?;
+        transaction
             .execute(
                 "INSERT INTO questions (
                      question_id, revision, state, kind, context, question, choices, source,
@@ -354,6 +359,16 @@ impl Store {
                 ],
             )
             .map_err(QuestionError::unavailable)?;
+        write_event(
+            &transaction,
+            &QuestionEvent {
+                kind: QuestionEventKind::Created,
+                question: question.clone(),
+                pending_since_ms: question.created_at_ms,
+                recorded_at_ms: now.utc_ms,
+            },
+        )?;
+        transaction.commit().map_err(QuestionError::unavailable)?;
         Ok(Created {
             question,
             caller_token,
@@ -463,6 +478,7 @@ impl Store {
             question_id,
             expected,
             QuestionState::Answered,
+            QuestionEventKind::Answered,
             Some(&record),
             now,
         )
@@ -479,7 +495,14 @@ impl Store {
         expected: QuestionRevision,
         now: Now,
     ) -> Result<Resolved> {
-        self.resolve(question_id, expected, QuestionState::Cancelled, None, now)
+        self.resolve(
+            question_id,
+            expected,
+            QuestionState::Cancelled,
+            QuestionEventKind::Cancelled,
+            None,
+            now,
+        )
     }
 
     /// Moves every question whose time is up, or whose source has gone, to `expired`.
@@ -526,9 +549,14 @@ impl Store {
                 continue;
             }
             let current = self.read_revision(question_id)?;
-            if let Ok(resolved) =
-                self.resolve(question_id, current, QuestionState::Expired, None, now)
-            {
+            if let Ok(resolved) = self.resolve(
+                question_id,
+                current,
+                QuestionState::Expired,
+                QuestionEventKind::Expired,
+                None,
+                now,
+            ) {
                 expired.push(resolved);
             }
         }
@@ -619,31 +647,6 @@ impl Store {
         )
     }
 
-    /// Records one transition in the durable feed the attention engine reads.
-    ///
-    /// The feed is written inside the same ledger as the questions themselves, so a transition and
-    /// its event cannot disagree after a crash. It carries the moment the question became pending,
-    /// which is what section 25's five-minute idle reminder measures from.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`QuestionError::Unavailable`] when the write fails.
-    pub fn record_event(&mut self, event: &QuestionEvent) -> Result<()> {
-        self.connection
-            .execute(
-                "INSERT INTO question_events (kind, question_id, record, recorded_at_ms)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![
-                    event.kind.event_type(),
-                    event.question.question_id.get().as_bytes().as_slice(),
-                    encode(event)?,
-                    millis(event.recorded_at_ms.get())
-                ],
-            )
-            .map_err(QuestionError::unavailable)?;
-        Ok(())
-    }
-
     /// Returns the transitions recorded after this cursor, oldest first.
     ///
     /// # Errors
@@ -700,6 +703,7 @@ impl Store {
         question_id: QuestionId,
         expected: QuestionRevision,
         state: QuestionState,
+        kind: QuestionEventKind,
         answer: Option<&AnswerRecord>,
         now: Now,
     ) -> Result<Resolved> {
@@ -707,10 +711,16 @@ impl Store {
             Some(record) => Some(encode(record)?),
             None => None,
         };
+        // The transition and the event it produces are one transaction. A crash between them
+        // would leave a question that had moved and a feed that never heard, and the attention
+        // engine reads that feed rather than polling every question.
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(QuestionError::unavailable)?;
         // One conditional update is the whole of the atomicity. Two answers race here, and the
         // loser changes no row at all rather than overwriting the winner's.
-        let changed = self
-            .connection
+        let changed = transaction
             .execute(
                 "UPDATE questions
                     SET state = ?1, revision = revision + 1, answer = ?2, resolved_at_ms = ?3
@@ -724,7 +734,13 @@ impl Store {
                 ],
             )
             .map_err(QuestionError::unavailable)?;
-        let row = self.row(question_id)?.ok_or_else(|| unknown(question_id))?;
+        let row = read_row_in(
+            &transaction,
+            self.session_id,
+            self.session_epoch,
+            question_id,
+        )?
+        .ok_or_else(|| unknown(question_id))?;
         if changed == 0 {
             return Err(match row.question.state {
                 QuestionState::Expired => QuestionError::Expired {
@@ -743,10 +759,13 @@ impl Store {
                 },
             });
         }
-        Ok(Resolved {
+        let resolved = Resolved {
             question: row.question,
             pending_since_ms: row.pending_since_ms,
-        })
+        };
+        write_event(&transaction, &event_of(kind, &resolved, now))?;
+        transaction.commit().map_err(QuestionError::unavailable)?;
+        Ok(resolved)
     }
 
     fn read_revision(&self, question_id: QuestionId) -> Result<QuestionRevision> {
@@ -793,65 +812,97 @@ impl Store {
     }
 
     fn hydrate(&self, row: &rusqlite::Row<'_>) -> Result<Row> {
-        let read = |index: usize| -> Result<Vec<u8>> {
-            row.get::<_, Vec<u8>>(index)
-                .map_err(QuestionError::unavailable)
-        };
-        let text = |index: usize| -> Result<String> {
-            row.get::<_, String>(index)
-                .map_err(QuestionError::unavailable)
-        };
-        let number = |index: usize| -> Result<u64> {
-            row.get::<_, i64>(index)
-                .map(|value| u64::try_from(value).unwrap_or_default())
-                .map_err(QuestionError::unavailable)
-        };
-        let state = QuestionState::from_wire(&text(2)?)
-            .ok_or_else(|| QuestionError::unavailable("a question state this build cannot read"))?;
-        let kind = match text(3)?.as_str() {
-            "input" => QuestionKind::Input,
-            "select" => QuestionKind::Select,
-            "confirm" => QuestionKind::Confirm,
-            other => {
-                return Err(QuestionError::unavailable(format!(
-                    "a question kind this build cannot read: {other}"
-                )));
-            }
-        };
-        let answer = row
-            .get::<_, Option<Vec<u8>>>(11)
-            .map_err(QuestionError::unavailable)?
-            .map(|bytes| decode::<AnswerRecord>(&bytes))
-            .transpose()?;
-        let resolved = row
-            .get::<_, Option<i64>>(12)
-            .map_err(QuestionError::unavailable)?
-            .map(|value| TimestampMs::new(u64::try_from(value).unwrap_or_default()));
-        Ok(Row {
-            question: Question {
-                question_id: QuestionId::new(uuid_from(&read(0)?)?),
-                revision: QuestionRevision::new(number(1)?),
-                state,
-                session_id: self.session_id,
-                session_epoch: self.session_epoch,
-                kind,
-                context: text(4)?,
-                question: text(5)?,
-                choices: decode::<Vec<QuestionChoice>>(&read(6)?)?,
-                source: decode::<QuestionSource>(&read(7)?)?,
-                created_at_ms: TimestampMs::new(number(8)?),
-                expires_at_ms: TimestampMs::new(number(10)?),
-                answer: Nullable(answer),
-                resolved_at_ms: Nullable(resolved),
-            },
-            pending_since_ms: TimestampMs::new(number(9)?),
-            token_nonce: read(13)?,
-            token_sealed: read(14)?,
-            token_tag: read(17)?,
-            digest: read(15)?,
-            source_key: text(16)?,
-        })
+        hydrate_row(self.session_id, self.session_epoch, row)
     }
+}
+
+/// The columns every question read selects, in the order [`hydrate_row`] expects them.
+const ROW_COLUMNS: &str = "question_id, revision, state, kind, context, question, choices, source,
+         created_at_ms, pending_since_ms, expires_at_ms, answer, resolved_at_ms,
+         token_nonce, token_sealed, payload_digest, source_key, token_tag";
+
+/// Reads one question inside a transaction.
+fn read_row_in(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: SessionId,
+    session_epoch: SessionEpoch,
+    question_id: QuestionId,
+) -> Result<Option<Row>> {
+    transaction
+        .query_row(
+            &format!("SELECT {ROW_COLUMNS} FROM questions WHERE question_id = ?1"),
+            params![question_id.get().as_bytes().as_slice()],
+            |row| Ok(hydrate_row(session_id, session_epoch, row)),
+        )
+        .optional()
+        .map_err(QuestionError::unavailable)?
+        .transpose()
+}
+
+/// Builds one question from a row of [`ROW_COLUMNS`].
+fn hydrate_row(
+    session_id: SessionId,
+    session_epoch: SessionEpoch,
+    row: &rusqlite::Row<'_>,
+) -> Result<Row> {
+    let read = |index: usize| -> Result<Vec<u8>> {
+        row.get::<_, Vec<u8>>(index)
+            .map_err(QuestionError::unavailable)
+    };
+    let text = |index: usize| -> Result<String> {
+        row.get::<_, String>(index)
+            .map_err(QuestionError::unavailable)
+    };
+    let number = |index: usize| -> Result<u64> {
+        row.get::<_, i64>(index)
+            .map(|value| u64::try_from(value).unwrap_or_default())
+            .map_err(QuestionError::unavailable)
+    };
+    let state = QuestionState::from_wire(&text(2)?)
+        .ok_or_else(|| QuestionError::unavailable("a question state this build cannot read"))?;
+    let kind = match text(3)?.as_str() {
+        "input" => QuestionKind::Input,
+        "select" => QuestionKind::Select,
+        "confirm" => QuestionKind::Confirm,
+        other => {
+            return Err(QuestionError::unavailable(format!(
+                "a question kind this build cannot read: {other}"
+            )));
+        }
+    };
+    let answer = row
+        .get::<_, Option<Vec<u8>>>(11)
+        .map_err(QuestionError::unavailable)?
+        .map(|bytes| decode::<AnswerRecord>(&bytes))
+        .transpose()?;
+    let resolved = row
+        .get::<_, Option<i64>>(12)
+        .map_err(QuestionError::unavailable)?
+        .map(|value| TimestampMs::new(u64::try_from(value).unwrap_or_default()));
+    Ok(Row {
+        question: Question {
+            question_id: QuestionId::new(uuid_from(&read(0)?)?),
+            revision: QuestionRevision::new(number(1)?),
+            state,
+            session_id,
+            session_epoch,
+            kind,
+            context: text(4)?,
+            question: text(5)?,
+            choices: decode::<Vec<QuestionChoice>>(&read(6)?)?,
+            source: decode::<QuestionSource>(&read(7)?)?,
+            created_at_ms: TimestampMs::new(number(8)?),
+            expires_at_ms: TimestampMs::new(number(10)?),
+            answer: Nullable(answer),
+            resolved_at_ms: Nullable(resolved),
+        },
+        pending_since_ms: TimestampMs::new(number(9)?),
+        token_nonce: read(13)?,
+        token_sealed: read(14)?,
+        token_tag: read(17)?,
+        digest: read(15)?,
+        source_key: text(16)?,
+    })
 }
 
 /// One stored question, with the material a token check needs.
@@ -871,6 +922,37 @@ pub struct Row {
     pub digest: Vec<u8>,
     /// The verified source that created it.
     pub source_key: String,
+}
+
+/// Writes one transition to the durable feed, inside the caller's transaction.
+///
+/// The feed is written in the same transaction as the transition it describes, so a crash cannot
+/// leave a question that moved beside a feed that never heard. Each event carries the moment the
+/// question became pending, which is what section 25's five-minute idle reminder measures from.
+fn write_event(transaction: &rusqlite::Transaction<'_>, event: &QuestionEvent) -> Result<()> {
+    transaction
+        .execute(
+            "INSERT INTO question_events (kind, question_id, record, recorded_at_ms)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                event.kind.event_type(),
+                event.question.question_id.get().as_bytes().as_slice(),
+                encode(event)?,
+                millis(event.recorded_at_ms.get())
+            ],
+        )
+        .map_err(QuestionError::unavailable)?;
+    Ok(())
+}
+
+/// Renders one resolution as the event the feed carries.
+fn event_of(kind: QuestionEventKind, resolved: &Resolved, now: Now) -> QuestionEvent {
+    QuestionEvent {
+        kind,
+        question: resolved.question.clone(),
+        pending_since_ms: resolved.pending_since_ms,
+        recorded_at_ms: now.utc_ms,
+    }
 }
 
 fn millis(value: u64) -> i64 {
@@ -919,6 +1001,17 @@ fn payload_digest(params: &QuestionCreateParams, choices: &[QuestionChoice]) -> 
                 })
                 .collect(),
         ),
+        // Everything the question is made of, including what a person reads and how long it lives.
+        // A caller that changed the label it shows or the time it allows has asked a different
+        // question, and returning the first one under that identifier would answer a question
+        // nobody asked.
+        kr_cbor::CanonicalValue::text(params.agent_name.as_ref().map_or("", String::as_str)),
+        kr_cbor::CanonicalValue::text(
+            params
+                .requested_expiry_ms
+                .as_ref()
+                .map_or_else(String::new, |asked| asked.get().to_string()),
+        ),
     ]);
     kr_cbor::sha256_of_canonical(&elements).to_vec()
 }
@@ -929,6 +1022,7 @@ fn alert_digest(params: &AlertCreateParams) -> Vec<u8> {
         kr_cbor::CanonicalValue::text(&params.dedup_id),
         kr_cbor::CanonicalValue::text(&params.text),
         kr_cbor::CanonicalValue::text(params.severity.as_str()),
+        kr_cbor::CanonicalValue::text(params.agent_name.as_ref().map_or("", String::as_str)),
         kr_cbor::CanonicalValue::text(params.safe_session_link.as_ref().map_or("", String::as_str)),
     ]);
     kr_cbor::sha256_of_canonical(&elements).to_vec()

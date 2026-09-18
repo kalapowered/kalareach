@@ -60,6 +60,13 @@ struct Layout {
 struct Configuration {
     path: PathBuf,
     format: Format,
+    /// True when more than one agent reads this document.
+    ///
+    /// A project's `.mcp.json` is the shared case. Everything written into one has to be the same
+    /// whichever agent's installation wrote it, because they are all reading one entry: an
+    /// agent-specific field there would make the second installation rewrite the first's entry and
+    /// leave its record describing something that is no longer in the file.
+    shared: bool,
 }
 
 /// How one agent's configuration document is written.
@@ -134,6 +141,7 @@ impl Installer {
     /// name exists and was not written by this host.
     pub fn install(&self, params: &AgentToolsParams) -> Result<AgentToolsInstallResult> {
         let layout = self.layout(params)?;
+        self.check(params)?;
         if let Some(existing) = self.recorded(params)?
             && self.drift(&existing)?.is_empty()
         {
@@ -161,7 +169,7 @@ impl Installer {
             });
         }
         if let Some(configuration) = layout.configuration.as_ref() {
-            operations.push(self.write_entry(configuration)?);
+            operations.push(self.write_entry(configuration, params.agent)?);
         }
         let manifest = ChangeManifest {
             skill_version: SKILL_VERSION.to_owned(),
@@ -261,10 +269,21 @@ impl Installer {
                     entry,
                     digest,
                     created_document,
-                } => match self.remove_entry(Path::new(path), *digest, *created_document)? {
-                    Removal::Removed => removed.push(operation.clone()),
-                    Removal::Kept(reason) => retained.push(format!("{entry} in {path}: {reason}")),
-                },
+                } => {
+                    let key = entry.rsplit_once('.').map_or("mcpServers", |(key, _)| key);
+                    match self.remove_entry(
+                        Path::new(path),
+                        key,
+                        *digest,
+                        *created_document,
+                        params,
+                    )? {
+                        Removal::Removed => removed.push(operation.clone()),
+                        Removal::Kept(reason) => {
+                            retained.push(format!("{entry} in {path}: {reason}"));
+                        }
+                    }
+                }
                 ChangeOperation::CreateDirectory { path } => {
                     // Only when it is empty. A directory that holds anything else holds somebody
                     // else's file.
@@ -337,16 +356,23 @@ impl Installer {
     }
 
     /// Adds the server entry to an agent's configuration, leaving its other settings alone.
-    fn write_entry(&self, configuration: &Configuration) -> Result<ChangeOperation> {
+    fn write_entry(
+        &self,
+        configuration: &Configuration,
+        agent: AgentTarget,
+    ) -> Result<ChangeOperation> {
         let created_document = !configuration.path.exists();
         if let Some(parent) = configuration.path.parent()
             && !parent.exists()
         {
             std::fs::create_dir_all(parent).map_err(storage)?;
         }
+        // A shared document gets the same entry whichever agent's installation writes it, so the
+        // deadline an individual agent would declare is left out of one.
+        let declaring = (!configuration.shared).then_some(agent);
         let digest = match configuration.format {
-            Format::CodexToml => self.write_toml_entry(&configuration.path)?,
-            format => self.write_json_entry(&configuration.path, format)?,
+            Format::CodexToml => self.write_toml_entry(&configuration.path, declaring)?,
+            format => self.write_json_entry(&configuration.path, format, declaring)?,
         };
         Ok(ChangeOperation::AddConfigurationEntry {
             path: display(&configuration.path),
@@ -356,7 +382,7 @@ impl Installer {
         })
     }
 
-    fn write_toml_entry(&self, path: &Path) -> Result<Digest256> {
+    fn write_toml_entry(&self, path: &Path, agent: Option<AgentTarget>) -> Result<Digest256> {
         let text = read_to_string(path)?.unwrap_or_default();
         let mut document: toml_edit::DocumentMut = text.parse().map_err(|error| {
             ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
@@ -372,7 +398,7 @@ impl Installer {
         })?;
         table.set_implicit(true);
         if table.contains_key(SERVER_NAME) {
-            self.guard_existing(path)?;
+            self.guard_existing(path, Format::CodexToml)?;
         }
         let mut entry = toml_edit::Table::new();
         entry["command"] = toml_edit::value(self.executable.clone());
@@ -381,6 +407,11 @@ impl Installer {
             args.push(*argument);
         }
         entry["args"] = toml_edit::value(args);
+        if let Some((field, seconds)) = agent.and_then(deadline_field)
+            && let Some(seconds) = seconds.as_i64()
+        {
+            entry[field] = toml_edit::value(seconds);
+        }
         table.insert(SERVER_NAME, toml_edit::Item::Table(entry));
         write_atomically(path, document.to_string().as_bytes())?;
         self.entry_digest(path)?.ok_or_else(|| {
@@ -388,7 +419,12 @@ impl Installer {
         })
     }
 
-    fn write_json_entry(&self, path: &Path, format: Format) -> Result<Digest256> {
+    fn write_json_entry(
+        &self,
+        path: &Path,
+        format: Format,
+        agent: Option<AgentTarget>,
+    ) -> Result<Digest256> {
         let mut document = read_json(path)?;
         let key = format.json_key();
         let root = document.as_object_mut().ok_or_else(|| {
@@ -404,9 +440,9 @@ impl Installer {
             ))
         })?;
         if servers.contains_key(SERVER_NAME) {
-            self.guard_existing(path)?;
+            self.guard_existing(path, format)?;
         }
-        servers.insert(SERVER_NAME.to_owned(), self.entry_value(format));
+        servers.insert(SERVER_NAME.to_owned(), self.entry_value(format, agent));
         let text = serde_json::to_string_pretty(&document)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         write_atomically(path, format!("{text}\n").as_bytes())?;
@@ -415,11 +451,66 @@ impl Installer {
         })
     }
 
+    /// Refuses an installation that would change anything this host did not write.
+    ///
+    /// Every check happens before the first write, so a refusal leaves the agent's tree exactly as
+    /// it found it, and before the dispatch marker, so a refusal is never reported as an outcome
+    /// that might have happened.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] when a file or a server entry is already
+    /// there and this host did not write it, and [`ControllerError::InvalidArgument`] when the
+    /// scope needs a project directory that was not given.
+    pub fn check(&self, params: &AgentToolsParams) -> Result<()> {
+        let layout = self.layout(params)?;
+        let root = layout.skills.clone();
+        self.check_before_writing(params, &layout, &root)
+    }
+
+    fn check_before_writing(
+        &self,
+        params: &AgentToolsParams,
+        layout: &Layout,
+        root: &Path,
+    ) -> Result<()> {
+        let recorded = self.recorded(params)?;
+        for (name, _) in files() {
+            let path = root.join(name);
+            let Some(present) = read_digest(&path)? else {
+                continue;
+            };
+            let ours = recorded.as_ref().is_some_and(|manifest| {
+                manifest.operations.iter().any(|operation| {
+                    matches!(
+                        operation,
+                        ChangeOperation::WriteFile { path: recorded_path, digest, .. }
+                            if recorded_path == &display(&path) && *digest == present
+                    )
+                })
+            });
+            if !ours {
+                return Err(ControllerError::PermissionDenied {
+                    detail: format!(
+                        "{} is already there and this host did not write it; move it aside before \
+                         installing",
+                        display(&path)
+                    ),
+                });
+            }
+        }
+        if let Some(configuration) = layout.configuration.as_ref() {
+            self.guard_existing(&configuration.path, configuration.format)?;
+        }
+        Ok(())
+    }
+
     /// Refuses to replace an entry this host did not write.
-    fn guard_existing(&self, path: &Path) -> Result<()> {
-        let present = self.entry_digest(path)?;
-        let ours = self.records_hold(present.as_ref());
-        if ours {
+    fn guard_existing(&self, path: &Path, format: Format) -> Result<()> {
+        let Some(present) = self.entry_digest(path)? else {
+            return Ok(());
+        };
+        if self.records_hold(path, format.json_key(), &present) {
             return Ok(());
         }
         Err(ControllerError::PermissionDenied {
@@ -431,29 +522,46 @@ impl Installer {
         })
     }
 
-    /// Returns true when some record of this host wrote an entry with this digest.
-    fn records_hold(&self, digest: Option<&Digest256>) -> bool {
-        let Some(digest) = digest else {
-            return false;
-        };
+    /// Returns true when a record of this host wrote *this* entry, in *this* document.
+    ///
+    /// The digest alone is not enough. Several agents share one project `.mcp.json`, and an entry
+    /// written for one of them has the same digest as the entry another would write; matching on
+    /// the digest alone would let one installation claim, and later remove, another's entry.
+    fn records_hold(&self, path: &Path, key: &str, digest: &Digest256) -> bool {
+        self.holders(path, key, digest) > 0
+    }
+
+    /// Returns how many recorded installations claim this exact entry.
+    fn holders(&self, path: &Path, key: &str, digest: &Digest256) -> usize {
+        let entry_name = format!("{key}.{SERVER_NAME}");
+        let wanted = display(path);
         let Ok(entries) = std::fs::read_dir(&self.records) else {
-            return false;
+            return 0;
         };
-        entries.flatten().any(|entry| {
-            let Ok(text) = std::fs::read_to_string(entry.path()) else {
-                return false;
-            };
-            let Ok(manifest) = serde_json::from_str::<ChangeManifest>(&text) else {
-                return false;
-            };
-            manifest.operations.iter().any(|operation| {
-                matches!(
-                    operation,
-                    ChangeOperation::AddConfigurationEntry { digest: recorded, .. }
-                        if recorded == digest
-                )
+        entries
+            .flatten()
+            .filter(|entry| {
+                let Ok(text) = std::fs::read_to_string(entry.path()) else {
+                    return false;
+                };
+                let Ok(manifest) = serde_json::from_str::<ChangeManifest>(&text) else {
+                    return false;
+                };
+                manifest.operations.iter().any(|operation| {
+                    matches!(
+                        operation,
+                        ChangeOperation::AddConfigurationEntry {
+                            path: recorded_path,
+                            entry: recorded_entry,
+                            digest: recorded,
+                            ..
+                        } if recorded_path == &wanted
+                            && recorded_entry == &entry_name
+                            && recorded == digest
+                    )
+                })
             })
-        })
+            .count()
     }
 
     /// Returns the digest of the server entry in a configuration document.
@@ -491,20 +599,53 @@ impl Installer {
         Ok(None)
     }
 
+    /// Returns the digest of the server entry under one named key.
+    fn entry_digest_under(&self, path: &Path, key: &str) -> Result<Option<Digest256>> {
+        if path
+            .extension()
+            .is_some_and(|extension| extension == "toml")
+        {
+            return self.entry_digest(path);
+        }
+        let Some(text) = read_to_string(path)? else {
+            return Ok(None);
+        };
+        let document: Value = serde_json::from_str(&text).map_err(|error| {
+            ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
+        })?;
+        Ok(document
+            .get(key)
+            .and_then(|servers| servers.get(SERVER_NAME))
+            .map(|entry| digest_of(entry.to_string().as_bytes())))
+    }
+
     /// Removes the server entry, when it is still the one that was written.
     fn remove_entry(
         &self,
         path: &Path,
+        key: &str,
         digest: Digest256,
         created_document: bool,
+        params: &AgentToolsParams,
     ) -> Result<Removal> {
-        let Some(present) = self.entry_digest(path)? else {
+        let Some(present) = self.entry_digest_under(path, key)? else {
             return Ok(Removal::Kept("it is already gone".to_owned()));
         };
         if present != digest {
             return Ok(Removal::Kept(
                 "it has changed since it was installed".to_owned(),
             ));
+        }
+        // Several agents share one project `.mcp.json`. Removing one installation must not take
+        // the server another installation is still using, so the entry goes only when this record
+        // is the last one claiming it. This record is still on disk here, which is why one holder
+        // means this one alone.
+        if self.holders(path, key, &digest) > 1 {
+            return Ok(Removal::Kept(format!(
+                "another installation on this host still uses it; {} at {} scope was removed \
+                 around it",
+                params.agent, params.scope
+            )));
         }
         if path
             .extension()
@@ -523,12 +664,12 @@ impl Installer {
             write_atomically(path, document.to_string().as_bytes())?;
         } else {
             let mut document = read_json(path)?;
-            if let Some(root) = document.as_object_mut() {
-                for key in ["mcpServers", "mcp"] {
-                    if let Some(servers) = root.get_mut(key).and_then(Value::as_object_mut) {
-                        servers.remove(SERVER_NAME);
-                    }
-                }
+            if let Some(root) = document.as_object_mut()
+                && let Some(servers) = root.get_mut(key).and_then(Value::as_object_mut)
+            {
+                // Only the key the record names. A document that holds both shapes keeps whichever
+                // this installation did not write.
+                servers.remove(SERVER_NAME);
             }
             let empty = document
                 .as_object()
@@ -545,7 +686,7 @@ impl Installer {
         Ok(Removal::Removed)
     }
 
-    fn entry_value(&self, format: Format) -> Value {
+    fn entry_value(&self, format: Format, agent: Option<AgentTarget>) -> Value {
         let arguments: Vec<&str> = ENTRY_ARGS.to_vec();
         match format {
             Format::JsonLocalCommandList => {
@@ -554,7 +695,22 @@ impl Installer {
                 json!({"type": "local", "command": command, "enabled": true})
             }
             Format::CodexToml | Format::JsonCommandArgs => {
-                json!({"type": "stdio", "command": self.executable, "args": arguments})
+                let mut entry = json!({
+                    "type": "stdio",
+                    "command": self.executable,
+                    "args": arguments,
+                });
+                // Section 11 shortens a long poll to the installed client's qualified tool
+                // deadline. Where an agent lets a server declare that deadline, the installation
+                // declares one long enough for the host's own ceiling, so a wait returns the
+                // durable question rather than being cut off by a default the agent chose for
+                // ordinary tools.
+                if let Some((field, value)) = agent.and_then(deadline_field)
+                    && let Some(object) = entry.as_object_mut()
+                {
+                    object.insert(field.to_owned(), value);
+                }
+                entry
             }
         }
     }
@@ -576,25 +732,30 @@ impl Installer {
         };
         let home = &self.home;
         let layout = match (params.agent, params.scope) {
+            // Codex reads repository and user skills from `.agents/skills`, and scopes servers to
+            // a project with `.codex/config.toml`.
             (AgentTarget::Codex, User) => Layout {
-                skills: home.join(".codex/skills").join(SKILL_NAME),
+                skills: home.join(".agents/skills").join(SKILL_NAME),
                 configuration: Some(Configuration {
                     path: home.join(".codex/config.toml"),
                     format: Format::CodexToml,
+                    shared: false,
                 }),
             },
-            // Codex reads its servers from the user configuration alone, so a project-scope
-            // installation places the skill in the project and says, by recording no entry, that
-            // the server stays registered where the user configuration has it.
             (AgentTarget::Codex, Project) => Layout {
-                skills: project()?.join(".codex/skills").join(SKILL_NAME),
-                configuration: None,
+                skills: project()?.join(".agents/skills").join(SKILL_NAME),
+                configuration: Some(Configuration {
+                    path: project()?.join(".codex/config.toml"),
+                    format: Format::CodexToml,
+                    shared: false,
+                }),
             },
             (AgentTarget::ClaudeCode, User) => Layout {
                 skills: home.join(".claude/skills").join(SKILL_NAME),
                 configuration: Some(Configuration {
                     path: home.join(".claude.json"),
                     format: Format::JsonCommandArgs,
+                    shared: false,
                 }),
             },
             (AgentTarget::ClaudeCode, Project) => Layout {
@@ -602,6 +763,7 @@ impl Installer {
                 configuration: Some(Configuration {
                     path: project()?.join(".mcp.json"),
                     format: Format::JsonCommandArgs,
+                    shared: true,
                 }),
             },
             (AgentTarget::Opencode, User) => Layout {
@@ -609,6 +771,7 @@ impl Installer {
                 configuration: Some(Configuration {
                     path: home.join(".config/opencode/opencode.json"),
                     format: Format::JsonLocalCommandList,
+                    shared: false,
                 }),
             },
             (AgentTarget::Opencode, Project) => Layout {
@@ -616,6 +779,7 @@ impl Installer {
                 configuration: Some(Configuration {
                     path: project()?.join("opencode.json"),
                     format: Format::JsonLocalCommandList,
+                    shared: false,
                 }),
             },
             (AgentTarget::GeminiCli, User) => Layout {
@@ -623,6 +787,7 @@ impl Installer {
                 configuration: Some(Configuration {
                     path: home.join(".gemini/settings.json"),
                     format: Format::JsonCommandArgs,
+                    shared: false,
                 }),
             },
             (AgentTarget::GeminiCli, Project) => Layout {
@@ -630,6 +795,7 @@ impl Installer {
                 configuration: Some(Configuration {
                     path: project()?.join(".gemini/settings.json"),
                     format: Format::JsonCommandArgs,
+                    shared: false,
                 }),
             },
             (AgentTarget::KimiCodeCli, User) => Layout {
@@ -637,6 +803,7 @@ impl Installer {
                 configuration: Some(Configuration {
                     path: home.join(".kimi-code/mcp.json"),
                     format: Format::JsonCommandArgs,
+                    shared: false,
                 }),
             },
             (AgentTarget::KimiCodeCli, Project) => Layout {
@@ -644,6 +811,7 @@ impl Installer {
                 configuration: Some(Configuration {
                     path: project()?.join(".mcp.json"),
                     format: Format::JsonCommandArgs,
+                    shared: true,
                 }),
             },
             (AgentTarget::QoderCli, User) => Layout {
@@ -651,6 +819,7 @@ impl Installer {
                 configuration: Some(Configuration {
                     path: home.join(".qoder/settings.json"),
                     format: Format::JsonCommandArgs,
+                    shared: false,
                 }),
             },
             (AgentTarget::QoderCli, Project) => Layout {
@@ -658,6 +827,7 @@ impl Installer {
                 configuration: Some(Configuration {
                     path: project()?.join(".mcp.json"),
                     format: Format::JsonCommandArgs,
+                    shared: true,
                 }),
             },
         };
@@ -693,12 +863,178 @@ impl Installer {
     }
 }
 
+/// The durable record of one admitted installation action.
+///
+/// Section 9 makes a mutation's identity its action, not its parameters: the same action retried
+/// returns what it produced the first time, the same identifier with a different payload is
+/// `ID_CONFLICT`, and a dispatch marker without a recorded outcome is `unknown` rather than
+/// something to do again. An installation changes files, so it needs all three.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ActionRecord {
+    /// The digest of the mutation this action was admitted for.
+    digest: String,
+    /// `dispatching` until the effect finishes, then `applied`.
+    state: String,
+    /// What the effect produced, once it has: its canonical encoding, in hexadecimal.
+    result: Option<String>,
+}
+
+impl Installer {
+    /// Returns the answer a retained installation action is owed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::IdConflict`] when the identifier carries a different payload,
+    /// and [`ControllerError::Uncertain`] when a marker was written and no outcome was recorded:
+    /// the files may have changed, and doing it again is exactly what section 9 forbids.
+    pub fn retained(
+        &self,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: kr_protocol::ids::ActionId,
+        digest: &Digest256,
+    ) -> Result<Option<kr_protocol::envelope::ParamsValue>> {
+        let Some(text) = read_to_string(&self.action_path(actor_id, action_id))? else {
+            return Ok(None);
+        };
+        let record: ActionRecord = serde_json::from_str(&text)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        if record.digest != hex(digest.as_bytes()) {
+            return Err(ControllerError::IdConflict {
+                token: action_id.to_string(),
+            });
+        }
+        match (record.state.as_str(), record.result) {
+            ("applied", Some(result)) => Ok(Some(decode_result(&result)?)),
+            _ => Err(ControllerError::Uncertain {
+                detail: format!(
+                    "installation action {action_id} was begun and its outcome was never \
+                     recorded, so what it changed is not known; read the status before asking \
+                     again"
+                ),
+            }),
+        }
+    }
+
+    /// Commits the dispatch marker, before anything on disk changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the marker cannot be written.
+    pub fn mark_dispatching(
+        &self,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: kr_protocol::ids::ActionId,
+        digest: &Digest256,
+    ) -> Result<()> {
+        self.write_action(
+            actor_id,
+            action_id,
+            &ActionRecord {
+                digest: hex(digest.as_bytes()),
+                state: "dispatching".to_owned(),
+                result: None,
+            },
+        )
+    }
+
+    /// Records what the effect produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the record cannot be written.
+    pub fn settle(
+        &self,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: kr_protocol::ids::ActionId,
+        digest: &Digest256,
+        result: &kr_protocol::envelope::ParamsValue,
+    ) -> Result<()> {
+        self.write_action(
+            actor_id,
+            action_id,
+            &ActionRecord {
+                digest: hex(digest.as_bytes()),
+                state: "applied".to_owned(),
+                result: Some(hex(&kr_cbor::encode(result.as_value()))),
+            },
+        )
+    }
+
+    fn write_action(
+        &self,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: kr_protocol::ids::ActionId,
+        record: &ActionRecord,
+    ) -> Result<()> {
+        let path = self.action_path(actor_id, action_id);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(storage)?;
+        }
+        let text = serde_json::to_string_pretty(record)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        write_atomically(&path, format!("{text}\n").as_bytes())
+    }
+
+    fn action_path(
+        &self,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: kr_protocol::ids::ActionId,
+    ) -> PathBuf {
+        self.records.join("actions").join(format!(
+            "{}-{action_id}.json",
+            hex(&kr_cbor::sha256(actor_id.as_str().as_bytes())[..8])
+        ))
+    }
+}
+
+/// Reads a retained result back from its hexadecimal encoding.
+fn decode_result(text: &str) -> Result<kr_protocol::envelope::ParamsValue> {
+    let bytes = unhex(text).ok_or_else(|| {
+        ControllerError::InvalidArgument("a retained result is not readable".to_owned())
+    })?;
+    let value = kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+    Ok(kr_protocol::envelope::ParamsValue::new(value))
+}
+
+/// Reads hexadecimal back to bytes.
+fn unhex(text: &str) -> Option<Vec<u8>> {
+    if !text.len().is_multiple_of(2) {
+        return None;
+    }
+    text.as_bytes()
+        .chunks(2)
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok())
+        .collect()
+}
+
 /// What a removal did with one configuration entry.
 enum Removal {
     /// It was the entry that was written, and it is gone.
     Removed,
     /// It was left alone, for the stated reason.
     Kept(String),
+}
+
+/// The longest a contact tool holds a call, in seconds, plus room to answer.
+///
+/// It is the host's long-poll ceiling with a margin, so a client that honours a declared deadline
+/// never cuts off a wait the host would have finished.
+const QUALIFIED_DEADLINE_SECONDS: i64 = 660;
+
+/// The field one agent declares a server's tool deadline in, where it has one.
+///
+/// An agent without one is not given an invented field: its own default governs, and the tool
+/// reference tells the agent to ask for a shorter wait than its client allows.
+fn deadline_field(agent: AgentTarget) -> Option<(&'static str, Value)> {
+    match agent {
+        AgentTarget::Codex => Some(("tool_timeout_sec", json!(QUALIFIED_DEADLINE_SECONDS))),
+        AgentTarget::KimiCodeCli => {
+            Some(("toolTimeoutMs", json!(QUALIFIED_DEADLINE_SECONDS * 1_000)))
+        }
+        AgentTarget::QoderCli => Some(("timeout", json!(QUALIFIED_DEADLINE_SECONDS * 1_000))),
+        AgentTarget::ClaudeCode | AgentTarget::Opencode | AgentTarget::GeminiCli => None,
+    }
 }
 
 /// The files an installation writes, in the order it writes them.
@@ -756,10 +1092,28 @@ fn digest_of(bytes: &[u8]) -> Digest256 {
 }
 
 /// Writes a file so a failure part way through cannot truncate what was there.
+///
+/// The replacement carries the permissions of what it replaces. An agent's configuration can hold
+/// a credential, and a document somebody kept private must not become world-readable because this
+/// host rewrote it under its own umask. A file that did not exist is written owner-only for the
+/// same reason.
 fn write_atomically(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap_or(Path::new("."));
     let temporary = parent.join(format!(".{}.kalareach", file_name(path)));
     std::fs::write(&temporary, bytes).map_err(storage)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = std::fs::metadata(path)
+            .ok()
+            .map_or(0o600, |existing| existing.permissions().mode() & 0o777);
+        let mut permissions = std::fs::metadata(&temporary)
+            .map_err(storage)?
+            .permissions();
+        permissions.set_mode(mode);
+        std::fs::set_permissions(&temporary, permissions).map_err(storage)?;
+    }
     std::fs::rename(&temporary, path).map_err(storage)
 }
 
@@ -1075,6 +1429,148 @@ mod tests {
         assert!(text.contains("# a comment somebody wrote"));
         assert!(text.contains("[mcp_servers.theirs]"));
         assert!(!text.contains("[mcp_servers.kalareach]"));
+    }
+
+    #[test]
+    fn a_file_this_host_did_not_write_stops_the_installation_before_anything_changes() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let skills = tree.home().join(".claude/skills/kalareach-contact");
+        std::fs::create_dir_all(&skills).expect("a directory");
+        std::fs::write(skills.join("SKILL.md"), "somebody's own notes").expect("writes");
+        let error = installer
+            .install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+            .expect_err("refuses");
+        assert_eq!(
+            error.to_protocol_error().code,
+            kr_protocol::error::ErrorCode::PermissionDenied
+        );
+        assert_eq!(
+            std::fs::read_to_string(skills.join("SKILL.md")).expect("still there"),
+            "somebody's own notes"
+        );
+        assert!(!tree.home().join(".claude.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_configuration_stays_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let tree = Tree::create();
+        let configuration = tree.home().join(".claude.json");
+        std::fs::write(&configuration, "{}").expect("writes");
+        std::fs::set_permissions(&configuration, std::fs::Permissions::from_mode(0o600))
+            .expect("makes it private");
+        tree.installer()
+            .install(&params(AgentTarget::ClaudeCode, InstallScope::User))
+            .expect("installs");
+        let mode = std::fs::metadata(&configuration)
+            .expect("the file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600, "the configuration kept its permissions");
+    }
+
+    #[test]
+    fn a_shared_project_entry_survives_one_installation_being_removed() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let project = tree.root.join("project");
+        std::fs::create_dir_all(&project).expect("a project");
+        let with_project = |agent| AgentToolsParams {
+            agent,
+            scope: InstallScope::Project,
+            project_dir: Nullable::some(display(&project)),
+        };
+        installer
+            .install(&with_project(AgentTarget::ClaudeCode))
+            .expect("installs");
+        installer
+            .install(&with_project(AgentTarget::QoderCli))
+            .expect("installs");
+        let shared = project.join(".mcp.json");
+        assert!(shared.is_file());
+
+        let removed = installer
+            .remove(&with_project(AgentTarget::ClaudeCode))
+            .expect("removes");
+        let configuration: Value =
+            serde_json::from_str(&std::fs::read_to_string(&shared).expect("the file"))
+                .expect("json");
+        assert!(
+            configuration["mcpServers"].get("kalareach").is_some(),
+            "the other installation still has its server: {configuration}"
+        );
+        assert!(
+            removed
+                .retained
+                .iter()
+                .any(|note| note.contains("still uses it")),
+            "the removal says why it kept it: {:?}",
+            removed.retained
+        );
+
+        installer
+            .remove(&with_project(AgentTarget::QoderCli))
+            .expect("removes");
+        let configuration: Value =
+            serde_json::from_str(&std::fs::read_to_string(&shared).expect("the file"))
+                .expect("json");
+        assert!(configuration["mcpServers"].get("kalareach").is_none());
+    }
+
+    #[test]
+    fn an_installation_action_is_answered_once_and_conflicts_on_a_changed_payload() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let actor = kr_protocol::ids::ActorId::new("local:501").expect("a principal");
+        let action =
+            kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([7; 16]));
+        let digest = digest_of(b"one payload");
+        let other = digest_of(b"another payload");
+
+        assert!(
+            installer
+                .retained(&actor, action, &digest)
+                .expect("reads")
+                .is_none()
+        );
+        installer
+            .mark_dispatching(&actor, action, &digest)
+            .expect("marks");
+        // A marker with no outcome is uncertain: the files may have changed, and repeating the
+        // change is what section 9 forbids.
+        let error = installer
+            .retained(&actor, action, &digest)
+            .expect_err("uncertain");
+        assert_eq!(
+            error.to_protocol_error().code,
+            kr_protocol::error::ErrorCode::OutcomeUnknown
+        );
+
+        let result = kr_protocol::envelope::ParamsValue::from_typed(&AgentToolsRemoveResult {
+            agent: AgentTarget::Codex,
+            scope: InstallScope::User,
+            removed: Vec::new(),
+            retained: Vec::new(),
+        })
+        .expect("encodes");
+        installer
+            .settle(&actor, action, &digest, &result)
+            .expect("settles");
+        assert_eq!(
+            installer.retained(&actor, action, &digest).expect("reads"),
+            Some(result)
+        );
+        let error = installer
+            .retained(&actor, action, &other)
+            .expect_err("conflict");
+        assert_eq!(
+            error.to_protocol_error().code,
+            kr_protocol::error::ErrorCode::IdConflict
+        );
     }
 
     #[test]

@@ -99,7 +99,6 @@ impl Questions {
                 recorded_at_ms: now.utc_ms,
             });
         }
-        publish(&mut store, &events)?;
         drop(store);
         self.changed.notify_waiters();
         Ok((
@@ -151,8 +150,7 @@ impl Questions {
         now: Now,
     ) -> Result<()> {
         let mut store = self.locked()?;
-        let expired = store.expire_due(now)?;
-        publish(&mut store, &expiry_events(expired, now))?;
+        store.expire_due(now)?;
         let question = store.read(question_id)?;
         if let Some(answer) = answer {
             check_answer(&question, answer)?;
@@ -209,7 +207,6 @@ impl Questions {
         let events = expiry_events(store.expire_due(now)?, now);
         let row = store.read_row(params.question_id)?;
         store.check_token(&row, source, &params.caller_token)?;
-        publish(&mut store, &events)?;
         Ok((
             QuestionOwnResult {
                 question: row.question,
@@ -237,7 +234,6 @@ impl Questions {
         store.check_token(&row, source, &params.caller_token)?;
         let resolved = store.cancel(params.question_id, row.question.revision, now)?;
         events.push(event(QuestionEventKind::Cancelled, &resolved, now));
-        publish(&mut store, &events)?;
         let question = resolved.question;
         drop(store);
         self.changed.notify_waiters();
@@ -292,7 +288,6 @@ impl Questions {
             Some(question_id) => vec![store.read(*question_id)?],
             None => store.list(params.include_resolved)?,
         };
-        publish(&mut store, &events)?;
         Ok((QuestionReadResult { questions }, events))
     }
 
@@ -323,7 +318,6 @@ impl Questions {
             now,
         )?;
         events.push(event(QuestionEventKind::Answered, &resolved, now));
-        publish(&mut store, &events)?;
         let question = resolved.question;
         drop(store);
         self.changed.notify_waiters();
@@ -344,7 +338,6 @@ impl Questions {
         let mut events = expiry_events(store.expire_due(now)?, now);
         let resolved = store.cancel(params.question_id, params.expected_revision, now)?;
         events.push(event(QuestionEventKind::Cancelled, &resolved, now));
-        publish(&mut store, &events)?;
         let question = resolved.question;
         drop(store);
         self.changed.notify_waiters();
@@ -359,7 +352,6 @@ impl Questions {
     pub fn sweep(&self, now: Now) -> Result<Vec<QuestionEvent>> {
         let mut store = self.locked()?;
         let events = expiry_events(store.expire_due(now)?, now);
-        publish(&mut store, &events)?;
         drop(store);
         if !events.is_empty() {
             self.changed.notify_waiters();
@@ -382,7 +374,16 @@ impl Questions {
     /// cares about and waits again if it was somebody else's question that moved. Nothing here
     /// notifies a person a second time, and nothing recreates a question.
     pub async fn wait_for_change(&self, within: std::time::Duration) {
-        let _ = tokio::time::timeout(within, self.changed.notified()).await;
+        let _ = tokio::time::timeout(within, self.subscribe()).await;
+    }
+
+    /// Takes a subscription that will fire on the next change.
+    ///
+    /// A caller that means to read the state and then wait takes this *first*: a change between
+    /// the read and the wait is then delivered to a subscription that already exists, rather than
+    /// happening in the gap between them.
+    pub fn subscribe(&self) -> impl std::future::Future<Output = ()> + '_ {
+        self.changed.notified()
     }
 
     /// Returns the transitions recorded after this cursor, oldest first.
@@ -421,14 +422,6 @@ fn event(kind: QuestionEventKind, resolved: &Resolved, now: Now) -> QuestionEven
         pending_since_ms: resolved.pending_since_ms,
         recorded_at_ms: now.utc_ms,
     }
-}
-
-/// Writes a batch of transitions to the durable feed.
-fn publish(store: &mut Store, events: &[QuestionEvent]) -> Result<()> {
-    for event in events {
-        store.record_event(event)?;
-    }
-    Ok(())
 }
 
 fn expiry_events(expired: Vec<Resolved>, now: Now) -> Vec<QuestionEvent> {
@@ -623,6 +616,96 @@ mod tests {
                 .expect("still there")
                 .state,
             QuestionState::Pending
+        );
+    }
+
+    #[test]
+    fn an_expiry_reaches_the_feed_even_when_the_read_that_found_it_fails() {
+        let questions = questions();
+        // A source the kernel says has already gone, so its question expires with its binding.
+        let gone = VerifiedSource {
+            process: kr_protocol::identity::ProcessStartIdentity::new(
+                7,
+                kr_protocol::identity::ProcessStartSource::LinuxProcStat,
+                11,
+            ),
+            executable: None,
+            session_member: true,
+            ancestry: false,
+            launch_channel: false,
+            connection_id: ConnectionId::new(Uuid::from_bytes([9; 16])),
+        };
+        questions
+            .create(&gone, &select_params(), now(1_000))
+            .expect("created");
+        // A read for a question that does not exist. It expires what is due on its way in and then
+        // fails, and the transition it made has to survive that failure.
+        let error = questions
+            .read_own(
+                &gone,
+                &QuestionReadOwnParams {
+                    session_id: session(),
+                    question_id: kr_protocol::ids::QuestionId::new(Uuid::from_bytes([8; 16])),
+                    caller_token: kr_protocol::question::CallerToken::new(vec![0; 32]),
+                    wait_ms: Nullable::null(),
+                },
+                now(2_000),
+            )
+            .expect_err("no such question");
+        assert_eq!(
+            error.code(),
+            kr_protocol::error::ErrorCode::PermissionDenied
+        );
+        let events = questions.events_since(0, 16).expect("the feed");
+        assert!(
+            events
+                .iter()
+                .any(|(_, event)| event.kind == QuestionEventKind::Expired),
+            "the expiry is in the feed: {events:?}"
+        );
+    }
+
+    #[test]
+    fn every_transition_reaches_the_feed_in_order() {
+        let questions = questions();
+        let (created, _) = questions
+            .create(&source(), &select_params(), now(1_000))
+            .expect("created");
+        questions
+            .answer(
+                &ActorId::new("local:501").expect("a principal"),
+                None,
+                &QuestionAnswerParams {
+                    session_id: session(),
+                    question_id: created.question.question_id,
+                    expected_revision: created.question.revision,
+                    answer: QuestionAnswer::Choice {
+                        choice_id: "left".to_owned(),
+                    },
+                },
+                now(2_000),
+            )
+            .expect("answered");
+        let events = questions.events_since(0, 16).expect("the feed");
+        let kinds: Vec<QuestionEventKind> = events.iter().map(|(_, event)| event.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![QuestionEventKind::Created, QuestionEventKind::Answered]
+        );
+        // The idle reminder measures from the moment the question became pending, and every event
+        // carries it.
+        assert!(
+            events
+                .iter()
+                .all(|(_, event)| event.pending_since_ms == TimestampMs::new(1_000))
+        );
+        let after_first = events[0].0;
+        assert_eq!(
+            questions
+                .events_since(after_first, 16)
+                .expect("the feed")
+                .len(),
+            1
         );
     }
 

@@ -10,7 +10,8 @@
     "args": [
       "agent-tools",
       "--stdio"
-    ]
+    ],
+    "note": "An installation writes the absolute path of the `kr` beside this host's daemon when there is one, so a build that is not on the path is still reached."
   },
   "files": [
     {
@@ -19,7 +20,7 @@
     },
     {
       "path": "TOOLS.md",
-      "sha256": "013f9e591d60604895945a52579bcb30385d97fc5e721f87aca378cc22b7f43a"
+      "sha256": "b0eacf0f469a2fd79a493ed9fa5c799e431076098f4e543fecb5eb6609509686"
     }
   ],
   "tools": [
@@ -33,6 +34,7 @@
     "poll_default_ms": 300000,
     "poll_maximum_ms": 600000,
     "poll_renewal_ms": 20000,
+    "declared_tool_deadline_ms": 660000,
     "question_lifetime_ms": 86400000,
     "answer_limit_bytes": 16384,
     "timeout_preserves_question": true,
@@ -46,13 +48,15 @@
   "agents": [
     {
       "agent": "codex",
-      "evidence": "verified against codex-cli 0.154.0 on this host",
-      "skills_user": "~/.codex/skills/kalareach-contact",
-      "skills_project": "<project>/.codex/skills/kalareach-contact",
+      "evidence": "verified against codex-cli 0.154.0 on this host and its published documentation",
+      "skills_user": "~/.agents/skills/kalareach-contact",
+      "skills_project": "<project>/.agents/skills/kalareach-contact",
       "configuration_user": "~/.codex/config.toml [mcp_servers.kalareach]",
-      "configuration_project": null,
+      "configuration_project": "<project>/.codex/config.toml [mcp_servers.kalareach]",
       "entry_shape": "toml_table",
-      "note": "codex reads MCP servers from the user configuration only, so a project-scope installation places the skill in the project and leaves the server registered for the user."
+      "declares_tool_deadline": "tool_timeout_sec",
+      "shared_project_document": false,
+      "note": "Codex reads repository and user skills from .agents/skills, and scopes servers to a trusted project with .codex/config.toml."
     },
     {
       "agent": "claude-code",
@@ -62,26 +66,32 @@
       "configuration_user": "~/.claude.json mcpServers.kalareach",
       "configuration_project": "<project>/.mcp.json mcpServers.kalareach",
       "entry_shape": "command_args",
-      "note": "project scope uses the shared .mcp.json the project's collaborators approve."
+      "declares_tool_deadline": null,
+      "shared_project_document": true,
+      "note": "The project document is the shared .mcp.json a project's collaborators approve."
     },
     {
       "agent": "opencode",
-      "evidence": "assumed from published documentation; not verified on this host",
+      "evidence": "assumed from published documentation; not installed on this host",
       "skills_user": "~/.config/opencode/skills/kalareach-contact",
       "skills_project": "<project>/.opencode/skills/kalareach-contact",
       "configuration_user": "~/.config/opencode/opencode.json mcp.kalareach",
       "configuration_project": "<project>/opencode.json mcp.kalareach",
       "entry_shape": "local_command_list",
-      "note": "opencode names a local server with a single command array and an enabled flag."
+      "declares_tool_deadline": null,
+      "shared_project_document": false,
+      "note": "opencode names a local server with one command array and an enabled flag."
     },
     {
       "agent": "gemini-cli",
-      "evidence": "assumed from published documentation; not verified on this host",
+      "evidence": "assumed from published documentation; not installed on this host",
       "skills_user": "~/.gemini/skills/kalareach-contact",
       "skills_project": "<project>/.gemini/skills/kalareach-contact",
       "configuration_user": "~/.gemini/settings.json mcpServers.kalareach",
       "configuration_project": "<project>/.gemini/settings.json mcpServers.kalareach",
       "entry_shape": "command_args",
+      "declares_tool_deadline": null,
+      "shared_project_document": false,
       "note": null
     },
     {
@@ -92,6 +102,8 @@
       "configuration_user": "~/.kimi-code/mcp.json mcpServers.kalareach",
       "configuration_project": "<project>/.mcp.json mcpServers.kalareach",
       "entry_shape": "command_args",
+      "declares_tool_deadline": "toolTimeoutMs",
+      "shared_project_document": true,
       "note": null
     },
     {
@@ -102,6 +114,8 @@
       "configuration_user": "~/.qoder/settings.json mcpServers.kalareach",
       "configuration_project": "<project>/.mcp.json mcpServers.kalareach",
       "entry_shape": "command_args",
+      "declares_tool_deadline": "timeout",
+      "shared_project_document": true,
       "note": null
     }
   ],
@@ -111,7 +125,8 @@
       "write_file",
       "add_configuration_entry"
     ],
-    "rule": "A removal replays the recorded operations in reverse and stops at anything whose digest no longer matches what was written. Nothing without the x-kalareach-managed marker is ever changed or removed, and a directory is deleted only when it is empty.",
-    "marker": "x-kalareach-managed"
+    "rule": "A removal replays the recorded operations in reverse and stops at anything whose digest no longer matches what was written. A directory is deleted only when it is empty, and a server entry only when no other recorded installation on this host still names the same document and entry.",
+    "guard": "The digest of what was written, recorded against the exact path and entry. An installation refuses to replace a file or a server entry this host did not write, and a removal leaves anything that changed since.",
+    "record_location": "the host's own state directory, under agent-tools/"
   }
 }

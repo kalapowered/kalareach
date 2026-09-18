@@ -103,8 +103,13 @@ async fn probes_bound(bound: &Bound, build_id: BuildId) -> bool {
         caller_token: CallerToken::new(vec![0; kr_protocol::question::CALLER_TOKEN_BYTES]),
         wait_ms: Nullable::null(),
     };
+    // Only a recognised binding outcome selects a worker. A worker that holds this process
+    // answers that the question is unknown, which is `PERMISSION_DENIED`; one that does not holds
+    // answers `NOT_IN_KR_SESSION`. Anything else — an unsupported method, a failing ledger, a
+    // truncated connection — says nothing about where this process is, and choosing a session on
+    // the strength of it would create the next question in the wrong one.
     match client.request(Method::QuestionReadOwn, &params).await {
-        Ok(Err(error)) => error.code != ErrorCode::NotInKrSession,
+        Ok(Err(error)) => error.code == ErrorCode::PermissionDenied,
         Ok(Ok(_)) => true,
         Err(_) => false,
     }

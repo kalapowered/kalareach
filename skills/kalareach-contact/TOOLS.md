@@ -50,7 +50,7 @@ notification and no log. It permits exactly two things: polling and cancelling t
 | --- | --- | --- | --- |
 | `question_id` | string | yes | The question `ask_user` returned |
 | `caller_token` | string | yes | The token it returned with it |
-| `wait_seconds` | integer | no | Default 300, maximum 600. Shortened to your client's own tool deadline |
+| `wait_seconds` | integer | no | Default 300, maximum 600. Ask for less than your own client's tool deadline |
 
 Returns the same question shape as `ask_user`, without the token. `state` is `pending`, `answered`,
 `cancelled` or `expired`.
@@ -117,7 +117,7 @@ It asks for nothing and there is nothing to wait on.
 | | |
 | --- | --- |
 | Wait on creation | up to 30 seconds |
-| Long poll | 300 seconds by default, 600 maximum, shortened to your client's tool deadline |
+| Long poll | 300 seconds by default, 600 maximum |
 | Internal renewal | 20 seconds per broker wait, renewed until your deadline |
 | Question lifetime | 24 hours, or the life of this process, whichever ends first |
 | Answer size | 16 KiB |
@@ -125,6 +125,12 @@ It asks for nothing and there is nothing to wait on.
 
 A timeout preserves the question. Cancelling a tool call ends the wait, not the question; use
 `cancel_question` to end the question itself.
+
+Your own client also has a tool deadline, and it is the shorter of the two that decides. Where the
+agent lets a server declare one, the installation declares 660 seconds so a full poll can finish;
+where it does not, the client's own default governs and it is often 60 seconds. Ask for a
+`wait_seconds` below your client's deadline: a call your client cuts off loses the wait, never the
+question, and calling `wait_for_answer` again resumes it.
 
 ## Limits of these tools
 

@@ -38,6 +38,7 @@ struct Hosted {
     temp: kr_ipc::testing::TempHost,
     session_id: SessionId,
     descriptor: WorkerDescriptor,
+    journal: PathBuf,
     binary: PathBuf,
     client: RunningService<rmcp::RoleClient, ()>,
     _service: Arc<WorkerService>,
@@ -221,6 +222,7 @@ async fn hosted() -> Hosted {
         .expect("the tool server answered the handshake");
 
     Hosted {
+        journal: environment.journal_database(session_id),
         temp,
         session_id,
         descriptor,
@@ -617,6 +619,26 @@ async fn a_cancelled_question_stays_cancelled() {
         .await;
     assert!(!failed, "the question was cancelled: {cancelled}");
     assert_eq!(cancelled["state"], "cancelled");
+
+    // A cancellation carries the caller token in its parameters, and the journal keeps every
+    // mutation's intent. Section 11 keeps that token out of every durable record but the ledger's
+    // own sealed copy, so it must not be anywhere in the journal or its write-ahead log.
+    let token_bytes: Vec<u8> = (0..token.len() / 2)
+        .map(|index| u8::from_str_radix(&token[index * 2..index * 2 + 2], 16).expect("hexadecimal"))
+        .collect();
+    for suffix in ["", "-wal", "-shm"] {
+        let path = PathBuf::from(format!("{}{suffix}", hosted.journal.display()));
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        assert!(
+            !bytes
+                .windows(token_bytes.len())
+                .any(|window| window == token_bytes.as_slice()),
+            "the caller token is not in {}",
+            path.display()
+        );
+    }
 
     let (again, failed) = hosted
         .call(

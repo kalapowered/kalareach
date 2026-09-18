@@ -1578,7 +1578,7 @@ impl Controller {
                 self.session_close(mutation, &actor, accepted).await
             }
             Method::AgentToolsInstall | Method::AgentToolsRemove => {
-                self.agent_tools_change(method, &mutation.params)
+                self.agent_tools_change(actor_id, mutation, method)
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
@@ -1595,17 +1595,39 @@ impl Controller {
     }
 
     /// Installs or removes the contact skill for one agent.
-    fn agent_tools_change(&self, method: Method, params: &ParamsValue) -> Result<ParamsValue> {
-        let params: kr_protocol::skill::AgentToolsParams = parse(params)?;
+    ///
+    /// An installation changes files, so it runs under section 9's receipt contract: the same
+    /// action retried returns what it produced the first time rather than repeating the change,
+    /// the same identifier with a different payload is `ID_CONFLICT`, and a marker written before
+    /// the change with no outcome after it is `unknown` rather than something to do again. What
+    /// can be refused without touching anything is refused before the marker.
+    fn agent_tools_change(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::skill::AgentToolsParams = parse(&mutation.params)?;
         let installer = self.installer()?;
-        match method {
-            Method::AgentToolsInstall => encode(&installer.install(&params)?),
-            Method::AgentToolsRemove => encode(&installer.remove(&params)?),
-            _ => Err(ControllerError::InvalidArgument(format!(
-                "{} is not an installation this daemon serves",
-                method.as_str()
-            ))),
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        if let Some(retained) = installer.retained(actor_id, mutation.action_id, &digest)? {
+            return Ok(retained);
         }
+        installer.check(&params)?;
+        installer.mark_dispatching(actor_id, mutation.action_id, &digest)?;
+        let result = match method {
+            Method::AgentToolsInstall => encode(&installer.install(&params)?)?,
+            Method::AgentToolsRemove => encode(&installer.remove(&params)?)?,
+            _ => {
+                return Err(ControllerError::InvalidArgument(format!(
+                    "{} is not an installation this daemon serves",
+                    method.as_str()
+                )));
+            }
+        };
+        installer.settle(actor_id, mutation.action_id, &digest, &result)?;
+        Ok(result)
     }
 
     /// Returns the installer, which keeps this host's record of what it wrote.

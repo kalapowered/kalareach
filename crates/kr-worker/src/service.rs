@@ -746,6 +746,10 @@ impl WorkerService {
             tokio::time::Instant::now() + std::time::Duration::from_millis(bounded.get());
         let step = std::time::Duration::from_millis(kr_protocol::question::WAIT_RENEWAL.get());
         while tokio::time::Instant::now() < deadline {
+            // The subscription is taken before the state is read. Registering afterwards would
+            // leave a window in which an answer arrives between the read and the wait, and the
+            // caller would sleep through its own answer until the next renewal.
+            let waiting = self.questions.subscribe();
             let _ = self.questions.sweep(self.question_clock());
             match self.questions.question(params.question_id) {
                 Ok(question) if question.state.is_resolved() => return,
@@ -753,7 +757,7 @@ impl WorkerService {
                 Ok(_) => {}
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            self.questions.wait_for_change(remaining.min(step)).await;
+            let _ = tokio::time::timeout(remaining.min(step), waiting).await;
         }
     }
 
@@ -1611,8 +1615,7 @@ impl WorkerService {
                     .unwrap_or(u64::MAX),
             ),
         );
-        let intent = kr_cbor::to_canonical_vec(mutation)
-            .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?;
+        let intent = Self::intent_of(mutation, method)?;
         let submission = crate::journal::Submission {
             actor_id: actor_id.clone(),
             action_id: mutation.action_id,
@@ -1764,6 +1767,37 @@ impl WorkerService {
             AfterEffect::Close(gate) => state.close_gate = Some((mutation.action_id, gate)),
         }
         Ok(Answered::Performed(value))
+    }
+
+    /// Returns the bytes the journal keeps as this mutation's intent.
+    ///
+    /// Ordinarily that is the mutation exactly as it arrived, because the intent is what a
+    /// recovering worker reads to know what the action was going to do. A cancellation from a
+    /// question's source is the exception: it carries the caller token, and section 11 keeps that
+    /// token out of every durable record but the ledger's own sealed copy. The journal is such a
+    /// record, and so is its write-ahead log, so the token is emptied before the intent is
+    /// encoded. What remains still says which question was to be cancelled and under whose
+    /// authority, which is everything a recovery needs; the token itself is not a fact about the
+    /// action, it is the caller proving it may ask.
+    fn intent_of(mutation: &MutationRequest, method: Method) -> Result<Vec<u8>> {
+        let redacted;
+        let recorded = if method == Method::QuestionCancelOwn {
+            let params: kr_protocol::question::QuestionCancelOwnParams = parse(&mutation.params)?;
+            let params = kr_protocol::question::QuestionCancelOwnParams {
+                caller_token: kr_protocol::question::CallerToken::new(Vec::new()),
+                ..params
+            };
+            redacted = MutationRequest {
+                params: ParamsValue::from_typed(&params)
+                    .map_err(|error| WorkerError::InvalidArgument(error.to_string()))?,
+                ..mutation.clone()
+            };
+            &redacted
+        } else {
+            mutation
+        };
+        kr_cbor::to_canonical_vec(recorded)
+            .map_err(|error| WorkerError::InvalidArgument(error.to_string()))
     }
 
     /// Returns the answer a retained action is owed, when this caller has one.
@@ -2396,6 +2430,7 @@ impl WorkerService {
         let boundary = Self::session_boundary(&self.runtime.session());
         Ok(crate::questions::binding::verify(
             state.peer_pid,
+            state.peer_process.as_ref(),
             state.connection_id,
             boundary.as_ref(),
         )?)
@@ -2409,6 +2444,7 @@ impl WorkerService {
         let boundary = Self::session_boundary(session);
         Ok(crate::questions::binding::verify(
             state.peer_pid,
+            state.peer_process.as_ref(),
             state.connection_id,
             boundary.as_ref(),
         )?)
@@ -2954,6 +2990,11 @@ pub struct ConnectionState {
     /// It is what a question's source binding is established from, and it comes from the socket
     /// rather than from anything the caller sent.
     pub peer_pid: Option<u32>,
+    /// That process's start identity, read when the connection was accepted.
+    ///
+    /// Pinning it here is what stops a process identifier the kernel recycles while this
+    /// connection is open from being answered as though it were the caller that opened it.
+    pub peer_process: Option<kr_protocol::identity::ProcessStartIdentity>,
     next_request: u64,
 }
 
@@ -2989,6 +3030,9 @@ impl ConnectionState {
             actor_id: ActorId::new(format!("local:{}", peer.uid))
                 .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal")),
             peer_pid: peer.pid,
+            peer_process: peer
+                .pid
+                .and_then(|pid| kr_ipc::identity::process_start_identity(pid).ok()),
             next_request: 0,
         }
     }

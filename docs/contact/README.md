@@ -44,7 +44,13 @@ rather than the caller:
 3. **Session membership.** The process is looked for inside the boundary the session owns: a
    control group where the platform has one, otherwise the controlling terminal and the process
    group the root shell leads.
-4. **Ancestry.** The parent chain is walked to the root shell, each link checked by start identity.
+4. **Ancestry.** The parent chain is walked to the root shell. Every link is read from the kernel
+   and checked for consistency: a candidate parent that started after its child is an identifier
+   the kernel has handed to something else since, and the chain stops there.
+
+The identity read when the connection was accepted is the one every later call on it is checked
+against, so a process identifier the kernel recycles mid-connection cannot be answered as though it
+were the caller that opened it.
 
 Either of the last two admits a source, and both are recorded on the question. Neither is a defence
 against arbitrary code running under the same operating-system account, and the specification says
@@ -97,9 +103,16 @@ revision, so of two simultaneous answers exactly one changes the question and th
 | Lifetime | 24 hours, or the life of the application that asked, whichever ends first |
 | Wait on creation | 30 seconds |
 | Long poll | 300 seconds by default, 600 maximum, renewed in 20-second steps |
+| Declared client deadline | 660 seconds, written into the server entry where the agent supports one |
 
 A wait that runs out returns the same durable question. It recreates nothing and notifies nobody a
 second time.
+
+The client's own tool deadline is the other bound, and the shorter of the two decides. Where an
+agent lets a server declare one, the installation declares 660 seconds so a full poll can finish;
+where it does not, the agent's own default governs, and the tool reference tells the agent to ask
+for a shorter wait than its client allows. A call the client cuts off loses the wait, never the
+question.
 
 ## The caller token
 
@@ -109,11 +122,16 @@ same verified application.
 
 The worker stores a keyed verification tag and a sealed copy, both bound to the question
 identifier. The key is generated when the ledger opens and lives in the worker's memory alone, so
-the sealed copies stop being readable the moment the worker exits — which is when a question's
-source access ends. The token appears in no event, no notification, no backup and no log, and the
-one durable record that would otherwise carry it, a retained action result, is deliberately not
-written for a question creation. Nothing is lost by that: a question is de-duplicated by its source
-and its own `request_id`, which returns the same question and the same token.
+the sealed copies stop being readable the moment the worker exits, which is when a question's
+source access ends: a worker's death ends the session, and no later worker takes its place.
+
+The token appears in no event, no notification, no backup and no log, and in no durable record but
+that sealed copy. Two records would otherwise carry it. A created question's retained action result
+is deliberately not written, and nothing is lost by that, because a question is de-duplicated by its
+source and its own `request_id`, which returns the same question and the same token. A cancellation
+from the source carries the token in its parameters, and the intent the journal keeps has it emptied
+before it is encoded; what remains still says which question was to be cancelled and under whose
+authority.
 
 ## Answering from the terminal
 
@@ -150,14 +168,23 @@ Three properties make an installation safe to undo:
   own state directory, not in the agent's, so an agent that rewrites its configuration cannot lose
   it. A removal replays the record in reverse and stops at anything whose digest no longer matches,
   because a changed file is somebody's edit.
-* **An entry is guarded rather than assumed.** An installation refuses to replace a server entry it
-  did not write, which is what keeps an unrelated entry of the same name from being overwritten and
-  then removed.
+* **Nothing is written until everything has been checked.** An installation refuses a file or a
+  server entry that is already there and that this host did not write, and it refuses before its
+  first write, so a refusal leaves the agent's tree exactly as it found it.
 * **Other settings survive.** A TOML configuration is edited in place with a format-preserving
   editor, so ordering and comments are untouched. A JSON configuration is reparsed and rewritten:
-  every setting survives, and the document's key order and indentation are normalised.
+  every setting survives, and the document's key order and indentation are normalised. The
+  replacement keeps the permissions of the document it replaces, because an agent's configuration
+  can hold a credential.
 
-A directory the installation created is removed only when it is empty.
+A directory the installation created is removed only when it is empty. A project's `.mcp.json` is
+read by more than one agent, so the entry in one is written identically whichever installation
+wrote it and is removed only when no other recorded installation still names it.
+
+Installing and removing are mutations, and they carry section 9's receipt contract: the same action
+retried returns what it produced the first time rather than changing anything again, the same
+identifier with a different payload is `ID_CONFLICT`, and an action whose marker was written and
+whose outcome was not is reported as unknown rather than repeated.
 
 ## What contact is not
 
