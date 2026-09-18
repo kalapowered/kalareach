@@ -566,10 +566,44 @@ application, so an envelope that names one is refused before anything runs.
 Some of these calls are long. A clone reaches the network and a materialisation copies files, so
 they run on blocking tasks and the journal's lock is never held across a subprocess. A cancellation
 therefore cannot reach inside a running clone: it sets the operation's flag, and the invocation that
-holds the child ends the process group *it* started, by the identity this process recorded. On Unix
-that group holds every helper the clone spawned; on Windows the containment a Job Object would give
-is outside this crate, and a cancellation there says the host could not confirm that everything it
-started ended.
+holds the child ends everything *it* started, by the identity this process recorded. On Unix that is
+the process group the child leads, which holds every helper the clone spawned; on Windows it is the
+job object the child was created inside, which holds them for the same reason and which a process
+cannot leave.
+
+### The boundary around a Git invocation
+
+Every Git this host runs is enclosed by the operating system for the length of that one invocation,
+and the enclosure is built from the directories this host opened rather than from the paths it was
+given. Three things it holds, whatever the repository's configuration says and whoever writes to the
+repository while Git is running.
+
+* **Only Git executes.** Git's own program and the helpers under Git's own directory, and the
+  approved broker's ssh program for a remote that needs one. A driver, filter, hook, credential
+  helper, pager or filesystem monitor planted anywhere else cannot be executed, whether it was
+  planted before this host read the configuration, between that reading and the moment Git started,
+  or while Git was running.
+* **Only this operation's network.** A local operation reaches no address at all and nothing may
+  listen. An operation that reaches a remote may open outbound connections on the ports its
+  transport uses and resolve the remote's name, and nothing may listen there either.
+* **Only this operation's directories are written.** The repository's working tree and its Git
+  directory, the destination the operation reserved, and one temporary directory that exists for the
+  length of the invocation and is taken away with it. Everything else is read-only.
+
+The enclosure is what makes the checks around it sufficient rather than advisory. This host reads a
+repository's configuration before it runs Git and reads it again afterwards, and it always could; a
+writer racing the two readings is what those checks could notice and not prevent. Now the child
+starts inside the directory this host opened rather than at a name, so a tree put at that name
+afterwards is not the tree Git works in and is never written to, and the invocation either produces
+the verified tree's result or fails with this host's declared answer.
+
+What it does not confine is reading. Git reads the system's shared libraries, its locale data and
+its certificate store, and a read confinement that missed one of those would fail an operation for a
+reason that has nothing to do with safety. What a repository can reach by reading is what the account
+this host runs as can reach, exactly as before.
+
+`docs/project/` and `crates/kr-project/README.md` say which mechanism holds which guarantee on each
+platform, and what a platform refuses rather than pretends.
 
 This daemon's project mutations check the accepted deadline and the connection's authority
 immediately before the write, as its transfer mutations do. That is the boundary the host contract
