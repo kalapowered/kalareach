@@ -720,20 +720,31 @@ impl HostReservation {
     }
 
     /// Builds the launch plan for one host executable.
-    #[must_use]
+    ///
+    /// The executable and the packages directory are resolved here rather than left as they were
+    /// given. The host runs in a directory of its own, so a relative name would be looked for
+    /// beneath that directory instead of beneath the one this launcher was started in: a relative
+    /// executable would not be found, and a relative packages directory would be created, empty,
+    /// somewhere nothing installs components.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`LaunchError::Refused`] when either path cannot be resolved.
     pub fn plan(
         &self,
         environment: &EnvironmentPaths,
         program: impl Into<PathBuf>,
         packages: &Path,
-    ) -> HostLaunchPlan {
-        HostLaunchPlan {
+    ) -> LaunchResult<HostLaunchPlan> {
+        let program = kr_ipc::paths::resolve_here(program.into())?;
+        let packages = kr_ipc::paths::resolve_here(packages.to_path_buf())?;
+        Ok(HostLaunchPlan {
             label: self.label(),
-            program: program.into(),
-            arguments: self.arguments(environment, packages),
+            program,
+            arguments: self.arguments(environment, &packages),
             jobs_directory: environment.jobs_dir(),
             working_directory: self.working_directory(environment),
-        }
+        })
     }
 
     /// Waits for the host's claim, checks it, publishes the descriptor and acknowledges it.
@@ -959,7 +970,7 @@ pub async fn start(
     // The rendezvous listener exists before anything is started, so a host that connects the
     // instant it starts finds somebody listening.
     let reservation = HostReservation::open(environment)?;
-    let plan = reservation.plan(environment, program, packages);
+    let plan = reservation.plan(environment, program, packages)?;
     // Made before anything is started, so a launch cannot fail on a directory that does not exist
     // yet. It is inside this environment's state directory, which this host owns and which holds
     // nothing a person keeps.
@@ -1102,6 +1113,41 @@ mod tests {
         retire_descriptor(&environment).expect("the descriptor is retired");
         assert!(read_descriptor(&environment).expect("a read").is_none());
         retire_descriptor(&environment).expect("a second retirement is quiet");
+    }
+
+    #[tokio::test]
+    async fn a_launch_resolves_what_it_names_before_the_host_changes_directory() {
+        let host = kr_ipc::testing::TempHost::create();
+        let environment = host.environment();
+        let reservation = HostReservation::open(&environment).expect("a reservation");
+
+        // Relative names, as a caller in this directory would give them. The host runs somewhere
+        // else, so a name left relative would be looked for there: the executable would not be
+        // found, and the packages directory would be made, empty, where nothing installs a
+        // component.
+        let plan = reservation
+            .plan(&environment, "kr-plugin-host", Path::new("packages"))
+            .expect("a plan");
+        assert!(
+            plan.program.is_absolute(),
+            "the executable is still relative: {}",
+            plan.program.display()
+        );
+        let packages = plan
+            .arguments
+            .windows(2)
+            .find(|pair| pair[0] == "--packages-dir")
+            .map(|pair| pair[1].clone())
+            .expect("the packages directory is named");
+        assert!(
+            Path::new(&packages).is_absolute(),
+            "the packages directory is still relative: {packages}"
+        );
+        assert!(
+            plan.working_directory.starts_with(environment.state_dir()),
+            "the host runs outside the state directory: {}",
+            plan.working_directory.display()
+        );
     }
 
     #[tokio::test]

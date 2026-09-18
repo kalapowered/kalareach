@@ -724,6 +724,18 @@ async fn kr_req_05_06_the_plugin_runtime_is_a_lazily_started_job_of_its_own() {
         launch.working_directory.display()
     );
 
+    // And the process is actually in it. The plan naming a directory would be satisfied by a
+    // supervisor that never applied it, so the kernel is asked what the child's directory is.
+    if let Some(running_in) = working_directory_of(pid) {
+        assert_eq!(
+            running_in.canonicalize().ok(),
+            launch.working_directory.canonicalize().ok(),
+            "the host is running in {}, not in {}",
+            running_in.display(),
+            launch.working_directory.display()
+        );
+    }
+
     started.kill();
     let _ = launcher::retire_descriptor(&environment);
 }
@@ -1072,6 +1084,22 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
 
     started.kill();
     let _ = launcher::retire_descriptor(&environment);
+}
+
+/// Returns the directory a running process is in, as the kernel reports it.
+///
+/// Nothing when this platform's tool is unavailable: what the test then still checks is the plan.
+fn working_directory_of(pid: u32) -> Option<PathBuf> {
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
 }
 
 /// Returns the highest `kalareach-N` in `text`, if there is one.
