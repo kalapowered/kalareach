@@ -85,6 +85,31 @@ fn command_binaries() -> &'static std::path::Path {
 fn kr() -> std::path::PathBuf {
     command_binaries().join("kr")
 }
+/// A directory of files a session's application waits on, so this test decides when it acts.
+///
+/// An application on a clock races the attachment: what it writes before the attachment exists is
+/// in the first screen the attachment is given rather than in what the test watched arrive, and a
+/// test that watches a window would then be asserting about how fast the machine was. These let the
+/// test say when instead. They are on the internal disk, like everything else a launched process
+/// touches.
+fn gates() -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("kalareach-gates-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&root).expect("a directory for this test's gates");
+    root
+}
+
+/// The shell that waits for one of those files to appear.
+fn waits_for(gates: &std::path::Path, gate: &str) -> String {
+    format!(
+        "while [ ! -e {} ]; do sleep 0.05; done",
+        gates.join(gate).display()
+    )
+}
+
+/// Lets the application past one.
+fn open_gate(gates: &std::path::Path, gate: &str) {
+    std::fs::write(gates.join(gate), b"").expect("opens a gate the application is waiting on");
+}
 
 async fn hosted(script: &str) -> Hosted {
     // Before the application starts, not between its start and the attachment. Copying the command
@@ -561,10 +586,17 @@ async fn raw_input_reaches_the_application_byte_for_byte() {
 /// own behaviour rather than an echo of what this test typed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
-    let hosted = hosted(
-        "printf 'kr-ready.'; sleep 1; printf 'kr-batch-1.'; sleep 1; printf 'kr-batch-2.'; \
-         sleep 1; printf 'kr-batch-3.'; sleep 120",
-    )
+    // Each batch waits for this test rather than for a clock. On a clock, a batch written while
+    // the attachment was still being made would be in the first screen the attachment is given,
+    // and this test is about what the command draws *while output flows*.
+    let gates = gates();
+    let hosted = hosted(&format!(
+        "printf 'kr-ready.'; {}; printf 'kr-batch-1.'; {}; printf 'kr-batch-2.'; {}; \
+         printf 'kr-batch-3.'; sleep 120",
+        waits_for(&gates, "one"),
+        waits_for(&gates, "two"),
+        waits_for(&gates, "three"),
+    ))
     .await;
     let pty = native_pty_system()
         .openpty(PtySize {
@@ -598,11 +630,20 @@ async fn the_command_draws_what_the_host_sends_and_nothing_of_its_own() {
     // this point is what the command draws while output flows.
     let settled = output.snapshot();
 
-    output.expect_within(
-        b"kr-batch-3.",
-        LIVENESS_DEADLINE,
-        "three separate output batches reached the terminal",
-    );
+    // One at a time, each released only once the one before it has arrived, so all three are
+    // certainly in the window below and each is certainly a write of its own.
+    for (gate, batch) in [
+        ("one", b"kr-batch-1.".as_slice()),
+        ("two", b"kr-batch-2.".as_slice()),
+        ("three", b"kr-batch-3.".as_slice()),
+    ] {
+        open_gate(&gates, gate);
+        output.expect_within(
+            batch,
+            LIVENESS_DEADLINE,
+            "the batch this test released reached the terminal",
+        );
+    }
     let after = output.snapshot();
     let during = &after[settled.len().min(after.len())..];
     // The batches arrived as the bytes the application wrote. A command that repainted per batch

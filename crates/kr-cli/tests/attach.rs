@@ -85,6 +85,31 @@ fn kr() -> std::path::PathBuf {
 fn kr_attach_guard() -> std::path::PathBuf {
     command_binaries().join("kr-attach-guard")
 }
+/// A directory of files a session's application waits on, so this test decides when it acts.
+///
+/// An application on a clock races the attachment: what it writes before the attachment exists is
+/// in the first screen the attachment is given rather than in what the test watched arrive, and a
+/// test that watches a window would then be asserting about how fast the machine was. These let the
+/// test say when instead. They are on the internal disk, like everything else a launched process
+/// touches.
+fn gates() -> std::path::PathBuf {
+    let root = std::env::temp_dir().join(format!("kalareach-gates-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&root).expect("a directory for this test's gates");
+    root
+}
+
+/// The shell that waits for one of those files to appear.
+fn waits_for(gates: &std::path::Path, gate: &str) -> String {
+    format!(
+        "while [ ! -e {} ]; do sleep 0.05; done",
+        gates.join(gate).display()
+    )
+}
+
+/// Lets the application past one.
+fn open_gate(gates: &std::path::Path, gate: &str) {
+    std::fs::write(gates.join(gate), b"").expect("opens a gate the application is waiting on");
+}
 
 async fn hosted(script: &str) -> Hosted {
     // Before the application starts, not between its start and the attachment. Copying the command
@@ -757,7 +782,16 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
     // stack with one sequence, and it does so here. Because KalaReach never put an entry of its own
     // on it, there is no pop written on the way out to land on an outer entry instead: what the
     // terminal reported is written back as the state it is.
-    let hosted = hosted("printf '\\033[<65535u'; while true; do echo ready; sleep 1; done").await;
+    // The application empties the stack when this test says so, not when it starts. On its own
+    // clock it could do it before there was an attachment at all, and then a terminal that saw no
+    // stack operation would prove nothing: there would have been none to see.
+    let gates = gates();
+    let hosted = hosted(&format!(
+        "printf 'kr-up.\\n'; {}; printf '\\033[<65535u'; printf 'kr-popped.\\n'; \
+         while true; do echo ready; sleep 1; done",
+        waits_for(&gates, "pop")
+    ))
+    .await;
     let pty = native_pty_system()
         .openpty(PtySize {
             rows: 24,
@@ -781,11 +815,20 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     let queries = answer_keyboard_queries(&output, pty.master.take_writer().expect("a writer"));
     output.expect_within(
-        b"ready",
+        b"kr-up.",
         LIVENESS_DEADLINE,
         "the session's output reached the terminal",
     );
     answered(queries);
+
+    // Now, with the attachment live and forwarding, the application empties the stack. The marker
+    // after it is what says the sequence was written while there was an attachment to carry it.
+    open_gate(&gates, "pop");
+    output.expect_within(
+        b"kr-popped.",
+        LIVENESS_DEADLINE,
+        "the application emptied the keyboard stack while this terminal was attached",
+    );
 
     let session = hosted.session_id.to_string();
     let detach = std::process::Command::new(kr())
