@@ -262,16 +262,30 @@ kr_shell_cancel_key_wait (kr_cancellation *out)
   out->vi_motion = RL_ISSTATE (RL_STATE_VIMOTION | RL_STATE_CHARSEARCH) ? 1 : 0;
   out->macro_input = (macro_left > 0) || RL_ISSTATE (RL_STATE_MACROINPUT);
   out->buffer_preserved = 1;
-  out->discarded_bytes = (unsigned long) ((macro_left > 0 ? macro_left : 0)
-                                          + (buffered > 0 ? buffered : 0)
-                                          + (rl_pending_input ? 1 : 0));
 
-  /*
-   * The next read returns KR_RL_CANCEL. Readline's own abort path then pops the executing macro,
-   * clears the pending input and resets the argument, and the edit buffer is left as it was.
-   */
-  kr_cancel_requested = 1;
-  kr_idle_reported = 0;
+  if (out->partial_escape || out->multikey_sequence || out->quoted_insertion || out->vi_motion
+      || out->macro_input)
+    {
+      out->discarded_bytes = (unsigned long) ((macro_left > 0 ? macro_left : 0)
+                                              + (buffered > 0 ? buffered : 0)
+                                              + (rl_pending_input ? 1 : 0));
+      /*
+       * The reader is inside something, so the next read returns KR_RL_CANCEL. Readline's own
+       * abort path then pops the executing macro, clears the pending input and resets the
+       * argument, and the edit buffer is left as it was.
+       */
+      kr_cancel_requested = 1;
+      kr_idle_reported = 0;
+    }
+  else
+    {
+      /*
+       * Nothing was in progress, so there is nothing to unwind and nothing to throw away. The
+       * reader stays in the read it is in, and a sequence the person starts afterwards is not
+       * taken for one this cancellation ended.
+       */
+      out->discarded_bytes = 0;
+    }
 }
 
 void

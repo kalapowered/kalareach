@@ -1381,6 +1381,82 @@ pub fn a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(kind: ShellKind) 
     );
 }
 
+/// KR-REQ-07.34 and KR-REQ-07.35: a cancellation ends what it found, and nothing else.
+pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: ShellKind) {
+    let Some(package) = Package::found(kind) else {
+        return;
+    };
+    let mut session = Session::start(&package);
+    session.first_prompt();
+    session.forget_events();
+    session.type_line("echo kr-ready");
+    assert!(session.wait_for_output("kr-ready", REPLY));
+    let enter = session.next_prompt();
+
+    // The reader is waiting for a key with nothing in progress, so there is nothing of the old
+    // lease's for this cancellation to end and nothing for it to throw away.
+    session.type_bytes(b"echo kr-");
+    std::thread::sleep(Duration::from_millis(120));
+    let idle = session.ask(WorkerRequest::Cancel(CancelKeyWait {
+        session_id: session.session_id,
+        sequence: U64::new(1),
+        epoch: epoch(4),
+        prompt_generation: enter.prompt_generation,
+        reader_revision: enter.reader_revision,
+    }));
+    let BridgeAnswer::Cancel(report) = session.answer(idle) else {
+        panic!("the reader answered a cancellation with something else")
+    };
+    assert!(
+        !report.cancelled.any(),
+        "a cancellation at a reader with nothing in progress ended something: {:?}",
+        report.cancelled
+    );
+    assert_eq!(
+        report.discarded_bytes,
+        U64::new(0),
+        "a cancellation that ended nothing reported input it had discarded"
+    );
+
+    // The person then starts a sequence of their own, and the mailbox is read while it is
+    // part-read. The cancellation before it is over, so the sequence is still the reader's to
+    // finish rather than something that cancellation takes away.
+    session.type_bytes(ESCAPE);
+    std::thread::sleep(Duration::from_millis(120));
+    for fence in [fence_id(20), fence_id(21)] {
+        let held = session.fence_exchange(&enter, fence);
+        assert!(
+            held.editor.pending.multikey_sequence && !held.queues.partial_key_drained,
+            "the reader lost the sequence the person had started: {:?} {:?}",
+            held.editor.pending,
+            held.queues
+        );
+    }
+
+    // A cancellation now does end that sequence, and the typed text is still there afterwards.
+    let ends = session.ask(WorkerRequest::Cancel(CancelKeyWait {
+        session_id: session.session_id,
+        sequence: U64::new(2),
+        epoch: epoch(4),
+        prompt_generation: enter.prompt_generation,
+        reader_revision: enter.reader_revision,
+    }));
+    let BridgeAnswer::Cancel(report) = session.answer(ends) else {
+        panic!("the reader answered a cancellation with something else")
+    };
+    assert!(
+        report.cancelled.any() && report.buffer_preserved,
+        "the cancellation did not end the sequence it found: {:?}",
+        report.cancelled
+    );
+    session.type_line("idle-ok");
+    assert!(
+        session.wait_for_output("kr-idle-ok", REPLY),
+        "the edit buffer did not survive the cancellations:\n{}",
+        session.terminal_output()
+    );
+}
+
 /// KR-REQ-07.72: the person's own IGNORE_EOF setting is left as they set it.
 pub fn the_ignore_eof_setting_is_left_as_the_person_set_it(kind: ShellKind) {
     let Some(package) = Package::found(kind) else {

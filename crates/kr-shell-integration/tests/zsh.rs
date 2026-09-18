@@ -115,6 +115,12 @@ fn a_takeover_ends_a_pending_key_wait_and_keeps_the_edit_buffer() {
     shellpkg::a_takeover_ends_a_pending_key_wait_and_keeps_the_buffer(ZSH);
 }
 
+/// KR-REQ-07.34
+#[test]
+fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone() {
+    shellpkg::a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(ZSH);
+}
+
 /// KR-REQ-07.85, KR-REQ-26.11
 #[test]
 fn the_package_declares_the_managed_zsh_baseline_and_its_reproducible_identity() {

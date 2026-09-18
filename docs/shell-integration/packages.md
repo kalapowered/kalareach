@@ -69,7 +69,8 @@ those two need no change.
 Immediate acceptance is the mailbox's own: the reader installs the command, answers, sets `done`
 and returns from the read loop at the boundary it is already standing on. Cancellation is ZLE's
 timeout path — the pending read ends, the longest complete prefix is dropped and the edit buffer is
-untouched.
+untouched. A cancellation that finds nothing in progress ends nothing: it discards nothing, the
+reader stays in the wait it is in, and the sequence the person starts next is their own.
 
 The boundary is also where a key the person has just typed is still theirs. `getkeycmd` has
 resolved a complete sequence and nothing has run it yet, so the reader reports that sequence as
@@ -100,7 +101,8 @@ callback therefore classifies typeahead wrongly. So:
   `READERR`, so `_rl_dispatch_subseq`, `_rl_insert_next`, `rl_digit_loop` and `rl_vi_domove` each
   end their own operation through the path they already have for a negative key, which runs
   `_rl_abort_internal`: the executing macro is popped, pending input is cleared, the argument is
-  reset, and `rl_line_buffer` is left exactly as it was.
+  reset, and `rl_line_buffer` is left exactly as it was. A cancellation that finds nothing in
+  progress returns no key at all, so the reader stays in the read it is in.
 - **`readline_internal_char` takes the end-of-file decision** immediately before Readline's own
   `c == EOF && rl_end` and empty-line branches, after the next character has been selected. It
   answers native or consume, replaces no binding, and a consume continues the same `readline` call.

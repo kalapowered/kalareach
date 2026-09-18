@@ -259,11 +259,23 @@ kr_shell_cancel_key_wait(kr_cancellation *out)
     out->vi_motion = (virangeflag != 0);
     out->macro_input = (kungetct > 0);
     out->buffer_preserved = 1;
-    out->discarded_bytes = (unsigned long)kungetct + (unsigned long)keybuflen;
 
-    /* The old lease's undelivered input goes, the edit buffer stays. */
-    kungetct = 0;
-    kr_cancel_requested = 1;
+    if (out->partial_escape || out->multikey_sequence || out->quoted_insertion || out->vi_motion ||
+        out->macro_input) {
+        out->discarded_bytes = (unsigned long)kungetct + (unsigned long)keybuflen;
+        /* The old lease's undelivered input goes, the edit buffer stays. */
+        kungetct = 0;
+        /* The reader is inside something, so it is brought out of it: the wait ends and the
+         * part-read sequence is dropped at the boundary that follows. */
+        kr_cancel_requested = 1;
+    } else {
+        /*
+         * Nothing was in progress, so there is nothing to unwind and nothing to throw away. The
+         * reader stays in the wait it is in, and a sequence the person starts afterwards is not
+         * taken for one this cancellation ended.
+         */
+        out->discarded_bytes = 0;
+    }
 }
 
 char *
