@@ -1436,6 +1436,16 @@ async fn a_document_nobody_received_asks_the_component_to_draw_again() {
         }
     }
     assert!(drew, "the component was never asked to draw again");
+
+    // The document leaves from inside the snapshot call, and the obligation is cleared once that
+    // call has returned and answered -- it has to be, because a draw that failed or was declined
+    // leaves the obligation standing. Holding the document therefore says the component drew, not
+    // that the binding has finished with the obligation, so this waits for it as the loop above
+    // waits for the document.
+    let cleared_by = std::time::Instant::now() + core::time::Duration::from_secs(5);
+    while handle.snapshot_required() && std::time::Instant::now() < cleared_by {
+        tokio::time::sleep(core::time::Duration::from_millis(10)).await;
+    }
     assert!(
         !handle.snapshot_required(),
         "the obligation was not cleared"
