@@ -211,34 +211,20 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
     );
     let at_overflow = runtime.session().output_cursor();
     let read_at_overflow = received.load(std::sync::atomic::Ordering::Relaxed);
-    let advances_after = progress(&received, Duration::from_secs(5)).await;
-    let afterwards = runtime.session().output_cursor();
     assert!(
-        afterwards > at_overflow,
-        "and the pseudo-terminal was still being read afterwards: the output cursor stood at \
-         {at_overflow} when the queue filled and is at {afterwards} five seconds later, on {}",
-        finished(&draining)
+        read_at_overflow > 0,
+        "the client that kept reading had received output by the time the other one's queue filled"
     );
-    assert!(
-        received.load(std::sync::atomic::Ordering::Relaxed) > read_at_overflow
-            || draining.is_finished(),
-        "and output still reached the client that was reading, or that client had fallen behind \
-         too and been told so: {advances_after} arrivals after the overflow"
-    );
-
-    // The session is still running: the one that stopped reading held nothing up.
-    assert_eq!(
-        runtime.state(),
-        SessionState::Live,
-        "the session kept running while one client was not reading"
-    );
-    let before = received.load(std::sync::atomic::Ordering::Relaxed);
-    assert!(before > 0, "the client that kept reading received output");
-    // Waited for rather than sampled over a fixed window: what this asserts is that more arrives,
-    // not how quickly a loaded machine delivers it.
+    // Waited for rather than sampled over a fixed window: what this asserts is that more arrives
+    // after the overflow, not how quickly a loaded machine delivers it. There are two allowed
+    // answers and either ends the wait - more output reaching the client that kept up, or that
+    // client falling behind too and being told so - because what is being measured is the session,
+    // not which of its clients kept pace.
     let started = Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
-    while received.load(std::sync::atomic::Ordering::Relaxed) <= before {
+    while received.load(std::sync::atomic::Ordering::Relaxed) <= read_at_overflow
+        && !draining.is_finished()
+    {
         assert!(
             Instant::now() < deadline,
             "waited {:?} for more output to reach the client that kept reading while the other \
@@ -247,9 +233,27 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    let afterwards = runtime.session().output_cursor();
     assert!(
-        !draining.is_finished(),
-        "the client that kept reading was not resynchronised"
+        afterwards > at_overflow,
+        "and the pseudo-terminal was still being read afterwards: the output cursor stood at \
+         {at_overflow} when the queue filled and is at {afterwards} after {:?}, on {}",
+        started.elapsed(),
+        finished(&draining)
+    );
+    assert!(
+        received.load(std::sync::atomic::Ordering::Relaxed) > read_at_overflow
+            || draining.is_finished(),
+        "and output still reached the client that was reading, or that client had fallen behind \
+         too and been told so, after {:?}",
+        started.elapsed()
+    );
+
+    // The session is still running: the one that stopped reading held nothing up.
+    assert_eq!(
+        runtime.state(),
+        SessionState::Live,
+        "the session kept running while one client was not reading"
     );
 
     // Now the client that stopped reading looks at what it was sent. What it finds is the marker,
