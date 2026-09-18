@@ -19,8 +19,8 @@
 //! # One draft, one file, one lock
 //!
 //! A draft is stored as `<draft_id>.draft`, written to a temporary file, flushed, and renamed over
-//! its name. Every change takes an exclusive lock on the store's own `.lock` file and every read
-//! takes a shared one, so reading a revision, comparing it and replacing it is one step against
+//! its name. Every change takes an exclusive lock on the store's own `store.lock` file and every
+//! read takes a shared one, so reading a revision, comparing it and replacing it is one step against
 //! every other window of the application and against another process. Without that a second editor
 //! could pass the comparison a moment before the first one wrote, and the text it replaced would be
 //! gone with no trace that it had ever been there.
