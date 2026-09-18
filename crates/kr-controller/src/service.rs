@@ -2418,8 +2418,11 @@ impl Controller {
     /// then have nothing watching it; and a reading taken before the lock could be applied after a
     /// later one, which is how an assertion outlives the work it was taken for: the closure that
     /// ended the work would have been counted by the older reading and released by the newer, and
-    /// then taken again by the older. The cost is that one evaluation waits for another, which is
-    /// bounded by what the scan is allowed, and no caller's own answer waits for either.
+    /// then taken again by the older. The cost is that one evaluation waits for another, and a
+    /// caller that asks for the state itself waits with it: `host.info`, `environment.capabilities`
+    /// and `host.doctor` read the setting through this, so their answer includes whatever
+    /// evaluation was already under way as well as their own. A receipt never waits, because the
+    /// paths that produce one schedule the look rather than awaiting it.
     async fn evaluate_power(self: &Arc<Self>, claim: Claim) -> (SleepInhibitionState, Review) {
         let mut inhibitor = self.inhibitor.lock().await;
         let setting = power::read(&self.paths);
