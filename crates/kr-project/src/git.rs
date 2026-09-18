@@ -507,13 +507,21 @@ pub struct RestrictedProfile {
 /// the weaker claim. It is compiled with the fixtures and is never set by the service.
 #[cfg(feature = "git-fixtures")]
 #[derive(Clone)]
-pub struct Interposition(Arc<dyn Fn(&Path) + Send + Sync>);
+pub struct Interposition(Interposed);
+
+/// What an interposition does, as the fixtures hand it over.
+#[cfg(feature = "git-fixtures")]
+pub type Interposed = Arc<dyn Fn(&str, &Path) + Send + Sync>;
 
 #[cfg(feature = "git-fixtures")]
 impl Interposition {
-    /// Builds one from what it does, which is given this invocation's private temporary directory.
+    /// Builds one from what it does.
+    ///
+    /// It is given the invocation as [`GitRequest::describe`] reads it and this invocation's
+    /// private temporary directory, so a fixture can act before one particular spawn rather than
+    /// before all of them, which is what makes the window it acts in the real one.
     #[must_use]
-    pub fn new(act: Arc<dyn Fn(&Path) + Send + Sync>) -> Self {
+    pub fn new(act: Interposed) -> Self {
         Self(act)
     }
 }
@@ -546,7 +554,11 @@ impl RestrictedProfile {
     ///
     /// Returns [`ProjectError::StagingUnavailable`] when a directory or the empty file cannot be
     /// created, or when one of them is not empty.
-    pub fn prepare_with(root: &Path, environment_id: EnvironmentId, git: GitProgram) -> Result<Self> {
+    pub fn prepare_with(
+        root: &Path,
+        environment_id: EnvironmentId,
+        git: GitProgram,
+    ) -> Result<Self> {
         // Every directory in the profile is derived from this one, and one of them is where each
         // Git child starts. A relative root would name a different directory depending on where
         // this process happens to be, so it is refused rather than resolved into one.
@@ -702,7 +714,7 @@ impl RestrictedProfile {
         let described = request.describe();
         #[cfg(feature = "git-fixtures")]
         if let Some(interposition) = self.interposition.as_ref() {
-            interposition.0(temporary.path());
+            interposition.0(&described, temporary.path());
         }
         let mut child = crate::boundary::start(
             &crate::boundary::Invocation {
@@ -1965,10 +1977,7 @@ fn helpers(request: &GitRequest<'_>) -> Vec<PathBuf> {
         helpers.push(program.to_owned());
     }
     if request.transport.is_some_and(|transport| {
-        matches!(
-            transport,
-            RemoteTransport::LocalPath | RemoteTransport::Ssh
-        )
+        matches!(transport, RemoteTransport::LocalPath | RemoteTransport::Ssh)
     }) {
         // An https remote needs none: Git executes its own `git-remote-https` directly. A local
         // path and an ssh remote are both started as a command string, which is the shell.
@@ -1998,13 +2007,16 @@ impl PrivateTemporary {
             name.push_str(&format!("{byte:02x}"));
         }
         let path = root.join(&name);
-        let mut builder = std::fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt as _;
 
+            let mut builder = std::fs::DirBuilder::new();
             builder.mode(0o700);
-        }
+            builder
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
         builder
             .create(&path)
             .map_err(|error| ProjectError::StagingUnavailable {
@@ -2015,12 +2027,13 @@ impl PrivateTemporary {
             })?;
         // The boundary's rules are written against a path with no link left in it, and the state
         // directory above this one may reach it through one.
-        let path = std::fs::canonicalize(&path).map_err(|error| ProjectError::StagingUnavailable {
-            detail: format!(
-                "{described}'s own temporary directory could not be resolved: {error}"
-            )
-            .into(),
-        })?;
+        let path =
+            std::fs::canonicalize(&path).map_err(|error| ProjectError::StagingUnavailable {
+                detail: format!(
+                    "{described}'s own temporary directory could not be resolved: {error}"
+                )
+                .into(),
+            })?;
         Ok(Self { path })
     }
 
@@ -2055,7 +2068,8 @@ fn handed_off_to(program: &Path, exec_path: &Path, version: &str) -> PathBuf {
     if candidate == program {
         return program.to_owned();
     }
-    let same_version = ask(&candidate, &["--version"]).is_ok_and(|reported| reported.trim_end() == version);
+    let same_version =
+        ask(&candidate, &["--version"]).is_ok_and(|reported| reported.trim_end() == version);
     let same_helpers = ask(&candidate, &["--exec-path"])
         .is_ok_and(|reported| Path::new(reported.trim_end()) == exec_path);
     if same_version && same_helpers {
@@ -2329,7 +2343,8 @@ mod tests {
         assert!(argv.contains(&OsString::from("--no-optional-locks")));
         assert!(argv.contains(&OsString::from("--no-pager")));
         // The environment is built rather than inherited, so what Git reads is exactly this.
-        let environment = profile.environment(&request, Path::new("/state/git-profile/temporary/one"));
+        let environment =
+            profile.environment(&request, Path::new("/state/git-profile/temporary/one"));
         let value = |name: &str| {
             environment
                 .iter()
@@ -2415,15 +2430,14 @@ mod tests {
         let profile = test_profile();
         let arguments: [&OsStr; 1] = [OsStr::new("clone")];
         let helper = OsString::from("/usr/libexec/git-core/git-credential-osxkeychain");
-        let request = GitRequest::write(Path::new("/stage"), &arguments).with_transport(
-            RemoteAccess {
+        let request =
+            GitRequest::write(Path::new("/stage"), &arguments).with_transport(RemoteAccess {
                 transport: RemoteTransport::Https,
                 credential_helper: Some(helper.as_os_str()),
                 ssh_command: None,
                 ssh_program: None,
                 port: None,
-            },
-        );
+            });
         let overrides = profile.overrides(&request);
         let helpers: Vec<&OsString> = overrides
             .iter()
@@ -2450,7 +2464,8 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "core.sshCommand" && value.is_empty())
         );
-        let environment = profile.environment(&request, Path::new("/state/git-profile/temporary/one"));
+        let environment =
+            profile.environment(&request, Path::new("/state/git-profile/temporary/one"));
         assert!(
             environment
                 .iter()
@@ -2588,7 +2603,8 @@ mod tests {
         );
         // A key holding an equals sign is expressible only in the environment form, which is why
         // the overrides travel there: the key and the value are separate variables.
-        let environment = profile.environment(&request, Path::new("/state/git-profile/temporary/one"));
+        let environment =
+            profile.environment(&request, Path::new("/state/git-profile/temporary/one"));
         let keys: Vec<String> = environment
             .iter()
             .filter(|(name, _)| name.to_string_lossy().starts_with("GIT_CONFIG_KEY_"))

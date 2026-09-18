@@ -42,8 +42,7 @@ use super::{Confinement, Reach};
 use crate::error::{ProjectError, Result};
 
 /// What the boundary is, for a person reading a record.
-pub const MECHANISM: &str =
-    "Landlock rules built from opened directory handles, with a system-call filter for the \
+pub const MECHANISM: &str = "Landlock rules built from opened directory handles, with a system-call filter for the \
      sockets Landlock does not cover";
 
 /// The interface version at which Landlock can restrict TCP.
@@ -136,7 +135,9 @@ pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
     // ruleset that enforces less than it says.
     let mut ruleset = Ruleset::default();
     ruleset.set_compatibility(CompatLevel::HardRequirement);
-    let mut ruleset = ruleset.handle_access(AccessFs::from_all(abi)).map_err(rules)?;
+    let mut ruleset = ruleset
+        .handle_access(AccessFs::from_all(abi))
+        .map_err(rules)?;
     if remote {
         ruleset = ruleset
             .handle_access(AccessNet::from_all(NETWORK_ABI))

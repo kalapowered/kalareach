@@ -163,10 +163,11 @@ impl Reach {
 /// resolved at the same moment rather than one after the other.
 #[derive(Debug)]
 pub struct WorkingDirectory {
+    environment_id: kr_protocol::ids::EnvironmentId,
     directory: AuthorisedDirectory,
     path: PathBuf,
     identity: ObjectIdentity,
-    witnessed_at_ms: Option<u64>,
+    created_at_ms: Option<u64>,
 }
 
 impl WorkingDirectory {
@@ -205,23 +206,13 @@ impl WorkingDirectory {
             )
             .into(),
         })?;
-        let witnessed_at_ms = directory
-            .handle()
-            .dir_metadata()
-            .ok()
-            .and_then(|metadata| metadata.created().ok().or_else(|| metadata.modified().ok()))
-            .and_then(|instant| {
-                instant
-                    .into_std()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-            })
-            .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
+        let created_at_ms = created_at_ms(directory.handle());
         Ok(Self {
+            environment_id,
             directory,
             path: resolved,
             identity,
-            witnessed_at_ms,
+            created_at_ms,
         })
     }
 
@@ -243,41 +234,50 @@ impl WorkingDirectory {
         self.identity
     }
 
-    /// Refuses when the object this handle names is no longer the one it was opened on.
+    /// Refuses when the path this invocation was started at no longer holds the object that was
+    /// opened.
     ///
-    /// The handle cannot start naming another object, so what this establishes is that the object
-    /// is still there and still the same one: an inode reused after the directory was taken away
-    /// has a different creation or modification instant, which is the same witness a publication
-    /// is reconciled against.
+    /// Where a platform starts a process at a path rather than in an open directory, this is what
+    /// answers for the difference: the object at the path is opened again and required to be the
+    /// same one, by identity and by the instant the filesystem says it was created. A creation
+    /// instant does not change when a directory is written in, so an ordinary operation passes
+    /// this and an object made in place of the one that was opened does not.
     ///
     /// # Errors
     ///
-    /// Returns [`ProjectError::IdentityChanged`] when the object or its witness differs.
-    pub fn confirm(&self) -> Result<()> {
-        self.directory.revalidate()?;
-        let now = self
-            .directory
-            .handle()
-            .dir_metadata()
-            .ok()
-            .and_then(|metadata| metadata.created().ok().or_else(|| metadata.modified().ok()))
-            .and_then(|instant| {
-                instant
-                    .into_std()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .ok()
-            })
-            .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX));
-        if self.witnessed_at_ms.is_some() && now != self.witnessed_at_ms {
+    /// Returns [`ProjectError::IdentityChanged`] when the object or its creation instant differs.
+    pub fn confirm_path(&self) -> Result<()> {
+        let now = AuthorisedDirectory::open_root(self.environment_id, &self.path)?;
+        if now.identity() != self.identity || created_at_ms(now.handle()) != self.created_at_ms {
             return Err(ProjectError::IdentityChanged {
-                detail: "the directory the invocation ran in is no longer the object it was \
-                         started in, so what it produced is not served"
+                detail: "the directory this invocation ran in is not the object it was started \
+                         against, so what it produced is not served"
                     .to_owned()
                     .into(),
             });
         }
         Ok(())
     }
+}
+
+/// Returns the instant the filesystem says a directory was created, where it says.
+///
+/// Only the creation instant: a modification instant changes whenever the directory is written in,
+/// which every ordinary operation does. Where a platform reports no creation instant this is
+/// nothing, and the identity alone is the witness, which is what the project service already
+/// records elsewhere.
+fn created_at_ms(directory: &cap_std::fs::Dir) -> Option<u64> {
+    directory
+        .dir_metadata()
+        .ok()
+        .and_then(|metadata| metadata.created().ok())
+        .and_then(|instant| {
+            instant
+                .into_std()
+                .duration_since(std::time::UNIX_EPOCH)
+                .ok()
+        })
+        .map(|since| u64::try_from(since.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// Everything one invocation is allowed to do, as the boundary is built from it.
@@ -396,7 +396,10 @@ mod tests {
             program: PathBuf::from("/usr/bin/git"),
             exec_path: PathBuf::from("/usr/lib/git-core"),
             helpers: vec![PathBuf::from("/usr/bin/ssh")],
-            writable: vec![PathBuf::from("/work/tree"), PathBuf::from("/work/tree/.git")],
+            writable: vec![
+                PathBuf::from("/work/tree"),
+                PathBuf::from("/work/tree/.git"),
+            ],
             temporary: PathBuf::from("/state/git-profile/temporary/one"),
             reach: Reach::Nothing,
         };

@@ -963,7 +963,9 @@ fn nothing_a_caller_or_a_repository_supplied_reaches_a_refusal() {
 
 /// An environment for a profile a test prepares outside a host tree.
 fn an_environment() -> kr_protocol::ids::EnvironmentId {
-    kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes(*uuid::Uuid::new_v4().as_bytes()))
+    kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes(
+        *uuid::Uuid::new_v4().as_bytes(),
+    ))
 }
 
 #[test]

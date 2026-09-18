@@ -174,6 +174,16 @@ impl ProjectService {
         })
     }
 
+    /// Runs something between the reading of a repository's configuration and the start of a Git
+    /// child.
+    ///
+    /// Compiled with the fixtures, so that the tests which prove what the boundary holds can act in
+    /// the window it exists for. Nothing in the service sets it.
+    #[cfg(feature = "git-fixtures")]
+    pub fn interpose(&mut self, interposition: crate::git::Interposition) {
+        self.profile.interpose(interposition);
+    }
+
     /// Returns the directory, under the environment's state directory, that this service owns.
     #[must_use]
     pub fn root_of(paths: &EnvironmentPaths) -> PathBuf {

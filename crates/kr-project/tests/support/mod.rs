@@ -146,6 +146,11 @@ impl Fixture {
         fixture
     }
 
+    /// Runs something between the reading of a repository's configuration and each Git child.
+    pub fn interpose(&mut self, interposition: kr_project::git::Interposition) {
+        self.service.interpose(interposition);
+    }
+
     /// Returns the service.
     #[must_use]
     pub const fn service(&self) -> &ProjectService {
