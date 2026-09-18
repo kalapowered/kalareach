@@ -60,7 +60,7 @@ fn an_initialised_repository_is_published_from_a_private_sibling_and_nothing_is_
             .is_some_and(|name| name.starts_with(STAGING_PREFIX)),
         "the staging path is a private sibling of the destination: {staged}"
     );
-    assert!(!Path::new(staged).exists(), "the sibling is gone");
+    support::assert_absent(Path::new(staged), "the sibling is gone");
     // The published repository is a repository, and the parent holds nothing else.
     assert!(fixture.work().join("fresh/.git").is_dir());
     assert_eq!(support::names_in(fixture.work()), vec!["fresh".to_owned()]);
@@ -646,9 +646,9 @@ fn an_interrupted_publication_is_reconciled_against_the_create_token() {
     let recovery = replacement.recover().expect("recovery runs");
     assert_eq!(recovery.publications_completed, 1);
     assert_eq!(recovery.unresolved, 0);
-    assert!(
-        !sibling.exists(),
-        "the sibling the publication came out of is removed"
+    support::assert_absent(
+        &sibling,
+        "the sibling the publication came out of is removed",
     );
     // The same publication with *no* recorded identity for the sibling: the publication still
     // completes, and the directory is left for a person rather than removed on a name alone.
@@ -795,7 +795,7 @@ fn an_operation_that_never_published_leaves_the_destination_untouched_and_is_clo
     let replacement = fixture.reopen();
     let recovery = replacement.recover().expect("recovery runs");
     assert_eq!(recovery.staging_removed, 1);
-    assert!(!staging.exists(), "the abandoned staging directory is gone");
+    support::assert_absent(&staging, "the abandoned staging directory is gone");
     // The published repository is untouched: nothing here removes a destination.
     assert!(fixture.work().join("never/.git").is_dir());
     let operation = replacement
@@ -1212,7 +1212,7 @@ fn recovery_removes_the_staging_directories_it_recorded_and_nothing_else() {
     let replacement = fixture.reopen();
     let recovery = replacement.recover().expect("recovery runs");
     assert!(recovery.staging_removed >= 1);
-    assert!(!recorded.exists(), "the recorded sibling is removed");
+    support::assert_absent(&recorded, "the recorded sibling is removed");
     // And the user's own repository, whose name merely looks like one of this host's, is untouched.
     assert!(
         decoy.join(".git").is_dir(),

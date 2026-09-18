@@ -583,9 +583,9 @@ fn a_driver_named_in_a_spelling_an_override_could_miss_still_never_runs() {
             .profile()
             .run_checked(&repository.read(&arguments))
             .expect("the status is read");
-        assert!(
-            !sentinels.exists(),
-            "the {key} driver never ran during the status"
+        support::assert_absent(
+            &sentinels,
+            &format!("the {key} driver never ran during the status"),
         );
     }
 }

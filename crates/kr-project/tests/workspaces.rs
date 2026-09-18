@@ -199,9 +199,12 @@ fn an_isolated_workspace_copies_what_the_policy_includes_and_the_source_keeps_ev
         "changed after the commit\n"
     );
     // The excluded classes did not.
-    assert!(!review.join("notes.txt").exists());
-    assert!(!review.join("generated/output.txt").exists());
-    assert!(!review.join("image.bin").exists());
+    for excluded in ["notes.txt", "generated/output.txt", "image.bin"] {
+        support::assert_absent(
+            &review.join(excluded),
+            "the excluded classes did not arrive",
+        );
+    }
     // And the source tree still holds every one of them, byte for byte. Nothing was cleaned,
     // stashed or discarded to start a reviewer.
     assert_eq!(
@@ -281,16 +284,19 @@ fn an_independent_clone_has_its_own_object_store() {
         .expect("the workspace is created");
     let clone = fixture.work().join("independent");
     assert!(clone.join(".git/objects").is_dir());
-    assert!(
-        !clone.join(".git/objects/info/alternates").exists(),
-        "an independent clone shares no object store"
+    support::assert_absent(
+        &clone.join(".git/objects/info/alternates"),
+        "an independent clone shares no object store",
     );
     // The base alone: nothing uncommitted was copied in.
     assert_eq!(
         std::fs::read_to_string(clone.join("README.md")).expect("it is there"),
         "a repository\n"
     );
-    assert!(!clone.join("notes.txt").exists());
+    support::assert_absent(
+        &clone.join("notes.txt"),
+        "nothing uncommitted was copied in",
+    );
 }
 
 #[test]
@@ -476,7 +482,7 @@ fn a_removal_is_refused_while_a_bound_session_is_live() {
         .expect("the removal is admitted once nothing is bound");
     assert!(removed.working_files_removed);
     assert_eq!(removed.workspace.state, WorkspaceState::Removed);
-    assert!(!tree.exists());
+    support::assert_absent(&tree, "the working files are gone");
     // The repository's own tree is untouched.
     assert!(fixture.work().join("bound/README.md").is_file());
 }
@@ -568,7 +574,7 @@ fn a_removal_keeps_dirty_content_a_pin_and_review_evidence_until_the_user_approv
     assert_eq!(answer.workspace.state, WorkspaceState::Removed);
     assert!(answer.retained.is_empty());
     assert!(answer.working_files_removed);
-    assert!(!tree.exists());
+    support::assert_absent(&tree, "the working files are gone");
     // And the record survives, so a later read says what happened rather than nothing.
     let read = fixture
         .service()
@@ -977,13 +983,16 @@ fn a_deletion_the_user_has_is_carried_by_removing_the_path() {
         "the preview names the deletion: {:?}",
         created.preview.entries
     );
-    assert!(
-        !fixture.work().join("deleted/README.md").exists(),
-        "the workspace holds the deletion rather than the base's copy"
+    support::assert_absent(
+        &fixture.work().join("deleted/README.md"),
+        "the workspace holds the deletion rather than the base's copy",
     );
     // And the source still has its own state: the file the user deleted is still deleted there,
     // and nothing else was touched.
-    assert!(!fixture.work().join("deleting/README.md").exists());
+    support::assert_absent(
+        &fixture.work().join("deleting/README.md"),
+        "the source still holds the deletion the user made",
+    );
     assert!(fixture.work().join("deleting/src/lib.rs").is_file());
 }
 
@@ -1048,7 +1057,10 @@ fn a_path_this_host_cannot_read_is_excluded_by_an_exclusion_and_named_by_an_incl
     assert_eq!(link.content, kr_protocol::project::ContentClass::Unknown);
     assert!(!link.included, "what this host could not read is left out");
     assert!(excluded.preview.unknown_content.get() >= 1);
-    assert!(!fixture.work().join("excluded/link.rs").exists());
+    support::assert_absent(
+        &fixture.work().join("excluded/link.rs"),
+        "what this host could not read is left out",
+    );
 
     // An inclusion of binary files takes it, and the result names it as one this host could not
     // carry rather than pretending the workspace holds it.
@@ -1079,8 +1091,12 @@ fn a_path_this_host_cannot_read_is_excluded_by_an_exclusion_and_named_by_an_incl
         "the result names what it could not carry: {:?}",
         included.unapplied
     );
-    // And the link is still in the source tree.
-    assert!(fixture.work().join("unreadable/link.rs").exists());
+    // And the link is still in the source tree. The name is what matters, not what it points at,
+    // so this asks about the name itself.
+    assert!(
+        std::fs::symlink_metadata(fixture.work().join("unreadable/link.rs")).is_ok(),
+        "the link the inclusion could not carry is still where the user left it"
+    );
 }
 
 #[test]
@@ -1156,7 +1172,10 @@ fn a_live_automation_run_refuses_a_removal_as_a_live_session_does() {
         )
         .expect("the removal is admitted once nothing holds it");
     assert_eq!(answer.workspace.state, WorkspaceState::Removed);
-    assert!(!fixture.work().join("run-tree").exists());
+    support::assert_absent(
+        &fixture.work().join("run-tree"),
+        "the working files are gone once nothing holds the workspace",
+    );
 }
 
 #[test]
@@ -1617,9 +1636,9 @@ fn a_staged_deletion_is_carried_like_an_unstaged_one() {
         "a staged deletion is a deletion: {:?}",
         created.preview.entries
     );
-    assert!(
-        !fixture.work().join("staged-tree/README.md").exists(),
-        "the workspace holds the deletion rather than the base's copy"
+    support::assert_absent(
+        &fixture.work().join("staged-tree/README.md"),
+        "the workspace holds the deletion rather than the base's copy",
     );
 }
 
@@ -1916,9 +1935,9 @@ fn a_staging_name_a_workspace_recorded_is_swept_only_while_it_holds_that_object(
     drop(journal);
     let replacement = fixture.reopen();
     replacement.recover().expect("recovery runs again");
-    assert!(
-        !replaced.exists(),
-        "the sibling whose identity the row holds is removed"
+    support::assert_absent(
+        &replaced,
+        "the sibling whose identity the row holds is removed",
     );
 }
 
@@ -2131,9 +2150,9 @@ fn a_link_the_policy_includes_is_named_rather_than_copied() {
         std::fs::read_to_string(tree.join("generated/real.txt")).is_ok(),
         "the file beside it is carried"
     );
-    assert!(
-        !tree.join("generated/link.txt").exists(),
-        "and nothing is put where the link was"
+    support::assert_absent(
+        &tree.join("generated/link.txt"),
+        "and nothing is put where the link was",
     );
     // The path is journalled with the rest, so a recovered answer names it too.
     let journal = rusqlite::Connection::open(

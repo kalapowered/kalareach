@@ -17,6 +17,31 @@ use kr_ipc::testing::TempHost;
 use kr_project::ProjectService;
 use kr_project::credential::{BrokerRegistry, OS_SECRET_STORE};
 
+/// Fails the test unless nothing at all is at the path, and says what it found instead.
+///
+/// `Path::exists` answers false when the platform would not say — a permission failure anywhere
+/// along the path reads exactly like an absence — and it follows a link, so a name whose target is
+/// gone reads as absent although the name is still there. An assertion that something was removed
+/// has to distinguish those, so this asks about the name itself and accepts only its plain absence.
+///
+/// # Panics
+///
+/// Panics when something is at the path, and when the platform will not say whether anything is.
+pub fn assert_absent(path: &Path, what: &str) {
+    match std::fs::symlink_metadata(path) {
+        Ok(found) => panic!(
+            "{what}: {} still holds {:?}",
+            path.display(),
+            found.file_type()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "{what}: whether {} is there could not be established: {error}",
+            path.display()
+        ),
+    }
+}
+
 /// Returns the names one directory holds, sorted, and fails the test on anything it could not read.
 ///
 /// A listing that turns a failure into an empty list is a listing that says "there is nothing here"

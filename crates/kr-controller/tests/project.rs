@@ -373,7 +373,7 @@ async fn every_project_and_workspace_method_runs_end_to_end_through_the_daemon()
         .expect("the preview counts untracked files");
     assert_eq!(untracked.total, U64::new(1));
     assert_eq!(untracked.included, U64::new(0));
-    assert!(!host.work().join("review").exists());
+    assert_absent(&host.work().join("review"), "the preview created nothing");
 
     // Then the creation itself.
     let created: WorkspaceCreateResult = typed(
@@ -401,7 +401,10 @@ async fn every_project_and_workspace_method_runs_end_to_end_through_the_daemon()
         std::fs::read_to_string(host.work().join("review/README.md")).expect("it is there"),
         "changed after the commit\n"
     );
-    assert!(!host.work().join("review/notes.txt").exists());
+    assert_absent(
+        &host.work().join("review/notes.txt"),
+        "the excluded file did not arrive",
+    );
     assert_eq!(
         std::fs::read_to_string(source.join("notes.txt")).expect("the original is untouched"),
         "the user's own untracked file\n"
@@ -535,7 +538,10 @@ async fn the_daemon_refuses_a_project_envelope_that_names_a_session_or_another_e
             .expect("the call reaches the daemon"),
     );
     assert_eq!(refusal.code, ErrorCode::InvalidArgument);
-    assert!(!host.work().join("never").exists());
+    assert_absent(
+        &host.work().join("never"),
+        "a refused creation makes nothing",
+    );
     let _ = host.stop().await;
 }
 
@@ -906,7 +912,10 @@ async fn a_verified_download_publishes_into_a_workspace_this_daemon_created() {
         bytes
     );
     // And the repository's own tree did not receive it: a workspace is its own object.
-    assert!(!host.work().join("delivered/review-notes.bin").exists());
+    assert_absent(
+        &host.work().join("delivered/review-notes.bin"),
+        "the repository's own tree did not receive it",
+    );
     drop(control);
     let _ = host.stop().await;
 }
@@ -1000,10 +1009,7 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
 
     // The replacement resolved it: the destination was never written and the staged content is
     // gone. Nothing was retried as another clone.
-    assert!(
-        !work.path().join("hanging").exists(),
-        "the destination is untouched"
-    );
+    assert_absent(&work.path().join("hanging"), "the destination is untouched");
     let leftovers: Vec<String> = names_in(work.path())
         .into_iter()
         .filter(|name| name.starts_with(kr_project::operation::STAGING_PREFIX))
@@ -1062,10 +1068,7 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
             .expect("the call reaches the replacement"),
     );
     assert_eq!(refusal.code, ErrorCode::IdConflict);
-    assert!(
-        !work.path().join("hanging").exists(),
-        "the repeat cloned nothing"
-    );
+    assert_absent(&work.path().join("hanging"), "the repeat cloned nothing");
     let listed: ProjectListResult = typed(
         &control
             .request(Method::ProjectList, &ProjectListParams { environment_id })
@@ -1195,6 +1198,25 @@ impl Drop for EnvironmentSecrets {
     fn drop(&mut self) {
         // Best effort on the way out an assertion takes. The successful path checks the result.
         let _ = self.remove();
+    }
+}
+
+/// Fails the test unless nothing at all is at the path, and says what it found instead.
+///
+/// `Path::exists` answers false when the platform would not say, and it follows a link, so an
+/// assertion that something was never created has to ask about the name itself.
+fn assert_absent(path: &Path, what: &str) {
+    match std::fs::symlink_metadata(path) {
+        Ok(found) => panic!(
+            "{what}: {} still holds {:?}",
+            path.display(),
+            found.file_type()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!(
+            "{what}: whether {} is there could not be established: {error}",
+            path.display()
+        ),
     }
 }
 
