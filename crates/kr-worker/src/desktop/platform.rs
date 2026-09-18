@@ -416,9 +416,7 @@ mod implementation {
 #[cfg(target_os = "linux")]
 mod implementation {
     use super::{Login, Presence, Printed, Reading, anchor, run};
-    use kr_protocol::desktop::{
-        DesktopAvailability, DesktopGenerationSource, DesktopSessionKind, DisplayServer,
-    };
+    use kr_protocol::desktop::{DesktopGenerationSource, DesktopSessionKind, DisplayServer};
 
     /// Reads the user's graphical login session through the login manager.
     ///

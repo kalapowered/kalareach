@@ -540,29 +540,6 @@ mod platform {
         })
     }
 
-    #[cfg(test)]
-    mod tests {
-        use super::names;
-
-        #[test]
-        fn only_this_process_s_own_inhibitor_acknowledges_it() {
-            let printed = "KalaReach 1000 someone 4242 systemd-inhibit sleep:idle KalaReach has \
-                           admitted work that is still running block\n\
-                           KalaReach 1000 someone 99 systemd-inhibit sleep:idle KalaReach has \
-                           admitted work that is still running block\n";
-            assert!(names(printed, "4242"));
-            assert!(names(printed, "99"));
-            assert!(
-                !names(printed, "4243"),
-                "another environment's inhibitor is not this one"
-            );
-            assert!(
-                !names("PowerDevil 1000 someone 4242 kded5 sleep block\n", "4242"),
-                "another program's inhibitor is not this one"
-            );
-        }
-    }
-
     /// Reads whether this host is running on mains power.
     ///
     /// The kernel publishes one file per power supply. A supply of type `Mains` that is online is
@@ -592,6 +569,29 @@ mod platform {
             (Some(false), false) => PowerSource::Unknown,
             (None, true) => PowerSource::Battery,
             (None, false) => PowerSource::Unknown,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::names;
+
+        #[test]
+        fn only_this_process_s_own_inhibitor_acknowledges_it() {
+            let printed = "KalaReach 1000 someone 4242 systemd-inhibit sleep:idle KalaReach has \
+                           admitted work that is still running block\n\
+                           KalaReach 1000 someone 99 systemd-inhibit sleep:idle KalaReach has \
+                           admitted work that is still running block\n";
+            assert!(names(printed, "4242"));
+            assert!(names(printed, "99"));
+            assert!(
+                !names(printed, "4243"),
+                "another environment's inhibitor is not this one"
+            );
+            assert!(
+                !names("PowerDevil 1000 someone 4242 kded5 sleep block\n", "4242"),
+                "another program's inhibitor is not this one"
+            );
         }
     }
 }

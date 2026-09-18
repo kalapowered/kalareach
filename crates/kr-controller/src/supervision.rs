@@ -482,6 +482,10 @@ impl WorkerSupervisor for SystemdSupervisor {
     fn start_service(&self, launch: &ServiceLaunch) -> LaunchOutcome {
         self.start_unit(launch, &[])
     }
+
+    fn describe(&self) -> String {
+        "systemd, one transient user service per session".to_owned()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -516,12 +520,7 @@ impl SystemdSupervisor {
         // disjoint, which is what lets this stand although the manager applies it last.
         let cleared: Vec<&str> = crate::desktop::agent::session_variables()
             .into_iter()
-            .filter(|name| {
-                !launch
-                    .desktop_environment
-                    .iter()
-                    .any(|(set, _)| set == name)
-            })
+            .filter(|name| !desktop.iter().any(|(set, _)| set == name))
             .collect();
         if !cleared.is_empty() {
             arguments.push(format!("--property=UnsetEnvironment={}", cleared.join(" ")));
@@ -560,10 +559,6 @@ impl SystemdSupervisor {
             };
         };
         settle(pid)
-    }
-
-    fn describe(&self) -> String {
-        "systemd, one transient user service per session".to_owned()
     }
 }
 
