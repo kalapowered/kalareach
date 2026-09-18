@@ -2162,6 +2162,24 @@ impl PrivateTemporary {
                 )
                 .into(),
             })?;
+        // Made and opened are two calls, and no interface here makes them one. What the second one
+        // opened is required to be empty, because this host had just made it: a directory somebody
+        // else put at the name between the two is one with something in it, or one this invocation
+        // uses and takes away again having put nothing of anybody else's in it.
+        let mut entries = handle
+            .entries()
+            .map_err(|error| ProjectError::StagingUnavailable {
+                detail: format!("{described}'s own temporary directory could not be read: {error}")
+                    .into(),
+            })?;
+        if entries.next().is_some() {
+            return Err(ProjectError::StagingUnavailable {
+                detail: format!(
+                    "{described}'s own temporary directory is not the empty one this host made"
+                )
+                .into(),
+            });
+        }
         // The boundary's rules are written against a path with no link left in it, and the state
         // directory above this one may reach it through one.
         let path = std::fs::canonicalize(root_path.join(&name)).map_err(|error| {
