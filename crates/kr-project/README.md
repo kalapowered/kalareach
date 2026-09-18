@@ -5,9 +5,10 @@ Git invocation KalaReach makes. `docs/project/` describes the ten methods, the i
 staged publication and the credential rule. This file describes one thing: the boundary each Git
 invocation runs inside, and exactly which mechanism holds which guarantee on each platform.
 
-One Git runs outside all of this, once: the one that says which Git this host has. Resolving the
-program asks it for its version and its own helper directory, with an environment of nothing and no
-repository anywhere near it, before any of the rest exists.
+The Git that runs outside all of this is the one that says which Git this host has. Resolving the
+program starts it two to four times at startup — for its version and its own helper directory, and
+again for the copy under that directory — each with an environment of nothing and no repository
+named, and none of them under a boundary.
 
 ## Why there is one
 
@@ -60,9 +61,10 @@ the Git common directory by its own, the reserved destination by the identity th
 returned. A directory substituted at one of those names is refused before anything starts. The child
 then does not start at a path either: it moves into the open working directory before the boundary
 is applied and before Git runs, with `-C .` as its only directory argument. And after the child has
-gone, every one of those directories is required to still be that object before anything it produced
-is used: a substitution made while Git ran is this service's declared refusal rather than a result
-nobody can account for.
+gone, every one of those directories is required to still be that object before its result reaches a
+caller: a substitution made while Git ran is this service's declared refusal rather than a result
+nobody can account for. That check is on those directories and not on every descendant of them, and
+two readings cannot tell a change made and undone from no change at all.
 
 **Reads are not confined on macOS or Linux.** Git reads the system's shared libraries, its locale
 data and its certificate store, and a read confinement that missed one of those would fail an
@@ -136,9 +138,12 @@ write one. That is why the service refuses on Windows rather than claiming the g
 system-call filter reads scalar arguments while an address is behind a pointer, so nothing there
 could bound where a datagram goes. Rather than permit one, the boundary refuses it: an internet
 socket is a stream socket, which is what every transport here uses and what the port rules govern.
-Turning a name into an address goes over the same kind of connection, which the child is told to do
-and which the port a resolver answers on is in the rules for. A system whose resolver will not take
-that instruction cannot resolve a name inside the boundary, and the operation fails saying so.
+An internet stream socket is also required to be of the protocol those rules are about, because a
+stream socket of another protocol is one they would say nothing about. Turning a name into an
+address goes over the same kind of connection, which the child is told to do and for which the port
+a resolver answers on is added to the rules, on any address, because which machine answers a name is
+not this service's to decide. A system whose resolver will not take that instruction cannot resolve
+a name inside the boundary, and the operation fails saying so.
 
 **The port list would not be enforced on Windows.** An application container's capability permits
 reaching the network or nothing at all; bounding which ports it reaches needs a system-wide filtering

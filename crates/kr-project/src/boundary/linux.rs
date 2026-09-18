@@ -41,12 +41,17 @@
 //! a stream socket, which is what every transport here uses and what Landlock's port rules govern.
 //! Neither may listen, and neither may open a raw or packet socket.
 //!
+//! A stream socket is not the same thing as the protocol the kernel's address rules are about, so
+//! the protocol is checked too: an internet stream socket is the one those rules bound, and a stream
+//! socket of another protocol is one they would say nothing about and is not made.
+//!
 //! What that costs is name resolution, which ordinarily sends datagrams. The child is told to
 //! resolve over the same kind of connection it fetches over (`RES_OPTIONS=use-vc`, which the usual
-//! C library reads), and the port a resolver answers on is in the connect rules for a remote
-//! operation. A system whose resolver does not take that instruction cannot turn a host name into an
-//! address inside this boundary, and the operation fails saying so rather than being given a
-//! datagram socket nothing can bound.
+//! C library reads), and the port a resolver answers on is added to the connect rules for a remote
+//! operation — on any address, because which machine answers a name is not this host's to decide. A
+//! system whose resolver does not take that instruction cannot turn a host name into an address
+//! inside this boundary, and the operation fails saying so rather than being given a datagram
+//! socket nothing can bound.
 //!
 //! The filter is built for this machine's own instruction set, and an architecture whose call
 //! numbers this host does not hold refuses the invocation rather than installing a filter that
@@ -363,6 +368,8 @@ const MACHINE: u32 = 4;
 const FIRST_ARGUMENT: u32 = 16;
 /// Where in the call this filter is judging each thing is.
 const SECOND_ARGUMENT: u32 = 24;
+/// Where in the call this filter is judging each thing is.
+const THIRD_ARGUMENT: u32 = 32;
 
 /// The bits of a socket's kind that name the kind, without the flags that travel beside it.
 const KIND: u32 = 0xff;
@@ -407,21 +414,26 @@ fn filter(remote: bool) -> Result<Vec<libc::sock_filter>> {
         // govern. A datagram is the one thing nothing here could bound, so there is not one.
         program.extend([
             // Index 9: `listen` is refused outright.
-            instruction(COMPARE, 8, 0, SYS_LISTEN),
+            instruction(COMPARE, 11, 0, SYS_LISTEN),
             // 10: anything that is not `socket` is the ordinary work of running Git.
-            instruction(COMPARE, 0, 8, SYS_SOCKET),
+            instruction(COMPARE, 0, 11, SYS_SOCKET),
             // 11, 12: a packet socket is not something any transport needs.
             instruction(LOAD, 0, 0, FIRST_ARGUMENT),
-            instruction(COMPARE, 5, 0, libc::AF_PACKET as u32),
+            instruction(COMPARE, 8, 0, libc::AF_PACKET as u32),
             // 13, 14: a family that is not an internet one reaches this machine's own services and
             // not an address, so it is left alone.
             instruction(COMPARE, 1, 0, libc::AF_INET as u32),
-            instruction(COMPARE, 0, 4, libc::AF_INET6 as u32),
+            instruction(COMPARE, 0, 7, libc::AF_INET6 as u32),
             // 15, 16, 17: an internet socket is a stream one, whatever flags travel beside its kind.
             instruction(LOAD, 0, 0, SECOND_ARGUMENT),
             instruction(MASK, 0, 0, KIND),
-            instruction(COMPARE, 1, 0, libc::SOCK_STREAM as u32),
-            // 18, 19.
+            instruction(COMPARE, 0, 3, libc::SOCK_STREAM as u32),
+            // 18, 19, 20: and its protocol is the one the kernel's own address rules are about.
+            // A stream socket of another protocol is a stream socket those rules say nothing about.
+            instruction(LOAD, 0, 0, THIRD_ARGUMENT),
+            instruction(COMPARE, 2, 0, 0),
+            instruction(COMPARE, 1, 0, libc::IPPROTO_TCP as u32),
+            // 21, 22.
             instruction(ANSWER, 0, 0, REFUSED),
             instruction(ANSWER, 0, 0, PERMITTED),
         ]);
@@ -472,6 +484,7 @@ mod tests {
         number: u32,
         family: u32,
         kind: u32,
+        protocol: u32,
     }
 
     /// Runs the filter over one call and returns the answer it gives.
@@ -487,6 +500,7 @@ mod tests {
                         MACHINE => call.machine,
                         FIRST_ARGUMENT => call.family,
                         SECOND_ARGUMENT => call.kind,
+                        THIRD_ARGUMENT => call.protocol,
                         other => panic!("the filter loaded {other}, which nothing here means"),
                     };
                     at += 1;
@@ -520,6 +534,14 @@ mod tests {
             number,
             family,
             kind,
+            protocol: 0,
+        }
+    }
+
+    fn call_with(number: u32, family: u32, kind: u32, protocol: u32) -> Call {
+        Call {
+            protocol,
+            ..call(number, family, kind)
         }
     }
 
@@ -602,6 +624,32 @@ mod tests {
                 )
             ),
             REFUSED
+        );
+        // A stream socket of a protocol the kernel's address rules say nothing about is one those
+        // rules would not bound, so it is not made either.
+        assert_eq!(
+            judge(
+                &program,
+                call_with(
+                    SYS_SOCKET,
+                    libc::AF_INET as u32,
+                    libc::SOCK_STREAM as u32,
+                    libc::IPPROTO_SCTP as u32
+                )
+            ),
+            REFUSED
+        );
+        assert_eq!(
+            judge(
+                &program,
+                call_with(
+                    SYS_SOCKET,
+                    libc::AF_INET as u32,
+                    libc::SOCK_STREAM as u32,
+                    libc::IPPROTO_TCP as u32
+                )
+            ),
+            PERMITTED
         );
         assert_eq!(judge(&program, call(SYS_LISTEN, 0, 0)), REFUSED);
         assert_eq!(judge(&program, call(1, 0, 0)), PERMITTED);

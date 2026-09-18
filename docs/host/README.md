@@ -609,8 +609,11 @@ confinement that missed one of those would fail an operation for a reason that h
 with safety. What a repository can reach by reading is what the account this host runs as can reach,
 exactly as before.
 
-Where a guarantee cannot be enforced from outside Git, the operation that needs it is refused rather
-than run under checks that notice afterwards. A kernel too old to mediate the filesystem rights this
+Where a guarantee cannot be enforced from outside Git at all, the operation that needs it is refused
+rather than run under checks that notice afterwards. Two cases are the exception, and
+`crates/kr-project/README.md` names them: a directory Git is given by name, and a directory put
+inside a tree the operation owns, are answered by a refusal after the fact rather than prevented,
+because no filesystem confinement that grants a tree can refuse part of it. A kernel too old to mediate the filesystem rights this
 rests on runs no Git; one too old to say which addresses a process may reach runs no remote
 operation; and **Windows runs no repository operation at all**, because an application container cannot keep a
 repository from being executed from and cannot bound which ports a remote operation reaches. The
