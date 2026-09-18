@@ -317,10 +317,6 @@ const SECOND_ARGUMENT: u32 = 24;
 const KIND: u32 = 0xff;
 
 /// The answer for a call this filter will not let happen: the caller is refused permission.
-#[expect(
-    clippy::cast_sign_loss,
-    reason = "the error number is a small positive constant"
-)]
 const REFUSED: u32 = 0x0005_0000 | (libc::EACCES as u32);
 /// The answer for a call this filter permits.
 const PERMITTED: u32 = 0x7fff_0000;
@@ -336,10 +332,6 @@ const UNKNOWN_MACHINE: u32 = 0x8000_0000;
 ///
 /// Returns [`ProjectError::GitFailed`] on an instruction set this host holds no call numbers for.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[expect(
-    clippy::cast_sign_loss,
-    reason = "the address families and socket kinds are small positive constants"
-)]
 fn filter(remote: bool) -> Result<Vec<libc::sock_filter>> {
     let mut program = vec![
         instruction(LOAD, 0, 0, MACHINE),
@@ -472,10 +464,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "the address families and socket kinds are small positive constants"
-    )]
     fn a_local_invocation_cannot_make_an_internet_socket_or_listen() {
         let program = filter(false).expect("a filter for this machine");
         for family in [libc::AF_INET, libc::AF_INET6, libc::AF_PACKET] {
@@ -496,10 +484,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(
-        clippy::cast_sign_loss,
-        reason = "the address families and socket kinds are small positive constants"
-    )]
     fn a_remote_invocation_may_connect_out_and_still_cannot_listen_or_go_below_its_protocol() {
         let program = filter(true).expect("a filter for this machine");
         assert_eq!(
