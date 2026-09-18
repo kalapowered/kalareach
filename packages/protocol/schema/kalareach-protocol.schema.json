@@ -440,6 +440,16 @@
         }
       ]
     },
+    "AdoptionFlow": {
+      "description": "The one adoption flow this host supports for a destination that already exists.\n\nSection 14 rejects a nonempty or existing destination *unless the user explicitly chooses an\nindependently supported adoption flow*, and forbids merging a clone into one. So there is\nexactly one member: adopting a checkout that is already a Git repository, which reads what is\nthere and writes nothing into the working tree. A second member would have to be a merge, and\nthat is the thing the paragraph forbids.",
+      "oneOf": [
+        {
+          "const": "existing_checkout",
+          "description": "Register an existing Git working tree as a repository, changing nothing inside it.\n\nThe host reads the repository's own configuration under the restricted profile, records its\nfilesystem identity and its current reference, and adds a row. It does not fetch, does not\ncheck anything out, does not touch the index and does not write into the working tree.",
+          "type": "string"
+        }
+      ]
+    },
     "AgentBindingRevision": {
       "description": "Changes when the active upstream execution owner or selected thread changes.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -1705,6 +1715,26 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "ChangeKind": {
+      "description": "What the working tree holds for one path.\n\nA copy is not the only way to carry an inclusion: a deletion is carried by removing the path\nfrom the new workspace, and a path this host cannot read is carried by neither.",
+      "oneOf": [
+        {
+          "const": "present",
+          "description": "The content differs from the base, or the path is new.",
+          "type": "string"
+        },
+        {
+          "const": "deleted",
+          "description": "The path is gone from the working tree and the base still has it.",
+          "type": "string"
+        },
+        {
+          "const": "unmerged",
+          "description": "The path has an unresolved merge.",
+          "type": "string"
+        }
+      ]
+    },
     "ChangeSetId": {
       "description": "One immutable captured change set.",
       "format": "uuid",
@@ -2161,6 +2191,26 @@
         {
           "const": "wsl",
           "description": "The context runs in a Windows Subsystem for Linux distribution.",
+          "type": "string"
+        }
+      ]
+    },
+    "ContentClass": {
+      "description": "What one path's content is, as far as this host read it.\n\nThe test for binary is Git's own: a null byte in the first eight thousand bytes of content as it\nis stored. [`Self::Unknown`] is the honest third answer, for a path this host did not read\nbecause the preview's scan bound was reached, or could not read at all. An unknown path is\ntreated as binary by an exclusion, because excluding what might be binary is the direction that\nhonours the request.",
+      "oneOf": [
+        {
+          "const": "text",
+          "description": "Read, and no null byte in the first eight thousand bytes.",
+          "type": "string"
+        },
+        {
+          "const": "binary",
+          "description": "Read, and a null byte in the first eight thousand bytes.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "Not read, so neither.",
           "type": "string"
         }
       ]
@@ -2820,6 +2870,55 @@
         {
           "const": "none",
           "description": "No graphical login session was named. A headless user context reads this way.",
+          "type": "string"
+        }
+      ]
+    },
+    "DestinationRequest": {
+      "additionalProperties": false,
+      "description": "Where a repository operation puts what it creates.\n\nA parent the caller already holds authority over, and one single-component name inside it. The\nparent is named by a path the host resolves **once**, with its own ambient authority, into a\ndirectory handle; everything after that is relative to the handle. A multi-component name is\nrefused, because the operation that creates the entry must not depend on a prefix resolved\nafter the check.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the repository will belong to."
+        },
+        "name": {
+          "description": "The single name inside it. No separators, no traversal segment, no reserved device name.",
+          "type": "string"
+        },
+        "parent_path": {
+          "description": "The parent directory, as an absolute host path the caller chose.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "environment_id",
+        "parent_path",
+        "name"
+      ],
+      "type": "object"
+    },
+    "DestinationState": {
+      "description": "What a destination looked like before an operation was allowed to use it.",
+      "oneOf": [
+        {
+          "const": "absent",
+          "description": "Nothing exists at the name.",
+          "type": "string"
+        },
+        {
+          "const": "empty_directory",
+          "description": "A directory exists at the name and holds nothing.",
+          "type": "string"
+        },
+        {
+          "const": "non_empty_directory",
+          "description": "A directory exists at the name and holds entries.",
+          "type": "string"
+        },
+        {
+          "const": "occupied",
+          "description": "A file, a link or something else exists at the name.",
           "type": "string"
         }
       ]
@@ -4976,6 +5075,25 @@
         }
       ]
     },
+    "FilesystemIdentity": {
+      "additionalProperties": false,
+      "description": "A repository's stable environment-local identity, as a client may show it.\n\nThe two numbers are the device and the object number of the Git directory: the inode on Unix\nand the file index on Windows. They are metadata a client can display and compare; they are\nnever an authority, because authority is the opened handle the host holds.",
+      "properties": {
+        "device": {
+          "$ref": "#/$defs/U64",
+          "description": "The device or volume the object lives on."
+        },
+        "file_id": {
+          "$ref": "#/$defs/U64",
+          "description": "The object's number within that device or volume."
+        }
+      },
+      "required": [
+        "device",
+        "file_id"
+      ],
+      "type": "object"
+    },
     "ForwardedMutation": {
       "additionalProperties": false,
       "description": "A mutation the host admitted for a caller, passed to the component that owns its subject.\n\nThe control daemon owns admission: it authenticates the caller, stamps the freshness window,\nchecks the envelope and derives the accepted deadline. The worker owns the subject. Forwarding\ncarries the caller's mutation to the worker **unchanged**, because the mutation is what the\npayload digest covers and what the caller will retry with: rewriting any of it would give the\nworker a different action from the one the caller asked for.\n\nWhat travels beside it is what the worker cannot establish for itself: which principal the host\nverified, and the deadline the host accepted. The worker performs the action under both.",
@@ -5720,6 +5838,182 @@
         }
       ]
     },
+    "InclusionChoice": {
+      "description": "What a workspace does with the user's uncommitted work.\n\nEvery member is a decision the user made, and none of them removes anything from the user's own\ntree: an exclusion means the new workspace starts without that file, never that the file is\ncleaned, stashed or discarded where it is.",
+      "oneOf": [
+        {
+          "const": "include",
+          "description": "The workspace starts with this class of file copied in.",
+          "type": "string"
+        },
+        {
+          "const": "exclude",
+          "description": "The workspace starts without it. The original stays where it is, untouched.",
+          "type": "string"
+        }
+      ]
+    },
+    "InclusionClass": {
+      "description": "Which class of the working tree one previewed entry belongs to.\n\nThe first four say where a path came from and a path has exactly one of them.\n[`Self::BinaryFile`] is the exception: it cuts across the others, so it appears in the counts\nand in [`PreviewEntry::binary`] rather than as a path's own class.",
+      "oneOf": [
+        {
+          "const": "dirty_file",
+          "description": "A tracked file with uncommitted modifications.",
+          "type": "string"
+        },
+        {
+          "const": "untracked_file",
+          "description": "A file Git neither tracks nor ignores.",
+          "type": "string"
+        },
+        {
+          "const": "submodule",
+          "description": "A submodule working tree.",
+          "type": "string"
+        },
+        {
+          "const": "binary_file",
+          "description": "A file whose content Git reports as binary.",
+          "type": "string"
+        },
+        {
+          "const": "generated_artefact",
+          "description": "A file an ignore rule covers.",
+          "type": "string"
+        }
+      ]
+    },
+    "InclusionPolicy": {
+      "additionalProperties": false,
+      "description": "The inclusion policy of an isolated workspace, one decision per class.\n\nSection 14 names the five classes explicitly, so they are five fields rather than a list of\npatterns: a user answering five questions can see what they answered, and a policy that is a\npattern language cannot be previewed honestly.",
+      "properties": {
+        "binary_files": {
+          "$ref": "#/$defs/InclusionChoice",
+          "description": "Files whose content Git reports as binary."
+        },
+        "dirty_files": {
+          "$ref": "#/$defs/InclusionChoice",
+          "description": "Tracked files with uncommitted modifications."
+        },
+        "generated_artefacts": {
+          "$ref": "#/$defs/InclusionChoice",
+          "description": "Files an ignore rule covers, which is what a build usually produces."
+        },
+        "submodules": {
+          "$ref": "#/$defs/InclusionChoice",
+          "description": "Submodule working trees."
+        },
+        "untracked_files": {
+          "$ref": "#/$defs/InclusionChoice",
+          "description": "Files Git does not track and does not ignore."
+        }
+      },
+      "required": [
+        "dirty_files",
+        "untracked_files",
+        "submodules",
+        "binary_files",
+        "generated_artefacts"
+      ],
+      "type": "object"
+    },
+    "InclusionPreview": {
+      "additionalProperties": false,
+      "description": "What a reviewer would see, before the workspace exists.\n\nSection 14 requires the create interface to preview what will be included. This is that\npreview as data: exact counts per class, a bounded sample of paths, and the base the\nmaterialisation would start from. It is a read, so it creates nothing and changes nothing.",
+      "properties": {
+        "base_change_set_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChangeSetId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The change-set version an isolated workspace would materialise, when it names one."
+        },
+        "base_reference": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The reference that revision was named by, when it was named by one."
+        },
+        "base_revision": {
+          "description": "The revision an isolated workspace would start from, as the repository resolved it.",
+          "type": "string"
+        },
+        "counts": {
+          "description": "One row per class, with exact counts.",
+          "items": {
+            "$ref": "#/$defs/PreviewCount"
+          },
+          "type": "array"
+        },
+        "counts_complete": {
+          "description": "True when every count above is the whole of its class.\n\nFalse when a bound was reached: an ignored directory deeper or larger than the walk\ncovers, or a directory this host could not list. Then each count is a lower bound and the\nlimitations say which bound was reached.",
+          "type": "boolean"
+        },
+        "entries": {
+          "description": "A bounded sample of the paths, grouped by class in [`InclusionClass::EVERY`] order.",
+          "items": {
+            "$ref": "#/$defs/PreviewEntry"
+          },
+          "type": "array"
+        },
+        "kind": {
+          "$ref": "#/$defs/WorkspaceKind",
+          "description": "The kind of workspace it was taken for."
+        },
+        "limitations": {
+          "description": "What this preview cannot promise, in the host's own words.\n\nA shared workspace is not a sandbox; a worktree shares repository metadata; a working tree\ncan change between the preview and the creation. A client shows this rather than deciding\nfor the user.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "omitted_entries": {
+          "$ref": "#/$defs/U64",
+          "description": "How many paths the sample left out. The counts still cover them."
+        },
+        "policy": {
+          "$ref": "#/$defs/InclusionPolicy",
+          "description": "The policy it was taken under."
+        },
+        "project_repository_id": {
+          "$ref": "#/$defs/ProjectRepositoryId",
+          "description": "The repository the preview was taken on."
+        },
+        "taken_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was taken."
+        },
+        "unknown_content": {
+          "$ref": "#/$defs/U64",
+          "description": "How many paths this host could not classify as text or binary.\n\nReading every path's first bytes costs an open each, and a working tree with a build\ndirectory in it holds hundreds of thousands. Above [`MAX_BINARY_SCAN_ENTRIES`] the host\nstops reading and says how many it did not read rather than calling them text."
+        }
+      },
+      "required": [
+        "project_repository_id",
+        "kind",
+        "policy",
+        "base_revision",
+        "base_reference",
+        "base_change_set_id",
+        "counts",
+        "entries",
+        "omitted_entries",
+        "unknown_content",
+        "counts_complete",
+        "limitations",
+        "taken_at_ms"
+      ],
+      "type": "object"
+    },
     "InhibitionMechanism": {
       "description": "Which platform facility holds the assertion.",
       "oneOf": [
@@ -6059,6 +6353,21 @@
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "IsolationMechanism": {
+      "description": "How an isolated workspace is separated from the user's own tree.",
+      "oneOf": [
+        {
+          "const": "git_worktree",
+          "description": "A Git worktree: separate working files, shared repository metadata, same account.\n\nNot a security sandbox. A process in this workspace can read and write the repository's\nobjects and references, which are the same ones the user's own tree uses.",
+          "type": "string"
+        },
+        {
+          "const": "independent_clone",
+          "description": "An independent clone: its own object store and its own references.\n\nUsed where shared metadata is not acceptable. It costs the objects it copies.",
+          "type": "string"
+        }
+      ]
     },
     "KeyId": {
       "contentEncoding": "base64url",
@@ -7673,6 +7982,142 @@
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
     },
+    "OperationRecord": {
+      "additionalProperties": false,
+      "description": "One repository operation, as a read or a cancellation returns it.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The action that started it. This is the create token a reconciliation is decided against."
+        },
+        "destination_state": {
+          "$ref": "#/$defs/DestinationState",
+          "description": "The destination's state when the operation was admitted."
+        },
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why it ended, when it ended for a reason."
+        },
+        "ended_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When it ended, once it has."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns it."
+        },
+        "method": {
+          "description": "Which method started it.",
+          "type": "string"
+        },
+        "project_repository_id": {
+          "$ref": "#/$defs/ProjectRepositoryId",
+          "description": "The repository it creates, allocated when the operation begins."
+        },
+        "remote": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteSpecification"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The remote it reaches, when it reaches one."
+        },
+        "removed_staging_paths": {
+          "description": "The staging paths this host removed.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "retained_staging_paths": {
+          "description": "The staging paths that still exist, for a person to find.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "started_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it started."
+        },
+        "state": {
+          "$ref": "#/$defs/OperationState",
+          "description": "What state it is in."
+        }
+      },
+      "required": [
+        "action_id",
+        "environment_id",
+        "project_repository_id",
+        "method",
+        "state",
+        "remote",
+        "destination_state",
+        "retained_staging_paths",
+        "removed_staging_paths",
+        "detail",
+        "started_at_ms",
+        "ended_at_ms"
+      ],
+      "type": "object"
+    },
+    "OperationState": {
+      "description": "What state one repository operation is in.",
+      "oneOf": [
+        {
+          "const": "staging",
+          "description": "It is staging content and has published nothing.",
+          "type": "string"
+        },
+        {
+          "const": "publishing",
+          "description": "Staging finished, and the publication into the destination is under way.\n\nA daemon that dies here resolves the publication from the create token rather than starting\nanother clone: whichever name holds the staged object decides what happened.",
+          "type": "string"
+        },
+        {
+          "const": "completed",
+          "description": "It completed and the repository exists.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "The caller cancelled it. The result says which staging paths were removed and which stayed.",
+          "type": "string"
+        },
+        {
+          "const": "failed",
+          "description": "It failed. The reason is recorded and the staged content is cleaned up.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "It ran past [`OPERATION_DEADLINE`].",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "It was interrupted and this host cannot say whether its publication landed.\n\nReconciliation resolves it against the create token; until it does, a repeat of the same\naction is answered with this rather than performed again.",
+          "type": "string"
+        }
+      ]
+    },
     "OrganisationId": {
       "description": "One organisation whose signed policy a host has opted into.",
       "format": "uuid",
@@ -8653,6 +9098,81 @@
         }
       ]
     },
+    "PreviewCount": {
+      "additionalProperties": false,
+      "description": "One class's counts in a preview.",
+      "properties": {
+        "byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "Their total size in bytes, as far as the host could read it."
+        },
+        "class": {
+          "$ref": "#/$defs/InclusionClass",
+          "description": "The class."
+        },
+        "included": {
+          "$ref": "#/$defs/U64",
+          "description": "How many of them the policy in force would copy in."
+        },
+        "total": {
+          "$ref": "#/$defs/U64",
+          "description": "How many paths in the working tree belong to it."
+        }
+      },
+      "required": [
+        "class",
+        "total",
+        "included",
+        "byte_len"
+      ],
+      "type": "object"
+    },
+    "PreviewEntry": {
+      "additionalProperties": false,
+      "description": "One path an inclusion preview names.",
+      "properties": {
+        "byte_len": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its size in bytes, when the host could read one."
+        },
+        "change": {
+          "$ref": "#/$defs/ChangeKind",
+          "description": "What change the working tree holds for it."
+        },
+        "class": {
+          "$ref": "#/$defs/InclusionClass",
+          "description": "Which class it belongs to: where in the working tree it came from."
+        },
+        "content": {
+          "$ref": "#/$defs/ContentClass",
+          "description": "What its content is.\n\nThis cuts across the other classes rather than replacing them: a dirty file may be binary,\nand a policy that includes dirty files and excludes binaries leaves this one out."
+        },
+        "included": {
+          "description": "Whether the policy in force would copy it into the new workspace.",
+          "type": "boolean"
+        },
+        "path": {
+          "description": "The path, relative to the repository's top level.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "class",
+        "change",
+        "content",
+        "byte_len",
+        "included"
+      ],
+      "type": "object"
+    },
     "PreviewFormat": {
       "description": "The image formats a preview decoder accepts.\n\nNothing else is decoded. HTML and SVG are files, not images: rendering either needs a reviewed\nrenderer, which this is not.",
       "oneOf": [
@@ -8751,11 +9271,365 @@
       ],
       "type": "object"
     },
+    "ProjectAdoptParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `project.adopt`.",
+      "properties": {
+        "destination": {
+          "$ref": "#/$defs/DestinationRequest",
+          "description": "The checkout to adopt, named the same way a destination is."
+        },
+        "flow": {
+          "$ref": "#/$defs/AdoptionFlow",
+          "description": "The flow the user explicitly chose.\n\nThere is no default. A destination that already exists is refused unless this names a flow,\nwhich is what section 14 requires."
+        },
+        "label": {
+          "description": "The label the user gave it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "destination",
+        "label",
+        "flow"
+      ],
+      "type": "object"
+    },
+    "ProjectAdoptResult": {
+      "additionalProperties": false,
+      "description": "Result of `project.adopt`.",
+      "properties": {
+        "operation": {
+          "$ref": "#/$defs/OperationRecord",
+          "description": "The operation that registered it."
+        },
+        "project": {
+          "$ref": "#/$defs/ProjectSummary",
+          "description": "The repository that is now known here."
+        }
+      },
+      "required": [
+        "project",
+        "operation"
+      ],
+      "type": "object"
+    },
+    "ProjectCloneParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `project.clone`.",
+      "properties": {
+        "destination": {
+          "$ref": "#/$defs/DestinationRequest",
+          "description": "Where the clone goes."
+        },
+        "label": {
+          "description": "The label the user gave it.",
+          "type": "string"
+        },
+        "remote": {
+          "$ref": "#/$defs/RemoteSpecification",
+          "description": "The remote to clone, its validated transport, its provider and its credential broker."
+        }
+      },
+      "required": [
+        "destination",
+        "label",
+        "remote"
+      ],
+      "type": "object"
+    },
+    "ProjectCloneResult": {
+      "additionalProperties": false,
+      "description": "Result of `project.clone`.",
+      "properties": {
+        "operation": {
+          "$ref": "#/$defs/OperationRecord",
+          "description": "The operation that created it."
+        },
+        "project": {
+          "$ref": "#/$defs/ProjectSummary",
+          "description": "The repository that now exists."
+        }
+      },
+      "required": [
+        "project",
+        "operation"
+      ],
+      "type": "object"
+    },
+    "ProjectInitParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `project.init`.",
+      "properties": {
+        "destination": {
+          "$ref": "#/$defs/DestinationRequest",
+          "description": "Where the repository goes."
+        },
+        "initial_branch": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The name of the initial branch, when the user chose one."
+        },
+        "label": {
+          "description": "The label the user gave it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "destination",
+        "label",
+        "initial_branch"
+      ],
+      "type": "object"
+    },
+    "ProjectInitResult": {
+      "additionalProperties": false,
+      "description": "Result of `project.init`.",
+      "properties": {
+        "operation": {
+          "$ref": "#/$defs/OperationRecord",
+          "description": "The operation that created it."
+        },
+        "project": {
+          "$ref": "#/$defs/ProjectSummary",
+          "description": "The repository that now exists."
+        }
+      },
+      "required": [
+        "project",
+        "operation"
+      ],
+      "type": "object"
+    },
+    "ProjectListParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `project.list`.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment to list."
+        }
+      },
+      "required": [
+        "environment_id"
+      ],
+      "type": "object"
+    },
+    "ProjectListResult": {
+      "additionalProperties": false,
+      "description": "Result of `project.list`.",
+      "properties": {
+        "projects": {
+          "description": "The repositories, oldest first.",
+          "items": {
+            "$ref": "#/$defs/ProjectSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "projects"
+      ],
+      "type": "object"
+    },
+    "ProjectOperationCancelParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `project.operation.cancel`.",
+      "properties": {
+        "operation_action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The action that started the operation to cancel."
+        }
+      },
+      "required": [
+        "operation_action_id"
+      ],
+      "type": "object"
+    },
+    "ProjectOperationCancelResult": {
+      "additionalProperties": false,
+      "description": "Result of `project.operation.cancel`.",
+      "properties": {
+        "operation": {
+          "$ref": "#/$defs/OperationRecord",
+          "description": "The operation, with its retained and removed staging paths."
+        },
+        "stopped_processes": {
+          "$ref": "#/$defs/U64",
+          "description": "How many subprocesses this host owned and stopped."
+        }
+      },
+      "required": [
+        "operation",
+        "stopped_processes"
+      ],
+      "type": "object"
+    },
+    "ProjectOrigin": {
+      "description": "How a repository came to be known to this host.",
+      "oneOf": [
+        {
+          "const": "initialised",
+          "description": "`project.init` created it empty.",
+          "type": "string"
+        },
+        {
+          "const": "cloned",
+          "description": "`project.clone` cloned it from a remote.",
+          "type": "string"
+        },
+        {
+          "const": "adopted",
+          "description": "`project.adopt` registered an existing checkout.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProjectReadParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `project.read`.",
+      "properties": {
+        "project_repository_id": {
+          "$ref": "#/$defs/ProjectRepositoryId",
+          "description": "The repository to read."
+        }
+      },
+      "required": [
+        "project_repository_id"
+      ],
+      "type": "object"
+    },
+    "ProjectReadResult": {
+      "additionalProperties": false,
+      "description": "Result of `project.read`.",
+      "properties": {
+        "operation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OperationRecord"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The operation that created it, when this host still has the record."
+        },
+        "project": {
+          "$ref": "#/$defs/ProjectSummary",
+          "description": "The repository."
+        },
+        "workspaces": {
+          "description": "Its workspaces.",
+          "items": {
+            "$ref": "#/$defs/WorkspaceSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "project",
+        "workspaces",
+        "operation"
+      ],
+      "type": "object"
+    },
     "ProjectRepositoryId": {
       "description": "One environment-bound source repository.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "ProjectState": {
+      "description": "What state one repository record is in.",
+      "oneOf": [
+        {
+          "const": "ready",
+          "description": "The repository exists and its identity matched the last time it was opened.",
+          "type": "string"
+        },
+        {
+          "const": "creating",
+          "description": "The operation that would have created it is still running.",
+          "type": "string"
+        },
+        {
+          "const": "detached",
+          "description": "The object the record names is gone, or a different object now holds its path.\n\nThe record is kept rather than deleted: a repository whose disk was unmounted comes back,\nand a record that named an object which has been replaced is evidence rather than rubbish.\nNothing is served from it until its identity matches again.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProjectSummary": {
+      "additionalProperties": false,
+      "description": "One repository, as a scoped read returns it.",
+      "properties": {
+        "created_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the record was written."
+        },
+        "display_path": {
+          "description": "The path it was created or adopted at, for a person to read.\n\nDiagnostics only. Re-resolving it would let a rename hand a grant to an unrelated tree,\nwhich is why every operation uses the recorded identity and an opened handle instead.",
+          "type": "string"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns it."
+        },
+        "filesystem_identity": {
+          "$ref": "#/$defs/FilesystemIdentity",
+          "description": "The stable filesystem identity of its Git directory."
+        },
+        "label": {
+          "description": "The label the user gave it.",
+          "type": "string"
+        },
+        "origin": {
+          "$ref": "#/$defs/ProjectOrigin",
+          "description": "How it came to be known here."
+        },
+        "project_repository_id": {
+          "$ref": "#/$defs/ProjectRepositoryId",
+          "description": "Its environment-local identity."
+        },
+        "remote": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RemoteSpecification"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The remote it was cloned from, when it has one."
+        },
+        "state": {
+          "$ref": "#/$defs/ProjectState",
+          "description": "What state the record is in."
+        },
+        "workspace_count": {
+          "$ref": "#/$defs/U64",
+          "description": "How many workspaces are selected on it."
+        }
+      },
+      "required": [
+        "project_repository_id",
+        "environment_id",
+        "label",
+        "origin",
+        "state",
+        "filesystem_identity",
+        "display_path",
+        "remote",
+        "created_at_ms",
+        "workspace_count"
+      ],
+      "type": "object"
     },
     "PromptGeneration": {
       "description": "The prompt the root editor is at. It advances at every primary prompt.",
@@ -10841,6 +11715,60 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "RemoteSpecification": {
+      "additionalProperties": false,
+      "description": "A remote a repository operation reaches, and who authenticates it.\n\nThe URL is here; a credential is not, and there is no field one could travel in. What the host\nrecords and what a diagnostic shows is this object, so a credential cannot leak through either.",
+      "properties": {
+        "credential_broker": {
+          "description": "The approved credential broker that authenticates it, when the transport needs one.\n\nEmpty for a transport that needs no credential. A named broker is one the host has, and a\nname it does not have is refused before anything is executed.",
+          "type": "string"
+        },
+        "provider": {
+          "description": "The provider that serves it, as the host resolved it from the host name.",
+          "type": "string"
+        },
+        "remote_name": {
+          "description": "The remote's name inside the repository, conventionally `origin`.",
+          "type": "string"
+        },
+        "transport": {
+          "$ref": "#/$defs/RemoteTransport",
+          "description": "The validated transport."
+        },
+        "url": {
+          "description": "The URL, with no user information and no credential.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "remote_name",
+        "transport",
+        "url",
+        "provider",
+        "credential_broker"
+      ],
+      "type": "object"
+    },
+    "RemoteTransport": {
+      "description": "The transports a repository operation may use.\n\nAn allowlist, because the question is not which transports Git can be talked into using (a list\nnobody can close: `ext::`, `file://` to a submodule helper, a remote helper on the path) but\nwhich ones this host validated. Everything else is refused with the reason, which is what\nsection 14 means by validating the transport before executing it.",
+      "oneOf": [
+        {
+          "const": "https",
+          "description": "`https://`. The credential broker supplies the authentication.",
+          "type": "string"
+        },
+        {
+          "const": "ssh",
+          "description": "`ssh://`, or the `user@host:path` form. The broker supplies the key.",
+          "type": "string"
+        },
+        {
+          "const": "local_path",
+          "description": "A local path on this host, used for a clone between two directories of the same machine.\n\nThe path is an authorised source handle rather than a URL, so a `file://` URL that Git\nwould hand to a helper never appears.",
+          "type": "string"
+        }
+      ]
+    },
     "RepositoryGeneration": {
       "description": "The catalogue generation a plugin package was resolved against.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -11158,6 +12086,72 @@
         "oldest_retained_cursor"
       ],
       "type": "object"
+    },
+    "RetainedItem": {
+      "additionalProperties": false,
+      "description": "One thing a workspace holds that its removal would have to account for.",
+      "properties": {
+        "change_set_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChangeSetId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The change set it belongs to, when it belongs to one."
+        },
+        "detail": {
+          "description": "What it is, in the host's own words.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/RetainedKind",
+          "description": "What kind of thing it is."
+        }
+      },
+      "required": [
+        "kind",
+        "detail",
+        "change_set_id"
+      ],
+      "type": "object"
+    },
+    "RetainedKind": {
+      "description": "What kind of retained thing a workspace holds.",
+      "oneOf": [
+        {
+          "const": "dirty_content",
+          "description": "Uncommitted work in the workspace's own tree.",
+          "type": "string"
+        },
+        {
+          "const": "pinned_change_set",
+          "description": "A change-set version something has pinned.",
+          "type": "string"
+        },
+        {
+          "const": "review_evidence",
+          "description": "Evidence of a review that bound to a version of this workspace.",
+          "type": "string"
+        }
+      ]
+    },
+    "RetentionPolicy": {
+      "description": "What a workspace removal does with what it holds.",
+      "oneOf": [
+        {
+          "const": "keep_everything",
+          "description": "Keep everything. The workspace is removed only when it holds nothing.\n\nThe one a client offers first, because it is the only one that cannot lose work. What the\nworkspace holds is measured rather than assumed: its own uncommitted work as well as the\npins and the review evidence recorded against it. When it holds something, nothing is\nremoved and the result lists what.",
+          "type": "string"
+        },
+        {
+          "const": "remove_retained",
+          "description": "Remove everything, including what is held.\n\nSection 14 keeps dirty content, pinned change sets and review evidence until the user\napproves their removal, so this policy *is* the approval: it follows a\n[`Self::KeepEverything`] request that listed what is held, and the result lists what went.\n\nThere is deliberately no third policy that removes the working files while keeping the\ndirty content in them. Keeping content means capturing it, and capturing an immutable\nversion of a workspace is the change-set service's; a policy that claimed to keep what it\nhad just deleted would be a lie.",
+          "type": "string"
+        }
+      ]
     },
     "RetryCategory": {
       "description": "How a client may react to an error.\n\nOnly idempotent reads, transfer chunks and requests whose receipt proves no dispatch may retry\nautomatically.",
@@ -14074,11 +15068,415 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "WorkspaceCreateParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `workspace.preview`, which is a read `workspace.create` shares its shape with.\n\nThis is not a method of its own: `workspace.create` carries the same fields and the daemon\nanswers the preview from the create parameters when `preview_only` is set. One shape is a\nconvenience rather than a binding: a preview and a creation are two independent requests, and\na creation returns the preview it was created under, which is what a client shows.",
+      "properties": {
+        "base_change_set_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChangeSetId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The change-set version an isolated workspace materialises, when it names one."
+        },
+        "base_revision": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The revision an isolated workspace starts from, when it names one directly."
+        },
+        "destination": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DestinationRequest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where an isolated workspace's working tree goes.\n\nA shared workspace names none: it is the repository's own tree."
+        },
+        "isolation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IsolationMechanism"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How an isolated workspace is separated. Ignored for a shared one."
+        },
+        "kind": {
+          "$ref": "#/$defs/WorkspaceKind",
+          "description": "Which kind it is. Explicit, with no default."
+        },
+        "label": {
+          "description": "The label the user gave it.",
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/InclusionPolicy",
+          "description": "The inclusion policy, one decision per class."
+        },
+        "preview_only": {
+          "description": "Return the preview and create nothing.\n\nThe create interface previews first, and the preview is this method with nothing written.\nIt is still a mutation in the registry, because the parameters are the same object and a\ncaller that may not create a workspace has no business measuring one.",
+          "type": "boolean"
+        },
+        "project_repository_id": {
+          "$ref": "#/$defs/ProjectRepositoryId",
+          "description": "The repository to make a working copy of."
+        }
+      },
+      "required": [
+        "project_repository_id",
+        "label",
+        "kind",
+        "isolation",
+        "policy",
+        "base_revision",
+        "base_change_set_id",
+        "destination",
+        "preview_only"
+      ],
+      "type": "object"
+    },
+    "WorkspaceCreateResult": {
+      "additionalProperties": false,
+      "description": "Result of `workspace.create`.",
+      "properties": {
+        "preview": {
+          "$ref": "#/$defs/InclusionPreview",
+          "description": "What a reviewer would see, always."
+        },
+        "unapplied": {
+          "description": "The paths the policy included that this host could not carry into the workspace.\n\nA symbolic link, a device, a submodule's own working tree, and a path whose destination\nthis host could not replace. The workspace exists and is usable; what it does not hold is\nnamed here rather than left for a reviewer to notice.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "workspace": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The workspace, or nothing when this was a preview."
+        }
+      },
+      "required": [
+        "workspace",
+        "preview",
+        "unapplied"
+      ],
+      "type": "object"
+    },
     "WorkspaceId": {
       "description": "One selected working copy and its policy.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "WorkspaceKind": {
+      "description": "Which kind of working copy a workspace is.\n\nThere is no default. Section 14 requires the choice to be explicit, because the two have\ndifferent concurrency and different guarantees, and a host that picked one would be choosing\nfor the user.",
+      "oneOf": [
+        {
+          "const": "shared_existing",
+          "description": "The user's own working tree, used where it is.\n\nDirty and untracked files stay exactly as they are. Concurrency is the limit of the tree\nitself: one working tree, one index, and every session bound to this workspace sees the\nother's edits. An apply to it is best-effort conflict detection rather than\ncompare-and-swap.",
+          "type": "string"
+        },
+        {
+          "const": "isolated",
+          "description": "A separate working tree materialised from a named base.\n\nThe base is a revision or a change-set version, and what of the user's uncommitted work\ncomes with it is the explicit inclusion policy. A Git worktree implements the isolation of\nworking *files*; it shares repository metadata and runs under the same account, so it is not\na security sandbox. Where that matters the host uses an independent clone.",
+          "type": "string"
+        }
+      ]
+    },
+    "WorkspaceListParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `workspace.list`.",
+      "properties": {
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment to list."
+        },
+        "project_repository_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectRepositoryId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "One repository to list, or none for every repository in the environment."
+        }
+      },
+      "required": [
+        "environment_id",
+        "project_repository_id"
+      ],
+      "type": "object"
+    },
+    "WorkspaceListResult": {
+      "additionalProperties": false,
+      "description": "Result of `workspace.list`.",
+      "properties": {
+        "workspaces": {
+          "description": "The workspaces, oldest first.",
+          "items": {
+            "$ref": "#/$defs/WorkspaceSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "workspaces"
+      ],
+      "type": "object"
+    },
+    "WorkspaceReadParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `workspace.read`.",
+      "properties": {
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId",
+          "description": "The workspace to read."
+        }
+      },
+      "required": [
+        "workspace_id"
+      ],
+      "type": "object"
+    },
+    "WorkspaceReadResult": {
+      "additionalProperties": false,
+      "description": "Result of `workspace.read`.",
+      "properties": {
+        "workspace": {
+          "$ref": "#/$defs/WorkspaceSummary",
+          "description": "The workspace."
+        }
+      },
+      "required": [
+        "workspace"
+      ],
+      "type": "object"
+    },
+    "WorkspaceRemoveParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `workspace.remove`.",
+      "properties": {
+        "retention": {
+          "$ref": "#/$defs/RetentionPolicy",
+          "description": "What the removal does with what the workspace holds."
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId",
+          "description": "The workspace to remove."
+        }
+      },
+      "required": [
+        "workspace_id",
+        "retention"
+      ],
+      "type": "object"
+    },
+    "WorkspaceRemoveResult": {
+      "additionalProperties": false,
+      "description": "Result of `workspace.remove`.",
+      "properties": {
+        "retained": {
+          "description": "What is still held, and is waiting for the user's approval.",
+          "items": {
+            "$ref": "#/$defs/RetainedItem"
+          },
+          "type": "array"
+        },
+        "working_files_removed": {
+          "description": "True when this workspace's own working files are gone.\n\nRead from the filesystem rather than from what the removal did: the tree is not there any\nmore, whether this call removed it, an earlier one did, or the user did. A removal never\ntouches a *shared* workspace's tree, because that tree is the user's own, so this is\nordinarily false for one; it says false whenever the host could not establish that the\ndirectory is absent.",
+          "type": "boolean"
+        },
+        "workspace": {
+          "$ref": "#/$defs/WorkspaceSummary",
+          "description": "The workspace, in the state the removal left it."
+        }
+      },
+      "required": [
+        "workspace",
+        "working_files_removed",
+        "retained"
+      ],
+      "type": "object"
+    },
+    "WorkspaceState": {
+      "description": "What state one workspace is in.",
+      "oneOf": [
+        {
+          "const": "ready",
+          "description": "It exists and can be used.",
+          "type": "string"
+        },
+        {
+          "const": "materialising",
+          "description": "Its materialisation is still running.",
+          "type": "string"
+        },
+        {
+          "const": "removal_pending",
+          "description": "The user asked for it to be removed and something it holds is retained.\n\nA workspace reaches this state rather than disappearing when it still holds dirty content,\na pinned change set or review evidence. What is retained is listed, and the removal\nfinishes when the user approves it.",
+          "type": "string"
+        },
+        {
+          "const": "removed",
+          "description": "It is gone. The record stays so a later read says what happened rather than nothing.",
+          "type": "string"
+        }
+      ]
+    },
+    "WorkspaceSummary": {
+      "additionalProperties": false,
+      "description": "One workspace, as a scoped read returns it.",
+      "properties": {
+        "base_change_set_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChangeSetId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The change-set version it materialised, when it named one."
+        },
+        "base_revision": {
+          "description": "The revision it started from.",
+          "type": "string"
+        },
+        "bound_runs": {
+          "description": "The automation runs bound to it that are still live.\n\nSection 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace\nbetween two sessions or after its last one ended, so it is recorded separately and refuses\na removal in the same way.",
+          "items": {
+            "$ref": "#/$defs/WorkflowRunId"
+          },
+          "type": "array"
+        },
+        "bound_sessions": {
+          "description": "The sessions bound to it that are still live.\n\nA removal is refused while this is not empty, whatever retention policy it carries.",
+          "items": {
+            "$ref": "#/$defs/SessionId"
+          },
+          "type": "array"
+        },
+        "created_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was created."
+        },
+        "detail": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why it is in the state it is in, when it ended up there for a reason."
+        },
+        "display_path": {
+          "description": "The path it was created at, for a person to read.",
+          "type": "string"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns it."
+        },
+        "filesystem_identity": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FilesystemIdentity"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The stable filesystem identity of its working tree, once this host has one.\n\nAbsent while the workspace is being materialised, and absent afterwards only when the\nmaterialisation did not get as far as creating the tree. An absent identity is what refuses\na removal: this host does not delete a directory it cannot prove it created."
+        },
+        "isolation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/IsolationMechanism"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How an isolated workspace is separated, when it is one."
+        },
+        "kind": {
+          "$ref": "#/$defs/WorkspaceKind",
+          "description": "Which kind it is."
+        },
+        "label": {
+          "description": "The label the user gave it.",
+          "type": "string"
+        },
+        "policy": {
+          "$ref": "#/$defs/InclusionPolicy",
+          "description": "The inclusion policy it was created under."
+        },
+        "project_repository_id": {
+          "$ref": "#/$defs/ProjectRepositoryId",
+          "description": "The repository it is a working copy of."
+        },
+        "retained": {
+          "description": "What it holds that a removal would have to account for.",
+          "items": {
+            "$ref": "#/$defs/RetainedItem"
+          },
+          "type": "array"
+        },
+        "state": {
+          "$ref": "#/$defs/WorkspaceState",
+          "description": "What state it is in."
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId",
+          "description": "Its identity."
+        }
+      },
+      "required": [
+        "workspace_id",
+        "project_repository_id",
+        "environment_id",
+        "label",
+        "kind",
+        "isolation",
+        "policy",
+        "state",
+        "base_revision",
+        "base_change_set_id",
+        "filesystem_identity",
+        "display_path",
+        "detail",
+        "bound_sessions",
+        "bound_runs",
+        "retained",
+        "created_at_ms"
+      ],
+      "type": "object"
     }
   },
   "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -14528,6 +15926,9 @@
       },
       "type": "object"
     },
+    "inclusion_preview": {
+      "$ref": "#/$defs/InclusionPreview"
+    },
     "input_acquire_params": {
       "$ref": "#/$defs/InputAcquireParams"
     },
@@ -14570,6 +15971,9 @@
     "notification": {
       "$ref": "#/$defs/Notification"
     },
+    "operation_record": {
+      "$ref": "#/$defs/OperationRecord"
+    },
     "organisation_policy": {
       "$ref": "#/$defs/OrganisationPolicy"
     },
@@ -14602,6 +16006,48 @@
     },
     "policy_authority": {
       "$ref": "#/$defs/PolicyAuthority"
+    },
+    "preview_entry": {
+      "$ref": "#/$defs/PreviewEntry"
+    },
+    "project_adopt_params": {
+      "$ref": "#/$defs/ProjectAdoptParams"
+    },
+    "project_adopt_result": {
+      "$ref": "#/$defs/ProjectAdoptResult"
+    },
+    "project_clone_params": {
+      "$ref": "#/$defs/ProjectCloneParams"
+    },
+    "project_clone_result": {
+      "$ref": "#/$defs/ProjectCloneResult"
+    },
+    "project_init_params": {
+      "$ref": "#/$defs/ProjectInitParams"
+    },
+    "project_init_result": {
+      "$ref": "#/$defs/ProjectInitResult"
+    },
+    "project_list_params": {
+      "$ref": "#/$defs/ProjectListParams"
+    },
+    "project_list_result": {
+      "$ref": "#/$defs/ProjectListResult"
+    },
+    "project_operation_cancel_params": {
+      "$ref": "#/$defs/ProjectOperationCancelParams"
+    },
+    "project_operation_cancel_result": {
+      "$ref": "#/$defs/ProjectOperationCancelResult"
+    },
+    "project_read_params": {
+      "$ref": "#/$defs/ProjectReadParams"
+    },
+    "project_read_result": {
+      "$ref": "#/$defs/ProjectReadResult"
+    },
+    "project_summary": {
+      "$ref": "#/$defs/ProjectSummary"
     },
     "proposed_grant": {
       "$ref": "#/$defs/ProposedGrant"
@@ -14854,6 +16300,33 @@
     },
     "worker_verify_proof": {
       "$ref": "#/$defs/WorkerVerifyProof"
+    },
+    "workspace_create_params": {
+      "$ref": "#/$defs/WorkspaceCreateParams"
+    },
+    "workspace_create_result": {
+      "$ref": "#/$defs/WorkspaceCreateResult"
+    },
+    "workspace_list_params": {
+      "$ref": "#/$defs/WorkspaceListParams"
+    },
+    "workspace_list_result": {
+      "$ref": "#/$defs/WorkspaceListResult"
+    },
+    "workspace_read_params": {
+      "$ref": "#/$defs/WorkspaceReadParams"
+    },
+    "workspace_read_result": {
+      "$ref": "#/$defs/WorkspaceReadResult"
+    },
+    "workspace_remove_params": {
+      "$ref": "#/$defs/WorkspaceRemoveParams"
+    },
+    "workspace_remove_result": {
+      "$ref": "#/$defs/WorkspaceRemoveResult"
+    },
+    "workspace_summary": {
+      "$ref": "#/$defs/WorkspaceSummary"
     }
   },
   "title": "KalaReach protocol",
