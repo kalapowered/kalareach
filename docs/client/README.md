@@ -23,9 +23,9 @@ the far side of a relay runs the same code above the transport.
 
 ## What a failure means
 
-`retry` is one table over every error code section 23 requires. Each code has a step — what happens
-to the request — and an action, which is the direct thing a user interface offers instead of showing
-the code. The match is exhaustive, so a code added to the protocol has to be decided here rather
+`retry` is one table over every error code section 23 requires. Each code has a step, which is what
+happens to the request, and an action, which is the direct thing a user interface offers instead of
+showing the code. The match is exhaustive, so a code added to the protocol has to be decided here rather
 than reaching a client unclassified.
 
 An automatic retry needs two things at once, and neither alone is enough:
@@ -117,19 +117,19 @@ that it should not have is a control the host then refuses.
 
 ## Managed services
 
-`services` holds one trait per managed service section 17 names — account login, relay leases, push,
-encrypted sync and backup, managed inference — and `ServiceClients` holds one optional
+`services` holds one trait per managed service section 17 names (account login, relay leases, push,
+encrypted sync and backup, managed inference), and `ServiceClients` holds one optional
 implementation of each. `services::relay` is the one managed implementation this crate carries,
 because a lease is the one managed resource a client cannot do without and still use a relay at all.
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of
-them. `ServiceClients::availability` reports every service in one shape. A service with no implementation
-is named along with what to do instead; a service with one is reported as configured, which is the
-only thing a client can know without asking — `NullService` is configured and answers nothing, and
-whether a call succeeds is what the call says. It explains and nothing more: no code path consults
-it before doing local work, and a client that deleted every field would lose the managed resources
-and keep the product.
+them. `ServiceClients::availability` reports every service in one shape. A service with no
+implementation is named along with what to do instead; a service with one is reported as configured,
+which is the only thing a client can know without asking, because `NullService` is configured and
+answers nothing and whether a call succeeds is what the call says. It explains and nothing more: no
+code path consults it before doing local work, and a client that deleted every field would lose the
+managed resources and keep the product.
 
 `services::NullService` implements every trait by saying so. It exists so a caller can hold a
 service client unconditionally and get an honest answer rather than a silent default.

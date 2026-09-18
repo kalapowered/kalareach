@@ -424,7 +424,7 @@ impl Session {
     ///
     /// The two failures are separated because only one of them is a decision the policy makes: a
     /// host that refused said why, and a connection that ended did not. A transport failure is
-    /// never retried here — the reconnect loop owns that, and a second request on a connection
+    /// never retried here: the reconnect loop owns that, and a second request on a connection
     /// that has gone would fail the same way.
     async fn send_read(
         &self,

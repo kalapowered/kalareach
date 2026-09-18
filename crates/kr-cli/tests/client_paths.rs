@@ -18,7 +18,7 @@ use kr_protocol::worker::WorkerDescriptor;
 /// A descriptor naming an endpoint nothing is listening on.
 ///
 /// Everything but the endpoint is beside the point here: the connection fails before a descriptor's
-/// claims are acted on, which is itself the contract — nothing in one is believed until the worker
+/// claims are acted on, which is itself the contract: nothing in one is believed until the worker
 /// behind it has answered a challenge.
 fn descriptor_for(endpoint: &kr_ipc::paths::Endpoint) -> WorkerDescriptor {
     WorkerDescriptor {
@@ -72,9 +72,9 @@ async fn reaching_a_session_on_this_machine_is_a_local_ipc_client() {
 #[tokio::test]
 async fn reaching_the_control_daemon_is_a_round_trip_over_the_local_socket() {
     // The other half of the local path: the daemon this machine's own commands talk to. A fake one
-    // here, because what is under test is the command's side of the exchange — the opening frames
-    // it sends, the acknowledgement it reads and the request it correlates — rather than what a
-    // real daemon would answer.
+    // here, because what is under test is the command's side of the exchange, which is the opening
+    // frames it sends, the acknowledgement it reads and the request it correlates, rather than what
+    // a real daemon would answer.
     let tree = kr_ipc::testing::TempHost::create();
     let paths = tree.environment();
     let endpoint = paths.controller_endpoint().expect("an endpoint path");

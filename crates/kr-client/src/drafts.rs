@@ -1155,8 +1155,8 @@ pub struct Fetched {
 /// A note that is lost or was never written costs a comparison, not a draft: the publication is
 /// refused, the content the service holds comes down beside the local draft, and the note is written
 /// from the generation that fetch reported. The next publication then compares against it. A note
-/// that names a generation the service no longer has — a service that was reset, or a different one
-/// — is the case that does not resolve itself: the publication is refused and there is nothing to
+/// that names a generation the service no longer has, because it was reset or replaced, is the case
+/// that does not resolve itself: the publication is refused and there is nothing to
 /// fetch, and [`DraftStore::forget_checkpoint`] is how a caller says so.
 #[derive(Clone, Debug)]
 pub struct DraftSync {

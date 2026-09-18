@@ -14,8 +14,9 @@
 //!
 //! # Two conditions, both required
 //!
-//! An automatic retry needs the *code* to permit one — [`kr_protocol::error::RetryCategory`] is
-//! `Transient` — and the *request* to be one of the three classes the specification names. Neither
+//! An automatic retry needs the *code* to permit one, which means its
+//! [`kr_protocol::error::RetryCategory`] is `Transient`, and the *request* to be one of the three
+//! classes the specification names. Neither
 //! alone is enough. A transient failure of a mutation is not retried, because the library cannot
 //! know whether the host dispatched it; and an idempotent read that failed with
 //! `PERMISSION_DENIED` is not retried, because sending it again cannot change the answer.
