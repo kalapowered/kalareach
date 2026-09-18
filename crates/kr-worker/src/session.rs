@@ -870,15 +870,23 @@ impl Session {
     pub fn minimum_projection_install(&self, attachment_id: AttachmentId) -> Result<usize> {
         let dimensions = self.attachment_dimensions(attachment_id)?;
         self.engine.minimum_projection_install(
-            dimensions,
-            self.viewport_anchor(attachment_id),
+            self.window_of(attachment_id, dimensions),
             self.content_scope(attachment_id),
         )
     }
 
-    /// Where one attachment's window sits: the live screen, or a retained row above it.
-    fn viewport_anchor(&self, attachment_id: AttachmentId) -> crate::projection::ViewportAnchor {
-        crate::projection::ViewportAnchor::of(self.attachments.history_top_row(attachment_id))
+    /// What one attachment is looking through: its own size, and where its window sits.
+    fn window_of(
+        &self,
+        attachment_id: AttachmentId,
+        dimensions: Dimensions,
+    ) -> crate::projection::Window {
+        crate::projection::Window {
+            dimensions,
+            anchor: crate::projection::ViewportAnchor::of(
+                self.attachments.history_top_row(attachment_id),
+            ),
+        }
     }
 
     /// Returns one attachment's own dimensions, falling back to the session's canonical geometry.
@@ -1883,8 +1891,7 @@ impl Session {
                 .engine
                 .projection_advance(
                     held,
-                    dimensions,
-                    self.viewport_anchor(attachment_id),
+                    self.window_of(attachment_id, dimensions),
                     self.content_scope(attachment_id),
                 )
                 .unwrap_or(crate::snapshot::Owed::Snapshot(
@@ -1908,10 +1915,10 @@ impl Session {
                 // And how much of the screen this client's authority reaches: a caller drawn the
                 // live screen alone is paged the buffer that is showing and never the other one.
                 let scope = self.content_scope(attachment_id);
-                let anchor = self.viewport_anchor(attachment_id);
+                let window = self.window_of(attachment_id, dimensions);
                 match self
                     .engine
-                    .projection_install(dimensions, anchor, reason, gate, now, budget, scope)
+                    .projection_install(window, reason, gate, now, budget, scope)
                 {
                     Ok((update, settled)) => {
                         // Taking a snapshot settles the screen. It changes no display state here,
@@ -1941,7 +1948,7 @@ impl Session {
             base: update.base,
             viewport: self
                 .engine
-                .anchored_viewport(dimensions, self.viewport_anchor(attachment_id)),
+                .anchored_viewport(self.window_of(attachment_id, dimensions)),
         };
         for outgoing in update.events {
             let cursor = outgoing.event.cursor();

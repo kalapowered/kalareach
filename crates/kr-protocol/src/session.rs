@@ -847,12 +847,12 @@ mod tests {
             },
         }));
         assert!(
-            request(Presentation::Invisible, probed.clone())
+            request(Presentation::Invisible, probed)
                 .palette_refusal()
                 .is_some()
         );
         assert!(
-            request(Presentation::Attach, probed.clone())
+            request(Presentation::Attach, probed)
                 .palette_refusal()
                 .is_none()
         );
