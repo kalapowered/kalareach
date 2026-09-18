@@ -1088,18 +1088,26 @@ async fn kr_req_11_39_a_terminal_drains_and_is_answered_while_a_component_runs()
 
 /// Returns the directory a running process is in, as the kernel reports it.
 ///
-/// Nothing when this platform's tool is unavailable: what the test then still checks is the plan.
+/// Nothing when this platform has no such tool, which is the only case this test skips. A tool that
+/// is there and answers with something else is a failure rather than a reason to assert less.
 fn working_directory_of(pid: u32) -> Option<PathBuf> {
-    let output = std::process::Command::new("/usr/sbin/lsof")
-        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
+    let tool = std::path::Path::new("/usr/sbin/lsof");
+    if !tool.exists() {
         return None;
     }
-    String::from_utf8_lossy(&output.stdout)
+    let output = std::process::Command::new(tool)
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .expect("the tool that reports a process's directory runs");
+    assert!(
+        output.status.success(),
+        "asking for process {pid}'s directory failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported = String::from_utf8_lossy(&output.stdout)
         .lines()
-        .find_map(|line| line.strip_prefix('n').map(PathBuf::from))
+        .find_map(|line| line.strip_prefix('n').map(PathBuf::from));
+    Some(reported.expect("the tool named the process's directory"))
 }
 
 /// Returns the highest `kalareach-N` in `text`, if there is one.

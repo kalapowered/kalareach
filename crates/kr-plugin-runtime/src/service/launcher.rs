@@ -736,8 +736,13 @@ impl HostReservation {
         program: impl Into<PathBuf>,
         packages: &Path,
     ) -> LaunchResult<HostLaunchPlan> {
-        let program = kr_ipc::paths::resolve_here(program.into())?;
-        let packages = kr_ipc::paths::resolve_here(packages.to_path_buf())?;
+        let resolve = |path: PathBuf, what: &str| {
+            kr_ipc::paths::resolve_here(path).map_err(|error| LaunchError::Refused {
+                detail: format!("the plugin host's {what} could not be resolved: {error}"),
+            })
+        };
+        let program = resolve(program.into(), "executable")?;
+        let packages = resolve(packages.to_path_buf(), "packages directory")?;
         Ok(HostLaunchPlan {
             label: self.label(),
             program,
