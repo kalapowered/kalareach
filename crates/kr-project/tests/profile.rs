@@ -1060,3 +1060,25 @@ fn a_git_invocation_names_an_absolute_directory_and_leaves_the_profiles_own_one_
         home.display()
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_name_this_test_cannot_see_through_is_not_an_empty_directory() {
+    // Reading a directory follows a link, so a link whose target is gone answers "not found" and a
+    // listing built on that reports an empty directory although the name is there. The sentinel
+    // directory is exactly where that matters: a planted helper that ran and could not write its
+    // marker would otherwise pass for a helper that never ran.
+    let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+    assert!(
+        support::names_in_if_any(&directory.path().join("nothing-at-all")).is_empty(),
+        "a name with nothing at it holds nothing"
+    );
+    let dangling = directory.path().join("sentinels");
+    std::os::unix::fs::symlink(directory.path().join("gone"), &dangling)
+        .expect("a link whose target is not there");
+    let refused = std::panic::catch_unwind(|| support::names_in_if_any(&dangling));
+    assert!(
+        refused.is_err(),
+        "a name that is not a directory is not an empty directory"
+    );
+}

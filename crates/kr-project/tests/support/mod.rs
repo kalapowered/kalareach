@@ -72,15 +72,28 @@ pub fn names_in(directory: &Path) -> Vec<String> {
 
 /// The same, where an absent directory is a valid answer and nothing else is.
 ///
+/// The name is asked about before the directory is read, because reading one follows a link: a
+/// link whose target is gone answers "not found", and a listing built on that reports an empty
+/// directory although the name is there and something may well have written through it.
+///
 /// # Panics
 ///
-/// Panics when the directory exists and it or any entry in it cannot be read.
+/// Panics when the name holds anything other than a directory, and when the directory or any entry
+/// in it cannot be read.
 #[must_use]
 pub fn names_in_if_any(directory: &Path) -> Vec<String> {
-    match std::fs::read_dir(directory) {
-        Ok(_) => names_in(directory),
+    match std::fs::symlink_metadata(directory) {
+        Ok(found) if found.is_dir() => names_in(directory),
+        Ok(found) => panic!(
+            "{} is {:?} rather than a directory",
+            directory.display(),
+            found.file_type()
+        ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-        Err(error) => panic!("{} could not be read: {error}", directory.display()),
+        Err(error) => panic!(
+            "whether {} is there could not be established: {error}",
+            directory.display()
+        ),
     }
 }
 
