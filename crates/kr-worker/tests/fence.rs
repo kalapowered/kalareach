@@ -1493,6 +1493,100 @@ async fn a_request_that_expires_a_hold_delivers_what_it_released() {
     wired.close().await;
 }
 
+/// A-17 again, on the request that is refused rather than admitted.
+///
+/// An interrupt whose epoch has moved is refused, and the refusal is what the caller is told. What
+/// the machine let go of on the way is still the application's: a refusal is an answer about the
+/// interrupt, not about input this session accepted before it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_refused_request_still_delivers_what_it_released() {
+    let wired = unpumped().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let attached: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &terminal(wired.session_id),
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("attaches")
+        .to_typed()
+        .expect("decodes");
+    let holder = attached.attachment.attachment_id;
+    client
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &kr_protocol::input::InputAcquireParams {
+                session_id: wired.session_id,
+                attachment_id: holder,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("takes the keys");
+
+    let epoch = wired.runtime.session().lease().epoch.get();
+    {
+        let mut session = wired.runtime.session();
+        let driver = session.fence_mut().expect("a driver");
+        let _ = driver.bridge_event(
+            kr_protocol::ids::RequestId::new(2),
+            &enter(wired.session_id, 1, 1),
+        );
+        session
+            .write_input(
+                holder,
+                epoch,
+                0,
+                b"waited\n",
+                None,
+                std::time::Instant::now(),
+            )
+            .expect("accepted");
+    }
+    assert!(!contains(&retained(&wired.runtime.session()), b"waited"));
+
+    wired.clock.advance(Duration::from_millis(400));
+    let refused = client
+        .mutate(
+            Method::InputInterrupt,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &kr_protocol::input::InputInterruptParams {
+                session_id: wired.session_id,
+                attachment_id: holder,
+                // An epoch this lease has moved past, so the machine refuses the interrupt and
+                // nothing is sent to the shell.
+                epoch: kr_protocol::ids::InputLeaseEpoch::new(epoch.saturating_sub(1)),
+                action: kr_protocol::input::InterruptAction::NativeInterrupt,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("the epoch has moved");
+    assert_eq!(refused.code, ErrorCode::LeaseLost, "{refused}");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if contains(&retained(&wired.runtime.session()), b"waited") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a refused request kept what the machine released"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    wired.close().await;
+}
+
 /// KR-REQ-07.79: a retry happens at the reader's next idle callback, and waits for a drain.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withheld_fence_is_retried_at_the_next_idle_callback() {

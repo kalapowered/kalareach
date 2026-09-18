@@ -204,6 +204,12 @@ pub struct Controller {
     /// worker, used in order, is what stops that.
     connections: Mutex<BTreeMap<SessionId, Arc<tokio::sync::Mutex<Option<LocalClient>>>>>,
     pending: Mutex<BTreeMap<ReservationId, PendingCreate>>,
+    /// Held for the length of one look for unresolved claims.
+    ///
+    /// Two requests that looked at once would challenge the same worker from two stale snapshots,
+    /// and each challenge that succeeds presents a generation token, which fences whichever
+    /// connection of this daemon's came first.
+    recovering: Mutex<()>,
     /// Every connection this daemon has admitted, and the authority revision it was admitted at.
     ///
     /// This is the daemon's authority store for live connections. A registration is written in the
@@ -385,6 +391,7 @@ impl Controller {
             directory: Mutex::new(Directory::default()),
             connections: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
+            recovering: Mutex::new(()),
             admitted: std::sync::Mutex::new(BTreeMap::new()),
             identity,
             secret_store: setup.secret_store,
@@ -558,14 +565,51 @@ impl Controller {
     /// A claim whose worker is gone is resolved the same way it is at startup, and one whose worker
     /// is alive and still unqualified is simply left for the next look.
     async fn recover_claims(&self) -> Result<()> {
+        let _recovering = self.recovering.lock().await;
         let claimed = {
             let registry = self.registry.lock().await;
             registry.reservations_in(LaunchPhase::Claimed)?
         };
         for reservation in claimed {
-            self.recover_claim(&reservation).await?;
+            if self.creating(reservation.reservation_id).await {
+                continue;
+            }
+            // One session's failure is not another's, and a list asks about every session. A
+            // reservation that cannot be recovered now is left claimed for the next look.
+            let _ = self.recover_claim(&reservation).await;
         }
         Ok(())
+    }
+
+    /// Looks again for one session's own unresolved claim, and says what went wrong.
+    ///
+    /// The same look as [`Self::recover_claims`], for a caller that asked about one session and is
+    /// owed the reason rather than a session that is simply not there.
+    async fn recover_claim_for(&self, session_id: kr_protocol::ids::SessionId) -> Result<()> {
+        let _recovering = self.recovering.lock().await;
+        let reservation = {
+            let registry = self.registry.lock().await;
+            registry.reservation_for_session(session_id)?
+        };
+        let Some(reservation) = reservation else {
+            return Ok(());
+        };
+        if reservation.phase != LaunchPhase::Claimed
+            || self.creating(reservation.reservation_id).await
+        {
+            return Ok(());
+        }
+        self.recover_claim(&reservation).await
+    }
+
+    /// Returns whether this daemon is still running the create that made one reservation.
+    ///
+    /// Its claim is recorded for as long as it takes the worker to report itself. Adopting it here
+    /// would resolve the claim from the wrong side: the worker's own report would then find a
+    /// reservation the registry had already moved past, and the caller that asked for the session
+    /// would wait out its whole deadline for a session that exists.
+    async fn creating(&self, reservation_id: ReservationId) -> bool {
+        self.pending.lock().await.contains_key(&reservation_id)
     }
 
     /// Restores the directory entry of every worker the registry records.
@@ -2859,7 +2903,9 @@ impl Controller {
         // A worker that did not answer at startup is not gone; it was busy, or it started slowly.
         // Trying again here is what keeps a session readable without another daemon restart.
         if self.directory.lock().await.get(params.session_id).is_none() {
-            let _ = self.recover_claims().await;
+            // This session's own claim, and the reason when it cannot be resolved: a caller that
+            // named one session is owed that rather than "no such session".
+            self.recover_claim_for(params.session_id).await?;
             let _ = self.recover_workers().await;
         }
         let worker = self.directory.lock().await.get(params.session_id).cloned();
@@ -3267,7 +3313,7 @@ impl Controller {
             .get(reservation.session_id)
             .is_none()
         {
-            let _ = self.recover_claims().await;
+            self.recover_claim_for(reservation.session_id).await?;
         }
         let worker = self
             .directory
