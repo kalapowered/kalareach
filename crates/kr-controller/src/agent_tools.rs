@@ -388,7 +388,11 @@ impl Installer {
             skill_version: Nullable::some(manifest.skill_version.clone()),
             files,
             drift,
-            removal: manifest.operations.iter().rev().cloned().collect(),
+            // The order a removal would actually use, so what this reports is what would happen.
+            removal: removal_order(&manifest.operations)
+                .into_iter()
+                .cloned()
+                .collect(),
         })
     }
 
