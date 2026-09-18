@@ -133,14 +133,15 @@ echo "starting the control daemon"
   --worker "$run_root/bin/kr-worker") \
   >"$run_root/evidence/controller.log" 2>&1 &
 started_pids+=("$!")
-# A minute of asking, because this is a real daemon on a real machine: it opens its registry,
+# Three minutes of asking, because this is a real daemon on a real machine: it opens its registry,
 # builds or reads its signing identity through the platform's credential store, and publishes its
-# socket, and a machine with something else running takes longer over all three. The wall clock is
-# what is reported, not the waiting, so a start that is merely slow reads as slow rather than as
-# broken. It is an allowance rather than a deadline: the last question is answered or refused
-# however long it takes.
+# socket. The credential store is the slow one, and it is not this host's to hurry: the platform's
+# keychain is one file for the whole login, locked while anything writes to it, so a machine where
+# something else is also starting a host waits its turn there. The wall clock is what is reported,
+# not the waiting, so a start that is merely slow reads as slow rather than as broken. It is an
+# allowance rather than a deadline: the last question is answered or refused however long it takes.
 daemon_started_at="$(date +%s)"
-daemon_deadline=$((daemon_started_at + 60))
+daemon_deadline=$((daemon_started_at + 180))
 while [ "$(date +%s)" -lt "$daemon_deadline" ]; do
   if "$kr" doctor --json >/dev/null 2>&1; then
     break
