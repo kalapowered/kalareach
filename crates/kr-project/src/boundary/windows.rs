@@ -32,12 +32,19 @@
 //! A container also reaches a file only where that file's permissions name it **or** name every
 //! application package, and this host cannot know which other permissions a repository already
 //! carries. So the grants this host makes on the directories an operation owns are paired with a
-//! refusal of the execute right to the same container, which no other permission can add back.
+//! refusal of the execute right to the same container. A refusal beats every grant that reaches the
+//! object the same way it does, which is every grant inherited from the same directory. What it
+//! does not beat is a grant written directly on a file inside that directory: this platform
+//! consults a file's own entries before it reaches an inherited refusal, so somebody who can create
+//! a file in the repository can also write such a grant on it. **The execution guarantee here is
+//! therefore weaker than it is on the other two platforms**, and it is one of the reasons this
+//! platform is not qualified.
 //!
 //! Every grant this host makes is taken away again when the invocation ends, and the container
-//! profile is deleted with it. A grant whose removal fails is left, and this host does not pretend
-//! otherwise: the profile is per-invocation and named after nothing, so what is left names a
-//! container that no longer exists.
+//! profile is deleted with it. Neither the removal nor the deletion is checked, because there is
+//! nothing left to do about a failure at that point. One invocation at a time changes a path's
+//! permissions, so two of this service's own invocations cannot lose each other's entries; another
+//! program editing the same permissions at the same time still can.
 
 #![expect(
     unsafe_code,

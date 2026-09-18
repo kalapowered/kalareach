@@ -2055,10 +2055,10 @@ fn search_path(file_name: &str) -> Option<PathBuf> {
 
 /// Returns the program Git starts the other end of a connection as.
 ///
-/// Git's own, by absolute path, under Git's own helper directory. It is what a clone is told to use
-/// so that nothing a repository's configuration says can change it.
-#[must_use]
-pub fn upload_pack(git: &GitProgram) -> PathBuf {
+/// Git's own, by absolute path, under Git's own helper directory, which is where the boundary's
+/// execution list already reaches. It is what a clone runs with, in the form no configuration file
+/// can undo, so that a writer racing the clone's own destination cannot name a command instead.
+fn upload_pack(git: &GitProgram) -> PathBuf {
     git.exec_path().join(if cfg!(windows) {
         "git-upload-pack.exe"
     } else {
