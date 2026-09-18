@@ -356,7 +356,8 @@ impl std::fmt::Debug for Controller {
 
 /// One reservation, held by whichever of a look and a publication took it.
 ///
-/// Giving it back wakes whoever is waiting for that reservation, and only they look again.
+/// Giving it back wakes everybody who is waiting, and each of them looks for the one reservation it
+/// came for: whoever was waiting for this one takes it, and the rest wait again.
 struct ReservationHold<'a> {
     controller: &'a Controller,
     reservation_id: ReservationId,
@@ -656,7 +657,8 @@ impl Controller {
     async fn hold_reservation(&self, reservation_id: ReservationId) -> ReservationHold<'_> {
         loop {
             // Created before the set is read, so a reservation given back between the two is not
-            // missed: the permit is already waiting here.
+            // missed: a wake from that moment on is already counted for this waiter, and the wait
+            // below ends at once rather than sleeping through it.
             let given_back = self.recovered.notified();
             {
                 let mut held = self
