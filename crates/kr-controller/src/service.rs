@@ -1664,13 +1664,6 @@ impl Controller {
                             .to_owned(),
                     ));
                 }
-                // A managed session needs a KalaReach-qualified shell package. Refusing here means
-                // refusing before a reservation is recorded and before anything is spawned, so an
-                // unsupported shell costs the caller a named error rather than a session that
-                // closes itself a moment later.
-                if params.shell_mode == kr_protocol::session::ShellMode::Managed {
-                    self.check_qualified_package(params.shell.0.as_deref())?;
-                }
             }
             // A skill installation is the host's, not a session's, so its target names the
             // environment and nothing else. A request that named a session here would be asking
@@ -2926,6 +2919,13 @@ impl Controller {
         // nothing measured.
         if let Some(refusal) = create.palette_refusal() {
             return Err(ControllerError::InvalidArgument(refusal));
+        }
+        // A managed session needs a KalaReach-qualified shell package, and this is the one place
+        // every ingress passes through. Refusing here refuses before a reservation is recorded and
+        // before anything is spawned, so an unsupported shell costs the caller a named error rather
+        // than a session that closes itself a moment later.
+        if create.shell_mode == kr_protocol::session::ShellMode::Managed {
+            self.check_qualified_package(create.shell.0.as_deref())?;
         }
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
@@ -4734,6 +4734,57 @@ mod a_create_that_launches_nothing {
             registry.occupancy().expect("counts"),
             0,
             "the reservation it made is released"
+        );
+    }
+
+    /// A managed create with no qualified package is refused on the path every ingress takes.
+    ///
+    /// The local endpoint checks its own envelope before it dispatches; a caller on the network
+    /// reaches `session_create` directly. The package check belongs to the create itself, so this
+    /// drives the create the way the network path does and expects the same named refusal, with
+    /// nothing reserved and nothing started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_managed_create_that_did_not_pass_a_local_envelope_is_refused_the_same_way() {
+        let (temp, controller, asked) = daemon().await;
+        let environment_id = temp.environment_id();
+        let (connection_id, actor_id) = admitted(&controller).await;
+        let accepted = AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_secs(30))
+                .expect("a deadline half a minute out"),
+            bound: DeadlineBound::RequestedTtl,
+        };
+
+        let mut request = create_request(environment_id);
+        let mut params = create_params(environment_id);
+        params.shell_mode = ShellMode::Managed;
+        params.shell = Nullable::some("/bin/ksh".to_owned());
+        request.params = ParamsValue::from_typed(&params).expect("encodes");
+
+        let error = controller
+            .session_create(
+                &actor_id,
+                &request,
+                carried(&controller, connection_id, accepted),
+            )
+            .await
+            .expect_err("a shell no package qualifies is refused");
+        assert_eq!(
+            error.code(),
+            kr_protocol::error::ErrorCode::ShellIntegrationUnsupported,
+            "{error}"
+        );
+        assert!(
+            asked.lock().expect("the record is not poisoned").is_empty(),
+            "nothing is started for a shell no package qualifies"
+        );
+        let registry = controller.registry.lock().await;
+        assert_eq!(
+            registry.occupancy().expect("counts"),
+            0,
+            "and nothing is reserved either"
         );
     }
 
