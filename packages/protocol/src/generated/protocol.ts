@@ -1897,7 +1897,10 @@ export interface ChangeManifest {
    */
   entry_point: string[]
   /**
-   * Every change, in the order it was applied. A removal replays it in reverse.
+   * Every change, in the order it was applied.
+   *
+   * A removal undoes them in the order it can carry out: files and server entries first, then
+   * the directories that held them, deepest first.
    */
   operations: ChangeOperation[]
   /**
@@ -2739,7 +2742,10 @@ export interface ChangeManifest1 {
    */
   entry_point: string[]
   /**
-   * Every change, in the order it was applied. A removal replays it in reverse.
+   * Every change, in the order it was applied.
+   *
+   * A removal undoes them in the order it can carry out: files and server entries first, then
+   * the directories that held them, deepest first.
    */
   operations: ChangeOperation[]
   /**

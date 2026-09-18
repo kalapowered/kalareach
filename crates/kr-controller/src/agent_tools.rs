@@ -6,8 +6,9 @@
 //!
 //! * **Every change is recorded with the digest of what it wrote.** The record is kept in this
 //!   host's own state directory, not in the agent's, so an agent that rewrites its configuration
-//!   cannot lose it. A removal replays the record in reverse and stops at anything whose digest no
-//!   longer matches, because a changed file is somebody's edit.
+//!   cannot lose it. A removal undoes what the record owns, taking files and server entries before
+//!   the directories that held them and a deeper directory before a shallower one, and stops at
+//!   anything whose digest no longer matches, because a changed file is somebody's edit.
 //! * **An entry is guarded rather than assumed.** An installation refuses to replace a server
 //!   entry it did not write. That is what keeps an unrelated `kalareach` entry somebody else
 //!   created from being overwritten and then removed.

@@ -229,7 +229,10 @@ pub struct ChangeManifest {
     pub root: String,
     /// The command the agent runs to reach the tools.
     pub entry_point: Vec<String>,
-    /// Every change, in the order it was applied. A removal replays it in reverse.
+    /// Every change, in the order it was applied.
+    ///
+    /// A removal undoes them in the order it can carry out: files and server entries first, then
+    /// the directories that held them, deepest first.
     pub operations: Vec<ChangeOperation>,
 }
 

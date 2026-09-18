@@ -1837,7 +1837,7 @@
           "type": "array"
         },
         "operations": {
-          "description": "Every change, in the order it was applied. A removal replays it in reverse.",
+          "description": "Every change, in the order it was applied.\n\nA removal undoes them in the order it can carry out: files and server entries first, then\nthe directories that held them, deepest first.",
           "items": {
             "$ref": "#/$defs/ChangeOperation"
           },
