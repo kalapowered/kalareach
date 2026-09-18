@@ -18,18 +18,21 @@ pub enum ClientError {
     /// The host answered with an error.
     #[error("{}: {}", .0.code.as_str(), .0.message)]
     Host(ProtocolError),
-    /// A managed service refused the request, and said when the same one could be sent again.
+    /// A managed service refused the request.
     ///
-    /// The refusal is the protocol error a caller branches on; the delay is what the service asked
-    /// for, in seconds. It is separate from [`Self::Host`] because honouring it is the difference
-    /// between backing off and being refused again, and a delay inside a message is a delay nothing
-    /// can act on.
-    #[error("{}: {} (retry after {retry_after_seconds}s)", .error.code.as_str(), .error.message)]
+    /// The refusal is the protocol error a caller branches on, and the delay beside it is what the
+    /// service asked for, in seconds, when it said. It is separate from [`Self::Host`] for two
+    /// reasons. Honouring a stated delay is the difference between backing off and being refused
+    /// again, and a delay inside a message is a delay nothing can act on. And who refused decides
+    /// what a person is told: a host answering `PERMISSION_DENIED` means this device does not hold
+    /// the right, while a service answering it means the account is not signed in. A service
+    /// refusal is therefore this variant whether or not it named a delay.
+    #[error("{}: {}{}", .error.code.as_str(), .error.message, delay_note(.retry_after_seconds))]
     Refused {
         /// What the service said was wrong.
         error: ProtocolError,
-        /// Seconds to wait before sending the same request again.
-        retry_after_seconds: u64,
+        /// Seconds to wait before sending the same request again, when the service said.
+        retry_after_seconds: Option<u64>,
     },
     /// A value could not be encoded or decoded as KR-CBOR-1.
     #[error("the message was not canonical: {0}")]
@@ -142,7 +145,7 @@ impl ClientError {
             Self::Refused {
                 retry_after_seconds,
                 ..
-            } => Some(std::time::Duration::from_secs(*retry_after_seconds)),
+            } => retry_after_seconds.map(std::time::Duration::from_secs),
             _ => None,
         };
         crate::retry::decision(
@@ -173,6 +176,11 @@ impl From<ProtocolError> for ClientError {
             Self::Host(error)
         }
     }
+}
+
+/// Renders the delay a service asked for, when it asked for one.
+fn delay_note(retry_after_seconds: &Option<u64>) -> String {
+    retry_after_seconds.map_or_else(String::new, |seconds| format!(" (retry after {seconds}s)"))
 }
 
 /// The result of a client operation.

@@ -12,7 +12,8 @@ use std::time::Duration;
 use iroh::{Endpoint, EndpointAddr};
 use kr_client::cursors::{Restoration, RestorationStep};
 use kr_client::drafts::{
-    Associations, DraftSealer, DraftStore, DraftSync, DraftTarget, Published, draft_collection,
+    Associations, DraftSealer, DraftStore, DraftSync, DraftTarget, Published, SyncCheckpoint,
+    draft_collection,
 };
 use kr_client::error::ClientError;
 use kr_client::retry::{Recovery, RequestClass, UserAction};
@@ -27,7 +28,8 @@ use kr_protocol::envelope::{
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
     AgentBindingRevision, ApplicationInstanceId, AttachmentId, BootEpoch, BuildId, ClockEpoch,
-    DeviceId, DeviceKeyRevision, EnvironmentId, EventSequence, EventType, SessionId, StreamId,
+    DeviceId, DeviceKeyRevision, DraftRevision, EnvironmentId, EventSequence, EventType, SessionId,
+    StreamId,
 };
 use kr_protocol::method::Method;
 use kr_protocol::receipt::{Receipt, ReceiptState};
@@ -1006,17 +1008,30 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         DeviceId::new(Uuid::from_bytes([9; 16])),
     )
     .expect("a store");
-    let theirs = remote_store
+    let mut theirs = remote_store
         .create(
             target.clone(),
-            "what the other device had".to_owned(),
+            "an earlier thought".to_owned(),
             TimestampMs::new(2),
         )
         .expect("a draft");
+    // Three edits on that device, so its revision is past the one a fresh copy would carry and the
+    // conflict cannot report the copy's number by accident.
+    for (revision, text) in [(2, "a second thought"), (3, "what the other device had")] {
+        theirs = remote_store
+            .update(
+                theirs.draft_id,
+                DraftRevision::new(revision - 1),
+                TimestampMs::new(revision + 1),
+                |draft| draft.text = text.to_owned(),
+            )
+            .expect("an edit");
+    }
+    assert_eq!(theirs.revision, DraftRevision::new(3));
     let service = Arc::new(RemoteObjects::default());
     let sealer = ReversingSealer;
     let sealed = sealer
-        .seal(&DraftStore::encode(&theirs).expect("canonical bytes"))
+        .seal(&DraftStore::encode_payload(&theirs).expect("canonical bytes"))
         .expect("sealed");
     service
         .compare_exchange(&draft_collection(draft.draft_id), 0, &sealed)
@@ -1030,12 +1045,15 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         .expect("an answer");
     let Published::Conflicted {
         copy,
-        current_revision,
+        remote_revision,
     } = published
     else {
         panic!("this device was overtaken: {published:?}");
     };
-    assert_eq!(current_revision, theirs.revision);
+    assert_eq!(
+        remote_revision, theirs.revision,
+        "the revision reported is the other device's, not the copy's"
+    );
 
     // The person's own draft is exactly as it was, and the other device's content is beside it.
     assert_eq!(store.load(draft.draft_id).expect("the draft"), draft);
@@ -1045,17 +1063,42 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
     assert_ne!(kept.draft_id, draft.draft_id);
     assert_eq!(store.list().expect("a listing").len(), 2);
 
-    // A publication that is not overtaken is accepted at the revision it named.
-    let fresh = store
+    // A draft this device edited offline is published against the generation this device last saw,
+    // which is none: its own revision counter has nothing to do with the service's.
+    let mut fresh = store
         .create(target, "a second draft".to_owned(), TimestampMs::new(4))
         .expect("a draft");
+    fresh = store
+        .update(
+            fresh.draft_id,
+            fresh.revision,
+            TimestampMs::new(5),
+            |draft| draft.text = "a second draft, edited".to_owned(),
+        )
+        .expect("an edit");
+    assert_eq!(fresh.revision, DraftRevision::new(2));
     assert_eq!(
-        sync.publish(&store, &fresh, TimestampMs::new(5))
+        sync.publish(&store, &fresh, TimestampMs::new(6))
             .await
             .expect("an answer"),
-        Published::Accepted {
-            revision: fresh.revision
+        Published::Accepted { generation: 1 }
+    );
+    // The note records where it reached, so the next publication names that generation.
+    assert_eq!(
+        store
+            .checkpoint(fresh.draft_id)
+            .expect("a note")
+            .expect("published once"),
+        SyncCheckpoint {
+            generation: U64::new(1),
+            revision: fresh.revision,
         }
+    );
+    assert_eq!(
+        sync.publish(&store, &fresh, TimestampMs::new(7))
+            .await
+            .expect("an answer"),
+        Published::Accepted { generation: 2 }
     );
 
     assert!(script.actions.lock().await.is_empty());

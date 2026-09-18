@@ -14,6 +14,7 @@
 
 use std::sync::{Arc, Mutex};
 
+use kr_client::retry::{RequestClass, UserAction};
 use kr_client::services::relay::{
     ManagedRelayLeaseService, RelayLeaseIssueBody, RelayLeaseRevokeBody,
 };
@@ -384,6 +385,21 @@ async fn a_refusal_arrives_as_the_code_the_service_named() {
         .await
         .expect_err("a refusal");
     assert_eq!(error.code(), ErrorCode::PermissionDenied);
+    // A refusal the service named no delay for is still the service's, so a person is offered the
+    // account rather than a setting on their own machine.
+    assert!(matches!(
+        error,
+        ClientError::Refused {
+            retry_after_seconds: None,
+            ..
+        }
+    ));
+    assert_eq!(error.user_action(), UserAction::SignIn);
+    assert!(
+        !error
+            .decision(RequestClass::IdempotentRead)
+            .retries_automatically()
+    );
 
     http.answer_with(
         501,
@@ -420,7 +436,7 @@ async fn a_refusal_arrives_as_the_code_the_service_named() {
     assert!(matches!(
         error,
         ClientError::Refused {
-            retry_after_seconds: 42,
+            retry_after_seconds: Some(42),
             ..
         }
     ));

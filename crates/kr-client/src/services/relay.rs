@@ -659,12 +659,12 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
 
     let error = ProtocolError::new(code_of(&refusal.code, answer.status), refusal.message);
 
-    Err(match refusal.retry_after_seconds {
-        Some(retry_after_seconds) => ClientError::Refused {
-            error,
-            retry_after_seconds,
-        },
-        None => ClientError::Host(error),
+    // Always the service's own variant, with or without a delay. What a person is told about a
+    // refusal turns on who refused, so a refusal that named no delay is still a refusal from here
+    // rather than one that reads as the host's.
+    Err(ClientError::Refused {
+        error,
+        retry_after_seconds: refusal.retry_after_seconds,
     })
 }
 

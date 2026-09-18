@@ -31,10 +31,14 @@ use std::time::Duration;
 use kr_protocol::error::{ErrorCode, RetryCategory};
 use kr_transport::reconnect::Backoff;
 
-/// The shortest delay before an automatic retry.
+/// The shortest delay the policy draws when nothing told it how long to wait.
+///
+/// It bounds the backoff this module produces, not a delay a host or a service stated: a refuser
+/// that named a figure knows when its condition passes, and its figure is honoured as it came.
+/// [`MAX_AUTOMATIC_DELAY`] is what bounds how long a *call* waits, whichever the delay came from.
 pub const RETRY_BACKOFF_MIN: Duration = Duration::from_millis(100);
 
-/// The longest delay before an automatic retry, before jitter.
+/// The longest delay the policy draws when nothing told it how long to wait, before jitter.
 pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 
 /// How many times the library sends the same request again before it hands the decision back.
@@ -506,6 +510,11 @@ impl Attempts {
 /// A caller deciding what to show a person wants this rather than [`Attempts`]: the step and the
 /// action do not depend on how many attempts are left, and the delay is the shortest the policy
 /// would use.
+///
+/// It is not a record of what already happened. The budget is fresh, so a transient failure of an
+/// eligible request reads as [`Recovery::Retry`] here even when the call that produced it had
+/// already spent its attempts and given up. Read the recovery a call returned from the call, and
+/// read this for the step and the action.
 #[must_use]
 pub fn decision(failure: Failure, class: RequestClass) -> Decision {
     Attempts::new().decide(failure, class)
