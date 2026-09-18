@@ -17,10 +17,13 @@
 //!    user name is not a credential and is kept, because ssh needs it.
 //! 3. **The provider is named.** It is the host name as this host resolved it, recorded beside the
 //!    remote so a receipt says which service was reached.
-//! 4. **The broker is approved.** A transport that needs authentication names a broker this host
-//!    has, and the broker supplies a *program* Git will run for a credential. The host never sees
-//!    the credential itself: the helper is the only thing that does, and it is resolved to an
-//!    absolute path inside Git's own helper directory rather than found on a path.
+//! 4. **The broker is approved.** Every remote that reaches a network names a broker this host has.
+//!    A broker supplies the *programs* Git runs: an ssh command for the ssh transport, which is how
+//!    that transport is reached at all, and a credential helper where the host has one. The helper
+//!    can be absent — Git ships one for the platform's secret store on some hosts and not on others
+//!    — and an https remote is then fetched carrying no credential rather than refused. The host
+//!    never sees a credential either way: the helper is the only thing that does, and it is
+//!    resolved to an absolute path inside Git's own helper directory rather than found on a path.
 //!
 //! A local-path remote needs no broker and reaches no network, so it names none.
 

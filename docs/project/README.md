@@ -149,8 +149,10 @@ A network operation names three things and carries no fourth.
    either way is that no credential of the user's is used without the broker: the helper list is
    emptied, the ask-pass programs are empty and the terminal prompt is off, so a remote that does
    want a credential refuses the fetch rather than finding one somewhere this host did not grant.
-   A fetch that failed that way says so, because Git's own words are not repeated and a person told
-   only that the remote refused would have nothing else to go on.
+   A failed attempt that carried no credential says so beside whatever Git said: what was available
+   for it, rather than why it failed. This host cannot tell a refused authentication from a remote
+   it never reached, and it does not repeat Git's own words, so what it can honestly add is the
+   context a person on such a host would otherwise be missing.
 
 After a clone the stored `remote.<name>.url` is read back and compared with the URL this host
 passed. A rewrite, a helper or a version of Git that stored something else would be a credential in

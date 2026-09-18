@@ -1301,10 +1301,10 @@ impl ProjectService {
                 self.record_staging(row, &name, &destination.parent_path().join(&name))?;
                 let staging = StagingSibling::create(destination, &name)?;
                 self.record_staging_identity(row, &staging)?;
-                // A fetch this host could not authenticate says so beside whatever Git said,
-                // because what Git says is not repeated: a person told only that the remote
-                // refused, on a host whose Git ships no credential helper, has no way to find out
-                // why. A fetch that succeeded needed no credential, and says nothing.
+                // A failed attempt that carried no credential says so beside whatever Git said,
+                // because what Git says is not repeated: a person on a host whose Git ships no
+                // credential helper would otherwise have nothing to go on. It is context rather
+                // than a cause. An attempt that succeeded needed no credential, and says nothing.
                 stage_clone(&self.profile, &staging, remote, cancel)
                     .map_err(|error| unauthenticated_fetch(error, remote))?;
                 let staged = staging.staged_witness()?;

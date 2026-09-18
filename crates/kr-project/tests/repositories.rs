@@ -1621,13 +1621,15 @@ fn a_destination_a_caller_named_does_not_reach_the_journal() {
 }
 
 #[test]
-fn an_https_clone_reaches_the_remote_where_the_broker_lends_no_credential_helper() {
+fn an_https_clone_with_no_credential_helper_is_attempted_rather_than_refused() {
     // Git ships a credential helper for the platform's secret store on some hosts and not on
     // others, and an ordinary Linux installation has none. A host that refused an https remote
-    // there would put every one of them out of reach, a public repository included, so the fetch
-    // goes ahead without a credential: the failure below is the remote's, reached over the network,
-    // rather than this host's refusal to try. What the profile still guarantees is that no
-    // credential of the user's is used: the helper list is empty and no prompt can be answered.
+    // there would put every one of them out of reach, a public repository included. So the attempt
+    // goes ahead carrying no credential, and what this test establishes is exactly that: the remote
+    // passed validation and Git was started for it, rather than the host refusing the broker before
+    // anything ran. What became of the attempt after that is Git's, and this does not read it.
+    // What the profile still guarantees is that no credential of the user's is used: the helper
+    // list is empty and no prompt can be answered.
     let fixture = Fixture::with_brokers(support::broker_without_a_credential_helper());
     // A port nothing is listening on, so the attempt ends at once and nothing leaves this machine.
     let closed = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback port");
@@ -1654,19 +1656,19 @@ fn an_https_clone_reaches_the_remote_where_the_broker_lends_no_credential_helper
             },
             Some(&action("project.clone", 41)),
         )
-        .expect_err("nothing is listening, so the clone fails at the remote");
+        .expect_err("nothing is listening at that port, so the attempt fails");
     assert_eq!(
         refusal.code(),
         ErrorCode::UpstreamUnavailable,
-        "the failure is the remote's rather than a refusal to try: {refusal}"
+        "the attempt got as far as Git rather than being refused for its broker: {refusal}"
     );
     assert!(
         refusal.to_string().contains("no credential was available"),
         "and it says what the attempt carried, because Git's own words are not repeated: {refusal}"
     );
-    // What this establishes is that the host got as far as running Git rather than refusing the
-    // broker; whether the connection itself was made is Git's business and this does not read it.
-    // The destination was never made, and the private sibling the attempt staged into is one the
+    // The code above is every Git failure's, a process that would not start included, so it says
+    // the attempt reached Git and no more than that. The rest is what was left behind: the
+    // destination was never made, and the private sibling the attempt staged into is one the
     // journal accounts for, so the next recovery takes it away rather than leaving it for nobody.
     support::assert_absent(
         &fixture.work().join("unauthenticated"),
