@@ -165,20 +165,30 @@ impl Installer {
         // What this host already did keeps its place. An installation that repairs one file must
         // not drop the claim it holds on the others or on its configuration entry, because a claim
         // it drops is a claim it will later refuse to replace and will not remove.
+        let (previous, carried) = existing.map_or_else(
+            || {
+                (
+                    ChangeManifest {
+                        skill_version: SKILL_VERSION.to_owned(),
+                        agent: params.agent,
+                        scope: params.scope,
+                        root: display(&root),
+                        entry_point: self.entry_point(),
+                        operations: Vec::new(),
+                    },
+                    Vec::new(),
+                )
+            },
+            // Whatever an earlier attempt was in the middle of stays unresolved until something
+            // resolves it. A repair that quietly dropped the note would leave a change nobody can
+            // account for and a record that says everything is accounted for.
+            |existing| (existing.manifest, existing.pending),
+        );
         let mut record = InstallationRecord {
+            version: InstallationRecord::VERSION,
             state: InstallationRecord::INSTALLING.to_owned(),
-            manifest: existing.map_or_else(
-                || ChangeManifest {
-                    skill_version: SKILL_VERSION.to_owned(),
-                    agent: params.agent,
-                    scope: params.scope,
-                    root: display(&root),
-                    entry_point: self.entry_point(),
-                    operations: Vec::new(),
-                },
-                |existing| existing.manifest,
-            ),
-            pending: Vec::new(),
+            manifest: previous,
+            pending: carried,
         };
         record.manifest.skill_version = SKILL_VERSION.to_owned();
         record.manifest.root = display(&root);
@@ -192,8 +202,7 @@ impl Installer {
                 path: display(&directory),
             };
             self.begin(params, &mut record, operation.clone())?;
-            create_directory_durably(&directory)?;
-            self.finish(params, &mut record, operation)?;
+            self.settle_directory(params, &mut record, &directory, operation)?;
         }
         for (name, contents) in files() {
             let path = root.join(name);
@@ -215,8 +224,7 @@ impl Installer {
                         path: display(&directory),
                     };
                     self.begin(params, &mut record, operation.clone())?;
-                    create_directory_durably(&directory)?;
-                    self.finish(params, &mut record, operation)?;
+                    self.settle_directory(params, &mut record, &directory, operation)?;
                 }
             }
             let planned = ChangeOperation::AddConfigurationEntry {
@@ -241,6 +249,27 @@ impl Installer {
         })
     }
 
+    /// Records a directory this installation created, or forgets one it did not.
+    ///
+    /// A directory that was already there when the call ran belongs to whatever made it. Claiming
+    /// it would let a later removal delete somebody else's, so the note is simply dropped.
+    fn settle_directory(
+        &self,
+        params: &AgentToolsParams,
+        record: &mut InstallationRecord,
+        directory: &Path,
+        operation: ChangeOperation,
+    ) -> Result<()> {
+        if create_directory_durably(directory)? {
+            self.finish(params, record, operation)
+        } else {
+            record
+                .pending
+                .retain(|noted| !same_target(noted, &operation));
+            self.write(params, record)
+        }
+    }
+
     /// Notes a change this installation is about to make.
     fn begin(
         &self,
@@ -248,7 +277,7 @@ impl Installer {
         record: &mut InstallationRecord,
         operation: ChangeOperation,
     ) -> Result<()> {
-        record.pending = vec![operation];
+        merge(&mut record.pending, operation);
         self.write(params, record)
     }
 
@@ -259,8 +288,12 @@ impl Installer {
         record: &mut InstallationRecord,
         operation: ChangeOperation,
     ) -> Result<()> {
+        // The note this change left is resolved, and only that one: a note some earlier attempt
+        // left about a different target is still unresolved.
+        record
+            .pending
+            .retain(|noted| !same_target(noted, &operation));
         merge(&mut record.manifest.operations, operation);
-        record.pending.clear();
         self.write(params, record)
     }
 
@@ -419,8 +452,9 @@ impl Installer {
             .iter()
             .map(|operation| {
                 format!(
-                    "{} may or may not have been written when the installation stopped, so it is \
-                     left alone",
+                    "a change to {} may or may not have been written when the installation \
+                     stopped; the change itself is left alone, though an earlier recorded write \
+                     to the same place is still undone below",
                     operation.path()
                 )
             })
@@ -684,16 +718,24 @@ impl Installer {
                 continue;
             };
             let wanted = display(&path);
-            // A file this host planned or wrote, at a digest it planned or wrote. Anything else
-            // there is somebody's own file, and an installation does not write over one.
+            // A file this host wrote, or one it was in the middle of writing when an installation
+            // stopped, at exactly the content the record names. The in-flight note counts because
+            // the content proves the claim: writing the same bytes again changes nothing, and
+            // refusing here would make an interrupted installation unrepairable. Anything else at
+            // that path is somebody's own file, and an installation does not write over one.
             let ours = recorded.as_ref().is_some_and(|record| {
-                record.manifest.operations.iter().any(|operation| {
-                    matches!(
-                        operation,
-                        ChangeOperation::WriteFile { path: recorded_path, digest, .. }
-                            if *recorded_path == wanted && *digest == present
-                    )
-                })
+                record
+                    .manifest
+                    .operations
+                    .iter()
+                    .chain(record.pending.iter())
+                    .any(|operation| {
+                        matches!(
+                            operation,
+                            ChangeOperation::WriteFile { path: recorded_path, digest, .. }
+                                if *recorded_path == wanted && *digest == present
+                        )
+                    })
             });
             if !ours {
                 return Err(ControllerError::PermissionDenied {
@@ -711,6 +753,23 @@ impl Installer {
             // container is something other than a table is refused here rather than after the
             // skill files have been written.
             self.check_container(configuration)?;
+            // Replacing a document by renaming another over it gives the replacement the new
+            // file's own access control. On Unix the mode is carried across; Windows protects a
+            // file with a security descriptor this crate cannot read or reapply without platform
+            // calls it does not make. Rather than quietly weakening a document somebody
+            // restricted, an existing one is not replaced there at all — and the refusal happens
+            // here, before anything else is written. This host's own files carry no such risk:
+            // they are its records and the package it wrote.
+            #[cfg(windows)]
+            if configuration.path.exists() {
+                return Err(ControllerError::PermissionDenied {
+                    detail: format!(
+                        "{} already exists, and replacing it here cannot carry its access control \
+                         across; add the server with the agent's own command instead",
+                        display(&configuration.path)
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -926,6 +985,11 @@ impl Installer {
             {
                 servers.remove(SERVER_NAME);
             }
+            // The document itself stays, even when this host created it and the entry was the
+            // only thing in it. A format-preserving editor keeps comments and spacing that are
+            // nobody's business but the author's, and an empty-looking table is not evidence the
+            // file holds nothing of theirs. The JSON branch below can delete one because it
+            // reparses the document and can see that it holds nothing at all.
             write_atomically(path, document.to_string().as_bytes(), PRIVATE)?;
         } else {
             let mut document = read_json(path)?;
@@ -1128,8 +1192,32 @@ impl Installer {
         self.records.join(format!("{}-{scope}.json", params.agent))
     }
 
+    /// Returns the name an earlier build would have given this record, when it differs.
+    fn legacy_record_path(&self, params: &AgentToolsParams) -> Option<PathBuf> {
+        let directory = params.project_dir.as_ref()?;
+        (params.scope == kr_protocol::skill::InstallScope::User).then(|| {
+            self.records.join(format!(
+                "{}-{}-{}.json",
+                params.agent,
+                params.scope,
+                hex(&kr_cbor::sha256(directory.as_bytes())[..8])
+            ))
+        })
+    }
+
     fn recorded(&self, params: &AgentToolsParams) -> Result<Option<InstallationRecord>> {
-        let Some(text) = read_to_string(&self.record_path(params))? else {
+        let path = self.record_path(params);
+        if !path.exists()
+            && let Some(legacy) = self.legacy_record_path(params)
+            && legacy.exists()
+        {
+            // An earlier build named a user record after a project directory it was given, which
+            // the reader no longer recognises. Move it to the name it should have had, so the
+            // claims in it keep counting.
+            std::fs::rename(&legacy, &path).map_err(storage)?;
+            sync_directory(&self.records)?;
+        }
+        let Some(text) = read_to_string(&path)? else {
             return Ok(None);
         };
         read_record(&text).map(Some).map_err(|error| {
@@ -1154,12 +1242,20 @@ impl Installer {
 
 /// What this host recorded about one installation.
 ///
-/// The plan is written before the first effect and the state is moved to `installed` after the
-/// last one, so an installation interrupted part way through is distinguishable from one that
-/// finished: `kr skill status` reports it as unfinished, `kr skill remove` undoes whatever of the
-/// plan actually reached the disk, and a later installation does not mistake it for complete.
+/// It is a journal, not a plan. Each change is noted as pending before its effect and moved to the
+/// manifest after it, and the state becomes `installed` once the last one has been made. An
+/// installation interrupted part way through is therefore distinguishable from one that finished:
+/// `kr skill status` reports it as unfinished, `kr skill remove` undoes what the manifest records
+/// and reports what was pending rather than guessing at it, and a later installation does not
+/// mistake it for complete.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct InstallationRecord {
+    /// Which shape this record is written in.
+    ///
+    /// A record without one was written before the operations in it meant "this happened", so it
+    /// is read as evidence of something uncertain rather than as ownership.
+    #[serde(default)]
+    version: u32,
     /// `installing` while the journal is being carried out, `installed` once it has been.
     state: String,
     /// What this installation has actually done, in the order it did it.
@@ -1178,6 +1274,9 @@ struct InstallationRecord {
 }
 
 impl InstallationRecord {
+    /// The shape this build writes, in which a recorded operation is one that happened.
+    const VERSION: u32 = 1;
+
     /// The state of a record whose journal has been carried out.
     const INSTALLED: &'static str = "installed";
 
@@ -1295,9 +1394,9 @@ impl Installer {
     ) -> Result<()> {
         let path = self.action_path(actor_id, action_id);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(storage)?;
-            // The directory entry itself, before anything inside it is claimed to be durable.
-            sync_directory(parent)?;
+            // Every missing ancestor, each one's own entry made durable in the directory above it,
+            // before anything inside is claimed to be durable.
+            create_directory_durably(parent)?;
         }
         let text = serde_json::to_string_pretty(record)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
@@ -1344,14 +1443,33 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
 /// installation that was in fact complete writes the same files again, while claiming a completion
 /// that may not have happened would leave a half-installed agent looking installed.
 fn read_record(text: &str) -> std::result::Result<InstallationRecord, serde_json::Error> {
-    serde_json::from_str::<InstallationRecord>(text).or_else(|error| {
-        serde_json::from_str::<ChangeManifest>(text)
-            .map(|manifest| InstallationRecord {
-                state: InstallationRecord::INSTALLING.to_owned(),
-                manifest,
-                pending: Vec::new(),
-            })
-            .map_err(|_| error)
+    if let Ok(record) = serde_json::from_str::<InstallationRecord>(text) {
+        if record.version == InstallationRecord::VERSION {
+            return Ok(record);
+        }
+        // A record from the build that wrote its intentions rather than its effects. Those
+        // operations may or may not have happened, so they become evidence of uncertainty: a
+        // removal reports them and leaves them alone, because removing something this host may
+        // never have written would delete somebody else's.
+        let mut migrated = record;
+        migrated.pending = migrated
+            .manifest
+            .operations
+            .drain(..)
+            .chain(migrated.pending)
+            .collect();
+        migrated.state = InstallationRecord::INSTALLING.to_owned();
+        migrated.version = InstallationRecord::VERSION;
+        return Ok(migrated);
+    }
+    // The first shape: the manifest alone. That build recorded each change after making it, so
+    // those operations are things that happened; what it does not say is whether the installation
+    // finished, and a completion that may not have happened is never claimed.
+    serde_json::from_str::<ChangeManifest>(text).map(|manifest| InstallationRecord {
+        version: InstallationRecord::VERSION,
+        state: InstallationRecord::INSTALLING.to_owned(),
+        manifest,
+        pending: Vec::new(),
     })
 }
 
@@ -1366,23 +1484,30 @@ fn removal_order(operations: &[ChangeOperation]) -> Vec<&ChangeOperation> {
         // Files and entries first, then directories; within each, the deepest path first.
         (
             u8::from(directory),
-            std::cmp::Reverse(operation.path().matches(std::path::MAIN_SEPARATOR).count()),
+            std::cmp::Reverse(Path::new(operation.path()).components().count()),
         )
     });
     ordered
 }
 
 /// Creates a directory and makes the entry that names it durable.
-fn create_directory_durably(path: &Path) -> Result<()> {
+fn create_directory_durably(path: &Path) -> Result<bool> {
+    let mut created = false;
     for directory in missing_ancestors(path) {
-        std::fs::create_dir(&directory).map_err(storage)?;
+        match std::fs::create_dir(&directory) {
+            Ok(()) => created = true,
+            // Something else made it between the look and the call. It is not this host's to
+            // claim, and claiming it would let a later removal delete somebody else's directory.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(storage(error)),
+        }
         // The parent's own entry for it, not the new directory's contents: what has to survive is
         // the name, because everything written inside it is reached through that name.
         if let Some(parent) = directory.parent() {
             sync_directory(parent)?;
         }
     }
-    Ok(())
+    Ok(created)
 }
 
 /// Returns true when this file name is one this host gives an installation record.
@@ -1412,41 +1537,26 @@ fn is_record_name(name: &str) -> bool {
 /// record written there is durable only as far as the platform's own ordering makes it.
 fn sync_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
-    let directory = std::fs::File::open(path).map_err(storage)?;
-    #[cfg(windows)]
-    let directory = {
-        use std::os::windows::fs::OpenOptionsExt as _;
-
-        // A directory handle needs the backup flag; without it opening one fails. The flag is
-        // about how the handle is opened, not about what may be written through it.
-        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)
-            .map_err(storage)?
-    };
-    #[cfg(not(any(unix, windows)))]
     {
-        return Err(ControllerError::Storage {
-            operation: "make a directory entry durable",
-            detail: format!(
-                "{} cannot be synchronised on this platform, and an installation that cannot \
-                 record what it did durably does not begin",
-                display(path)
-            ),
-        });
-    }
-    #[cfg(any(unix, windows))]
-    {
+        let directory = std::fs::File::open(path).map_err(storage)?;
         directory.sync_all().map_err(storage)?;
-        Ok(())
     }
+    // Windows has no equivalent this crate can reach: flushing a handle's buffers there needs
+    // write access, and a directory handle cannot be opened for writing. An installation on
+    // Windows is therefore as durable as the platform's own ordering makes it, which is a gap the
+    // Windows qualification has to close rather than one this code can paper over. It is named
+    // here and in the contact documentation instead of being claimed as durability it does not
+    // have.
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
 }
 
-/// Adds an operation to a plan, replacing any earlier one for the same target.
-fn merge(operations: &mut Vec<ChangeOperation>, operation: ChangeOperation) {
-    let same = |left: &ChangeOperation, right: &ChangeOperation| match (left, right) {
+/// Returns true when two operations are about the same thing.
+fn same_target(left: &ChangeOperation, right: &ChangeOperation) -> bool {
+    match (left, right) {
         (
             ChangeOperation::AddConfigurationEntry {
                 path: left_path,
@@ -1463,10 +1573,14 @@ fn merge(operations: &mut Vec<ChangeOperation>, operation: ChangeOperation) {
             std::mem::discriminant(left) == std::mem::discriminant(right)
                 && left.path() == right.path()
         }
-    };
+    }
+}
+
+/// Adds an operation to a list, replacing any earlier one about the same thing.
+fn merge(operations: &mut Vec<ChangeOperation>, operation: ChangeOperation) {
     if let Some(existing) = operations
         .iter_mut()
-        .find(|existing| same(existing, &operation))
+        .find(|existing| same_target(existing, &operation))
     {
         *existing = operation;
         return;
@@ -1588,22 +1702,6 @@ const PRIVATE: u32 = 0o600;
 /// did not exist is created with `default_mode`.
 fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> {
     use std::io::Write as _;
-
-    // Replacing a file by renaming another over it gives the replacement the new file's own access
-    // control. On Unix the mode is carried across below, which is the protection those files have.
-    // Windows protects a file with a security descriptor that this crate cannot read or reapply
-    // without platform calls it does not make, so rather than quietly weakening a document that
-    // somebody restricted, an existing one is not replaced at all.
-    #[cfg(windows)]
-    if path.exists() {
-        return Err(ControllerError::PermissionDenied {
-            detail: format!(
-                "{} already exists, and replacing it here cannot carry its access control across; \
-                 add the server with the agent's own command instead",
-                display(path)
-            ),
-        });
-    }
 
     let parent = path.parent().unwrap_or(Path::new("."));
     // A distinct name per write. A fixed one is a collision between two callers writing the same
@@ -2196,6 +2294,137 @@ mod tests {
             "{:?}",
             removed.retained
         );
+    }
+
+    #[test]
+    fn a_file_left_in_flight_is_repaired_rather_than_refused() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        installer.install(&params).expect("installs");
+
+        // What a crash between writing a skill file and recording it leaves: the file is on disk
+        // holding what the note says, and the record does not claim it yet.
+        let path = installer.record_path(&params);
+        let mut record =
+            read_record(&std::fs::read_to_string(&path).expect("the record")).expect("reads");
+        let in_flight = record
+            .manifest
+            .operations
+            .iter()
+            .position(|operation| matches!(operation, ChangeOperation::WriteFile { .. }))
+            .expect("a file was written");
+        let operation = record.manifest.operations.remove(in_flight);
+        let file = PathBuf::from(operation.path().to_owned());
+        record.pending = vec![operation];
+        record.state = InstallationRecord::INSTALLING.to_owned();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&record).expect("encodes"),
+        )
+        .expect("writes");
+
+        installer.install(&params).expect("repairs");
+
+        let repaired = installer
+            .recorded(&params)
+            .expect("reads")
+            .expect("a record");
+        assert!(repaired.is_complete(), "the repair finishes it");
+        assert!(repaired.pending.is_empty(), "nothing is left uncertain");
+        assert!(
+            installer.status(&params).expect("reads").installed,
+            "and it reads as installed"
+        );
+
+        // The same file holding somebody else's content is a different matter.
+        std::fs::write(&file, "mine, actually").expect("writes");
+        let refused = installer.install(&params).expect_err("refuses");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { .. }),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_predicted_record_from_an_earlier_build_becomes_uncertain_rather_than_owned() {
+        // The shape that recorded what an installation *meant* to do. Those operations may or may
+        // not have happened, so they become evidence of uncertainty instead of ownership.
+        let text = serde_json::json!({
+            "state": "installing",
+            "manifest": {
+                "skill_version": SKILL_VERSION,
+                "agent": "codex",
+                "scope": "user",
+                "root": "/somewhere",
+                "entry_point": ["kr"],
+                "operations": [{
+                    "operation": "add_configuration_entry",
+                    "path": "/somewhere/config.toml",
+                    "entry": "mcp_servers.kalareach",
+                    "digest": serde_json::to_value(digest_of(b"predicted"))
+                        .expect("a digest"),
+                    "created_document": false,
+                }],
+            },
+        })
+        .to_string();
+        let record = read_record(&text).expect("reads the earlier shape");
+        assert!(!record.is_complete());
+        assert!(record.manifest.operations.is_empty(), "nothing is owned");
+        assert_eq!(record.pending.len(), 1, "everything is uncertain");
+    }
+
+    #[test]
+    fn a_user_record_an_earlier_build_named_after_a_project_is_still_found() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        // A user installation asked for while a project directory happened to be in the request.
+        // An earlier build put that directory in the record's name.
+        let mut params = params(AgentTarget::Codex, InstallScope::User);
+        params.project_dir = Nullable::from(Some("/work/somewhere".to_owned()));
+        installer.install(&params).expect("installs");
+        let modern = installer.record_path(&params);
+        let legacy = installer
+            .legacy_record_path(&params)
+            .expect("the earlier name");
+        std::fs::rename(&modern, &legacy).expect("wears the earlier name");
+
+        let record = installer
+            .recorded(&params)
+            .expect("reads")
+            .expect("a record");
+
+        assert!(record.is_complete(), "the claim still counts");
+        assert!(modern.is_file(), "it wears the name the reader knows");
+        assert!(!legacy.exists(), "and only that one");
+        installer.remove(&params).expect("removes");
+    }
+
+    #[test]
+    fn a_directory_that_was_already_there_is_not_claimed() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        // Somebody else's directory, in the place this installation would have made one.
+        let skills = tree.home().join(".claude/skills/kalareach-contact");
+        std::fs::create_dir_all(&skills).expect("a directory");
+        installer.install(&params).expect("installs");
+        let recorded = installer
+            .recorded(&params)
+            .expect("reads")
+            .expect("a record");
+        assert!(
+            !recorded
+                .manifest
+                .operations
+                .iter()
+                .any(|operation| matches!(operation, ChangeOperation::CreateDirectory { .. })),
+            "no directory is claimed: {:?}",
+            recorded.manifest.operations
+        );
+        installer.remove(&params).expect("removes");
+        assert!(skills.is_dir(), "somebody else's directory is still there");
     }
 
     #[test]

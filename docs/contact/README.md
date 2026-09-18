@@ -190,9 +190,12 @@ Three properties make an installation safe to undo:
   agent's own command. On Unix an extended access-control list beyond the mode bits is likewise not
   carried.
 
-A directory the installation created is removed only when it is empty. A project's `.mcp.json` is
-read by more than one agent, so the entry in one is written identically whichever installation
-wrote it and is removed only when no other recorded installation still names it.
+A directory the installation created is removed only when it is empty, and a directory that was
+already there is never claimed. A project's `.mcp.json` is read by more than one agent, so the entry
+in one is written identically whichever installation wrote it and is removed only when no other
+recorded installation still names it. A JSON document this host created goes with the entry when
+nothing else was ever put in it; a TOML one does not, because a format-preserving editor keeps
+comments and spacing this host cannot read as its own.
 
 Installing and removing are mutations, and they carry section 9's receipt contract: the same action
 retried returns what it produced the first time rather than changing anything again, the same
@@ -203,10 +206,16 @@ immediately before anything durable happens.
 
 Each change is noted in the record before it happens and recorded after it, and the record is marked
 complete only when the last one is. An installation interrupted part way through is therefore not
-mistaken for a finished one: `kr skill status` says it did not finish, `kr skill remove` undoes what
-was recorded, and installing again finishes the work. The one change that was in flight is named by
-both, and left alone: a digest proves what a file contains, not who wrote it, and removing something
-this host may never have written would delete somebody else's file.
+mistaken for a finished one: `kr skill status` says it did not finish, and `kr skill remove` undoes
+what was recorded. The one change that was in flight is named and left alone: a digest proves what a
+file contains, not who wrote it, and removing something this host may never have written would
+delete somebody else's file.
+
+Installing again carries on from there. A skill file whose content is what the record names, whether
+it was recorded or still in flight, is written again and claimed; a file at that path holding
+anything else is somebody's own, and the installation refuses and says to move it aside. So a
+repair finishes an interrupted installation, except where somebody has since put their own file
+where one of its files goes.
 
 ## What contact is not
 
