@@ -46,7 +46,9 @@
 //! | [`limits`] | Protocol defaults |
 //! | [`local`] | The local IPC handshake and the control-stream message union |
 //! | [`identity`] | Boot, process-start and worker-profile identities |
+//! | [`question`] | Agent questions, their answers, alerts and the caller token |
 //! | [`session`] | The session lifecycle, closure records and the session method group |
+//! | [`skill`] | Contact-skill installation: agents, scopes and the exact change manifest |
 //! | [`attachment`] | Attachments, geometry ownership and the attachment method group |
 //! | [`input`] | The single input lease and the input method group |
 //! | [`root`] | The trusted root integration: the editor fence, its events and the launch transaction |
@@ -112,6 +114,7 @@ pub mod pairing;
 pub mod preauth;
 pub mod project;
 pub mod push;
+pub mod question;
 pub mod receipt;
 pub mod recovery;
 pub mod relay;
@@ -122,6 +125,7 @@ pub mod schema;
 pub mod semantic;
 pub mod service;
 pub mod session;
+pub mod skill;
 pub mod sync;
 pub mod transfer;
 pub mod vectors;
