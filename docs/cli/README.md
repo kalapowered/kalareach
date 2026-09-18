@@ -183,10 +183,16 @@ does; they keep working while the control daemon is restarting.
 The agents are `codex`, `claude-code`, `opencode`, `gemini-cli`, `kimi-code-cli` and `qoder-cli`. A
 project scope with no `--project-dir` means this directory.
 
-`kr skill status` reports what is installed and lists anything that has changed since. `kr skill
-remove` undoes exactly what the installation recorded, and leaves alone anything that changed after
-it was written. Both print the change manifest: every directory created, every file written, and
-the configuration entry added.
+`kr skill status` reports what is installed and lists anything that has changed since, including an
+installation that began and did not finish. `kr skill remove` undoes exactly what the installation
+recorded, and leaves alone anything that changed after it was written. Both print the change
+manifest: every directory created, every file written, and the configuration entry added.
+
+What cannot be done safely is refused before anything changes: a file or a server entry this host
+did not write, a configuration document whose access controls a replacement could not carry, and
+every installation change on Windows, where this host has no way to make the change durable. After
+an interrupted installation, `kr skill install` says so and lists under `unresolved` anything that
+neither it nor a removal can account for.
 
 ## `kr agent-tools`
 
