@@ -53,9 +53,10 @@ to be the object its record names: the working tree by the identity the reposito
 the Git common directory by its own, the reserved destination by the identity the reservation
 returned. A directory substituted at one of those names is refused before anything starts. The child
 then does not start at a path either: it moves into the open working directory before the boundary
-is applied and before Git runs, with `-C .` as its only directory argument. A tree substituted at
-the name afterwards is not the tree Git works in; the invocation fails with this service's declared
-answer and the substituted tree is never written.
+is applied and before Git runs, with `-C .` as its only directory argument. And after the child has
+gone, every one of those directories is required to still be that object before anything it produced
+is used: a substitution made while Git ran is this service's declared refusal rather than a result
+nobody can account for.
 
 **Reads are not confined on macOS or Linux.** Git reads the system's shared libraries, its locale
 data and its certificate store, and a read confinement that missed one of those would fail an
@@ -79,9 +80,11 @@ Where a guarantee cannot be enforced from outside Git, the operation that needs 
 of these falls back to reading the configuration and hoping.
 
 * **A kernel older than Linux 6.2** cannot mediate truncation, so a process could shorten a file the
-  boundary never made writable. No Git is run there. A host in that position runs the service inside
-  a bubblewrap container, which gives the same confinement one level up; that container is something
-  an operator builds, not something this service starts.
+  boundary never made writable. No Git is run there, and that is the whole of it: a bubblewrap
+  container around the service would give an operator the same confinement from one level up, and
+  this service would still refuse inside one, because the refusal is about what this kernel can
+  enforce rather than about what is around the process. Supporting such a kernel means a different
+  mechanism, not a wrapper.
 * **A kernel older than Linux 6.7** has no rules for which addresses a process reaches, so an
   operation that needs a remote is refused there. Local operations still run: their filesystem
   confinement is the same, and the system-call filter that refuses them an internet socket does not
@@ -100,10 +103,21 @@ of these falls back to reading the configuration and hoping.
 
 Stated rather than implied.
 
-**Two of the three mechanisms write their rules against paths**, because that is what they take. The
-object the child works in is the one this service opened, so a substitution cannot redirect it; what
-a substitution can do is make the invocation fail, which is the declared answer rather than a silent
-one. Landlock is the exception: its rules are attached to the opened objects themselves.
+**A substitution while Git runs is refused rather than prevented.** Two of the three mechanisms
+write their rules against paths, because that is what they take, so a directory put at one of those
+names while Git ran is one the rules still permitted; and a directory put *inside* a tree the
+operation owns is inside a tree the operation owns, which no confinement that grants a tree can
+refuse part of. The object the child works in is still the one this service opened, and every
+directory the boundary was built around is required to still be that object before anything the
+child produced is used. So the answer is a refusal that names what changed. Landlock is the
+exception for the first of the two: its rules are attached to the opened objects themselves.
+
+**On Windows the execution refusal rests on permissions a repository can carry its own.** The
+container is refused the execute right on the directories the operation owns, and a refusal beats
+every grant that reaches the object the same way. What it does not beat is a grant written directly
+on a file inside that directory, which Windows consults before it reaches an inherited refusal. A
+writer who can create files in the repository can write such a grant. This is a property of the
+mechanism rather than of the code, and it is one reason the platform is not qualified.
 
 **A remote operation's non-TCP traffic on Linux is not bounded by address.** Landlock's rules cover
 TCP, and a system-call filter reads scalar arguments while an address is behind a pointer. Turning a
@@ -116,8 +130,11 @@ an ordinary account cannot set. A local operation there still reaches no address
 of the guarantee the capability does express.
 
 **A Windows grant whose removal fails is left behind.** Each is taken away when the invocation ends
-and the container profile is deleted with it, and a removal that fails is not pretended otherwise:
-what remains names a container that no longer exists.
+and the container profile is deleted with it. Neither the removal nor the deletion is checked,
+because there is nothing left to do about a failure at that point, so what may remain is a grant
+naming a container that may still exist. One invocation at a time changes a path's permissions, so
+two of this service's own invocations cannot lose each other's entries; another program editing the
+same permissions at the same time still can.
 
 **A repository's configuration can still make Git refuse to do something**, produce a limitation or
 name a helper this service will not run. That is the restricted profile's business and it is

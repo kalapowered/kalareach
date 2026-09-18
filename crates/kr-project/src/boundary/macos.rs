@@ -10,11 +10,16 @@
 //!
 //! ## What applies it
 //!
-//! The platform's own launcher, `/usr/bin/sandbox-exec`, which reads the profile, compiles it into
-//! itself and then executes Git. The invocation's program becomes the launcher and its arguments
-//! gain the profile's path; everything else about the child — its environment, its directory, its
-//! process group, its pipes — is unchanged, and the launcher replaces itself with Git, so the
-//! process this host waits on is Git.
+//! The platform's own launcher, `/usr/bin/sandbox-exec`, which compiles the profile into itself and
+//! then executes Git. The invocation's program becomes the launcher and the profile travels as one
+//! of its arguments; everything else about the child — its environment, its directory, its process
+//! group, its pipes — is unchanged, and the launcher replaces itself with Git, so the process this
+//! host waits on is Git and its exit status is Git's.
+//!
+//! The profile is an argument rather than a file on purpose. A file would be a second thing for a
+//! writer under the same account to reach: a name to plant a link at before this host writes it, and
+//! a document to rewrite between the writing and the launcher reading it. An argument vector this
+//! process built is reachable by nothing.
 //!
 //! The library call `sandbox_init` would apply the same text without the extra program, and it
 //! works on this platform. It is not used, and the reason is where it would have to be called:
@@ -37,9 +42,6 @@ pub const MECHANISM: &str = "a per-invocation macOS sandbox profile, applied by 
 /// The launcher that applies a profile and then executes what it was given.
 const LAUNCHER: &str = "/usr/bin/sandbox-exec";
 
-/// The name the profile is written under inside the invocation's own temporary directory.
-const PROFILE_FILE: &str = "boundary.sb";
-
 /// The socket this system's name resolution goes through.
 ///
 /// A remote operation has to turn the remote's host name into an address, and on this platform
@@ -57,20 +59,20 @@ const DEVICES: &[&str] = &[
     "/dev/dtracehelper",
 ];
 
-/// The profile this invocation runs under, and where it was written.
+/// The profile this invocation runs under.
 #[derive(Debug)]
 pub struct Prepared {
-    profile: PathBuf,
+    profile: String,
 }
 
 impl Prepared {
     /// Returns the program the child executes and the arguments it runs with.
     ///
-    /// The launcher first, then the profile, then Git and its own arguments.
+    /// The launcher first, then the profile itself, then Git and its own arguments.
     pub fn command(&self, invocation: &Invocation<'_>) -> (PathBuf, Vec<OsString>) {
         let mut arguments = vec![
-            OsString::from("-f"),
-            self.profile.as_os_str().to_owned(),
+            OsString::from("-p"),
+            OsString::from(&self.profile),
             invocation.program.as_os_str().to_owned(),
         ];
         arguments.extend(invocation.arguments.iter().cloned());
@@ -90,7 +92,7 @@ impl Prepared {
     }
 }
 
-/// Builds the profile one invocation runs under and writes it where the launcher reads it.
+/// Builds the profile one invocation runs under.
 ///
 /// # Errors
 ///
@@ -140,13 +142,7 @@ pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
             text.push_str(")\n");
         }
     }
-    // Inside the invocation's own temporary directory, which the boundary itself makes writable and
-    // which goes away with the invocation. The launcher reads it before the profile applies.
-    let profile = confinement.temporary.path().join(PROFILE_FILE);
-    std::fs::write(&profile, text).map_err(|error| ProjectError::GitFailed {
-        detail: format!("this invocation's boundary could not be written down: {error}").into(),
-    })?;
-    Ok(Prepared { profile })
+    Ok(Prepared { profile: text })
 }
 
 /// Returns one path as a profile's literal filter.
@@ -193,10 +189,7 @@ fn quoted(path: &Path) -> Result<String> {
 /// Returns whatever [`prepare`] would have refused the invocation for.
 #[cfg(any(test, feature = "git-fixtures"))]
 pub fn profile_text(confinement: &Confinement) -> Result<String> {
-    let prepared = prepare(confinement)?;
-    std::fs::read_to_string(&prepared.profile).map_err(|error| ProjectError::GitFailed {
-        detail: format!("this invocation's boundary could not be read back: {error}").into(),
-    })
+    Ok(prepare(confinement)?.profile)
 }
 
 #[cfg(test)]

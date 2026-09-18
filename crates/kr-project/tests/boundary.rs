@@ -404,6 +404,9 @@ fn a_driver_planted_into_a_clones_own_destination_never_runs_during_its_checkout
     require_the_planting_would_have_run(&published);
 }
 
+// Both swaps rename a directory this host holds open, which every Unix system permits and Windows
+// does not; a Windows test of the same claim needs its own shape and the platform to run it on.
+#[cfg(unix)]
 #[test]
 fn a_tree_substituted_at_the_path_is_not_what_a_read_is_taken_from() {
     let mut fixture = Fixture::create();
@@ -427,33 +430,27 @@ fn a_tree_substituted_at_the_path_is_not_what_a_read_is_taken_from() {
         OsStr::new("--porcelain=v2"),
         OsStr::new("--untracked-files=all"),
     ];
-    let read = fixture
+    let refusal = fixture
         .service()
         .profile()
         .run(&repository.read(&arguments))
-        .expect("the status runs");
-    let text = read.text().into_owned();
-    assert!(
-        text.contains("only-in-the-verified-tree.txt"),
-        "the status was taken from the tree this host opened: {text}"
-    );
-    assert!(
-        !text.contains("only-in-the-substitute.txt"),
-        "and never from the tree that took its name: {text}"
-    );
+        .expect_err("a result taken where the directory no longer is, is not served");
+    // The declared honest result. Git ran inside the object this host opened, and the name it was
+    // started at no longer holds that object, so what it produced is refused rather than returned
+    // as if the two were the same thing.
+    assert_eq!(refusal.code(), kr_protocol::error::ErrorCode::SourceChanged);
+    // The tree that took the name holds exactly what it held.
     assert_eq!(
         tree_state(&verified),
         before,
-        "the tree that took the name was not written to either"
+        "the tree that took the name was neither read from nor written to"
     );
-    // And the host refuses a later result too, because the repository is no longer where it was.
-    assert!(
-        repository.confirm(fixture.service().profile()).is_err(),
-        "a repository that is no longer at the path it reported does not have its results served"
-    );
+    // And the verified tree is whole where it was moved to.
     assert!(moved.join("only-in-the-verified-tree.txt").is_file());
+    assert!(moved.join(".git").is_dir());
 }
 
+#[cfg(unix)]
 #[test]
 fn a_tree_substituted_at_the_path_is_not_what_a_write_lands_in() {
     let mut fixture = Fixture::create();
@@ -512,6 +509,7 @@ fn a_tree_substituted_at_the_path_is_not_what_a_write_lands_in() {
 }
 
 /// Builds a repository and a second one to put at its name, each with a file only it has.
+#[cfg(unix)]
 fn two_repositories(fixture: &Fixture, name: &str) -> (PathBuf, PathBuf, PathBuf) {
     let verified = ordinary_repository(fixture.work(), &format!("verified-{name}"));
     write(
@@ -530,6 +528,7 @@ fn two_repositories(fixture: &Fixture, name: &str) -> (PathBuf, PathBuf, PathBuf
 }
 
 /// An interposition that puts one tree at another's name immediately before a chosen spawn.
+#[cfg_attr(not(unix), expect(dead_code, reason = "only the swap tests use it"))]
 ///
 /// After the invocation has opened and verified every directory it is enclosed around, and before
 /// the child exists: the moment the boundary is for.
@@ -554,14 +553,21 @@ fn swapping_before(
     ))
 }
 
-/// Returns what identifies one tree: the names it holds, the file that names it, and its head.
-fn tree_state(path: &Path) -> (Vec<String>, String, String) {
+/// Returns what identifies one tree: what it holds, what its Git directory holds, the file that
+/// names it, and its head.
+#[cfg_attr(not(unix), expect(dead_code, reason = "only the swap tests use it"))]
+///
+/// The Git directory's own entries are in it because a write into the wrong tree need not change
+/// anything in the working tree: `git worktree add` writes a record under `.git/worktrees` and
+/// touches nothing else.
+fn tree_state(path: &Path) -> (Vec<String>, Vec<String>, String, String) {
     let names = names_in_if_any(path);
+    let administrative = names_in_if_any(&path.join(".git"));
     let identifying = std::fs::read_to_string(path.join("only-in-the-substitute.txt"))
         .or_else(|_| std::fs::read_to_string(path.join("only-in-the-verified-tree.txt")))
         .unwrap_or_default();
     let head = std::fs::read_to_string(path.join(".git/HEAD")).unwrap_or_default();
-    (names, identifying, head)
+    (names, administrative, identifying, head)
 }
 
 #[test]
@@ -603,6 +609,7 @@ fn an_invocation_reaches_only_the_ports_its_own_transport_uses() {
         ssh_command: None,
         ssh_program: None,
         port,
+        remote_name: Some("origin"),
     };
 
     // The control: a remote operation whose validated URL named this port reaches it.
@@ -761,6 +768,7 @@ fn only_an_invocation_that_reaches_a_repository_may_execute_a_shell() {
             ssh_command: None,
             ssh_program: None,
             port: None,
+            remote_name: Some("origin"),
         });
         let list = profile.execution_list(&reaching);
         assert!(
@@ -772,6 +780,77 @@ fn only_an_invocation_that_reaches_a_repository_may_execute_a_shell() {
              helper Git builds as command strings: {transport:?} {list:?}"
         );
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_destination_substituted_after_the_boundary_was_built_is_the_declared_refusal() {
+    // The other half of the destination case: not a substitution before the invocation opened it,
+    // which is refused before anything starts, but one made after it was opened and verified, while
+    // the boundary's own rules already named it. The rules are written against paths on this
+    // platform, so the substitute is a directory those rules permit; what makes that answerable is
+    // that every directory an invocation was enclosed around is required to still be that object
+    // before anything the child produced is used.
+    let mut fixture = Fixture::create();
+    let source = ordinary_repository(fixture.work(), "reserved-late");
+    let repository = OpenedRepository::open(
+        fixture.service().profile(),
+        fixture.environment_id(),
+        &source,
+    )
+    .expect("the repository opens");
+    let reserved = fixture.work().join("reserved-late-destination");
+    let theirs = fixture.work().join("theirs");
+    std::fs::create_dir_all(&reserved).expect("the destination this operation reserves");
+    std::fs::create_dir_all(&theirs).expect("the directory somebody else made");
+    write(&theirs, "theirs.txt", "not this operation's\n");
+    let identity =
+        identity_of(fixture.environment_id(), &reserved).expect("the destination's own object");
+
+    let swap = {
+        let reserved = reserved.clone();
+        let theirs = theirs.clone();
+        let aside = fixture.work().join("reserved-late-aside");
+        let done = AtomicUsize::new(0);
+        Interposition::new(Arc::new(
+            move |described: &str, _working: &Path, _temporary: &Path| {
+                if !described.starts_with("git worktree") || done.fetch_add(1, Ordering::SeqCst) > 0
+                {
+                    return;
+                }
+                std::fs::rename(&reserved, &aside).expect("the reserved destination moves aside");
+                std::fs::rename(&theirs, &reserved).expect("another takes its name");
+            },
+        ))
+    };
+    fixture.interpose(swap);
+
+    let arguments: [&OsStr; 5] = [
+        OsStr::new("worktree"),
+        OsStr::new("add"),
+        OsStr::new("--detach"),
+        reserved.as_os_str(),
+        OsStr::new("HEAD"),
+    ];
+    let refusal = fixture
+        .service()
+        .profile()
+        .run(
+            &repository
+                .write(&arguments)
+                .writing(&[(reserved.as_path(), identity)]),
+        )
+        .expect_err("a destination that changed under the invocation is not served");
+    assert_eq!(
+        refusal.code(),
+        kr_protocol::error::ErrorCode::SourceChanged,
+        "and it is refused as an identity that changed: {refusal}"
+    );
+    assert_eq!(
+        names_in(&reserved),
+        vec!["theirs.txt".to_owned()],
+        "and nothing this host recorded was written into the directory that took the name"
+    );
 }
 
 #[test]

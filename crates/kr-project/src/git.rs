@@ -494,6 +494,10 @@ pub struct RestrictedProfile {
     template: PathBuf,
     home: PathBuf,
     temporary: PathBuf,
+    /// The directory each invocation's own temporary directory is made inside, opened once. Making
+    /// one goes through this handle rather than through the path, so the directory an invocation
+    /// gets is one this host made inside the object it opened.
+    temporary_root: Arc<cap_std::fs::Dir>,
     #[cfg(feature = "git-fixtures")]
     interposition: Option<Interposition>,
 }
@@ -630,6 +634,10 @@ impl RestrictedProfile {
             }
         }
         std::fs::create_dir_all(&temporary).map_err(ProjectError::staging)?;
+        let temporary_root = Arc::new(
+            cap_std::fs::Dir::open_ambient_dir(&temporary, cap_std::ambient_authority())
+                .map_err(ProjectError::staging)?,
+        );
         Ok(Self {
             git,
             environment_id,
@@ -638,6 +646,7 @@ impl RestrictedProfile {
             template,
             home,
             temporary,
+            temporary_root,
             #[cfg(feature = "git-fixtures")]
             interposition: None,
         })
@@ -722,8 +731,13 @@ impl RestrictedProfile {
         // One directory per invocation, which nothing else can reach and which goes away with the
         // invocation. It is where Git puts its temporary files, so a Git that needed one does not
         // reach for a shared directory it is not confined to.
-        let temporary = PrivateTemporary::create(&self.temporary, &request.describe())?;
-        let confinement = self.confinement(request, working, temporary.path())?;
+        let temporary = PrivateTemporary::create(
+            self.environment_id,
+            &self.temporary_root,
+            &self.temporary,
+            &request.describe(),
+        )?;
+        let confinement = self.confinement(request, working, &temporary)?;
         let arguments = self.argument_vector(request);
         let environment = self.environment(request, temporary.path());
         let described = request.describe();
@@ -796,6 +810,10 @@ impl RestrictedProfile {
             }
             std::thread::sleep(Duration::from_millis(5));
         };
+        // Before anything the child produced is used: every directory this invocation was enclosed
+        // around is still the object it was enclosed around, or this is a refusal rather than a
+        // result.
+        confinement.confirm()?;
         let out = join(out, &described)?;
         let err = join(err, &described)?;
         let stderr = git_said(&String::from_utf8_lossy(&err.bytes));
@@ -824,7 +842,7 @@ impl RestrictedProfile {
         &self,
         request: &GitRequest<'_>,
         working: OpenedDirectory,
-        temporary: &Path,
+        temporary: &PrivateTemporary,
     ) -> Result<Confinement> {
         let mut reserved = Vec::new();
         for (directory, identity) in &request.writable {
@@ -837,9 +855,13 @@ impl RestrictedProfile {
                 Some(*identity),
             )?);
         }
-        // This host made it a moment ago inside its own state directory, so there is no earlier
-        // record for it to be required to match.
-        let temporary = OpenedDirectory::open(self.environment_id, temporary, None)?;
+        // The object this host made a moment ago through the handle it holds on their parent, and
+        // required to be that object rather than whatever now holds the name.
+        let temporary = OpenedDirectory::open(
+            self.environment_id,
+            temporary.path(),
+            Some(temporary.identity()),
+        )?;
         Ok(Confinement {
             program: self.git.executable().to_owned(),
             exec_path: self.git.exec_path().to_owned(),
@@ -849,13 +871,16 @@ impl RestrictedProfile {
             temporary,
             // Where a platform's mechanism confines reading as well as writing, these are what Git
             // reads that lie outside the directories the operation owns.
-            readable: vec![
+            readable: [
                 self.git.program().to_owned(),
                 self.empty_config.clone(),
                 self.hooks.clone(),
                 self.template.clone(),
                 self.home.clone(),
-            ],
+            ]
+            .into_iter()
+            .chain(request.readable.iter().map(|path| (*path).to_owned()))
+            .collect(),
             reach: Reach::for_transport(request.transport, request.remote_port),
         })
     }
@@ -998,6 +1023,19 @@ impl RestrictedProfile {
         ));
         if let Some(helper) = request.credential_helper {
             settings.push(("credential.helper".to_owned(), helper.to_owned()));
+        }
+        // The program the other end of a connection is started as. A clone creates its destination's
+        // configuration and then reads it, so a writer racing the clone could put a command of their
+        // own in `remote.<name>.uploadpack` and Git would start it through the shell this invocation
+        // has. It is fixed here to Git's own program, in the form no configuration file can undo.
+        // The command line cannot carry it: `--upload-pack` is one of the arguments this service
+        // refuses, because naming a program is the profile's business rather than a caller's, and
+        // this is the profile doing it.
+        if let Some(name) = request.remote_name.filter(|name| plain_name(name)) {
+            settings.push((
+                format!("remote.{name}.uploadpack"),
+                upload_pack(&self.git).into_os_string(),
+            ));
         }
         // Every driver the repository defines, blanked by name. The names come from the audit,
         // which read the effective configuration, because the set of possible names is unbounded.
@@ -1183,13 +1221,16 @@ pub struct RemoteAccess<'a> {
     pub ssh_program: Option<&'a Path>,
     /// The port the remote named, when it named one of its own.
     pub port: Option<u16>,
+    /// The name the remote is recorded under, which is the one the clone creates.
+    pub remote_name: Option<&'a str>,
 }
 
 impl RemoteAccess<'_> {
     /// Returns the access a clone between two directories of this machine runs with.
     ///
     /// No credential helper, no ssh program and no port: a local clone reaches no address, so the
-    /// boundary gives it nothing to reach one through.
+    /// boundary gives it nothing to reach one through. The remote is the one `git clone` makes
+    /// without being told otherwise, and naming it is what fixes the program its connection runs.
     #[must_use]
     pub const fn local() -> Self {
         Self {
@@ -1198,6 +1239,7 @@ impl RemoteAccess<'_> {
             ssh_command: None,
             ssh_program: None,
             port: None,
+            remote_name: Some("origin"),
         }
     }
 }
@@ -1227,6 +1269,8 @@ pub struct GitRequest<'a> {
     pub ssh_program: Option<&'a Path>,
     /// The port the validated remote named, when it named one of its own.
     pub remote_port: Option<u16>,
+    /// The name the remote is recorded under, when this invocation reaches one.
+    pub remote_name: Option<&'a str>,
     /// The directories this invocation may write in besides the one it runs in, each with the
     /// object it must still be.
     ///
@@ -1238,6 +1282,11 @@ pub struct GitRequest<'a> {
     pub writable: Vec<(&'a Path, ObjectIdentity)>,
     /// The object the directory must still be, when the caller recorded one.
     pub expected: Option<ObjectIdentity>,
+    /// Directories this invocation reads that lie outside the ones the operation owns.
+    ///
+    /// A local clone's source is the one case: the repository it copies from is somewhere else
+    /// entirely. It matters only where a platform's mechanism confines reading as well as writing.
+    pub readable: Vec<&'a Path>,
     /// The driver sections and names the audit found, each blanked by name.
     pub drivers: Vec<(String, String)>,
     /// Where repository discovery stops.
@@ -1261,8 +1310,10 @@ impl<'a> GitRequest<'a> {
             ssh_command: None,
             ssh_program: None,
             remote_port: None,
+            remote_name: None,
             writable: Vec::new(),
             expected: None,
+            readable: Vec::new(),
             drivers: Vec::new(),
             ceiling: None,
             deadline: Duration::from_millis(GIT_READ_DEADLINE.get()),
@@ -1316,6 +1367,7 @@ impl<'a> GitRequest<'a> {
         self.ssh_command = access.ssh_command;
         self.ssh_program = access.ssh_program;
         self.remote_port = access.port;
+        self.remote_name = access.remote_name;
         self
     }
 
@@ -1325,6 +1377,17 @@ impl<'a> GitRequest<'a> {
         for directory in writable {
             if !self.writable.contains(directory) {
                 self.writable.push(*directory);
+            }
+        }
+        self
+    }
+
+    /// Adds a directory this invocation reads that lies outside the ones the operation owns.
+    #[must_use]
+    pub fn reading(mut self, readable: &[&'a Path]) -> Self {
+        for directory in readable {
+            if !self.readable.contains(directory) {
+                self.readable.push(directory);
             }
         }
         self
@@ -1990,6 +2053,31 @@ fn search_path(file_name: &str) -> Option<PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Returns the program Git starts the other end of a connection as.
+///
+/// Git's own, by absolute path, under Git's own helper directory. It is what a clone is told to use
+/// so that nothing a repository's configuration says can change it.
+#[must_use]
+pub fn upload_pack(git: &GitProgram) -> PathBuf {
+    git.exec_path().join(if cfg!(windows) {
+        "git-upload-pack.exe"
+    } else {
+        "git-upload-pack"
+    })
+}
+
+/// Returns whether one name is plain enough to put in a configuration key.
+///
+/// The same notion the diagnostics use: letters, digits and the three separators a name can hold.
+/// A remote whose name is anything else gets no override keyed by it, and the command-line option
+/// the clone carries is what fixes its connection instead.
+fn plain_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
+}
+
 /// Returns the programs outside Git's own installation one invocation may execute.
 ///
 /// Two, and only for an invocation that reaches a repository over Git's transport: the approved
@@ -2021,6 +2109,7 @@ fn helpers(request: &GitRequest<'_>, exec_path: &Path) -> Vec<PathBuf> {
 #[derive(Debug)]
 struct PrivateTemporary {
     path: PathBuf,
+    identity: crate::boundary::ObjectIdentity,
     /// The directory itself, opened when it was made. Taking it away goes through this rather than
     /// through the name, so a directory somebody put at the name afterwards is not what is removed.
     handle: Option<cap_std::fs::Dir>,
@@ -2028,31 +2117,38 @@ struct PrivateTemporary {
 
 impl PrivateTemporary {
     /// Creates one inside the profile's own temporary directory.
-    fn create(root: &Path, described: &str) -> Result<Self> {
+    ///
+    /// Made and opened through the handle this host holds on their parent rather than through a
+    /// path, and the object that comes back is what every later rule and every removal is written
+    /// against.
+    fn create(
+        environment_id: EnvironmentId,
+        root: &cap_std::fs::Dir,
+        root_path: &Path,
+        described: &str,
+    ) -> Result<Self> {
         let mut name = String::with_capacity(32);
         for byte in uuid::Uuid::new_v4().as_bytes() {
             name.push_str(&format!("{byte:02x}"));
         }
-        let path = root.join(&name);
         #[cfg(unix)]
-        let builder = {
-            use std::os::unix::fs::DirBuilderExt as _;
+        let made = {
+            use cap_std::fs::DirBuilderExt as _;
 
-            let mut builder = std::fs::DirBuilder::new();
+            let mut builder = cap_std::fs::DirBuilder::new();
             builder.mode(0o700);
-            builder
+            root.create_dir_with(&name, &builder)
         };
         #[cfg(not(unix))]
-        let builder = std::fs::DirBuilder::new();
-        builder
-            .create(&path)
-            .map_err(|error| ProjectError::StagingUnavailable {
-                detail: format!(
-                    "{described} could not be given a temporary directory of its own: {error}"
-                )
-                .into(),
-            })?;
-        let handle = cap_std::fs::Dir::open_ambient_dir(&path, cap_std::ambient_authority())
+        let made = root.create_dir(&name);
+        made.map_err(|error| ProjectError::StagingUnavailable {
+            detail: format!(
+                "{described} could not be given a temporary directory of its own: {error}"
+            )
+            .into(),
+        })?;
+        let handle = root
+            .open_dir(&name)
             .map_err(|error| ProjectError::StagingUnavailable {
                 detail: format!(
                     "{described}'s own temporary directory could not be opened: {error}"
@@ -2061,15 +2157,26 @@ impl PrivateTemporary {
             })?;
         // The boundary's rules are written against a path with no link left in it, and the state
         // directory above this one may reach it through one.
-        let path =
-            std::fs::canonicalize(&path).map_err(|error| ProjectError::StagingUnavailable {
+        let path = std::fs::canonicalize(root_path.join(&name)).map_err(|error| {
+            ProjectError::StagingUnavailable {
                 detail: format!(
                     "{described}'s own temporary directory could not be resolved: {error}"
                 )
                 .into(),
+            }
+        })?;
+        let identity =
+            crate::boundary::identity_of_handle(environment_id, &handle).map_err(|error| {
+                ProjectError::StagingUnavailable {
+                    detail: format!(
+                        "{described}'s own temporary directory could not be identified: {error}"
+                    )
+                    .into(),
+                }
             })?;
         Ok(Self {
             path,
+            identity,
             handle: Some(handle),
         })
     }
@@ -2077,6 +2184,11 @@ impl PrivateTemporary {
     /// Returns where it is.
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Returns the object this host made.
+    const fn identity(&self) -> crate::boundary::ObjectIdentity {
+        self.identity
     }
 }
 
@@ -2477,6 +2589,7 @@ mod tests {
                 ssh_command: None,
                 ssh_program: None,
                 port: None,
+                remote_name: Some("origin"),
             });
         let overrides = profile.overrides(&request);
         let helpers: Vec<&OsString> = overrides
@@ -2749,9 +2862,74 @@ mod tests {
             template: PathBuf::from("/state/git-profile/template"),
             home: PathBuf::from("/state/git-profile/home"),
             temporary: PathBuf::from("/state/git-profile/temporary"),
+            temporary_root: Arc::new(
+                cap_std::fs::Dir::open_ambient_dir(
+                    std::env::temp_dir(),
+                    cap_std::ambient_authority(),
+                )
+                .expect("a directory for a profile whose own are never made"),
+            ),
             #[cfg(feature = "git-fixtures")]
             interposition: None,
         }
+    }
+
+    #[test]
+    fn a_clone_fixes_the_program_its_connection_runs() {
+        // A clone creates its destination's configuration and then reads it, and Git starts the
+        // other end of a local or ssh connection as a command string. So the program is fixed in
+        // the form no configuration file can undo, rather than left where a writer racing the clone
+        // could put a command of their own.
+        let profile = test_profile();
+        let arguments = [OsStr::new("clone")];
+        let request =
+            GitRequest::write(Path::new("/stage"), &arguments).with_transport(RemoteAccess {
+                transport: RemoteTransport::LocalPath,
+                credential_helper: None,
+                ssh_command: None,
+                ssh_program: None,
+                port: None,
+                remote_name: Some("origin"),
+            });
+        let overrides = profile.overrides(&request);
+        let fixed: Vec<&OsString> = overrides
+            .iter()
+            .filter(|(key, _)| key == "remote.origin.uploadpack")
+            .map(|(_, value)| value)
+            .collect();
+        assert_eq!(fixed.len(), 1, "the program is named exactly once");
+        assert_eq!(
+            fixed[0],
+            &OsString::from("/usr/libexec/git-core/git-upload-pack"),
+            "and it is Git's own, under Git's own helper directory"
+        );
+
+        // A remote whose name is not one this host can put in a key gets no override, and the name
+        // is not repeated into one either.
+        let awkward =
+            GitRequest::write(Path::new("/stage"), &arguments).with_transport(RemoteAccess {
+                transport: RemoteTransport::LocalPath,
+                credential_helper: None,
+                ssh_command: None,
+                ssh_program: None,
+                port: None,
+                remote_name: Some("a name with spaces"),
+            });
+        assert!(
+            !profile
+                .overrides(&awkward)
+                .iter()
+                .any(|(key, _)| key.ends_with(".uploadpack"))
+        );
+
+        // An invocation that reaches nothing names no connection at all.
+        let read = GitRequest::read(Path::new("/tree"), &arguments);
+        assert!(
+            !profile
+                .overrides(&read)
+                .iter()
+                .any(|(key, _)| key.ends_with(".uploadpack"))
+        );
     }
 
     #[test]

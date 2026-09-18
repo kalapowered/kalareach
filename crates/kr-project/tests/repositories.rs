@@ -1024,6 +1024,7 @@ fn a_cancellation_ends_the_subprocess_this_host_started() {
                     ssh_command: None,
                     ssh_program: None,
                     port: Some(port),
+                    remote_name: Some("origin"),
                 })
                 .with_deadline(Duration::from_secs(120))
                 .with_cancellation(watched),

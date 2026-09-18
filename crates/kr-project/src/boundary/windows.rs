@@ -69,8 +69,9 @@ use windows_sys::Win32::Security::{
     SID_AND_ATTRIBUTES, WinCapabilityInternetClientSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_EXECUTE, FILE_GENERIC_READ, FILE_GENERIC_WRITE,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, GetFinalPathNameByHandleW, OPEN_EXISTING,
+    CreateFileW, DELETE, FILE_ATTRIBUTE_NORMAL, FILE_DELETE_CHILD, FILE_EXECUTE, FILE_GENERIC_READ,
+    FILE_GENERIC_WRITE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFinalPathNameByHandleW,
+    OPEN_EXISTING,
 };
 use windows_sys::Win32::System::JobObjects::{
     CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
@@ -96,10 +97,12 @@ pub const MECHANISM: &str = "a per-invocation application container whose grants
 
 /// The rights a container is given on a directory an operation owns.
 ///
-/// Read and write and nothing else. `FILE_EXECUTE` is deliberately absent: it is what makes a file
-/// in the repository runnable, and the whole of the execution guarantee here is that it is not
-/// granted anywhere but on Git's own installation.
-const OWNED_DIRECTORY_RIGHTS: u32 = FILE_GENERIC_READ | FILE_GENERIC_WRITE;
+/// Read, write, and the right to take a name away, which is what an ordinary Git operation needs:
+/// its lock files are made, renamed into place and removed. `FILE_EXECUTE` is deliberately absent:
+/// it is what makes a file in the repository runnable, and the execution guarantee here is that it
+/// is not granted anywhere but on Git's own installation, and refused outright below.
+const OWNED_DIRECTORY_RIGHTS: u32 =
+    FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | FILE_DELETE_CHILD;
 
 /// The rights a container is given on Git's own installation.
 const PROGRAM_RIGHTS: u32 = FILE_GENERIC_READ | FILE_EXECUTE;
@@ -394,20 +397,22 @@ fn build(confinement: &Confinement) -> Result<Container> {
                 .into(),
         });
     }
-    let sid = OwnedSid {
-        bytes: sid_bytes(sid),
-        allocated: Some(sid),
-    };
-    let mut capabilities = Vec::new();
-    if matches!(confinement.reach, Reach::Outbound(_)) {
-        capabilities.push(well_known(WinCapabilityInternetClientSid)?);
-    }
+    // The container exists from here, so everything that could fail below happens with it already
+    // in hand: dropping it deletes the profile and takes away whatever was granted.
     let mut container = Container {
         name,
-        sid,
-        capabilities,
+        sid: OwnedSid {
+            bytes: sid_bytes(sid),
+            allocated: Some(sid),
+        },
+        capabilities: Vec::new(),
         granted: Vec::new(),
     };
+    if matches!(confinement.reach, Reach::Outbound(_)) {
+        container
+            .capabilities
+            .push(well_known(WinCapabilityInternetClientSid)?);
+    }
     // Read and write on the directories this operation owns, and the execute right refused to the
     // same container: a refusal beats every grant, including one a repository already carries for
     // every application package, so a program planted in the repository cannot be executed whatever
@@ -451,8 +456,19 @@ fn grant(container: &mut Container, path: &Path, rights: u32, mode: i32) -> Resu
     Ok(())
 }
 
+/// The lock one invocation holds while it changes a path's permissions.
+///
+/// Every grant is a read of a list, an edit of a copy and a replacement of the whole list, and two
+/// invocations share Git's own installation. Without this, two of them could each read the same
+/// list and the second could write back a copy that never held the first's entry. It bounds this
+/// process, which is the one that runs the service's invocations.
+static PERMISSIONS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Adds or removes one entry from a path's permissions.
 fn set_access(path: &Path, sid: PSID, rights: u32, mode: i32) -> std::io::Result<()> {
+    let _held = PERMISSIONS
+        .lock()
+        .map_err(|_| std::io::Error::other("this host's own record of permissions is unusable"))?;
     let wide_path = wide(path.as_os_str());
     let mut existing: *mut ACL = std::ptr::null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -613,14 +629,24 @@ fn pipe() -> Result<(OwnedHandle, OwnedHandle)> {
         });
     }
     // SAFETY: the write end is the child's and is marked to be passed to it; the read end is this
-    // host's alone and is not.
+    // host's alone and is not. Both are checked, because a read end the child inherited would
+    // outlive the child and a write end it did not would give it nowhere to write.
     unsafe {
-        SetHandleInformation(write, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-        SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0);
-        Ok((
+        let marked = SetHandleInformation(write, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) != 0
+            && SetHandleInformation(read, HANDLE_FLAG_INHERIT, 0) != 0;
+        let ends = (
             OwnedHandle::from_raw_handle(read.cast()),
             OwnedHandle::from_raw_handle(write.cast()),
-        ))
+        );
+        if marked {
+            Ok(ends)
+        } else {
+            Err(ProjectError::GitFailed {
+                detail:
+                    "this invocation's output could not be given to it alone, so Git is not run"
+                        .into(),
+            })
+        }
     }
 }
 
@@ -646,8 +672,16 @@ fn open_nul() -> Result<OwnedHandle> {
     }
     // SAFETY: the handle came from the call above and is this process's to own.
     unsafe {
-        SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-        Ok(OwnedHandle::from_raw_handle(handle.cast()))
+        let marked = SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) != 0;
+        let empty = OwnedHandle::from_raw_handle(handle.cast());
+        if marked {
+            Ok(empty)
+        } else {
+            Err(ProjectError::GitFailed {
+                detail: "this invocation could not be given an empty input, so Git is not run"
+                    .into(),
+            })
+        }
     }
 }
 

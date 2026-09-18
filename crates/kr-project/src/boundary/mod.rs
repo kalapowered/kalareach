@@ -44,11 +44,15 @@
 //! substituted at a name afterwards is therefore neither the tree Git works in nor a tree the
 //! boundary was built around.
 //!
-//! What remains is that two of the three mechanisms write their rules against paths, because that
-//! is what they take. A substitution after the rules are built moves the verified tree out from
-//! under them, so its writes are refused and the run fails with this host's declared result; the
-//! substituted tree is not written either, because Git never names it. On Linux the rules are
-//! attached to the opened objects themselves, so nothing is left there at all.
+//! Two things remain, and they are why every directory an invocation was enclosed around is
+//! required to still be that object before anything the child produced is used. Two of the three
+//! mechanisms write their rules against paths, because that is what they take, so a directory
+//! substituted at one of those names while Git ran is one those rules still permitted. And a
+//! directory substituted *inside* a tree the operation owns is inside a tree the operation owns:
+//! no confinement that grants a tree can refuse part of it. Neither is prevented; both are the
+//! declared refusal, and the identity check after the run is where that is decided. On Linux the
+//! rules themselves are attached to the opened objects, so the first of the two does not arise
+//! there.
 //!
 //! ## What enforces what
 //!
@@ -308,6 +312,27 @@ impl Confinement {
             .chain(std::iter::once(&self.temporary))
     }
 
+    /// Refuses when a directory this invocation was enclosed around is no longer the object it was
+    /// enclosed around.
+    ///
+    /// Called after the child has gone and before anything it produced is used. Two of the three
+    /// mechanisms write their rules against paths, so a directory substituted at one of those names
+    /// while Git ran is a directory the rules still permitted; what this does is make that the
+    /// declared refusal rather than a result nobody can account for. The invocation's own temporary
+    /// directory is not in the list: this host made it and holds it open, and it is taken away
+    /// through that handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProjectError::IdentityChanged`] when any of them differs.
+    pub fn confirm(&self) -> Result<()> {
+        self.working.confirm_path()?;
+        for directory in &self.reserved {
+            directory.confirm_path()?;
+        }
+        Ok(())
+    }
+
     /// Returns every program the invocation may execute, besides Git's own helper directory.
     #[must_use]
     pub fn executables(&self) -> Vec<&Path> {
@@ -350,11 +375,13 @@ pub struct Invocation<'a> {
 pub fn connection_shell(exec_path: &Path) -> Vec<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if cfg!(windows) {
-        // Git for Windows ships its own shell beside its helper directory, under the installation
-        // root that `--exec-path` sits inside.
-        let root = exec_path.parent().and_then(Path::parent);
-        for relative in ["usr/bin/sh.exe", "bin/sh.exe"] {
-            if let Some(root) = root {
+        // Git for Windows ships its own shell inside the installation, and how far the helper
+        // directory sits below that installation is the packaging's decision: an ordinary install
+        // puts it at `<root>\mingw64\libexec\git-core` and the shell at `<root>\usr\bin\sh.exe`,
+        // and other layouts put both one level nearer. So every ancestor is tried rather than a
+        // fixed number of them, and only what exists is kept.
+        for root in exec_path.ancestors() {
+            for relative in ["usr/bin/sh.exe", "bin/sh.exe"] {
                 candidates.push(root.join(relative));
             }
         }
@@ -366,6 +393,23 @@ pub fn connection_shell(exec_path: &Path) -> Vec<PathBuf> {
     }
     candidates.retain(|candidate| candidate.is_file());
     candidates
+}
+
+/// Returns the object one opened directory is.
+///
+/// # Errors
+///
+/// Returns [`ProjectError::Destination`] when the handle's identity cannot be read.
+pub fn identity_of_handle(
+    environment_id: EnvironmentId,
+    directory: &cap_std::fs::Dir,
+) -> Result<ObjectIdentity> {
+    let handle = directory
+        .try_clone()
+        .map_err(|error| ProjectError::Destination {
+            detail: format!("a directory this host made could not be identified: {error}").into(),
+        })?;
+    Ok(AuthorisedDirectory::from_handle(environment_id, handle, PathBuf::new())?.identity())
 }
 
 /// Returns the object one path names now, for a caller that needs to record it.

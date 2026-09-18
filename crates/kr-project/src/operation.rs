@@ -748,11 +748,17 @@ pub fn stage_clone(
     arguments.push(OsStr::new("--"));
     arguments.push(OsStr::new(&remote.specification.url));
     arguments.push(OsStr::new(STAGED_TREE));
-    let request = GitRequest::write(staging.path(), &arguments)
+    // A clone from a path on this machine reads the repository it copies, which is not one of the
+    // directories this operation owns. It matters where a platform's mechanism confines reading.
+    let source = PathBuf::from(&remote.specification.url);
+    let mut request = GitRequest::write(staging.path(), &arguments)
         .with_ceiling(staging.path())
         .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
         .with_transport(remote.access())
         .with_cancellation(Arc::clone(cancel));
+    if matches!(remote.specification.transport, RemoteTransport::LocalPath) {
+        request = request.reading(&[source.as_path()]);
+    }
     profile.run_checked(&request)?;
     // The URL the repository stored has to be the one this host passed. A rewrite, a helper or a
     // version of Git that stored something else is a credential in remote state waiting to happen.

@@ -1768,6 +1768,9 @@ impl ProjectService {
                         self.profile.run_checked(
                             &GitRequest::write(staging.path(), &arguments)
                                 .with_ceiling(staging.path())
+                                // The repository this clone copies, which is not one of the
+                                // directories the operation owns.
+                                .reading(&[repository.top_level()])
                                 .with_transport(crate::git::RemoteAccess::local())
                                 .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
                                 .with_cancellation(Arc::clone(&cancel)),

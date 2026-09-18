@@ -346,6 +346,7 @@ impl ValidatedRemote {
                 None
             },
             port: self.port,
+            remote_name: Some(&self.specification.remote_name),
         }
     }
 }

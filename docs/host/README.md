@@ -587,7 +587,10 @@ repository while Git is running.
   running.
 * **Only this operation's network.** A local operation reaches no address at all and nothing may
   listen. An operation that reaches a remote may open outbound connections on the ports its
-  transport uses and resolve the remote's name, and nothing may listen there either.
+  transport uses and resolve the remote's name, and nothing may listen there either. Which part of
+  that each platform enforces, and what it leaves, is in `crates/kr-project/README.md`: the ports
+  are enforced on two of the three platforms, and on Linux they are a guarantee about the protocol
+  the transports use rather than about every packet a name resolution sends.
 * **Only this operation's directories are written.** The repository's working tree and its Git
   directory, the destination the operation reserved, and one temporary directory that exists for the
   length of the invocation and is taken away with it. Everything else is read-only.
@@ -596,8 +599,9 @@ The enclosure is what makes the checks around it sufficient rather than advisory
 repository's configuration before it runs Git and reads it again afterwards, and it always could; a
 writer racing the two readings is what those checks could notice and not prevent. Now the child
 starts inside the directory this host opened rather than at a name, so a tree put at that name
-afterwards is not the tree Git works in and is never written to, and the invocation either produces
-the verified tree's result or fails with this host's declared answer.
+afterwards is not the tree Git works in; and every directory the enclosure was built around is
+required to still be that object before anything the child produced is used, so a substitution made
+while Git ran is this host's declared refusal rather than a result nobody can account for.
 
 What it does not confine, on the two platforms whose mechanism separates the two, is reading. Git
 reads the system's shared libraries, its locale data and its certificate store, and a read

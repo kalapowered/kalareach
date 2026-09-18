@@ -82,6 +82,25 @@ const NETWORK_ABI: ABI = ABI::V4;
 /// The device files a process needs to run at all.
 const DEVICES: &[&str] = &["/dev/null", "/dev/zero", "/dev/random", "/dev/urandom"];
 
+/// The program loaders a dynamically linked program is started through.
+///
+/// The kernel opens a program's interpreter for execution as part of starting the program, and that
+/// open is judged by the same right an ordinary `execve` is. So a boundary that granted the execute
+/// right on Git alone would refuse to start Git at all. These are named instead of the directories
+/// they are in, because a directory of libraries is a great deal more than a loader. One that this
+/// machine does not have is skipped; a machine with none of them starts no Git, which is a refusal
+/// rather than a boundary that let something else run.
+const LOADERS: &[&str] = &[
+    "/lib64/ld-linux-x86-64.so.2",
+    "/lib/ld-linux-aarch64.so.1",
+    "/lib/ld-linux-x86-64.so.2",
+    "/lib/ld-linux.so.2",
+    "/lib/ld-musl-x86_64.so.1",
+    "/lib/ld-musl-aarch64.so.1",
+    "/usr/lib/ld-musl-x86_64.so.1",
+    "/usr/lib/ld-musl-aarch64.so.1",
+];
+
 /// The boundary as the parent built it, ready for the child to apply.
 #[derive(Debug)]
 pub struct Prepared {
@@ -111,19 +130,21 @@ impl Prepared {
     /// Returns the kernel's refusal, or a permission failure when the ruleset was applied without
     /// being fully enforced.
     pub fn apply(&mut self) -> std::io::Result<()> {
+        // Each of these refusals carries a different number, so the failure the parent reports
+        // names the step it came from rather than leaving three possibilities.
         let ruleset = self
             .ruleset
             .take()
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EPERM))?;
         let status = ruleset
             .restrict_self()
-            .map_err(|_| std::io::Error::from_raw_os_error(libc::EPERM))?;
+            .map_err(|_| std::io::Error::from_raw_os_error(libc::ENOLCK))?;
         if status.ruleset != RulesetStatus::FullyEnforced {
-            return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+            return Err(std::io::Error::from_raw_os_error(libc::ENOTSUP));
         }
         let program = libc::sock_fprog {
             len: u16::try_from(self.filter.len())
-                .map_err(|_| std::io::Error::from_raw_os_error(libc::EPERM))?,
+                .map_err(|_| std::io::Error::from_raw_os_error(libc::E2BIG))?,
             filter: self.filter.as_ptr().cast_mut(),
         };
         // SAFETY: both calls are this process acting on itself. The first takes two scalars. The
@@ -211,6 +232,17 @@ pub fn prepare(confinement: &Confinement) -> Result<Prepared> {
             ))
             .map_err(rules)?;
     }
+    // The loader, so that a dynamically linked Git can be started at all.
+    for loader in LOADERS {
+        if let Ok(handle) = PathFd::new(Path::new(loader)) {
+            created = created
+                .add_rule(PathBeneath::new(
+                    handle,
+                    AccessFs::Execute | AccessFs::ReadFile,
+                ))
+                .map_err(rules)?;
+        }
+    }
     for device in DEVICES {
         let device = Path::new(device);
         // The rights a file can carry, and only those: a directory's rights on something that is
@@ -280,6 +312,15 @@ const OTHER_CONVENTION: u32 = 0x4000_0000;
 #[cfg(target_arch = "aarch64")]
 const OTHER_CONVENTION: u32 = 0x4000_0000;
 
+/// The first of the three calls that set up the kernel's own queued-work interface.
+///
+/// A process with one of those queues can ask the kernel to make a socket and connect it without
+/// making either call itself, so a filter that judged only the calls would not see it. Git does not
+/// use the interface; the three numbers are contiguous and are refused together.
+const SYS_QUEUED_WORK: u32 = 425;
+/// The last of those three.
+const SYS_QUEUED_WORK_LAST: u32 = 427;
+
 /// The `socket` call's number on this instruction set.
 #[cfg(target_arch = "x86_64")]
 const SYS_SOCKET: u32 = 41;
@@ -343,25 +384,32 @@ fn filter(remote: bool) -> Result<Vec<libc::sock_filter>> {
         instruction(AT_LEAST, 0, 1, OTHER_CONVENTION),
         instruction(ANSWER, 0, 0, UNKNOWN_MACHINE),
     ];
+    // The kernel's queued-work interface, refused for every invocation: it is another way to reach
+    // the calls below without making them.
+    program.extend([
+        instruction(AT_LEAST, 0, 2, SYS_QUEUED_WORK),
+        instruction(AT_LEAST, 1, 0, SYS_QUEUED_WORK_LAST + 1),
+        instruction(ANSWER, 0, 0, REFUSED),
+    ]);
     if remote {
         // Nothing may listen, and nothing may reach the network below its protocols. Creating an
         // ordinary socket and connecting out is what the transport does, and which addresses it
         // reaches is Landlock's rule rather than this one's.
         program.extend([
-            // Index 6: `listen` is refused outright.
+            // Index 9: `listen` is refused outright.
             instruction(COMPARE, 7, 0, SYS_LISTEN),
-            // 7: anything that is not `socket` is the ordinary work of running Git.
+            // 10: anything that is not `socket` is the ordinary work of running Git.
             instruction(COMPARE, 0, 7, SYS_SOCKET),
-            // 8, 9: a packet socket is not something any transport needs.
+            // 11, 12: a packet socket is not something any transport needs.
             instruction(LOAD, 0, 0, FIRST_ARGUMENT),
             instruction(COMPARE, 4, 0, libc::AF_PACKET as u32),
-            // 10, 11, 12: nor is a raw one, whatever flags travel beside its kind.
+            // 13, 14, 15: nor is a raw one, whatever flags travel beside its kind.
             instruction(LOAD, 0, 0, SECOND_ARGUMENT),
             instruction(MASK, 0, 0, KIND),
             instruction(COMPARE, 1, 0, libc::SOCK_RAW as u32),
-            // 13: everything else is permitted, and Landlock decides where it may go.
+            // 16: everything else is permitted, and Landlock decides where it may go.
             instruction(ANSWER, 0, 0, PERMITTED),
-            // 14, 15.
+            // 17, 18.
             instruction(ANSWER, 0, 0, REFUSED),
             instruction(ANSWER, 0, 0, PERMITTED),
         ]);
@@ -530,6 +578,26 @@ mod tests {
         );
         assert_eq!(judge(&program, call(SYS_LISTEN, 0, 0)), REFUSED);
         assert_eq!(judge(&program, call(1, 0, 0)), PERMITTED);
+    }
+
+    #[test]
+    fn no_invocation_may_set_up_a_queue_that_makes_calls_for_it() {
+        for remote in [false, true] {
+            let program = filter(remote).expect("a filter for this machine");
+            for number in SYS_QUEUED_WORK..=SYS_QUEUED_WORK_LAST {
+                assert_eq!(
+                    judge(&program, call(number, 0, 0)),
+                    REFUSED,
+                    "a queue that makes calls on a process's behalf is refused"
+                );
+            }
+            // The numbers either side of them are ordinary calls.
+            assert_eq!(judge(&program, call(SYS_QUEUED_WORK - 1, 0, 0)), PERMITTED);
+            assert_eq!(
+                judge(&program, call(SYS_QUEUED_WORK_LAST + 1, 0, 0)),
+                PERMITTED
+            );
+        }
     }
 
     #[test]
