@@ -1558,7 +1558,11 @@ async fn a_shell_that_has_already_ended_is_a_closed_session_rather_than_a_failed
     let host = kr_ipc::testing::TempHost::create();
     let config = configuration(&host, "exit 3");
     let runtime = std::sync::Arc::new(
-        kr_worker::runtime::start(config).expect("the shell ran, so the session was created"),
+        kr_worker::runtime::start(
+            config,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("the shell ran, so the session was created"),
     );
     let record = closure_record(&runtime, "the session closes on the root shell's exit").await;
 
@@ -1632,7 +1636,13 @@ async fn a_shell_the_host_described_keeps_the_identity_the_kernel_gave_it() {
         kr_ipc::identity::START_VALUE_UNREAD,
         "the kernel described this shell, so its identity is a reading"
     );
-    let runtime = std::sync::Arc::new(SessionRuntime::start(session).expect("starts"));
+    let runtime = std::sync::Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts"),
+    );
 
     // The shell says it is there, and then it is told to leave. Both are events rather than delays.
     let seen = collect(&mut stream, b"kr-alive").await;
@@ -1649,6 +1659,7 @@ async fn a_shell_the_host_described_keeps_the_identity_the_kernel_gave_it() {
                 epoch,
                 0,
                 b"leave\n",
+                None,
                 std::time::Instant::now(),
             )
             .expect("writes the line the shell is waiting for");
