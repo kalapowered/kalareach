@@ -837,8 +837,17 @@ mod projection_tests {
         let mut engine = engine();
         let mut stream = Vec::new();
         stream.extend_from_slice(b"what the shell left behind\r\n");
+        // The shell's own keyboard negotiation, on the primary buffer: flags pushed onto that
+        // buffer's stack, which the protocol keeps per screen. A narrowed client is not told it.
+        stream.extend_from_slice(b"\x1b[>5u\x1b[>1u");
+        // Then a saved cursor for that buffer, with a link open, which is saved with it.
+        stream.extend_from_slice(b"\x1b]8;;https://example.invalid/what-the-shell-was-in\x1b\\");
+        stream.extend_from_slice(b"\x1b7");
+        stream.extend_from_slice(b"\x1b]8;;\x1b\\");
         stream.extend_from_slice(b"\x1b[?1049h");
         stream.extend_from_slice(b"an application's screen\r\n");
+        // And the application's own, on the buffer that is showing, which it is told.
+        stream.extend_from_slice(b"\x1b[>3u");
         engine.feed(0, &stream, LaneGate::default(), 0);
 
         for (scope, expected) in [
@@ -906,7 +915,19 @@ mod projection_tests {
                     "nor that buffer's keyboard negotiation: {:?}",
                     header.keyboard.primary
                 );
+                assert!(
+                    header.keyboard.alternate.flags.0.is_some(),
+                    "while the buffer it is looking at keeps its own: {:?}",
+                    header.keyboard.alternate
+                );
             } else {
+                assert!(
+                    header.keyboard.primary.flags.0.is_some()
+                        || !header.keyboard.primary.stack.is_empty(),
+                    "a client drawn the whole screen is told the other buffer's keyboard too: \
+                     {:?}",
+                    header.keyboard.primary
+                );
                 assert!(
                     described.contains(&kr_protocol::projection::ProjectedBuffer::Primary),
                     "a client drawn the whole screen is told both buffers' saved cursors: \
@@ -944,6 +965,17 @@ mod projection_tests {
             saved_cursors: None,
             hyperlink: None,
         };
+        delta.keyboard = Some(kr_term::snapshot::KeyboardSnapshot {
+            modify_other_keys: 2,
+            primary: kr_term::snapshot::KittyKeyboard {
+                flags: Some(5),
+                stack: vec![1, 3],
+            },
+            alternate: kr_term::snapshot::KittyKeyboard {
+                flags: Some(3),
+                stack: vec![3],
+            },
+        });
         delta.saved_cursors = Some([
             Some(kr_term::snapshot::SavedCursor {
                 buffer: kr_term::snapshot::ActiveBuffer::Primary,
@@ -1011,6 +1043,21 @@ mod projection_tests {
         assert!(
             !text.contains("what-the-shell-was-in"),
             "and nothing of the other buffer's saved cursor reaches it: {text}"
+        );
+        let keyboard = carried
+            .keyboard
+            .0
+            .as_ref()
+            .expect("the delta carries the keyboard it changed");
+        assert!(
+            keyboard.primary.flags.0.is_none() && keyboard.primary.stack.is_empty(),
+            "nor the flags or the stack of the buffer it may not see: {:?}",
+            keyboard.primary
+        );
+        assert!(
+            keyboard.alternate.flags.0.is_some() && !keyboard.alternate.stack.is_empty(),
+            "while the buffer it is looking at keeps both: {:?}",
+            keyboard.alternate
         );
     }
 
