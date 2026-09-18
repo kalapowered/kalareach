@@ -188,7 +188,10 @@ Three properties make an installation safe to undo:
   by an access-control list beyond those bits is refused, by both installation and removal, before
   anything is written, with the advice to add or remove the server with the agent's own command.
   Reapplying such a list needs calls this host does not make, and somebody who restricted a file
-  meant it.
+  meant it. The same refusal covers a document whose directory hands out access to whatever is
+  created in it, because the replacement is a new file in that directory and would be given what
+  the document it replaces does not have. Where a platform will not answer the question at all, the
+  answer is not read as "no list": the document is refused.
 
 A directory the installation created is removed only when it is empty, and a directory that was
 already there is never claimed. A project's `.mcp.json` is read by more than one agent, so the entry

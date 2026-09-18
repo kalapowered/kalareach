@@ -1670,10 +1670,19 @@ impl Controller {
         if let Some(retained) = installer.retained(actor_id, mutation.action_id, &digest)? {
             return Ok(retained);
         }
-        // Only an installation has something to refuse before it writes. A removal reads its own
-        // record and leaves alone whatever changed, which is not a refusal.
-        if method == Method::AgentToolsInstall {
-            installer.check(&params)?;
+        // What either change can refuse without touching anything, refused here: the platform, the
+        // scope, a file or entry this host did not write, a record it cannot read, a document whose
+        // protection it cannot keep. A refusal after the marker below would be reported as a change
+        // whose outcome nobody knows, for a change that never began.
+        match method {
+            Method::AgentToolsInstall => installer.check(&params)?,
+            Method::AgentToolsRemove => installer.check_removal(&params)?,
+            _ => {
+                return Err(ControllerError::InvalidArgument(format!(
+                    "{} is not an installation this daemon serves",
+                    method.as_str()
+                )));
+            }
         }
         // Everything above can wait: for this task to be scheduled, for the lock, for the checks
         // to read the agent's tree. The deadline this action was admitted under is read after

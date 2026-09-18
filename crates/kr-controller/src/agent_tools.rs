@@ -215,6 +215,7 @@ impl Installer {
                 digest: digest_of(contents.as_bytes()),
                 replaced_digest: Nullable(read_digest(&path)?),
             };
+            self.confirm_existing(params, &mut record, &operation)?;
             self.begin(params, &mut record, operation.clone())?;
             write_atomically(&path, contents.as_bytes(), READABLE)?;
             self.finish(params, &mut record, operation)?;
@@ -248,6 +249,7 @@ impl Installer {
                 created_document: self.created_document(&record, &configuration.path)
                     || !configuration.path.exists(),
             };
+            self.confirm_existing(params, &mut record, &planned)?;
             self.begin(params, &mut record, planned)?;
             let written = self.write_entry(configuration, params.agent)?;
             let written = self.keep_provenance(&record, written, &configuration.path);
@@ -300,6 +302,54 @@ impl Installer {
                 .retain(|noted| !same_target(noted, &operation));
             self.write(params, record)
         }
+    }
+
+    /// Confirms what an earlier attempt left where this one is about to write.
+    ///
+    /// A note says this host was writing something to that place and could not confirm it. Where
+    /// what is there is exactly what the note names, preflight has already decided it is this
+    /// host's own unfinished work, and recording that is what keeps the claim: the note is about to
+    /// be replaced by one for the new content, and the evidence for what is on disk now would go
+    /// with it. Confirming first means a replacement that fails half way leaves a record that still
+    /// accounts for what is there.
+    fn confirm_existing(
+        &self,
+        params: &AgentToolsParams,
+        record: &mut InstallationRecord,
+        planned: &ChangeOperation,
+    ) -> Result<()> {
+        let Some(noted) = record
+            .pending
+            .iter()
+            .find(|noted| same_target(noted, planned))
+            .cloned()
+        else {
+            return Ok(());
+        };
+        let holds = match &noted {
+            ChangeOperation::WriteFile { path, digest, .. } => {
+                read_digest(Path::new(path))? == Some(*digest)
+            }
+            ChangeOperation::AddConfigurationEntry {
+                path,
+                entry,
+                digest,
+                ..
+            } => {
+                let key = entry
+                    .rsplit_once('.')
+                    .map_or(entry.as_str(), |(key, _)| key);
+                self.entry_digest_under(Path::new(path), key)? == Some(*digest)
+            }
+            // A directory is claimed when this host creates it, and never afterwards.
+            ChangeOperation::CreateDirectory { .. } => false,
+        };
+        if !holds {
+            return Ok(());
+        }
+        record.pending.retain(|noted| !same_target(noted, planned));
+        merge(&mut record.manifest.operations, noted);
+        self.write(params, record)
     }
 
     /// Notes a change this installation is about to make.
@@ -467,9 +517,11 @@ impl Installer {
     ///
     /// Returns an error when the record cannot be read or a file cannot be removed.
     pub fn remove(&self, params: &AgentToolsParams) -> Result<AgentToolsRemoveResult> {
-        supported_platform()?;
+        // The record is read, and read as valid, before anything is moved: a record this build
+        // does not understand must not change its name on the way to being refused.
+        let read = self.removable(params)?;
         self.migrate_records(params)?;
-        let Some(record) = self.recorded(params)? else {
+        let Some(record) = read else {
             return Ok(AgentToolsRemoveResult {
                 agent: params.agent,
                 scope: params.scope,
@@ -480,14 +532,6 @@ impl Installer {
                 )],
             });
         };
-        // Every document this removal would rewrite, checked before the first file goes. A
-        // removal that took the package and then refused the document would leave the agent with
-        // an entry pointing at a skill that is no longer there.
-        for operation in &record.manifest.operations {
-            if let ChangeOperation::AddConfigurationEntry { path, .. } = operation {
-                guard_access_controls(Path::new(path))?;
-            }
-        }
         let mut removed = Vec::new();
         let mut retained: Vec<String> = record
             .pending
@@ -728,6 +772,41 @@ impl Installer {
         self.entry_digest_under(path, key)?.ok_or_else(|| {
             ControllerError::InvalidArgument(format!("{} did not keep the entry", display(path)))
         })
+    }
+
+    /// Refuses a removal that cannot be carried out, without carrying any of it out.
+    ///
+    /// Everything here reads. It runs before the dispatch marker, so a removal this host will not
+    /// do is refused rather than recorded as a change whose outcome nobody knows.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] on a platform this host cannot change an
+    /// installation on, or where a document it would rewrite is protected by an access-control
+    /// list, and [`ControllerError::InvalidArgument`] when the scope needs a project directory
+    /// that was not given, or the record cannot be read.
+    pub fn check_removal(&self, params: &AgentToolsParams) -> Result<()> {
+        self.removable(params).map(|_| ())
+    }
+
+    /// Reads what a removal would work from, refusing everything it cannot do.
+    fn removable(&self, params: &AgentToolsParams) -> Result<Option<InstallationRecord>> {
+        supported_platform()?;
+        // A removal of something never installed still has to know where it would have been, or it
+        // is not the removal of anything in particular.
+        self.layout(params)?;
+        let Some(record) = self.recorded(params)? else {
+            return Ok(None);
+        };
+        // Every document this removal would rewrite. A removal that took the package and then
+        // refused the document would leave the agent with an entry pointing at a skill that is no
+        // longer there.
+        for operation in &record.manifest.operations {
+            if let ChangeOperation::AddConfigurationEntry { path, .. } = operation {
+                guard_access_controls(Path::new(path))?;
+            }
+        }
+        Ok(Some(record))
     }
 
     /// Refuses an installation that would change anything this host did not write.
@@ -1513,7 +1592,32 @@ fn decode_result(text: &str) -> Result<kr_protocol::envelope::ParamsValue> {
     })?;
     let value = kr_cbor::decode(&bytes, &kr_cbor::Limits::DEFAULT)
         .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-    Ok(kr_protocol::envelope::ParamsValue::new(value))
+    Ok(kr_protocol::envelope::ParamsValue::new(
+        carry_result_forward(value)?,
+    ))
+}
+
+/// Brings a result an earlier build recorded into the shape this one answers with.
+///
+/// An action is answered once: what it produced is replayed, never done again. A result that build
+/// wrote has to be readable by a client of this one, and the only difference is the list of what an
+/// installation could not account for, which that build had no way to leave behind. An empty list
+/// is what it means.
+fn carry_result_forward(value: kr_cbor::CanonicalValue) -> Result<kr_cbor::CanonicalValue> {
+    let kr_cbor::CanonicalValue::Map(mut map) = value else {
+        return Ok(value);
+    };
+    if map.get("manifest").is_some()
+        && map.get("already_installed").is_some()
+        && map.get("unresolved").is_none()
+    {
+        map.insert(
+            "unresolved".to_owned(),
+            kr_cbor::CanonicalValue::Array(Vec::new()),
+        )
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+    }
+    Ok(kr_cbor::CanonicalValue::Map(map))
 }
 
 /// Reads hexadecimal back to bytes.
@@ -1687,16 +1791,35 @@ fn supported_platform() -> Result<()> {
 /// meant it, so a document carrying one is refused before anything is written rather than quietly
 /// weakened.
 fn guard_access_controls(path: &Path) -> Result<()> {
-    if !path.exists() || !extended_access_controls(path)? {
+    if !path.exists() {
         return Ok(());
     }
-    Err(ControllerError::PermissionDenied {
-        detail: format!(
-            "{} is protected by an access-control list, and changing it here would not carry that \
-             across; add or remove the server with the agent's own command instead",
-            display(path)
-        ),
-    })
+    if extended_access_controls(path)? {
+        return Err(ControllerError::PermissionDenied {
+            detail: format!(
+                "{} is protected by an access-control list, and changing it here would not carry \
+                 that across; add or remove the server with the agent's own command instead",
+                display(path)
+            ),
+        });
+    }
+    // Changing it means writing a new file beside it and renaming that over it. A directory that
+    // grants access to whatever is created in it would give that grant to the replacement, and the
+    // document being replaced does not have it. The write itself checks the copy it made; this
+    // check is here so the refusal comes before anything is installed rather than half way through.
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    if inheritable_access_controls(parent)? {
+        return Err(ControllerError::PermissionDenied {
+            detail: format!(
+                "{} grants access to the files created in it, which {} does not have, and changing \
+                 that document here would replace it with one that does; add or remove the server \
+                 with the agent's own command instead",
+                display(parent),
+                display(path)
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Returns true when the file carries access controls its mode bits do not describe.
@@ -1719,12 +1842,25 @@ fn extended_access_controls(path: &Path) -> Result<bool> {
     // This platform keeps a POSIX access-control list in one extended attribute, and a file without
     // that attribute is described by its mode bits alone.
     let mut probe = [0_u8; 1];
-    match rustix::fs::getxattr(path, "system.posix_acl_access", &mut probe[..]) {
-        // There is a list. One byte of it is as much as this needs to know.
+    interpret_probe(rustix::fs::getxattr(
+        path,
+        "system.posix_acl_access",
+        &mut probe[..],
+    ))
+}
+
+/// Turns the answer to an access-control probe into what it says about the file.
+#[cfg(target_os = "linux")]
+fn interpret_probe(answer: std::result::Result<usize, rustix::io::Errno>) -> Result<bool> {
+    match answer {
+        // There is a list. One byte of it is as much as this needs to know, so a list longer than
+        // the byte offered for it answers the question as well as a shorter one would.
         Ok(_) | Err(rustix::io::Errno::RANGE) => Ok(true),
         Err(rustix::io::Errno::NODATA) => Ok(false),
-        // A filesystem that cannot hold an extended attribute cannot hold a list either.
-        Err(rustix::io::Errno::NOTSUP) => Ok(false),
+        // Anything else is a failure to look, including a filesystem that does not answer this
+        // question: a refusal to answer is not an answer of "none". An NFSv4 share keeps its list
+        // somewhere else entirely and refuses this one, and a file protected there must not be
+        // replaced on the strength of a probe that never saw its protection.
         Err(error) => Err(storage(std::io::Error::from(error))),
     }
 }
@@ -1734,6 +1870,39 @@ fn extended_access_controls(path: &Path) -> Result<bool> {
     // Nothing here can read this platform's access controls, so nothing here can promise to keep
     // them. An existing document is refused rather than replaced.
     let _ = path;
+    Ok(true)
+}
+
+/// Returns true when files created in this directory are given access controls by it.
+///
+/// # Errors
+///
+/// Returns [`ControllerError::Storage`] when the directory's access controls cannot be read.
+#[cfg(target_os = "macos")]
+fn inheritable_access_controls(directory: &Path) -> Result<bool> {
+    exacl::getfacl(directory, None)
+        .map(|entries| {
+            entries
+                .iter()
+                .any(|entry| entry.flags.contains(exacl::Flag::FILE_INHERIT))
+        })
+        .map_err(storage)
+}
+
+#[cfg(target_os = "linux")]
+fn inheritable_access_controls(directory: &Path) -> Result<bool> {
+    // What a directory gives the files made in it is its default list, in an attribute of its own.
+    let mut probe = [0_u8; 1];
+    interpret_probe(rustix::fs::getxattr(
+        directory,
+        "system.posix_acl_default",
+        &mut probe[..],
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn inheritable_access_controls(directory: &Path) -> Result<bool> {
+    let _ = directory;
     Ok(true)
 }
 
@@ -1937,6 +2106,21 @@ fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> 
     #[cfg(not(unix))]
     let _ = default_mode;
     let mut file = options.open(&temporary).map_err(storage)?;
+    // The copy that is about to take an existing file's place, before anything is written into it.
+    // A directory can give what is created in it access its own files do not have, and the rename
+    // below would hand that to the document being replaced.
+    if path.exists() && extended_access_controls(&temporary)? {
+        drop(file);
+        let _ = std::fs::remove_file(&temporary);
+        return Err(ControllerError::PermissionDenied {
+            detail: format!(
+                "a new file in {} is given an access-control list by the directory itself, so \
+                 replacing {} here would change who can read it",
+                display(parent),
+                display(path)
+            ),
+        });
+    }
     file.write_all(bytes).map_err(storage)?;
     // The bytes reach the disk before the rename that publishes them, and the directory entry
     // reaches it before this call returns, so a record written before an effect is on disk before
@@ -2619,6 +2803,172 @@ mod tests {
                 )),
             "the entry is owned again"
         );
+    }
+
+    #[test]
+    fn an_interrupted_entry_is_adopted_before_it_is_replaced() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::Codex, InstallScope::User);
+        installer.install(&params).expect("installs");
+
+        // Interrupted after the entry was written and before it was recorded.
+        let path = installer.record_path(&params);
+        let mut record =
+            read_record(&std::fs::read_to_string(&path).expect("the record")).expect("reads");
+        let written = record
+            .manifest
+            .operations
+            .iter()
+            .position(|operation| {
+                matches!(operation, ChangeOperation::AddConfigurationEntry { .. })
+            })
+            .expect("an entry was written");
+        record.pending = vec![record.manifest.operations.remove(written)];
+        record.state = InstallationRecord::INSTALLING.to_owned();
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(&record).expect("encodes"),
+        )
+        .expect("writes");
+
+        // The repair wants a different entry, because this host now reaches the tools by another
+        // path. The note about the old one is the only evidence that the old one is this host's.
+        let moved = Installer::new(
+            tree.home(),
+            installer.records.clone(),
+            "/opt/elsewhere/kr".to_owned(),
+        );
+        let repaired = moved.install(&params).expect("repairs");
+
+        assert!(repaired.unresolved.is_empty(), "{:?}", repaired.unresolved);
+        let recorded = moved.recorded(&params).expect("reads").expect("a record");
+        assert!(recorded.is_complete());
+        assert!(recorded.pending.is_empty());
+        assert_eq!(
+            recorded.manifest.entry_point,
+            vec![
+                "/opt/elsewhere/kr".to_owned(),
+                "agent-tools".to_owned(),
+                "--stdio".to_owned()
+            ],
+            "and the entry it owns is the new one"
+        );
+        // Which it can undo, because it owns it.
+        let removed = moved.remove(&params).expect("removes");
+        assert!(
+            removed.removed.iter().any(|operation| matches!(
+                operation,
+                ChangeOperation::AddConfigurationEntry { .. }
+            )),
+            "{:?}",
+            removed.removed
+        );
+    }
+
+    #[test]
+    fn a_result_an_earlier_build_retained_is_still_readable() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let actor = kr_protocol::ids::ActorId::new("local:501").expect("a principal");
+        let action =
+            kr_protocol::ids::ActionId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
+        let digest = digest_of(b"the payload");
+        // The shape that build recorded: an installation result with no account of what it could
+        // not resolve, because it had no such account to give.
+        let manifest = ChangeManifest {
+            skill_version: SKILL_VERSION.to_owned(),
+            agent: params(AgentTarget::Codex, InstallScope::User).agent,
+            scope: InstallScope::User,
+            root: "/somewhere".to_owned(),
+            entry_point: vec!["kr".to_owned()],
+            operations: Vec::new(),
+        };
+        let stored = kr_cbor::CanonicalValue::Map(
+            kr_cbor::CanonicalMap::from_entries([
+                (
+                    "manifest".to_owned(),
+                    kr_cbor::to_canonical_value(&manifest).expect("encodes"),
+                ),
+                (
+                    "already_installed".to_owned(),
+                    kr_cbor::CanonicalValue::Bool(true),
+                ),
+            ])
+            .expect("a map"),
+        );
+        installer
+            .write_action(
+                &actor,
+                action,
+                &ActionRecord {
+                    digest: hex(digest.as_bytes()),
+                    state: "applied".to_owned(),
+                    result: Some(hex(&kr_cbor::encode(&stored))),
+                },
+            )
+            .expect("writes the action record");
+
+        let answer = installer
+            .retained(&actor, action, &digest)
+            .expect("reads")
+            .expect("an answer");
+
+        let result: AgentToolsInstallResult = answer.to_typed().expect("this build can read it");
+        assert!(result.already_installed);
+        assert!(result.unresolved.is_empty());
+    }
+
+    /// A directory that hands out access is not a place to replace a file.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_document_in_a_directory_that_grants_access_is_not_replaced() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::Codex, InstallScope::User);
+        installer.install(&params).expect("installs");
+        let document = tree.home().join(".codex/config.toml");
+        // The document itself carries nothing; its directory gives what is made in it a grant the
+        // document does not have.
+        exacl::setfacl(
+            &[document.parent().expect("a directory")],
+            &[exacl::AclEntry::allow_group(
+                "everyone",
+                exacl::Perm::READ,
+                Some(exacl::Flag::FILE_INHERIT),
+            )],
+            None,
+        )
+        .expect("grants access through the directory");
+
+        let refused = installer
+            .install(&params)
+            .expect_err("refuses to replace it");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains("grants access to the files created in it")),
+            "{refused:?}"
+        );
+
+        // And the write itself refuses, wherever it is reached from.
+        let refused = write_atomically(&document, b"anything", PRIVATE).expect_err("refuses");
+        assert!(
+            matches!(refused, ControllerError::PermissionDenied { ref detail }
+                if detail.contains("given an access-control list by the directory")),
+            "{refused:?}"
+        );
+    }
+
+    /// The Linux probe's answers, including the one that is not an answer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_probe_that_cannot_answer_is_not_read_as_no_list() {
+        assert!(interpret_probe(Ok(1)).expect("a list"));
+        assert!(interpret_probe(Err(rustix::io::Errno::RANGE)).expect("a longer list"));
+        assert!(!interpret_probe(Err(rustix::io::Errno::NODATA)).expect("no list"));
+        // An NFSv4 share keeps its list somewhere this probe cannot see and refuses the question.
+        // A refusal to answer is not an answer of "none".
+        assert!(interpret_probe(Err(rustix::io::Errno::NOTSUP)).is_err());
     }
 
     #[test]
