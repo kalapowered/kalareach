@@ -148,6 +148,7 @@ async fn host_with(
                 controller_public_key: *controller.public_key(),
                 controller_generation: ControllerGeneration::new(1),
                 build_id: build(),
+                journal_path: None,
             },
         )
         .expect("a worker service"),

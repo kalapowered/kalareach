@@ -503,17 +503,394 @@
       ],
       "type": "object"
     },
+    "AgentTarget": {
+      "description": "One agent an installation can target.",
+      "oneOf": [
+        {
+          "const": "codex",
+          "description": "Codex.",
+          "type": "string"
+        },
+        {
+          "const": "claude-code",
+          "description": "Claude Code.",
+          "type": "string"
+        },
+        {
+          "const": "opencode",
+          "description": "OpenCode.",
+          "type": "string"
+        },
+        {
+          "const": "gemini-cli",
+          "description": "Gemini CLI.",
+          "type": "string"
+        },
+        {
+          "const": "kimi-code-cli",
+          "description": "Kimi Code CLI.",
+          "type": "string"
+        },
+        {
+          "const": "qoder-cli",
+          "description": "Qoder CLI.",
+          "type": "string"
+        }
+      ]
+    },
     "AgentThreadId": {
       "description": "The upstream agent's conversation identifier, where available. Correlation data, not authority.",
       "maxLength": 256,
       "minLength": 1,
       "type": "string"
     },
+    "AgentToolsInstallResult": {
+      "additionalProperties": false,
+      "description": "The result of `agent_tools.install`.",
+      "properties": {
+        "already_installed": {
+          "description": "True when the installation was already present and unchanged.",
+          "type": "boolean"
+        },
+        "manifest": {
+          "$ref": "#/$defs/ChangeManifest",
+          "description": "What was changed, and how to undo it."
+        },
+        "unresolved": {
+          "description": "What an earlier attempt may have written and this one could not account for.\n\nEmpty in the ordinary case. A line here means the installation is not finished: the change\nit names is neither owned nor undone, and somebody has to look at it.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "manifest",
+        "already_installed",
+        "unresolved"
+      ],
+      "type": "object"
+    },
+    "AgentToolsParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `agent_tools.install`, `agent_tools.status` and `agent_tools.remove`.",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentTarget",
+          "description": "The agent."
+        },
+        "project_dir": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The project directory, for project scope."
+        },
+        "scope": {
+          "$ref": "#/$defs/InstallScope",
+          "description": "The scope."
+        }
+      },
+      "required": [
+        "agent",
+        "scope",
+        "project_dir"
+      ],
+      "type": "object"
+    },
+    "AgentToolsRemoveResult": {
+      "additionalProperties": false,
+      "description": "The result of `agent_tools.remove`.",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentTarget",
+          "description": "The agent."
+        },
+        "removed": {
+          "description": "What was undone.",
+          "items": {
+            "$ref": "#/$defs/ChangeOperation"
+          },
+          "type": "array"
+        },
+        "retained": {
+          "description": "What was left alone, and why.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "scope": {
+          "$ref": "#/$defs/InstallScope",
+          "description": "The scope."
+        }
+      },
+      "required": [
+        "agent",
+        "scope",
+        "removed",
+        "retained"
+      ],
+      "type": "object"
+    },
+    "AgentToolsStatusResult": {
+      "additionalProperties": false,
+      "description": "The result of `agent_tools.status`.",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentTarget",
+          "description": "The agent."
+        },
+        "drift": {
+          "description": "What no longer matches the record, in the words a person reads.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "files": {
+          "description": "Each installed file and whether it is still what was written.",
+          "items": {
+            "$ref": "#/$defs/InstalledFile"
+          },
+          "type": "array"
+        },
+        "installed": {
+          "description": "True when a recorded installation is present.",
+          "type": "boolean"
+        },
+        "removal": {
+          "description": "The operations a removal would run.",
+          "items": {
+            "$ref": "#/$defs/ChangeOperation"
+          },
+          "type": "array"
+        },
+        "root": {
+          "description": "The directory the scope resolved to.",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/InstallScope",
+          "description": "The scope."
+        },
+        "skill_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version recorded, when there is one."
+        }
+      },
+      "required": [
+        "agent",
+        "scope",
+        "root",
+        "installed",
+        "skill_version",
+        "files",
+        "drift",
+        "removal"
+      ],
+      "type": "object"
+    },
     "AgentTurnId": {
       "description": "The upstream agent's current turn identifier, where available.",
       "maxLength": 256,
       "minLength": 1,
       "type": "string"
+    },
+    "Alert": {
+      "additionalProperties": false,
+      "description": "One alert. It reports; it asks for nothing.",
+      "properties": {
+        "created_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was raised."
+        },
+        "dedup_id": {
+          "description": "The source's own de-duplication identifier.",
+          "type": "string"
+        },
+        "safe_session_link": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A link into this host's own session, when the source supplied one."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session it belongs to."
+        },
+        "severity": {
+          "$ref": "#/$defs/AlertSeverity",
+          "description": "How urgent it is."
+        },
+        "source": {
+          "$ref": "#/$defs/QuestionSource",
+          "description": "The verified source, and the unverified label beside it."
+        },
+        "text": {
+          "description": "The concise text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dedup_id",
+        "session_id",
+        "source",
+        "text",
+        "severity",
+        "safe_session_link",
+        "created_at_ms"
+      ],
+      "type": "object"
+    },
+    "AlertCreateParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `alert.create`.",
+      "properties": {
+        "agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The caller's label for itself. Unverified."
+        },
+        "dedup_id": {
+          "description": "The source's de-duplication identifier.",
+          "type": "string"
+        },
+        "safe_session_link": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A link into this host's own session, when there is one."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        },
+        "severity": {
+          "$ref": "#/$defs/AlertSeverity",
+          "description": "How urgent it is."
+        },
+        "text": {
+          "description": "The concise text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "dedup_id",
+        "agent_name",
+        "text",
+        "severity",
+        "safe_session_link"
+      ],
+      "type": "object"
+    },
+    "AlertCreateResult": {
+      "additionalProperties": false,
+      "description": "The result of `alert.create`.",
+      "properties": {
+        "alert": {
+          "$ref": "#/$defs/Alert",
+          "description": "The alert."
+        },
+        "deduplicated": {
+          "description": "True when an exact duplicate returned the existing alert rather than raising one.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "alert",
+        "deduplicated"
+      ],
+      "type": "object"
+    },
+    "AlertSeverity": {
+      "description": "How urgent an alert is.",
+      "oneOf": [
+        {
+          "const": "info",
+          "description": "Something worth knowing.",
+          "type": "string"
+        },
+        {
+          "const": "warning",
+          "description": "Something that may need attention.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "Something that went wrong.",
+          "type": "string"
+        }
+      ]
+    },
+    "AnswerRecord": {
+      "additionalProperties": false,
+      "description": "The answer, who gave it and against which revision.",
+      "properties": {
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The host-verified principal that answered. A caller never asserts its own."
+        },
+        "answer": {
+          "$ref": "#/$defs/QuestionAnswer",
+          "description": "What was answered."
+        },
+        "answered_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the answer was recorded."
+        },
+        "device_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The paired device that answered, when the answer came from one."
+        },
+        "question_revision": {
+          "$ref": "#/$defs/QuestionRevision",
+          "description": "The revision of the question the person was shown."
+        }
+      },
+      "required": [
+        "answer",
+        "actor_id",
+        "device_id",
+        "question_revision",
+        "answered_at_ms"
+      ],
+      "type": "object"
     },
     "ApplicationInstanceId": {
       "description": "One foreground application within a terminal session.",
@@ -1365,6 +1742,10 @@
       "pattern": "^[A-Za-z0-9_-]*$",
       "type": "string"
     },
+    "CallerToken": {
+      "$ref": "#/$defs/Bytes",
+      "description": "The opaque token that lets one verified source poll or cancel its own question.\n\nIt is not authority over a session and it is not an answer: it permits exactly the two reads\nand the one cancellation that belong to the question it was issued for, and only from the same\nverified application. Section 11 keeps it out of events, push payloads, backups and logs, so\nthis type prints as a redaction and carries no `Display`."
+    },
     "CapabilityId": {
       "description": "A versioned capability name. Capabilities describe feasibility, never authority.",
       "maxLength": 256,
@@ -1666,6 +2047,142 @@
           "const": "unmerged",
           "description": "The path has an unresolved merge.",
           "type": "string"
+        }
+      ]
+    },
+    "ChangeManifest": {
+      "additionalProperties": false,
+      "description": "The exact set of changes one installation made, and how to undo them.",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentTarget",
+          "description": "The agent it was installed for."
+        },
+        "entry_point": {
+          "description": "The command the agent runs to reach the tools.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "operations": {
+          "description": "Every change, in the order it was applied.\n\nA removal undoes them in the order it can carry out: files and server entries first, then\nthe directories that held them, deepest first.",
+          "items": {
+            "$ref": "#/$defs/ChangeOperation"
+          },
+          "type": "array"
+        },
+        "root": {
+          "description": "The directory the scope resolved to.",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/InstallScope",
+          "description": "The scope it was installed at."
+        },
+        "skill_version": {
+          "description": "The skill version installed.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill_version",
+        "agent",
+        "scope",
+        "root",
+        "entry_point",
+        "operations"
+      ],
+      "type": "object"
+    },
+    "ChangeOperation": {
+      "description": "One change an installation makes, with its inverse implied by its kind.",
+      "oneOf": [
+        {
+          "description": "A directory this installation created. Removal deletes it only when it is empty.",
+          "properties": {
+            "operation": {
+              "const": "create_directory",
+              "type": "string"
+            },
+            "path": {
+              "description": "The absolute path.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A file this installation owns outright.",
+          "properties": {
+            "digest": {
+              "$ref": "#/$defs/Digest256",
+              "description": "The digest of the content written. A removal that finds different content stops."
+            },
+            "operation": {
+              "const": "write_file",
+              "type": "string"
+            },
+            "path": {
+              "description": "The absolute path.",
+              "type": "string"
+            },
+            "replaced_digest": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Digest256"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The digest of what was there before, when the file already existed."
+            }
+          },
+          "required": [
+            "operation",
+            "path",
+            "digest",
+            "replaced_digest"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "One entry added to an agent's configuration document, under the managed marker.\n\nNothing else in the document is read as this installation's, and nothing else is written.",
+          "properties": {
+            "created_document": {
+              "description": "True when the document did not exist and this installation created it.",
+              "type": "boolean"
+            },
+            "digest": {
+              "$ref": "#/$defs/Digest256",
+              "description": "The digest of the entry's value, so a removal can tell an unchanged entry from an\nedited one."
+            },
+            "entry": {
+              "description": "The dotted location of the entry inside it, for example `mcpServers.kalareach`.",
+              "type": "string"
+            },
+            "operation": {
+              "const": "add_configuration_entry",
+              "type": "string"
+            },
+            "path": {
+              "description": "The absolute path of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation",
+            "path",
+            "entry",
+            "digest",
+            "created_document"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -5982,11 +6499,57 @@
         }
       ]
     },
+    "InstallScope": {
+      "description": "Where an installation is written.",
+      "oneOf": [
+        {
+          "const": "user",
+          "description": "This operating-system user's own agent configuration.",
+          "type": "string"
+        },
+        {
+          "const": "project",
+          "description": "One project directory's agent configuration.",
+          "type": "string"
+        }
+      ]
+    },
     "InstallationId": {
       "description": "One native application installation registered with a push gateway.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "InstalledFile": {
+      "additionalProperties": false,
+      "description": "What one installed file looks like now.",
+      "properties": {
+        "actual_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest on disk now, or null when the path is gone."
+        },
+        "expected_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest the manifest recorded."
+        },
+        "path": {
+          "description": "The absolute path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "expected_digest",
+        "actual_digest"
+      ],
+      "type": "object"
     },
     "InterruptAction": {
       "description": "What an interrupt may do.\n\nThe method accepts only the configured native interrupt action. It never accepts arbitrary\ncommand bytes, and it bypasses the reader-transition hold.",
@@ -11194,16 +11757,673 @@
         }
       ]
     },
+    "Question": {
+      "additionalProperties": false,
+      "description": "One durable question.\n\nThis is the whole public view. The caller token is deliberately not a field: it is returned to\nthe source once, in [`QuestionCreateResult`], and never appears in a read, an event or a log.",
+      "properties": {
+        "answer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AnswerRecord"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The answer, once there is one."
+        },
+        "choices": {
+          "description": "The options, including the free-text one for `select` and `confirm`.",
+          "items": {
+            "$ref": "#/$defs/QuestionChoice"
+          },
+          "type": "array"
+        },
+        "context": {
+          "description": "The concise decision context the source supplied.",
+          "type": "string"
+        },
+        "created_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was created."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it expires if nothing else resolves it."
+        },
+        "kind": {
+          "$ref": "#/$defs/QuestionKind",
+          "description": "What kind of answer it asks for."
+        },
+        "question": {
+          "description": "The question itself.",
+          "type": "string"
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId",
+          "description": "The question's identity."
+        },
+        "resolved_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When it reached a terminal state."
+        },
+        "revision": {
+          "$ref": "#/$defs/QuestionRevision",
+          "description": "Its revision. An answer names the exact revision it is answering."
+        },
+        "session_epoch": {
+          "$ref": "#/$defs/SessionEpoch",
+          "description": "The epoch that session was in when the question was created."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session that owns it."
+        },
+        "source": {
+          "$ref": "#/$defs/QuestionSource",
+          "description": "The verified source, and the unverified label beside it."
+        },
+        "state": {
+          "$ref": "#/$defs/QuestionState",
+          "description": "Where it is in its life."
+        }
+      },
+      "required": [
+        "question_id",
+        "revision",
+        "state",
+        "session_id",
+        "session_epoch",
+        "kind",
+        "context",
+        "question",
+        "choices",
+        "source",
+        "created_at_ms",
+        "expires_at_ms",
+        "answer",
+        "resolved_at_ms"
+      ],
+      "type": "object"
+    },
+    "QuestionAnswer": {
+      "description": "What a person answered.\n\nThe four arms stay four arms. Section 11 forbids coercing [`Self::Other`] into a listed choice\nor into a yes, so an answer that arrived as free text is read as free text by whatever consumes\nit.",
+      "oneOf": [
+        {
+          "description": "Free text, for an `input` question.",
+          "properties": {
+            "kind": {
+              "const": "input",
+              "type": "string"
+            },
+            "text": {
+              "description": "What the person typed.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "One of the listed choices, for a `select` question.",
+          "properties": {
+            "choice_id": {
+              "description": "The choice the person selected.",
+              "type": "string"
+            },
+            "kind": {
+              "const": "choice",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "choice_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Yes or no, for a `confirm` question.",
+          "properties": {
+            "decided": {
+              "description": "True for yes.",
+              "type": "boolean"
+            },
+            "kind": {
+              "const": "decision",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "decided"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The free-text option, available on every `select` and `confirm`.",
+          "properties": {
+            "kind": {
+              "const": "other",
+              "type": "string"
+            },
+            "text": {
+              "description": "What the person typed instead of choosing.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "QuestionAnswerParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `question.answer`.",
+      "properties": {
+        "answer": {
+          "$ref": "#/$defs/QuestionAnswer",
+          "description": "The answer."
+        },
+        "expected_revision": {
+          "$ref": "#/$defs/QuestionRevision",
+          "description": "The revision the person was shown. A different current revision is refused."
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId",
+          "description": "The question."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "question_id",
+        "expected_revision",
+        "answer"
+      ],
+      "type": "object"
+    },
+    "QuestionCancelOwnParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `question.cancel_own`.",
+      "properties": {
+        "caller_token": {
+          "$ref": "#/$defs/CallerToken",
+          "description": "The token issued when it was created."
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId",
+          "description": "The question."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "question_id",
+        "caller_token"
+      ],
+      "type": "object"
+    },
+    "QuestionCancelParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `question.cancel`.",
+      "properties": {
+        "expected_revision": {
+          "$ref": "#/$defs/QuestionRevision",
+          "description": "The revision the person was shown."
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId",
+          "description": "The question."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "question_id",
+        "expected_revision"
+      ],
+      "type": "object"
+    },
+    "QuestionChoice": {
+      "additionalProperties": false,
+      "description": "One option a `select` question offers.",
+      "properties": {
+        "choice_id": {
+          "description": "The stable identifier an answer names. It does not change with the label.",
+          "type": "string"
+        },
+        "label": {
+          "description": "What the person reads.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "choice_id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "QuestionCreateParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `question.create`.",
+      "properties": {
+        "agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The caller's label for itself. Unverified."
+        },
+        "choices": {
+          "description": "The choices, for a `select`. The free-text option is added by the host.",
+          "items": {
+            "$ref": "#/$defs/QuestionChoice"
+          },
+          "type": "array"
+        },
+        "context": {
+          "description": "The concise decision context.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/QuestionKind",
+          "description": "What kind of answer it asks for."
+        },
+        "question": {
+          "description": "The question itself.",
+          "type": "string"
+        },
+        "request_id": {
+          "description": "The caller's own unpredictable identifier for this request.\n\nDe-duplication is by the verified originating application and this value together. A caller\nlabel is not part of it.",
+          "type": "string"
+        },
+        "requested_expiry_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DurationMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How long the question should live. Bounded by [`MAX_EXPIRY`] and by the source's own\nlifetime."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the source believes it is in. The host checks the binding regardless."
+        },
+        "wait_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DurationMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How long to wait for an answer before returning the pending question. Bounded by\n[`MAX_CREATE_WAIT`]."
+        }
+      },
+      "required": [
+        "session_id",
+        "request_id",
+        "agent_name",
+        "context",
+        "question",
+        "kind",
+        "choices",
+        "requested_expiry_ms",
+        "wait_ms"
+      ],
+      "type": "object"
+    },
+    "QuestionCreateResult": {
+      "additionalProperties": false,
+      "description": "The result of `question.create`.",
+      "properties": {
+        "caller_token": {
+          "$ref": "#/$defs/CallerToken",
+          "description": "The token that lets this source poll and cancel it."
+        },
+        "deduplicated": {
+          "description": "True when an exact duplicate returned the existing question rather than creating one.",
+          "type": "boolean"
+        },
+        "question": {
+          "$ref": "#/$defs/Question",
+          "description": "The durable question."
+        }
+      },
+      "required": [
+        "question",
+        "caller_token",
+        "deduplicated"
+      ],
+      "type": "object"
+    },
+    "QuestionEvent": {
+      "additionalProperties": false,
+      "description": "One question transition, as the attention engine reads it.\n\nSection 25's idle reminder fires after five minutes of a *verified pending* request, so the\nevent carries the moment the question became pending and whether its source was verified.\nNothing here is the reminder itself; the attention engine owns that rule.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/QuestionEventKind",
+          "description": "What happened."
+        },
+        "pending_since_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the question first became pending, which is when its idle timer starts."
+        },
+        "question": {
+          "$ref": "#/$defs/Question",
+          "description": "The question at this revision."
+        },
+        "recorded_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When this transition was recorded."
+        }
+      },
+      "required": [
+        "kind",
+        "question",
+        "pending_since_ms",
+        "recorded_at_ms"
+      ],
+      "type": "object"
+    },
+    "QuestionEventKind": {
+      "description": "What happened to a question, for the attention feed.",
+      "oneOf": [
+        {
+          "const": "created",
+          "description": "A verified source created it.",
+          "type": "string"
+        },
+        {
+          "const": "answered",
+          "description": "A person answered it.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "It was withdrawn.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "Its deadline passed or its source went.",
+          "type": "string"
+        }
+      ]
+    },
     "QuestionId": {
       "description": "One agent-to-user question.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "QuestionKind": {
+      "description": "What a question asks for.",
+      "oneOf": [
+        {
+          "const": "input",
+          "description": "Free text.",
+          "type": "string"
+        },
+        {
+          "const": "select",
+          "description": "One of the listed choices, or free text.",
+          "type": "string"
+        },
+        {
+          "const": "confirm",
+          "description": "Yes, no, or free text.",
+          "type": "string"
+        }
+      ]
+    },
+    "QuestionOwnResult": {
+      "additionalProperties": false,
+      "description": "The result of `question.read_own` and `question.cancel_own`.",
+      "properties": {
+        "question": {
+          "$ref": "#/$defs/Question",
+          "description": "The question as it now stands."
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "type": "object"
+    },
+    "QuestionReadOwnParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `question.read_own`.",
+      "properties": {
+        "caller_token": {
+          "$ref": "#/$defs/CallerToken",
+          "description": "The token issued when it was created."
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId",
+          "description": "The question."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        },
+        "wait_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DurationMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How long to wait for a change before answering with the question as it stands.\n\nA wait that times out returns the same durable question. It does not recreate it, and it\ndoes not notify anybody again."
+        }
+      },
+      "required": [
+        "session_id",
+        "question_id",
+        "caller_token",
+        "wait_ms"
+      ],
+      "type": "object"
+    },
+    "QuestionReadParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `question.read`.",
+      "properties": {
+        "include_resolved": {
+          "description": "True to include questions that have already been resolved.",
+          "type": "boolean"
+        },
+        "question_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QuestionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "One question, or null for every question this actor may see."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "question_id",
+        "include_resolved"
+      ],
+      "type": "object"
+    },
+    "QuestionReadResult": {
+      "additionalProperties": false,
+      "description": "The result of `question.read`.",
+      "properties": {
+        "questions": {
+          "description": "The questions, oldest first.",
+          "items": {
+            "$ref": "#/$defs/Question"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "questions"
+      ],
+      "type": "object"
+    },
+    "QuestionResolveResult": {
+      "additionalProperties": false,
+      "description": "The result of `question.answer` and `question.cancel`.",
+      "properties": {
+        "question": {
+          "$ref": "#/$defs/Question",
+          "description": "The question as it now stands."
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "type": "object"
+    },
     "QuestionRevision": {
       "description": "The exact version of a question that a person answers.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "QuestionSource": {
+      "additionalProperties": false,
+      "description": "The application the host verified as the source of a question.\n\nEverything here except [`Self::agent_label`] comes from the operating system through the\nworker's private socket. The label comes from the caller and is displayed as unverified, which\nis the whole of the difference between the two.",
+      "properties": {
+        "agent_binding_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentBindingRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The agent thread or binding revision, when a qualified bridge supplied one.\n\nNull when no bridge did. A null here is not a claim that the thread never changed: without\na bridge the question is application-scoped and thread-switch detection is not offered."
+        },
+        "agent_label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The caller's own label for itself. Unverified, and never part of authority."
+        },
+        "ancestry": {
+          "description": "True when the process's parent chain reaches the session's root shell.\n\nA checked hint, recorded for diagnostics. Section 11 is explicit that ancestry is not a\ndefence against arbitrary code running under the same account, so nothing is admitted on\nthis alone.",
+          "type": "boolean"
+        },
+        "application_instance_id": {
+          "$ref": "#/$defs/ApplicationInstanceId",
+          "description": "The application instance the worker minted for this verified process."
+        },
+        "connection_id": {
+          "$ref": "#/$defs/ConnectionId",
+          "description": "The connection the question was created on."
+        },
+        "executable": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The executable that process is running, where the platform names it."
+        },
+        "launch_channel": {
+          "description": "True when the helper presented the private launch channel it inherited.\n\nFalse means the binding rests on the checks below instead; it does not mean the source is\nless bound, and it is recorded so a reader can tell which evidence was available.",
+          "type": "boolean"
+        },
+        "process": {
+          "$ref": "#/$defs/ProcessStartIdentity",
+          "description": "The process the kernel reports on the other end of the socket, with its start value."
+        },
+        "session_member": {
+          "description": "True when the process is inside the session's own ownership boundary, as the kernel\nreports it. This is what admits a source.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "application_instance_id",
+        "process",
+        "executable",
+        "agent_label",
+        "connection_id",
+        "launch_channel",
+        "session_member",
+        "ancestry",
+        "agent_binding_revision"
+      ],
+      "type": "object"
+    },
+    "QuestionState": {
+      "description": "Where a question is in its life.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Waiting for a person. Dismissing the form leaves it here.",
+          "type": "string"
+        },
+        {
+          "const": "answered",
+          "description": "A person answered it. Terminal.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "The source or a person withdrew it. Terminal.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "Its deadline passed, or the application that asked has gone. Terminal.",
+          "type": "string"
+        }
+      ]
     },
     "QueueDrainReport": {
       "additionalProperties": false,
@@ -15914,6 +17134,30 @@
     "agent_draft_add_attachment_result": {
       "$ref": "#/$defs/AgentDraftAddAttachmentResult"
     },
+    "agent_tools_install_result": {
+      "$ref": "#/$defs/AgentToolsInstallResult"
+    },
+    "agent_tools_params": {
+      "$ref": "#/$defs/AgentToolsParams"
+    },
+    "agent_tools_remove_result": {
+      "$ref": "#/$defs/AgentToolsRemoveResult"
+    },
+    "agent_tools_status_result": {
+      "$ref": "#/$defs/AgentToolsStatusResult"
+    },
+    "alert": {
+      "$ref": "#/$defs/Alert"
+    },
+    "alert_create_params": {
+      "$ref": "#/$defs/AlertCreateParams"
+    },
+    "alert_create_result": {
+      "$ref": "#/$defs/AlertCreateResult"
+    },
+    "answer_record": {
+      "$ref": "#/$defs/AnswerRecord"
+    },
     "archive_descriptor": {
       "$ref": "#/$defs/ArchiveDescriptor"
     },
@@ -15952,6 +17196,12 @@
     },
     "backup_writer_record": {
       "$ref": "#/$defs/BackupWriterRecord"
+    },
+    "change_manifest": {
+      "$ref": "#/$defs/ChangeManifest"
+    },
+    "change_operation": {
+      "$ref": "#/$defs/ChangeOperation"
     },
     "client_offer": {
       "$ref": "#/$defs/ClientOffer"
@@ -16346,6 +17596,9 @@
     "input_write_result": {
       "$ref": "#/$defs/InputWriteResult"
     },
+    "installed_file": {
+      "$ref": "#/$defs/InstalledFile"
+    },
     "local_hello": {
       "$ref": "#/$defs/LocalHello"
     },
@@ -16489,6 +17742,51 @@
     },
     "push_sender_revocation": {
       "$ref": "#/$defs/PushSenderRevocation"
+    },
+    "question": {
+      "$ref": "#/$defs/Question"
+    },
+    "question_answer": {
+      "$ref": "#/$defs/QuestionAnswer"
+    },
+    "question_answer_params": {
+      "$ref": "#/$defs/QuestionAnswerParams"
+    },
+    "question_cancel_own_params": {
+      "$ref": "#/$defs/QuestionCancelOwnParams"
+    },
+    "question_cancel_params": {
+      "$ref": "#/$defs/QuestionCancelParams"
+    },
+    "question_choice": {
+      "$ref": "#/$defs/QuestionChoice"
+    },
+    "question_create_params": {
+      "$ref": "#/$defs/QuestionCreateParams"
+    },
+    "question_create_result": {
+      "$ref": "#/$defs/QuestionCreateResult"
+    },
+    "question_event": {
+      "$ref": "#/$defs/QuestionEvent"
+    },
+    "question_own_result": {
+      "$ref": "#/$defs/QuestionOwnResult"
+    },
+    "question_read_own_params": {
+      "$ref": "#/$defs/QuestionReadOwnParams"
+    },
+    "question_read_params": {
+      "$ref": "#/$defs/QuestionReadParams"
+    },
+    "question_read_result": {
+      "$ref": "#/$defs/QuestionReadResult"
+    },
+    "question_resolve_result": {
+      "$ref": "#/$defs/QuestionResolveResult"
+    },
+    "question_source": {
+      "$ref": "#/$defs/QuestionSource"
     },
     "receipt": {
       "$ref": "#/$defs/Receipt"
