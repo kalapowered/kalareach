@@ -659,6 +659,51 @@ fn an_invocation_reaches_only_the_ports_its_own_transport_uses() {
     );
 }
 
+#[test]
+fn a_remote_operation_turns_a_name_this_machine_answers_into_an_address() {
+    // The boundary refuses every way of reaching another program on this machine, which is how a
+    // name service cache and a resolver's own interface are reached. What is left is the files and
+    // the resolver itself, and this is the first of those: a name every machine answers from its
+    // own files, resolved inside the boundary, reaching a listener this test owns. A failure here
+    // is the boundary having taken away more than it meant to.
+    let fixture = Fixture::create();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a listener on this machine");
+    let port = listener.local_addr().expect("the bound address").port();
+    let (arrived, connections) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+            if arrived.send(()).is_err() {
+                return;
+            }
+        }
+    });
+
+    let url = format!("https://localhost:{port}/repository.git");
+    let arguments: [&OsStr; 5] = [
+        OsStr::new("clone"),
+        OsStr::new("--template="),
+        OsStr::new("--no-checkout"),
+        OsStr::new(&url),
+        OsStr::new("by-name"),
+    ];
+    let request = GitRequest::write(fixture.work(), &arguments)
+        .with_deadline(Duration::from_secs(30))
+        .with_transport(RemoteAccess {
+            transport: RemoteTransport::Https,
+            credential_helper: None,
+            ssh_command: None,
+            ssh_program: None,
+            port: Some(port),
+            remote_name: Some("origin"),
+        });
+    let _ = fixture.service().profile().run(&request);
+
+    connections
+        .recv_timeout(Duration::from_secs(30))
+        .expect("a name this machine answers from its own files is turned into an address");
+}
+
 // The boundary runs on the platforms that can hold its guarantees; where it refuses, a Git
 // invocation is the refusal and there is nothing here to observe.
 #[cfg(unix)]
