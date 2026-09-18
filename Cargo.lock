@@ -3196,6 +3196,7 @@ dependencies = [
  "kr-cbor",
  "kr-crypto",
  "kr-ipc",
+ "kr-plugin-sdk",
  "kr-protocol",
  "kr-term",
  "kr-transport",

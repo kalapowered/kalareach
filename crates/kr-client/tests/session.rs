@@ -17,7 +17,9 @@ use kr_client::drafts::{
 };
 use kr_client::error::ClientError;
 use kr_client::retry::{Recovery, RequestClass, UserAction};
-use kr_client::services::{NullService, RelayLeaseService, ServiceClients, SyncBackupService};
+use kr_client::services::{
+    ManagedService, NullService, RelayLeaseService, ServiceClients, SyncBackupService,
+};
 use kr_client::session::Session;
 use kr_client::transport::NetworkTransport;
 use kr_crypto::connect::{ChallengeLedger, PairedPeer};
@@ -1190,4 +1192,356 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
     assert!(script.actions.lock().await.is_empty());
     session.close();
     serving.abort();
+}
+
+/// A host on this machine: a local socket that answers the opening exchange and then control
+/// frames, which is all a local endpoint is.
+///
+/// Section 23 puts local endpoints and network connections on the same typed frames, with local
+/// peer authentication instead of a device proof. This is the local half of that, small on purpose:
+/// what the tests below check is that everything above the transport is the same either way.
+fn spawn_local_host(
+    listener: kr_ipc::endpoint::Listener,
+    script: Arc<HostScript>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let Ok((connection, peer)) = listener.accept().await else {
+                return;
+            };
+            let script = Arc::clone(&script);
+            tokio::spawn(async move {
+                let (mut reader, mut writer) =
+                    kr_ipc::framed::split(connection, kr_protocol::frame::StreamKind::Control);
+                let Ok(ControlFrame::Hello(hello)) = reader.read_message::<ControlFrame>().await
+                else {
+                    return;
+                };
+                let connection_id = kr_protocol::ids::ConnectionId::new(Uuid::from_bytes([42; 16]));
+                let acknowledgement = kr_protocol::local::LocalHelloAck {
+                    selected_version: kr_protocol::hello::PROTOCOL_VERSION,
+                    role: kr_protocol::local::LocalRole::Controller,
+                    connection_id,
+                    environment_id: EnvironmentId::new(Uuid::from_bytes([5; 16])),
+                    boot_identity: kr_protocol::identity::BootIdentity {
+                        source: kr_protocol::identity::BootIdentitySource::BootTime,
+                        value: kr_protocol::scalars::Bytes::new(vec![1, 2, 3, 4]),
+                    },
+                    peer: kr_protocol::local::LocalPeer {
+                        uid: U64::new(u64::from(peer.uid)),
+                        gid: U64::new(u64::from(peer.gid)),
+                        pid: Nullable::null(),
+                    },
+                    action_window: kr_protocol::hello::ActionWindow {
+                        action_window_id: kr_protocol::ids::ActionWindowId::new("window-1")
+                            .expect("a literal window identifier"),
+                        connection_id,
+                        boot_epoch: BootEpoch::new(1),
+                        issued_at_ms: TimestampMs::new(0),
+                        valid_for_ms: DurationMs::new(60_000),
+                    },
+                    capabilities: kr_protocol::scalars::CanonicalSet::new(),
+                    max_receive: hello.max_receive,
+                };
+                if writer
+                    .write_message(&ControlFrame::HelloAck(Box::new(acknowledgement)))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                loop {
+                    let Ok(frame) = reader.read_message::<ControlFrame>().await else {
+                        return;
+                    };
+                    let answer = match frame {
+                        ControlFrame::Request(request) => {
+                            script.reads.fetch_add(1, Ordering::AcqRel);
+                            ControlFrame::Response(Response {
+                                request_id: request.request_id,
+                                outcome: Outcome::Ok(
+                                    ParamsValue::from_typed(&SessionList { count: 2 })
+                                        .expect("a result"),
+                                ),
+                            })
+                        }
+                        ControlFrame::Mutation(mutation) => {
+                            script.actions.lock().await.push(mutation.action_id);
+                            script
+                                .windows
+                                .lock()
+                                .await
+                                .push(mutation.action_window_id.to_string());
+                            ControlFrame::Receipt(Box::new(kr_protocol::receipt::ReceiptResponse {
+                                request_id: mutation.request_id,
+                                receipt: Receipt {
+                                    action_id: mutation.action_id,
+                                    actor_id: kr_protocol::ids::ActorId::new("device:local")
+                                        .expect("a principal"),
+                                    method: mutation.method.clone(),
+                                    method_version: mutation.method_version,
+                                    revision: U64::new(1),
+                                    state: ReceiptState::Accepted,
+                                    reason: Nullable::null(),
+                                    payload_digest: Digest256::from_bytes([0; 32]),
+                                    accepted_deadline_ms: Nullable::null(),
+                                    error: Nullable::null(),
+                                    updated_at_ms: TimestampMs::new(0),
+                                },
+                            }))
+                        }
+                        _ => continue,
+                    };
+                    if writer.write_message(&answer).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+    })
+}
+
+#[tokio::test]
+async fn the_local_path_is_a_socket_and_the_remote_path_is_iroh_behind_one_seam() {
+    // The local path. A command line on this machine reaches its host through kr-ipc: a socket or
+    // a named pipe, peer authentication instead of a device proof, and the host's own stamp of the
+    // connection's freshness context.
+    let tree = kr_ipc::testing::TempHost::create();
+    let endpoint = tree
+        .paths()
+        .environment(tree.environment_id())
+        .controller_endpoint()
+        .expect("a controller endpoint");
+    let listener = kr_ipc::endpoint::Listener::bind(&endpoint).expect("a local endpoint");
+    let local_script = Arc::new(HostScript::default());
+    let serving_locally = spawn_local_host(listener, Arc::clone(&local_script));
+
+    let local = kr_client::ipc::IpcTransport::connect(&endpoint, kr_cli_build_id())
+        .await
+        .expect("a local connection");
+    assert_eq!(
+        local.context().role,
+        kr_protocol::local::LocalRole::Controller
+    );
+    assert_eq!(
+        local.context().peer.uid.get(),
+        u64::from(kr_ipc::paths::current_uid()),
+        "the host authenticated the operating-system caller rather than a device"
+    );
+    let local: Arc<dyn kr_client::transport::ControlTransport> = local.shared();
+
+    // The remote path. A device off this machine reaches the same host through kr-client over
+    // iroh: the same typed frames, with the connection proofs a network peer owes.
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let network_script = Arc::new(HostScript::default());
+    let serving_remotely = spawn_host(&host, client.record, Arc::clone(&network_script), None);
+    let remote: Arc<dyn kr_client::transport::ControlTransport> = Arc::new(
+        NetworkTransport::connect(
+            &client.endpoint,
+            direct_addr(&host),
+            &client.identity,
+            &host.record,
+            SendLimits::default(),
+        )
+        .await
+        .expect("an authorised connection"),
+    );
+
+    // One seam. The session is written against `ControlTransport` and nothing else, so the same
+    // calls produce the same answers whichever way the client connected.
+    for (name, transport, script) in [
+        ("the local socket", local, Arc::clone(&local_script)),
+        ("iroh", remote, Arc::clone(&network_script)),
+    ] {
+        let session = Session::start(transport).expect("a session");
+        let listing: SessionList = session
+            .read(Method::SessionList, &Empty {})
+            .await
+            .unwrap_or_else(|error| panic!("a listing over {name}: {error}"));
+        assert_eq!(listing, SessionList { count: 2 }, "over {name}");
+        let settled = session
+            .mutate(
+                Method::SessionCreate,
+                ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+                None,
+                &Empty {},
+                &Empty {},
+                DurationMs::new(120_000),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("a settlement over {name}: {error}"));
+        let receipt = settled.receipt().expect("a receipt");
+        assert_eq!(receipt.state, ReceiptState::Accepted, "over {name}");
+        // The client generated the action identifier and presented the window the host issued on
+        // this connection, whichever transport carried it.
+        let actions = script.actions.lock().await;
+        assert_eq!(actions.len(), 1, "over {name}");
+        assert_eq!(actions[0].get().version(), 4, "over {name}");
+        drop(actions);
+        assert_eq!(
+            script.windows.lock().await[0],
+            session.action_window().await.action_window_id.to_string(),
+            "over {name}"
+        );
+        session.close();
+    }
+
+    serving_locally.abort();
+    serving_remotely.abort();
+}
+
+/// The build identity a command line presents. It is a client build, not a host's.
+fn kr_cli_build_id() -> BuildId {
+    BuildId::new("kr/0.1.0+test").expect("a build identity")
+}
+
+#[tokio::test]
+async fn every_local_operation_works_with_no_managed_service_and_with_every_one_replaced() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let directory = tempfile::tempdir().expect("a directory");
+    let device = DeviceId::new(Uuid::from_bytes([2; 16]));
+
+    // The same work, twice: once with nothing configured, once with every service replaced by a
+    // client that answers nothing. Section 17 says the local product is complete without any of
+    // them, so the two runs have to be indistinguishable.
+    let mut observed = Vec::new();
+    for (round, clients) in [
+        ("nothing configured", ServiceClients::none()),
+        (
+            "every service replaced",
+            ServiceClients {
+                account: Some(Arc::new(NullService)),
+                relay_leases: Some(Arc::new(NullService)),
+                push: Some(Arc::new(NullService)),
+                sync_backup: Some(Arc::new(NullService)),
+                managed_inference: Some(Arc::new(NullService)),
+            },
+        ),
+    ] {
+        let script = Arc::new(HostScript::default());
+        let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+        let session = connect(&client, &host).await;
+
+        // A read and a mutation against the host.
+        let listing: SessionList = session
+            .read(Method::SessionList, &Empty {})
+            .await
+            .unwrap_or_else(|error| panic!("a listing with {round}: {error}"));
+        let settled = session
+            .mutate(
+                Method::SessionCreate,
+                ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+                None,
+                &Empty {},
+                &Empty {},
+                DurationMs::new(120_000),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("a settlement with {round}: {error}"));
+
+        // A draft on this device, which needs no service at all.
+        let store = DraftStore::open(directory.path().join(round.replace(' ', "-")), device)
+            .expect("a store");
+        let draft = store
+            .create(
+                DraftTarget::session(SessionId::new(Uuid::from_bytes([3; 16]))),
+                "written with nothing managed".to_owned(),
+                TimestampMs::new(1),
+            )
+            .expect("a draft");
+        let edited = store
+            .update(
+                &Draft {
+                    text: "and edited".to_owned(),
+                    ..draft
+                },
+                TimestampMs::new(2),
+            )
+            .expect("an edit");
+
+        // A control, decided from what this client knows.
+        let shown = kr_client::controls::evaluate(
+            &kr_plugin_sdk::predicate::Predicate::Flag {
+                flag: kr_plugin_sdk::predicate::PresentationFlag::DraftNotEmpty,
+            },
+            &kr_client::controls::ControlState::new().with_flag(
+                kr_plugin_sdk::predicate::PresentationFlag::DraftNotEmpty,
+                true,
+            ),
+        );
+
+        observed.push((
+            listing,
+            settled.receipt().expect("a receipt").state,
+            edited.text.clone(),
+            edited.revision,
+            shown.is_shown(),
+            clients.is_empty(),
+        ));
+
+        // Availability is explained service by service, in one shape, and every explanation names
+        // its service. It explains; nothing above consulted it before doing any of the work here.
+        let availability = clients.availability();
+        assert_eq!(availability.len(), ManagedService::ALL.len(), "{round}");
+        for report in &availability {
+            assert_eq!(
+                report.available,
+                clients.holds(report.service),
+                "{round}: {report:?}"
+            );
+            assert!(
+                report.explanation.contains(report.service.as_str()),
+                "{round}: an explanation that does not name its service: {report:?}"
+            );
+        }
+        if clients.is_empty() {
+            // Nothing configured: each report says so and says what to do instead.
+            assert!(
+                availability.iter().all(|report| !report.available),
+                "{round}"
+            );
+            assert!(
+                availability
+                    .iter()
+                    .all(|report| report.explanation.contains("You can")),
+                "{round}"
+            );
+        } else {
+            // A service replaced by one that answers nothing is configured, and says which service
+            // it is refusing for when it is called. Neither is a claim that anything is entitled.
+            assert!(
+                availability.iter().all(|report| report.available),
+                "{round}"
+            );
+            let refusal = clients
+                .account
+                .as_ref()
+                .expect("an account client")
+                .sign_in("code")
+                .await
+                .expect_err("a service that answers nothing");
+            assert_eq!(refusal.code(), ErrorCode::HostNotConfigured);
+            assert!(
+                refusal
+                    .to_string()
+                    .contains(ManagedService::AccountLogin.as_str()),
+                "{refusal}"
+            );
+            assert_eq!(refusal.user_action(), UserAction::FixConfiguration);
+        }
+
+        session.close();
+        serving.abort();
+    }
+
+    let (first, second) = (&observed[0], &observed[1]);
+    assert_eq!(first.0, second.0, "the listing differed");
+    assert_eq!(first.1, second.1, "the receipt differed");
+    assert_eq!(first.2, second.2, "the draft differed");
+    assert_eq!(first.3, second.3, "the draft revision differed");
+    assert_eq!(first.4, second.4, "the control decision differed");
+    // The one thing that does differ is whether anything is configured, which is the point.
+    assert!(first.5 && !second.5);
 }

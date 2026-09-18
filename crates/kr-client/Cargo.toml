@@ -13,6 +13,9 @@ iroh.workspace = true
 kr-cbor.workspace = true
 kr-crypto.workspace = true
 kr-ipc.workspace = true
+# The document union, the control model and the visibility grammar a package contributes. A client
+# renders what packages produce, so the contract it renders against is the package contract's.
+kr-plugin-sdk.workspace = true
 kr-protocol.workspace = true
 kr-term.workspace = true
 kr-transport.workspace = true
@@ -24,6 +27,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 iroh = { workspace = true, features = ["test-utils"] }
+# A disposable owner-only host tree, so a local endpoint in a test lives on the internal disk and
+# disappears with the test.
+kr-ipc = { workspace = true, features = ["testing"] }
 # The draft store writes to a caller-supplied directory, so its tests supply a disposable one.
 tempfile.workspace = true
 

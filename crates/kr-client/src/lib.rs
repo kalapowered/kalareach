@@ -20,6 +20,7 @@
 //! | [`transport`] | The shape both transports share, and the iroh connection |
 //! | [`encoder`] | The shared terminal input encoder: keys, modifiers, pointers and pastes |
 //! | [`viewport`] | The clipped window onto the canonical grid, and the presentation switch |
+//! | [`controls`] | What a client shows, and what it lets a person invoke |
 //! | [`drafts`] | Drafts this device owns, and the attachment that only presents one |
 //! | [`ipc`] | The local socket or named pipe, with the host-stamped freshness context |
 //! | [`projection`] | The screen a projected client holds, and the renderer that draws it |
@@ -37,6 +38,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod controls;
 pub mod cursors;
 pub mod drafts;
 pub mod encoder;

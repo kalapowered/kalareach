@@ -235,6 +235,81 @@ pub trait ManagedInferenceService: Send + Sync + std::fmt::Debug {
     fn close_session<'a>(&'a self, session: &'a str) -> ServiceFuture<'a, ()>;
 }
 
+/// One managed service a client may hold an implementation of.
+///
+/// The set is closed, and it is section 17's: account login, relay leases, push, encrypted sync and
+/// backup, and managed inference. A fork points these at its own infrastructure; a self-hosted
+/// deployment supplies some and not others; a client with none is a complete client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ManagedService {
+    /// Account login.
+    AccountLogin,
+    /// Relay leases.
+    RelayLeases,
+    /// Push registration.
+    Push,
+    /// Encrypted sync and backup.
+    SyncBackup,
+    /// Managed inference.
+    ManagedInference,
+}
+
+impl ManagedService {
+    /// Every managed service, in declaration order.
+    pub const ALL: [Self; 5] = [
+        Self::AccountLogin,
+        Self::RelayLeases,
+        Self::Push,
+        Self::SyncBackup,
+        Self::ManagedInference,
+    ];
+
+    /// Returns the name a report uses, which is also the name the null implementation reports.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::AccountLogin => "account login",
+            Self::RelayLeases => "relay leases",
+            Self::Push => "push registration",
+            Self::SyncBackup => "sync and backup",
+            Self::ManagedInference => "managed inference",
+        }
+    }
+
+    /// Returns what a client does instead when this service is not there.
+    ///
+    /// Every one of these is a complete way to work rather than a degraded one, which is what
+    /// section 17 means by the local product being complete.
+    #[must_use]
+    pub const fn alternative(self) -> &'static str {
+        match self {
+            Self::AccountLogin => "pair devices directly and use this host without an account",
+            Self::RelayLeases => "connect directly, or run your own relay",
+            Self::Push => "open the app to see what is waiting",
+            Self::SyncBackup => {
+                "keep settings and drafts on each device, and back them up yourself"
+            }
+            Self::ManagedInference => "use your own provider credentials",
+        }
+    }
+}
+
+/// Whether one managed service is there, and what to do about it when it is not.
+///
+/// Section 17: client entitlement state explains availability; it does not protect the business
+/// model. This is an explanation and only an explanation. Nothing in this library consults it
+/// before doing local work, and a client that deleted every field of [`ServiceClients`] would lose
+/// the managed resources and keep the product.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Availability {
+    /// Which service.
+    pub service: ManagedService,
+    /// Whether an implementation is configured.
+    pub available: bool,
+    /// What a person is told: the service, and what they can do instead.
+    pub explanation: String,
+}
+
 /// Every service client one client holds.
 ///
 /// A field left `None` is a service this client does not use. Nothing degrades: the local product
@@ -263,11 +338,53 @@ impl ServiceClients {
     /// Returns true when no managed service is configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.account.is_none()
-            && self.relay_leases.is_none()
-            && self.push.is_none()
-            && self.sync_backup.is_none()
-            && self.managed_inference.is_none()
+        ManagedService::ALL
+            .into_iter()
+            .all(|service| !self.holds(service))
+    }
+
+    /// Returns true when an implementation of `service` is configured.
+    #[must_use]
+    pub fn holds(&self, service: ManagedService) -> bool {
+        match service {
+            ManagedService::AccountLogin => self.account.is_some(),
+            ManagedService::RelayLeases => self.relay_leases.is_some(),
+            ManagedService::Push => self.push.is_some(),
+            ManagedService::SyncBackup => self.sync_backup.is_some(),
+            ManagedService::ManagedInference => self.managed_inference.is_some(),
+        }
+    }
+
+    /// Returns what to say about one service.
+    #[must_use]
+    pub fn availability_of(&self, service: ManagedService) -> Availability {
+        let available = self.holds(service);
+        let explanation = if available {
+            format!("{} is configured.", service.as_str())
+        } else {
+            format!(
+                "No {} service is configured. You can {}.",
+                service.as_str(),
+                service.alternative()
+            )
+        };
+        Availability {
+            service,
+            available,
+            explanation,
+        }
+    }
+
+    /// Returns what to say about every service, in one shape.
+    ///
+    /// One shape, because a client that had to ask a different question of each service would end
+    /// up with five ways of saying the same thing and five chances to say it differently.
+    #[must_use]
+    pub fn availability(&self) -> Vec<Availability> {
+        ManagedService::ALL
+            .into_iter()
+            .map(|service| self.availability_of(service))
+            .collect()
     }
 }
 
@@ -284,17 +401,17 @@ fn unconfigured<T: Send + 'static>(what: &'static str) -> ServiceFuture<'static,
 
 impl AccountService for NullService {
     fn sign_in<'a>(&'a self, _authorisation_code: &'a str) -> ServiceFuture<'a, AccountSession> {
-        unconfigured("account login")
+        unconfigured(ManagedService::AccountLogin.as_str())
     }
 
     fn refresh<'a>(&'a self, _refresh_token: &'a str) -> ServiceFuture<'a, AccountSession> {
-        unconfigured("account login")
+        unconfigured(ManagedService::AccountLogin.as_str())
     }
 }
 
 impl RelayLeaseService for NullService {
     fn issue<'a>(&'a self, _request: &'a LeaseRequest) -> ServiceFuture<'a, RelayLeaseAnswer> {
-        unconfigured("relay leases")
+        unconfigured(ManagedService::RelayLeases.as_str())
     }
 
     fn revoke<'a>(
@@ -302,17 +419,17 @@ impl RelayLeaseService for NullService {
         _lease_id: RelayLeaseId,
         _reason: LeaseEndReason,
     ) -> ServiceFuture<'a, RelayLeaseEnding> {
-        unconfigured("relay leases")
+        unconfigured(ManagedService::RelayLeases.as_str())
     }
 }
 
 impl PushService for NullService {
     fn register<'a>(&'a self, _token: &'a str) -> ServiceFuture<'a, PushRegistration> {
-        unconfigured("push registration")
+        unconfigured(ManagedService::Push.as_str())
     }
 
     fn revoke<'a>(&'a self, _installation_id: InstallationId) -> ServiceFuture<'a, ()> {
-        unconfigured("push registration")
+        unconfigured(ManagedService::Push.as_str())
     }
 }
 
@@ -323,21 +440,21 @@ impl SyncBackupService for NullService {
         _expected_generation: u64,
         _ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, u64> {
-        unconfigured("sync and backup")
+        unconfigured(ManagedService::SyncBackup.as_str())
     }
 
     fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, (u64, Vec<u8>)> {
-        unconfigured("sync and backup")
+        unconfigured(ManagedService::SyncBackup.as_str())
     }
 }
 
 impl ManagedInferenceService for NullService {
     fn open_session<'a>(&'a self, _profile: &'a str) -> ServiceFuture<'a, String> {
-        unconfigured("managed inference")
+        unconfigured(ManagedService::ManagedInference.as_str())
     }
 
     fn close_session<'a>(&'a self, _session: &'a str) -> ServiceFuture<'a, ()> {
-        unconfigured("managed inference")
+        unconfigured(ManagedService::ManagedInference.as_str())
     }
 }
 
