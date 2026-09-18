@@ -159,6 +159,12 @@ pub struct Session {
     hub: OutputHub,
     journal: Option<Journal>,
     journal_failure: Option<String>,
+    /// The one time contract every expiry in this session is decided by.
+    ///
+    /// Retention is the consumer that exists today: section 9 stops expiry-based collection while
+    /// the wall clock cannot be proved, and this is what answers that. A signed object that
+    /// outlives a reboot is the other consumer, and no store holds one yet.
+    time: Arc<crate::action::time::TimeContract>,
     closure: Option<ClosureRecord>,
     application_state: Option<ApplicationState>,
     closing_reason: Option<ClosureReason>,
@@ -274,19 +280,77 @@ impl Session {
             }
             None => OutputHistory::in_memory(config.resident_bytes),
         };
-        let (journal, journal_failure) = match config.journal_path.as_ref() {
+        let boot_identity = kr_ipc::identity::boot_identity().map_err(|error| {
+            WorkerError::ResourceUnavailable {
+                detail: error.to_string(),
+            }
+        })?;
+        let (mut journal, mut journal_failure) = match config.journal_path.as_ref() {
             Some(path) => match Journal::open(path) {
-                Ok(mut journal) => {
-                    // A dispatch marker with no authoritative answer is unresolvable from here, so
-                    // it becomes unknown and is never dispatched again.
-                    let _ = journal.resolve_unfinished_dispatches(kr_ipc::now_ms());
-                    let _ = journal.prune(kr_ipc::now_ms());
-                    (Some(journal), None)
-                }
+                Ok(journal) => (Some(journal), None),
                 Err(error) => (None, Some(error.to_string())),
             },
             None => (Journal::in_memory().ok(), None),
         };
+        // The host time contract, over this machine's own clocks and its own time service, built
+        // from what the host wrote down before it restarted. The trust, the furthest reading it
+        // could prove and the objects it had already expired are what a restarted host cannot
+        // work out again, so they are read back before anything expiry-dependent is served.
+        //
+        // A recorded state that cannot be read is not the same as nothing recorded. Nothing
+        // recorded is a host with no history, and its own time service decides; this is a host
+        // whose history is unreadable, and the only safe reading of that is a clock it cannot
+        // prove. Fresh actions bounded by this boot's continuous clock keep working either way.
+        //
+        // The configured time authority is empty until a host configuration carries one, and an
+        // empty name is a host with none: no automatic retrust qualifies, and the owner's explicit
+        // one is the only route left. That is the conservative reading of section 9's "configured
+        // host time authority" rather than accepting whatever calls itself one.
+        let recorded = match journal.as_ref().map(Journal::read_host_time) {
+            Some(Ok(recorded)) => recorded,
+            Some(Err(error)) => {
+                journal_failure.get_or_insert_with(|| error.to_string());
+                Some(kr_protocol::action::HostTimeState {
+                    checkpoint: kr_protocol::scalars::Nullable::null(),
+                    trust: kr_protocol::action::WallClockTrust::Unresolved,
+                    owner_confirmed: false,
+                    proven: kr_protocol::scalars::Nullable::null(),
+                    tombstones: Vec::new(),
+                })
+            }
+            None => None,
+        };
+        let time = Arc::new(crate::action::time::TimeContract::restore(
+            boot_identity,
+            String::new(),
+            crate::action::time::TimeSources::system(),
+            recorded,
+        ));
+        if let Some(journal) = journal.as_mut() {
+            // Recovery, in the order section 9 gives it. The clocks are looked at first, because
+            // everything after it depends on what they say: a dispatch marker with no
+            // authoritative answer is unresolvable from here, so it becomes unknown and is never
+            // dispatched again; an accepted intent with no marker is rejected, because the
+            // freshness it was admitted under cannot be proved after a restart. A failure here is
+            // recorded rather than swallowed: a journal that could not be recovered is one whose
+            // receipts do not say what happened.
+            //
+            // Retention is not part of recovery. It is maintenance, it runs on the host's own
+            // cadence while it serves, and running it here as well would only mean collecting
+            // against a clock that had just been read for the first time.
+            time.observe();
+            let (state, generation) = time.durable_state();
+            let recovery = journal
+                .resolve_unfinished_dispatches(kr_ipc::now_ms())
+                .and_then(|_| journal.reject_unrevalidated_intents(kr_ipc::now_ms()))
+                .and_then(|_| journal.record_host_time(&state));
+            match recovery {
+                Ok(()) => time.note_saved(generation),
+                Err(error) => {
+                    journal_failure.get_or_insert_with(|| error.to_string());
+                }
+            }
+        }
         Ok(Self {
             attachments: AttachmentTable::new(config.dimensions),
             state: SessionState::Creating,
@@ -299,6 +363,7 @@ impl Session {
             hub: OutputHub::new(),
             journal,
             journal_failure,
+            time,
             closure: None,
             application_state: None,
             closing_reason: None,
@@ -1148,30 +1213,7 @@ impl Session {
         {
             return Err(WorkerError::LeaseLost);
         }
-        // Section 8: the lease goes to a controller that can supply the encoding this application
-        // reads. Refusing here leaves the attachment everything else it has - it goes on watching,
-        // and its typed actions are unaffected - rather than letting it send an encoding that means
-        // other keys. It is refused whichever way the mismatch runs: a terminal nobody was allowed
-        // to ask about is as likely to be in an enhanced protocol somebody else left it in as it is
-        // to be in the ordinary one, and neither this host nor that terminal can say which.
-        let required = self.engine.keyboard_negotiated();
-        match self.attachments.encoders(attachment_id) {
-            Some(Some(encoders)) if encoders.supplies(required) => {}
-            Some(offered) => {
-                return Err(WorkerError::InputIncompatible {
-                    required: self.engine.keyboard_in_force(),
-                    offered: offered.map_or_else(
-                        || UNDECLARED_TERMINAL.to_owned(),
-                        crate::input::Encoders::describe,
-                    ),
-                });
-            }
-            None => {
-                return Err(WorkerError::UnknownAttachment {
-                    attachment: attachment_id.to_string(),
-                });
-            }
-        }
+        self.input_compatible(attachment_id)?;
 
         // An interrupted paste is closed before the new lease writes, so the application never
         // sees a paste finished under a different actor.
@@ -2078,7 +2120,193 @@ impl Session {
         self.attachments.summaries()
     }
 
-    /// Returns the private journal, when one is available.
+    /// Refuses an operation that needs a session which is still running.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::SessionClosed`] once the session has begun closing.
+    pub const fn require_live(&self) -> Result<()> {
+        self.require_running()
+    }
+
+    /// Decides whether this session can admit the attachment these parameters ask for.
+    ///
+    /// The admission path calls this before anything durable is written, and [`Self::attach`]
+    /// applies the same rules where the attachment is made. Section 9 requires a refusal the host
+    /// can decide to be a rejection, and a rule applied only inside the effect cannot be one.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first reason the attachment cannot be admitted, including a session that is no
+    /// longer running.
+    pub fn attachable(&self, params: &SessionAttachParams) -> Result<()> {
+        self.attachments.admissible(params).map(|_| ())
+    }
+
+    /// Decides whether one attachment may be given the geometry.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first reason the transfer cannot be admitted.
+    pub fn transferable(&self, attachment_id: AttachmentId) -> Result<()> {
+        self.attachments.transferable(attachment_id)
+    }
+
+    /// Decides whether one attachment may resize the session now.
+    ///
+    /// The dimensions, the ownership and the epoch, which is every reason a resize can be refused
+    /// from what this host already holds. [`Self::resize`] applies the same three where the size
+    /// changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first reason the resize cannot be admitted.
+    pub fn resizable(
+        &self,
+        attachment_id: AttachmentId,
+        dimensions: Dimensions,
+        expected_epoch: u64,
+    ) -> Result<()> {
+        self.attachments
+            .check_resize(attachment_id, dimensions, expected_epoch)
+    }
+
+    /// Decides whether one attachment may take or drop a geometry claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::InvalidArgument`] when a semantic attachment claims geometry or the
+    /// attachment does not hold the geometry right, and [`WorkerError::UnknownAttachment`] when
+    /// the identifier names no attachment of this session.
+    pub fn configurable(&self, attachment_id: AttachmentId, claim_geometry: bool) -> Result<()> {
+        self.attachments
+            .check_configure(attachment_id, claim_geometry)
+    }
+
+    /// Decides whether one attachment may report a viewport of these dimensions.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::InvalidArgument`] when the dimensions are not ones this host serves
+    /// or the attachment has no terminal presentation, and [`WorkerError::UnknownAttachment`] when
+    /// the identifier names no attachment of this session.
+    pub fn viewportable(&self, attachment_id: AttachmentId, dimensions: Dimensions) -> Result<()> {
+        self.attachments.check_viewport(attachment_id, dimensions)
+    }
+
+    /// Decides whether one attachment can supply the input encoding this application reads.
+    ///
+    /// Section 8: the lease goes to a controller that can supply the encoding the application
+    /// reads. Refusing leaves the attachment everything else it has - it goes on watching, and its
+    /// typed actions are unaffected - rather than letting it send an encoding that means other
+    /// keys. It is refused whichever way the mismatch runs: a terminal nobody was allowed to ask
+    /// about is as likely to be in an enhanced protocol somebody else left it in as it is to be in
+    /// the ordinary one, and neither this host nor that terminal can say which.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::InputIncompatible`] when the attachment cannot supply the encoding,
+    /// and [`WorkerError::UnknownAttachment`] when it names no attachment of this session.
+    pub fn input_compatible(&self, attachment_id: AttachmentId) -> Result<()> {
+        let required = self.engine.keyboard_negotiated();
+        match self.attachments.encoders(attachment_id) {
+            Some(Some(encoders)) if encoders.supplies(required) => Ok(()),
+            Some(offered) => Err(WorkerError::InputIncompatible {
+                required: self.engine.keyboard_in_force(),
+                offered: offered.map_or_else(
+                    || UNDECLARED_TERMINAL.to_owned(),
+                    crate::input::Encoders::describe,
+                ),
+            }),
+            None => Err(WorkerError::UnknownAttachment {
+                attachment: attachment_id.to_string(),
+            }),
+        }
+    }
+
+    /// Returns the host time contract this session's expiries are decided by.
+    #[must_use]
+    pub fn time(&self) -> &Arc<crate::action::time::TimeContract> {
+        &self.time
+    }
+
+    /// Looks at the host's clocks and says what moved.
+    ///
+    /// Section 9 puts this before anything whose answer depends on an expiry. What the caller does
+    /// with a discontinuity is revalidate the freshness resources it owns, which this session does
+    /// not hold: the windows belong to the host that issued them. Anything the observation changed
+    /// that a restarted host could not work out again is written down here, because the next thing
+    /// to happen may be the crash that makes it matter.
+    pub fn observe_time(&mut self) -> crate::action::time::Discontinuity {
+        let time = Arc::clone(&self.time);
+        let found = time.observe();
+        self.persist_time(&time);
+        found
+    }
+
+    /// Records that the freshness resources a discontinuity affected have been rechecked.
+    pub fn note_leases_revalidated(&mut self) {
+        let time = Arc::clone(&self.time);
+        time.leases_revalidated();
+    }
+
+    /// Collects de-duplication records past the retention period, and says how many went.
+    ///
+    /// The host time contract decides whether it runs at all. Retention is expiry-based
+    /// collection, and section 9 stops that while the wall clock cannot be proved: collecting
+    /// against an unproved clock is how a rollback deletes something that had not expired.
+    ///
+    /// A failure is recorded against this session rather than returned. Collection is maintenance:
+    /// nothing a caller asked for depends on it, the next run tries again, and recording the
+    /// failure here rather than handing it back is what keeps the caller to one look at this
+    /// session - a caller that took the lock again to record it would be waiting for the lock it
+    /// was already holding.
+    pub fn collect_expired(&mut self) -> usize {
+        let permitted = self.time.may_collect_expired();
+        let collected = match self.journal.as_mut() {
+            Some(journal) => journal.prune_if_due(kr_ipc::now_ms(), permitted),
+            None => Ok(0),
+        };
+        match collected {
+            Ok(collected) => collected,
+            Err(error) => {
+                self.note_journal_failure(error);
+                0
+            }
+        }
+    }
+
+    /// Writes down what the time contract has to survive a restart, when it has changed.
+    fn persist_time(&mut self, time: &crate::action::time::TimeContract) {
+        if !time.unsaved() {
+            return;
+        }
+        let (state, generation) = time.durable_state();
+        let recorded = self
+            .journal
+            .as_mut()
+            .map(|journal| journal.record_host_time(&state));
+        match recorded {
+            Some(Ok(())) => time.note_saved(generation),
+            // A host that cannot write down an unresolved clock or an expired object still holds
+            // both in memory. What it loses is the restart, and that is what the recorded failure
+            // says: this session's durability is no longer what it claimed.
+            Some(Err(error)) => self.note_journal_failure(error),
+            None => {}
+        }
+    }
+
+    /// Returns the private journal for reading, when one is available.
+    ///
+    /// The pre-dispatch revalidation reads it and writes nothing, so it takes this rather than the
+    /// mutable one: what it decides is whether a mutation may be admitted at all, which is a
+    /// question about the journal's current contents.
+    #[must_use]
+    pub const fn journal(&self) -> Option<&Journal> {
+        self.journal.as_ref()
+    }
+
+    /// Returns the private journal for writing, when one is available.
     pub fn journal_mut(&mut self) -> Option<&mut Journal> {
         self.journal.as_mut()
     }

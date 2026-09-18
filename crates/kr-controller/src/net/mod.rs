@@ -58,7 +58,6 @@ use kr_protocol::pairing::NetworkConfig;
 use kr_protocol::scalars::{AuthorisationKey, EndpointKey};
 use kr_transport::clock::ContinuousInstant;
 use kr_transport::handshake::{HostEpochs, LocalIdentity, PairedDirectory};
-use kr_transport::lease::RevocationStatus;
 use kr_transport::listener::{AuthorisedSession, BoxFuture, HostHandler, ListenerConfig};
 use kr_transport::preauth::PairingSurface;
 use kr_transport::window::AcceptedDeadline;
@@ -321,13 +320,16 @@ impl Network {
     /// registry lock is released.
     ///
     /// A revocation is not complete when it is recorded. It is complete for a worker once that
-    /// worker has acknowledged the revision, or has been confirmed ended, which is what the
-    /// returned status reports.
+    /// worker has acknowledged the revision and said what its fence did, or has been confirmed
+    /// ended, which is what the returned barrier reports per worker.
     ///
     /// # Errors
     ///
     /// Returns an error when the record or the revision cannot be written.
-    pub async fn revoke_device(&self, device_id: DeviceId) -> Result<RevocationStatus> {
+    pub async fn revoke_device(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<kr_protocol::action::RevocationBarrier> {
         self.guard.host.revoke_device(device_id).await
     }
 
@@ -441,7 +443,7 @@ impl HostHandler for NetworkHost {
         // authority store still holds.
         if let Some(controller) = self.controller.upgrade() {
             tokio::spawn(async move {
-                controller.deregister(connection_id).await;
+                controller.deregister(connection_id);
             });
         }
     }
@@ -477,7 +479,7 @@ impl NetworkHost {
                     .to_owned(),
             });
         }
-        let mut admitted = controller.admitted.lock().await;
+        let mut admitted = controller.admitted_table();
         admitted.insert(
             session.connection_id,
             AdmittedConnection {
@@ -614,7 +616,7 @@ impl NetworkHost {
                     .control
                     .send(&refusal(&error.to_protocol_error()))
                     .await;
-                controller.deregister(connection_id).await;
+                controller.deregister(connection_id);
                 return;
             }
         };
@@ -681,7 +683,10 @@ impl NetworkHost {
     /// inside the same critical section, so nothing can be admitted between a withdrawn record and
     /// the revision that fences the connections already admitted. A failure after the fence is
     /// reported with the fence standing rather than silently leaving it undone.
-    async fn revoke_device(&self, device_id: DeviceId) -> Result<RevocationStatus> {
+    async fn revoke_device(
+        &self,
+        device_id: DeviceId,
+    ) -> Result<kr_protocol::action::RevocationBarrier> {
         let controller = self.daemon()?;
         let revision = {
             let mut registry = controller.registry.lock().await;
@@ -689,13 +694,25 @@ impl NetworkHost {
             // The connections this fences are this device's. Nobody else's authority was
             // withdrawn, and a local terminal losing its connection because a phone was revoked
             // would be a fence on the wrong thing.
-            let mut admitted = controller.admitted.lock().await;
+            let mut admitted = controller.admitted_table();
             admitted.retain(|_, connection| connection.actor_id != revoked);
             drop(admitted);
             self.withdraw_device(device_id);
             self.devices.revoke(device_id, kr_ipc::now_ms())?;
             registry.advance_authority_revision()?;
-            registry.authority_revision()?
+            let revision = registry.authority_revision()?;
+            // The connections that were *not* withdrawn hold authority this revocation did not
+            // touch, so they are admitted at the revision now in force. Leaving them at the
+            // previous one would refuse their next mutation as revoked and make one device's
+            // revocation everybody's reconnection. What the revision still fences is work already
+            // admitted: a mutation carries the revision it was admitted under, and one admitted
+            // before this point is refused inside its own transaction as it was before.
+            let mut admitted = controller.admitted_table();
+            for connection in admitted.values_mut() {
+                connection.admitted_revision = revision;
+            }
+            drop(admitted);
+            revision
         };
         controller.leases.revoke(revision);
         controller.announce_authority_revision().await
@@ -913,7 +930,7 @@ impl Drop for ConnectionGuard {
         // neither can run in a destructor, so they run on a task that outlives the connection.
         tokio::spawn(async move {
             remote.release().await;
-            controller.deregister(connection_id).await;
+            controller.deregister(connection_id);
         });
     }
 }
@@ -1295,6 +1312,9 @@ impl Controller {
                 .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
                     environment_id: self.paths().environment_id(),
                     revision,
+                    // The first page of whatever its fence named: this worker has said nothing
+                    // about this revocation yet, so there is nothing to continue from.
+                    evidence_from: 0,
                 })
                 .await;
             match answered {
@@ -1316,11 +1336,26 @@ impl Controller {
         };
         match answered {
             Some(ack) if ack.revision.get() >= revision.get() => {
-                self.registry
-                    .lock()
-                    .await
-                    .record_acknowledged_revision(session_id, ack.revision)?;
-                self.leases.acknowledge(session_id, binding, ack.revision);
+                // What its fence rejected and could not take back travels with the
+                // acknowledgement, because section 9 makes the acknowledgement two statements. A
+                // worker that said nothing about its fence has made one of them, and the barrier
+                // reports it as pending for exactly that reason.
+                let evidenced = ack.fence.is_some();
+                let accepted =
+                    self.leases
+                        .acknowledge(session_id, binding, ack.revision, ack.fence);
+                if accepted && evidenced {
+                    self.registry
+                        .lock()
+                        .await
+                        .record_acknowledged_revision(session_id, ack.revision)?;
+                    // The names travel a page at a time, and this announcement carried the first
+                    // one. The rest of what this worker owes, for this revocation and for any
+                    // older one whose pages never finished arriving, is collected here as it is
+                    // after the announcement every worker gets.
+                    self.collect_owed_evidence(session_id, binding, revision)
+                        .await;
+                }
                 Ok(())
             }
             _ => {

@@ -362,16 +362,53 @@ pub struct AuthorityRevisionNotice {
     pub environment_id: EnvironmentId,
     /// The revision now in force.
     pub revision: AuthorityRevision,
+    /// How many names of this revision's fence evidence the daemon already has.
+    ///
+    /// Nought asks for the first page, which is what a first announcement is. An announcement that
+    /// carries more is asking for the rest of what the previous answer said remained, from the
+    /// name after the last one it carried.
+    ///
+    /// It is absent from the wire when it is nought, so an announcement that asks for a first page
+    /// is byte for byte what a worker built before paging existed expects. A daemon only ever
+    /// sends a continuation to a worker whose own answer reported names remaining, and a worker
+    /// that reports no evidence at all never does.
+    #[serde(default, skip_serializing_if = "is_first_page")]
+    pub evidence_from: u64,
+}
+
+/// Returns whether this is a request for the first page of fence evidence.
+fn is_first_page(evidence_from: &u64) -> bool {
+    *evidence_from == 0
 }
 
 /// A worker's acknowledgement that it is acting under an authority revision.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+///
+/// Section 9 makes the acknowledgement two statements rather than one: the revision is installed,
+/// **and** the undispatched actions it affects have been rejected or fenced. The two lists are
+/// therefore part of the acknowledgement rather than something a caller has to ask for
+/// afterwards. An action whose dispatch transition had already won the serial race is named in
+/// `possibly_executed`.
+///
+/// The evidence defaults to absent on the wire. A worker keeps running across a controller
+/// replacement, so during an update a new daemon can be talking to a worker built before the
+/// evidence existed, and architecture decision C keeps local support until the last such worker
+/// exits. Defaulting lets that worker's two-field acknowledgement decode instead of failing the
+/// revocation outright, and the daemon can still tell it apart from a worker whose fence found
+/// nothing, because absent and empty are different values.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct AuthorityRevisionAck {
     /// The session that acknowledged it.
     pub session_id: SessionId,
     /// The revision the worker now holds.
     pub revision: AuthorityRevision,
+    /// What the fence did, when this worker reports it.
+    ///
+    /// Absent is not the same as empty. Empty says the fence ran and found nothing; absent says
+    /// this worker does not report fence evidence at all, and a daemon that read the two the same
+    /// way would call a revocation complete on the strength of a worker that never said so.
+    #[serde(default)]
+    pub fence: Option<crate::action::FenceEvidence>,
 }
 
 /// How a worker's execution context is bound, as recorded in the registry.

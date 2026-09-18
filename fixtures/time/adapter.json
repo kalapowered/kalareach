@@ -1,0 +1,279 @@
+{
+  "version": 1,
+  "note": "Recorded platform time-service readings and the classification each one must produce. Every raw value is what the named operating-system interface reports; nothing here is a measurement this build took of a clock it does not own, and no case describes an authenticated time protocol the platforms do not expose.",
+  "bounds": {
+    "max_trusted_uncertainty_us": 2000000,
+    "max_wall_clock_rollback_ms": 5000
+  },
+  "platforms": [
+    {
+      "platform": "macos",
+      "api": "ntp_adjtime(2)",
+      "reads": "The kernel clock discipline the system time service maintains. `modes` is zero, so the call reports and changes nothing, and it needs no privilege. The return value is the time state; the status word says which discipline is running; `maxerror` is the kernel's own bound in microseconds.",
+      "cases": [
+        {
+          "name": "this machine, recorded 2026-09-17",
+          "raw": {
+            "time_state": 0,
+            "status": 8321,
+            "maxerror_us": 62192,
+            "esterror_us": 500000
+          },
+          "expect": {
+            "source": "network_time_service",
+            "status": "ok",
+            "uncertainty_us": 62192,
+            "estimated_error_us": 500000,
+            "qualified": true
+          }
+        },
+        {
+          "name": "the service has not settled the clock yet",
+          "raw": {
+            "time_state": 5,
+            "status": 65,
+            "maxerror_us": 16000000,
+            "esterror_us": 16000000
+          },
+          "expect": {
+            "source": "unsynchronised",
+            "status": "error",
+            "uncertainty_us": 16000000,
+            "estimated_error_us": 16000000,
+            "qualified": false
+          }
+        },
+        {
+          "name": "nothing is keeping the clock",
+          "raw": {
+            "time_state": 0,
+            "status": 0,
+            "maxerror_us": 500,
+            "esterror_us": 500
+          },
+          "expect": {
+            "source": "unclassified",
+            "status": "ok",
+            "uncertainty_us": 500,
+            "estimated_error_us": 500,
+            "qualified": false
+          }
+        }
+      ]
+    },
+    {
+      "platform": "linux",
+      "api": "ntp_adjtime(2)",
+      "reads": "The same kernel model, through the adjtimex status, maintained by whichever of systemd-timesyncd, chronyd or ntpd the host runs. The Linux and macOS status bits and time states are the same values, which is why one classifier serves both.",
+      "cases": [
+        {
+          "name": "systemd-timesyncd has the clock",
+          "raw": {
+            "time_state": 0,
+            "status": 8193,
+            "maxerror_us": 138000,
+            "esterror_us": 2000
+          },
+          "expect": {
+            "source": "network_time_service",
+            "status": "ok",
+            "uncertainty_us": 138000,
+            "estimated_error_us": 2000,
+            "qualified": true
+          }
+        },
+        {
+          "name": "a pulse-per-second reference is disciplining the phase",
+          "raw": {
+            "time_state": 0,
+            "status": 8453,
+            "maxerror_us": 40,
+            "esterror_us": 12
+          },
+          "expect": {
+            "source": "pulse_per_second",
+            "status": "ok",
+            "uncertainty_us": 40,
+            "estimated_error_us": 12,
+            "qualified": true
+          }
+        },
+        {
+          "name": "a leap second will be inserted",
+          "raw": {
+            "time_state": 1,
+            "status": 8209,
+            "maxerror_us": 120000,
+            "esterror_us": 4000
+          },
+          "expect": {
+            "source": "network_time_service",
+            "status": "insert_leap",
+            "uncertainty_us": 120000,
+            "estimated_error_us": 4000,
+            "qualified": true
+          }
+        },
+        {
+          "name": "the clock hardware itself failed",
+          "raw": {
+            "time_state": 0,
+            "status": 12289,
+            "maxerror_us": 900000,
+            "esterror_us": 900000
+          },
+          "expect": {
+            "source": "network_time_service",
+            "status": "error",
+            "uncertainty_us": 900000,
+            "estimated_error_us": 900000,
+            "qualified": false
+          }
+        },
+        {
+          "name": "a bound looser than the tolerance is not evidence",
+          "raw": {
+            "time_state": 0,
+            "status": 8193,
+            "maxerror_us": 4000000,
+            "esterror_us": 1000000
+          },
+          "expect": {
+            "source": "network_time_service",
+            "status": "ok",
+            "uncertainty_us": 4000000,
+            "estimated_error_us": 1000000,
+            "qualified": false
+          }
+        }
+      ]
+    },
+    {
+      "platform": "windows",
+      "api": "w32tm /query /status",
+      "reads": "The W32Time service's own status report. `Source` names what is keeping the clock, `Leap Indicator` is the NTP field of the same name, `Stratum` says whether the reference is attached to this machine (one) or reached over the network (two to fifteen), and a stratum of one is read as a reference clock only when the source also names one, and the bound is the root dispersion plus half the root delay, which is how NTP bounds a reading taken across a round trip. Both halves are required: reading a missing round trip as zero would understate what the service claims.",
+      "cases": [
+        {
+          "name": "a domain or public time server has the clock",
+          "report": "Leap Indicator: 0(no warning)\nStratum: 3 (secondary reference - syncd by (S)NTP)\nPrecision: -23 (119.209ns per tick)\nRoot Delay: 0.0289001s\nRoot Dispersion: 0.4083099s\nReferenceId: 0x0A0A0A0A (source IP:  10.10.10.10)\nSource: time.windows.com,0x9\n",
+          "expect": {
+            "source": "network_time_service",
+            "status": "ok",
+            "uncertainty_us": 422760,
+            "qualified": true
+          }
+        },
+        {
+          "name": "a server whose name happens to contain the word local",
+          "report": "Leap Indicator: 0(no warning)\nStratum: 3 (secondary reference - syncd by (S)NTP)\nRoot Delay: 0.0010000s\nRoot Dispersion: 0.0100000s\nSource: time.corp.local,0x9\n",
+          "expect": {
+            "source": "network_time_service",
+            "status": "ok",
+            "uncertainty_us": 10500,
+            "qualified": true
+          }
+        },
+        {
+          "name": "a reference clock attached to this machine",
+          "report": "Leap Indicator: 0(no warning)\nStratum: 1 (primary reference - syncd by radio clock)\nRoot Dispersion: 0.0000400s\nSource: Hardware Reference Clock\n",
+          "expect": {
+            "source": "pulse_per_second",
+            "status": "ok",
+            "uncertainty_us": 40,
+            "qualified": true
+          }
+        },
+        {
+          "name": "the machine is on its own clock",
+          "report": "Leap Indicator: 3(not synchronized)\nStratum: 0 (unspecified)\nPrecision: -23 (119.209ns per tick)\nSource: Local CMOS Clock\n",
+          "expect": {
+            "source": "unsynchronised",
+            "status": "error",
+            "uncertainty_us": null,
+            "qualified": false
+          }
+        },
+        {
+          "name": "the machine gave up on the source it had",
+          "report": "Leap Indicator: 3(not synchronized)\nStratum: 0 (unspecified)\nSource: Free-running System Clock\n",
+          "expect": {
+            "source": "unsynchronised",
+            "status": "error",
+            "uncertainty_us": null,
+            "qualified": false
+          }
+        },
+        {
+          "name": "the service could not be read",
+          "report": "",
+          "expect": {
+            "source": "unclassified",
+            "status": "unavailable",
+            "uncertainty_us": null,
+            "qualified": false
+          }
+        },
+        {
+          "name": "a report this build cannot read carries no stratum",
+          "report": "Source: time.windows.com,0x9\nLeap Indicator: 0(no warning)\n",
+          "expect": {
+            "source": "unclassified",
+            "status": "unavailable",
+            "uncertainty_us": null,
+            "qualified": false
+          }
+        },
+        {
+          "name": "stratum zero says nothing about what is keeping the clock",
+          "report": "Leap Indicator: 0(no warning)\nStratum: 0 (unspecified)\nRoot Dispersion: 0.0000400s\nSource: time.windows.com,0x9\n",
+          "expect": {
+            "source": "unclassified",
+            "status": "unavailable",
+            "uncertainty_us": null,
+            "qualified": false
+          }
+        },
+        {
+          "name": "a dispersion looser than the tolerance is not evidence",
+          "report": "Leap Indicator: 0(no warning)\nStratum: 5 (secondary reference - syncd by (S)NTP)\nRoot Delay: 0.0100000s\nRoot Dispersion: 9.4083099s\nSource: time.windows.com,0x9\n",
+          "expect": {
+            "source": "network_time_service",
+            "status": "ok",
+            "uncertainty_us": 9413310,
+            "qualified": false
+          }
+        },
+        {
+          "name": "a report missing half the bound carries no bound",
+          "report": "Leap Indicator: 0(no warning)\nStratum: 3 (secondary reference - syncd by (S)NTP)\nRoot Dispersion: 0.0100000s\nSource: time.windows.com,0x9\n",
+          "expect": {
+            "source": "network_time_service",
+            "status": "ok",
+            "uncertainty_us": null,
+            "qualified": false
+          }
+        },
+        {
+          "name": "a stratum outside the range is a report this build cannot read",
+          "report": "Leap Indicator: 0(no warning)\nStratum: 16 (unsynchronized)\nRoot Delay: 0.0010000s\nRoot Dispersion: 0.0100000s\nSource: time.windows.com,0x9\n",
+          "expect": {
+            "source": "unclassified",
+            "status": "unavailable",
+            "uncertainty_us": null,
+            "qualified": false
+          }
+        },
+        {
+          "name": "a primary reference this build cannot recognise",
+          "report": "Leap Indicator: 0(no warning)\nStratum: 1 (primary reference - syncd by radio clock)\nRoot Dispersion: 0.0000400s\nSource: something.this.build.does.not.know,0x1\n",
+          "expect": {
+            "source": "unclassified",
+            "status": "unavailable",
+            "uncertainty_us": null,
+            "qualified": false
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -101,6 +101,24 @@ pub enum WorkerError {
         /// What disagreed.
         detail: String,
     },
+    /// A resource limit this host configures was reached.
+    #[error("{detail}")]
+    QuotaExceeded {
+        /// Which limit, and what it is.
+        detail: String,
+    },
+    /// This host cannot prove what its wall clock reads, so the expiry cannot be decided.
+    #[error("{detail}")]
+    ClockUntrusted {
+        /// What cannot be proved, and what would settle it.
+        detail: String,
+    },
+    /// The caller holds no authority over what it named.
+    #[error("{detail}")]
+    PermissionDenied {
+        /// What was refused, and why.
+        detail: String,
+    },
     /// The request is not valid.
     #[error("{0}")]
     InvalidArgument(String),
@@ -144,9 +162,11 @@ impl WorkerError {
             Self::NotGeometryOwner => ErrorCode::GeometryNotOwner,
             Self::SessionClosed => ErrorCode::SessionClosed,
             Self::IdConflict { .. } => ErrorCode::IdConflict,
-            Self::GenerationFenced { .. } | Self::WindowExpired { .. } => {
-                ErrorCode::PermissionDenied
-            }
+            Self::GenerationFenced { .. }
+            | Self::WindowExpired { .. }
+            | Self::PermissionDenied { .. } => ErrorCode::PermissionDenied,
+            Self::QuotaExceeded { .. } => ErrorCode::QuotaExceeded,
+            Self::ClockUntrusted { .. } => ErrorCode::ClockUntrusted,
             Self::PreconditionFailed { .. } => ErrorCode::DraftConflict,
             Self::StaleTarget { .. } => ErrorCode::StaleSession,
             Self::Ipc(error) => error.code(),

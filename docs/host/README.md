@@ -351,6 +351,135 @@ suspend-aware continuous clock (`kr_transport::clock`).
   daemon takes it at the moment it forwards, not when the request arrived, and the lease's own
   remaining time bounds the deadline the worker is given.
 
+### The admission a mutation carries
+
+A deadline checked before a service takes its store lock proves the deadline stood before the
+wait, which is not the question. So the daemon builds one **admission** when it accepts a mutation:
+the accepted deadline, the authority revision it was admitted under, and the connection it arrived
+on. The mutation carries it into its own transaction.
+
+Every service in this host follows one rule, in this order:
+
+1. Take the service's own store lock.
+2. Take the daemon's registry lock. Admission and revocation both take these two in this order, so
+   none of the three can interleave.
+3. Check the admission. It is refused when the accepted deadline has passed, when the authority
+   revision has advanced past the one the mutation was admitted under, or when the connection's
+   registration has been withdrawn.
+4. Write, with nothing awaited between the check and the write.
+
+`Controller::enter_admitted` is steps 2 to 4 as one operation: a service in another crate holds its
+own store lock, calls it, and writes inside the closure, so the registry lock is held across the
+check and the write and a revocation cannot land between them. `kr_controller::authority::AdmittedMutation`
+is what the mutation carries from the moment the daemon accepted it.
+
+`session.create` checks it inside the same critical section as the transition to `spawned`, after
+the durable write rather than before it, so a create that queued past its deadline fails its
+reservation instead of starting a shell. `session.close` checks it once it holds the worker's
+client, which is where the waiting happens.
+
+An admission can carry **no deadline at all**, and that is not the same as one whose deadline has
+passed. A retry of an action this host may already hold has no freshness: section 9 keeps a receipt
+readable after the window that admitted it is gone, so the daemon forwards such a mutation with a
+spent deadline and lets the process that owns the record answer it. The authority half still
+applies, because disclosing a retained result under withdrawn authority is exactly what the
+registration check exists to stop.
+
+Such an admission may be *answered* and may not **write**: `Controller::enter_admitted` refuses it
+outright, because what the freshness admitted was the action and nothing can admit a new one
+without it. A mutation this daemon performs itself has its retained record here, so a window that
+admits nothing has already been past its own answer.
+
+### The revocation barrier
+
+A revocation is complete for a worker when that worker has acknowledged installing the revision
+**and** fencing the undispatched actions it affects, or when its execution is confirmed ended.
+Nothing else completes it, and nothing ends a process to make it complete: a worker that will not
+answer stays `pending`, and the daemon says so.
+
+The acknowledgement carries two lists, because the fence produces two answers:
+
+* the undispatched intents it rejected, which are now `rejected(revoked)`;
+* the actions whose dispatch transition had already won the serial race, which are **named** rather
+  than counted. The set is defined by the race rather than by the outcome, so an action that
+  settled while the revocation queued behind it is named too, and each one's receipt state says how
+  much is known about what it did.
+
+Both lists are retained. An acknowledgement lost on the way back is the ordinary case, so the
+worker replays what its fence found for a repeat of the same revision, and the daemon accumulates
+across passes rather than replacing: a fence that ran in two goes has to have all of it named.
+
+The evidence is bounded, because the acknowledgement that carries it is one control frame. A fence
+names at most `kr_protocol::action::MAX_NAMED_FENCED_ACTIONS` actions of each kind and reports how
+many more it holds; every one of them keeps its own receipt in the worker's journal, which is where
+the complete record lives either way. A revocation whose evidence would not encode is worse than
+one whose evidence is partly counted.
+
+The names live in the worker's journal, in a `fence_evidence` row per named action, and not in its
+memory, and the position the last completed fence reached is a row of its own in `fence_state`.
+That is what lets a revocation's result survive what memory does not: a fence that failed part way,
+an acknowledgement lost on the way back, a page whose exchange failed, collection taking the
+receipt the name refers to, and the worker's own restart.
+
+A revision advancing is not what finishes a revocation's names. They are kept until the daemon has
+taken them, however many revisions have been installed since, because the actions a fence could not
+take back are named in the *result*. What the daemon holds is a fact the worker has: an
+announcement asks for the page after the names it already has, and that is what the worker writes
+down, against the controller generation that said it. A replacement controller holds none of what
+its predecessor collected, so a later generation's count replaces the figure rather than being
+compared with it, and only a count the generation asking now made is what finishes a revocation's
+names.
+
+Keeping them for a daemon that stopped asking would grow the journal a revocation at a time, so at
+most `kr_worker::journal::MAX_HELD_REVOCATIONS` revocations have names in it at once, counting the
+one a fence is about to name. Past that the oldest go, and the count of what went takes their place
+in `FenceEvidence.omitted`, so a page that carries nothing because nothing is left says how much is
+missing rather than reading as a fence that named nothing. Those counts are bounded in the same
+way, and a revocation older than the oldest count is answered with no evidence at all rather than
+with an empty page: absent evidence and empty evidence are different statements, and the daemon
+reads the difference. The boundary is written down before the count it replaces goes, so a failure
+between the two leaves the conservative answer rather than none.
+
+The daemon keeps its reports the same way, one per revocation rather than one per worker. An older
+revocation's result names what that revocation's fence named, and a newer one's lists are a
+different question's answer. It also asks again for the pages an older revocation still owes: the
+revision in force comes first, and the unfinished ones after it, out of one page budget per
+announcement.
+
+A rejection and its name are one transaction. A rejection committed without its name would be an
+action the result owes and cannot produce, and the next pass would not find it: a pass selects
+intents that are still accepted, and that one is not.
+
+The evidence is delivered a page at a time. One acknowledgement carries at most
+`kr_protocol::action::MAX_NAMED_FENCED_ACTIONS` names and says how many remain; the daemon asks
+again from where the page ended, through `AuthorityRevisionNotice.evidence_from`, until nothing
+remains or it has collected as many pages as one announcement collects, and each of those
+exchanges is bounded like the first. The barrier holds on the first
+page, because that page *is* the acknowledgement; what the later ones complete is the naming, and
+`WorkerBarrier.names_pending` says how much of it has not arrived rather than letting a partial
+report read as a complete one.
+
+An announcement that arrives while the worker is inside a dispatch transition is answered with a
+refusal that says to come back, and the daemon reports that worker `pending`. The fence takes the
+same serial boundary a dispatch does, which is what makes its two answers two answers: it reads an
+action either before its dispatch marker, and rejects it, or after it, and names it, never between
+the acceptance and the marker. The refused revision is recorded, and the worker's own maintenance
+runs the fence inside that boundary, so the fence does not wait on the daemon asking again.
+
+A worker that reports **no** evidence is a third case, and it is not a barrier that holds. Such a
+worker has installed the revision and said nothing about its fence, which is half of what section 9
+asks for, so the revocation stays `pending` for it with a report that says which half is missing.
+Absent evidence and empty evidence are different values on the wire for this reason.
+
+Membership is the registry's durable worker rows, not the verified directory. A worker whose
+challenge failed, or that a replacement daemon has never reached, is still recorded and still
+pending: a revocation is not complete for a worker nobody can account for. Each announcement is
+bounded, because waiting is the opposite of completion, and a worker that runs out is reported
+`pending` while the announcement carries on to the next one.
+
+`kr_controller::authority::AuthorityBarrier` holds both halves, the lease issuer and the fence
+reports, because a lease running out is not a barrier holding and the two are read together.
+
 ## The network path
 
 The daemon joins the network once, at the end of its startup, when its environment selects one.
@@ -468,16 +597,64 @@ Each worker has its own SQLite journal in write-ahead-logging mode with full syn
 
 | Table | What it holds |
 | --- | --- |
-| `receipts` | one row per `(verified_actor_id, action_id)`: method, revision, state, rejection reason, payload digest, accepted deadline, error, timestamps |
+| `receipts` | one row per `(verified_actor_id, action_id)`: method, revision, state, rejection reason, payload digest, subject digest, accepted deadline, the boot and continuous instant it was created at, error, timestamps |
+| `fence_evidence` | one row per action a revocation's fence named, in delivery order: the revision, the position, whether it was rejected or is possibly executed, the actor, the action, and for a possibly executed one its method and receipt state |
+| `fence_state` | one row: the journal event position the last completed fence reached, which is where the next one starts looking |
+| `fence_delivery` | one row per revocation whose names are still accounted for: how many its fence produced, how many the daemon has taken, and the controller generation that took them |
+| `fence_forgotten` | one row: the revision up to which this journal can no longer say what a fence named |
+| `host_time` | one row: what the host time contract has to survive a restart - the last qualified checkpoint, the trust the clock stands at now, the furthest reading it could prove, and the expiration tombstones |
 | `results` | the result a duplicate request must receive back |
+| `observations` | additive evidence about an action: its provenance, the subject and version it saw, the source cursor and what it claims |
 | `closure` | the session's final record |
 
 The order is the contract. The intent is committed before the caller is told it was accepted. The
-dispatch marker is committed before the effect. A marker with no authoritative outcome becomes
-`unknown` on restart and is never dispatched again, because nothing can establish from here whether
-the effect happened. De-duplication records are kept for 30 days.
+dispatch marker is committed before the effect.
 
-Raw input is not in this table. Section 9 makes it a separate ordered stream keyed by connection,
+**Everything the host can decide is decided before the marker.** There is no
+`dispatching -> rejected` edge, because past the marker nothing may imply that an uncertain side
+effect did not happen. So a refusal the host is able to reach on its own, a stale geometry epoch, a
+lease somebody else holds, a cancellation of an action that has already been dispatched, happens in
+the revalidation rather than inside the effect, and the receipt it leaves says `rejected`.
+
+**Recovery is two rules.** A marker with no authoritative outcome becomes `unknown` and is never
+dispatched again, because nothing can establish from here whether the effect happened. An accepted
+intent with no marker is *rejected*: section 9 lets it proceed only if the revalidation still
+passes, and the freshness it was admitted under cannot be revalidated after a restart, because the
+deadline was decided on a continuous clock this process no longer has and the connection and the
+window that admitted it went with the process that issued them. Rejecting it also releases the
+outstanding-mutation capacity it was holding.
+
+**De-duplication records are kept for 30 days**, pruned while the worker runs rather than only when
+it starts. Retention is a wall-clock period and the wall clock is the thing that can move, so a
+record this boot wrote is kept while a window that could admit its exact original request may still
+be live: a window lasts at most five minutes on the continuous clock, and no step of the wall clock
+shortens that. A record from an earlier boot needs no such guard, because the windows a host issues
+live in its memory and a host that has restarted can admit nothing through them.
+
+An observation is evidence, not an execution state. Only an authoritative answer about an uncertain
+outcome moves a receipt, and an inferred screen never does: a screen is what the host parsed, not
+what the interface that owns the subject said. "Observed" in a user interface means evidence was
+observed.
+
+A new action identifier cannot quietly take an uncertain outcome's place. The journal stores a
+**subject digest** beside the payload digest: the method and version, the complete target and the
+parameters, and nothing that differs between a first attempt and the later request that supersedes
+it. So a fresh identifier for a subject that already carries an uncertain outcome is refused
+unless its preconditions name that action and the receipt revision the caller read it at. A service
+that wanted to hide the uncertainty would have to name the receipt it was hiding.
+
+One actor holds at most eight admitted, unsettled mutations at once, lowered by whatever the
+connection negotiated. That is section 9's figure, and what it bounds is durable admissions this
+host still owes a decision on. A connection that offers to hold none is refused at the handshake
+rather than read as one, and a connection that offers more than eight does not get more. Eight is
+this build's ceiling: there is no host configuration that raises or lowers it, and when one arrives
+it replaces the constant rather than being compared against it.
+
+The concurrent-attachment limit is kept per session in this build, while section 23 states it per
+host. One session is the whole of what a worker serves, so the two are the same figure for a
+single-session host and the per-host bound is the stricter of the two once a host serves several.
+
+Raw input is not in these tables. Section 9 makes it a separate ordered stream keyed by connection,
 lease epoch and sequence, with nothing replayed on reconnection.
 
 ## What an idle session wakes for
@@ -660,6 +837,74 @@ nothing new may hold one whose removal has begun.
 `docs/project/` has the ten methods, the identity model, the staged publication, the credential rule
 and the restricted Git execution profile.
 
+## The host time contract
+
+`kr_worker::action::time` holds this host's time contract. It rests on three anchors and concludes
+only what each one supports.
+
+What asks it today is retention: section 9 stops expiry-based collection while the wall clock
+cannot be proved, and the session's journal prunes only when the contract says collection may run.
+The deadlines that exist besides that, the action window, the dispatch lease and the accepted
+deadline of a mutation, are decided on the transport's suspend-aware continuous clock, which is the
+same anchor reached by a different route. The consumer the contract has and nothing yet uses is the
+cross-reboot signed object: no store holds one, and `ExpiringObject::signed_across_reboot` is the
+shape the grant and archive tasks hand it.
+
+| Anchor | What it proves |
+| --- | --- |
+| the recorded boot identity | which boot a continuous reading belongs to; a reading from another boot proves nothing, because the clock restarts |
+| a suspend-aware continuous anchor (`kr_ipc::clock`) | how much time has passed, including time the machine spent asleep; a timer that excludes sleep cannot extend authority |
+| a trusted UTC deadline | the only thing that can outlive a reboot, and usable only while this host can prove what its wall clock reads |
+
+A wake, a reboot or any other discontinuity owes a revalidation before an expiry-dependent read or
+mutation is served. The detector is two clocks rather than a notification: one counts a suspension
+and the other does not, so the difference between two deltas of theirs *is* the suspension, with
+nothing to subscribe to. On Apple and Linux the second clock is `std::time::Instant`; on Windows
+`Instant` is the performance counter, which keeps running through a suspension, so the detector
+there is `QueryUnbiasedInterruptTime` beside the biased counter `kr_ipc::clock` reads. A suspension
+shorter than the tolerance is not noticed, which is a bound rather than a guarantee.
+
+A wall-clock rollback beyond five seconds marks wall-clock trust unresolved. That stops
+expiry-based collection and refuses objects whose expiry cannot otherwise be proved. It does **not**
+disable a non-expiring personal owner grant, or a fresh online action bounded by this boot's
+continuous clock: neither depends on the wall clock. A forward step expires conservatively, and a
+rollback never enlarges a lifetime. A previously expired object never revives, because its
+expiration tombstone answers whatever the clock later reads.
+
+The rollback is measured against the furthest point this host could ever *prove* the clock had
+reached, projected forward by the continuous time since. Measuring against the previous reading
+alone would forgive a little slippage, then forgive the next against the moved mark, and enough of
+those would give a deadline back indefinitely. The same proven reading is what a UTC deadline is
+compared against, with the platform's own uncertainty bound added to it, so an object expires when
+it cannot still be valid rather than when a forgiving clock says so.
+
+The checkpoint, the trust it stood at and the expiration tombstones are what a host writes down.
+Without them a restarted host would start trusting a clock it had marked unresolved, and an object
+it had already expired could revive; `TimeContract::durable_state` and `TimeContract::restore` are
+the two halves. A host with nothing recorded starts trusted only when its own time service says so,
+because with no earlier mark that answer is the whole of what it knows.
+
+Returning to trusted needs qualified evidence from the configured host time authority and a new
+checkpoint, with the old tombstones retained; without that, the owner performs an explicit
+authenticated retrust. An ordinary paired peer's clock is never a time authority.
+
+### The platform time adapter
+
+The adapter records the synchronisation source, its status and a bounded uncertainty, using the
+interface the platform actually supports. Nothing here opens a socket, contacts a time server or
+signs anything.
+
+| Platform | What is read |
+| --- | --- |
+| macOS | `ntp_adjtime(2)` with no modes set: the kernel discipline the system time service maintains, its status word, its maximum and estimated error, and the time state as the return value |
+| Linux | `ntp_adjtime(2)`, the adjtimex status, maintained by `systemd-timesyncd`, `chronyd` or `ntpd` |
+| Windows | `w32tm /query /status`: the W32Time service's own source, leap indicator, stratum and root dispersion |
+
+The reading half is behind `cfg` because the call is; the classifier is not. `fixtures/time/adapter.json`
+records real platform values for all three platforms and the classification each must produce, so
+one machine checks every platform's classification while only its own reading comes from the
+kernel. A reading the host could not take reports `unavailable` rather than a synchronised clock
+with no stated error, because not knowing is its own state.
 ## Closure
 
 `session.close` is a state, not a request to exit.

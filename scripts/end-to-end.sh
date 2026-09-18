@@ -81,6 +81,8 @@ suites=(
   "kr-worker:host|a daemon restart that keeps the shell, the session limit, a retried create token, and a closed session answering from the worker's own record"
   "kr-worker:terminal|the terminal-engine boundary: a query answered by the host, a screen drawn rather than history replayed, a projected terminal, and a side effect with one destination"
   "kr-worker:authority|controller fencing at dispatch, freshness windows, preconditions, and a fenced connection's subscription stopping"
+  "kr-worker:receipts|the receipt transitions, de-duplication, the revalidation before the marker, the action window, the raw input stream and this machine's own time service"
+  "kr-controller:barrier|a revocation announced while a worker is isolated, the dispatch lease, and a mutation whose admission lapses while it waits for a store lock"
   "kr-worker:backpressure|a client that stops reading is resynchronised and holds the read loop up for nobody"
   "kr-worker:session|a real shell, its closure, and the input lease"
   "kr-controller:contracts|the two contracts the transport names: a revocable registration and a durable commit that outlives its caller"

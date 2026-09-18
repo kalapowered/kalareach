@@ -416,6 +416,18 @@ reports `pending` per worker until each affected worker has acknowledged the rev
 confirmed ended. Cutting a network path or waiting for a lease timer is not completion, because a
 paused worker could already be inside a dispatch transition.
 
+The barrier itself belongs to the host, because only the host can ask a worker what its fence did.
+`docs/host/README.md` describes what the acknowledgement carries, how it is retained so a lost
+answer does not lose it, and why membership comes from the registry's durable rows rather than from
+whichever workers a daemon has reached. Nothing in either half ends a process to make a revocation
+complete.
+
+What the lease enforces today is the deadline: the daemon takes it at the moment it forwards and
+bounds the deadline it gives the worker by whatever the lease has left, and the worker checks that
+deadline in its serial path. The lease's own identity, generation and revision do not travel to the
+worker, because a remote device's mutation does not yet reach one. That is the remaining half, and
+it belongs with the path that carries such a mutation.
+
 ## Performance targets
 
 Section 27 sets two targets for the transport. Both are measured over a real connection on

@@ -30,6 +30,7 @@
 //! | [`method`] | The method registry: one exhaustive entry per method, and the deny rule |
 //! | [`envelope`] | Request, mutation, response and notification envelopes |
 //! | [`receipt`] | Receipt states and the transition contract |
+//! | [`action`] | Observation evidence, the revocation barrier's report and the host time contract |
 //! | [`relay`] | Relay leases, consumption receipts and relay instance registration |
 //! | [`error`] | Error codes, retry categories and the error object |
 //! | [`frame`] | Stream headers and the length-delimited frame codec |
@@ -92,6 +93,7 @@
 //! ```
 
 pub mod account;
+pub mod action;
 pub mod actor;
 pub mod archive;
 pub mod attachment;

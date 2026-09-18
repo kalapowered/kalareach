@@ -207,8 +207,37 @@ impl ActionWindowIssuer {
         requested_ttl: DurationMs,
         authority_deadline: Option<ContinuousInstant>,
     ) -> std::result::Result<AcceptedDeadline, WindowRefusal> {
+        self.accept_at(
+            action_window_id,
+            connection_id,
+            boot_epoch,
+            self.clock.now(),
+            requested_ttl,
+            authority_deadline,
+        )
+    }
+
+    /// Derives the accepted deadline of one first admission from a recorded receipt time.
+    ///
+    /// Section 9 measures the requested lifetime from *receipt* time, which is when the request
+    /// arrived rather than when the host got round to admitting it. A host whose admission waits
+    /// for a serial boundary must therefore record the moment it read the request and pass it here;
+    /// sampling the clock inside this call would give the request its whole lifetime back after the
+    /// wait, which is exactly what a duration rather than a refreshable deadline forbids.
+    ///
+    /// # Errors
+    ///
+    /// Returns the window refusal when the window cannot first-admit anything.
+    pub fn accept_at(
+        &self,
+        action_window_id: &ActionWindowId,
+        connection_id: ConnectionId,
+        boot_epoch: BootEpoch,
+        received_at: ContinuousInstant,
+        requested_ttl: DurationMs,
+        authority_deadline: Option<ContinuousInstant>,
+    ) -> std::result::Result<AcceptedDeadline, WindowRefusal> {
         let window_expiry = self.validate(action_window_id, connection_id, boot_epoch)?;
-        let received_at = self.clock.now();
         let ttl = Duration::from_millis(requested_ttl.get()).min(MAX_ACCEPTED_TTL);
         let ttl_deadline = received_at.checked_add(ttl).unwrap_or(window_expiry);
 
@@ -237,6 +266,19 @@ impl ActionWindowIssuer {
     #[must_use]
     pub fn outstanding(&self) -> usize {
         self.lock().len()
+    }
+
+    /// Retires every window whose deadline has passed, and says how many went.
+    ///
+    /// A host calls this when its clocks moved in a way that owes a revalidation: a wake, a reboot
+    /// or a step of the wall clock. The deadlines themselves are on the suspend-aware continuous
+    /// clock, so this is a revalidation rather than a correction - it establishes that what is
+    /// still held is still live, before anything is served against it.
+    pub fn revalidate(&self) -> usize {
+        let now = self.clock.now();
+        let before = self.lock().len();
+        self.retire_expired(now);
+        before.saturating_sub(self.lock().len())
     }
 
     fn retire_expired(&self, now: ContinuousInstant) {

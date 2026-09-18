@@ -142,7 +142,7 @@ async fn a_revocation_withdraws_a_connection_that_was_already_admitted() {
         .await
         .expect("the revocation is recorded");
     assert!(
-        status.acknowledged.is_empty() && status.pending.is_empty(),
+        status.workers.is_empty() && status.holds(),
         "no worker is running, so there is nothing for the revocation to be pending on"
     );
 

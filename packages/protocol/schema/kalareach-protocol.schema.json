@@ -82,6 +82,64 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "ActionObservation": {
+      "additionalProperties": false,
+      "description": "One piece of additive evidence about an action.\n\nThe word in a user interface is \"observed\", and it means evidence was observed. It does not\nmean the mutation is confirmed, which is why every observation carries the provenance a reader\nneeds in order to know which of the two it is looking at.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The action the evidence is about."
+        },
+        "claimed_result": {
+          "$ref": "#/$defs/ObservedResult",
+          "description": "What the evidence claims happened."
+        },
+        "observed_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the observation was recorded."
+        },
+        "provenance": {
+          "$ref": "#/$defs/ObservationProvenance",
+          "description": "Where the evidence came from."
+        },
+        "source_cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The position in the source stream the evidence was read from, when there is one."
+        },
+        "subject": {
+          "description": "The subject the evidence is about, named the way its own interface names it.",
+          "type": "string"
+        },
+        "subject_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The subject's version at the moment of the observation, when the subject has one."
+        }
+      },
+      "required": [
+        "action_id",
+        "provenance",
+        "subject",
+        "subject_revision",
+        "source_cursor",
+        "claimed_result",
+        "observed_at_ms"
+      ],
+      "type": "object"
+    },
     "ActionReadParams": {
       "additionalProperties": false,
       "description": "What `action.read` names.",
@@ -1464,8 +1522,20 @@
     },
     "AuthorityRevisionAck": {
       "additionalProperties": false,
-      "description": "A worker's acknowledgement that it is acting under an authority revision.",
+      "description": "A worker's acknowledgement that it is acting under an authority revision.\n\nSection 9 makes the acknowledgement two statements rather than one: the revision is installed,\n**and** the undispatched actions it affects have been rejected or fenced. The two lists are\ntherefore part of the acknowledgement rather than something a caller has to ask for\nafterwards. An action whose dispatch transition had already won the serial race is named in\n`possibly_executed`.\n\nThe evidence defaults to absent on the wire. A worker keeps running across a controller\nreplacement, so during an update a new daemon can be talking to a worker built before the\nevidence existed, and architecture decision C keeps local support until the last such worker\nexits. Defaulting lets that worker's two-field acknowledgement decode instead of failing the\nrevocation outright, and the daemon can still tell it apart from a worker whose fence found\nnothing, because absent and empty are different values.",
       "properties": {
+        "fence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FenceEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "What the fence did, when this worker reports it.\n\nAbsent is not the same as empty. Empty says the fence ran and found nothing; absent says\nthis worker does not report fence evidence at all, and a daemon that read the two the same\nway would call a revocation complete on the strength of a worker that never said so."
+        },
         "revision": {
           "$ref": "#/$defs/AuthorityRevision",
           "description": "The revision the worker now holds."
@@ -1488,6 +1558,12 @@
         "environment_id": {
           "$ref": "#/$defs/EnvironmentId",
           "description": "The environment whose authority changed."
+        },
+        "evidence_from": {
+          "description": "How many names of this revision's fence evidence the daemon already has.\n\nNought asks for the first page, which is what a first announcement is. An announcement that\ncarries more is asking for the rest of what the previous answer said remained, from the\nname after the last one it carried.\n\nIt is absent from the wire when it is nought, so an announcement that asks for a first page\nis byte for byte what a worker built before paging existed expects. A daemon only ever\nsends a continuation to a worker whose own answer reported names remaining, and a worker\nthat reports no evidence at all never does.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "revision": {
           "$ref": "#/$defs/AuthorityRevision",
@@ -1685,6 +1761,26 @@
       "description": "The revision of one collection's enrolled backup writer. Only the collection's owner advances it.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "BarrierState": {
+      "description": "What one worker's half of a revocation barrier has reached.",
+      "oneOf": [
+        {
+          "const": "acknowledged",
+          "description": "The worker installed the revision and fenced the undispatched actions it affects.",
+          "type": "string"
+        },
+        {
+          "const": "ended",
+          "description": "The worker's execution has ended, so it can no longer dispatch anything.",
+          "type": "string"
+        },
+        {
+          "const": "pending",
+          "description": "Neither has been established. The revocation is not complete for this worker.",
+          "type": "string"
+        }
+      ]
     },
     "BootEpoch": {
       "description": "The host boot epoch, which binds continuous-time deadlines to one boot.",
@@ -4986,6 +5082,55 @@
       ],
       "type": "object"
     },
+    "ExpirationTombstone": {
+      "additionalProperties": false,
+      "description": "The record an expired object leaves behind.\n\nIt outlives a retrust deliberately. Section 9 keeps old expiration tombstones when the wall\nclock becomes trusted again, which is what stops a clock correction from reviving something\nthat had already run out.",
+      "properties": {
+        "boot_identity": {
+          "$ref": "#/$defs/BootIdentity",
+          "description": "The boot the expiry was observed in."
+        },
+        "cross_reboot": {
+          "default": true,
+          "description": "Whether the object could still be presented in another boot.\n\nAn object bounded only by a continuous deadline in one boot is refused in that boot by a\nclock that only moves forward, and in any other boot by the boot identity its deadline\nbelongs to. Nothing but this record refuses one that also carries a trusted UTC deadline,\nwhich is why a host that has to bound its tombstone table can let the first kind go and\nnever the second.\n\nA record that does not say defaults to `true`, which is the answer that keeps the\ntombstone: a host reading back a tombstone from a build that did not record this cannot\ntell which kind it was, and dropping one it should have kept is the failure that matters.",
+          "type": "boolean"
+        },
+        "expired_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "What the wall clock read when the expiry was observed."
+        },
+        "object": {
+          "description": "The object, named the way its own store names it.",
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/ExpiryReason",
+          "description": "Why it expired."
+        }
+      },
+      "required": [
+        "object",
+        "reason",
+        "boot_identity",
+        "expired_at_ms"
+      ],
+      "type": "object"
+    },
+    "ExpiryReason": {
+      "description": "Why an object expired.",
+      "oneOf": [
+        {
+          "const": "continuous_deadline",
+          "description": "A continuous deadline in this boot passed.",
+          "type": "string"
+        },
+        {
+          "const": "trusted_utc_deadline",
+          "description": "A trusted UTC deadline passed.",
+          "type": "string"
+        }
+      ]
+    },
     "ExternalProviderPolicy": {
       "description": "What an organisation permits its members' clients to reach outside KalaReach.",
       "oneOf": [
@@ -5074,6 +5219,41 @@
           "type": "string"
         }
       ]
+    },
+    "FenceEvidence": {
+      "additionalProperties": false,
+      "description": "What a worker's fence did, as one acknowledgement carries it.\n\nThe lists are the acknowledgement rather than an addition to it: section 9 makes the\nacknowledgement a statement that the revision is installed **and** that the undispatched\nactions it affects have been rejected or named. A worker that reports no evidence at all is a\ndifferent thing from one that reports empty lists, which is why this travels as a whole.",
+      "properties": {
+        "omitted": {
+          "$ref": "#/$defs/U64",
+          "description": "How many affected actions this worker could hold no name for at all.\n\nNought in every ordinary case. Anything else says the fence affected more actions than one\nworker keeps names for, and their receipts are in its journal."
+        },
+        "possibly_executed": {
+          "description": "The actions whose dispatch transition had already won the serial race, in this page.\n\nEach one's receipt state says how much is known about what it did; the list is not only the\nuncertain ones.",
+          "items": {
+            "$ref": "#/$defs/PossiblyExecutedAction"
+          },
+          "type": "array"
+        },
+        "rejected_actions": {
+          "description": "The undispatched intents the fence rejected, in this page.",
+          "items": {
+            "$ref": "#/$defs/FencedAction"
+          },
+          "type": "array"
+        },
+        "remaining": {
+          "$ref": "#/$defs/U64",
+          "description": "How many names this worker holds that this page did not carry.\n\nNought means the evidence is complete as far as this worker holds it. Anything else is what\nthe next announcement asks for, from `evidence_from` = the number of names taken so far."
+        }
+      },
+      "required": [
+        "rejected_actions",
+        "possibly_executed",
+        "remaining",
+        "omitted"
+      ],
+      "type": "object"
     },
     "FenceId": {
       "description": "One published editor fence. An identity from an unacknowledged exchange names no fence.",
@@ -5241,6 +5421,25 @@
           "type": "string"
         }
       ]
+    },
+    "FencedAction": {
+      "additionalProperties": false,
+      "description": "One action a fence named, with the actor whose action it was.\n\nThe actor is part of the name because the de-duplication key is the actor and the action\ntogether: two actors may each have used one identifier, and an identifier on its own would name\neither of them.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The action."
+        },
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The actor whose action it was."
+        }
+      },
+      "required": [
+        "actor_id",
+        "action_id"
+      ],
+      "type": "object"
     },
     "FilesystemIdentity": {
       "additionalProperties": false,
@@ -8223,6 +8422,51 @@
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
     },
+    "ObservationProvenance": {
+      "description": "Where an observation's evidence came from.\n\nOnly an authoritative answer can resolve an uncertain outcome. Everything else is evidence a\nperson may read and act on, and nothing more: section 9 says outright that an inferred screen\nobservation cannot change `unknown` to `applied`.",
+      "oneOf": [
+        {
+          "const": "authoritative_interface",
+          "description": "The interface that owns the subject answered for this operation.",
+          "type": "string"
+        },
+        {
+          "const": "upstream_correlation",
+          "description": "A connector matched its own upstream correlation identifier to this operation.",
+          "type": "string"
+        },
+        {
+          "const": "inferred_screen",
+          "description": "The host parsed a screen and inferred what it means. Inference, never confirmation.",
+          "type": "string"
+        },
+        {
+          "const": "user_report",
+          "description": "A person reported what they saw.",
+          "type": "string"
+        }
+      ]
+    },
+    "ObservedResult": {
+      "description": "What an observation claims the operation's result was.",
+      "oneOf": [
+        {
+          "const": "applied",
+          "description": "The evidence claims the operation took effect.",
+          "type": "string"
+        },
+        {
+          "const": "refused",
+          "description": "The evidence claims the operation was refused without the requested effect.",
+          "type": "string"
+        },
+        {
+          "const": "indeterminate",
+          "description": "The evidence says something about the subject without settling the operation.",
+          "type": "string"
+        }
+      ]
+    },
     "OperationRecord": {
       "additionalProperties": false,
       "description": "One repository operation, as a read or a cancellation returns it.",
@@ -9407,6 +9651,35 @@
       "description": "The revision of an organisation's policy-signing key, advanced on every rotation.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "PossiblyExecutedAction": {
+      "additionalProperties": false,
+      "description": "An action whose dispatch transition had already won the serial race when the fence ran.\n\nThe set is defined by the race rather than by the outcome, which is what section 9 says: an\naction whose dispatch transition already won it is named in the result. [`Self::state`] is what\nsays how much is known about what it did, from `dispatching` through `unknown` to an\nauthoritative `applied` or `refused`, so a person reading a revocation sees which operations\nwent out under the authority that has just been withdrawn and which of them are still\nuncertain.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The action."
+        },
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The actor that submitted it."
+        },
+        "method": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The method it was submitted under."
+        },
+        "state": {
+          "$ref": "#/$defs/ReceiptState",
+          "description": "The receipt state it stood at when the fence ran."
+        }
+      },
+      "required": [
+        "action_id",
+        "actor_id",
+        "method",
+        "state"
+      ],
+      "type": "object"
     },
     "Presentation": {
       "description": "How a new session is presented locally.\n\nThe three are mutually exclusive. `attach` is the default when standard input and output are\nterminals; otherwise the caller states one.",
@@ -13761,6 +14034,70 @@
         }
       ]
     },
+    "RetrustEvidence": {
+      "description": "What is offered as grounds for returning a host's wall clock to trusted.",
+      "oneOf": [
+        {
+          "description": "A qualified reading from the configured host time authority.",
+          "properties": {
+            "authority": {
+              "description": "The authority as the host's configuration names it.",
+              "type": "string"
+            },
+            "kind": {
+              "const": "host_time_authority",
+              "type": "string"
+            },
+            "reading": {
+              "$ref": "#/$defs/TimeAdapterReading",
+              "description": "The reading it produced."
+            }
+          },
+          "required": [
+            "kind",
+            "authority",
+            "reading"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The owner's explicit authenticated retrust, bound to the exact action they confirmed.",
+          "properties": {
+            "action_digest": {
+              "$ref": "#/$defs/Digest256",
+              "description": "The digest of the action the owner confirmed."
+            },
+            "kind": {
+              "const": "owner_retrust",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "action_digest"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A paired peer's claim about the time. Never grounds on its own.",
+          "properties": {
+            "device_id": {
+              "$ref": "#/$defs/DeviceId",
+              "description": "The peer that offered it."
+            },
+            "kind": {
+              "const": "paired_peer",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "device_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "RetryCategory": {
       "description": "How a client may react to an error.\n\nOnly idempotent reads, transfer chunks and requests whose receipt proves no dispatch may retry\nautomatically.",
       "oneOf": [
@@ -13897,6 +14234,28 @@
         "authority_revision",
         "completion",
         "acknowledged_at_ms"
+      ],
+      "type": "object"
+    },
+    "RevocationBarrier": {
+      "additionalProperties": false,
+      "description": "The result of installing an authority revision across every affected worker.\n\nUntil every barrier holds, this is `pending` with per-worker status. Cutting a network path or\nwaiting for a lease timer is not completion, because a paused worker could already be inside a\ndispatch transition, so nothing here treats the absence of an answer as an answer.",
+      "properties": {
+        "authority_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The revision being installed."
+        },
+        "workers": {
+          "description": "One entry per affected worker.",
+          "items": {
+            "$ref": "#/$defs/WorkerBarrier"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "authority_revision",
+        "workers"
       ],
       "type": "object"
     },
@@ -15949,6 +16308,163 @@
       ],
       "type": "object"
     },
+    "TimeAdapterReading": {
+      "additionalProperties": false,
+      "description": "One reading of the platform time adapter.\n\nEvery field is what the operating system reported, classified into this build's vocabulary. No\nfield is a measurement of our own, and nothing here contacts a time server: section 9 requires\nthe actual supported platform service and forbids an invented universal authenticated call.",
+      "properties": {
+        "api": {
+          "description": "The service or interface the reading came from.",
+          "type": "string"
+        },
+        "estimated_error_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The platform's own estimate of its error, in microseconds, when it reports one."
+        },
+        "platform": {
+          "description": "Which platform adapter produced this reading.",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/TimeSyncSource",
+          "description": "What the platform says is disciplining its clock."
+        },
+        "status": {
+          "$ref": "#/$defs/TimeSyncStatus",
+          "description": "What the platform says the state of that synchronisation is."
+        },
+        "uncertainty_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The platform's own bound on how wrong its clock may be, in microseconds.\n\nNull means the platform reported no bound, which is not the same as a bound of zero."
+        },
+        "wall_clock_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "What the wall clock read when the reading was taken."
+        }
+      },
+      "required": [
+        "platform",
+        "api",
+        "source",
+        "status",
+        "uncertainty_us",
+        "estimated_error_us",
+        "wall_clock_ms"
+      ],
+      "type": "object"
+    },
+    "TimeCheckpoint": {
+      "additionalProperties": false,
+      "description": "A durable mark of what this host's wall clock read, and what stood behind it.\n\nThe boot identity is part of it because a continuous reading means nothing outside the boot it\nwas taken in: the clock restarts, so a deadline from another boot reads as long past rather\nthan as time remaining.",
+      "properties": {
+        "boot_identity": {
+          "$ref": "#/$defs/BootIdentity",
+          "description": "The boot the mark was taken in."
+        },
+        "continuous_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "The boot-scoped continuous reading at the same moment."
+        },
+        "reading": {
+          "$ref": "#/$defs/TimeAdapterReading",
+          "description": "The platform reading that stood behind the mark."
+        },
+        "trust": {
+          "$ref": "#/$defs/WallClockTrust",
+          "description": "Whether the wall clock was trusted at the mark."
+        },
+        "wall_clock_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "What the wall clock read."
+        }
+      },
+      "required": [
+        "boot_identity",
+        "wall_clock_ms",
+        "continuous_ms",
+        "reading",
+        "trust"
+      ],
+      "type": "object"
+    },
+    "TimeSyncSource": {
+      "description": "What the operating system says is disciplining its clock.",
+      "oneOf": [
+        {
+          "const": "network_time_service",
+          "description": "The platform's own network time service is disciplining the clock.",
+          "type": "string"
+        },
+        {
+          "const": "pulse_per_second",
+          "description": "A pulse-per-second reference is disciplining the clock.",
+          "type": "string"
+        },
+        {
+          "const": "unsynchronised",
+          "description": "Nothing is disciplining the clock.",
+          "type": "string"
+        },
+        {
+          "const": "unclassified",
+          "description": "The platform answered with a state this build does not classify.",
+          "type": "string"
+        }
+      ]
+    },
+    "TimeSyncStatus": {
+      "description": "What the operating system says the state of that synchronisation is.\n\nThese are the states the platform time services actually report, which is why there is a\nseparate value for the answer never arriving. A host that cannot read its own time service\nknows less than one whose service says it is unsynchronised, and the two are not the same fact.",
+      "oneOf": [
+        {
+          "const": "ok",
+          "description": "The clock is synchronised and no leap second is pending.",
+          "type": "string"
+        },
+        {
+          "const": "insert_leap",
+          "description": "A leap second will be inserted.",
+          "type": "string"
+        },
+        {
+          "const": "delete_leap",
+          "description": "A leap second will be deleted.",
+          "type": "string"
+        },
+        {
+          "const": "leap_in_progress",
+          "description": "A leap second is in progress.",
+          "type": "string"
+        },
+        {
+          "const": "leap_recovering",
+          "description": "The clock is recovering from a leap second.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "The platform reports its clock as unsynchronised or in error.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "The platform's time service could not be read.",
+          "type": "string"
+        }
+      ]
+    },
     "TimestampMs": {
       "description": "A UTC timestamp in milliseconds, as a decimal string in JSON.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -16365,6 +16881,21 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "WallClockTrust": {
+      "description": "Whether this host can prove what its wall clock reads.",
+      "oneOf": [
+        {
+          "const": "trusted",
+          "description": "The checkpoint stands: the clock has not moved backwards beyond the tolerance.",
+          "type": "string"
+        },
+        {
+          "const": "unresolved",
+          "description": "A rollback beyond the tolerance was observed, so the wall clock proves nothing.",
+          "type": "string"
+        }
+      ]
+    },
     "WithheldReason": {
       "description": "Why a fence was not published after an exchange.",
       "oneOf": [
@@ -16424,6 +16955,68 @@
           "type": "string"
         }
       ]
+    },
+    "WorkerBarrier": {
+      "additionalProperties": false,
+      "description": "One worker's half of a revocation barrier.",
+      "properties": {
+        "acknowledged_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthorityRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The revision the worker has installed, when it has installed one."
+        },
+        "detail": {
+          "description": "Why this worker's barrier has not held, or what is still outstanding about one that has.",
+          "type": "string"
+        },
+        "names_pending": {
+          "$ref": "#/$defs/U64",
+          "description": "How many names this worker holds that have not reached this daemon yet.\n\nNought means the evidence is complete. Anything else says a page exchange has not happened\nyet or did not finish; the names are in the worker's journal and the next announcement\ncontinues from where the last page ended."
+        },
+        "omitted_actions": {
+          "$ref": "#/$defs/U64",
+          "description": "How many affected actions the worker could hold no name for.\n\nNought in every ordinary case, because the names are kept in the worker's journal and\ndelivered a page at a time. Anything else is a worker that could not record a name at all."
+        },
+        "possibly_executed": {
+          "description": "The actions whose dispatch transition had already won the serial race.\n\nEach one's receipt state says how much is known about what it did; the list is\nnot only the uncertain ones.",
+          "items": {
+            "$ref": "#/$defs/PossiblyExecutedAction"
+          },
+          "type": "array"
+        },
+        "rejected_actions": {
+          "description": "The undispatched intents the fence rejected.",
+          "items": {
+            "$ref": "#/$defs/FencedAction"
+          },
+          "type": "array"
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the worker owns."
+        },
+        "state": {
+          "$ref": "#/$defs/BarrierState",
+          "description": "What this worker's barrier has reached."
+        }
+      },
+      "required": [
+        "session_id",
+        "state",
+        "acknowledged_revision",
+        "rejected_actions",
+        "possibly_executed",
+        "omitted_actions",
+        "names_pending",
+        "detail"
+      ],
+      "type": "object"
     },
     "WorkerDescriptor": {
       "additionalProperties": false,
@@ -17116,6 +17709,9 @@
     "action_cancel_result": {
       "$ref": "#/$defs/ActionCancelResult"
     },
+    "action_observation": {
+      "$ref": "#/$defs/ActionObservation"
+    },
     "action_read_params": {
       "$ref": "#/$defs/ActionReadParams"
     },
@@ -17274,6 +17870,15 @@
     },
     "events_subscribe_result": {
       "$ref": "#/$defs/EventsSubscribeResult"
+    },
+    "expiration_tombstone": {
+      "$ref": "#/$defs/ExpirationTombstone"
+    },
+    "fence_evidence": {
+      "$ref": "#/$defs/FenceEvidence"
+    },
+    "fenced_action": {
+      "$ref": "#/$defs/FencedAction"
     },
     "forwarded_mutation": {
       "$ref": "#/$defs/ForwardedMutation"
@@ -17821,8 +18426,14 @@
     "resync_required": {
       "$ref": "#/$defs/ResyncRequired"
     },
+    "retrust_evidence": {
+      "$ref": "#/$defs/RetrustEvidence"
+    },
     "revocation_acknowledgement": {
       "$ref": "#/$defs/RevocationAcknowledgement"
+    },
+    "revocation_barrier": {
+      "$ref": "#/$defs/RevocationBarrier"
     },
     "revocation_request": {
       "$ref": "#/$defs/RevocationRequest"
@@ -17952,6 +18563,12 @@
     },
     "terminal_resize_params": {
       "$ref": "#/$defs/TerminalResizeParams"
+    },
+    "time_adapter_reading": {
+      "$ref": "#/$defs/TimeAdapterReading"
+    },
+    "time_checkpoint": {
+      "$ref": "#/$defs/TimeCheckpoint"
     },
     "upload_begin_params": {
       "$ref": "#/$defs/UploadBeginParams"

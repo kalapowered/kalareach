@@ -16,6 +16,7 @@ use kr_ipc::framed::split;
 use kr_ipc::paths::{Endpoint, EnvironmentPaths};
 use kr_ipc::peer::PeerIdentity;
 use kr_ipc::verify::{ControllerIdentity, check_rendezvous};
+use kr_protocol::action::RevocationBarrier;
 use kr_protocol::envelope::{
     ControlEvent, ControlFrame, MutationRequest, Outcome, ParamsValue, Request, Response,
 };
@@ -28,8 +29,8 @@ use kr_protocol::hostinfo::{
 };
 use kr_protocol::identity::{BootIdentity, WorkerProfile};
 use kr_protocol::ids::{
-    ActorId, BootEpoch, BuildId, ConnectionId, ControllerGeneration, EnvironmentId, RequestId,
-    SessionEpoch, SessionId,
+    ActorId, AuthorityRevision, BootEpoch, BuildId, ConnectionId, ControllerGeneration,
+    EnvironmentId, RequestId, SessionEpoch, SessionId,
 };
 use kr_protocol::local::{LocalClientKind, LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::Method;
@@ -43,7 +44,7 @@ use kr_protocol::worker::{
     ReservationId, WorkerDescriptor, WorkerLaunchSpec, WorkerReady, WorkerRendezvous,
 };
 use kr_transport::clock::{ContinuousClock, SystemContinuousClock};
-use kr_transport::lease::{LeaseIssuer, LeaseRefusal, RevocationStatus};
+use kr_transport::lease::LeaseRefusal;
 use kr_transport::window::{AcceptedDeadline, ActionWindowIssuer, MAX_WINDOW_VALIDITY};
 use tokio::sync::{Mutex, oneshot};
 
@@ -69,6 +70,21 @@ pub const LAUNCH_IDENTITY_TIMEOUT: std::time::Duration = std::time::Duration::fr
 
 /// How long a create waits for its worker to report itself.
 pub const RENDEZVOUS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many pages of one worker's fence evidence this daemon collects in one announcement.
+///
+/// The names are in the worker's journal, so there is no bound on how many a busy session can
+/// produce; what is bounded is how long one announcement spends collecting them. A worker with
+/// more than this many pages keeps the rest, the report says how many have not arrived, and the
+/// next announcement continues from where this one stopped.
+const MAX_EVIDENCE_PAGES: usize = 64;
+
+/// How long the daemon waits for one worker to answer before it reports that worker as pending.
+///
+/// Section 9: waiting is not completion. A worker that will not answer is `pending`, and the only
+/// way to make it complete is an acknowledgement or a confirmed ending, so the wait has a bound and
+/// the report goes out without it.
+const WORKER_EXCHANGE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// How long a close waits for the worker that owns the session.
 ///
@@ -115,7 +131,7 @@ pub struct Controller {
     /// This is the daemon's authority store for live connections. A registration is written in the
     /// same critical section as the caller's final record validation, and withdrawn when the
     /// authority it was made under is revoked or the connection ends.
-    admitted: Mutex<BTreeMap<ConnectionId, AdmittedConnection>>,
+    admitted: std::sync::Mutex<BTreeMap<ConnectionId, AdmittedConnection>>,
     identity: ControllerIdentity,
     /// Which store this daemon keeps its keys in.
     secret_store: kr_crypto::store::StoreSelection,
@@ -137,9 +153,9 @@ pub struct Controller {
     ///
     /// A lease carries the generation and the authority revision it was issued at, so advancing
     /// the revision invalidates every outstanding lease at once and a replacement daemon cannot
-    /// renew a lease it did not issue.
-    leases: LeaseIssuer,
-    /// The network this daemon is on, when its environment selects one.
+    /// renew a lease it did not issue. The same type holds the revocation barrier, because a lease
+    /// running out is not a barrier holding and the two have to be read together.
+    leases: crate::authority::AuthorityBarrier,
     /// The network host this daemon serves, once it is on a network.
     ///
     /// The host is what a revocation needs: withdrawing a registration stops the next request, and
@@ -206,7 +222,7 @@ impl Controller {
             directory: Mutex::new(Directory::default()),
             connections: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
-            admitted: Mutex::new(BTreeMap::new()),
+            admitted: std::sync::Mutex::new(BTreeMap::new()),
             identity,
             secret_store: setup.secret_store,
             generation,
@@ -215,7 +231,7 @@ impl Controller {
             boot_epoch,
             windows: ActionWindowIssuer::with_default_validity(Arc::clone(&clock) as Arc<_>),
             shared_clock: Arc::new(kr_ipc::clock::SystemSharedClock),
-            leases: LeaseIssuer::with_maximum_validity(generation, authority_revision),
+            leases: crate::authority::AuthorityBarrier::new(generation, authority_revision),
             clock,
             network: std::sync::OnceLock::new(),
             supervisor: setup.supervisor,
@@ -493,19 +509,20 @@ impl Controller {
     /// The worker cannot know when the daemon finished passing the reply on, and it must not
     /// signal a process group whose command is still waiting to read its own answer.
     async fn confirm_delivery(&self, action_id: kr_protocol::ids::ActionId) {
-        let links: Vec<Arc<tokio::sync::Mutex<Option<LocalClient>>>> = self
+        let links: Vec<(SessionId, Arc<tokio::sync::Mutex<Option<LocalClient>>>)> = self
             .connections
             .lock()
             .await
-            .values()
-            .map(Arc::clone)
+            .iter()
+            .map(|(session_id, link)| (*session_id, Arc::clone(link)))
             .collect();
-        for link in links {
+        for (session_id, link) in links {
             let mut held = link.lock().await;
             if let Some(client) = held.as_mut()
                 && client.confirm_delivery(action_id).await.is_err()
             {
                 *held = None;
+                self.lost_control_path(session_id);
             }
         }
     }
@@ -513,40 +530,74 @@ impl Controller {
     /// Announces the environment's current authority revision to every worker it knows about.
     ///
     /// A revocation is not complete when the daemon records it. It is complete for a worker when
-    /// that worker has acknowledged the revision that removed the authority, or when the worker is
-    /// confirmed ended. Anything else is pending, and this reports which.
+    /// that worker has acknowledged the revision that removed the authority **and** fenced the
+    /// undispatched actions it affects, or when the worker is confirmed ended. Anything else is
+    /// pending, and this reports which, along with every action whose dispatch transition had
+    /// already won the serial race and may therefore have executed.
     ///
     /// # Errors
     ///
     /// Returns an error when the registry cannot be read or written.
-    pub async fn announce_authority_revision(&self) -> Result<RevocationStatus> {
+    pub async fn announce_authority_revision(&self) -> Result<RevocationBarrier> {
         let revision = {
             let registry = self.registry.lock().await;
             registry.authority_revision()?
         };
         let workers: Vec<KnownWorker> = self.directory.lock().await.iter().cloned().collect();
+        // Membership comes from the registry, not from the verified directory. A worker whose
+        // challenge failed, or that this daemon has never reached, is outside the directory and
+        // still durably recorded: a revocation is not complete for a worker this daemon cannot
+        // account for, and reporting over the directory alone would let a replacement daemon that
+        // has reached nobody report success.
+        let known: Vec<SessionId> = {
+            let registry = self.registry.lock().await;
+            registry
+                .workers()?
+                .into_iter()
+                .map(|worker| worker.session_id)
+                .collect()
+        };
+        let mut attempted: Vec<SessionId> = Vec::new();
         for worker in workers {
             let session_id = worker.descriptor.session_id;
+            attempted.push(session_id);
             // The binding is taken before the announcement travels, so an acknowledgement that
             // arrives over a control path this daemon has already given up on lifts nothing.
-            let binding = self.leases.binding(session_id);
+            // The control path is registered before the announcement travels, so an
+            // acknowledgement is measured against a binding this daemon actually holds. Without
+            // it a replacement daemon would compare every answer against a binding of zero.
+            let binding = self.leases.bind(session_id);
             let outcome = {
-                match self.worker_client(&worker).await {
-                    Ok(mut held) => {
+                match tokio::time::timeout(WORKER_EXCHANGE, self.worker_client(&worker)).await {
+                    Ok(Ok(mut held)) => {
                         let client = held.as_mut().expect("the connection is open");
-                        let answered = client
-                            .announce_revision(kr_protocol::worker::AuthorityRevisionNotice {
-                                environment_id: self.paths.environment_id(),
-                                revision,
-                            })
-                            .await;
-                        if answered.is_err() {
-                            *held = None;
-                            self.leases.stop_renewal(session_id, binding);
+                        // Bounded, because a worker that will not answer must not stop the
+                        // revocation from reporting `pending` for it, and must not stop the
+                        // announcement reaching the workers after it. Section 9 makes waiting the
+                        // opposite of completion.
+                        let answered = tokio::time::timeout(
+                            WORKER_EXCHANGE,
+                            client.announce_revision(
+                                kr_protocol::worker::AuthorityRevisionNotice {
+                                    environment_id: self.paths.environment_id(),
+                                    revision,
+                                    evidence_from: 0,
+                                },
+                            ),
+                        )
+                        .await;
+                        match answered {
+                            Ok(Ok(ack)) => Some(ack),
+                            Ok(Err(_)) | Err(_) => {
+                                // An exchange that failed or ran out leaves a client whose stream
+                                // position nothing knows, so it is retired rather than returned.
+                                *held = None;
+                                self.leases.stop_renewal(session_id, binding);
+                                None
+                            }
                         }
-                        answered.ok()
                     }
-                    Err(_) => {
+                    Ok(Err(_)) | Err(_) => {
                         self.leases.stop_renewal(session_id, binding);
                         None
                     }
@@ -554,14 +605,34 @@ impl Controller {
             };
             match outcome {
                 Some(ack) if ack.revision.get() >= revision.get() => {
-                    let mut registry = self.registry.lock().await;
-                    registry.record_acknowledged_revision(session_id, ack.revision)?;
-                    drop(registry);
+                    // The barrier first, because it is what validates the binding: this
+                    // announcement was made over one control path, and another exchange can lose
+                    // that path and advance the binding while this one waits. Recording the
+                    // acknowledgement in the registry before the barrier had judged it would let a
+                    // stale answer move `revision_pending` even where the barrier refused it.
+                    //
                     // Under the binding this announcement was made over, not whatever the binding
-                    // is now: another exchange can lose the path and advance it while this one
-                    // waits for the registry, and an acknowledgement from the path that was lost
-                    // must not lift the fence that loss set on the one in force.
-                    self.leases.acknowledge(session_id, binding, ack.revision);
+                    // is now.
+                    // Whether this worker reported what its fence did, which is the half of the
+                    // acknowledgement the durable row stands for. Recording the revision for a
+                    // worker that said nothing about its fence would make `revision_pending` and
+                    // the barrier disagree, and the barrier is the one section 9 defines.
+                    let evidenced = ack.fence.is_some();
+                    let accepted =
+                        self.leases
+                            .acknowledge(session_id, binding, ack.revision, ack.fence);
+                    if accepted && evidenced {
+                        {
+                            let mut registry = self.registry.lock().await;
+                            registry.record_acknowledged_revision(session_id, ack.revision)?;
+                        }
+                        // The evidence travels a page at a time, because one acknowledgement is
+                        // one control frame. The barrier holds on the first page, which is the
+                        // acknowledgement itself; what these further exchanges complete is the
+                        // naming section 9 requires, and each one is bounded like the first.
+                        self.collect_owed_evidence(session_id, binding, revision)
+                            .await;
+                    }
                 }
                 // A worker that is confirmed gone answers the question a different way: it can no
                 // longer act under anything.
@@ -572,7 +643,101 @@ impl Controller {
                 }
             }
         }
-        Ok(self.leases.status(revision))
+        // Every durably recorded worker the directory does not list. Those are the ones this
+        // daemon has never reached or has given up on verifying, and the announcement cannot go to
+        // them: what can still be established is whether they are gone. A worker confirmed ended
+        // satisfies the barrier as surely as one that acknowledged, and one that is still running
+        // stays pending rather than being left unaccounted for because nobody could see it.
+        for session_id in &known {
+            if attempted.contains(session_id) {
+                continue;
+            }
+            if self.reconcile(*session_id).await?.is_some() {
+                self.leases.worker_ended(*session_id);
+            }
+        }
+        Ok(self.leases.report(revision, known))
+    }
+
+    /// Asks a worker for the rest of the fence evidence it owes, a page at a time.
+    ///
+    /// The revision in force comes first, because that is the revocation someone is waiting on.
+    /// After it come the older revocations whose names this daemon has not finished collecting: a
+    /// page whose exchange failed before a newer revision was installed would otherwise never be
+    /// asked for again, and section 9 requires the actions a fence could not take back to be named
+    /// in *that* revocation's result. Every page in the whole sequence comes out of one budget, so
+    /// a worker with several unfinished revocations cannot make one announcement unbounded.
+    async fn collect_owed_evidence(
+        &self,
+        session_id: SessionId,
+        binding: kr_transport::lease::WorkerBinding,
+        revision: AuthorityRevision,
+    ) {
+        let mut budget = MAX_EVIDENCE_PAGES;
+        self.collect_fence_evidence(session_id, binding, revision, &mut budget)
+            .await;
+        for older in self.leases.evidence_outstanding(session_id, revision) {
+            if budget == 0 {
+                return;
+            }
+            self.collect_fence_evidence(session_id, binding, older, &mut budget)
+                .await;
+        }
+    }
+
+    /// Asks a worker for the rest of one revocation's fence evidence, a page at a time.
+    ///
+    /// One page arrives with the acknowledgement; this is how the names that did not fit follow.
+    /// It stops when the worker says nothing remains, when an exchange fails, or when the budget
+    /// runs out: a worker that kept reporting names remaining would otherwise keep this daemon
+    /// asking, and a revocation that cannot finish reporting is still a revocation that holds.
+    async fn collect_fence_evidence(
+        &self,
+        session_id: SessionId,
+        binding: kr_transport::lease::WorkerBinding,
+        revision: AuthorityRevision,
+        budget: &mut usize,
+    ) {
+        while *budget > 0 {
+            *budget -= 1;
+            let Some(from) = self.leases.evidence_owed(session_id, revision) else {
+                return;
+            };
+            let notice = kr_protocol::worker::AuthorityRevisionNotice {
+                environment_id: self.paths.environment_id(),
+                revision,
+                evidence_from: from,
+            };
+            let answered = {
+                let Ok(Ok(mut held)) =
+                    tokio::time::timeout(WORKER_EXCHANGE, self.worker_client_of(session_id)).await
+                else {
+                    self.lost_control_path(session_id);
+                    return;
+                };
+                let Some(client) = held.as_mut() else {
+                    return;
+                };
+                match tokio::time::timeout(WORKER_EXCHANGE, client.announce_revision(notice)).await
+                {
+                    Ok(Ok(ack)) => Some(ack),
+                    Ok(Err(_)) | Err(_) => {
+                        *held = None;
+                        self.lost_control_path(session_id);
+                        None
+                    }
+                }
+            };
+            let Some(ack) = answered else {
+                return;
+            };
+            if !self
+                .leases
+                .acknowledge(session_id, binding, ack.revision, ack.fence)
+            {
+                return;
+            }
+        }
     }
 
     /// Advances the environment's authority revision and announces it.
@@ -585,7 +750,7 @@ impl Controller {
     /// # Errors
     ///
     /// Returns an error when the registry cannot be written.
-    pub async fn revoke_authority(&self) -> Result<RevocationStatus> {
+    pub async fn revoke_authority(&self) -> Result<RevocationBarrier> {
         // The store's lock order is the registry first, then the connections. Admission takes the
         // same two in the same order, so a connection cannot be registered against a revision this
         // has already replaced.
@@ -593,7 +758,7 @@ impl Controller {
             let mut registry = self.registry.lock().await;
             registry.advance_authority_revision()?;
             let revision = registry.authority_revision()?;
-            let mut admitted = self.admitted.lock().await;
+            let mut admitted = self.admitted_table();
             admitted.retain(|_, connection| connection.admitted_revision >= revision);
             drop(admitted);
             revision
@@ -684,7 +849,7 @@ impl Controller {
         // connection was accepted, and this one happens where the registration is written, so
         // nothing can be admitted between the two.
         peer.authorise(kr_ipc::paths::current_uid())?;
-        let mut admitted = self.admitted.lock().await;
+        let mut admitted = self.admitted_table();
         admitted.insert(
             connection_id,
             AdmittedConnection {
@@ -697,9 +862,113 @@ impl Controller {
         Ok(())
     }
 
+    /// Refuses a mutation whose admission no longer stands, inside the caller's transaction.
+    ///
+    /// The caller holds the store lock it is about to write under, and passes the registry guard
+    /// it took next: that order is the one admission and revocation both take, so neither can
+    /// interleave with this. Nothing is awaited between this answer and the write, which is what
+    /// makes the answer still true when the write happens.
+    ///
+    /// Checking before the wait would prove the admission stood before the wait, which is not the
+    /// question. `docs/host/README.md` states the rule for the services outside this crate.
+    ///
+    /// # Errors
+    ///
+    /// Returns the way the admission lapsed: its deadline passed, the authority it was admitted
+    /// under was withdrawn, or its connection's registration was.
+    pub fn check_admission(
+        &self,
+        registry: &Registry,
+        admission: &crate::authority::AdmittedMutation,
+    ) -> Result<()> {
+        let authority_revision = registry.authority_revision()?;
+        let admitted = self.admitted_table();
+        let registered = admitted
+            .get(&admission.connection_id)
+            .is_some_and(|connection| connection.admitted_revision >= authority_revision);
+        drop(admitted);
+        admission
+            .check(crate::authority::AdmissionContext {
+                now: self.clock.now(),
+                authority_revision,
+                registered,
+            })
+            .map_err(|lapse| match lapse {
+                crate::authority::AdmissionLapse::Expired => ControllerError::WindowExpired {
+                    detail: lapse.to_string(),
+                },
+                crate::authority::AdmissionLapse::Revoked
+                | crate::authority::AdmissionLapse::Deregistered => {
+                    ControllerError::PermissionDenied {
+                        detail: lapse.to_string(),
+                    }
+                }
+            })
+    }
+
+    /// Returns the table of admitted connections.
+    ///
+    /// A synchronous lock, deliberately: nothing is awaited while it is held, and the registry
+    /// guard often is. A connection table behind an asynchronous lock would make every reader of
+    /// it require the registry to be shared across threads, which a SQLite connection is not.
+    fn admitted_table(
+        &self,
+    ) -> std::sync::MutexGuard<'_, BTreeMap<ConnectionId, AdmittedConnection>> {
+        self.admitted
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Records that a worker's control path was lost, wherever the loss was noticed.
+    ///
+    /// Renewal stops with the path. Section 9 ties renewal to the live binding rather than to a
+    /// revision number, so every place that gives up on a worker's client says so here rather than
+    /// leaving a lease renewable over a socket that has gone.
+    fn lost_control_path(&self, session_id: SessionId) {
+        let binding = self.leases.binding(session_id);
+        self.leases.stop_renewal(session_id, binding);
+    }
+
+    /// Returns this daemon's continuous clock, for a caller that has to build an admission.
+    #[must_use]
+    pub fn continuous_now(&self) -> kr_transport::clock::ContinuousInstant {
+        self.clock.now()
+    }
+
+    /// Runs one service transaction under a carried admission.
+    ///
+    /// This is the guarded operation `docs/host/README.md` names for a service in another crate. A
+    /// service holds its own store lock, calls this, and writes inside the closure: the registry
+    /// lock is taken here and held across the check and the write, so a revocation cannot land
+    /// between them. Nothing is awaited inside the closure, which is what makes the answer still
+    /// true when the write happens.
+    ///
+    /// # Errors
+    ///
+    /// Returns the way the admission lapsed, or whatever the closure returns.
+    pub async fn enter_admitted<T>(
+        &self,
+        admission: &crate::authority::AdmittedMutation,
+        write: impl FnOnce(&mut Registry) -> Result<T>,
+    ) -> Result<T> {
+        // An admission with no deadline is a retry's admission: it may be *answered* from what
+        // this host already holds, and it may not write. Section 9 keeps a receipt readable after
+        // the freshness that admitted it is gone; what the freshness admitted was the action, and
+        // nothing here can admit a new one without it.
+        if admission.deadline.is_none() {
+            return Err(ControllerError::WindowExpired {
+                detail: "this action carries no freshness, so it may be answered from what this                          host holds and may not write"
+                    .to_owned(),
+            });
+        }
+        let mut registry = self.registry.lock().await;
+        self.check_admission(&registry, admission)?;
+        write(&mut registry)
+    }
+
     /// Refuses a request on a connection whose registration has been withdrawn.
-    async fn authorised(&self, connection_id: ConnectionId) -> Result<ActorId> {
-        let admitted = self.admitted.lock().await;
+    fn authorised(&self, connection_id: ConnectionId) -> Result<ActorId> {
+        let admitted = self.admitted_table();
         match admitted.get(&connection_id) {
             Some(connection) => Ok(connection.actor_id.clone()),
             None => Err(ControllerError::PermissionDenied {
@@ -710,9 +979,24 @@ impl Controller {
         }
     }
 
+    /// Returns the authority revision a connection was admitted under.
+    fn admitted_revision(&self, connection_id: ConnectionId) -> Result<AuthorityRevision> {
+        let admitted = self.admitted_table();
+        admitted.get(&connection_id).map_or_else(
+            || {
+                Err(ControllerError::PermissionDenied {
+                    detail: "the authority this connection was admitted under has been withdrawn; \
+                             open a new connection"
+                        .to_owned(),
+                })
+            },
+            |connection| Ok(connection.admitted_revision),
+        )
+    }
+
     /// Withdraws one connection's registration.
-    async fn deregister(&self, connection_id: ConnectionId) {
-        self.admitted.lock().await.remove(&connection_id);
+    fn deregister(&self, connection_id: ConnectionId) {
+        self.admitted_table().remove(&connection_id);
     }
 
     /// Takes the dispatch lease a remote-origin mutation needs, and returns its deadline.
@@ -1113,6 +1397,7 @@ impl Controller {
         connection_id: ConnectionId,
         mutation: &MutationRequest,
         method: Method,
+        received_at: kr_transport::clock::ContinuousInstant,
     ) -> Result<AcceptedDeadline> {
         use kr_protocol::authority::AuthorityDecision;
 
@@ -1242,10 +1527,11 @@ impl Controller {
         // requested lifetime, and any applicable authority deadline. The caller never supplies an
         // authoritative deadline, and nothing downstream lengthens this one.
         self.windows
-            .accept(
+            .accept_at(
                 &mutation.action_window_id,
                 connection_id,
                 self.boot_epoch,
+                received_at,
                 mutation.requested_ttl_ms,
                 None,
             )
@@ -1269,7 +1555,7 @@ impl Controller {
         // outlived its connection could first-admit a request through a connection that no longer
         // exists, and a registration that outlived it would be an authority nothing can revoke.
         self.windows.retire_connection(connection_id);
-        self.deregister(connection_id).await;
+        self.deregister(connection_id);
         outcome
     }
 
@@ -1319,6 +1605,19 @@ impl Controller {
             };
             let reply = match frame {
                 ControlFrame::Hello(hello) => {
+                    // A peer that says it can hold no outstanding mutation at all is refused
+                    // rather than quietly read as one. The worker's endpoint refuses the same
+                    // offer, and a limit this host would then ignore is worse than a refusal.
+                    if hello.max_receive.max_outstanding_mutations.get() == 0 {
+                        let refusal = error_reply(
+                            RequestId::new(0),
+                            ErrorCode::InvalidArgument,
+                            "a connection holds at least one outstanding mutation; offering none \
+                             is not a limit this host serves",
+                        );
+                        let _ = writer.write_message(&refusal).await;
+                        break;
+                    }
                     if hello
                         .offered_versions
                         .iter()
@@ -1376,14 +1675,14 @@ impl Controller {
                     )
                 }
                 ControlFrame::Request(request) if negotiated => {
-                    match self.authorised(connection_id).await {
+                    match self.authorised(connection_id) {
                         Ok(_) => {
                             let answer = self.read_method(&actor_id, &request).await;
                             // Checked again now the read has finished. A read that passed its check
                             // and then waited for the registry can complete after the authority
                             // behind it was withdrawn, and what the contract forbids is *serving*
                             // that state rather than reading it.
-                            match self.authorised(connection_id).await {
+                            match self.authorised(connection_id) {
                                 Ok(_) => answer,
                                 Err(error) => error_reply(
                                     request.request_id,
@@ -1436,7 +1735,12 @@ impl Controller {
         connection_id: ConnectionId,
         mutation: MutationRequest,
     ) -> ControlFrame {
-        if let Err(error) = self.authorised(connection_id).await {
+        // Receipt time, recorded before anything this daemon then waits for. Section 9 measures a
+        // requested lifetime from when the request arrived, and the retained lookup below takes
+        // the registry lock: sampling the clock after it would hand the request its whole lifetime
+        // back after the wait.
+        let received_at = self.clock.now();
+        if let Err(error) = self.authorised(connection_id) {
             return error_reply(
                 mutation.request_id,
                 ErrorCode::PermissionDenied,
@@ -1454,24 +1758,40 @@ impl Controller {
         // Section 9 makes the freshness window the thing that admits a *new* action; applying it to
         // a retry would refuse a caller its own completed result because its window has since been
         // replaced, and replacing the window of an action already submitted is not allowed either.
-        if let Some(retained) = self
+        //
+        // Every store that retains an action here is asked in turn, and whichever answers, the
+        // answer passes through the same guard. Finding a retained action takes a lock and can
+        // wait for a blocking thread; what the contract forbids is *disclosing* a retained result
+        // under authority that has since been withdrawn, so the check belongs where the answer is
+        // about to be written rather than only where the lookup began.
+        let mut retained = self
             .retained(actor_id, &mutation, method, connection_id)
-            .await
-        {
+            .await;
+        if retained.is_none() && crate::transfer::TransferModule::serves(method) {
+            retained = self.transfer.retained(actor_id, &mutation, method).await;
+        }
+        if retained.is_none() && crate::project::ProjectModule::serves(method) {
+            retained = self.project.retained(actor_id, &mutation, method).await;
+        }
+        if let Some(retained) = retained {
+            if let Err(error) = self.authorised(connection_id) {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    error.to_string(),
+                );
+            }
             return retained;
         }
-        if crate::transfer::TransferModule::serves(method)
-            && let Some(retained) = self.transfer.retained(actor_id, &mutation, method).await
-        {
-            return retained;
-        }
-        if crate::project::ProjectModule::serves(method)
-            && let Some(retained) = self.project.retained(actor_id, &mutation, method).await
-        {
-            return retained;
-        }
-        let accepted = match self.check_envelope(connection_id, &mutation, method) {
-            Ok(accepted) => accepted,
+        let accepted = match self.check_envelope(connection_id, &mutation, method, received_at) {
+            Ok(accepted) => Some(accepted),
+            // A window that admits nothing says nothing about an action the host may already
+            // hold. Section 9 keeps a receipt readable after the freshness that admitted it is
+            // gone, and for a mutation this daemon forwards, the worker that owns the session is
+            // the only thing that knows whether it holds one. So the mutation goes on with no
+            // freshness at all: a retry finds its receipt there, and a first admission is refused
+            // there for the same reason it would have been refused here.
+            Err(ControllerError::WindowExpired { .. }) if forwarded_to_worker(method) => None,
             Err(error) => {
                 return ControlFrame::Response(Response {
                     request_id: mutation.request_id,
@@ -1513,7 +1833,7 @@ impl Controller {
         // Waiting for that lock takes time, and a retained result is a read of somebody's action.
         // Section 9 checks current authority before returning one, so it is checked after the wait
         // rather than before it.
-        if let Err(error) = self.authorised(connection_id).await {
+        if let Err(error) = self.authorised(connection_id) {
             return Some(respond(mutation.request_id, Err(error)));
         }
         match installer.retained(actor_id, mutation.action_id, &digest) {
@@ -1561,7 +1881,7 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         connection_id: ConnectionId,
-        accepted: AcceptedDeadline,
+        accepted: Option<AcceptedDeadline>,
     ) -> ControlFrame {
         if crate::transfer::TransferModule::serves(method) {
             // The stored subject is read first, because reading it waits: for a blocking thread
@@ -1582,16 +1902,21 @@ impl Controller {
             // scheduled, for a blocking thread, for the subject read above. An action whose
             // accepted deadline passed while it queued does not go on to write, and neither does
             // one whose connection lost its authority in the meantime.
-            if self.clock.now() >= accepted.deadline {
+            //
+            // A mutation carrying no freshness at all is refused here too. This service answers
+            // its own retained actions before this point, so anything still travelling is a first
+            // admission, and a first admission needs a deadline it was admitted under.
+            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
                 return respond(
                     mutation.request_id,
                     Err(ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it                                  could run"
+                        detail: "the deadline this action was admitted under passed before it \
+                                 could run"
                             .to_owned(),
                     }),
                 );
             }
-            if let Err(error) = self.authorised(connection_id).await {
+            if let Err(error) = self.authorised(connection_id) {
                 return error_reply(
                     mutation.request_id,
                     ErrorCode::PermissionDenied,
@@ -1604,17 +1929,20 @@ impl Controller {
             // Everything between the envelope check and this point can wait: for this task to be
             // scheduled and for a blocking thread. An action whose accepted deadline passed while
             // it queued does not go on to write, and neither does one whose connection lost its
-            // authority in the meantime.
-            if self.clock.now() >= accepted.deadline {
+            // authority in the meantime. A mutation carrying no freshness at all is refused here
+            // for the reason the transfer service refuses one: this service answers its own
+            // retained actions above, so anything still travelling is a first admission.
+            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
                 return respond(
                     mutation.request_id,
                     Err(ControllerError::WindowExpired {
-                        detail: "the deadline this action was admitted under passed before it                                  could run"
+                        detail: "the deadline this action was admitted under passed before it \
+                                 could run"
                             .to_owned(),
                     }),
                 );
             }
-            if let Err(error) = self.authorised(connection_id).await {
+            if let Err(error) = self.authorised(connection_id) {
                 return error_reply(
                     mutation.request_id,
                     ErrorCode::PermissionDenied,
@@ -1623,14 +1951,41 @@ impl Controller {
             }
             return self.project.write_frame(actor_id, mutation, method).await;
         }
-        let outcome = match method {
-            Method::SessionCreate => {
-                self.session_create(actor_id, mutation, connection_id, accepted)
-                    .await
+        // The admission the mutation carries into its transaction: the deadline this daemon
+        // accepted, the authority revision it was admitted under, and the connection it arrived
+        // on. Every service re-checks all three inside its own transaction.
+        let admitted_revision = match self.admitted_revision(connection_id) {
+            Ok(revision) => revision,
+            Err(error) => {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    error.to_string(),
+                );
             }
+        };
+        let carried = crate::authority::AdmittedMutation {
+            connection_id,
+            admitted_revision,
+            deadline: accepted.map(|accepted| accepted.deadline),
+        };
+        let outcome = match method {
+            // A create needs freshness of its own. An admission that carries none is a retry of an
+            // action this host may already hold: section 9 keeps its record readable after the
+            // window that admitted it is gone, and the reservation above is where such a retry is
+            // answered from. What it may not do is start a session.
+            Method::SessionCreate => match accepted {
+                Some(_) => self.session_create(actor_id, mutation, carried).await,
+                None => Err(ControllerError::WindowExpired {
+                    detail: "this action carries no freshness, so it may be answered from what \
+                             this host holds and may not start a session"
+                        .to_owned(),
+                }),
+            },
             Method::SessionClose => {
                 let actor = local_actor(actor_id.clone(), connection_id, self.generation);
-                self.session_close(mutation, &actor, accepted).await
+                self.session_close(mutation, &actor, accepted, carried)
+                    .await
             }
             Method::AgentToolsInstall | Method::AgentToolsRemove => {
                 self.agent_tools_change(actor_id, mutation, method, connection_id, accepted)
@@ -1663,7 +2018,7 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
         connection_id: ConnectionId,
-        accepted: AcceptedDeadline,
+        accepted: Option<AcceptedDeadline>,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::skill::AgentToolsParams = parse(&mutation.params)?;
         let installer = self.installer()?;
@@ -1675,7 +2030,7 @@ impl Controller {
         // Waiting for that lock takes time, and what happens next is either a read of somebody's
         // completed action or a change to their files. Both need current authority, so it is
         // checked here rather than before the wait.
-        self.authorised(connection_id).await?;
+        self.authorised(connection_id)?;
         if let Some(retained) = installer.retained(actor_id, mutation.action_id, &digest)? {
             return Ok(retained);
         }
@@ -1698,7 +2053,7 @@ impl Controller {
         // those waits, and the dispatch marker is written while this daemon's authority store is
         // held, so a revocation cannot complete between the check and the marker: withdrawing a
         // registration takes the same lock.
-        let registrations = self.admitted.lock().await;
+        let registrations = self.admitted_table();
         if !registrations.contains_key(&connection_id) {
             return Err(ControllerError::PermissionDenied {
                 detail: "the authority this connection was admitted under has been withdrawn; \
@@ -1706,7 +2061,10 @@ impl Controller {
                     .to_owned(),
             });
         }
-        if self.clock.now() >= accepted.deadline {
+        // A change carrying no freshness at all is refused here as well. This path answers its own
+        // retained actions above, so anything still travelling is a first admission, and a first
+        // admission needs a deadline it was admitted under.
+        if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
             return Err(ControllerError::WindowExpired {
                 detail: "the deadline this installation was admitted under passed before it could \
                          run"
@@ -1918,8 +2276,7 @@ impl Controller {
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
-        connection_id: ConnectionId,
-        accepted: AcceptedDeadline,
+        carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let create: SessionCreateParams = parse(&mutation.params)?;
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
@@ -1983,22 +2340,12 @@ impl Controller {
         {
             let mut registry = self.registry.lock().await;
             registry.set_phase(reservation.reservation_id, LaunchPhase::Spawned)?;
-            // The registration first, because reading it waits: the connection table is taken
-            // under this guard, and a revocation can be part way through taking it. The deadline
-            // is checked afterwards, so the last thing between this create and its launch is a
-            // reading of the clock with nothing left to wait for.
-            let refusal = match self.authorised(connection_id).await.err() {
-                Some(withdrawn) => Some(withdrawn),
-                None if self.clock.now() >= accepted.deadline => {
-                    Some(ControllerError::WindowExpired {
-                        detail: "the deadline this create was admitted under passed before it \
-                                 could start"
-                            .to_owned(),
-                    })
-                }
-                None => None,
-            };
-            if let Some(refusal) = refusal {
+            // The admission this create carries, against the registry this guard holds: the
+            // authority revision it was admitted under, the registration behind it, and the
+            // deadline, in that order. The registration is read with the registry lock already
+            // held, which is the order a revocation takes, and the clock is read last, so the last
+            // thing between this create and its launch is a reading with nothing left to wait for.
+            if let Err(refusal) = self.check_admission(&registry, &carried) {
                 // Nothing was started, so the reservation is resolved as a confirmed failure and
                 // stops occupying the environment. The caller is told which of the two it was.
                 registry.set_phase(reservation.reservation_id, LaunchPhase::Failed)?;
@@ -2230,7 +2577,8 @@ impl Controller {
         self: &Arc<Self>,
         mutation: &MutationRequest,
         actor: &kr_protocol::actor::ActorEnvelope,
-        accepted: AcceptedDeadline,
+        accepted: Option<AcceptedDeadline>,
+        carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let params: SessionCloseParams = parse(&mutation.params)?;
         let worker = self.directory.lock().await.get(params.session_id).cloned();
@@ -2276,6 +2624,31 @@ impl Controller {
             // while this close is still queueing, and fencing the binding that was current then
             // would lift nothing. This is the path the exchange below actually runs over.
             let binding = self.leases.binding(params.session_id);
+            // The admission is checked here rather than before the wait, because this is where
+            // the wait was. A deadline that ran out while this close queued does not stop it
+            // reaching the worker, because the worker is the only thing that knows whether it
+            // already holds this action's receipt; what a spent deadline stops is a *first*
+            // admission, and the worker refuses that for the same reason this daemon would have.
+            // The authority half is different: it refuses outright, because disclosing anything
+            // under authority that has been withdrawn is what the contract forbids.
+            {
+                // Inside the same budget as the exchange: this daemon is holding the worker's link
+                // while it asks, and a registry another operation is holding must not let that
+                // link be held past what a closure is allowed to take.
+                let registry = tokio::time::timeout_at(budget, self.registry.lock())
+                    .await
+                    .map_err(|_| {
+                        ControllerError::supervision(
+                            "this daemon could not read its own authority in time, so nothing was \
+                             closed",
+                        )
+                    })?;
+                match self.check_admission(&registry, &carried) {
+                    Ok(()) => {}
+                    Err(ControllerError::WindowExpired { .. }) => {}
+                    Err(error) => return Err(error),
+                }
+            }
             // Remote dispatch additionally needs a live lease, taken at the moment the dispatch
             // runs rather than one that was valid when the request arrived. Its own remaining time
             // then bounds the deadline the worker is given.
@@ -2283,16 +2656,18 @@ impl Controller {
             // What the worker is told is the accepted deadline itself, on the machine's own
             // continuous clock: the same clock the worker reads, so the deadline does not restart
             // on arrival and nothing has to guess at what the journey cost. A deadline already
-            // spent is never forwarded as though it had time left.
-            let accepted_deadline_boot_ms = remaining_deadline(
-                &*self.shared_clock,
-                &*self.clock,
-                accepted.deadline,
-                lease_deadline,
-            )
-            .ok_or_else(|| ControllerError::WindowExpired {
-                detail: "the deadline this action was admitted under has passed".to_owned(),
-            })?;
+            // spent is forwarded as spent - nought is in every boot's past - rather than as a
+            // refusal, so the worker answers from what it holds and admits nothing new.
+            let accepted_deadline_boot_ms = accepted
+                .and_then(|accepted| {
+                    remaining_deadline(
+                        &*self.shared_clock,
+                        &*self.clock,
+                        accepted.deadline,
+                        lease_deadline,
+                    )
+                })
+                .unwrap_or_else(|| U64::new(0));
             let client = held.as_mut().expect("the connection is open");
             match tokio::time::timeout_at(
                 budget,
@@ -2330,9 +2705,13 @@ impl Controller {
         };
         match result {
             Ok(value) => {
-                let reply: SessionCloseResult = value
-                    .to_typed()
-                    .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+                // A retry of an action this worker settled without closing anything answers with
+                // its receipt rather than a close result. That is the right answer to the caller's
+                // retry, so it is passed through as it stands: reading it as a close result would
+                // turn the receipt the caller asked for into a decoding failure.
+                let Ok(reply) = value.to_typed::<SessionCloseResult>() else {
+                    return Ok(value);
+                };
                 match reply.closure.as_ref() {
                     Some(record) => self.retire(record).await?,
                     // The worker has accepted the close and is stopping its processes. Something
@@ -2509,6 +2888,11 @@ impl Controller {
         kr_ipc::descriptor::retire(&self.paths, record.session_id)?;
         self.directory.lock().await.remove(record.session_id);
         self.connections.lock().await.remove(&record.session_id);
+        // The barrier is told before the record is gone. A worker that has ended satisfies the
+        // barrier, and the barrier keeps a participant it has ever heard of: without this, a
+        // retired worker would stay pending for every later revocation, because nothing would be
+        // left to say that it ended.
+        self.leases.worker_ended(record.session_id);
         // The directory the worker ran in goes with the session. It holds nothing the closure
         // record needs, and one per session that nothing removes would outlive every session this
         // host has ever run. A worker still on its way out may be holding it; on the platforms
@@ -2532,8 +2916,10 @@ impl Controller {
             Ok(result) => result,
             Err(error) => {
                 // A transport failure ends this connection. The next call opens a new one and
-                // presents the generation again rather than writing into a socket that is gone.
+                // presents the generation again rather than writing into a socket that is gone,
+                // and renewal stops with the path rather than outliving it.
                 *held = None;
+                self.lost_control_path(worker.descriptor.session_id);
                 return Err(error.into());
             }
         };
@@ -2569,6 +2955,22 @@ impl Controller {
             *held = Some(self.open_worker(worker).await?);
         }
         Ok(held)
+    }
+
+    /// Returns this daemon's one connection to the worker of one session.
+    ///
+    /// The directory is what says where that worker is. A session the directory does not list has
+    /// no connection to open, which is a worker this daemon has not reached rather than an error
+    /// about the session.
+    async fn worker_client_of(
+        &self,
+        session_id: SessionId,
+    ) -> Result<tokio::sync::OwnedMutexGuard<Option<LocalClient>>> {
+        let worker = self.directory.lock().await.get(session_id).cloned();
+        let worker = worker.ok_or_else(|| ControllerError::UnknownSession {
+            session: session_id.to_string(),
+        })?;
+        self.worker_client(&worker).await
     }
 
     async fn open_worker(&self, worker: &KnownWorker) -> Result<LocalClient> {
@@ -2706,6 +3108,15 @@ fn remaining_deadline(
     let deadline = lease.map_or(accepted, |lease| lease.min(accepted));
     let remaining = deadline.saturating_duration_since(now);
     kr_ipc::clock::transferred_deadline(shared_now, remaining).map(U64::new)
+}
+
+/// Returns whether this daemon forwards the method to the worker that owns the session.
+///
+/// It decides what a window refusal means. A mutation this daemon performs itself has its
+/// retained action here, and a window that admits nothing has already been past it; one it
+/// forwards has its retained action in the worker's journal, which only the worker can read.
+const fn forwarded_to_worker(method: Method) -> bool {
+    matches!(method, Method::SessionClose)
 }
 
 /// Returns the sentence a caller is given when a window cannot first-admit a request.
@@ -2976,6 +3387,57 @@ mod a_create_that_launches_nothing {
     }
 
     /// Starts a daemon on a tree of its own, with a supervisor that starts nothing.
+    /// The admission a create carries in these tests: this connection, the revision in force and
+    /// the deadline the host accepted.
+    fn carried(
+        controller: &Controller,
+        connection_id: ConnectionId,
+        accepted: AcceptedDeadline,
+    ) -> crate::authority::AdmittedMutation {
+        crate::authority::AdmittedMutation {
+            connection_id,
+            admitted_revision: controller.leases.authority_revision(),
+            deadline: Some(accepted.deadline),
+        }
+    }
+
+    /// Holds this daemon's connection table the way a create's own transition reads it.
+    ///
+    /// The table is a synchronous lock, so it is held on a blocking thread rather than across an
+    /// await: holding it in this task would stop the runtime the create needs rather than pause
+    /// the create.
+    struct HeldConnections {
+        release: Option<std::sync::mpsc::Sender<()>>,
+        task: Option<tokio::task::JoinHandle<()>>,
+    }
+
+    impl HeldConnections {
+        fn hold(controller: &Arc<Controller>) -> Self {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let (held, confirmed) = std::sync::mpsc::channel::<()>();
+            let controller = Arc::clone(controller);
+            let task = tokio::task::spawn_blocking(move || {
+                let _table = controller.admitted_table();
+                held.send(()).expect("the test is waiting");
+                // Held until the test releases it. The receiver ends when the sender is dropped,
+                // so a test that panics does not leave the table locked for the rest of the suite.
+                let _ = wait.recv();
+            });
+            confirmed.recv().expect("the connection table is held");
+            Self {
+                release: Some(release),
+                task: Some(task),
+            }
+        }
+
+        async fn release(mut self) {
+            drop(self.release.take());
+            if let Some(task) = self.task.take() {
+                task.await.expect("the holding thread finishes");
+            }
+        }
+    }
+
     async fn daemon() -> (
         kr_ipc::testing::TempHost,
         Arc<Controller>,
@@ -3071,13 +3533,17 @@ mod a_create_that_launches_nothing {
         let mutation = create_request(environment_id);
 
         // The create stops here, between its reservation and the transition to `spawned`.
-        let paused = controller.pending.lock().await;
+        let paused_pending = controller.pending.lock().await;
         let create = tokio::spawn({
             let controller = Arc::clone(&controller);
             let actor_id = actor_id.clone();
             async move {
                 controller
-                    .session_create(&actor_id, &mutation, connection_id, accepted)
+                    .session_create(
+                        &actor_id,
+                        &mutation,
+                        carried(&controller, connection_id, accepted),
+                    )
                     .await
             }
         });
@@ -3091,7 +3557,7 @@ mod a_create_that_launches_nothing {
             .revoke_authority()
             .await
             .expect("the revocation completes");
-        drop(paused);
+        drop(paused_pending);
 
         let outcome = create.await.expect("the create finishes");
         let error = outcome.expect_err("a create whose authority was withdrawn starts nothing");
@@ -3146,13 +3612,17 @@ mod a_create_that_launches_nothing {
         let mutation = create_request(environment_id);
 
         // The create stops at the transition to `spawned`, which reads the connection table.
-        let paused = controller.admitted.lock().await;
+        let paused = HeldConnections::hold(&controller);
         let create = tokio::spawn({
             let controller = Arc::clone(&controller);
             let actor_id = actor_id.clone();
             async move {
                 controller
-                    .session_create(&actor_id, &mutation, connection_id, accepted)
+                    .session_create(
+                        &actor_id,
+                        &mutation,
+                        carried(&controller, connection_id, accepted),
+                    )
                     .await
             }
         });
@@ -3161,7 +3631,7 @@ mod a_create_that_launches_nothing {
         // registry what the create has reached: the deadline is absolute, and a create that has
         // not started yet still finds it spent by the time it looks.
         tokio::time::sleep(Duration::from_millis(600)).await;
-        drop(paused);
+        paused.release().await;
 
         let outcome = create.await.expect("the create finishes");
         let error = outcome.expect_err("a create whose deadline has passed starts nothing");
@@ -3173,6 +3643,81 @@ mod a_create_that_launches_nothing {
         assert!(
             matches!(error, ControllerError::WindowExpired { .. }),
             "the receipt says the deadline passed: {error}"
+        );
+        assert!(
+            asked.lock().expect("the record is not poisoned").is_empty(),
+            "no worker is started for a create the host refused"
+        );
+        let registry = controller.registry.lock().await;
+        assert_eq!(
+            registry.occupancy().expect("counts"),
+            0,
+            "the reservation it made is released"
+        );
+    }
+
+    /// A create whose registration survived a revocation is still refused: it was admitted under
+    /// the revision before it.
+    ///
+    /// One device's revocation advances the revision and leaves every other connection registered,
+    /// at the revision now in force. What that connection may do is submit new work; what it may
+    /// not do is finish work admitted before the revocation, and the admission this create carries
+    /// is what says which this is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_create_admitted_before_a_revision_is_refused_though_its_connection_stands() {
+        let (temp, controller, asked) = daemon().await;
+        let environment_id = temp.environment_id();
+        let (connection_id, actor_id) = admitted(&controller).await;
+
+        let accepted = AcceptedDeadline {
+            deadline: controller
+                .clock
+                .now()
+                .checked_add(Duration::from_secs(30))
+                .expect("a deadline half a minute out"),
+            bound: DeadlineBound::RequestedTtl,
+        };
+        // The admission this create carries, taken at the revision in force now.
+        let admitted_at = carried(&controller, connection_id, accepted);
+
+        // The revision advances and this connection keeps its registration *at the revision now in
+        // force*, which is exactly what a revocation of somebody else's device leaves behind.
+        {
+            let mut registry = controller.registry.lock().await;
+            registry
+                .advance_authority_revision()
+                .expect("the revision advances");
+            let revision = registry
+                .authority_revision()
+                .expect("the revision in force");
+            let mut admitted = controller.admitted_table();
+            for connection in admitted.values_mut() {
+                connection.admitted_revision = revision;
+            }
+        }
+        // So new work from that connection is admitted: what is refused below is not the
+        // registration but the revision this create was admitted under.
+        {
+            let registry = controller.registry.lock().await;
+            let fresh = crate::authority::AdmittedMutation {
+                connection_id,
+                admitted_revision: registry
+                    .authority_revision()
+                    .expect("the revision in force"),
+                deadline: Some(accepted.deadline),
+            };
+            controller
+                .check_admission(&registry, &fresh)
+                .expect("new work from this connection is admitted at the revision in force");
+        }
+
+        let error = controller
+            .session_create(&actor_id, &create_request(environment_id), admitted_at)
+            .await
+            .expect_err("a create admitted under the revision before is refused");
+        assert!(
+            matches!(error, ControllerError::PermissionDenied { .. }),
+            "the authority it was admitted under was withdrawn: {error}"
         );
         assert!(
             asked.lock().expect("the record is not poisoned").is_empty(),
@@ -3212,8 +3757,7 @@ mod a_create_that_launches_nothing {
             .session_create(
                 &actor_id,
                 &create_request(environment_id),
-                connection_id,
-                accepted,
+                carried(&controller, connection_id, accepted),
             )
             .await
             .expect_err("a create that cannot be prepared starts nothing");
@@ -3274,8 +3818,7 @@ mod a_create_that_launches_nothing {
             .session_create(
                 &actor_id,
                 &create_request(environment_id),
-                connection_id,
-                accepted,
+                carried(&controller, connection_id, accepted),
             )
             .await
             .expect_err("this supervisor starts nothing");
@@ -3306,18 +3849,22 @@ mod a_create_that_launches_nothing {
             bound: DeadlineBound::RequestedTtl,
         };
         let mutation = create_request(environment_id);
-        let paused = controller.admitted.lock().await;
+        let paused = HeldConnections::hold(&controller);
         let create = tokio::spawn({
             let controller = Arc::clone(&controller);
             let actor_id = actor_id.clone();
             async move {
                 controller
-                    .session_create(&actor_id, &mutation, connection_id, accepted)
+                    .session_create(
+                        &actor_id,
+                        &mutation,
+                        carried(&controller, connection_id, accepted),
+                    )
                     .await
             }
         });
         tokio::time::sleep(Duration::from_millis(600)).await;
-        drop(paused);
+        paused.release().await;
         create
             .await
             .expect("the create finishes")
@@ -3395,8 +3942,7 @@ mod a_create_that_launches_nothing {
             .session_create(
                 &actor_id,
                 &create_request(environment_id),
-                connection_id,
-                accepted,
+                carried(&controller, connection_id, accepted),
             )
             .await
             .expect_err("this supervisor starts nothing");
@@ -3603,6 +4149,33 @@ mod a_close_a_worker_never_answers {
     }
 
     /// A daemon with one silent worker in its directory, and everything a close needs.
+    /// Registers one caller and returns the admission its close carries: the connection it
+    /// arrived on, the revision in force and the deadline this host accepted.
+    async fn admission(
+        controller: &Controller,
+        accepted: AcceptedDeadline,
+    ) -> crate::authority::AdmittedMutation {
+        let connection_id = ConnectionId::new(kr_ipc::new_uuid());
+        let actor_id = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+        controller
+            .admit_connection(
+                connection_id,
+                &actor_id,
+                &kr_ipc::peer::PeerIdentity {
+                    uid: kr_ipc::paths::current_uid(),
+                    gid: 0,
+                    pid: None,
+                },
+            )
+            .await
+            .expect("the connection is registered");
+        crate::authority::AdmittedMutation {
+            connection_id,
+            admitted_revision: controller.leases.authority_revision(),
+            deadline: Some(accepted.deadline),
+        }
+    }
+
     struct Silent {
         _temp: kr_ipc::testing::TempHost,
         controller: Arc<Controller>,
@@ -3709,9 +4282,67 @@ mod a_close_a_worker_never_answers {
     /// Records that this worker has acknowledged the revision in force, so its leases renew.
     fn acknowledged(controller: &Controller, session_id: SessionId) {
         let binding = controller.leases.binding(session_id);
-        controller
-            .leases
-            .acknowledge(session_id, binding, controller.leases.authority_revision());
+        controller.leases.acknowledge(
+            session_id,
+            binding,
+            controller.leases.authority_revision(),
+            None,
+        );
+    }
+
+    /// A close that has the worker's link and cannot read this daemon's own authority gives the
+    /// link back rather than holding it past what a closure may take.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_close_that_cannot_read_this_daemons_authority_in_time_gives_the_link_back() {
+        let Silent {
+            _temp,
+            controller,
+            environment_id,
+            session_id,
+            actor,
+            accepted,
+            serving,
+            ..
+        } = silent_worker().await;
+        acknowledged(&controller, session_id);
+        let carried = admission(&controller, accepted).await;
+
+        // Something else is holding the registry for longer than a closure may take. The close
+        // acquires the worker's link first and then waits for the registry, inside the same
+        // budget as the exchange itself.
+        let held = controller.registry.lock().await;
+        let started = tokio::time::Instant::now();
+        let refused = controller
+            .session_close(
+                &close_request(environment_id, session_id),
+                &actor,
+                Some(accepted),
+                carried,
+            )
+            .await
+            .expect_err("a close that cannot read this daemon's authority closes nothing");
+        let waited = started.elapsed();
+        drop(held);
+        assert!(
+            waited <= CLOSE_EXCHANGE + Duration::from_secs(2),
+            "the wait is bounded by what a closure may take: {waited:?}"
+        );
+        assert_eq!(
+            refused.code(),
+            ErrorCode::ResourceUnavailable,
+            "the caller is told this daemon could not answer, not that the worker did: {refused}"
+        );
+
+        // And the link is back: the next caller finds it rather than waiting behind this one.
+        let link = tokio::time::timeout(
+            Duration::from_secs(5),
+            controller.worker_client_of(session_id),
+        )
+        .await
+        .expect("the link is free")
+        .expect("the link is this daemon's own");
+        drop(link);
+        serving.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -3741,7 +4372,12 @@ mod a_close_a_worker_never_answers {
 
         let started = tokio::time::Instant::now();
         let first = controller
-            .session_close(&close_request(environment_id, session_id), &actor, accepted)
+            .session_close(
+                &close_request(environment_id, session_id),
+                &actor,
+                Some(accepted),
+                admission(&controller, accepted).await,
+            )
             .await
             .expect_err("a worker that never answers produces no closure");
         assert_eq!(
@@ -3795,7 +4431,12 @@ mod a_close_a_worker_never_answers {
         // The second caller is not waiting behind the first. It opens its own connection to the
         // same silent worker and is bounded in its own right.
         let second = controller
-            .session_close(&close_request(environment_id, session_id), &actor, accepted)
+            .session_close(
+                &close_request(environment_id, session_id),
+                &actor,
+                Some(accepted),
+                admission(&controller, accepted).await,
+            )
             .await
             .expect_err("the second close meets the same silent worker");
         assert_eq!(second.code(), ErrorCode::OutcomeUnknown);
@@ -3838,7 +4479,12 @@ mod a_close_a_worker_never_answers {
             let controller = Arc::clone(&controller);
             let actor = actor.clone();
             let mutation = close_request(environment_id, session_id);
-            async move { controller.session_close(&mutation, &actor, accepted).await }
+            async move {
+                let admission = admission(&controller, accepted).await;
+                controller
+                    .session_close(&mutation, &actor, Some(accepted), admission)
+                    .await
+            }
         });
         // Long enough for the close to be queueing for the slot.
         tokio::time::sleep(Duration::from_millis(200)).await;

@@ -7,6 +7,7 @@
 //!
 //! | Module | What it owns |
 //! | --- | --- |
+//! | [`action`] | Section 9's action model: freshness windows, de-duplication, cancellation, observation and the host time contract |
 //! | [`attachments`] | Attachments, geometry ownership and succession |
 //! | [`environment`] | The root shell's environment: what is inherited, what is replaced, what is refused |
 //! | [`history`] | Retained output: a resident window, an indexed spool and explicit gaps |
@@ -25,6 +26,7 @@
 //! | [`service`] | The private endpoint: the handshake, the challenge and the method dispatch |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
+pub mod action;
 pub mod attachments;
 pub mod conpty;
 pub mod environment;

@@ -296,19 +296,20 @@ impl AttachmentTable {
             .collect()
     }
 
-    /// Adds an attachment.
+    /// Decides whether this table can admit the attachment these parameters ask for.
+    ///
+    /// Nothing changes here, and that is what it is for. Section 9 requires every refusal the host
+    /// can decide to be a rejection decided *before* the dispatch marker, so this is called twice:
+    /// once by the admission path with nothing written yet, and once by [`Self::attach`] itself,
+    /// where it also produces the dimensions the attachment is recorded with. Two copies of these
+    /// rules would be two rules.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::InvalidArgument`] when a terminal attachment supplies no dimensions,
-    /// when a semantic attachment claims geometry, or when the dimensions violate a constraint.
-    pub fn attach(
-        &mut self,
-        params: &SessionAttachParams,
-        granted: CanonicalSet<AttachmentCapability>,
-        id: AttachmentId,
-        now: TimestampMs,
-    ) -> Result<(AttachmentSummary, GeometryChange)> {
+    /// Returns [`WorkerError::InvalidArgument`] when the session is full, when a semantic
+    /// attachment claims geometry, when a terminal attachment states no dimensions, or when the
+    /// dimensions themselves are not ones this host serves.
+    pub fn admissible(&self, params: &SessionAttachParams) -> Result<Option<Dimensions>> {
         // A session serves a bounded number of attachments. The bound is the protocol's, and it
         // is checked before an identifier is allocated so a refused attach leaves nothing behind.
         if self.attachments.len() >= kr_protocol::limits::MAX_CONCURRENT_ATTACHMENTS {
@@ -322,18 +323,53 @@ impl AttachmentTable {
                 "a semantic attachment cannot claim geometry".to_owned(),
             ));
         }
-        let dimensions = match (params.mode, params.dimensions.as_ref()) {
-            (AttachMode::Terminal, None) => {
-                return Err(WorkerError::InvalidArgument(
-                    "a terminal attachment states its dimensions".to_owned(),
-                ));
-            }
+        match (params.mode, params.dimensions.as_ref()) {
+            (AttachMode::Terminal, None) => Err(WorkerError::InvalidArgument(
+                "a terminal attachment states its dimensions".to_owned(),
+            )),
             (_, Some(dimensions)) => {
                 admit(*dimensions)?;
-                Some(*dimensions)
+                Ok(Some(*dimensions))
             }
-            (_, None) => None,
-        };
+            (_, None) => Ok(None),
+        }
+    }
+
+    /// Decides whether one attachment may be given the geometry.
+    ///
+    /// The eligibility half of [`Self::transfer`], for the same reason [`Self::admissible`] exists:
+    /// a transfer to an attachment that holds no eligible claim is a refusal this host can decide,
+    /// and deciding it inside the effect would make it an uncertain outcome instead of a rejection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::UnknownAttachment`] when the identifier names no attachment of this
+    /// session, and [`WorkerError::InvalidArgument`] when it holds no eligible geometry claim.
+    pub fn transferable(&self, id: AttachmentId) -> Result<()> {
+        let attachment = self.get(id).ok_or_else(|| unknown(id))?;
+        if attachment.is_eligible() {
+            Ok(())
+        } else {
+            Err(WorkerError::InvalidArgument(
+                "the selected attachment holds no eligible geometry claim".to_owned(),
+            ))
+        }
+    }
+
+    /// Adds an attachment.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever [`Self::admissible`] refuses, and [`WorkerError::ResourceUnavailable`]
+    /// when the session has exhausted its join order.
+    pub fn attach(
+        &mut self,
+        params: &SessionAttachParams,
+        granted: CanonicalSet<AttachmentCapability>,
+        id: AttachmentId,
+        now: TimestampMs,
+    ) -> Result<(AttachmentSummary, GeometryChange)> {
+        let dimensions = self.admissible(params)?;
         // Join order is what decides succession, so an ordinal that wrapped would put a new
         // attachment in front of older claims - or land on an occupied entry. The counter is
         // refused before it is spent rather than allowed to come round.
@@ -404,22 +440,13 @@ impl AttachmentTable {
     /// Returns [`WorkerError::UnknownAttachment`] when the identifier is not present, and
     /// [`WorkerError::InvalidArgument`] when the attachment may not claim geometry.
     pub fn configure(&mut self, id: AttachmentId, claim_geometry: bool) -> Result<GeometryChange> {
+        self.check_configure(id, claim_geometry)?;
         let ordinal = *self.by_id.get(&id).ok_or_else(|| unknown(id))?;
         {
             let attachment = self
                 .attachments
                 .get_mut(&ordinal)
                 .ok_or_else(|| unknown(id))?;
-            if claim_geometry && !attachment.mode.may_claim_geometry() {
-                return Err(WorkerError::InvalidArgument(
-                    "a semantic attachment cannot claim geometry".to_owned(),
-                ));
-            }
-            if claim_geometry && !attachment.granted.contains(&AttachmentCapability::Geometry) {
-                return Err(WorkerError::InvalidArgument(
-                    "this attachment does not hold the geometry right".to_owned(),
-                ));
-            }
             attachment.claim_geometry = claim_geometry;
         }
         if !claim_geometry && self.owner == Some(id) {
@@ -448,7 +475,7 @@ impl AttachmentTable {
         id: AttachmentId,
         dimensions: Dimensions,
     ) -> Result<TerminalPresentationMode> {
-        admit(dimensions)?;
+        self.check_viewport(id, dimensions)?;
         let ordinal = *self.by_id.get(&id).ok_or_else(|| unknown(id))?;
         let canonical = self.dimensions;
         {
@@ -600,6 +627,57 @@ impl AttachmentTable {
             .map(|attachment| attachment.dimensions)
     }
 
+    /// Decides whether one attachment may take or drop a geometry claim.
+    ///
+    /// Nothing changes here. Section 9 requires a refusal the host can decide to be a rejection
+    /// decided before the dispatch marker, so this is called by the admission path and by
+    /// [`Self::configure`] itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::UnknownAttachment`] when the identifier names no attachment, and
+    /// [`WorkerError::InvalidArgument`] when a semantic attachment claims geometry or the
+    /// attachment does not hold the geometry right.
+    pub fn check_configure(&self, id: AttachmentId, claim_geometry: bool) -> Result<()> {
+        let attachment = self.get(id).ok_or_else(|| unknown(id))?;
+        if claim_geometry && !attachment.mode.may_claim_geometry() {
+            return Err(WorkerError::InvalidArgument(
+                "a semantic attachment cannot claim geometry".to_owned(),
+            ));
+        }
+        if claim_geometry && !attachment.granted.contains(&AttachmentCapability::Geometry) {
+            return Err(WorkerError::InvalidArgument(
+                "this attachment does not hold the geometry right".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Decides whether one attachment may report a viewport of these dimensions.
+    ///
+    /// Nothing changes here, for the same reason [`Self::check_configure`] exists. A semantic
+    /// attachment has no terminal presentation at all, so a viewport report from one is a refusal
+    /// this host can decide rather than an effect that fails part way.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::UnknownAttachment`] when the identifier names no attachment, and
+    /// [`WorkerError::InvalidArgument`] when the dimensions violate a constraint or the attachment
+    /// has no terminal presentation.
+    pub fn check_viewport(&self, id: AttachmentId, dimensions: Dimensions) -> Result<()> {
+        admit(dimensions)?;
+        let attachment = self.get(id).ok_or_else(|| unknown(id))?;
+        if attachment
+            .presentation(self.dimensions, self.carryable)
+            .is_none()
+        {
+            return Err(WorkerError::InvalidArgument(
+                "a semantic attachment has no terminal presentation".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Checks a resize without changing anything.
     ///
     /// The caller asks the kernel between this and [`AttachmentTable::resize`], so a refused
@@ -663,12 +741,7 @@ impl AttachmentTable {
         if self.epoch != expected_epoch {
             return Err(WorkerError::NotGeometryOwner);
         }
-        let attachment = self.get(id).ok_or_else(|| unknown(id))?;
-        if !attachment.is_eligible() {
-            return Err(WorkerError::InvalidArgument(
-                "the selected attachment holds no eligible geometry claim".to_owned(),
-            ));
-        }
+        self.transferable(id)?;
         Ok(self.install_owner(Some(id)))
     }
 

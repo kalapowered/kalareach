@@ -12,6 +12,10 @@ use schemars::{JsonSchema, Schema, SchemaGenerator, generate::SchemaSettings, js
 use serde_json::{Map, Value, json};
 
 use crate::account::{MembershipLease, OrganisationPolicy, PolicyAuthority};
+use crate::action::{
+    ActionObservation, ExpirationTombstone, FenceEvidence, FencedAction, RetrustEvidence,
+    RevocationBarrier, TimeAdapterReading, TimeCheckpoint,
+};
 use crate::actor::ActorEnvelope;
 use crate::archive::{
     ArchiveDescriptor, BackupGenerationPublication, BackupWriterRecord, RecoveryBundle,
@@ -142,6 +146,7 @@ pub fn protocol_schema() -> Value {
     roots! {
         generator, properties,
         "action_cancel_params" => ActionCancelParams,
+        "action_observation" => ActionObservation,
         "action_cancel_result" => ActionCancelResult,
         "action_read_params" => ActionReadParams,
         "action_read_result" => ActionReadResult,
@@ -166,6 +171,9 @@ pub fn protocol_schema() -> Value {
         "direct_challenge" => DirectChallenge,
         "direct_redeem_proof" => DirectRedeemProof,
         "envelope_plaintext" => EnvelopePlaintext,
+        "expiration_tombstone" => ExpirationTombstone,
+        "fence_evidence" => FenceEvidence,
+        "fenced_action" => FencedAction,
         "environment_list_result" => EnvironmentListResult,
         "events_snapshot_params" => EventsSnapshotParams,
         "events_snapshot_result" => EventsSnapshotResult,
@@ -237,7 +245,9 @@ pub fn protocol_schema() -> Value {
         "request" => Request,
         "response" => Response,
         "resync_required" => ResyncRequired,
+        "retrust_evidence" => RetrustEvidence,
         "revocation_acknowledgement" => RevocationAcknowledgement,
+        "revocation_barrier" => RevocationBarrier,
         "revocation_request" => RevocationRequest,
         "root_command_accepted_params" => RootCommandAcceptedParams,
         "root_command_accepted_result" => RootCommandAcceptedResult,
@@ -279,6 +289,8 @@ pub fn protocol_schema() -> Value {
         "stream_header" => StreamHeader,
         "sync_conflict_copy" => SyncConflictCopy,
         "sync_object_record" => SyncObjectRecord,
+        "time_adapter_reading" => TimeAdapterReading,
+        "time_checkpoint" => TimeCheckpoint,
         "terminal_geometry_transfer_params" => TerminalGeometryTransferParams,
         "terminal_resize_params" => TerminalResizeParams,
         "worker_descriptor" => WorkerDescriptor,

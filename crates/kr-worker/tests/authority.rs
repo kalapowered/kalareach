@@ -497,6 +497,7 @@ async fn only_the_controller_that_holds_authority_announces_a_revision() {
     let notice = kr_protocol::worker::AuthorityRevisionNotice {
         environment_id: host.environment_id,
         revision: kr_protocol::ids::AuthorityRevision::new(4),
+        evidence_from: 0,
     };
     cli.writer()
         .write_message(&kr_protocol::envelope::ControlFrame::AuthorityRevision(

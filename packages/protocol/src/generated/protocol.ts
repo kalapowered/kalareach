@@ -20,6 +20,10 @@ export type DiagnosticId = string
 export type RejectionReason =
   'admission_failed' | 'expired' | 'cancelled' | 'revoked' | 'stale_preconditions'
 /**
+ * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+ */
+export type U64 = string
+/**
  * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
  */
 export type ParamsValue = unknown
@@ -119,10 +123,6 @@ export type RevocationRequestId = string
  * A versioned capability name. Capabilities describe feasibility, never authority.
  */
 export type CapabilityId = string
-/**
- * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
- */
-export type U64 = string
 /**
  * The host's answer to a client proof.
  */
@@ -879,6 +879,32 @@ export type RelayLeaseRequest =
       }
     }
 /**
+ * What is offered as grounds for returning a host's wall clock to trusted.
+ */
+export type RetrustEvidence =
+  | {
+      /**
+       * The authority as the host's configuration names it.
+       */
+      authority: string
+      kind: 'host_time_authority'
+      reading: TimeAdapterReading
+    }
+  | {
+      /**
+       * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+       */
+      action_digest: string
+      kind: 'owner_retrust'
+    }
+  | {
+      /**
+       * One paired device.
+       */
+      device_id: string
+      kind: 'paired_peer'
+    }
+/**
  * One published editor fence. An identity from an unacknowledged exchange names no fence.
  */
 export type FenceId = string
@@ -970,6 +996,7 @@ export type SyncRevisionId = string
 export interface KalaReachProtocol {
   action_cancel_params?: ActionCancelParams
   action_cancel_result?: ActionCancelResult
+  action_observation?: ActionObservation
   action_read_params?: ActionReadParams
   action_read_result?: ActionReadResult
   action_window?: ActionWindow
@@ -1023,6 +1050,9 @@ export interface KalaReachProtocol {
   events_snapshot_result?: EventsSnapshotResult
   events_subscribe_params?: EventsSubscribeParams
   events_subscribe_result?: EventsSubscribeResult
+  expiration_tombstone?: ExpirationTombstone
+  fence_evidence?: FenceEvidence
+  fenced_action?: FencedAction
   forwarded_mutation?: ForwardedMutation
   forwarded_request?: ForwardedRequest
   generation_accepted?: GenerationAccepted
@@ -1208,7 +1238,9 @@ export interface KalaReachProtocol {
   request?: Request
   response?: Response
   resync_required?: ResyncRequired
+  retrust_evidence?: RetrustEvidence
   revocation_acknowledgement?: RevocationAcknowledgement
+  revocation_barrier?: RevocationBarrier
   revocation_request?: RevocationRequest
   root_command_accepted_params?: RootCommandAcceptedParams
   root_command_accepted_result?: RootCommandAcceptedResult
@@ -1252,6 +1284,8 @@ export interface KalaReachProtocol {
   sync_object_record?: SyncObjectRecord
   terminal_geometry_transfer_params?: TerminalGeometryTransferParams
   terminal_resize_params?: TerminalResizeParams
+  time_adapter_reading?: TimeAdapterReading1
+  time_checkpoint?: TimeCheckpoint
   upload_begin_params?: UploadBeginParams
   upload_begin_result?: UploadBeginResult
   upload_cancel_params?: UploadCancelParams
@@ -1415,6 +1449,43 @@ export interface ProtocolError {
    * How the client may react. It must equal [`ErrorCode::retry_category`] for the code.
    */
   retry: 'no_retry' | 'transient' | 'resync' | 'configuration_change' | 'outcome_unknown'
+}
+/**
+ * One piece of additive evidence about an action.
+ *
+ * The word in a user interface is "observed", and it means evidence was observed. It does not
+ * mean the mutation is confirmed, which is why every observation carries the provenance a reader
+ * needs in order to know which of the two it is looking at.
+ */
+export interface ActionObservation {
+  /**
+   * The action the evidence is about.
+   */
+  action_id: string
+  /**
+   * What the evidence claims happened.
+   */
+  claimed_result: 'applied' | 'refused' | 'indeterminate'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  observed_at_ms: string
+  /**
+   * Where the evidence came from.
+   */
+  provenance: 'authoritative_interface' | 'upstream_correlation' | 'inferred_screen' | 'user_report'
+  /**
+   * The position in the source stream the evidence was read from, when there is one.
+   */
+  source_cursor: U64 | null
+  /**
+   * The subject the evidence is about, named the way its own interface names it.
+   */
+  subject: string
+  /**
+   * The subject's version at the moment of the observation, when the subject has one.
+   */
+  subject_revision: U64 | null
 }
 /**
  * What `action.read` names.
@@ -1601,11 +1672,11 @@ export interface AttachmentContribution {
    */
   insertion_method: 'typed_submission' | 'verified_composer_insertion' | 'manual_terminal_workflow'
   /**
-   * The largest file the selected model accepts, in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_byte_len: string
   /**
-   * How many attachments one draft may carry.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_count: string
   /**
@@ -1668,7 +1739,7 @@ export interface DraftAttachment {
  */
 export interface AttachmentHandle {
   /**
-   * The verified length in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   byte_len: string
   /**
@@ -1726,7 +1797,7 @@ export interface AttachmentHandle {
  */
 export interface AttachmentPreview {
   /**
-   * The thumbnail's height in pixels.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   height: string
   /**
@@ -1734,11 +1805,11 @@ export interface AttachmentPreview {
    */
   source_format: 'png' | 'jpeg' | 'webp' | 'gif_first_frame'
   /**
-   * The source's height in pixels.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   source_height: string
   /**
-   * The source's width in pixels.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   source_width: string
   /**
@@ -1746,7 +1817,7 @@ export interface AttachmentPreview {
    */
   thumbnail: string
   /**
-   * The thumbnail's width in pixels.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   width: string
 }
@@ -2096,7 +2167,7 @@ export interface QuestionSource {
  */
 export interface ProcessStartIdentity {
   /**
-   * The operating-system process identifier.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   pid: string
   /**
@@ -2104,7 +2175,7 @@ export interface ProcessStartIdentity {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * The kernel's start value in the source's own units.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   start_value: string
 }
@@ -2252,7 +2323,7 @@ export interface ArchiveDescriptor {
    */
   manifest_key_wraps: SealedKeyWrap[]
   /**
-   * The descriptor version.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   version: string
 }
@@ -2261,7 +2332,7 @@ export interface ArchiveDescriptor {
  */
 export interface EncryptedObjectRef {
   /**
-   * The stored size of the encrypted object, in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   encrypted_len: string
   /**
@@ -2365,11 +2436,11 @@ export interface AttachmentContribution1 {
    */
   insertion_method: 'typed_submission' | 'verified_composer_insertion' | 'manual_terminal_workflow'
   /**
-   * The largest file the selected model accepts, in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_byte_len: string
   /**
-   * How many attachments one draft may carry.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_count: string
   /**
@@ -2394,7 +2465,7 @@ export interface AttachmentContribution1 {
  */
 export interface AttachmentHandle1 {
   /**
-   * The verified length in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   byte_len: string
   /**
@@ -2497,11 +2568,11 @@ export interface AttachmentSummary {
  */
 export interface Dimensions {
   /**
-   * Columns, from 1 to 2,048.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   columns: string
   /**
-   * Rows, from 1 to 1,024.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
 }
@@ -2525,11 +2596,11 @@ export interface AttachmentViewportParams {
  */
 export interface Dimensions1 {
   /**
-   * Columns, from 1 to 2,048.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   columns: string
   /**
-   * Rows, from 1 to 1,024.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
 }
@@ -2565,18 +2636,39 @@ export interface GeometryState {
  */
 export interface Dimensions2 {
   /**
-   * Columns, from 1 to 2,048.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   columns: string
   /**
-   * Rows, from 1 to 1,024.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
 }
 /**
  * A worker's acknowledgement that it is acting under an authority revision.
+ *
+ * Section 9 makes the acknowledgement two statements rather than one: the revision is installed,
+ * **and** the undispatched actions it affects have been rejected or fenced. The two lists are
+ * therefore part of the acknowledgement rather than something a caller has to ask for
+ * afterwards. An action whose dispatch transition had already won the serial race is named in
+ * `possibly_executed`.
+ *
+ * The evidence defaults to absent on the wire. A worker keeps running across a controller
+ * replacement, so during an update a new daemon can be talking to a worker built before the
+ * evidence existed, and architecture decision C keeps local support until the last such worker
+ * exits. Defaulting lets that worker's two-field acknowledgement decode instead of failing the
+ * revocation outright, and the daemon can still tell it apart from a worker whose fence found
+ * nothing, because absent and empty are different values.
  */
 export interface AuthorityRevisionAck {
+  /**
+   * What the fence did, when this worker reports it.
+   *
+   * Absent is not the same as empty. Empty says the fence ran and found nothing; absent says
+   * this worker does not report fence evidence at all, and a daemon that read the two the same
+   * way would call a revocation complete on the strength of a worker that never said so.
+   */
+  fence?: FenceEvidence | null
   /**
    * The host's ordered authority revision. Only the host issues its own revisions.
    */
@@ -2585,6 +2677,80 @@ export interface AuthorityRevisionAck {
    * One KalaReach terminal session.
    */
   session_id: string
+}
+/**
+ * What a worker's fence did, as one acknowledgement carries it.
+ *
+ * The lists are the acknowledgement rather than an addition to it: section 9 makes the
+ * acknowledgement a statement that the revision is installed **and** that the undispatched
+ * actions it affects have been rejected or named. A worker that reports no evidence at all is a
+ * different thing from one that reports empty lists, which is why this travels as a whole.
+ */
+export interface FenceEvidence {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted: string
+  /**
+   * The actions whose dispatch transition had already won the serial race, in this page.
+   *
+   * Each one's receipt state says how much is known about what it did; the list is not only the
+   * uncertain ones.
+   */
+  possibly_executed: PossiblyExecutedAction[]
+  /**
+   * The undispatched intents the fence rejected, in this page.
+   */
+  rejected_actions: FencedAction[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  remaining: string
+}
+/**
+ * An action whose dispatch transition had already won the serial race when the fence ran.
+ *
+ * The set is defined by the race rather than by the outcome, which is what section 9 says: an
+ * action whose dispatch transition already won it is named in the result. [`Self::state`] is what
+ * says how much is known about what it did, from `dispatching` through `unknown` to an
+ * authoritative `applied` or `refused`, so a person reading a revocation sees which operations
+ * went out under the authority that has just been withdrawn and which of them are still
+ * uncertain.
+ */
+export interface PossiblyExecutedAction {
+  /**
+   * The action.
+   */
+  action_id: string
+  /**
+   * The actor that submitted it.
+   */
+  actor_id: string
+  /**
+   * The method it was submitted under.
+   */
+  method: string
+  /**
+   * The receipt state it stood at when the fence ran.
+   */
+  state: 'received' | 'accepted' | 'dispatching' | 'applied' | 'refused' | 'rejected' | 'unknown'
+}
+/**
+ * One action a fence named, with the actor whose action it was.
+ *
+ * The actor is part of the name because the de-duplication key is the actor and the action
+ * together: two actors may each have used one identifier, and an identifier on its own would name
+ * either of them.
+ */
+export interface FencedAction {
+  /**
+   * The action.
+   */
+  action_id: string
+  /**
+   * The actor whose action it was.
+   */
+  actor_id: string
 }
 /**
  * The host's current authority revision, announced to a worker by the controller that holds it.
@@ -2600,6 +2766,19 @@ export interface AuthorityRevisionNotice {
    * The environment whose authority changed.
    */
   environment_id: string
+  /**
+   * How many names of this revision's fence evidence the daemon already has.
+   *
+   * Nought asks for the first page, which is what a first announcement is. An announcement that
+   * carries more is asking for the rest of what the previous answer said remained, from the
+   * name after the last one it carried.
+   *
+   * It is absent from the wire when it is nought, so an announcement that asks for a first page
+   * is byte for byte what a worker built before paging existed expects. A daemon only ever
+   * sends a continuation to a worker whose own answer reported names remaining, and a worker
+   * that reports no evidence at all never does.
+   */
+  evidence_from?: number
   /**
    * The host's ordered authority revision. Only the host issues its own revisions.
    */
@@ -2680,7 +2859,7 @@ export interface ArchiveDescriptor1 {
    */
   manifest_key_wraps: SealedKeyWrap[]
   /**
-   * The descriptor version.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   version: string
 }
@@ -2800,23 +2979,23 @@ export interface ClientOffer {
  */
 export interface ReceiveLimits {
   /**
-   * Maximum complete attachment frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_attachment_frame_len: string
   /**
-   * Maximum complete control frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_control_frame_len: string
   /**
-   * Maximum complete input frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_input_frame_len: string
   /**
-   * Maximum outstanding mutations per session.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_outstanding_mutations: string
   /**
-   * Maximum queued bytes before the peer is resynchronised.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_send_queue_bytes: string
 }
@@ -2918,7 +3097,7 @@ export interface TerminatedProcess {
  */
 export interface ProcessStartIdentity1 {
   /**
-   * The operating-system process identifier.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   pid: string
   /**
@@ -2926,7 +3105,7 @@ export interface ProcessStartIdentity1 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * The kernel's start value in the source's own units.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   start_value: string
 }
@@ -2998,23 +3177,23 @@ export interface LocalHello {
  */
 export interface ReceiveLimits1 {
   /**
-   * Maximum complete attachment frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_attachment_frame_len: string
   /**
-   * Maximum complete control frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_control_frame_len: string
   /**
-   * Maximum complete input frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_input_frame_len: string
   /**
-   * Maximum outstanding mutations per session.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_outstanding_mutations: string
   /**
-   * Maximum queued bytes before the peer is resynchronised.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_send_queue_bytes: string
 }
@@ -3095,23 +3274,23 @@ export interface BootIdentity {
  */
 export interface ReceiveLimits2 {
   /**
-   * Maximum complete attachment frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_attachment_frame_len: string
   /**
-   * Maximum complete control frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_control_frame_len: string
   /**
-   * Maximum complete input frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_input_frame_len: string
   /**
-   * Maximum outstanding mutations per session.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_outstanding_mutations: string
   /**
-   * Maximum queued bytes before the peer is resynchronised.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_send_queue_bytes: string
 }
@@ -3390,7 +3569,7 @@ export interface BootIdentity1 {
  */
 export interface ProcessStartIdentity2 {
   /**
-   * The operating-system process identifier.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   pid: string
   /**
@@ -3398,7 +3577,7 @@ export interface ProcessStartIdentity2 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * The kernel's start value in the source's own units.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   start_value: string
 }
@@ -3519,11 +3698,11 @@ export interface WorkerReady {
  */
 export interface Dimensions3 {
   /**
-   * Columns, from 1 to 2,048.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   columns: string
   /**
-   * Rows, from 1 to 1,024.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
 }
@@ -3532,7 +3711,7 @@ export interface Dimensions3 {
  */
 export interface ProcessStartIdentity3 {
   /**
-   * The operating-system process identifier.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   pid: string
   /**
@@ -3540,7 +3719,7 @@ export interface ProcessStartIdentity3 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * The kernel's start value in the source's own units.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   start_value: string
 }
@@ -3599,7 +3778,7 @@ export interface BootIdentity2 {
  */
 export interface ProcessStartIdentity4 {
   /**
-   * The operating-system process identifier.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   pid: string
   /**
@@ -3607,7 +3786,7 @@ export interface ProcessStartIdentity4 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * The kernel's start value in the source's own units.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   start_value: string
 }
@@ -4048,7 +4227,7 @@ export interface DownloadBeginResult {
  */
 export interface ChunkDescriptor {
   /**
-   * Its exact length.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   byte_len: string
   /**
@@ -4056,7 +4235,7 @@ export interface ChunkDescriptor {
    */
   digest: string
   /**
-   * The chunk's position in the layout.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   index: string
 }
@@ -4065,15 +4244,15 @@ export interface ChunkDescriptor {
  */
 export interface ChunkLayout {
   /**
-   * How many chunks the transfer has.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   chunk_count: string
   /**
-   * Bytes per chunk, except the last.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   chunk_len: string
   /**
-   * Length of the final chunk. Equal to `chunk_len` when the size divides exactly.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   last_chunk_len: string
 }
@@ -4109,7 +4288,7 @@ export interface DownloadChunkResult {
  */
 export interface ChunkDescriptor1 {
   /**
-   * Its exact length.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   byte_len: string
   /**
@@ -4117,7 +4296,7 @@ export interface ChunkDescriptor1 {
    */
   digest: string
   /**
-   * The chunk's position in the layout.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   index: string
 }
@@ -4630,11 +4809,11 @@ export interface DesktopBinding {
  */
 export interface Dimensions4 {
   /**
-   * Columns, from 1 to 2,048.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   columns: string
   /**
-   * Rows, from 1 to 1,024.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
 }
@@ -4647,7 +4826,7 @@ export interface Dimensions4 {
  */
 export interface ProcessStartIdentity5 {
   /**
-   * The operating-system process identifier.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   pid: string
   /**
@@ -4655,7 +4834,7 @@ export interface ProcessStartIdentity5 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * The kernel's start value in the source's own units.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   start_value: string
 }
@@ -4714,6 +4893,55 @@ export interface HistoryGap {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   to_cursor: string
+}
+/**
+ * The record an expired object leaves behind.
+ *
+ * It outlives a retrust deliberately. Section 9 keeps old expiration tombstones when the wall
+ * clock becomes trusted again, which is what stops a clock correction from reviving something
+ * that had already run out.
+ */
+export interface ExpirationTombstone {
+  boot_identity: BootIdentity4
+  /**
+   * Whether the object could still be presented in another boot.
+   *
+   * An object bounded only by a continuous deadline in one boot is refused in that boot by a
+   * clock that only moves forward, and in any other boot by the boot identity its deadline
+   * belongs to. Nothing but this record refuses one that also carries a trusted UTC deadline,
+   * which is why a host that has to bound its tombstone table can let the first kind go and
+   * never the second.
+   *
+   * A record that does not say defaults to `true`, which is the answer that keeps the
+   * tombstone: a host reading back a tombstone from a build that did not record this cannot
+   * tell which kind it was, and dropping one it should have kept is the failure that matters.
+   */
+  cross_reboot?: boolean
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expired_at_ms: string
+  /**
+   * The object, named the way its own store names it.
+   */
+  object: string
+  /**
+   * Why it expired.
+   */
+  reason: 'continuous_deadline' | 'trusted_utc_deadline'
+}
+/**
+ * The boot the expiry was observed in.
+ */
+export interface BootIdentity4 {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
 }
 /**
  * A stored backup checkpoint a pairing transfers.
@@ -4936,23 +5164,23 @@ export interface HostSelection {
  */
 export interface ReceiveLimits3 {
   /**
-   * Maximum complete attachment frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_attachment_frame_len: string
   /**
-   * Maximum complete control frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_control_frame_len: string
   /**
-   * Maximum complete input frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_input_frame_len: string
   /**
-   * Maximum outstanding mutations per session.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_outstanding_mutations: string
   /**
-   * Maximum queued bytes before the peer is resynchronised.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_send_queue_bytes: string
 }
@@ -5054,7 +5282,7 @@ export interface DoctorCheck {
  * The result of `host.info`.
  */
 export interface HostInfoResult {
-  boot_identity: BootIdentity4
+  boot_identity: BootIdentity5
   /**
    * The controller build.
    */
@@ -5088,7 +5316,7 @@ export interface HostInfoResult {
 /**
  * The boot this host is running.
  */
-export interface BootIdentity4 {
+export interface BootIdentity5 {
   /**
    * Where the value came from.
    */
@@ -7693,15 +7921,11 @@ export interface ProjectedRow {
  */
 export interface CellRun {
   /**
-   * How many cells the run occupies, counting a wide cell as two.
-   *
-   * A client draws from `column` and advances by this, so a destination whose own width model
-   * disagrees with the session's is corrected at the next run rather than shifting everything
-   * after it.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   cells: string
   /**
-   * The canonical column of the first cell, zero-based.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   column: string
   /**
@@ -8146,11 +8370,11 @@ export interface ProjectedCursor1 {
  */
 export interface Dimensions5 {
   /**
-   * Columns, from 1 to 2,048.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   columns: string
   /**
-   * Rows, from 1 to 1,024.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
 }
@@ -10136,6 +10360,48 @@ export interface ResyncRequired {
   reason: 'send_queue_full' | 'history_evicted' | 'projection_reset'
 }
 /**
+ * The reading it produced.
+ */
+export interface TimeAdapterReading {
+  /**
+   * The service or interface the reading came from.
+   */
+  api: string
+  /**
+   * The platform's own estimate of its error, in microseconds, when it reports one.
+   */
+  estimated_error_us: U64 | null
+  /**
+   * Which platform adapter produced this reading.
+   */
+  platform: string
+  /**
+   * What the platform says is disciplining its clock.
+   */
+  source: 'network_time_service' | 'pulse_per_second' | 'unsynchronised' | 'unclassified'
+  /**
+   * What the platform says the state of that synchronisation is.
+   */
+  status:
+    | 'ok'
+    | 'insert_leap'
+    | 'delete_leap'
+    | 'leap_in_progress'
+    | 'leap_recovering'
+    | 'error'
+    | 'unavailable'
+  /**
+   * The platform's own bound on how wrong its clock may be, in microseconds.
+   *
+   * Null means the platform reported no bound, which is not the same as a bound of zero.
+   */
+  uncertainty_us: U64 | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  wall_clock_ms: string
+}
+/**
  * The host's acknowledgement of one revocation request.
  */
 export interface RevocationAcknowledgement {
@@ -10168,6 +10434,63 @@ export interface RevocationAcknowledgement {
    * One signed revocation request published by a remote owner.
    */
   request_id: string
+}
+/**
+ * The result of installing an authority revision across every affected worker.
+ *
+ * Until every barrier holds, this is `pending` with per-worker status. Cutting a network path or
+ * waiting for a lease timer is not completion, because a paused worker could already be inside a
+ * dispatch transition, so nothing here treats the absence of an answer as an answer.
+ */
+export interface RevocationBarrier {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * One entry per affected worker.
+   */
+  workers: WorkerBarrier[]
+}
+/**
+ * One worker's half of a revocation barrier.
+ */
+export interface WorkerBarrier {
+  /**
+   * The revision the worker has installed, when it has installed one.
+   */
+  acknowledged_revision: AuthorityRevision | null
+  /**
+   * Why this worker's barrier has not held, or what is still outstanding about one that has.
+   */
+  detail: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  names_pending: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted_actions: string
+  /**
+   * The actions whose dispatch transition had already won the serial race.
+   *
+   * Each one's receipt state says how much is known about what it did; the list is
+   * not only the uncertain ones.
+   */
+  possibly_executed: PossiblyExecutedAction[]
+  /**
+   * The undispatched intents the fence rejected.
+   */
+  rejected_actions: FencedAction[]
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * What this worker's barrier has reached.
+   */
+  state: 'acknowledged' | 'ended' | 'pending'
 }
 /**
  * A remote owner's signed revocation request.
@@ -10415,7 +10738,7 @@ export interface PendingReaderInput {
  */
 export interface ProcessStartIdentity6 {
   /**
-   * The operating-system process identifier.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   pid: string
   /**
@@ -10423,7 +10746,7 @@ export interface ProcessStartIdentity6 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * The kernel's start value in the source's own units.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   start_value: string
 }
@@ -10477,7 +10800,7 @@ export interface EditorFence {
  */
 export interface ProcessStartIdentity7 {
   /**
-   * The operating-system process identifier.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   pid: string
   /**
@@ -10485,7 +10808,7 @@ export interface ProcessStartIdentity7 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * The kernel's start value in the source's own units.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   start_value: string
 }
@@ -11483,7 +11806,7 @@ export interface ArchiveManifest {
    */
   owner_device_id: string
   /**
-   * The manifest schema version.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   schema_version: string
 }
@@ -11502,7 +11825,7 @@ export interface ManifestObject {
  */
 export interface EncryptedObjectRef1 {
   /**
-   * The stored size of the encrypted object, in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   encrypted_len: string
   /**
@@ -11966,13 +12289,137 @@ export interface TerminalResizeParams {
  */
 export interface Dimensions6 {
   /**
-   * Columns, from 1 to 2,048.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   columns: string
   /**
-   * Rows, from 1 to 1,024.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
+}
+/**
+ * One reading of the platform time adapter.
+ *
+ * Every field is what the operating system reported, classified into this build's vocabulary. No
+ * field is a measurement of our own, and nothing here contacts a time server: section 9 requires
+ * the actual supported platform service and forbids an invented universal authenticated call.
+ */
+export interface TimeAdapterReading1 {
+  /**
+   * The service or interface the reading came from.
+   */
+  api: string
+  /**
+   * The platform's own estimate of its error, in microseconds, when it reports one.
+   */
+  estimated_error_us: U64 | null
+  /**
+   * Which platform adapter produced this reading.
+   */
+  platform: string
+  /**
+   * What the platform says is disciplining its clock.
+   */
+  source: 'network_time_service' | 'pulse_per_second' | 'unsynchronised' | 'unclassified'
+  /**
+   * What the platform says the state of that synchronisation is.
+   */
+  status:
+    | 'ok'
+    | 'insert_leap'
+    | 'delete_leap'
+    | 'leap_in_progress'
+    | 'leap_recovering'
+    | 'error'
+    | 'unavailable'
+  /**
+   * The platform's own bound on how wrong its clock may be, in microseconds.
+   *
+   * Null means the platform reported no bound, which is not the same as a bound of zero.
+   */
+  uncertainty_us: U64 | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  wall_clock_ms: string
+}
+/**
+ * A durable mark of what this host's wall clock read, and what stood behind it.
+ *
+ * The boot identity is part of it because a continuous reading means nothing outside the boot it
+ * was taken in: the clock restarts, so a deadline from another boot reads as long past rather
+ * than as time remaining.
+ */
+export interface TimeCheckpoint {
+  boot_identity: BootIdentity6
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  continuous_ms: string
+  reading: TimeAdapterReading2
+  /**
+   * Whether the wall clock was trusted at the mark.
+   */
+  trust: 'trusted' | 'unresolved'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  wall_clock_ms: string
+}
+/**
+ * The boot the mark was taken in.
+ */
+export interface BootIdentity6 {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
+}
+/**
+ * The platform reading that stood behind the mark.
+ */
+export interface TimeAdapterReading2 {
+  /**
+   * The service or interface the reading came from.
+   */
+  api: string
+  /**
+   * The platform's own estimate of its error, in microseconds, when it reports one.
+   */
+  estimated_error_us: U64 | null
+  /**
+   * Which platform adapter produced this reading.
+   */
+  platform: string
+  /**
+   * What the platform says is disciplining its clock.
+   */
+  source: 'network_time_service' | 'pulse_per_second' | 'unsynchronised' | 'unclassified'
+  /**
+   * What the platform says the state of that synchronisation is.
+   */
+  status:
+    | 'ok'
+    | 'insert_leap'
+    | 'delete_leap'
+    | 'leap_in_progress'
+    | 'leap_recovering'
+    | 'error'
+    | 'unavailable'
+  /**
+   * The platform's own bound on how wrong its clock may be, in microseconds.
+   *
+   * Null means the platform reported no bound, which is not the same as a bound of zero.
+   */
+  uncertainty_us: U64 | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  wall_clock_ms: string
 }
 /**
  * Parameters of `upload.begin`.
@@ -12043,15 +12490,15 @@ export interface UploadBeginResult {
  */
 export interface ChunkLayout1 {
   /**
-   * How many chunks the transfer has.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   chunk_count: string
   /**
-   * Bytes per chunk, except the last.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   chunk_len: string
   /**
-   * Length of the final chunk. Equal to `chunk_len` when the size divides exactly.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   last_chunk_len: string
 }
@@ -12103,7 +12550,7 @@ export interface UploadChunkParams {
  */
 export interface ChunkDescriptor2 {
   /**
-   * Its exact length.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   byte_len: string
   /**
@@ -12111,7 +12558,7 @@ export interface ChunkDescriptor2 {
    */
   digest: string
   /**
-   * The chunk's position in the layout.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   index: string
 }
@@ -12180,7 +12627,7 @@ export interface UploadFinishResult {
  */
 export interface AttachmentHandle2 {
   /**
-   * The verified length in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   byte_len: string
   /**
@@ -12288,15 +12735,15 @@ export interface UploadStatusResult {
  */
 export interface ChunkLayout2 {
   /**
-   * How many chunks the transfer has.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   chunk_count: string
   /**
-   * Bytes per chunk, except the last.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   chunk_len: string
   /**
-   * Length of the final chunk. Equal to `chunk_len` when the size divides exactly.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   last_chunk_len: string
 }
@@ -12308,7 +12755,7 @@ export interface ChunkLayout2 {
  * against, and the identity fields are what the challenge's answer must match.
  */
 export interface WorkerDescriptor {
-  boot_identity: BootIdentity5
+  boot_identity: BootIdentity7
   /**
    * The local alias.
    */
@@ -12348,7 +12795,7 @@ export interface WorkerDescriptor {
 /**
  * The boot the worker started in.
  */
-export interface BootIdentity5 {
+export interface BootIdentity7 {
   /**
    * Where the value came from.
    */
@@ -12367,7 +12814,7 @@ export interface BootIdentity5 {
  */
 export interface ProcessStartIdentity8 {
   /**
-   * The operating-system process identifier.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   pid: string
   /**
@@ -12375,7 +12822,7 @@ export interface ProcessStartIdentity8 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * The kernel's start value in the source's own units.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   start_value: string
 }

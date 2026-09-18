@@ -16,6 +16,9 @@
 //!   same actor retrying the same action gets the same receipt back; the same identifier carrying
 //!   a different payload is an `ID_CONFLICT`, not a second action.
 
+use kr_protocol::action::{
+    ActionObservation, ObservationProvenance, ObservedResult, PossiblyExecutedAction,
+};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActionId, ActorId, RequestId};
 use kr_protocol::method::{MethodName, MethodVersion};
@@ -29,7 +32,24 @@ use crate::error::{Result, WorkerError};
 pub const RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
+
+/// How often a live journal prunes records past the retention period.
+///
+/// Pruning at startup alone leaves a worker that has been up for longer than the retention period
+/// holding records it should have forgotten. An hour is short against 30 days and long against
+/// anything on the mutation path, so the cost falls on neither.
+pub const PRUNE_INTERVAL_MS: u64 = 60 * 60 * 1000;
+
+/// How many revocations may have names this journal still owes the daemon.
+///
+/// A revocation's names are kept until the daemon has taken them, whatever has been installed
+/// since, because section 9 requires the actions a fence could not take back to be named in the
+/// *result*. A daemon that stops asking would otherwise grow this journal one revocation at a
+/// time, so this is where that stops: past it the oldest revocation's names go, and the count of
+/// what went takes their place, so a page of them says how many are missing rather than carrying
+/// nothing and reading as a fence that named nothing.
+pub const MAX_HELD_REVOCATIONS: usize = 8;
 
 /// One mutation being admitted.
 #[derive(Clone, Debug)]
@@ -44,6 +64,9 @@ pub struct Submission {
     pub method_version: MethodVersion,
     /// The digest of everything the mutation names.
     pub payload_digest: Digest256,
+    /// The digest of what the mutation asks for, without the identifier, window, lifetime or
+    /// preconditions that differ between a first attempt and the later request that supersedes it.
+    pub subject_digest: Digest256,
     /// The complete mutation envelope, canonically encoded.
     ///
     /// A digest proves an identifier was reused with a different payload. It cannot tell a
@@ -63,6 +86,71 @@ pub struct Admission {
     pub receipt: Receipt,
     /// True when an existing receipt was returned instead of a new one being committed.
     pub deduplicated: bool,
+}
+
+/// What fencing this session for a revocation could and could not take back.
+///
+/// The names live in the journal rather than in this value, because a revocation's result has to
+/// survive what a worker's memory does not: a fence that failed part way, an acknowledgement lost
+/// on the way back, a page of evidence whose exchange failed, and the worker's own restart. What
+/// this carries is the counts one pass produced, which is what a caller needs to know whether the
+/// pass finished.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fenced {
+    /// How many undispatched intents this pass rejected.
+    pub rejected: u64,
+    /// How many actions past their dispatch marker this pass named.
+    pub possibly_executed: u64,
+}
+
+impl Fenced {
+    /// How many names this pass produced.
+    #[must_use]
+    pub const fn named(&self) -> u64 {
+        self.rejected.saturating_add(self.possibly_executed)
+    }
+}
+
+/// One page of a revocation's fence evidence, as an acknowledgement carries it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EvidencePage {
+    /// The names in this page, in the order the journal holds them.
+    pub rejected: Vec<kr_protocol::action::FencedAction>,
+    /// The actions past their dispatch marker in this page.
+    pub possibly_executed: Vec<PossiblyExecutedAction>,
+    /// How many names this journal holds that this page did not carry.
+    pub remaining: u64,
+    /// How many of this revocation's names this journal no longer holds.
+    ///
+    /// A revocation's names are kept until the daemon has taken them, and a bounded number of
+    /// revocations are kept at once. Past that the oldest names go, and this is what takes their
+    /// place: a page that carried nothing because there is nothing left says how much is missing
+    /// rather than reading as a fence that named nothing.
+    pub omitted: u64,
+}
+
+impl EvidencePage {
+    /// Returns what this page says, as an acknowledgement carries it.
+    #[must_use]
+    pub fn evidence(&self) -> kr_protocol::action::FenceEvidence {
+        kr_protocol::action::FenceEvidence {
+            rejected_actions: self.rejected.clone(),
+            possibly_executed: self.possibly_executed.clone(),
+            remaining: U64::new(self.remaining),
+            omitted: U64::new(self.omitted),
+        }
+    }
+}
+
+/// One transition a receipt is being advanced through.
+///
+/// The four travel together because they are one change: the state it reaches, why it reached it,
+/// the error that explains it and when it happened.
+struct Transition {
+    state: ReceiptState,
+    reason: Option<RejectionReason>,
+    error: Option<ProtocolError>,
+    now_ms: TimestampMs,
 }
 
 /// One recorded change to a receipt.
@@ -86,6 +174,27 @@ pub struct ReceiptEvent {
 #[derive(Debug)]
 pub struct Journal {
     connection: Connection,
+    pruned_at_ms: u64,
+    /// The boot this journal is being written in, recorded once.
+    ///
+    /// A record from another boot cannot have a live freshness window, because the windows a host
+    /// issues live in its memory and the host has restarted. That is what lets retention treat
+    /// this boot's records and an earlier boot's differently.
+    boot: Option<Vec<u8>>,
+}
+
+/// The continuous reading below which a record this boot wrote is old enough to collect.
+///
+/// A freshness window lasts at most [`kr_protocol::limits::MAX_ACTION_WINDOW`] on the machine's
+/// continuous clock, and no step of the wall clock shortens that. A record whose continuous
+/// reading is above this floor therefore belongs to an action whose own window may still admit
+/// the original request, which is exactly what its de-duplication record has to answer.
+fn continuous_floor() -> i64 {
+    i64::try_from(
+        kr_ipc::clock::boot_elapsed_ms()
+            .saturating_sub(kr_protocol::limits::MAX_ACTION_WINDOW.get()),
+    )
+    .unwrap_or(i64::MAX)
 }
 
 impl Journal {
@@ -121,18 +230,74 @@ impl Journal {
         connection
             .pragma_update(None, "foreign_keys", "ON")
             .map_err(unavailable)?;
-        let journal = Self { connection };
+        let journal = Self {
+            connection,
+            pruned_at_ms: 0,
+            boot: kr_ipc::identity::boot_identity()
+                .ok()
+                .map(|boot| boot.value.as_slice().to_vec()),
+        };
         journal.migrate()?;
         Ok(journal)
     }
 
+    /// Brings the database to the schema this build reads.
+    ///
+    /// The order is the contract, and it is the order a reader would not guess: the recorded
+    /// version is read **before** anything is created. A `CREATE TABLE IF NOT EXISTS` does not add
+    /// a column to a table that already exists, so creating this build's schema over an older one
+    /// would leave the old shape in place and then fail on the first index that names a new
+    /// column. The migrations run first, and only then does the current schema get created for a
+    /// database that has none.
     fn migrate(&self) -> Result<()> {
-        // Forward-only migrations keyed by a schema version. The code reads one current schema
-        // after migration; there is no second reader for an older shape.
+        self.connection
+            .execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")
+            .map_err(unavailable)?;
+        let recorded: Option<i64> = self
+            .connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .optional()
+            .map_err(unavailable)?;
+        match recorded {
+            None => {
+                self.create_current_schema()?;
+                self.connection
+                    .execute(
+                        "INSERT INTO schema_version (version) VALUES (?1)",
+                        params![SCHEMA_VERSION],
+                    )
+                    .map_err(unavailable)?;
+            }
+            Some(version) if version == SCHEMA_VERSION => {
+                // Every object of the current schema is created if it is absent, which is what
+                // makes reopening a journal this build wrote cheap and idempotent.
+                self.create_current_schema()?;
+            }
+            Some(1) => {
+                self.migrate_1_to_2()?;
+                self.migrate_2_to_3()?;
+                self.create_current_schema()?;
+            }
+            Some(2) => {
+                self.migrate_2_to_3()?;
+                self.create_current_schema()?;
+            }
+            Some(version) => {
+                // Migrations are forward-only and this build reads one schema. A journal written
+                // by a later build is refused rather than read as though it were this one.
+                return Err(unavailable_detail_owned(format!(
+                    "this journal is at schema version {version}; this build reads {SCHEMA_VERSION}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Creates every object of the current schema that is not already there.
+    fn create_current_schema(&self) -> Result<()> {
         self.connection
             .execute_batch(
-                "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-                 CREATE TABLE IF NOT EXISTS receipts (
+                "CREATE TABLE IF NOT EXISTS receipts (
                      actor_id             TEXT    NOT NULL,
                      action_id            BLOB    NOT NULL,
                      method               TEXT    NOT NULL,
@@ -141,8 +306,11 @@ impl Journal {
                      state                TEXT    NOT NULL,
                      reason               TEXT,
                      payload_digest       BLOB    NOT NULL,
+                     subject_digest       BLOB,
                      intent               BLOB,
                      accepted_deadline_ms INTEGER,
+                     created_boot         BLOB,
+                     created_continuous_ms INTEGER,
                      error_code           TEXT,
                      error_message        TEXT,
                      created_at_ms        INTEGER NOT NULL,
@@ -150,6 +318,22 @@ impl Journal {
                      PRIMARY KEY (actor_id, action_id)
                  );
                  CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts (created_at_ms);
+                 CREATE INDEX IF NOT EXISTS receipts_subject
+                     ON receipts (actor_id, subject_digest, state);
+                 CREATE INDEX IF NOT EXISTS receipts_action ON receipts (action_id);
+                 CREATE TABLE IF NOT EXISTS observations (
+                     sequence          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     actor_id          TEXT    NOT NULL,
+                     action_id         BLOB    NOT NULL,
+                     provenance        TEXT    NOT NULL,
+                     subject           TEXT    NOT NULL,
+                     subject_revision  INTEGER,
+                     source_cursor     INTEGER,
+                     claimed_result    TEXT    NOT NULL,
+                     observed_at_ms    INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS observations_action
+                     ON observations (actor_id, action_id, sequence);
                  CREATE TABLE IF NOT EXISTS results (
                      actor_id  TEXT NOT NULL,
                      action_id BLOB NOT NULL,
@@ -180,45 +364,207 @@ impl Journal {
                      recorded_at_ms INTEGER NOT NULL
                  );
                  CREATE INDEX IF NOT EXISTS host_events_recorded_at
-                     ON host_events (recorded_at_ms);",
+                     ON host_events (recorded_at_ms);
+                 CREATE TABLE IF NOT EXISTS host_time (
+                     id    INTEGER PRIMARY KEY CHECK (id = 1),
+                     state BLOB NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS fence_evidence (
+                     revision  INTEGER NOT NULL,
+                     position  INTEGER NOT NULL,
+                     kind      TEXT    NOT NULL,
+                     actor_id  TEXT    NOT NULL,
+                     action_id BLOB    NOT NULL,
+                     method    TEXT,
+                     state     TEXT,
+                     PRIMARY KEY (revision, position)
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS fence_evidence_named
+                     ON fence_evidence (revision, kind, actor_id, action_id);
+                 CREATE TABLE IF NOT EXISTS fence_state (
+                     id             INTEGER PRIMARY KEY CHECK (id = 1),
+                     since_sequence INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS fence_delivery (
+                     revision   INTEGER PRIMARY KEY,
+                     named      INTEGER NOT NULL,
+                     delivered  INTEGER NOT NULL,
+                     generation INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS fence_forgotten (
+                     id              INTEGER PRIMARY KEY CHECK (id = 1),
+                     before_revision INTEGER NOT NULL
+                 );",
             )
             .map_err(unavailable)?;
-        let recorded: Option<i64> = self
+        self.add_delivery_generation()?;
+        Ok(())
+    }
+
+    /// Gives an older delivery record the generation column it does not have.
+    ///
+    /// `CREATE TABLE IF NOT EXISTS` leaves a table that is already there alone, so a journal an
+    /// earlier build of this schema version wrote keeps its three-column `fence_delivery`. Nought
+    /// is the conservative value for what it holds: it matches no controller generation this host
+    /// accepts, so nothing an earlier build recorded is read as delivered to the daemon asking now,
+    /// and the names stay until that daemon says it has them.
+    fn add_delivery_generation(&self) -> Result<()> {
+        let mut statement = self
             .connection
-            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
-            .optional()
+            .prepare("SELECT name FROM pragma_table_info('fence_delivery')")
             .map_err(unavailable)?;
-        match recorded {
-            None => {
-                self.connection
-                    .execute(
-                        "INSERT INTO schema_version (version) VALUES (?1)",
-                        params![SCHEMA_VERSION],
-                    )
-                    .map_err(unavailable)?;
+        let columns = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(unavailable)?;
+        let mut present = false;
+        for column in columns {
+            if column.map_err(unavailable)? == "generation" {
+                present = true;
             }
-            Some(version) if version == SCHEMA_VERSION => {}
-            Some(1) => self.migrate_1_to_2()?,
-            Some(version) => {
-                // Migrations are forward-only and this build reads one schema. A journal written
-                // by a later build is refused rather than read as though it were this one.
-                return Err(unavailable_detail_owned(format!(
-                    "this journal is at schema version {version}; this build reads {SCHEMA_VERSION}"
-                )));
+        }
+        drop(statement);
+        if present {
+            return Ok(());
+        }
+        self.connection
+            .execute_batch(
+                "ALTER TABLE fence_delivery ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// Brings a version 2 journal forward.
+    ///
+    /// Version 2 recorded the payload digest but not the subject digest, kept no observations, and
+    /// wrote down nothing about the host's clocks.
+    ///
+    /// The subject digest is **derived** for every record whose retained intent can be decoded.
+    /// Version 2 stored the complete mutation, so its subject is recoverable, and recovering it is
+    /// what keeps section 23's rule working across an update: a record with no subject stands in
+    /// nothing's way, so leaving the column empty would let a fresh identifier quietly take the
+    /// place of an uncertain outcome admitted by the previous build. A record whose intent cannot
+    /// be decoded keeps an empty subject, because there is nothing to derive one from, and that is
+    /// recorded here rather than guessed at.
+    ///
+    /// This migration goes when there can no longer be a version 2 journal to read, which is the
+    /// first release.
+    fn migrate_2_to_3(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "BEGIN;
+                 ALTER TABLE receipts ADD COLUMN subject_digest BLOB;
+                 ALTER TABLE receipts ADD COLUMN created_boot BLOB;
+                 ALTER TABLE receipts ADD COLUMN created_continuous_ms INTEGER;
+                 CREATE INDEX IF NOT EXISTS receipts_subject
+                     ON receipts (actor_id, subject_digest, state);
+                 CREATE INDEX IF NOT EXISTS receipts_action ON receipts (action_id);
+                 CREATE TABLE IF NOT EXISTS observations (
+                     sequence          INTEGER PRIMARY KEY AUTOINCREMENT,
+                     actor_id          TEXT    NOT NULL,
+                     action_id         BLOB    NOT NULL,
+                     provenance        TEXT    NOT NULL,
+                     subject           TEXT    NOT NULL,
+                     subject_revision  INTEGER,
+                     source_cursor     INTEGER,
+                     claimed_result    TEXT    NOT NULL,
+                     observed_at_ms    INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS observations_action
+                     ON observations (actor_id, action_id, sequence);
+                 CREATE TABLE IF NOT EXISTS host_time (
+                     id    INTEGER PRIMARY KEY CHECK (id = 1),
+                     state BLOB NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS fence_evidence (
+                     revision  INTEGER NOT NULL,
+                     position  INTEGER NOT NULL,
+                     kind      TEXT    NOT NULL,
+                     actor_id  TEXT    NOT NULL,
+                     action_id BLOB    NOT NULL,
+                     method    TEXT,
+                     state     TEXT,
+                     PRIMARY KEY (revision, position)
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS fence_evidence_named
+                     ON fence_evidence (revision, kind, actor_id, action_id);
+                 CREATE TABLE IF NOT EXISTS fence_state (
+                     id             INTEGER PRIMARY KEY CHECK (id = 1),
+                     since_sequence INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS fence_delivery (
+                     revision   INTEGER PRIMARY KEY,
+                     named      INTEGER NOT NULL,
+                     delivered  INTEGER NOT NULL,
+                     generation INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS fence_forgotten (
+                     id              INTEGER PRIMARY KEY CHECK (id = 1),
+                     before_revision INTEGER NOT NULL
+                 );",
+            )
+            .map_err(unavailable)?;
+        let backfilled = self.backfill_subjects();
+        let finish = match backfilled {
+            Ok(()) => self
+                .connection
+                .execute_batch("UPDATE schema_version SET version = 3;\n COMMIT;")
+                .map_err(unavailable),
+            // The whole migration goes back rather than leaving a half-derived column behind a
+            // version number that claims this build wrote it.
+            Err(error) => {
+                let _ = self.connection.execute_batch("ROLLBACK;");
+                return Err(error);
             }
+        };
+        finish?;
+        Ok(())
+    }
+
+    /// Derives the subject digest of every migrated record whose retained intent decodes.
+    fn backfill_subjects(&self) -> Result<()> {
+        let rows: Vec<(String, Vec<u8>, Vec<u8>)> = {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT actor_id, action_id, intent FROM receipts WHERE intent IS NOT NULL",
+                )
+                .map_err(unavailable)?;
+            statement
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .map_err(unavailable)?
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(unavailable)?
+        };
+        for (actor_id, action_id, intent) in rows {
+            // A record this build cannot read is left alone. An intent that decodes but whose
+            // subject cannot be computed is the same case: neither is a reason to fail an update,
+            // and neither is a reason to write a subject that does not describe the record.
+            let Ok(mutation) = kr_cbor::from_canonical_slice::<
+                kr_protocol::envelope::MutationRequest,
+            >(&intent, &kr_cbor::Limits::DEFAULT) else {
+                continue;
+            };
+            let Ok(subject) = kr_protocol::action::subject_digest(&mutation) else {
+                continue;
+            };
+            self.connection
+                .execute(
+                    "UPDATE receipts SET subject_digest = ?3
+                     WHERE actor_id = ?1 AND action_id = ?2",
+                    params![actor_id, action_id, subject.as_bytes().as_slice()],
+                )
+                .map_err(unavailable)?;
         }
         Ok(())
     }
 
-    /// Brings a version 1 journal forward.
-    ///
-    /// Version 1 stored a digest of each mutation but not the mutation, and recorded no event for
-    /// a receipt's transitions. The intent column is added empty, because a receipt written by
-    /// version 1 genuinely has none; its de-duplication key, its state and its retained result all
-    /// survive, which is what a retry and a recovery need.
-    ///
-    /// This migration goes when there can no longer be a version 1 journal to read, which is the
-    /// first release.
     fn migrate_1_to_2(&self) -> Result<()> {
         self.connection
             .execute_batch(
@@ -340,9 +686,11 @@ impl Journal {
         transaction
             .execute(
                 "INSERT INTO receipts (actor_id, action_id, method, method_version, revision,
-                     state, reason, payload_digest, intent, accepted_deadline_ms, error_code,
-                     error_message, created_at_ms, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, NULL, NULL, ?10, ?10)",
+                     state, reason, payload_digest, subject_digest, intent, accepted_deadline_ms,
+                     created_boot, created_continuous_ms, error_code, error_message,
+                     created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8, ?9, ?10, ?11, ?12, NULL, NULL,
+                     ?13, ?13)",
                 params![
                     receipt.actor_id.as_str(),
                     receipt.action_id.get().as_bytes().as_slice(),
@@ -351,10 +699,13 @@ impl Journal {
                     1_i64,
                     ReceiptState::Accepted.as_str(),
                     receipt.payload_digest.as_bytes().as_slice(),
+                    submission.subject_digest.as_bytes().as_slice(),
                     submission.intent.as_slice(),
                     submission
                         .accepted_deadline_ms
                         .map(|deadline| i64::try_from(deadline.get()).unwrap_or(i64::MAX)),
+                    self.boot.clone(),
+                    i64::try_from(kr_ipc::clock::boot_elapsed_ms()).unwrap_or(i64::MAX),
                     i64::try_from(submission.now_ms.get()).unwrap_or(i64::MAX),
                 ],
             )
@@ -648,6 +999,38 @@ impl Journal {
         error: Option<ProtocolError>,
         now_ms: TimestampMs,
     ) -> Result<Receipt> {
+        self.advance_and_name(
+            actor_id,
+            action_id,
+            Transition {
+                state,
+                reason,
+                error,
+                now_ms,
+            },
+            None,
+        )
+        .map(|(receipt, _)| receipt)
+    }
+
+    /// Advances a receipt and, when `fenced_for` is given, names it in that revocation's evidence.
+    ///
+    /// One transaction, because the two are one fact: a rejection with no name is an action the
+    /// revocation's result owes and cannot produce, and the next pass would not find it, because it
+    /// selects intents that are still accepted. The boolean says whether the name was new.
+    fn advance_and_name(
+        &mut self,
+        actor_id: ActorId,
+        action_id: ActionId,
+        transition: Transition,
+        fenced_for: Option<u64>,
+    ) -> Result<(Receipt, bool)> {
+        let Transition {
+            state,
+            reason,
+            error,
+            now_ms,
+        } = transition;
         let mut receipt = self
             .read(actor_id.clone(), action_id)?
             .ok_or_else(|| WorkerError::InvalidArgument(format!("no receipt for {action_id}")))?;
@@ -660,60 +1043,899 @@ impl Journal {
         let transaction = self.connection.transaction().map_err(unavailable)?;
         write_state(&transaction, &receipt)?;
         append_event(&transaction, &receipt)?;
+        let named = match fenced_for {
+            Some(revocation) => name_evidence(
+                &transaction,
+                revocation,
+                "rejected",
+                &actor_id,
+                action_id,
+                None,
+                None,
+            )?,
+            None => false,
+        };
         transaction.commit().map_err(unavailable)?;
-        Ok(receipt)
+        Ok((receipt, named))
     }
 
-    /// Rejects every intent that has not been dispatched.
+    /// Fences this session for a revocation, and reports what it could and could not take back.
     ///
     /// An authority revision that removes the authority an intent was admitted under is what
-    /// section 9 calls a revocation. An intent past its dispatch marker cannot be taken back from
-    /// here; one that has not been dispatched can, and this is where it is.
+    /// section 9 calls a revocation, and the acknowledgement it asks for is two statements rather
+    /// than one: the undispatched intents this revision affects have been rejected, **and** the
+    /// ones past their dispatch marker are named. The second list is defined by the race rather
+    /// than by the outcome: every action whose dispatch transition won it is named, and its receipt
+    /// state says how much is known about what it did.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read or the write fails.
+    pub fn fence_for_revocation(
+        &mut self,
+        revision: u64,
+        error: Option<ProtocolError>,
+        now_ms: TimestampMs,
+        since_sequence: u64,
+        generation: u64,
+    ) -> (Fenced, Result<u64>) {
+        let mut fenced = Fenced::default();
+        // An older revocation's names go once the daemon has taken them, and not for being older.
+        // "The daemon" is the controller generation this host answers to now, because a
+        // replacement holds none of what its predecessor collected. This runs before the pass, so
+        // a pass that fails part way leaves what it did name under the revision it ran for.
+        if let Err(error) = self.forget_delivered_evidence(revision, generation) {
+            return (fenced, Err(error));
+        }
+        // Read before anything is rejected, because everything this fence does appends events of
+        // its own. The boundary the *next* fence starts from is where this journal stood when this
+        // one began.
+        let reached = match self.event_high_water() {
+            Ok(reached) => reached,
+            Err(error) => return (fenced, Err(error)),
+        };
+        let undispatched = match self.identities_in(&[ReceiptState::Accepted]) {
+            Ok(found) => found,
+            Err(error) => return (fenced, Err(error)),
+        };
+        // Every state that carries a dispatch marker, moved since the previous fence. Section 9
+        // defines the set by the race rather than by the outcome: an action whose dispatch
+        // transition already won it is named in the result, and its receipt state says how much is
+        // known about what it did. An action that settled while the revocation was queued behind
+        // it won that race as surely as one still inside the transition.
+        //
+        // `since_sequence` is what bounds the answer. Naming every dispatched action this journal
+        // has ever retained would grow the report with the session's whole history, and eventually
+        // past the frame that has to carry it; what this revocation covers is what happened since
+        // the last one, measured on this journal's own event order rather than on a clock.
+        let past_the_marker = match self.identities_since(
+            &[
+                ReceiptState::Dispatching,
+                ReceiptState::Unknown,
+                ReceiptState::Applied,
+                ReceiptState::Refused,
+            ],
+            since_sequence,
+        ) {
+            Ok(found) => found,
+            Err(error) => return (fenced, Err(error)),
+        };
+
+        // The rejections are committed one at a time, so a failure part way leaves some of them
+        // done. What was done is reported either way: the acknowledgement is withheld, the daemon
+        // announces again, and the second pass has to be able to name what the first rejected.
+        for (actor_id, action_id) in undispatched {
+            // The rejection, its event and its name in one transaction: a rejection this pass
+            // committed without its name would be an action the result owes and cannot produce.
+            match self.advance_and_name(
+                actor_id,
+                action_id,
+                Transition {
+                    state: ReceiptState::Rejected,
+                    reason: Some(RejectionReason::Revoked),
+                    error: error.clone(),
+                    now_ms,
+                },
+                Some(revision),
+            ) {
+                Ok((_, named)) => {
+                    fenced.rejected = fenced.rejected.saturating_add(u64::from(named));
+                }
+                Err(error) => return (fenced, Err(error)),
+            }
+        }
+
+        for (actor_id, action_id) in past_the_marker {
+            match self.read(actor_id.clone(), action_id) {
+                Ok(Some(receipt)) => {
+                    let named = self.name_possibly_executed(
+                        revision,
+                        &PossiblyExecutedAction {
+                            action_id,
+                            actor_id,
+                            method: receipt.method,
+                            state: receipt.state,
+                        },
+                    );
+                    match named {
+                        Ok(named) => {
+                            fenced.possibly_executed =
+                                fenced.possibly_executed.saturating_add(u64::from(named));
+                        }
+                        Err(error) => return (fenced, Err(error)),
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => return (fenced, Err(error)),
+            }
+        }
+        // Recorded only now, because everything above had to get through first. What it bounds is
+        // where the next fence starts looking.
+        if let Err(error) = self.record_fence_boundary(reached) {
+            return (fenced, Err(error));
+        }
+        (fenced, Ok(reached))
+    }
+
+    /// Records one action past its dispatch marker, and says whether it was new.
+    fn name_possibly_executed(
+        &self,
+        revision: u64,
+        action: &PossiblyExecutedAction,
+    ) -> Result<bool> {
+        name_evidence(
+            &self.connection,
+            revision,
+            "possibly_executed",
+            &action.actor_id,
+            action.action_id,
+            Some(action.method.as_str()),
+            Some(action.state.as_str()),
+        )
+    }
+
+    /// Returns the journal event position the last completed fence ran at.
+    ///
+    /// It is durable because what it bounds outlives a process: where the next fence starts
+    /// looking. A boundary that reset to nothing on a restart would make the next fence name the
+    /// session's whole history. Collection does not read it - what a revocation has already named
+    /// is a `fence_evidence` row that outlives the receipt it refers to, and what no revocation
+    /// has looked at is bounded by the retention period rather than by a fence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn fence_boundary(&self) -> Result<u64> {
+        let boundary: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT since_sequence FROM fence_state WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(unavailable)?;
+        Ok(boundary
+            .and_then(|held| u64::try_from(held).ok())
+            .unwrap_or(0))
+    }
+
+    /// Records the position a completed fence reached.
+    fn record_fence_boundary(&self, reached: u64) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO fence_state (id, since_sequence) VALUES (1, ?1)
+                 ON CONFLICT (id) DO UPDATE SET since_sequence = excluded.since_sequence",
+                params![i64::try_from(reached).unwrap_or(i64::MAX)],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// Forgets the names of an older revocation the daemon has taken all of.
+    ///
+    /// A revision advancing is not what makes a revocation's names finished with. The daemon takes
+    /// them a page at a time, and section 9 requires the actions a fence could not take back to be
+    /// named in the *result*, so names it has not taken are still owed however many revisions have
+    /// been installed since. What it has taken is a fact this journal has: an announcement says how
+    /// many names the daemon already holds, and that is what is written down here.
+    ///
+    /// Keeping every revocation's names for a daemon that stopped asking would grow this journal a
+    /// revocation at a time, so at most [`MAX_HELD_REVOCATIONS`] revocations have names here,
+    /// counting the one this pass is about to name. Past that the oldest one's names go and the
+    /// count takes their place, which is what a page of them then reports.
+    ///
+    /// `generation` is the controller generation this host answers to now. What a *previous*
+    /// controller took is not something the current one holds, so a count another generation
+    /// wrote does not finish anything: the names stay until the controller that has to name them
+    /// says it has them.
+    fn forget_delivered_evidence(&self, revision: u64, generation: u64) -> Result<()> {
+        let current = i64::try_from(revision).unwrap_or(i64::MAX);
+        let holder = i64::try_from(generation).unwrap_or(i64::MAX);
+        let mut held: Vec<(i64, u64, u64)> = Vec::new();
+        {
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT e.revision, COUNT(*),
+                            COALESCE(MAX(CASE WHEN d.generation = ?1 THEN d.delivered END), 0)
+                     FROM fence_evidence AS e
+                     LEFT JOIN fence_delivery AS d ON d.revision = e.revision
+                     GROUP BY e.revision
+                     ORDER BY e.revision",
+                )
+                .map_err(unavailable)?;
+            let rows = statement
+                .query_map(params![holder], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(unavailable)?;
+            for row in rows {
+                let (held_revision, named, delivered) = row.map_err(unavailable)?;
+                held.push((
+                    held_revision,
+                    u64::try_from(named).unwrap_or(0),
+                    u64::try_from(delivered).unwrap_or(0),
+                ));
+            }
+        }
+        // Superseded and taken. Nothing is owed about it, so nothing about it is kept: the names
+        // go, and so does the record of them, because there is nothing left to say.
+        let mut owed = Vec::new();
+        for (held_revision, named, delivered) in held {
+            if held_revision < current && delivered >= named {
+                self.remove_evidence(held_revision)?;
+                self.forget_delivery(held_revision)?;
+            } else {
+                owed.push(held_revision);
+            }
+        }
+        // What is left is owed, and the bound is what stops it growing without end. The oldest
+        // goes first, because the newest revocation is the one a person is waiting on. The
+        // current revision is the newest of all, so it is never what goes. How many names went is
+        // written down before they do, because after that nothing can count them.
+        //
+        // The pass that follows this one names the current revision, so its place is kept here
+        // rather than taken afterwards: the bound is what this journal holds once the pass is
+        // done, not what it held before it started.
+        let keep = if owed.contains(&current) {
+            MAX_HELD_REVOCATIONS
+        } else {
+            MAX_HELD_REVOCATIONS.saturating_sub(1)
+        };
+        while owed.len() > keep {
+            let oldest = owed.remove(0);
+            self.record_named(oldest, holder)?;
+            self.remove_evidence(oldest)?;
+        }
+        self.bound_delivery_records(holder)?;
+        Ok(())
+    }
+
+    /// Removes one revocation's names.
+    fn remove_evidence(&self, revision: i64) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM fence_evidence WHERE revision = ?1",
+                params![revision],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// Records how many names one revocation's fence has produced so far.
+    ///
+    /// The figure only rises: a second pass names what the first could not reach, and a count
+    /// taken between them does not unsay the one before it. It is what a page reports as missing
+    /// once the names themselves have gone.
+    ///
+    /// What was taken is settled against the controller this host answers to now, because that is
+    /// the one the missing names are missing from. A count another generation made says nothing
+    /// about what this one holds, so it becomes nought here: the names are gone, and the
+    /// controller that has to name them never had them.
+    fn record_named(&self, revision: i64, generation: i64) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO fence_delivery (revision, named, delivered, generation)
+                 VALUES (?1, (SELECT COUNT(*) FROM fence_evidence WHERE revision = ?1), 0, ?2)
+                 ON CONFLICT (revision) DO UPDATE
+                     SET named = MAX(fence_delivery.named, excluded.named),
+                         delivered = CASE
+                             WHEN fence_delivery.generation = excluded.generation
+                                 THEN fence_delivery.delivered
+                             ELSE 0
+                         END,
+                         generation = excluded.generation",
+                params![revision, generation],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// Forgets what was said about a revocation whose names are all accounted for.
+    fn forget_delivery(&self, revision: i64) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM fence_delivery WHERE revision = ?1",
+                params![revision],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// Keeps the delivery records that still have something to say, and bounds them.
+    ///
+    /// A record whose names the controller asking now has all taken says nothing, so it goes as
+    /// soon as that is true. One that another generation took them is not that record: what a
+    /// replacement holds is nothing, so the count is a loss to it and is kept as one. A record that says names went without reaching the daemon outlives the names it
+    /// counts, and without a bound a host whose daemon stopped asking would keep one per
+    /// revocation for good. So the newest [`MAX_HELD_REVOCATIONS`] of those are kept, and what
+    /// goes past that is remembered as a boundary rather than as nothing: a page of a revocation
+    /// below it says this journal cannot answer for that revocation, which is not the same
+    /// statement as a fence that named nothing.
+    fn bound_delivery_records(&self, generation: i64) -> Result<()> {
+        let mut missing: Vec<i64> = Vec::new();
+        {
+            // What the controller asking now holds is nothing another generation took, so a count
+            // one of those wrote is a loss to this one exactly as names that never arrived are.
+            let mut statement = self
+                .connection
+                .prepare(
+                    "SELECT revision FROM fence_delivery
+                     WHERE named > CASE WHEN generation = ?1 THEN delivered ELSE 0 END
+                       AND revision NOT IN (SELECT DISTINCT revision FROM fence_evidence)
+                     ORDER BY revision",
+                )
+                .map_err(unavailable)?;
+            let rows = statement
+                .query_map(params![generation], |row| row.get::<_, i64>(0))
+                .map_err(unavailable)?;
+            for row in rows {
+                missing.push(row.map_err(unavailable)?);
+            }
+        }
+        // Everything else is either still named here or completely taken by the controller asking
+        // now, and neither needs a record once the names have gone.
+        self.connection
+            .execute(
+                "DELETE FROM fence_delivery
+                 WHERE named <= CASE WHEN generation = ?1 THEN delivered ELSE 0 END
+                   AND revision NOT IN (SELECT DISTINCT revision FROM fence_evidence)",
+                params![generation],
+            )
+            .map_err(unavailable)?;
+        while missing.len() > MAX_HELD_REVOCATIONS {
+            let oldest = missing.remove(0);
+            // The boundary first. A failure between these two leaves a count this journal can
+            // still read and a boundary that covers it, which answers conservatively; the other
+            // order would leave neither, and a revocation whose names went would read as one that
+            // named nothing.
+            self.record_forgotten(oldest)?;
+            self.forget_delivery(oldest)?;
+        }
+        Ok(())
+    }
+
+    /// Records that this journal can no longer answer for revocations up to and including this one.
+    fn record_forgotten(&self, revision: i64) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO fence_forgotten (id, before_revision) VALUES (1, ?1)
+                 ON CONFLICT (id) DO UPDATE
+                     SET before_revision = MAX(fence_forgotten.before_revision, excluded.before_revision)",
+                params![revision],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// Returns whether this journal can still answer for one revocation.
+    ///
+    /// A page of names this journal never held and a page of names it has forgotten are different
+    /// statements, and only the first one may read as a fence that named nothing. Section 9 makes
+    /// the acknowledgement two statements; a worker that cannot make the second one says so by
+    /// carrying no evidence at all, which is what a caller reads here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn evidence_answerable(&self, revision: u64) -> Result<bool> {
+        let revision = i64::try_from(revision).unwrap_or(i64::MAX);
+        let held: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM fence_evidence WHERE revision = ?1",
+                params![revision],
+                |row| row.get(0),
+            )
+            .map_err(unavailable)?;
+        if held > 0 {
+            return Ok(true);
+        }
+        let counted: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM fence_delivery WHERE revision = ?1",
+                params![revision],
+                |row| row.get(0),
+            )
+            .map_err(unavailable)?;
+        if counted > 0 {
+            return Ok(true);
+        }
+        let forgotten: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT before_revision FROM fence_forgotten WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(unavailable)?;
+        Ok(forgotten.is_none_or(|before| revision > before))
+    }
+
+    /// Records how many of a revocation's names the controller of one generation holds.
+    ///
+    /// An announcement carries the count, and that is what makes it a statement rather than a
+    /// guess: the daemon asks for the page after the names it already has. Within one generation
+    /// the figure only rises, because an announcement that asked for less does not unsay the page
+    /// before it.
+    ///
+    /// The generation is what the count belongs to. A controller keeps the names it has collected
+    /// in its own memory, and a replacement starts with none of them, so what the previous one
+    /// took is not something this journal may hold the new one to: a later generation's count
+    /// *replaces* the figure rather than being compared with it.
     ///
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
-    pub fn revoke_undispatched(
-        &mut self,
-        error: Option<ProtocolError>,
-        now_ms: TimestampMs,
-    ) -> Result<usize> {
-        let pending: Vec<(ActorId, ActionId)> = {
-            let mut statement = self
-                .connection
-                .prepare("SELECT actor_id, action_id FROM receipts WHERE state = ?1")
-                .map_err(unavailable)?;
+    pub fn note_evidence_delivered(
+        &self,
+        revision: u64,
+        delivered: u64,
+        generation: u64,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                // Nothing is written for a revocation this journal has already said it cannot
+                // answer for. A record made now would say the names were all taken, which is the
+                // opposite of what happened to them.
+                "INSERT INTO fence_delivery (revision, named, delivered, generation)
+                 SELECT ?1, (SELECT COUNT(*) FROM fence_evidence WHERE revision = ?1), ?2, ?3
+                 WHERE ?1 > COALESCE(
+                         (SELECT before_revision FROM fence_forgotten WHERE id = 1), 0)
+                    OR EXISTS (SELECT 1 FROM fence_evidence WHERE revision = ?1)
+                    OR EXISTS (SELECT 1 FROM fence_delivery WHERE revision = ?1)
+                 ON CONFLICT (revision) DO UPDATE
+                     SET named = MAX(fence_delivery.named, excluded.named),
+                         delivered = CASE
+                             WHEN excluded.generation > fence_delivery.generation
+                                 THEN excluded.delivered
+                             ELSE MAX(fence_delivery.delivered, excluded.delivered)
+                         END,
+                         generation = MAX(fence_delivery.generation, excluded.generation)",
+                params![
+                    i64::try_from(revision).unwrap_or(i64::MAX),
+                    i64::try_from(delivered).unwrap_or(i64::MAX),
+                    i64::try_from(generation).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// Reads one page of a revocation's fence evidence.
+    ///
+    /// `from` is how many names the caller already has, so a page follows the one before it without
+    /// the caller having to say where the journal put them. The page is at most
+    /// [`kr_protocol::action::MAX_NAMED_FENCED_ACTIONS`] names, and `remaining` says how many are
+    /// still to come: nought there is what says the evidence is complete.
+    ///
+    /// A revocation whose names this journal no longer holds is the one case where nought
+    /// remaining does not mean complete, and `omitted` is what says so: it carries how many names
+    /// went without reaching the daemon, so a page of nothing is not read as a fence that named
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn evidence_page(&self, revision: u64, from: u64) -> Result<EvidencePage> {
+        let revision = i64::try_from(revision).unwrap_or(i64::MAX);
+        let held: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM fence_evidence WHERE revision = ?1",
+                params![revision],
+                |row| row.get(0),
+            )
+            .map_err(unavailable)?;
+        let held = u64::try_from(held).unwrap_or(0);
+        let from = from.min(held);
+        let page_size = u64::try_from(kr_protocol::action::MAX_NAMED_FENCED_ACTIONS).unwrap_or(256);
+        let mut page = EvidencePage {
+            remaining: held.saturating_sub(from.saturating_add(page_size)),
+            omitted: self.evidence_omitted(revision, held)?,
+            ..EvidencePage::default()
+        };
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT kind, actor_id, action_id, method, state FROM fence_evidence
+                 WHERE revision = ?1
+                 ORDER BY position
+                 LIMIT ?2 OFFSET ?3",
+            )
+            .map_err(unavailable)?;
+        let rows = statement
+            .query_map(
+                params![
+                    revision,
+                    i64::try_from(page_size).unwrap_or(256),
+                    i64::try_from(from).unwrap_or(0)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .map_err(unavailable)?;
+        for row in rows {
+            let (kind, actor, action, method, state) = row.map_err(unavailable)?;
+            let actor_id = parse_actor(actor)?;
+            let action_id = parse_action(&action)?;
+            if kind == "rejected" {
+                page.rejected.push(kr_protocol::action::FencedAction {
+                    actor_id,
+                    action_id,
+                });
+                continue;
+            }
+            // A named action whose method or state this journal cannot read is not a name this
+            // host can report honestly, so it is skipped rather than given invented values. The
+            // count above still says a name was there.
+            let Some(method) = method else { continue };
+            let Ok(state) = parse_state(state.as_deref().unwrap_or_default()) else {
+                continue;
+            };
+            let Ok(method) = kr_protocol::method::MethodName::new(method) else {
+                continue;
+            };
+            page.possibly_executed.push(PossiblyExecutedAction {
+                action_id,
+                actor_id,
+                method,
+                state,
+            });
+        }
+        Ok(page)
+    }
+
+    /// Returns how many of a revocation's names this journal no longer holds.
+    ///
+    /// Nothing is missing while the names are here, because paging delivers all of them. Once they
+    /// have gone, what is missing is what the fence named less what the daemon had already taken,
+    /// and both figures are in the delivery record the names left behind.
+    fn evidence_omitted(&self, revision: i64, held: u64) -> Result<u64> {
+        if held > 0 {
+            return Ok(0);
+        }
+        let counts: Option<(i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT named, delivered FROM fence_delivery WHERE revision = ?1",
+                params![revision],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(unavailable)?;
+        let Some((named, delivered)) = counts else {
+            return Ok(0);
+        };
+        let named = u64::try_from(named).unwrap_or(0);
+        let delivered = u64::try_from(delivered).unwrap_or(0);
+        Ok(named.saturating_sub(delivered))
+    }
+
+    /// Returns the actor and action of every receipt in one of these states.
+    fn identities_in(&self, states: &[ReceiptState]) -> Result<Vec<(ActorId, ActionId)>> {
+        self.identities_since(states, 0)
+    }
+
+    /// Returns the actor and action of every receipt in one of these states, changed since a time.
+    /// Returns the actor and action of every receipt in one of these states that has changed
+    /// since one position in this journal's own event order.
+    ///
+    /// The boundary is a recorded event position rather than a wall-clock reading. Every state
+    /// change appends an event, and the sequence only increases, so "since the last fence" is a
+    /// fact about this store rather than about a clock: a wall clock that moved backwards would
+    /// otherwise put a receipt written after the previous fence *before* the boundary, and the
+    /// next fence would not name it.
+    fn identities_since(
+        &self,
+        states: &[ReceiptState],
+        since_sequence: u64,
+    ) -> Result<Vec<(ActorId, ActionId)>> {
+        let since = i64::try_from(since_sequence).unwrap_or(i64::MAX);
+        // From the beginning there is nothing to compare against, and a receipt can have no event
+        // at all: a journal an earlier build wrote has rows and no event history, and requiring an
+        // event would make recovery skip exactly those. Past the beginning the boundary is what
+        // bounds the answer.
+        let query = if since_sequence == 0 {
+            "SELECT actor_id, action_id FROM receipts AS r
+             WHERE r.state = ?1 AND ?2 = 0
+             ORDER BY r.created_at_ms, r.action_id"
+        } else {
+            "SELECT actor_id, action_id FROM receipts AS r
+             WHERE r.state = ?1
+               AND EXISTS (SELECT 1 FROM receipt_events AS e
+                           WHERE e.actor_id = r.actor_id
+                             AND e.action_id = r.action_id
+                             AND e.sequence > ?2)
+             ORDER BY r.created_at_ms, r.action_id"
+        };
+        let mut found = Vec::new();
+        for state in states {
+            let mut statement = self.connection.prepare(query).map_err(unavailable)?;
             let rows = statement
-                .query_map(params![ReceiptState::Accepted.as_str()], |row| {
+                .query_map(params![state.as_str(), since], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
                 })
                 .map_err(unavailable)?;
-            let mut pending = Vec::new();
             for row in rows {
                 let (actor, action) = row.map_err(unavailable)?;
-                let action = <[u8; 16]>::try_from(action.as_slice()).map_err(|_| {
-                    unavailable_detail("a stored action identifier is not 16 bytes")
-                })?;
-                pending.push((
-                    ActorId::new(actor)
-                        .map_err(|_| unavailable_detail("a stored actor is not valid"))?,
-                    ActionId::new(Uuid::from_bytes(action)),
-                ));
+                found.push((parse_actor(actor)?, parse_action(&action)?));
             }
-            pending
-        };
-        let count = pending.len();
-        for (actor_id, action_id) in pending {
-            self.advance(
-                actor_id,
-                action_id,
-                ReceiptState::Rejected,
-                Some(RejectionReason::Revoked),
-                error.clone(),
-                now_ms,
-            )?;
         }
-        Ok(count)
+        Ok(found)
+    }
+
+    /// Returns the furthest position this journal's event order has reached.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn event_high_water(&self) -> Result<u64> {
+        let sequence: i64 = self
+            .connection
+            .query_row(
+                "SELECT COALESCE(MAX(sequence), 0) FROM receipt_events",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(unavailable)?;
+        Ok(u64::try_from(sequence).unwrap_or(0))
+    }
+
+    /// Returns how many of this actor's mutations are admitted and not yet settled.
+    ///
+    /// Both durable states before an outcome count: an accepted intent this host still owes a
+    /// decision on, and one past its dispatch marker whose outcome has not been recorded.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn outstanding(&self, actor_id: &ActorId) -> Result<usize> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM receipts WHERE actor_id = ?1 AND state IN (?2, ?3)",
+                params![
+                    actor_id.as_str(),
+                    ReceiptState::Accepted.as_str(),
+                    ReceiptState::Dispatching.as_str()
+                ],
+                |row| row.get(0),
+            )
+            .map_err(unavailable)?;
+        Ok(usize::try_from(count).unwrap_or(usize::MAX))
+    }
+
+    /// Returns this actor's most recent uncertain outcome for a subject, if it has one.
+    ///
+    /// The subject rather than the action: section 23's rule is about a *new* identifier asking
+    /// for the same thing, so what has to be found is the earlier ask rather than the earlier
+    /// identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn uncertain_for_subject(
+        &self,
+        actor_id: &ActorId,
+        subject_digest: Digest256,
+    ) -> Result<Option<(ActionId, u64)>> {
+        let row: Option<(Vec<u8>, i64)> = self
+            .connection
+            .query_row(
+                "SELECT action_id, revision FROM receipts
+                 WHERE actor_id = ?1 AND subject_digest = ?2 AND state = ?3
+                 ORDER BY updated_at_ms DESC, action_id DESC LIMIT 1",
+                params![
+                    actor_id.as_str(),
+                    subject_digest.as_bytes().as_slice(),
+                    ReceiptState::Unknown.as_str()
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(unavailable)?;
+        row.map(|(action, revision)| {
+            Ok((
+                parse_action(&action)?,
+                u64::try_from(revision).unwrap_or_default(),
+            ))
+        })
+        .transpose()
+    }
+
+    /// Finds the one action an identifier names, whichever actor submitted it.
+    ///
+    /// The de-duplication key is the actor **and** the action, so an identifier is not by itself a
+    /// key: two actors may each have used the same one, and this journal holds both. This is the
+    /// only lookup in the worker that is not keyed by the calling actor, and it exists for the host
+    /// owner's cancellation; it therefore refuses an ambiguous identifier rather than choosing one
+    /// of the rows, because cancelling the wrong actor's intent is worse than refusing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-argument failure when more than one actor used the identifier, and
+    /// [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn find_any(&self, action_id: ActionId) -> Result<Option<(ActorId, Receipt)>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT actor_id FROM receipts WHERE action_id = ?1 ORDER BY actor_id")
+            .map_err(unavailable)?;
+        let rows = statement
+            .query_map(params![action_id.get().as_bytes().as_slice()], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(unavailable)?;
+        let mut actors = Vec::new();
+        for row in rows {
+            actors.push(parse_actor(row.map_err(unavailable)?)?);
+        }
+        if actors.len() > 1 {
+            return Err(WorkerError::InvalidArgument(format!(
+                "action {action_id} names {} actors' actions, so it does not identify one; the \
+                 de-duplication key is the actor and the action together",
+                actors.len()
+            )));
+        }
+        let Some(actor_id) = actors.pop() else {
+            return Ok(None);
+        };
+        Ok(self
+            .read(actor_id.clone(), action_id)?
+            .map(|receipt| (actor_id, receipt)))
+    }
+
+    /// Records one observation beside an action, and reconciles the receipt when it may.
+    ///
+    /// An observation never creates a receipt: evidence about an action this journal never admitted
+    /// is evidence about somebody else's action. It never moves a state the receipt contract has
+    /// settled either; only an authoritative answer about an uncertain outcome moves anything, and
+    /// [`crate::action::observation`] is where that is decided.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-argument failure when the action is not one this journal holds, and
+    /// [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn record_observation(
+        &mut self,
+        actor_id: &ActorId,
+        observation: &ActionObservation,
+    ) -> Result<Receipt> {
+        let receipt = self
+            .read(actor_id.clone(), observation.action_id)?
+            .ok_or_else(|| {
+                WorkerError::InvalidArgument(format!(
+                    "no receipt for action {}, so there is nothing to observe",
+                    observation.action_id
+                ))
+            })?;
+        let effect = crate::action::observation::effect(observation, receipt.state);
+        let transaction = self.connection.transaction().map_err(unavailable)?;
+        transaction
+            .execute(
+                "INSERT INTO observations (actor_id, action_id, provenance, subject,
+                     subject_revision, source_cursor, claimed_result, observed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    actor_id.as_str(),
+                    observation.action_id.get().as_bytes().as_slice(),
+                    observation.provenance.as_str(),
+                    observation.subject.as_str(),
+                    observation
+                        .subject_revision
+                        .as_ref()
+                        .map(|revision| i64::try_from(revision.get()).unwrap_or(i64::MAX)),
+                    observation
+                        .source_cursor
+                        .as_ref()
+                        .map(|cursor| i64::try_from(cursor.get()).unwrap_or(i64::MAX)),
+                    observation.claimed_result.as_str(),
+                    i64::try_from(observation.observed_at_ms.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(unavailable)?;
+        let mut receipt = receipt;
+        if let Some(state) = effect.reconciliation() {
+            // The observation and the reconciliation are one commit. A crash between them would
+            // leave a receipt claiming an outcome beside no record of what established it.
+            let revision = U64::new(receipt.revision.get() + 1);
+            receipt.advance(state, revision, None).map_err(|error| {
+                WorkerError::InvalidArgument(format!("receipt transition refused: {error}"))
+            })?;
+            receipt.updated_at_ms = observation.observed_at_ms;
+            write_state(&transaction, &receipt)?;
+            append_event(&transaction, &receipt)?;
+        }
+        transaction.commit().map_err(unavailable)?;
+        Ok(receipt)
+    }
+
+    /// Returns the observations recorded against one action, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn observations(
+        &self,
+        actor_id: &ActorId,
+        action_id: ActionId,
+    ) -> Result<Vec<ActionObservation>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT provenance, subject, subject_revision, source_cursor, claimed_result,
+                        observed_at_ms
+                 FROM observations WHERE actor_id = ?1 AND action_id = ?2 ORDER BY sequence",
+            )
+            .map_err(unavailable)?;
+        let rows = statement
+            .query_map(
+                params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .map_err(unavailable)?;
+        let mut observations = Vec::new();
+        for row in rows {
+            let (provenance, subject, revision, cursor, claimed, observed) =
+                row.map_err(unavailable)?;
+            observations.push(ActionObservation {
+                action_id,
+                provenance: parse_provenance(&provenance)?,
+                subject,
+                subject_revision: Nullable(
+                    revision.map(|value| U64::new(u64::try_from(value).unwrap_or_default())),
+                ),
+                source_cursor: Nullable(
+                    cursor.map(|value| U64::new(u64::try_from(value).unwrap_or_default())),
+                ),
+                claimed_result: parse_claimed_result(&claimed)?,
+                observed_at_ms: TimestampMs::new(u64::try_from(observed).unwrap_or_default()),
+            });
+        }
+        Ok(observations)
     }
 
     /// Reads one receipt.
@@ -777,38 +1999,114 @@ impl Journal {
         Ok(changed)
     }
 
+    /// Rejects every intent this journal accepted and never dispatched.
+    ///
+    /// This runs once at startup, beside [`Self::resolve_unfinished_dispatches`]. Section 9 permits
+    /// an accepted intent with no dispatch marker to proceed after recovery **only if** the
+    /// revalidation still passes, and otherwise requires a rejection. The freshness those intents
+    /// were admitted under cannot be revalidated here: the deadline was decided on a continuous
+    /// clock this process no longer has, and the connection and the window that admitted them are
+    /// gone with the process that issued them. So every one of them is rejected as expired, which
+    /// is the conservative direction and the one the contract names.
+    ///
+    /// It also releases the outstanding-mutation capacity those intents were holding, so an actor
+    /// whose worker restarted mid-admission is not left unable to submit anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn reject_unrevalidated_intents(&mut self, now_ms: TimestampMs) -> Result<usize> {
+        let pending = self.identities_in(&[ReceiptState::Accepted])?;
+        let count = pending.len();
+        for (actor_id, action_id) in pending {
+            self.advance(
+                actor_id,
+                action_id,
+                ReceiptState::Rejected,
+                Some(RejectionReason::Expired),
+                Some(ProtocolError::new(
+                    ErrorCode::PermissionDenied,
+                    "this intent was accepted before the worker restarted, and the freshness it \
+                     was admitted under cannot be proved again",
+                )),
+                now_ms,
+            )?;
+        }
+        Ok(count)
+    }
+
     /// Deletes de-duplication records older than the retention period.
+    ///
+    /// Retention is a wall-clock period, and the wall clock is the thing that can move. A record
+    /// this boot wrote is therefore kept while a freshness window that could admit its exact
+    /// original request may still be live: a window lasts at most five minutes on the machine's
+    /// continuous clock, and no step of the wall clock shortens that. Without the guard, a clock
+    /// pushed thirty days forward inside those five minutes would delete the de-duplication record
+    /// of an action whose own window still admitted it, and the original request would be admitted
+    /// a second time.
+    ///
+    /// A record from an earlier boot needs no such guard. The windows a host issues live in its
+    /// memory, so a host that has restarted can admit nothing through them.
+    ///
+    /// What retention does *not* promise is that a revocation can still name an action it has
+    /// forgotten. Section 9 sets the period at thirty days and a revocation names what this host
+    /// still retains; a name that a revocation owes is written into `fence_evidence` when the fence
+    /// runs, and that row outlives the receipt it refers to.
     ///
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
     pub fn prune(&mut self, now_ms: TimestampMs) -> Result<usize> {
         let cutoff = i64::try_from(now_ms.get().saturating_sub(RETENTION_MS)).unwrap_or(i64::MAX);
-        // The retained result and the event record are the receipt's, so they go when it goes.
-        // Leaving either behind would keep a duplicate answerable after the receipt that
-        // authorises the answer had been forgotten.
+        let continuous_floor = continuous_floor();
+        let boot = self.boot.clone();
+        // One selection, named once: the retained result, the event record and the observations
+        // belong to the receipt, so they go when it goes. Leaving any of them behind would keep a
+        // duplicate answerable after the receipt that authorises the answer had been forgotten.
+        const SELECT: &str = "SELECT r.actor_id, r.action_id FROM receipts AS r
+             WHERE r.created_at_ms < ?1
+               AND (r.created_boot IS NULL OR ?2 IS NULL OR r.created_boot <> ?2
+                    OR r.created_continuous_ms IS NULL OR r.created_continuous_ms < ?3)";
         let transaction = self.connection.transaction().map_err(unavailable)?;
-        transaction
-            .execute(
-                "DELETE FROM results WHERE (actor_id, action_id) IN
-                     (SELECT actor_id, action_id FROM receipts WHERE created_at_ms < ?1)",
-                params![cutoff],
-            )
-            .map_err(unavailable)?;
-        transaction
-            .execute(
-                "DELETE FROM receipt_events WHERE (actor_id, action_id) IN
-                     (SELECT actor_id, action_id FROM receipts WHERE created_at_ms < ?1)",
-                params![cutoff],
-            )
-            .map_err(unavailable)?;
+        for table in ["results", "receipt_events", "observations"] {
+            transaction
+                .execute(
+                    &format!("DELETE FROM {table} WHERE (actor_id, action_id) IN ({SELECT})"),
+                    params![cutoff, boot, continuous_floor],
+                )
+                .map_err(unavailable)?;
+        }
         let removed = transaction
             .execute(
-                "DELETE FROM receipts WHERE created_at_ms < ?1",
-                params![cutoff],
+                &format!("DELETE FROM receipts WHERE (actor_id, action_id) IN ({SELECT})"),
+                params![cutoff, boot, continuous_floor],
             )
             .map_err(unavailable)?;
         transaction.commit().map_err(unavailable)?;
+        Ok(removed)
+    }
+
+    /// Prunes records past the retention period, at most once an interval.
+    ///
+    /// `permitted` is the host time contract's answer. Retention is expiry-based collection, and
+    /// section 9 stops that while the wall clock cannot be proved: collecting against an unproved
+    /// clock is how a rollback deletes something that had not expired. A host that cannot collect
+    /// keeps its records and says nothing, which is the conservative direction.
+    ///
+    /// The schedule advances only when the prune succeeded, so a failure is retried rather than
+    /// skipped for an hour. Nothing on the mutation path depends on the answer: retention is
+    /// maintenance, and a maintenance failure must not decide what a caller is told about its own
+    /// action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn prune_if_due(&mut self, now_ms: TimestampMs, permitted: bool) -> Result<usize> {
+        if !permitted || now_ms.get() < self.pruned_at_ms.saturating_add(PRUNE_INTERVAL_MS) {
+            return Ok(0);
+        }
+        let removed = self.prune(now_ms)?;
+        self.pruned_at_ms = now_ms.get();
         Ok(removed)
     }
 
@@ -852,7 +2150,56 @@ impl Journal {
                 "this journal is at schema version {recorded}; this build reads {SCHEMA_VERSION}"
             )));
         }
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            pruned_at_ms: 0,
+            boot: None,
+        })
+    }
+
+    /// Writes down what the host's time contract has to survive a restart.
+    ///
+    /// One row, replaced each time. There is nothing to accumulate: the state is what the contract
+    /// holds now, and an earlier copy of it says nothing a restarted host needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn record_host_time(&mut self, state: &kr_protocol::action::HostTimeState) -> Result<()> {
+        let encoded = kr_cbor::to_canonical_vec(state)
+            .map_err(|error| unavailable_detail_owned(error.to_string()))?;
+        self.connection
+            .execute(
+                "INSERT INTO host_time (id, state) VALUES (1, ?1)
+                 ON CONFLICT (id) DO UPDATE SET state = excluded.state",
+                params![encoded],
+            )
+            .map_err(unavailable)?;
+        Ok(())
+    }
+
+    /// Reads back what the host wrote down about its clocks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the row cannot be read or cannot be
+    /// decoded. A caller that cannot read this must not fall back to "nothing was recorded":
+    /// nothing recorded means a host with no history, and this is a host whose history is
+    /// unreadable. The two lead to opposite conclusions about a clock.
+    pub fn read_host_time(&self) -> Result<Option<kr_protocol::action::HostTimeState>> {
+        let encoded: Option<Vec<u8>> = self
+            .connection
+            .query_row("SELECT state FROM host_time WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .optional()
+            .map_err(unavailable)?;
+        encoded
+            .map(|bytes| {
+                kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
+                    .map_err(|error| unavailable_detail_owned(error.to_string()))
+            })
+            .transpose()
     }
 
     /// Records what the session is, so a reader can describe it after the worker has gone.
@@ -1015,12 +2362,82 @@ impl RawReceipt {
     }
 }
 
+/// Appends one name to a revocation's evidence, at the next position.
+///
+/// The position is what paging reads in order, and the key is the revision, the kind, the actor and
+/// the action together: a second pass over the same revision names what it names again, and naming
+/// it twice would deliver it twice. Two actors may each have used one identifier, which is why the
+/// actor is part of the key rather than beside it.
+///
+/// It takes the connection rather than the journal so a caller can put it in a transaction with
+/// whatever made the name true.
+fn name_evidence(
+    connection: &Connection,
+    revision: u64,
+    kind: &str,
+    actor_id: &ActorId,
+    action_id: ActionId,
+    method: Option<&str>,
+    state: Option<&str>,
+) -> Result<bool> {
+    let revision = i64::try_from(revision).unwrap_or(i64::MAX);
+    let changed = connection
+        .execute(
+            "INSERT OR IGNORE INTO fence_evidence
+                 (revision, position, kind, actor_id, action_id, method, state)
+             VALUES (
+                 ?1,
+                 (SELECT COALESCE(MAX(position), 0) + 1 FROM fence_evidence WHERE revision = ?1),
+                 ?2, ?3, ?4, ?5, ?6
+             )",
+            params![
+                revision,
+                kind,
+                actor_id.as_str(),
+                action_id.get().as_bytes().as_slice(),
+                method,
+                state
+            ],
+        )
+        .map_err(unavailable)?;
+    Ok(changed > 0)
+}
+
 fn parse_state(text: &str) -> Result<ReceiptState> {
     ReceiptState::ALL
         .iter()
         .copied()
         .find(|state| state.as_str() == text)
         .ok_or_else(|| unavailable_detail("a stored receipt state is not in the contract"))
+}
+
+fn parse_actor(value: String) -> Result<ActorId> {
+    ActorId::new(value).map_err(|_| unavailable_detail("a stored actor is not valid"))
+}
+
+fn parse_action(value: &[u8]) -> Result<ActionId> {
+    let bytes = <[u8; 16]>::try_from(value)
+        .map_err(|_| unavailable_detail("a stored action identifier is not 16 bytes"))?;
+    Ok(ActionId::new(Uuid::from_bytes(bytes)))
+}
+
+fn parse_provenance(text: &str) -> Result<ObservationProvenance> {
+    ObservationProvenance::ALL
+        .iter()
+        .copied()
+        .find(|provenance| provenance.as_str() == text)
+        .ok_or_else(|| unavailable_detail("a stored observation provenance is not in the registry"))
+}
+
+fn parse_claimed_result(text: &str) -> Result<ObservedResult> {
+    match text {
+        "applied" => Ok(ObservedResult::Applied),
+        "refused" => Ok(ObservedResult::Refused),
+        "indeterminate" => Ok(ObservedResult::Indeterminate),
+        _ => Err(unavailable_detail(
+            "a stored observation result is not in the registry",
+        )),
+    }
 }
 
 fn parse_reason(text: &str) -> Option<RejectionReason> {
@@ -1135,6 +2552,7 @@ mod tests {
             method: kr_protocol::method::Method::SessionClose.into(),
             method_version: MethodVersion::V1,
             payload_digest: Digest256::from_bytes([digest; 32]),
+            subject_digest: Digest256::from_bytes([digest ^ 0xff; 32]),
             intent: vec![0xa0],
             accepted_deadline_ms: Some(TimestampMs::new(10_000)),
             now_ms: TimestampMs::new(1_000),
@@ -1280,6 +2698,26 @@ mod tests {
         let mut journal = Journal::in_memory().expect("opens");
         journal.accept(&submission(8, 1)).expect("accepts");
         assert_eq!(journal.prune(TimestampMs::new(1_500)).expect("prunes"), 0);
+        // Past the wall-clock period, and still kept: this boot wrote the record moments ago, so
+        // a window that would admit its original request can still be live. A clock pushed thirty
+        // days forward does not make a record from five seconds ago thirty days old.
+        assert_eq!(
+            journal
+                .prune(TimestampMs::new(RETENTION_MS + 2_000))
+                .expect("prunes"),
+            0
+        );
+        assert!(!journal.is_empty().expect("counts"));
+        // Once the record's continuous reading is older than the longest window this host issues,
+        // no window can admit the original request any more and the wall-clock period decides.
+        journal
+            .connection
+            .execute(
+                "UPDATE receipts SET created_continuous_ms = ?1",
+                params![continuous_floor() - 1],
+            )
+            .expect("ages the record");
+        assert_eq!(journal.prune(TimestampMs::new(1_500)).expect("prunes"), 0);
         assert_eq!(
             journal
                 .prune(TimestampMs::new(RETENTION_MS + 2_000))
@@ -1287,5 +2725,23 @@ mod tests {
             1
         );
         assert!(journal.is_empty().expect("counts"));
+    }
+
+    #[test]
+    fn a_record_from_an_earlier_boot_needs_no_window_guard() {
+        let mut journal = Journal::in_memory().expect("opens");
+        journal.accept(&submission(9, 1)).expect("accepts");
+        // The windows a host issues live in its memory, so a host that has restarted can admit
+        // nothing through them. The record's continuous reading belongs to a clock that is gone.
+        journal
+            .connection
+            .execute("UPDATE receipts SET created_boot = 'an-earlier-boot'", [])
+            .expect("moves the record to an earlier boot");
+        assert_eq!(
+            journal
+                .prune(TimestampMs::new(RETENTION_MS + 2_000))
+                .expect("prunes"),
+            1
+        );
     }
 }
