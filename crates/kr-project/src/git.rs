@@ -691,6 +691,14 @@ fn recorded(profile: &cap_std::fs::Dir) -> Option<std::collections::BTreeMap<Str
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(entries),
         Err(_) => return None,
     }
+    // A line this host was writing when it stopped is not a line: it is the end of the file with no
+    // end of line on it, it says nothing about what was made, and the sweep that reads this writes
+    // the record out again without it. Everything before it stands.
+    if let Some(ended) = text.rfind('\n') {
+        text.truncate(ended + 1);
+    } else {
+        text.clear();
+    }
     for line in text.lines() {
         let words: Vec<&str> = line.split_whitespace().collect();
         match words.as_slice() {
@@ -737,18 +745,20 @@ fn left_in_place(path: &Path, why: &str) {
 
 /// Takes away one directory this host recorded making, and only that.
 ///
-/// Nothing here descends. The name is opened; the object it resolves to is required to be the one
-/// the record names; the directory is required to hold this host's own mark and nothing besides;
-/// the mark is required to be the object the record names too, so that a file somebody put at that
-/// name is not the file this host unlinks; and only then is the mark taken out and the directory
-/// itself removed, which the kernel will not do unless it is empty. Anything else is left where it
-/// is and said so, because a directory holding what this host did not put there is not this host's
-/// to delete.
+/// Nothing here descends, and nothing goes on a name alone. The record has to name both objects —
+/// the directory and the mark inside it — because a record that says this host was *about to* make
+/// something says nothing about which object it ended up with. Then the name is opened; the object
+/// it resolves to is required to be the one recorded; it is required to hold this host's own mark
+/// and nothing besides; the mark is required to be the object recorded as well; and only then is
+/// the mark taken away and the directory after it. Both removals are the kind that takes an empty
+/// directory and nothing else, so no file and nothing held in a directory can go this way. Anything
+/// else is left where it is and said so.
 ///
-/// One act is still by name rather than by object: removing the directory. No interface on either
-/// platform removes a directory an open handle names, so an empty directory a same-account writer
-/// puts at that name in the instant between the check and the removal is one this host would
-/// remove. It cannot remove anything that is not empty, and `README.md` in this crate says so.
+/// Two acts are still by name rather than by object: taking away the mark, and taking away the
+/// directory. No interface on either platform removes a directory an open handle names, so an empty
+/// directory a same-account writer puts at one of those names in the instant between the check and
+/// the removal is one this host would remove; in the same instant that writer can move this host's
+/// own directory elsewhere and leave an empty one behind. `README.md` in this crate says so.
 fn remove_recorded(
     environment_id: EnvironmentId,
     root: &cap_std::fs::Dir,
@@ -757,13 +767,21 @@ fn remove_recorded(
     entry: &Recorded,
 ) -> bool {
     let path = root_path.join(name);
+    // Both objects, or neither: a record that says this host was about to make a directory says
+    // nothing about which object it ended up with, and a name is not ownership.
+    let (Some(identity), Some(mark)) = (entry.identity, entry.mark) else {
+        left_in_place(
+            &path,
+            "this host never got as far as recording which objects it made there",
+        );
+        return false;
+    };
     let Ok(handle) = root.open_dir(name) else {
         left_in_place(&path, "it could not be opened");
         return false;
     };
-    if let Some(identity) = entry.identity
-        && !crate::boundary::identity_of_handle(environment_id, &handle)
-            .is_ok_and(|found| found == identity)
+    if !crate::boundary::identity_of_handle(environment_id, &handle)
+        .is_ok_and(|found| found == identity)
     {
         left_in_place(&path, "it is not the object this host made");
         return false;
@@ -789,18 +807,17 @@ fn remove_recorded(
         );
         return false;
     }
-    if let Some(mark) = entry.mark {
-        let Ok(marked) = handle.open_dir(&entry.token) else {
-            left_in_place(&path, "this host's own mark could not be opened");
-            return false;
-        };
-        if !crate::boundary::identity_of_handle(environment_id, &marked)
-            .is_ok_and(|found| found == mark)
-        {
-            left_in_place(&path, "this host's own mark is not the object it made");
-            return false;
-        }
+    let Ok(marked) = handle.open_dir(&entry.token) else {
+        left_in_place(&path, "this host's own mark could not be opened");
+        return false;
+    };
+    if !crate::boundary::identity_of_handle(environment_id, &marked)
+        .is_ok_and(|found| found == mark)
+    {
+        left_in_place(&path, "this host's own mark is not the object it made");
+        return false;
     }
+    drop(marked);
     // The mark is a directory, so this cannot take away anything anybody wrote: a name holding a
     // file, or a directory with anything in it, is refused here rather than emptied.
     if handle.remove_dir(&entry.token).is_err() {
@@ -827,22 +844,27 @@ fn sweep(
     root: &cap_std::fs::Dir,
     root_path: &Path,
     manifest_path: &Path,
-) {
+) -> Result<()> {
     let Some(mut entries) = recorded(profile) else {
-        left_in_place(
-            manifest_path,
-            "this host's record of its own temporary directory cannot be read, so nothing in it \
-             was taken away",
-        );
-        return;
+        // Nothing is taken away on the strength of a record this host cannot read, and nothing is
+        // put in one either: an invocation that wrote to it would be writing into a record the
+        // next start refuses again.
+        return Err(ProjectError::StagingUnavailable {
+            detail: format!(
+                "{} is this host's record of what it made in its own temporary directory and it \
+                 cannot be read, so this host will neither take anything away by it nor add to it",
+                redact(&manifest_path.display().to_string())
+            )
+            .into(),
+        });
     };
     let Ok(held) = root.entries() else {
-        return;
+        return Ok(());
     };
     for found in held {
         let Ok(found) = found else {
             left_in_place(root_path, "it could not be read");
-            return;
+            return Ok(());
         };
         let name = found.file_name().to_string_lossy().into_owned();
         let Some(entry) = entries.get(&name) else {
@@ -867,13 +889,7 @@ fn sweep(
     if !text.is_empty() {
         text.push('\n');
     }
-    if compact(profile, &text).is_err() {
-        left_in_place(
-            manifest_path,
-            "this host's record of its own temporary directory could not be written again, so it \
-             still names what has gone",
-        );
-    }
+    compact(profile, &text)
 }
 
 /// Replaces the record with what is still true, in one act.
@@ -1048,7 +1064,7 @@ impl RestrictedProfile {
             &temporary_root,
             &temporary,
             &profile.join(TEMPORARY_MANIFEST_FILE),
-        );
+        )?;
         Ok(Self {
             git,
             environment_id,
@@ -2534,12 +2550,13 @@ fn helpers(request: &GitRequest<'_>, exec_path: &Path) -> Vec<PathBuf> {
     helpers
 }
 
-/// One invocation's own temporary directory, which exists only while the invocation does.
+/// One invocation's own temporary directory, made for it and taken away after it.
 ///
 /// Git writes temporary files for several ordinary reasons, and a shared temporary directory is
 /// both outside the boundary and a place anybody on this machine can put a program. So each
 /// invocation gets one of its own, named after nothing, reachable by nothing else, inside the
-/// boundary's write list, and taken away when the invocation ends.
+/// boundary's write list, and taken away when the invocation ends — by the record this host wrote
+/// before it made it, and only when nothing but this host's own mark is in it.
 #[derive(Debug)]
 struct PrivateTemporary {
     environment_id: EnvironmentId,
@@ -3462,7 +3479,9 @@ mod tests {
             ),
         )
         .expect("the record");
-        // One this host recorded making and never got to identify, holding its own mark.
+        // One this host recorded making and never got as far as identifying. A record that says
+        // this host was about to make something says nothing about which object it ended up with,
+        // so this one stays where it is.
         plant("half", "bbbb");
         record(&profile, "making half bbbb").expect("the record");
         // One this host never made.
@@ -3499,14 +3518,11 @@ mod tests {
         plant_theirs("collided", "ffff");
         record(&profile, "making collided ffff").expect("the record");
 
-        sweep(environment_id, &profile, &handle, &temporary, &manifest);
+        sweep(environment_id, &profile, &handle, &temporary, &manifest)
+            .expect("the record is written out again");
 
         assert!(!temporary.join("mine").exists(), "the recorded one is gone");
-        assert!(
-            !temporary.join("half").exists(),
-            "and so is the one holding nothing but this host's own mark"
-        );
-        for left in ["theirs", "used", "swapped", "foreign", "collided"] {
+        for left in ["half", "theirs", "used", "swapped", "foreign", "collided"] {
             assert!(
                 temporary.join(left).exists(),
                 "{left} is not this host's to take away"
@@ -3526,16 +3542,13 @@ mod tests {
             "and neither is a directory at that name that this host did not make"
         );
         let kept = recorded(&profile).expect("the record reads");
-        for name in ["used", "swapped", "foreign", "collided"] {
+        for name in ["half", "used", "swapped", "foreign", "collided"] {
             assert!(
                 kept.contains_key(name),
                 "the record keeps {name}, which is still there, so a later start tries again"
             );
         }
-        assert!(
-            !kept.contains_key("mine") && !kept.contains_key("half"),
-            "and forgets what is gone"
-        );
+        assert!(!kept.contains_key("mine"), "and forgets what is gone");
     }
 
     #[test]
@@ -3559,10 +3572,42 @@ mod tests {
         record(&profile, "something this host does not write").expect("the record");
 
         assert!(recorded(&profile).is_none(), "the record is not readable");
-        sweep(environment_id, &profile, &handle, &temporary, &manifest);
+        sweep(environment_id, &profile, &handle, &temporary, &manifest)
+            .expect_err("and this host will not go on with a record it cannot read");
         assert!(
             temporary.join("mine").exists(),
             "and nothing is taken away on the strength of it"
+        );
+    }
+
+    #[test]
+    fn a_line_this_host_was_writing_when_it_stopped_is_not_a_line() {
+        // A record ending without an end of line is an append that did not finish. It says nothing
+        // about what was made, and it is not a reason to refuse everything written before it.
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().expect("a directory for the record");
+        let profile_path = root.path().join(PROFILE_DIRECTORY);
+        std::fs::create_dir_all(&profile_path).expect("the profile's own directory");
+        let profile =
+            cap_std::fs::Dir::open_ambient_dir(&profile_path, cap_std::ambient_authority())
+                .expect("the profile's own directory opens");
+        record(&profile, "making whole aaaa").expect("the record");
+        {
+            let mut file = profile
+                .open_with(
+                    TEMPORARY_MANIFEST_FILE,
+                    cap_std::fs::OpenOptions::new().append(true),
+                )
+                .expect("the record opens");
+            file.write_all(b"making half-writ").expect("half a line");
+        }
+
+        let entries = recorded(&profile).expect("the lines before it still read");
+        assert!(entries.contains_key("whole"), "the line that finished");
+        assert!(
+            !entries.contains_key("half-writ"),
+            "and not the one that did not"
         );
     }
 
