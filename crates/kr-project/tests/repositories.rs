@@ -1626,8 +1626,9 @@ fn an_https_clone_with_no_credential_helper_is_attempted_rather_than_refused() {
     // others, and an ordinary Linux installation has none. A host that refused an https remote
     // there would put every one of them out of reach, a public repository included. So the attempt
     // goes ahead carrying no credential, and what this test establishes is exactly that: the remote
-    // passed validation and Git was started for it, rather than the host refusing the broker before
-    // anything ran. What became of the attempt after that is Git's, and this does not read it.
+    // passed validation and the host attempted to start Git for it, rather than refusing the broker
+    // before anything ran. What became of the attempt after that is Git's, and this does not read
+    // it.
     // What the profile still guarantees is that no credential of the user's is used: the helper
     // list is empty and no prompt can be answered.
     let fixture = Fixture::with_brokers(support::broker_without_a_credential_helper());
