@@ -20,7 +20,7 @@
     },
     {
       "path": "TOOLS.md",
-      "sha256": "b0eacf0f469a2fd79a493ed9fa5c799e431076098f4e543fecb5eb6609509686"
+      "sha256": "d104a9999de4b2b492b19b131dbc8a42033a189eeb7dbad475eae72e9ab35509"
     }
   ],
   "tools": [
@@ -39,7 +39,8 @@
     "answer_limit_bytes": 16384,
     "timeout_preserves_question": true,
     "cancellation_ends_the_wait_not_the_question": true,
-    "free_text_option": "something_else"
+    "free_text_option": "something_else",
+    "unqualified_poll_ms": 45000
   },
   "scopes": [
     "user",
@@ -66,9 +67,10 @@
       "configuration_user": "~/.claude.json mcpServers.kalareach",
       "configuration_project": "<project>/.mcp.json mcpServers.kalareach",
       "entry_shape": "command_args",
-      "declares_tool_deadline": null,
+      "declares_tool_deadline": "timeout",
       "shared_project_document": true,
-      "note": "The project document is the shared .mcp.json a project's collaborators approve."
+      "note": "The project document is the shared .mcp.json a project's collaborators approve.",
+      "project_tool_deadline": null
     },
     {
       "agent": "opencode",
@@ -80,7 +82,7 @@
       "entry_shape": "local_command_list",
       "declares_tool_deadline": null,
       "shared_project_document": false,
-      "note": "opencode names a local server with one command array and an enabled flag."
+      "note": "opencode's timeout setting is broader than one server, so this installation writes none and the helper's own bound applies."
     },
     {
       "agent": "gemini-cli",
@@ -90,7 +92,7 @@
       "configuration_user": "~/.gemini/settings.json mcpServers.kalareach",
       "configuration_project": "<project>/.gemini/settings.json mcpServers.kalareach",
       "entry_shape": "command_args",
-      "declares_tool_deadline": null,
+      "declares_tool_deadline": "timeout",
       "shared_project_document": false,
       "note": null
     },
@@ -104,7 +106,8 @@
       "entry_shape": "command_args",
       "declares_tool_deadline": "toolTimeoutMs",
       "shared_project_document": true,
-      "note": null
+      "note": null,
+      "project_tool_deadline": null
     },
     {
       "agent": "qoder-cli",
@@ -116,7 +119,8 @@
       "entry_shape": "command_args",
       "declares_tool_deadline": "timeout",
       "shared_project_document": true,
-      "note": null
+      "note": null,
+      "project_tool_deadline": null
     }
   ],
   "removal": {
@@ -127,6 +131,7 @@
     ],
     "rule": "A removal replays the recorded operations in reverse and stops at anything whose digest no longer matches what was written. A directory is deleted only when it is empty, and a server entry only when no other recorded installation on this host still names the same document and entry.",
     "guard": "The digest of what was written, recorded against the exact path and entry. An installation refuses to replace a file or a server entry this host did not write, and a removal leaves anything that changed since.",
-    "record_location": "the host's own state directory, under agent-tools/"
+    "record_location": "the host's own state directory, under agent-tools/",
+    "shared_documents": "A document more than one agent reads carries an entry identical whichever installation wrote it, and no per-agent tool deadline, because those agents do not share a spelling. It is removed only when no other recorded installation on this host still names the same document and entry."
   }
 }

@@ -150,6 +150,12 @@ pub struct Controller {
     transfer: Arc<crate::transfer::TransferModule>,
     /// The environment's project service, whose methods this daemon admits and dispatches.
     project: Arc<crate::project::ProjectModule>,
+    /// The serial boundary every contact-skill installation passes through.
+    ///
+    /// Reading an action's record, writing its dispatch marker, changing the files and recording
+    /// the outcome are one sequence, and two callers running it at once could both find no record
+    /// and both do the work. One daemon owns an environment, so one lock covers it.
+    agent_tools: tokio::sync::Mutex<()>,
     worker_program: PathBuf,
     build_id: BuildId,
     release: String,
@@ -212,6 +218,7 @@ impl Controller {
             supervisor: setup.supervisor,
             transfer,
             project,
+            agent_tools: tokio::sync::Mutex::new(()),
             // The executable the daemon was told to start, resolved here rather than at the
             // launch: a worker runs in a directory of its own, so a relative name would be looked
             // for beneath that instead of beneath the directory this daemon was started in.
@@ -623,6 +630,9 @@ impl Controller {
         mutation: &MutationRequest,
         method: Method,
     ) -> Option<ControlFrame> {
+        if matches!(method, Method::AgentToolsInstall | Method::AgentToolsRemove) {
+            return self.retained_installation(actor_id, mutation).await;
+        }
         if method != Method::SessionCreate {
             return None;
         }
@@ -1471,6 +1481,29 @@ impl Controller {
         })
     }
 
+    /// Returns the answer a retained installation action is owed.
+    ///
+    /// It runs before first-admission freshness, like every other retained action: a caller that
+    /// reconnects and asks again about work it already submitted must get its own result rather
+    /// than a refusal about a window that has since been replaced.
+    async fn retained_installation(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Option<ControlFrame> {
+        let installer = self.installer().ok()?;
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        let _admission = self.agent_tools.lock().await;
+        match installer.retained(actor_id, mutation.action_id, &digest) {
+            Ok(Some(result)) => Some(ControlFrame::Response(Response {
+                request_id: mutation.request_id,
+                outcome: Outcome::Ok(result),
+            })),
+            Ok(None) => None,
+            Err(error) => Some(respond(mutation.request_id, Err(error))),
+        }
+    }
+
     async fn read_method(self: &Arc<Self>, actor_id: &ActorId, request: &Request) -> ControlFrame {
         let Some(method) = request.method.method() else {
             return error_reply(
@@ -1578,7 +1611,8 @@ impl Controller {
                 self.session_close(mutation, &actor, accepted).await
             }
             Method::AgentToolsInstall | Method::AgentToolsRemove => {
-                self.agent_tools_change(actor_id, mutation, method)
+                self.agent_tools_change(actor_id, mutation, method, connection_id, accepted)
+                    .await
             }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
@@ -1601,16 +1635,21 @@ impl Controller {
     /// the same identifier with a different payload is `ID_CONFLICT`, and a marker written before
     /// the change with no outcome after it is `unknown` rather than something to do again. What
     /// can be refused without touching anything is refused before the marker.
-    fn agent_tools_change(
+    async fn agent_tools_change(
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
+        connection_id: ConnectionId,
+        accepted: AcceptedDeadline,
     ) -> Result<ParamsValue> {
         let params: kr_protocol::skill::AgentToolsParams = parse(&mutation.params)?;
         let installer = self.installer()?;
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        // From here to the recorded outcome is one sequence. Two callers cannot both find no
+        // record and both change the same files.
+        let _admission = self.agent_tools.lock().await;
         if let Some(retained) = installer.retained(actor_id, mutation.action_id, &digest)? {
             return Ok(retained);
         }
@@ -1619,6 +1658,18 @@ impl Controller {
         if method == Method::AgentToolsInstall {
             installer.check(&params)?;
         }
+        // Everything above can wait: for this task to be scheduled, for the lock, for the checks
+        // to read the agent's tree. The deadline this action was admitted under and the authority
+        // behind its connection are revalidated here, immediately before anything durable, rather
+        // than left as they were when the request arrived.
+        if self.clock.now() >= accepted.deadline {
+            return Err(ControllerError::WindowExpired {
+                detail: "the deadline this installation was admitted under passed before it could \
+                         run"
+                .to_owned(),
+            });
+        }
+        self.authorised(connection_id).await?;
         installer.mark_dispatching(actor_id, mutation.action_id, &digest)?;
         let result = match method {
             Method::AgentToolsInstall => encode(&installer.install(&params)?)?,

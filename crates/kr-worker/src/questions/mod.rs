@@ -29,11 +29,11 @@ use std::sync::Mutex;
 
 use kr_protocol::ids::{ActorId, DeviceId, SessionEpoch, SessionId};
 use kr_protocol::question::{
-    AlertCreateParams, AlertCreateResult, MAX_ALERT_TEXT_BYTES, Question, QuestionAnswer,
-    QuestionAnswerParams, QuestionCancelOwnParams, QuestionCancelParams, QuestionCreateParams,
-    QuestionCreateResult, QuestionEvent, QuestionEventKind, QuestionOwnResult,
-    QuestionReadOwnParams, QuestionReadParams, QuestionReadResult, QuestionResolveResult,
-    QuestionState, bounded_expiry, build_choices, check_answer, check_text,
+    AlertCreateParams, AlertCreateResult, MAX_AGENT_NAME_BYTES, MAX_ALERT_TEXT_BYTES, Question,
+    QuestionAnswer, QuestionAnswerParams, QuestionCancelOwnParams, QuestionCancelParams,
+    QuestionCreateParams, QuestionCreateResult, QuestionEvent, QuestionEventKind,
+    QuestionOwnResult, QuestionReadOwnParams, QuestionReadParams, QuestionReadResult,
+    QuestionResolveResult, QuestionState, bounded_expiry, build_choices, check_answer, check_text,
 };
 
 pub use crate::questions::binding::{SessionBoundary, VerifiedSource};
@@ -261,6 +261,16 @@ impl Questions {
         if params.text.trim().is_empty() || params.text.len() > MAX_ALERT_TEXT_BYTES {
             return Err(QuestionError::InvalidArgument(format!(
                 "an alert carries 1 to {MAX_ALERT_TEXT_BYTES} bytes of text"
+            )));
+        }
+        // A label is either absent or something a person can read. Accepting an empty one would
+        // make it indistinguishable from an absent one in the de-duplication digest, so two alerts
+        // that differ only in that would look like the same alert.
+        if let Some(name) = params.agent_name.as_ref()
+            && (name.trim().is_empty() || name.len() > MAX_AGENT_NAME_BYTES)
+        {
+            return Err(QuestionError::InvalidArgument(format!(
+                "an agent label is 1 to {MAX_AGENT_NAME_BYTES} bytes of text"
             )));
         }
         let mut store = self.locked()?;

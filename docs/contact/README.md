@@ -103,16 +103,21 @@ revision, so of two simultaneous answers exactly one changes the question and th
 | Lifetime | 24 hours, or the life of the application that asked, whichever ends first |
 | Wait on creation | 30 seconds |
 | Long poll | 300 seconds by default, 600 maximum, renewed in 20-second steps |
-| Declared client deadline | 660 seconds, written into the server entry where the agent supports one |
+| Helper poll with no duration named | 45 seconds |
+| Declared client deadline | 660 seconds, written into the agent's own server entry where it supports one |
 
 A wait that runs out returns the same durable question. It recreates nothing and notifies nobody a
 second time.
 
-The client's own tool deadline is the other bound, and the shorter of the two decides. Where an
-agent lets a server declare one, the installation declares 660 seconds so a full poll can finish;
-where it does not, the agent's own default governs, and the tool reference tells the agent to ask
-for a shorter wait than its client allows. A call the client cuts off loses the wait, never the
-question.
+The client's own tool deadline is the other bound, and the shorter of the two decides. A server
+cannot read a deadline the client never sends, so two things bound it from this side. An
+installation declares 660 seconds in the agent's own configuration where the agent supports a
+per-server deadline: `tool_timeout_sec` for Codex, `toolTimeoutMs` for Kimi Code CLI, `timeout` for
+Claude Code, Qoder CLI and Gemini CLI. A document more than one agent reads carries none of them,
+because those agents do not share a spelling and the entry has to be the same entry all of them
+read. And a poll the agent puts no duration on runs for 45 seconds rather than the host's own
+five-minute default, so an agent whose client allows less loses nothing it was relying on. A call
+the client cuts off loses the wait, never the question.
 
 ## The caller token
 

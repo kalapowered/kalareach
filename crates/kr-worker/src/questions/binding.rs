@@ -109,10 +109,14 @@ pub fn verify(
     // The identity is the connection's, read when it was accepted. A process identifier the kernel
     // recycles while this connection is open names a different program, and answering it as though
     // it were the caller that opened the connection is exactly what pairing an identifier with its
-    // start value prevents.
-    if let Some(admitted) = admitted
-        && !process.matches(admitted)
-    {
+    // start value prevents. A connection whose identity was never captured cannot acquire one
+    // later from whatever holds that identifier now, so it is refused outright.
+    let Some(admitted) = admitted else {
+        return Err(QuestionError::unbound(
+            "this connection's calling process was never identified, so nothing can be bound to it",
+        ));
+    };
+    if !process.matches(admitted) {
         return Err(QuestionError::unbound(
             "the process on this connection is no longer the one that opened it",
         ));
@@ -197,9 +201,13 @@ fn descends_from(pid: u32, root: &ProcessStartIdentity) -> bool {
         if parent.source != current.source || parent.start_value.get() > current.start_value.get() {
             return false;
         }
-        // The link is read again from the child's side: a parent that changed between the two
-        // reads is a process that exited, and its identifier now belongs to whatever replaced it.
-        if platform::parent(current_pid) != Some(parent_pid) {
+        // The child is read again, identity and parent together. If its identifier changed owners
+        // between the first read and this one, both parent readings describe the replacement's
+        // family rather than this one's, and the chain stops rather than climbing somebody else's.
+        let Ok(again) = kr_ipc::identity::process_start_identity(current_pid) else {
+            return false;
+        };
+        if !again.matches(&current) || platform::parent(current_pid) != Some(parent_pid) {
             return false;
         }
         current = parent;
@@ -317,6 +325,27 @@ mod tests {
         // identifier but not the identity must not complete.
         identity.start_value = kr_protocol::scalars::U64::new(identity.start_value.get() ^ 0xFFFF);
         assert!(!descends_from(std::process::id(), &identity));
+    }
+
+    #[test]
+    fn a_connection_whose_caller_was_never_identified_binds_to_nothing() {
+        let boundary = SessionBoundary {
+            boundary: OwnershipBoundary::TerminalGroup {
+                group: 1,
+                terminal: None,
+            },
+            root: kr_ipc::identity::process_start_identity(std::process::id())
+                .expect("an identity"),
+        };
+        let error = verify(
+            Some(std::process::id()),
+            None,
+            ConnectionId::new(Uuid::from_bytes([5; 16])),
+            Some(&boundary),
+        )
+        .expect_err("refused");
+        assert_eq!(error.code(), kr_protocol::error::ErrorCode::NotInKrSession);
+        assert!(error.to_string().contains("never identified"));
     }
 
     #[test]

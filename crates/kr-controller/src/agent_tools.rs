@@ -81,11 +81,12 @@ enum Format {
 }
 
 impl Format {
-    /// Returns the top-level key a JSON document holds servers under.
-    const fn json_key(self) -> &'static str {
+    /// Returns the top-level key this document holds servers under, in its own spelling.
+    const fn key(self) -> &'static str {
         match self {
+            Self::CodexToml => "mcp_servers",
             Self::JsonLocalCommandList => "mcp",
-            Self::CodexToml | Self::JsonCommandArgs => "mcpServers",
+            Self::JsonCommandArgs => "mcpServers",
         }
     }
 }
@@ -151,35 +152,41 @@ impl Installer {
             });
         }
         let root = layout.skills.clone();
-        let mut operations = Vec::new();
-        for directory in missing_ancestors(&root) {
-            std::fs::create_dir_all(&directory).map_err(storage)?;
-            operations.push(ChangeOperation::CreateDirectory {
-                path: display(&directory),
-            });
-        }
-        for (name, contents) in files() {
-            let path = root.join(name);
-            let replaced = read_digest(&path)?;
-            write_atomically(&path, contents.as_bytes(), READABLE)?;
-            operations.push(ChangeOperation::WriteFile {
-                path: display(&path),
-                digest: digest_of(contents.as_bytes()),
-                replaced_digest: Nullable(replaced),
-            });
-        }
-        if let Some(configuration) = layout.configuration.as_ref() {
-            operations.push(self.write_entry(configuration, params.agent)?);
-        }
-        let manifest = ChangeManifest {
+        // The record grows with the work rather than after it. An installation interrupted part
+        // way through then leaves a record of exactly what it had changed, which `kr skill status`
+        // shows and `kr skill remove` undoes; a record written only at the end would leave those
+        // files with nothing describing them.
+        let mut manifest = ChangeManifest {
             skill_version: SKILL_VERSION.to_owned(),
             agent: params.agent,
             scope: params.scope,
             root: display(&root),
             entry_point: self.entry_point(),
-            operations,
+            operations: Vec::new(),
         };
-        self.record(params, &manifest)?;
+        for directory in missing_ancestors(&root) {
+            std::fs::create_dir_all(&directory).map_err(storage)?;
+            manifest.operations.push(ChangeOperation::CreateDirectory {
+                path: display(&directory),
+            });
+            self.record(params, &manifest)?;
+        }
+        for (name, contents) in files() {
+            let path = root.join(name);
+            let replaced = read_digest(&path)?;
+            write_atomically(&path, contents.as_bytes(), READABLE)?;
+            manifest.operations.push(ChangeOperation::WriteFile {
+                path: display(&path),
+                digest: digest_of(contents.as_bytes()),
+                replaced_digest: Nullable(replaced),
+            });
+            self.record(params, &manifest)?;
+        }
+        if let Some(configuration) = layout.configuration.as_ref() {
+            let entry = self.write_entry(configuration, params.agent)?;
+            manifest.operations.push(entry);
+            self.record(params, &manifest)?;
+        }
         Ok(AgentToolsInstallResult {
             manifest,
             already_installed: false,
@@ -325,7 +332,10 @@ impl Installer {
                     entry,
                     digest,
                     ..
-                } => match self.entry_digest(Path::new(path))? {
+                } => match self.entry_digest_under(
+                    Path::new(path),
+                    entry.rsplit_once('.').map_or("mcpServers", |(key, _)| key),
+                )? {
                     None => drift.push(format!("{entry} is missing from {path}")),
                     Some(found) if found != *digest => {
                         drift.push(format!("{entry} in {path} has changed"));
@@ -376,7 +386,7 @@ impl Installer {
         };
         Ok(ChangeOperation::AddConfigurationEntry {
             path: display(&configuration.path),
-            entry: format!("{}.{SERVER_NAME}", configuration.format.json_key()),
+            entry: format!("{}.{SERVER_NAME}", configuration.format.key()),
             digest,
             created_document,
         })
@@ -414,9 +424,13 @@ impl Installer {
         }
         table.insert(SERVER_NAME, toml_edit::Item::Table(entry));
         write_atomically(path, document.to_string().as_bytes(), PRIVATE)?;
-        self.entry_digest(path)?.ok_or_else(|| {
-            ControllerError::InvalidArgument(format!("{} did not keep the entry", display(path)))
-        })
+        self.entry_digest_under(path, Format::CodexToml.key())?
+            .ok_or_else(|| {
+                ControllerError::InvalidArgument(format!(
+                    "{} did not keep the entry",
+                    display(path)
+                ))
+            })
     }
 
     fn write_json_entry(
@@ -426,7 +440,7 @@ impl Installer {
         agent: Option<AgentTarget>,
     ) -> Result<Digest256> {
         let mut document = read_json(path)?;
-        let key = format.json_key();
+        let key = format.key();
         let root = document.as_object_mut().ok_or_else(|| {
             ControllerError::InvalidArgument(format!("{} is not a JSON object", display(path)))
         })?;
@@ -446,7 +460,7 @@ impl Installer {
         let text = serde_json::to_string_pretty(&document)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         write_atomically(path, format!("{text}\n").as_bytes(), PRIVATE)?;
-        self.entry_digest(path)?.ok_or_else(|| {
+        self.entry_digest_under(path, key)?.ok_or_else(|| {
             ControllerError::InvalidArgument(format!("{} did not keep the entry", display(path)))
         })
     }
@@ -501,16 +515,64 @@ impl Installer {
         }
         if let Some(configuration) = layout.configuration.as_ref() {
             self.guard_existing(&configuration.path, configuration.format)?;
+            // The container the entry goes into, not only the entry. A document whose server
+            // container is something other than a table is refused here rather than after the
+            // skill files have been written.
+            self.check_container(configuration)?;
+        }
+        Ok(())
+    }
+
+    /// Refuses a configuration document this installation could not finish writing.
+    fn check_container(&self, configuration: &Configuration) -> Result<()> {
+        let Some(text) = read_to_string(&configuration.path)? else {
+            return Ok(());
+        };
+        let path = &configuration.path;
+        let key = configuration.format.key();
+        if configuration.format == Format::CodexToml {
+            let document: toml_edit::DocumentMut = text.parse().map_err(|error| {
+                ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
+            })?;
+            if let Some(item) = document.get(key)
+                && item.as_table().is_none()
+            {
+                return Err(ControllerError::InvalidArgument(format!(
+                    "{key} in {} holds something other than a table of servers",
+                    display(path)
+                )));
+            }
+            return Ok(());
+        }
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        let document: Value = serde_json::from_str(&text).map_err(|error| {
+            ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
+        })?;
+        if !document.is_object() {
+            return Err(ControllerError::InvalidArgument(format!(
+                "{} is not a JSON object",
+                display(path)
+            )));
+        }
+        if let Some(container) = document.get(key)
+            && !container.is_object()
+        {
+            return Err(ControllerError::InvalidArgument(format!(
+                "{key} in {} is not an object of servers",
+                display(path)
+            )));
         }
         Ok(())
     }
 
     /// Refuses to replace an entry this host did not write.
     fn guard_existing(&self, path: &Path, format: Format) -> Result<()> {
-        let Some(present) = self.entry_digest(path)? else {
+        let Some(present) = self.entry_digest_under(path, format.key())? else {
             return Ok(());
         };
-        if self.records_hold(path, format.json_key(), &present) {
+        if self.records_hold(path, format.key(), &present)? {
             return Ok(());
         }
         Err(ControllerError::PermissionDenied {
@@ -527,48 +589,74 @@ impl Installer {
     /// The digest alone is not enough. Several agents share one project `.mcp.json`, and an entry
     /// written for one of them has the same digest as the entry another would write; matching on
     /// the digest alone would let one installation claim, and later remove, another's entry.
-    fn records_hold(&self, path: &Path, key: &str, digest: &Digest256) -> bool {
-        self.holders(path, key, digest) > 0
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when a record cannot be read, because a record this
+    /// host cannot read is a claim it cannot rule out.
+    fn records_hold(&self, path: &Path, key: &str, digest: &Digest256) -> Result<bool> {
+        Ok(!self.holders(path, key, digest, None)?.is_empty())
     }
 
-    /// Returns how many recorded installations claim this exact entry.
-    fn holders(&self, path: &Path, key: &str, digest: &Digest256) -> usize {
+    /// Returns the records that claim this exact entry, except the one named.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::Storage`] when the records directory or one of its files cannot
+    /// be read.
+    fn holders(
+        &self,
+        path: &Path,
+        key: &str,
+        digest: &Digest256,
+        except: Option<&Path>,
+    ) -> Result<Vec<PathBuf>> {
         let entry_name = format!("{key}.{SERVER_NAME}");
         let wanted = display(path);
-        let Ok(entries) = std::fs::read_dir(&self.records) else {
-            return 0;
+        let listing = match std::fs::read_dir(&self.records) {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(storage(error)),
         };
-        entries
-            .flatten()
-            .filter(|entry| {
-                let Ok(text) = std::fs::read_to_string(entry.path()) else {
-                    return false;
-                };
-                let Ok(manifest) = serde_json::from_str::<ChangeManifest>(&text) else {
-                    return false;
-                };
-                manifest.operations.iter().any(|operation| {
-                    matches!(
-                        operation,
-                        ChangeOperation::AddConfigurationEntry {
-                            path: recorded_path,
-                            entry: recorded_entry,
-                            digest: recorded,
-                            ..
-                        } if recorded_path == &wanted
-                            && recorded_entry == &entry_name
-                            && recorded == digest
-                    )
-                })
-            })
-            .count()
+        let mut found = Vec::new();
+        for entry in listing {
+            let entry = entry.map_err(storage)?;
+            if !entry.path().is_file() || except.is_some_and(|skip| skip == entry.path()) {
+                continue;
+            }
+            let text = std::fs::read_to_string(entry.path()).map_err(storage)?;
+            let Ok(manifest) = serde_json::from_str::<ChangeManifest>(&text) else {
+                // An action record or anything else this host keeps here. Only a manifest claims
+                // a configuration entry.
+                continue;
+            };
+            let claims = manifest.operations.iter().any(|operation| {
+                matches!(
+                    operation,
+                    ChangeOperation::AddConfigurationEntry {
+                        path: recorded_path,
+                        entry: recorded_entry,
+                        digest: recorded,
+                        ..
+                    } if recorded_path == &wanted
+                        && recorded_entry == &entry_name
+                        && recorded == digest
+                )
+            });
+            if claims {
+                found.push(entry.path());
+            }
+        }
+        Ok(found)
     }
 
-    /// Returns the digest of the server entry in a configuration document.
+    /// Returns the digest of the server entry under one named key.
     ///
     /// The digest covers the entry alone, canonically rendered, so it does not change when
-    /// something unrelated in the file does.
-    fn entry_digest(&self, path: &Path) -> Result<Option<Digest256>> {
+    /// something unrelated in the file does. The key is always the one the record names: a
+    /// document that happens to hold two server containers must not have one of them answer for
+    /// the other.
+    fn entry_digest_under(&self, path: &Path, key: &str) -> Result<Option<Digest256>> {
         let Some(text) = read_to_string(path)? else {
             return Ok(None);
         };
@@ -580,36 +668,11 @@ impl Installer {
                 ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
             })?;
             let entry = document
-                .get("mcp_servers")
+                .get(key)
                 .and_then(|servers| servers.as_table())
                 .and_then(|servers| servers.get(SERVER_NAME));
             return Ok(entry.map(|entry| digest_of(entry.to_string().trim().as_bytes())));
         }
-        let document: Value = serde_json::from_str(&text).map_err(|error| {
-            ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
-        })?;
-        for key in ["mcpServers", "mcp"] {
-            if let Some(entry) = document
-                .get(key)
-                .and_then(|servers| servers.get(SERVER_NAME))
-            {
-                return Ok(Some(digest_of(entry.to_string().as_bytes())));
-            }
-        }
-        Ok(None)
-    }
-
-    /// Returns the digest of the server entry under one named key.
-    fn entry_digest_under(&self, path: &Path, key: &str) -> Result<Option<Digest256>> {
-        if path
-            .extension()
-            .is_some_and(|extension| extension == "toml")
-        {
-            return self.entry_digest(path);
-        }
-        let Some(text) = read_to_string(path)? else {
-            return Ok(None);
-        };
         let document: Value = serde_json::from_str(&text).map_err(|error| {
             ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
         })?;
@@ -637,14 +700,17 @@ impl Installer {
             ));
         }
         // Several agents share one project `.mcp.json`. Removing one installation must not take
-        // the server another installation is still using, so the entry goes only when this record
-        // is the last one claiming it. This record is still on disk here, which is why one holder
-        // means this one alone.
-        if self.holders(path, key, &digest) > 1 {
+        // the server another installation is still using, so the entry goes only when no *other*
+        // record claims it. This record is excluded by name rather than by counting, because a
+        // count cannot tell this record from somebody else's when its own file has already gone.
+        let others = self.holders(path, key, &digest, Some(&self.record_path(params)))?;
+        if !others.is_empty() {
             return Ok(Removal::Kept(format!(
-                "another installation on this host still uses it; {} at {} scope was removed \
+                "{} other installation(s) on this host still use it; {} at {} scope was removed \
                  around it",
-                params.agent, params.scope
+                others.len(),
+                params.agent,
+                params.scope
             )));
         }
         if path
@@ -656,7 +722,7 @@ impl Installer {
                 ControllerError::InvalidArgument(format!("{}: {error}", display(path)))
             })?;
             if let Some(servers) = document
-                .get_mut("mcp_servers")
+                .get_mut(key)
                 .and_then(|servers| servers.as_table_mut())
             {
                 servers.remove(SERVER_NAME);
@@ -1028,16 +1094,23 @@ const QUALIFIED_DEADLINE_SECONDS: i64 = 660;
 
 /// The field one agent declares a server's tool deadline in, where it has one.
 ///
-/// An agent without one is not given an invented field: its own default governs, and the tool
-/// reference tells the agent to ask for a shorter wait than its client allows.
+/// Each spelling belongs to that agent's own configuration document. A document more than one
+/// agent reads carries none of them: the three agents that share a project's `.mcp.json` do not
+/// share a spelling, and the entry written for one of them is the entry the others read. Where no
+/// deadline can be declared, the helper bounds its own default instead.
+///
+/// OpenCode is deliberately absent. What its configuration exposes is broader than one server, and
+/// a setting that changes how every server behaves is not this installation's to write.
 fn deadline_field(agent: AgentTarget) -> Option<(&'static str, Value)> {
     match agent {
         AgentTarget::Codex => Some(("tool_timeout_sec", json!(QUALIFIED_DEADLINE_SECONDS))),
         AgentTarget::KimiCodeCli => {
             Some(("toolTimeoutMs", json!(QUALIFIED_DEADLINE_SECONDS * 1_000)))
         }
-        AgentTarget::QoderCli => Some(("timeout", json!(QUALIFIED_DEADLINE_SECONDS * 1_000))),
-        AgentTarget::ClaudeCode | AgentTarget::Opencode | AgentTarget::GeminiCli => None,
+        AgentTarget::ClaudeCode | AgentTarget::QoderCli | AgentTarget::GeminiCli => {
+            Some(("timeout", json!(QUALIFIED_DEADLINE_SECONDS * 1_000)))
+        }
+        AgentTarget::Opencode => None,
     }
 }
 
@@ -1109,27 +1182,46 @@ const PRIVATE: u32 = 0o600;
 /// must not become world-readable because this host rewrote it under its own umask. A file that
 /// did not exist is created with `default_mode`.
 fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> {
+    use std::io::Write as _;
+
     let parent = path.parent().unwrap_or(Path::new("."));
-    let temporary = parent.join(format!(".{}.kalareach", file_name(path)));
-    std::fs::write(&temporary, bytes).map_err(storage)?;
+    // A distinct name per write. A fixed one is a collision between two callers writing the same
+    // file, and each would see the other's half-written bytes.
+    let temporary = parent.join(format!(
+        ".{}.{}.kalareach",
+        file_name(path),
+        hex(&kr_cbor::sha256(kr_ipc::new_uuid().as_bytes())[..6])
+    ));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
+        // The permissions are set before the content exists. Writing first and narrowing after
+        // would leave a readable copy of a private document for as long as the write takes, and
+        // for good after a crash.
         let mode = std::fs::metadata(path)
             .ok()
             .map_or(default_mode, |existing| {
                 existing.permissions().mode() & 0o777
             });
-        let mut permissions = std::fs::metadata(&temporary)
-            .map_err(storage)?
-            .permissions();
-        permissions.set_mode(mode);
-        std::fs::set_permissions(&temporary, permissions).map_err(storage)?;
+        options.mode(mode);
     }
     #[cfg(not(unix))]
     let _ = default_mode;
-    std::fs::rename(&temporary, path).map_err(storage)
+    let mut file = options.open(&temporary).map_err(storage)?;
+    file.write_all(bytes).map_err(storage)?;
+    // The bytes reach the disk before the rename that publishes them, and the directory entry
+    // reaches it before this call returns, so a record written before an effect is on disk before
+    // the effect begins.
+    file.sync_all().map_err(storage)?;
+    drop(file);
+    std::fs::rename(&temporary, path).map_err(storage)?;
+    if let Ok(directory) = std::fs::File::open(parent) {
+        let _ = directory.sync_all();
+    }
+    Ok(())
 }
 
 fn file_name(path: &Path) -> String {
@@ -1522,7 +1614,7 @@ mod tests {
             removed
                 .retained
                 .iter()
-                .any(|note| note.contains("still uses it")),
+                .any(|note| note.contains("still use it")),
             "the removal says why it kept it: {:?}",
             removed.retained
         );

@@ -549,7 +549,7 @@ impl Store {
                 continue;
             }
             let current = self.read_revision(question_id)?;
-            if let Ok(resolved) = self.resolve(
+            match self.resolve(
                 question_id,
                 current,
                 QuestionState::Expired,
@@ -557,7 +557,20 @@ impl Store {
                 None,
                 now,
             ) {
-                expired.push(resolved);
+                Ok(resolved) => expired.push(resolved),
+                // Somebody answered or cancelled it between the read above and this write, or it
+                // moved to a revision this sweep did not see. Both are races the sweep loses, and
+                // losing one is not a failure.
+                Err(
+                    QuestionError::Resolved { .. }
+                    | QuestionError::Expired { .. }
+                    | QuestionError::StaleRevision { .. }
+                    | QuestionError::Unknown { .. },
+                ) => {}
+                // Anything else is the ledger failing. Reporting success would leave a question
+                // that is past its deadline still answerable, because the caller that swept it
+                // goes on to read it as pending.
+                Err(error) => return Err(error),
             }
         }
         Ok(expired)

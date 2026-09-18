@@ -43,6 +43,15 @@ use kr_protocol::question::{
 use kr_protocol::scalars::{DurationMs, Nullable};
 
 use crate::contact::bind::{Bound, SETUP_INSTRUCTION};
+
+/// How long a poll runs when the caller asks for no particular duration.
+///
+/// The host's own default is five minutes, and the specification shortens that to the installed
+/// client's qualified tool deadline. A server cannot read a deadline the client never sends, so an
+/// unasked-for wait is bounded here instead: an installation declares a longer deadline where the
+/// agent lets it, and an agent that knows its client allows more asks for more. A call the client
+/// cuts off loses the wait, never the question.
+const UNQUALIFIED_WAIT: DurationMs = DurationMs::new(45 * 1000);
 use crate::error::{CliError, Result as CliResult};
 
 /// One choice an `ask_user` select offers.
@@ -323,7 +332,12 @@ impl Contact {
         let question_id = parse_question(&params.question_id)?;
         let token = decode_token(&params.caller_token)?;
         let mut client = bind::open(&bound, self.build_id.clone()).await?;
-        let wait = bounded_wait(params.wait_seconds.map(seconds), MAX_WAIT);
+        let wait = params
+            .wait_seconds
+            .map(seconds)
+            .map_or(UNQUALIFIED_WAIT, |asked| {
+                bounded_wait(Some(asked), MAX_WAIT)
+            });
         let question = self
             .poll(&bound, &mut client, question_id, &token, wait, cancelled)
             .await?;
@@ -390,6 +404,10 @@ impl Contact {
         cancelled: &CancellationToken,
     ) -> CliResult<Question> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(wait.get());
+        // The last state this poll actually read. A client that gives up part way through is
+        // answered from it rather than from another exchange, because a cancelled call's response
+        // is discarded by the client anyway and the question is durable either way.
+        let mut seen: Option<Question> = None;
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let step = std::time::Duration::from_millis(WAIT_RENEWAL.get()).min(remaining);
@@ -404,21 +422,21 @@ impl Contact {
             // The client giving up ends the wait at once rather than at the end of the current
             // renewal. A wait that ends this way changes nothing: the question is durable, and
             // calling again resumes waiting on the same one.
-            let ending = QuestionReadOwnParams {
-                wait_ms: Nullable::null(),
-                ..params.clone()
-            };
             let result: QuestionOwnResult = tokio::select! {
                 biased;
                 () = cancelled.cancelled() => {
                     // The read in flight is abandoned part way through its exchange, so this
-                    // connection is not used again: its answer would arrive as the answer to
-                    // whatever asked next on it. A fresh connection reads the question one last
-                    // time, and the question itself is untouched either way.
-                    let mut fresh = bind::open(bound, self.build_id.clone()).await?;
-                    let final_read: QuestionOwnResult =
-                        bind::read(&mut fresh, Method::QuestionReadOwn, &ending).await?;
-                    return Ok(final_read.question);
+                    // connection is never used again: its answer would arrive as the answer to
+                    // whatever asked next on it. Nothing further is asked, because the client that
+                    // cancelled is not waiting for one. What this poll last saw is returned, and
+                    // the question itself is untouched.
+                    return seen.ok_or_else(|| {
+                        CliError::Refused(ProtocolError::new(
+                            ErrorCode::OutcomeUnknown,
+                            "the wait was cancelled before the question could be read; it is \
+                             unchanged, and asking again resumes it",
+                        ))
+                    });
                 }
                 result = bind::read(client, Method::QuestionReadOwn, &params) => result?,
             };
@@ -428,6 +446,7 @@ impl Contact {
             {
                 return Ok(result.question);
             }
+            seen = Some(result.question);
         }
     }
 
