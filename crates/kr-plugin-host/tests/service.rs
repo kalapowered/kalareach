@@ -519,6 +519,7 @@ impl WorkerSession {
                     controller_public_key: *controller.public(),
                     controller_generation: ControllerGeneration::new(1),
                     build_id: build(),
+                    journal_path: Some(environment.journal_database(session_id)),
                 },
             )
             .expect("a worker service"),
