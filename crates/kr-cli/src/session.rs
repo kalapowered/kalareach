@@ -14,7 +14,6 @@ use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{InputLeaseEpoch, SessionId};
 use kr_protocol::method::Method;
-use kr_protocol::projection::ProjectionResetReason;
 use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::session::Dimensions;
 use kr_protocol::worker::WorkerDescriptor;
@@ -150,17 +149,47 @@ fn scroll_keys(bytes: &[u8]) -> Option<i64> {
     None
 }
 
-/// Whether a read is a report about the pointer, which addresses a cell of the live screen.
+/// The bytes a terminal sends when a bracketed paste begins.
+const PASTE_START: &[u8] = b"\x1b[200~";
+
+/// The bytes a terminal sends when a bracketed paste ends.
+const PASTE_END: &[u8] = b"\x1b[201~";
+
+/// Whether a read is nothing but reports about the pointer.
 ///
-/// The two encodings this host advertises: xterm's SGR reports, and the legacy form.
-fn is_mouse_report(bytes: &[u8]) -> bool {
-    let sgr = bytes.starts_with(b"\x1b[<")
-        && (bytes.ends_with(b"M") || bytes.ends_with(b"m"))
-        && bytes[3..bytes.len() - 1]
-            .iter()
-            .all(|byte| byte.is_ascii_digit() || *byte == b';');
-    let legacy = bytes.len() == 6 && bytes.starts_with(b"\x1b[M");
-    sgr || legacy
+/// The two encodings this host advertises: xterm's SGR reports, which are three numbers between
+/// `CSI <` and a press or a release, and the legacy form, which is three bytes after `CSI M`. A
+/// read is all of them or it is none: one press and its release arrive together, and a read with
+/// anything else in it is the session's like any other.
+fn is_pointer_report(bytes: &[u8]) -> bool {
+    let mut at = 0_usize;
+    let mut found = false;
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        if let Some(body) = rest.strip_prefix(b"\x1b[<") {
+            let Some(end) = body.iter().position(|byte| *byte == b'M' || *byte == b'm') else {
+                return false;
+            };
+            let fields: Vec<&[u8]> = body[..end].split(|byte| *byte == b';').collect();
+            if fields.len() != 3
+                || !fields
+                    .iter()
+                    .all(|field| !field.is_empty() && field.iter().all(u8::is_ascii_digit))
+            {
+                return false;
+            }
+            at += 3 + end + 1;
+            found = true;
+            continue;
+        }
+        if rest.starts_with(b"\x1b[M") && rest.len() >= 6 {
+            at += 6;
+            found = true;
+            continue;
+        }
+        return false;
+    }
+    found
 }
 
 /// The row an answer says this window landed on, or `None` for the live screen.
@@ -394,6 +423,7 @@ pub async fn run(
         [options.typed_before, probe.typed].concat(),
         Attached {
             attachment_id: attachment.attachment_id,
+            dimensions,
             lease_epoch: epoch,
             geometry_epoch: geometry.epoch,
             owns_geometry: geometry.owner.as_ref() == Some(&attachment.attachment_id),
@@ -447,6 +477,8 @@ pub async fn run(
 #[derive(Clone, Copy, Debug)]
 struct Attached {
     attachment_id: kr_protocol::ids::AttachmentId,
+    /// The size this attachment reported when it joined.
+    dimensions: Dimensions,
     /// The input lease, where this attachment was given one. `None` is an attachment that watches:
     /// the host would not let this terminal type, because what its keys mean was never established.
     lease_epoch: Option<InputLeaseEpoch>,
@@ -511,6 +543,16 @@ async fn drive(
     // the live screen. It is reported with every size report as well, so a window the person has
     // scrolled back to stays where they put it when they resize their terminal.
     let mut parked: Option<u64> = None;
+    // Movement the person has asked for and the session has not answered yet, the step it was
+    // measured with, and the size that report carried.
+    let mut queued = 0_i64;
+    let mut step = 1_u64;
+    let mut dimensions_now = attached.dimensions;
+    // Whether a bracketed paste is open, so that nothing inside one is read as a key.
+    let mut pasting = false;
+    // The output cursor of the last whole screen this terminal was given, which is how it tells a
+    // screen the session had something new to say from one it asked for itself.
+    let mut drawn_at: Option<u64> = None;
 
     // What the person typed while the host was asking the terminal what it was. It was buffered
     // rather than discarded, and it is the first thing the application receives, in the order it
@@ -581,18 +623,20 @@ async fn drive(
                                 outstanding.insert(request_id, Outstanding::Resubscribe);
                                 continue;
                             };
-                            // What counts as the session writing: a bounded update, and every
-                            // fresh screen the session sent for a reason of its own. A screen this
-                            // terminal asked for by moving its own window is not the session
-                            // writing, and following it would undo the move as it was made.
-                            let changed = match &event {
-                                kr_protocol::projection::ProjectionEvent::Delta(_) => true,
-                                kr_protocol::projection::ProjectionEvent::Reset(reset) => {
-                                    reset.reason != ProjectionResetReason::Attached
-                                }
-                                _ => false,
-                            };
                             let drawn = display.apply(event);
+                            // What counts as the session writing is the session's output cursor
+                            // moving, which is the one thing a screen this terminal asked for
+                            // itself does not do. A reason cannot answer it: the same reason
+                            // covers a screen sent after an overflow and a screen this terminal
+                            // moved its own window to.
+                            let changed = match display.output_cursor() {
+                                Some(now) => {
+                                    let moved = drawn_at.is_some_and(|before| now > before);
+                                    drawn_at = Some(now);
+                                    moved
+                                }
+                                None => false,
+                            };
                             // Where the window actually is, which is not always where this
                             // terminal last asked for: the session gives up its oldest rows, and a
                             // window that was over them is moved to the oldest ones that survive.
@@ -607,9 +651,9 @@ async fn drive(
                             // reading a position out of that would forget where the window is
                             // half way through being told.
                             if parked.is_some()
-                                && let Some(top) = display.window_top_row()
+                                && let Some(above) = display.window_above_the_live_page()
                             {
-                                parked = display.showing_history_buffer().then_some(top);
+                                parked = above;
                             }
                             // The client's own choice, not the session's: a person who asked to
                             // follow the live screen is taken back to it the moment the session
@@ -877,6 +921,37 @@ async fn drive(
                                 {
                                     parked = landed(result.position.0);
                                 }
+                                // What the person asked for while this was in flight, resolved
+                                // against where the window actually ended up. A refusal leaves the
+                                // window where it was, and the movement is measured from there.
+                                if queued != 0
+                                    && let Some(position) = scrolled(parked, queued, step)
+                                {
+                                    queued = 0;
+                                    let request_id =
+                                        kr_protocol::ids::RequestId::new(next_request);
+                                    next_request += 1;
+                                    let params =
+                                        kr_protocol::attachment::AttachmentViewportParams {
+                                            attachment_id,
+                                            dimensions: dimensions_now,
+                                            position: Nullable(position),
+                                        };
+                                    if !send_geometry(
+                                        client,
+                                        descriptor,
+                                        request_id,
+                                        Method::AttachmentViewport,
+                                        &params,
+                                    )
+                                    .await
+                                    {
+                                        return AttachOutcome::Disconnected;
+                                    }
+                                    outstanding.insert(request_id, Outstanding::Scrollback);
+                                } else {
+                                    queued = 0;
+                                }
                             }
                             // The screen follows as ordinary output. A refusal means the session no
                             // longer has this attachment, which is the end of it.
@@ -968,7 +1043,14 @@ async fn drive(
                 // sent them, so there is nothing above its screen but the session's window. And a
                 // full-screen application has its own use for these keys on a buffer that keeps no
                 // history, so they are this terminal's only while the shell's buffer is showing.
-                let mine = display.holds_screen() && display.showing_history_buffer();
+                // Nothing inside a bracketed paste is a key or a report: pasted text reaches the
+                // session byte for byte, whatever it happens to contain. The delimiters are read
+                // whole, like everything else here, so a paste is open from the read that begins
+                // with one to the read that ends with the other.
+                if pasting || bytes.starts_with(PASTE_START) {
+                    pasting = !bytes.ends_with(PASTE_END);
+                }
+                let mine = !pasting && display.holds_screen() && display.showing_history_buffer();
                 if mine
                     && let Some(steps) = scroll_keys(&bytes)
                     && let Ok(size) = terminal.size()
@@ -980,15 +1062,26 @@ async fn drive(
                     let shown = display
                         .window_rows()
                         .unwrap_or_else(|| u64::from(size.rows));
-                    if let Some(position) = scrolled(parked, steps, scroll_step(shown)) {
+                    step = scroll_step(shown);
+                    dimensions_now =
+                        Dimensions::new(u64::from(size.columns), u64::from(size.rows));
+                    // Where the window is is the answer's to say and never a request's guess, so
+                    // one request is in flight at a time and what the person presses meanwhile
+                    // waits for it. A key answered from a position the host had already moved past
+                    // would ask for somewhere nobody is, and two keys resolved against the same
+                    // position would land where one of them did.
+                    queued = queued.saturating_add(steps);
+                    if !outstanding
+                        .values()
+                        .any(|what| matches!(what, Outstanding::Scrollback))
+                        && let Some(position) = scrolled(parked, queued, step)
+                    {
+                        queued = 0;
                         let request_id = kr_protocol::ids::RequestId::new(next_request);
                         next_request += 1;
                         let params = kr_protocol::attachment::AttachmentViewportParams {
                             attachment_id,
-                            dimensions: Dimensions::new(
-                                u64::from(size.columns),
-                                u64::from(size.rows),
-                            ),
+                            dimensions: dimensions_now,
                             position: Nullable(position),
                         };
                         if !send_geometry(
@@ -1003,10 +1096,6 @@ async fn drive(
                             return AttachOutcome::Disconnected;
                         }
                         outstanding.insert(request_id, Outstanding::Scrollback);
-                        // Where the window is is the answer's to say and not this request's. A
-                        // second key pressed before the answer arrives therefore asks from where
-                        // the window last was, which moves it one page rather than two; a request
-                        // built on a guess could ask for somewhere nobody is.
                     }
                     // The key was this terminal's, so nothing of it reaches the session, whether
                     // or not the window had anywhere to go.
@@ -1018,7 +1107,7 @@ async fn drive(
                 // for the same reason the keys are: a report the terminal wrote on its own is a
                 // read of its own, and looking inside a batch is how a command starts altering
                 // what somebody typed.
-                if parked.is_some() && is_mouse_report(&bytes) {
+                if !pasting && parked.is_some() && is_pointer_report(&bytes) {
                     continue;
                 }
                 if bytes.is_empty() {
@@ -1308,17 +1397,30 @@ mod tests {
     /// Section 8: input outside the visible grid has no application effect.
     #[test]
     fn a_pointer_report_is_recognised_whole_or_not_at_all() {
-        use super::is_mouse_report;
+        use super::is_pointer_report;
 
-        assert!(is_mouse_report(b"\x1b[<0;10;4M"), "a press");
-        assert!(is_mouse_report(b"\x1b[<0;10;4m"), "and a release");
-        assert!(is_mouse_report(b"\x1b[M !!"), "and the legacy form");
-        assert!(!is_mouse_report(b"ls -l"), "ordinary typing is not");
+        assert!(is_pointer_report(b"\x1b[<0;10;4M"), "a press");
+        assert!(is_pointer_report(b"\x1b[<0;10;4m"), "and a release");
+        assert!(is_pointer_report(b"\x1b[M !!"), "and the legacy form");
         assert!(
-            !is_mouse_report(b"\x1b[<0;10;4Mls"),
+            is_pointer_report(b"\x1b[<0;10;4M\x1b[<0;10;4m"),
+            "a press and its release arrive together"
+        );
+        assert!(!is_pointer_report(b""), "nothing is not a report");
+        assert!(!is_pointer_report(b"ls -l"), "ordinary typing is not");
+        assert!(
+            !is_pointer_report(b"\x1b[<0;10;4Mls"),
             "and neither is a report with typing after it"
         );
-        assert!(!is_mouse_report(b"\x1b[<0;10"), "nor half of one");
+        assert!(!is_pointer_report(b"\x1b[<0;10"), "nor half of one");
+        assert!(
+            !is_pointer_report(b"\x1b[<M"),
+            "nor a report with no numbers in it"
+        );
+        assert!(
+            !is_pointer_report(b"\x1b[<0;10M"),
+            "nor one with two numbers where there are three"
+        );
     }
 
     /// The step is the window this terminal is shown, not the lines it happens to have.

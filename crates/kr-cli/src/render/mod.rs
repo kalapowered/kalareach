@@ -167,16 +167,30 @@ impl ProjectedDisplay {
             .map(|screen| screen.viewport.rows.get())
     }
 
-    /// The stable row the window this terminal is showing starts at.
+    /// Where the window this terminal is showing starts, when it starts above the live page.
     ///
-    /// `None` until a whole screen has arrived. It is where the window actually is, which is not
-    /// always where this terminal last asked for: the session gives up its oldest rows, and a
-    /// window that was over them is moved to the oldest ones that survive.
+    /// The outer `None` is a terminal holding no whole screen, which says nothing either way; the
+    /// inner one is a window on the live screen. Both origins decide it: a screen carries the rows
+    /// the window holds and the live screen's own first row, and a window above the live page is
+    /// one whose first row is earlier than that. Reading the window's row alone would call a live
+    /// screen historical whenever a session had scrolled.
     #[must_use]
-    pub fn window_top_row(&self) -> Option<u64> {
-        self.projection
-            .screen()
-            .map(|screen| screen.viewport.top_row.get())
+    pub fn window_above_the_live_page(&self) -> Option<Option<u64>> {
+        self.projection.screen().map(|screen| {
+            let top = screen.viewport.top_row.get();
+            (screen.active_buffer == kr_protocol::projection::ProjectedBuffer::Primary
+                && top < screen.viewport.screen_top_row.get())
+            .then_some(top)
+        })
+    }
+
+    /// The output cursor of the screen this terminal is holding.
+    ///
+    /// `None` until a whole screen has arrived. It moves when the session writes and stands still
+    /// when a screen was sent because this terminal moved its own window.
+    #[must_use]
+    pub fn output_cursor(&self) -> Option<u64> {
+        self.projection.screen().map(|screen| screen.cursor_at)
     }
 
     /// Discards the screen, because the session has said this terminal's view is no longer it.

@@ -1124,9 +1124,10 @@ impl Session {
             )?;
             if limit > 0 && limit < minimum {
                 return Err(WorkerError::InvalidArgument(format!(
-                    "a send queue of {limit} bytes cannot carry this window: the smallest screen \
-                     it can be installed with is {minimum} bytes, and a client holding part of a \
-                     screen holds none of it"
+                    "a send queue of {limit} bytes cannot carry this window: it is admitted \
+                     against {minimum} bytes, which is what the smallest screen of it costs with \
+                     the longest reason a reset can carry, and a client holding part of a screen \
+                     holds none of it"
                 )));
             }
         }
@@ -1959,11 +1960,6 @@ impl Session {
                 // And how much of the screen this client's authority reaches: a caller drawn the
                 // live screen alone is paged the buffer that is showing and never the other one.
                 let scope = self.content_scope(attachment_id);
-                if reason == ProjectionResetReason::BufferSwitch {
-                    // The screen was replaced rather than changed, and the buffer that replaced it
-                    // has no history above it. Every window comes back to the live screen with it.
-                    self.attachments.clear_history_windows();
-                }
                 let window = self.window_of(attachment_id, dimensions);
                 match self
                     .engine
@@ -2098,6 +2094,13 @@ impl Session {
             None
         };
         if reset_reason.is_some() {
+            // The screen was replaced rather than changed, and what replaced it has no history
+            // above it: the alternate buffer keeps none, and a full reset starts the rows again.
+            // Every window therefore comes back to the live screen with it. This happens where the
+            // session sees the reset rather than where a client is published to, because a client
+            // that is behind is published nothing at all and would otherwise be restored to rows
+            // that are no longer above anything.
+            self.attachments.clear_history_windows();
             for attachment_id in self.hub.subscribers() {
                 if projecting.contains(&attachment_id) {
                     self.projections.forget(attachment_id);

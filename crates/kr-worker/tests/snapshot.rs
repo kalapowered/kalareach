@@ -2513,3 +2513,80 @@ async fn a_window_too_large_for_this_queue_is_refused_rather_than_resynchronised
         .expect("the live screen is still where this window is");
     assert!(landed.is_none());
 }
+
+/// A full-screen application takes the screen, and every window comes back to the live screen.
+///
+/// The buffer it takes keeps no history and numbers its rows from its own beginning, so a window
+/// above the shell's live page has nothing to be above any more. It is cleared where the session
+/// sees the reset rather than where a client is published to, because a client that has fallen
+/// behind is published nothing at all and would otherwise be restored to rows that are no longer
+/// above anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_buffer_switch_brings_every_window_back_to_the_live_screen() {
+    let host = host_with(
+        "i=0; while [ $i -lt 300 ]; do printf 'line %d\\r\\n' $i; i=$((i+1)); done; \
+         sleep 3; printf '\\033[?1049h'; sleep 20",
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let _ = collect_until_installed(&mut watcher.client, Duration::from_secs(5)).await;
+    let answer = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(80),
+        )),
+    )
+    .await;
+    assert!(
+        matches!(
+            answer.position.0,
+            Some(kr_protocol::attachment::ViewportPosition::Row(_))
+        ),
+        "the window is above the live page: {:?}",
+        answer.position.0
+    );
+
+    // The application takes the screen while this client is reading its history. The projection
+    // reset that carries the switch is what this test is waiting for.
+    let switched = {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let mut seen = false;
+        while tokio::time::Instant::now() < deadline && !seen {
+            let events = collect(&mut watcher.client, Duration::from_secs(2)).await;
+            seen = events.iter().any(|event| {
+                matches!(event, Event::Reset(reset)
+                    if reset.reason == ProjectionResetReason::BufferSwitch)
+            });
+        }
+        seen
+    };
+    assert!(switched, "the application took the screen");
+
+    // The window is the live screen now, on both sides: the session holds no row above the live
+    // page for this attachment, so a report that names none is answered with none and a fresh
+    // screen is the live one.
+    let after = report_viewport(&host, &mut watcher, window, None).await;
+    assert!(
+        after.position.0.is_none(),
+        "the window came back to the live screen with it: {:?}",
+        after.position.0
+    );
+    let installed = collect_until_installed(&mut watcher.client, Duration::from_secs(5)).await;
+    if let Some(top) = installed.iter().rev().find_map(|event| match event {
+        Event::Snapshot(header) => Some(header.viewport),
+        _ => None,
+    }) {
+        assert_eq!(
+            top.top_row, top.screen_top_row,
+            "and the screen it draws is the live one"
+        );
+    }
+}
