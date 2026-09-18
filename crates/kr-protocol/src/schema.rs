@@ -61,6 +61,13 @@ use crate::push::{
     PushRegistrationAnswer, PushRegistrationChallenge, PushRequest, PushSenderRecord,
     PushSenderRenewal, PushSenderRevocation,
 };
+use crate::question::{
+    Alert, AlertCreateParams, AlertCreateResult, AnswerRecord, Question, QuestionAnswer,
+    QuestionAnswerParams, QuestionCancelOwnParams, QuestionCancelParams, QuestionChoice,
+    QuestionCreateParams, QuestionCreateResult, QuestionEvent, QuestionOwnResult,
+    QuestionReadOwnParams, QuestionReadParams, QuestionReadResult, QuestionResolveResult,
+    QuestionSource,
+};
 use crate::receipt::{
     ActionCancelParams, ActionCancelResult, ActionReadParams, ActionReadResult, Receipt,
     ReceiptResponse,
@@ -85,6 +92,10 @@ use crate::session::{
     ClosureRecord, SessionCloseParams, SessionCloseResult, SessionCreateParams,
     SessionCreateResult, SessionListParams, SessionListResult, SessionReadParams,
     SessionReadResult, SessionSummary,
+};
+use crate::skill::{
+    AgentToolsInstallResult, AgentToolsParams, AgentToolsRemoveResult, AgentToolsStatusResult,
+    ChangeManifest, ChangeOperation, InstalledFile,
 };
 use crate::sync::{SyncConflictCopy, SyncObjectRecord};
 use crate::transfer::{
@@ -324,6 +335,34 @@ pub fn protocol_schema() -> Value {
         "workspace_remove_params" => WorkspaceRemoveParams,
         "workspace_remove_result" => WorkspaceRemoveResult,
         "workspace_summary" => WorkspaceSummary,
+        // Agent contact: the questions an agent asks the person, the alerts it raises and the
+        // installation of the skill that carries them. Appended for the same reason.
+        "alert" => Alert,
+        "alert_create_params" => AlertCreateParams,
+        "alert_create_result" => AlertCreateResult,
+        "answer_record" => AnswerRecord,
+        "question" => Question,
+        "question_answer" => QuestionAnswer,
+        "question_answer_params" => QuestionAnswerParams,
+        "question_cancel_own_params" => QuestionCancelOwnParams,
+        "question_cancel_params" => QuestionCancelParams,
+        "question_choice" => QuestionChoice,
+        "question_create_params" => QuestionCreateParams,
+        "question_create_result" => QuestionCreateResult,
+        "question_event" => QuestionEvent,
+        "question_own_result" => QuestionOwnResult,
+        "question_read_own_params" => QuestionReadOwnParams,
+        "question_read_params" => QuestionReadParams,
+        "question_read_result" => QuestionReadResult,
+        "question_resolve_result" => QuestionResolveResult,
+        "question_source" => QuestionSource,
+        "agent_tools_params" => AgentToolsParams,
+        "agent_tools_install_result" => AgentToolsInstallResult,
+        "agent_tools_remove_result" => AgentToolsRemoveResult,
+        "agent_tools_status_result" => AgentToolsStatusResult,
+        "change_manifest" => ChangeManifest,
+        "change_operation" => ChangeOperation,
+        "installed_file" => InstalledFile,
     }
     properties.insert(
         "identifiers".to_owned(),

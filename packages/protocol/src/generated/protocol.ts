@@ -44,6 +44,59 @@ export type SessionId = string
  */
 export type ApplicationInstanceId = string
 /**
+ * One change an installation makes, with its inverse implied by its kind.
+ */
+export type ChangeOperation =
+  | {
+      operation: 'create_directory'
+      /**
+       * The absolute path.
+       */
+      path: string
+    }
+  | {
+      /**
+       * The digest of the content written. A removal that finds different content stops.
+       */
+      digest: string
+      operation: 'write_file'
+      /**
+       * The absolute path.
+       */
+      path: string
+      /**
+       * The digest of what was there before, when the file already existed.
+       */
+      replaced_digest: Digest256 | null
+    }
+  | {
+      /**
+       * True when the document did not exist and this installation created it.
+       */
+      created_document: boolean
+      /**
+       * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+       */
+      digest: string
+      /**
+       * The dotted location of the entry inside it, for example `mcpServers.kalareach`.
+       */
+      entry: string
+      operation: 'add_configuration_entry'
+      /**
+       * The absolute path of the document.
+       */
+      path: string
+    }
+/**
+ * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+ */
+export type Digest256 = string
+/**
+ * Changes when the active upstream execution owner or selected thread changes.
+ */
+export type AgentBindingRevision = string
+/**
  * What an attachment asks to be able to do.
  *
  * A request is not a grant. The host intersects these with the actor's rights, and an attachment
@@ -173,10 +226,6 @@ export type ControlFrame =
   | {
       acceptance_delivered: ActionId
     }
-/**
- * Changes when the active upstream execution owner or selected thread changes.
- */
-export type AgentBindingRevision = string
 /**
  * The session epoch, fixed at 1 in protocol version 1.
  */
@@ -780,6 +829,42 @@ export type PushRequest =
       }
     }
 /**
+ * What a person answered.
+ *
+ * The four arms stay four arms. Section 11 forbids coercing [`Self::Other`] into a listed choice
+ * or into a yes, so an answer that arrived as free text is read as free text by whatever consumes
+ * it.
+ */
+export type QuestionAnswer =
+  | {
+      kind: 'input'
+      /**
+       * What the person typed.
+       */
+      text: string
+    }
+  | {
+      /**
+       * The choice the person selected.
+       */
+      choice_id: string
+      kind: 'choice'
+    }
+  | {
+      /**
+       * True for yes.
+       */
+      decided: boolean
+      kind: 'decision'
+    }
+  | {
+      kind: 'other'
+      /**
+       * What the person typed instead of choosing.
+       */
+      text: string
+    }
+/**
  * What the payer's client sends to a relay's control endpoint.
  */
 export type RelayLeaseRequest =
@@ -891,6 +976,14 @@ export interface KalaReachProtocol {
   actor_envelope?: ActorEnvelope
   agent_draft_add_attachment_params?: AgentDraftAddAttachmentParams
   agent_draft_add_attachment_result?: AgentDraftAddAttachmentResult
+  agent_tools_install_result?: AgentToolsInstallResult
+  agent_tools_params?: AgentToolsParams
+  agent_tools_remove_result?: AgentToolsRemoveResult
+  agent_tools_status_result?: AgentToolsStatusResult
+  alert?: Alert
+  alert_create_params?: AlertCreateParams
+  alert_create_result?: AlertCreateResult
+  answer_record?: AnswerRecord
   archive_descriptor?: ArchiveDescriptor
   attachment_configure_params?: AttachmentConfigureParams
   attachment_contribution?: AttachmentContribution1
@@ -904,6 +997,8 @@ export interface KalaReachProtocol {
   authority_revision_record?: AuthorityRevisionRecord
   backup_generation_publication?: BackupGenerationPublication
   backup_writer_record?: BackupWriterRecord
+  change_manifest?: ChangeManifest1
+  change_operation?: ChangeOperation
   client_offer?: ClientOffer
   closure_record?: ClosureRecord
   connect_reply?: ConnectReply
@@ -1038,6 +1133,7 @@ export interface KalaReachProtocol {
   input_release_params?: InputReleaseParams
   input_write_params?: InputWriteParams
   input_write_result?: InputWriteResult
+  installed_file?: InstalledFile
   local_hello?: LocalHello
   local_hello_ack?: LocalHelloAck
   membership_lease?: MembershipLease
@@ -1082,6 +1178,21 @@ export interface KalaReachProtocol {
   push_sender_record?: PushSenderRecord
   push_sender_renewal?: PushSenderRenewal1
   push_sender_revocation?: PushSenderRevocation1
+  question?: Question
+  question_answer?: QuestionAnswer
+  question_answer_params?: QuestionAnswerParams
+  question_cancel_own_params?: QuestionCancelOwnParams
+  question_cancel_params?: QuestionCancelParams
+  question_choice?: QuestionChoice
+  question_create_params?: QuestionCreateParams
+  question_create_result?: QuestionCreateResult
+  question_event?: QuestionEvent
+  question_own_result?: QuestionOwnResult
+  question_read_own_params?: QuestionReadOwnParams
+  question_read_params?: QuestionReadParams
+  question_read_result?: QuestionReadResult
+  question_resolve_result?: QuestionResolveResult
+  question_source?: QuestionSource2
   receipt?: Receipt3
   receipt_response?: ReceiptResponse
   recovery_bundle?: RecoveryBundle
@@ -1757,6 +1868,362 @@ export interface DraftAttachment1 {
   upstream_evidence: string | null
 }
 /**
+ * The result of `agent_tools.install`.
+ */
+export interface AgentToolsInstallResult {
+  /**
+   * True when the installation was already present and unchanged.
+   */
+  already_installed: boolean
+  manifest: ChangeManifest
+  /**
+   * What an earlier attempt may have written and this one could not account for.
+   *
+   * Empty in the ordinary case. A line here means the installation is not finished: the change
+   * it names is neither owned nor undone, and somebody has to look at it.
+   */
+  unresolved: string[]
+}
+/**
+ * What was changed, and how to undo it.
+ */
+export interface ChangeManifest {
+  /**
+   * The agent it was installed for.
+   */
+  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  /**
+   * The command the agent runs to reach the tools.
+   */
+  entry_point: string[]
+  /**
+   * Every change, in the order it was applied. A removal replays it in reverse.
+   */
+  operations: ChangeOperation[]
+  /**
+   * The directory the scope resolved to.
+   */
+  root: string
+  /**
+   * The scope it was installed at.
+   */
+  scope: 'user' | 'project'
+  /**
+   * The skill version installed.
+   */
+  skill_version: string
+}
+/**
+ * Parameters of `agent_tools.install`, `agent_tools.status` and `agent_tools.remove`.
+ */
+export interface AgentToolsParams {
+  /**
+   * The agent.
+   */
+  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  /**
+   * The project directory, for project scope.
+   */
+  project_dir: string | null
+  /**
+   * The scope.
+   */
+  scope: 'user' | 'project'
+}
+/**
+ * The result of `agent_tools.remove`.
+ */
+export interface AgentToolsRemoveResult {
+  /**
+   * The agent.
+   */
+  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  /**
+   * What was undone.
+   */
+  removed: ChangeOperation[]
+  /**
+   * What was left alone, and why.
+   */
+  retained: string[]
+  /**
+   * The scope.
+   */
+  scope: 'user' | 'project'
+}
+/**
+ * The result of `agent_tools.status`.
+ */
+export interface AgentToolsStatusResult {
+  /**
+   * The agent.
+   */
+  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  /**
+   * What no longer matches the record, in the words a person reads.
+   */
+  drift: string[]
+  /**
+   * Each installed file and whether it is still what was written.
+   */
+  files: InstalledFile[]
+  /**
+   * True when a recorded installation is present.
+   */
+  installed: boolean
+  /**
+   * The operations a removal would run.
+   */
+  removal: ChangeOperation[]
+  /**
+   * The directory the scope resolved to.
+   */
+  root: string
+  /**
+   * The scope.
+   */
+  scope: 'user' | 'project'
+  /**
+   * The version recorded, when there is one.
+   */
+  skill_version: string | null
+}
+/**
+ * What one installed file looks like now.
+ */
+export interface InstalledFile {
+  /**
+   * The digest on disk now, or null when the path is gone.
+   */
+  actual_digest: Digest256 | null
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  expected_digest: string
+  /**
+   * The absolute path.
+   */
+  path: string
+}
+/**
+ * One alert. It reports; it asks for nothing.
+ */
+export interface Alert {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The source's own de-duplication identifier.
+   */
+  dedup_id: string
+  /**
+   * A link into this host's own session, when the source supplied one.
+   */
+  safe_session_link: string | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How urgent it is.
+   */
+  severity: 'info' | 'warning' | 'error'
+  source: QuestionSource
+  /**
+   * The concise text.
+   */
+  text: string
+}
+/**
+ * The verified source, and the unverified label beside it.
+ */
+export interface QuestionSource {
+  /**
+   * The agent thread or binding revision, when a qualified bridge supplied one.
+   *
+   * Null when no bridge did. A null here is not a claim that the thread never changed: without
+   * a bridge the question is application-scoped and thread-switch detection is not offered.
+   */
+  agent_binding_revision: AgentBindingRevision | null
+  /**
+   * The caller's own label for itself. Unverified, and never part of authority.
+   */
+  agent_label: string | null
+  /**
+   * True when the process's parent chain reaches the session's root shell.
+   *
+   * A checked hint, recorded for diagnostics. Section 11 is explicit that ancestry is not a
+   * defence against arbitrary code running under the same account, so nothing is admitted on
+   * this alone.
+   */
+  ancestry: boolean
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * The connection the question was created on.
+   */
+  connection_id: string
+  /**
+   * The executable that process is running, where the platform names it.
+   */
+  executable: string | null
+  /**
+   * True when the helper presented the private launch channel it inherited.
+   *
+   * False means the binding rests on the checks below instead; it does not mean the source is
+   * less bound, and it is recorded so a reader can tell which evidence was available.
+   */
+  launch_channel: boolean
+  process: ProcessStartIdentity
+  /**
+   * True when the process is inside the session's own ownership boundary, as the kernel
+   * reports it. This is what admits a source.
+   */
+  session_member: boolean
+}
+/**
+ * The process the kernel reports on the other end of the socket, with its start value.
+ */
+export interface ProcessStartIdentity {
+  /**
+   * The operating-system process identifier.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  /**
+   * The kernel's start value in the source's own units.
+   */
+  start_value: string
+}
+/**
+ * Parameters of `alert.create`.
+ */
+export interface AlertCreateParams {
+  /**
+   * The caller's label for itself. Unverified.
+   */
+  agent_name: string | null
+  /**
+   * The source's de-duplication identifier.
+   */
+  dedup_id: string
+  /**
+   * A link into this host's own session, when there is one.
+   */
+  safe_session_link: string | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How urgent it is.
+   */
+  severity: 'info' | 'warning' | 'error'
+  /**
+   * The concise text.
+   */
+  text: string
+}
+/**
+ * The result of `alert.create`.
+ */
+export interface AlertCreateResult {
+  alert: Alert1
+  /**
+   * True when an exact duplicate returned the existing alert rather than raising one.
+   */
+  deduplicated: boolean
+}
+/**
+ * The alert.
+ */
+export interface Alert1 {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The source's own de-duplication identifier.
+   */
+  dedup_id: string
+  /**
+   * A link into this host's own session, when the source supplied one.
+   */
+  safe_session_link: string | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How urgent it is.
+   */
+  severity: 'info' | 'warning' | 'error'
+  source: QuestionSource
+  /**
+   * The concise text.
+   */
+  text: string
+}
+/**
+ * The answer, who gave it and against which revision.
+ */
+export interface AnswerRecord {
+  /**
+   * The host-verified principal that answered. A caller never asserts its own.
+   */
+  actor_id: string
+  /**
+   * What was answered.
+   */
+  answer:
+    | {
+        kind: 'input'
+        /**
+         * What the person typed.
+         */
+        text: string
+      }
+    | {
+        /**
+         * The choice the person selected.
+         */
+        choice_id: string
+        kind: 'choice'
+      }
+    | {
+        /**
+         * True for yes.
+         */
+        decided: boolean
+        kind: 'decision'
+      }
+    | {
+        kind: 'other'
+        /**
+         * What the person typed instead of choosing.
+         */
+        text: string
+      }
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  answered_at_ms: string
+  /**
+   * The paired device that answered, when the answer came from one.
+   */
+  device_id: DeviceId | null
+  /**
+   * The revision of the question the person was shown.
+   */
+  question_revision: string
+}
+/**
  * The public descriptor of one archive.
  *
  * Everything outside it is opaque: the archive identity and encrypted-object references. The
@@ -1791,7 +2258,7 @@ export interface EncryptedObjectRef {
    */
   encrypted_len: string
   /**
-   * The SHA-256 of the encrypted object, including its `secretstream` header.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   encrypted_object_hash: string
   /**
@@ -1829,7 +2296,7 @@ export interface KeyWrapContext {
    */
   backup_generation: string
   /**
-   * The SHA-256 of the encrypted object.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   encrypted_object_hash: string
   /**
@@ -2260,6 +2727,35 @@ export interface TrustedWriter {
   writer_key_id: string
 }
 /**
+ * The exact set of changes one installation made, and how to undo them.
+ */
+export interface ChangeManifest1 {
+  /**
+   * The agent it was installed for.
+   */
+  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  /**
+   * The command the agent runs to reach the tools.
+   */
+  entry_point: string[]
+  /**
+   * Every change, in the order it was applied. A removal replays it in reverse.
+   */
+  operations: ChangeOperation[]
+  /**
+   * The directory the scope resolved to.
+   */
+  root: string
+  /**
+   * The scope it was installed at.
+   */
+  scope: 'user' | 'project'
+  /**
+   * The skill version installed.
+   */
+  skill_version: string
+}
+/**
  * The client's complete `hello` offer.
  */
 export interface ClientOffer {
@@ -2401,7 +2897,7 @@ export interface TerminatedProcess {
    * True when the process needed forced termination after the grace period.
    */
   forced: boolean
-  identity: ProcessStartIdentity
+  identity: ProcessStartIdentity1
   /**
    * The executable name, for diagnostics.
    */
@@ -2410,9 +2906,9 @@ export interface TerminatedProcess {
 /**
  * The process and its start identity, so a reused identifier is not mistaken for it.
  */
-export interface ProcessStartIdentity {
+export interface ProcessStartIdentity1 {
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The operating-system process identifier.
    */
   pid: string
   /**
@@ -2420,7 +2916,7 @@ export interface ProcessStartIdentity {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The kernel's start value in the source's own units.
    */
   start_value: string
 }
@@ -2847,7 +3343,7 @@ export interface Notification {
  */
 export interface WorkerRendezvous {
   boot_identity: BootIdentity1
-  process_start_identity: ProcessStartIdentity1
+  process_start_identity: ProcessStartIdentity2
   /**
    * The reservation this worker was started for.
    */
@@ -2882,9 +3378,9 @@ export interface BootIdentity1 {
  * The worker's own process identity, which the controller compares with what the launcher
  * reported and with the connecting peer.
  */
-export interface ProcessStartIdentity1 {
+export interface ProcessStartIdentity2 {
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The operating-system process identifier.
    */
   pid: string
   /**
@@ -2892,7 +3388,7 @@ export interface ProcessStartIdentity1 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The kernel's start value in the source's own units.
    */
   start_value: string
 }
@@ -2995,7 +3491,7 @@ export interface WorkerReady {
    * The worker's private endpoint.
    */
   endpoint: string
-  root_process: ProcessStartIdentity2
+  root_process: ProcessStartIdentity3
   /**
    * One KalaReach terminal session.
    */
@@ -3024,9 +3520,9 @@ export interface Dimensions3 {
 /**
  * The root shell's process identity.
  */
-export interface ProcessStartIdentity2 {
+export interface ProcessStartIdentity3 {
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The operating-system process identifier.
    */
   pid: string
   /**
@@ -3034,7 +3530,7 @@ export interface ProcessStartIdentity2 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The kernel's start value in the source's own units.
    */
   start_value: string
 }
@@ -3060,7 +3556,7 @@ export interface WorkerVerifyProof {
    * The endpoint the challenge arrived on.
    */
   endpoint: string
-  process_start_identity: ProcessStartIdentity3
+  process_start_identity: ProcessStartIdentity4
   protocol_version: ProtocolVersion2
   /**
    * The session epoch, fixed at 1 in protocol version 1.
@@ -3091,9 +3587,9 @@ export interface BootIdentity2 {
 /**
  * The worker's process identity.
  */
-export interface ProcessStartIdentity3 {
+export interface ProcessStartIdentity4 {
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The operating-system process identifier.
    */
   pid: string
   /**
@@ -3101,7 +3597,7 @@ export interface ProcessStartIdentity3 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The kernel's start value in the source's own units.
    */
   start_value: string
 }
@@ -3512,7 +4008,7 @@ export interface DownloadBeginResult {
    */
   chunks: ChunkDescriptor[]
   /**
-   * The whole-file digest.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   content_digest: string
   /**
@@ -3546,7 +4042,7 @@ export interface ChunkDescriptor {
    */
   byte_len: string
   /**
-   * The SHA-256 digest of exactly those bytes.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   digest: string
   /**
@@ -3607,7 +4103,7 @@ export interface ChunkDescriptor1 {
    */
   byte_len: string
   /**
-   * The SHA-256 digest of exactly those bytes.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   digest: string
   /**
@@ -3636,7 +4132,7 @@ export interface DownloadPlacement {
    */
   byte_len: string
   /**
-   * The verified whole-file digest the client must have computed.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   content_digest: string
   /**
@@ -4076,7 +4572,7 @@ export interface SessionSummary {
   /**
    * The root shell's process identity while the session is running.
    */
-  root_process: ProcessStartIdentity4 | null
+  root_process: ProcessStartIdentity5 | null
   /**
    * The session epoch, fixed at 1 in protocol version 1.
    */
@@ -4139,9 +4635,9 @@ export interface Dimensions4 {
  * unrelated program within milliseconds of the original exiting, so the host never terminates,
  * adopts or trusts a process on its identifier alone.
  */
-export interface ProcessStartIdentity4 {
+export interface ProcessStartIdentity5 {
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The operating-system process identifier.
    */
   pid: string
   /**
@@ -4149,7 +4645,7 @@ export interface ProcessStartIdentity4 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The kernel's start value in the source's own units.
    */
   start_value: string
 }
@@ -4225,7 +4721,7 @@ export interface GenerationCheckpoint {
    */
   backup_generation: string
   /**
-   * The hash of that generation's encrypted manifest.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   encrypted_manifest_hash: string
   /**
@@ -5540,7 +6036,7 @@ export interface OwnerConfirmationRequest {
     | 'grant_executable_capability'
     | 'change_host_authority'
   /**
-   * The digest of the exact action. One confirmation authorises one digest.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   action_digest: string
   /**
@@ -5611,7 +6107,7 @@ export interface OwnerConfirmationRequest1 {
     | 'grant_executable_capability'
     | 'change_host_authority'
   /**
-   * The digest of the exact action. One confirmation authorises one digest.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   action_digest: string
   /**
@@ -5656,11 +6152,11 @@ export interface PairFinishRequest {
    */
   binding_tag: string
   /**
-   * The SHA-256 of the canonical client bundle.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   client_bundle_hash: string
   /**
-   * The SHA-256 of the canonical host bundle.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   host_bundle_hash: string
   /**
@@ -5668,7 +6164,7 @@ export interface PairFinishRequest {
    */
   invitation_id: string
   /**
-   * The transcript both devices confirmed.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   transcript: string
 }
@@ -6990,7 +7486,7 @@ export interface PushInstallationBinding {
    */
   state: 'active' | 'disabled'
   /**
-   * The token, as the gateway records it.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   token_digest: string
 }
@@ -7042,7 +7538,7 @@ export interface PushRegistrationAnswerPayload {
    */
   registration_id: string
   /**
-   * The token the challenge was sent to.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   token_digest: string
 }
@@ -7084,7 +7580,7 @@ export interface PushRegistrationChallenge {
    */
   registration_id: string
   /**
-   * The token the challenge was sent to.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   token_digest: string
 }
@@ -7320,6 +7816,644 @@ export interface PushSenderRevocation1 {
   signature: string
 }
 /**
+ * One durable question.
+ *
+ * This is the whole public view. The caller token is deliberately not a field: it is returned to
+ * the source once, in [`QuestionCreateResult`], and never appears in a read, an event or a log.
+ */
+export interface Question {
+  /**
+   * The answer, once there is one.
+   */
+  answer: AnswerRecord | null
+  /**
+   * The options, including the free-text one for `select` and `confirm`.
+   */
+  choices: QuestionChoice[]
+  /**
+   * The concise decision context the source supplied.
+   */
+  context: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * What kind of answer it asks for.
+   */
+  kind: 'input' | 'select' | 'confirm'
+  /**
+   * The question itself.
+   */
+  question: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * When it reached a terminal state.
+   */
+  resolved_at_ms: TimestampMs | null
+  /**
+   * Its revision. An answer names the exact revision it is answering.
+   */
+  revision: string
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  source: QuestionSource1
+  /**
+   * Where it is in its life.
+   */
+  state: 'pending' | 'answered' | 'cancelled' | 'expired'
+}
+/**
+ * One option a `select` question offers.
+ */
+export interface QuestionChoice {
+  /**
+   * The stable identifier an answer names. It does not change with the label.
+   */
+  choice_id: string
+  /**
+   * What the person reads.
+   */
+  label: string
+}
+/**
+ * The verified source, and the unverified label beside it.
+ */
+export interface QuestionSource1 {
+  /**
+   * The agent thread or binding revision, when a qualified bridge supplied one.
+   *
+   * Null when no bridge did. A null here is not a claim that the thread never changed: without
+   * a bridge the question is application-scoped and thread-switch detection is not offered.
+   */
+  agent_binding_revision: AgentBindingRevision | null
+  /**
+   * The caller's own label for itself. Unverified, and never part of authority.
+   */
+  agent_label: string | null
+  /**
+   * True when the process's parent chain reaches the session's root shell.
+   *
+   * A checked hint, recorded for diagnostics. Section 11 is explicit that ancestry is not a
+   * defence against arbitrary code running under the same account, so nothing is admitted on
+   * this alone.
+   */
+  ancestry: boolean
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * The connection the question was created on.
+   */
+  connection_id: string
+  /**
+   * The executable that process is running, where the platform names it.
+   */
+  executable: string | null
+  /**
+   * True when the helper presented the private launch channel it inherited.
+   *
+   * False means the binding rests on the checks below instead; it does not mean the source is
+   * less bound, and it is recorded so a reader can tell which evidence was available.
+   */
+  launch_channel: boolean
+  process: ProcessStartIdentity
+  /**
+   * True when the process is inside the session's own ownership boundary, as the kernel
+   * reports it. This is what admits a source.
+   */
+  session_member: boolean
+}
+/**
+ * Parameters of `question.answer`.
+ */
+export interface QuestionAnswerParams {
+  /**
+   * The answer.
+   */
+  answer:
+    | {
+        kind: 'input'
+        /**
+         * What the person typed.
+         */
+        text: string
+      }
+    | {
+        /**
+         * The choice the person selected.
+         */
+        choice_id: string
+        kind: 'choice'
+      }
+    | {
+        /**
+         * True for yes.
+         */
+        decided: boolean
+        kind: 'decision'
+      }
+    | {
+        kind: 'other'
+        /**
+         * What the person typed instead of choosing.
+         */
+        text: string
+      }
+  /**
+   * The revision the person was shown. A different current revision is refused.
+   */
+  expected_revision: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * Parameters of `question.cancel_own`.
+ */
+export interface QuestionCancelOwnParams {
+  /**
+   * The token issued when it was created.
+   */
+  caller_token: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * Parameters of `question.cancel`.
+ */
+export interface QuestionCancelParams {
+  /**
+   * The revision the person was shown.
+   */
+  expected_revision: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * Parameters of `question.create`.
+ */
+export interface QuestionCreateParams {
+  /**
+   * The caller's label for itself. Unverified.
+   */
+  agent_name: string | null
+  /**
+   * The choices, for a `select`. The free-text option is added by the host.
+   */
+  choices: QuestionChoice[]
+  /**
+   * The concise decision context.
+   */
+  context: string
+  /**
+   * What kind of answer it asks for.
+   */
+  kind: 'input' | 'select' | 'confirm'
+  /**
+   * The question itself.
+   */
+  question: string
+  /**
+   * The caller's own unpredictable identifier for this request.
+   *
+   * De-duplication is by the verified originating application and this value together. A caller
+   * label is not part of it.
+   */
+  request_id: string
+  /**
+   * How long the question should live. Bounded by [`MAX_EXPIRY`] and by the source's own
+   * lifetime.
+   */
+  requested_expiry_ms: DurationMs | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How long to wait for an answer before returning the pending question. Bounded by
+   * [`MAX_CREATE_WAIT`].
+   */
+  wait_ms: DurationMs | null
+}
+/**
+ * The result of `question.create`.
+ */
+export interface QuestionCreateResult {
+  /**
+   * The token that lets this source poll and cancel it.
+   */
+  caller_token: string
+  /**
+   * True when an exact duplicate returned the existing question rather than creating one.
+   */
+  deduplicated: boolean
+  question: Question1
+}
+/**
+ * The durable question.
+ */
+export interface Question1 {
+  /**
+   * The answer, once there is one.
+   */
+  answer: AnswerRecord | null
+  /**
+   * The options, including the free-text one for `select` and `confirm`.
+   */
+  choices: QuestionChoice[]
+  /**
+   * The concise decision context the source supplied.
+   */
+  context: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * What kind of answer it asks for.
+   */
+  kind: 'input' | 'select' | 'confirm'
+  /**
+   * The question itself.
+   */
+  question: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * When it reached a terminal state.
+   */
+  resolved_at_ms: TimestampMs | null
+  /**
+   * Its revision. An answer names the exact revision it is answering.
+   */
+  revision: string
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  source: QuestionSource1
+  /**
+   * Where it is in its life.
+   */
+  state: 'pending' | 'answered' | 'cancelled' | 'expired'
+}
+/**
+ * One question transition, as the attention engine reads it.
+ *
+ * Section 25's idle reminder fires after five minutes of a *verified pending* request, so the
+ * event carries the moment the question became pending and whether its source was verified.
+ * Nothing here is the reminder itself; the attention engine owns that rule.
+ */
+export interface QuestionEvent {
+  /**
+   * What happened.
+   */
+  kind: 'created' | 'answered' | 'cancelled' | 'expired'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  pending_since_ms: string
+  question: Question2
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  recorded_at_ms: string
+}
+/**
+ * The question at this revision.
+ */
+export interface Question2 {
+  /**
+   * The answer, once there is one.
+   */
+  answer: AnswerRecord | null
+  /**
+   * The options, including the free-text one for `select` and `confirm`.
+   */
+  choices: QuestionChoice[]
+  /**
+   * The concise decision context the source supplied.
+   */
+  context: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * What kind of answer it asks for.
+   */
+  kind: 'input' | 'select' | 'confirm'
+  /**
+   * The question itself.
+   */
+  question: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * When it reached a terminal state.
+   */
+  resolved_at_ms: TimestampMs | null
+  /**
+   * Its revision. An answer names the exact revision it is answering.
+   */
+  revision: string
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  source: QuestionSource1
+  /**
+   * Where it is in its life.
+   */
+  state: 'pending' | 'answered' | 'cancelled' | 'expired'
+}
+/**
+ * The result of `question.read_own` and `question.cancel_own`.
+ */
+export interface QuestionOwnResult {
+  question: Question3
+}
+/**
+ * The question as it now stands.
+ */
+export interface Question3 {
+  /**
+   * The answer, once there is one.
+   */
+  answer: AnswerRecord | null
+  /**
+   * The options, including the free-text one for `select` and `confirm`.
+   */
+  choices: QuestionChoice[]
+  /**
+   * The concise decision context the source supplied.
+   */
+  context: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * What kind of answer it asks for.
+   */
+  kind: 'input' | 'select' | 'confirm'
+  /**
+   * The question itself.
+   */
+  question: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * When it reached a terminal state.
+   */
+  resolved_at_ms: TimestampMs | null
+  /**
+   * Its revision. An answer names the exact revision it is answering.
+   */
+  revision: string
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  source: QuestionSource1
+  /**
+   * Where it is in its life.
+   */
+  state: 'pending' | 'answered' | 'cancelled' | 'expired'
+}
+/**
+ * Parameters of `question.read_own`.
+ */
+export interface QuestionReadOwnParams {
+  /**
+   * The token issued when it was created.
+   */
+  caller_token: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How long to wait for a change before answering with the question as it stands.
+   *
+   * A wait that times out returns the same durable question. It does not recreate it, and it
+   * does not notify anybody again.
+   */
+  wait_ms: DurationMs | null
+}
+/**
+ * Parameters of `question.read`.
+ */
+export interface QuestionReadParams {
+  /**
+   * True to include questions that have already been resolved.
+   */
+  include_resolved: boolean
+  /**
+   * One question, or null for every question this actor may see.
+   */
+  question_id: QuestionId | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `question.read`.
+ */
+export interface QuestionReadResult {
+  /**
+   * The questions, oldest first.
+   */
+  questions: Question[]
+}
+/**
+ * The result of `question.answer` and `question.cancel`.
+ */
+export interface QuestionResolveResult {
+  question: Question4
+}
+/**
+ * One durable question.
+ *
+ * This is the whole public view. The caller token is deliberately not a field: it is returned to
+ * the source once, in [`QuestionCreateResult`], and never appears in a read, an event or a log.
+ */
+export interface Question4 {
+  /**
+   * The answer, once there is one.
+   */
+  answer: AnswerRecord | null
+  /**
+   * The options, including the free-text one for `select` and `confirm`.
+   */
+  choices: QuestionChoice[]
+  /**
+   * The concise decision context the source supplied.
+   */
+  context: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * What kind of answer it asks for.
+   */
+  kind: 'input' | 'select' | 'confirm'
+  /**
+   * The question itself.
+   */
+  question: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * When it reached a terminal state.
+   */
+  resolved_at_ms: TimestampMs | null
+  /**
+   * Its revision. An answer names the exact revision it is answering.
+   */
+  revision: string
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  source: QuestionSource1
+  /**
+   * Where it is in its life.
+   */
+  state: 'pending' | 'answered' | 'cancelled' | 'expired'
+}
+/**
+ * The application the host verified as the source of a question.
+ *
+ * Everything here except [`Self::agent_label`] comes from the operating system through the
+ * worker's private socket. The label comes from the caller and is displayed as unverified, which
+ * is the whole of the difference between the two.
+ */
+export interface QuestionSource2 {
+  /**
+   * The agent thread or binding revision, when a qualified bridge supplied one.
+   *
+   * Null when no bridge did. A null here is not a claim that the thread never changed: without
+   * a bridge the question is application-scoped and thread-switch detection is not offered.
+   */
+  agent_binding_revision: AgentBindingRevision | null
+  /**
+   * The caller's own label for itself. Unverified, and never part of authority.
+   */
+  agent_label: string | null
+  /**
+   * True when the process's parent chain reaches the session's root shell.
+   *
+   * A checked hint, recorded for diagnostics. Section 11 is explicit that ancestry is not a
+   * defence against arbitrary code running under the same account, so nothing is admitted on
+   * this alone.
+   */
+  ancestry: boolean
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * The connection the question was created on.
+   */
+  connection_id: string
+  /**
+   * The executable that process is running, where the platform names it.
+   */
+  executable: string | null
+  /**
+   * True when the helper presented the private launch channel it inherited.
+   *
+   * False means the binding rests on the checks below instead; it does not mean the source is
+   * less bound, and it is recorded so a reader can tell which evidence was available.
+   */
+  launch_channel: boolean
+  process: ProcessStartIdentity
+  /**
+   * True when the process is inside the session's own ownership boundary, as the kernel
+   * reports it. This is what admits a source.
+   */
+  session_member: boolean
+}
+/**
  * One action receipt.
  *
  * The de-duplication key is `(actor_id, action_id)`. An exact duplicate returns the stored
@@ -7421,7 +8555,7 @@ export interface ArchiveCheckpoint {
    */
   backup_generation: string
   /**
-   * The hash of that generation's encrypted manifest.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   encrypted_manifest_hash: string
   /**
@@ -8026,7 +9160,7 @@ export interface RootEditorEnterParams {
    * The revision of this reader inside that prompt.
    */
   reader_revision: string
-  root_process: ProcessStartIdentity5
+  root_process: ProcessStartIdentity6
   /**
    * One KalaReach terminal session.
    */
@@ -8090,9 +9224,9 @@ export interface PendingReaderInput {
  * unrelated program within milliseconds of the original exiting, so the host never terminates,
  * adopts or trusts a process on its identifier alone.
  */
-export interface ProcessStartIdentity5 {
+export interface ProcessStartIdentity6 {
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The operating-system process identifier.
    */
   pid: string
   /**
@@ -8100,7 +9234,7 @@ export interface ProcessStartIdentity5 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The kernel's start value in the source's own units.
    */
   start_value: string
 }
@@ -8147,14 +9281,14 @@ export interface EditorFence {
    * The reader revision inside that prompt.
    */
   reader_revision: string
-  root_process: ProcessStartIdentity6
+  root_process: ProcessStartIdentity7
 }
 /**
  * The root shell process, with the kernel's record of when it started.
  */
-export interface ProcessStartIdentity6 {
+export interface ProcessStartIdentity7 {
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The operating-system process identifier.
    */
   pid: string
   /**
@@ -8162,7 +9296,7 @@ export interface ProcessStartIdentity6 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The kernel's start value in the source's own units.
    */
   start_value: string
 }
@@ -8444,7 +9578,7 @@ export interface ServiceRequestSignature {
  */
 export interface ServiceRequestPayload {
   /**
-   * The SHA-256 of the canonical request body.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   body_digest: string
   /**
@@ -8828,7 +9962,7 @@ export interface SessionSummary1 {
   /**
    * The root shell's process identity while the session is running.
    */
-  root_process: ProcessStartIdentity4 | null
+  root_process: ProcessStartIdentity5 | null
   /**
    * The session epoch, fixed at 1 in protocol version 1.
    */
@@ -8951,7 +10085,7 @@ export interface SessionSummary2 {
   /**
    * The root shell's process identity while the session is running.
    */
-  root_process: ProcessStartIdentity4 | null
+  root_process: ProcessStartIdentity5 | null
   /**
    * The session epoch, fixed at 1 in protocol version 1.
    */
@@ -9034,7 +10168,7 @@ export interface SessionSummary3 {
   /**
    * The root shell's process identity while the session is running.
    */
-  root_process: ProcessStartIdentity4 | null
+  root_process: ProcessStartIdentity5 | null
   /**
    * The session epoch, fixed at 1 in protocol version 1.
    */
@@ -9183,7 +10317,7 @@ export interface EncryptedObjectRef1 {
    */
   encrypted_len: string
   /**
-   * The SHA-256 of the encrypted object, including its `secretstream` header.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   encrypted_object_hash: string
   /**
@@ -9201,7 +10335,7 @@ export interface SignedClientBundle {
    */
   signature: string
   /**
-   * The transcript the signature covers.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   transcript: string
 }
@@ -9262,7 +10396,7 @@ export interface SignedHostBundle {
    */
   signature: string
   /**
-   * The transcript the signature covers.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   transcript: string
 }
@@ -9660,7 +10794,7 @@ export interface UploadBeginParams {
    */
   declared_byte_len: string
   /**
-   * The declared whole-file digest, verified before anything is published.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   declared_digest: string
   /**
@@ -9784,7 +10918,7 @@ export interface ChunkDescriptor2 {
    */
   byte_len: string
   /**
-   * The SHA-256 digest of exactly those bytes.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   digest: string
   /**
@@ -9829,7 +10963,7 @@ export interface UploadFinishParams {
    */
   declared_byte_len: string
   /**
-   * The declared whole-file digest, which must match the one `upload.begin` recorded.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   declared_digest: string
   /**
@@ -9998,7 +11132,7 @@ export interface WorkerDescriptor {
    * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
-  process_start_identity: ProcessStartIdentity7
+  process_start_identity: ProcessStartIdentity8
   protocol_version: ProtocolVersion5
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
@@ -10042,9 +11176,9 @@ export interface BootIdentity5 {
  * unrelated program within milliseconds of the original exiting, so the host never terminates,
  * adopts or trusts a process on its identifier alone.
  */
-export interface ProcessStartIdentity7 {
+export interface ProcessStartIdentity8 {
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The operating-system process identifier.
    */
   pid: string
   /**
@@ -10052,7 +11186,7 @@ export interface ProcessStartIdentity7 {
    */
   source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
   /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   * The kernel's start value in the source's own units.
    */
   start_value: string
 }
