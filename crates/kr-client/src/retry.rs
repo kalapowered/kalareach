@@ -48,14 +48,14 @@ pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// call that never returns, and the caller would have nothing to show for the wait.
 pub const MAX_AUTOMATIC_RETRIES: u32 = 3;
 
-/// The longest single delay the library will wait inside a call before handing the decision back.
+/// The longest *one* delay may be before the library hands the decision back instead of waiting.
 ///
 /// A managed service may legitimately ask for a delay of minutes. Honouring it inside a call would
 /// hold the caller for minutes with no way to change its mind, so a longer delay is reported as a
 /// repeat the caller schedules rather than performed as a retry the caller cannot see.
 ///
-/// It bounds each delay rather than their sum. [`MAX_AUTOMATIC_RETRIES`] delays of this length add
-/// up, so the longest a call waits on the policy's account is the two multiplied together, and the
+/// It bounds each delay and not their sum. [`MAX_AUTOMATIC_RETRIES`] delays of this length add up,
+/// so the longest a call waits on the policy's account is the two multiplied together, and the
 /// requests themselves take whatever they take.
 pub const MAX_AUTOMATIC_DELAY: Duration = Duration::from_secs(10);
 

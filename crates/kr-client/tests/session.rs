@@ -28,8 +28,8 @@ use kr_protocol::envelope::{
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{
     AgentBindingRevision, ApplicationInstanceId, AttachmentId, BootEpoch, BuildId, ClockEpoch,
-    DeviceId, DeviceKeyRevision, DraftRevision, EnvironmentId, EventSequence, EventType, SessionId,
-    StreamId,
+    DeviceId, DeviceKeyRevision, DraftId, DraftRevision, EnvironmentId, EventSequence, EventType,
+    SessionId, StreamId,
 };
 use kr_protocol::method::Method;
 use kr_protocol::receipt::{Receipt, ReceiptState};
@@ -1000,37 +1000,27 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
     let mut rebound = store.load(draft.draft_id).expect("the draft");
     assert_eq!(rebound.rebind(Some(&target)), DraftState::Open);
     assert_eq!(rebound, draft, "a rebind changes nothing about the draft");
+    // A round trip first, so the host has answered everything this connection sent before the
+    // count is read: an empty list on a connection the host had not reached yet would pass for the
+    // wrong reason.
+    let _: SessionList = session
+        .read(Method::SessionList, &Empty {})
+        .await
+        .expect("a listing");
     assert!(
         script.actions.lock().await.is_empty(),
         "no action reached the host: a draft is submitted by a person, not by a reconnect"
     );
 
-    // Another device wrote to the shared object first. This device's write loses the comparison.
-    let remote_store = DraftStore::open(
-        directory.path().join("theirs"),
-        DeviceId::new(Uuid::from_bytes([9; 16])),
-    )
-    .expect("a store");
-    let mut theirs = remote_store
-        .create(
-            target.clone(),
-            "an earlier thought".to_owned(),
-            TimestampMs::new(2),
-        )
-        .expect("a draft");
-    // Three edits on that device, so its revision is past the one a fresh copy would carry and the
-    // conflict cannot report the copy's number by accident.
-    for (revision, text) in [(2, "a second thought"), (3, "what the other device had")] {
-        theirs = remote_store
-            .update(
-                theirs.draft_id,
-                DraftRevision::new(revision - 1),
-                TimestampMs::new(revision + 1),
-                |draft| draft.text = text.to_owned(),
-            )
-            .expect("an edit");
-    }
-    assert_eq!(theirs.revision, DraftRevision::new(3));
+    // Another device wrote to the shared object first. One collection holds one draft, so what it
+    // holds is this draft under that device's own revision and text.
+    let theirs = Draft {
+        device_id: DeviceId::new(Uuid::from_bytes([9; 16])),
+        revision: DraftRevision::new(3),
+        text: "what the other device had".to_owned(),
+        updated_at_ms: TimestampMs::new(2),
+        ..draft.clone()
+    };
     let service = Arc::new(RemoteObjects::default());
     let sealer = ReversingSealer;
     let sealed = sealer
@@ -1070,17 +1060,43 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
     assert!(listing.unreadable.is_empty());
     assert_eq!(listing.drafts.len(), 2);
 
+    // An object that opens to a different draft is not this draft's, whatever opened it.
+    let misfiled = sealer
+        .seal(
+            &DraftStore::encode_payload(&Draft {
+                draft_id: DraftId::new(Uuid::from_bytes([200; 16])),
+                ..theirs.clone()
+            })
+            .expect("canonical bytes"),
+        )
+        .expect("sealed");
+    service
+        .compare_exchange(&draft_collection(draft.draft_id), 1, &misfiled)
+        .await
+        .expect("a misfiled write");
+    let error = sync
+        .fetch_beside(&store, draft.draft_id, TimestampMs::new(4))
+        .await
+        .expect_err("a misfiled object");
+    assert!(error.to_string().contains("could not be read"), "{error}");
+    assert_eq!(
+        store.list().expect("a listing").drafts.len(),
+        2,
+        "nothing was kept from an object that is not this draft's"
+    );
+
     // A draft this device edited offline is published against the generation this device last saw,
     // which is none: its own revision counter has nothing to do with the service's.
-    let mut fresh = store
+    let fresh = store
         .create(target, "a second draft".to_owned(), TimestampMs::new(4))
         .expect("a draft");
-    fresh = store
+    let fresh = store
         .update(
-            fresh.draft_id,
-            fresh.revision,
+            &Draft {
+                text: "a second draft, edited".to_owned(),
+                ..fresh
+            },
             TimestampMs::new(5),
-            |draft| draft.text = "a second draft, edited".to_owned(),
         )
         .expect("an edit");
     assert_eq!(fresh.revision, DraftRevision::new(2));
@@ -1110,19 +1126,34 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
 
     // An older copy of this device's own draft is refused rather than sent. The service would take
     // it, because its generation is right and a draft revision means nothing to it, and the newest
-    // text would be gone from the object every other device reads.
-    let stale = store
-        .load(fresh.draft_id)
-        .map(|draft| Draft {
-            revision: DraftRevision::new(1),
-            ..draft
-        })
-        .expect("an older copy");
+    // text would be gone from the object every other device reads. What decides it is the store's
+    // own record, so a fetch that cleared the note does not clear the protection.
+    let stale = Draft {
+        revision: DraftRevision::new(1),
+        text: "what this window still had on screen".to_owned(),
+        ..fresh.clone()
+    };
     let error = sync
         .publish(&store, &stale, TimestampMs::new(8))
         .await
         .expect_err("an older copy");
-    assert!(error.to_string().contains("is older"), "{error}");
+    assert!(
+        error.to_string().contains("is not what this device holds"),
+        "{error}"
+    );
+
+    // A store opened for another device does not publish this one's drafts, the way it does not
+    // change or remove them.
+    let other_device = DraftStore::open(
+        directory.path().join("mine"),
+        DeviceId::new(Uuid::from_bytes([9; 16])),
+    )
+    .expect("a store");
+    let error = sync
+        .publish(&other_device, &fresh, TimestampMs::new(8))
+        .await
+        .expect_err("another device's draft");
+    assert!(error.to_string().contains("belongs to device"), "{error}");
 
     // A device that lost its note compares against nothing, is overtaken by what is already there,
     // keeps that content beside its own and learns the generation. The next publication works.
@@ -1137,6 +1168,11 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         matches!(published, Published::Conflicted { generation: 2, .. }),
         "{published:?}"
     );
+    // The local draft is exactly as it was. What came down is beside it.
+    assert_eq!(
+        store.load(fresh.draft_id).expect("the draft").text,
+        "a second draft, edited"
+    );
     assert_eq!(
         sync.publish(&store, &fresh, TimestampMs::new(10))
             .await
@@ -1145,6 +1181,12 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         "the note the fetch wrote is what the next comparison names"
     );
 
+    // The whole exercise, with the host still there: a draft was written, presented, re-presented,
+    // carried across a reconnect, overtaken and synchronised, and nothing was ever submitted.
+    let _: SessionList = session
+        .read(Method::SessionList, &Empty {})
+        .await
+        .expect("a listing");
     assert!(script.actions.lock().await.is_empty());
     session.close();
     serving.abort();

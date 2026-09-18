@@ -23,10 +23,11 @@ pub enum ClientError {
     /// The refusal is the protocol error a caller branches on, and the delay beside it is what the
     /// service asked for, in seconds, when it said. It is separate from [`Self::Host`] for two
     /// reasons. Honouring a stated delay is the difference between backing off and being refused
-    /// again, and a delay inside a message is a delay nothing can act on. And who refused decides
-    /// what a person is told: a host answering `PERMISSION_DENIED` means this device does not hold
-    /// the right, while a service answering it means the account is not signed in. A service
-    /// refusal is therefore this variant whether or not it named a delay.
+    /// again, and a delay inside a message is a delay nothing can act on. And a service knows more
+    /// about its own refusal than the required code set can carry: section 23 has one
+    /// `PERMISSION_DENIED`, and a service uses it both for a caller that is not signed in and for
+    /// an account that may not do this, so it says which by carrying the action. A service refusal
+    /// is therefore this variant whether or not it named a delay.
     #[error("{}: {}{}", .error.code.as_str(), .error.message, delay_note(.retry_after_seconds))]
     Refused {
         /// What the service said was wrong.
