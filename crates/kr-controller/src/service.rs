@@ -204,12 +204,16 @@ pub struct Controller {
     /// worker, used in order, is what stops that.
     connections: Mutex<BTreeMap<SessionId, Arc<tokio::sync::Mutex<Option<LocalClient>>>>>,
     pending: Mutex<BTreeMap<ReservationId, PendingCreate>>,
-    /// Held for the length of one look for unresolved claims.
+    /// The reservations a look or a publication currently holds.
     ///
-    /// Two requests that looked at once would challenge the same worker from two stale snapshots,
-    /// and each challenge that succeeds presents a generation token, which fences whichever
-    /// connection of this daemon's came first.
-    recovering: Mutex<()>,
+    /// A challenge presents a generation token, and one presented while that worker's own report is
+    /// being published fences the connection this daemon has just opened. So a look and a
+    /// publication take the reservation between them, one at a time. Two different reservations
+    /// have nothing to say to each other and never wait for one another: a worker that reported
+    /// itself must not sit behind a look at somebody else's silent process.
+    recovering: std::sync::Mutex<std::collections::BTreeSet<ReservationId>>,
+    /// Woken whenever a reservation is given back.
+    recovered: tokio::sync::Notify,
     /// Every connection this daemon has admitted, and the authority revision it was admitted at.
     ///
     /// This is the daemon's authority store for live connections. A registration is written in the
@@ -350,6 +354,25 @@ impl std::fmt::Debug for Controller {
     }
 }
 
+/// One reservation, held by whichever of a look and a publication took it.
+///
+/// Giving it back wakes whoever is waiting for that reservation, and only they look again.
+struct ReservationHold<'a> {
+    controller: &'a Controller,
+    reservation_id: ReservationId,
+}
+
+impl Drop for ReservationHold<'_> {
+    fn drop(&mut self) {
+        self.controller
+            .recovering
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.reservation_id);
+        self.controller.recovered.notify_waiters();
+    }
+}
+
 struct PendingCreate {
     ready: oneshot::Sender<std::result::Result<WorkerReady, ProtocolError>>,
 }
@@ -391,7 +414,8 @@ impl Controller {
             directory: Mutex::new(Directory::default()),
             connections: Mutex::new(BTreeMap::new()),
             pending: Mutex::new(BTreeMap::new()),
-            recovering: Mutex::new(()),
+            recovering: std::sync::Mutex::new(std::collections::BTreeSet::new()),
+            recovered: tokio::sync::Notify::new(),
             admitted: std::sync::Mutex::new(BTreeMap::new()),
             identity,
             secret_store: setup.secret_store,
@@ -565,7 +589,6 @@ impl Controller {
     /// A claim whose worker is gone is resolved the same way it is at startup, and one whose worker
     /// is alive and still unqualified is simply left for the next look.
     async fn recover_claims(&self) -> Result<()> {
-        let _recovering = self.recovering.lock().await;
         let claimed = {
             let registry = self.registry.lock().await;
             registry.reservations_in(LaunchPhase::Claimed)?
@@ -583,7 +606,6 @@ impl Controller {
     /// The same look as [`Self::recover_claims`], for a caller that asked about one session and is
     /// owed the reason rather than a session that is simply not there.
     async fn recover_claim_for(&self, session_id: kr_protocol::ids::SessionId) -> Result<()> {
-        let _recovering = self.recovering.lock().await;
         let reservation = {
             let registry = self.registry.lock().await;
             registry.reservation_for_session(session_id)?
@@ -605,6 +627,7 @@ impl Controller {
     /// Three things say it is not this daemon's to recover: a reservation that is no longer
     /// claimed, a create this daemon is still running, and a worker already in the directory.
     async fn recover_unresolved(&self, reservation_id: ReservationId) -> Result<()> {
+        let _held = self.hold_reservation(reservation_id).await;
         let reservation = {
             let registry = self.registry.lock().await;
             registry.reservation(reservation_id)?
@@ -626,6 +649,31 @@ impl Controller {
         self.recover_claim(&reservation).await
     }
 
+    /// Takes one reservation from whatever else would look at it, and gives it back on drop.
+    ///
+    /// Only that reservation: a caller waiting here is waiting for one worker's own turn, never for
+    /// a scan of somebody else's.
+    async fn hold_reservation(&self, reservation_id: ReservationId) -> ReservationHold<'_> {
+        loop {
+            // Created before the set is read, so a reservation given back between the two is not
+            // missed: the permit is already waiting here.
+            let given_back = self.recovered.notified();
+            {
+                let mut held = self
+                    .recovering
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if held.insert(reservation_id) {
+                    return ReservationHold {
+                        controller: self,
+                        reservation_id,
+                    };
+                }
+            }
+            given_back.await;
+        }
+    }
+
     /// Restores the directory entry of every worker the registry records.
     ///
     /// A daemon that crashed between recording a worker and publishing its descriptor left a row
@@ -644,13 +692,23 @@ impl Controller {
             // A fenced reservation is one the host stopped trusting. Publishing its worker again
             // because a descriptor happened to be missing would undo the fence through the back
             // door, so recovery leaves it alone and it stays out of the directory.
-            let fenced = {
+            let reservation = {
                 let registry = self.registry.lock().await;
-                registry
-                    .reservation_for_session(row.session_id)?
-                    .is_none_or(|reservation| reservation.phase == LaunchPhase::Fenced)
+                registry.reservation_for_session(row.session_id)?
             };
-            if fenced {
+            let Some(reservation) = reservation else {
+                continue;
+            };
+            if reservation.phase == LaunchPhase::Fenced {
+                continue;
+            }
+            // This row's own reservation, taken from whatever else would look at it. A challenge
+            // here presents a generation token too, and one presented while that worker's own
+            // report is being published fences the connection the daemon has just opened.
+            let _held = self.hold_reservation(reservation.reservation_id).await;
+            // The directory again, now that nothing else can be publishing into it: the report may
+            // have landed while this row was waiting its turn.
+            if self.directory.lock().await.get(row.session_id).is_some() {
                 continue;
             }
             let Ok(endpoint) = Endpoint::from_path(&row.endpoint) else {
@@ -1559,12 +1617,11 @@ impl Controller {
         claim: &WorkerRendezvous,
         ready: &WorkerReady,
     ) -> Result<()> {
-        // The same guard a look for unresolved claims holds, for the same reason and against the
-        // same thing. A report that arrives after its create gave up on waiting is still this
-        // worker's own word, and a look that started before it would otherwise challenge the
-        // worker while this is publishing it: two connections to one worker, and the second
-        // generation token fences the first.
-        let _recovering = self.recovering.lock().await;
+        // This reservation, taken from whatever else might look at it. A report that arrives after
+        // its create gave up on waiting is still this worker's own word, and a look that started
+        // before it would otherwise challenge the worker while this is publishing it: two
+        // connections to one worker, and the second generation token fences the first.
+        let _held = self.hold_reservation(reservation_id).await;
         let mut registry = self.registry.lock().await;
         let reservation = registry
             .reservation(reservation_id)?
@@ -4899,6 +4956,112 @@ mod a_create_that_launches_nothing {
             0,
             "and nothing is reserved either"
         );
+    }
+
+    /// A worker's own report never waits behind a look at somebody else's silent process.
+    ///
+    /// A look and a publication take one reservation between them, because a challenge presents a
+    /// generation token and one presented mid-publication fences the connection the daemon has just
+    /// opened. Two reservations are two different questions: a worker that reported itself must not
+    /// sit behind a challenge to a process that will never answer, because its create is waiting on
+    /// a deadline of its own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_report_does_not_wait_for_a_look_at_another_reservation() {
+        use kr_crypto::keys::AuthorisationKeyPair;
+        use kr_ipc::endpoint::Listener;
+
+        let (temp, controller, _asked) = daemon().await;
+        let environment = temp.environment();
+        let actor_id = kr_protocol::ids::ActorId::new("local:test").expect("a principal");
+
+        // One claimed reservation whose worker accepts a connection and answers nothing, so a look
+        // at it waits out the whole challenge.
+        let silent = seed_claim(&controller, &actor_id).await;
+        let silent_endpoint = environment
+            .worker_endpoint(silent.display_number)
+            .expect("an endpoint");
+        let _silent_listener = Listener::bind(&silent_endpoint).expect("binds a silent worker");
+
+        // Another reservation, whose worker is about to report itself.
+        let ready = seed_claim(&controller, &actor_id).await;
+        let keys = AuthorisationKeyPair::generate().expect("a key");
+        let process = kr_ipc::identity::current_process_start_identity().expect("this process");
+        let claim = kr_protocol::worker::WorkerRendezvous {
+            reservation_id: kr_protocol::worker::ReservationId::new(ready.reservation_id.get()),
+            session_id: ready.session_id,
+            worker_public_key: *keys.public(),
+            boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+            process_start_identity: process.clone(),
+            // The claim is not verified here: `record_ready` records what an admitted claim said.
+            signature: kr_crypto::sign::sign_elements(&keys, "kr-test/record-ready", Vec::new())
+                .expect("a signature"),
+        };
+        let report = kr_protocol::worker::WorkerReady {
+            session_id: ready.session_id,
+            endpoint: environment
+                .worker_endpoint(ready.display_number)
+                .expect("an endpoint")
+                .as_text(),
+            root_process: process,
+            shell_path: "/bin/cat".to_owned(),
+            dimensions: kr_protocol::session::Dimensions::new(80, 24),
+        };
+
+        // The look starts first and is still inside the silent worker's challenge.
+        let looking = {
+            let controller = Arc::clone(&controller);
+            tokio::spawn(async move { controller.recover_claims().await })
+        };
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(!looking.is_finished(), "the look is inside its challenge");
+
+        // The report goes through on its own reservation, without waiting for that look.
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            controller.record_ready(ready.reservation_id, &claim, &report),
+        )
+        .await
+        .expect("a report does not wait for another reservation's look")
+        .expect("records the worker");
+        assert!(
+            controller
+                .directory
+                .lock()
+                .await
+                .get(ready.session_id)
+                .is_some(),
+            "and the session it published is there"
+        );
+        looking.abort();
+    }
+
+    /// Records a reservation in the phase a worker's claim leaves it in.
+    async fn seed_claim(
+        controller: &Controller,
+        actor_id: &kr_protocol::ids::ActorId,
+    ) -> crate::registry::Reservation {
+        let mut registry = controller.registry.lock().await;
+        let admission = registry
+            .reserve(
+                actor_id,
+                kr_ipc::new_uuid(),
+                kr_protocol::scalars::Digest256::from_bytes([0x3c; 32]),
+                b"an intent",
+                kr_ipc::now_ms(),
+            )
+            .expect("reserves");
+        let reservation_id = admission.reservation.reservation_id;
+        registry
+            .set_phase(reservation_id, LaunchPhase::Spawned)
+            .expect("spawned");
+        registry
+            .claim_rendezvous(
+                reservation_id,
+                *kr_crypto::keys::AuthorisationKeyPair::generate()
+                    .expect("a key")
+                    .public(),
+            )
+            .expect("claims")
     }
 
     /// A create token that already has a reservation is answered from it, not refused again.
