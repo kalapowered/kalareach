@@ -43,11 +43,11 @@ the version before it.
 
 `.github/workflows/package-release.yml` runs on a tag matching `packages/v*`. It packs the archives
 with `scripts/release-packages.sh`, refuses to go on if that tag already has a release or a draft,
-attaches the archives and `SHA512SUMS` to a draft, and publishes the draft only once GitHub's record
-of every asset, down to the sha256 GitHub computed over the bytes it stored, matches what was packed.
-Publication then confirms that the release cannot be replaced, and the last step fetches each asset
-back from the URL GitHub serves it at, holds it to the packed sha512, and writes those URLs into the
-notes.
+creates a draft, attaches the archives and `SHA512SUMS` to the draft that creation returned, and
+publishes it only once GitHub's record of every asset, down to the sha256 GitHub computed over the
+bytes it stored, matches what was packed. Publication then confirms that the release cannot be
+replaced, and the last step fetches each asset back from the URL GitHub serves it at, holds it to
+the packed sha512, and writes those URLs into the notes.
 
 The script is what makes the release that commit's output rather than a working tree's:
 

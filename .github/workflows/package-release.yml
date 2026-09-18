@@ -85,6 +85,13 @@ jobs:
             exit 1
           fi
 
+          # The tag is what says which commit was packed, so the release names a tag the
+          # repository already has rather than one that publishing would create.
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --silent; then
+            echo "Could not confirm that $GITHUB_REF_NAME is a tag on this repository." >&2
+            exit 1
+          fi
+
           # The part of the notes that does not depend on where the assets end up. The last step
           # rebuilds the notes around it with the URLs GitHub reports.
           {
@@ -109,25 +116,49 @@ jobs:
             cat "$RUNNER_TEMP/notes-tail.md"
           } >"$RUNNER_TEMP/notes-draft.md"
 
-          gh release create "$GITHUB_REF_NAME" \
-            --draft \
-            --verify-tag \
-            --title "Packages $GITHUB_REF_NAME" \
-            --notes-file "$RUNNER_TEMP/notes-draft.md" \
-            "$packages"/*.tgz "$packages/SHA512SUMS"
+          # Creating the draft returns it, and everything below works from that answer: a release
+          # takes a while to appear in the listing, and the endpoint that fetches one by its tag
+          # answers for published releases only, so the id and the upload address the creation
+          # reports are what name the draft afterwards.
+          gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+            --raw-field "tag_name=$GITHUB_REF_NAME" \
+            --raw-field "name=Packages $GITHUB_REF_NAME" \
+            --field draft=true \
+            --field "body=@$RUNNER_TEMP/notes-draft.md" \
+            --jq '"\(.id) \(.upload_url)"' >"$RUNNER_TEMP/draft"
 
-          # A draft is not in the listing everyone sees, so it is found through the listing that
-          # includes drafts for a caller with write access.
-          gh api "repos/$GITHUB_REPOSITORY/releases" --paginate \
-            --jq ".[] | select(.tag_name == \"$GITHUB_REF_NAME\") | .id" >"$RUNNER_TEMP/release-id"
+          release="$(cut -d' ' -f1 <"$RUNNER_TEMP/draft")"
+          upload="$(cut -d' ' -f2 <"$RUNNER_TEMP/draft")"
 
-          if [ "$(wc -l <"$RUNNER_TEMP/release-id")" -ne 1 ]; then
-            echo "$GITHUB_REF_NAME now matches these releases:" >&2
-            cat "$RUNNER_TEMP/release-id" >&2
-            exit 1
-          fi
+          case "$release" in
+            '' | *[!0-9]*)
+              echo 'Creating the draft did not name one release:' >&2
+              cat "$RUNNER_TEMP/draft" >&2
+              exit 1
+              ;;
+          esac
 
-          release="$(cat "$RUNNER_TEMP/release-id")"
+          # The upload address ends in the template of the parameters it takes; gh fills the name
+          # in as the query string of each upload.
+          upload="${upload%%\{*}"
+
+          # An upload that ends in a lost connection or a 5xx is worth repeating; one that ends in
+          # the name already being taken fails the same way on the third attempt as on the first.
+          for file in "$packages"/*.tgz "$packages/SHA512SUMS"; do
+            attempt=1
+            until gh api --method POST "$upload" \
+              --raw-field "name=$(basename "$file")" \
+              --header 'Content-Type: application/octet-stream' \
+              --input "$file" --silent; do
+              if [ "$attempt" -ge 3 ]; then
+                echo "Uploading $(basename "$file") to draft release $release failed." >&2
+                echo 'Delete the draft and run this workflow again for the same tag.' >&2
+                exit 1
+              fi
+              attempt=$((attempt + 1))
+              sleep 5
+            done
+          done
 
           # The asset set is held to what was packed while nothing can install it: every archive, at
           # its length, with the sha256 GitHub computed over the bytes it stored, and nothing else
@@ -146,6 +177,7 @@ jobs:
             echo 'The release holds something other than what was packed; it stays a draft.' >&2
             echo 'A digest of null is GitHub reporting none for that asset, which leaves nothing' >&2
             echo 'to compare and is equally a reason not to publish it.' >&2
+            echo 'Delete the draft and run this workflow again for the same tag.' >&2
             exit 1
           fi
 
