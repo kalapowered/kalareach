@@ -564,7 +564,13 @@ pub fn plant_named_driver(parent: &Path, repository: &Path, name: &str, key: &st
 }
 
 /// Copies the marker program out of the fixture with its sentinel directory substituted.
-fn plant_marker(parent: &Path, name: &str, sentinels: &Path) -> PathBuf {
+/// Plants the marker program and proves it can record a run into the sentinel directory it is
+/// given.
+///
+/// # Panics
+///
+/// Panics when the program cannot be written, run, or does not record its own run.
+pub fn plant_marker(parent: &Path, name: &str, sentinels: &Path) -> PathBuf {
     let fixture = restricted_profile_fixture();
     let source = fixture["marker_program"][if cfg!(windows) { "windows" } else { "unix" }]
         .as_str()
@@ -578,7 +584,40 @@ fn plant_marker(parent: &Path, name: &str, sentinels: &Path) -> PathBuf {
     ));
     std::fs::write(&marker, body).expect("the marker program is written");
     make_executable(&marker);
+    prove_the_marker_records(&marker, sentinels);
     marker
+}
+
+/// Runs the planted marker once and requires it to leave its evidence.
+///
+/// Every restricted-profile assertion is "no sentinel appeared", and that is only evidence when a
+/// helper which ran *would* have left one. The marker records what it can and exits zero, because a
+/// helper that failed the command would hide itself behind an ordinary error; the cost of that is
+/// that a marker which could not write looks exactly like a marker that never ran. So the recorder
+/// is proved here, in the environment the test will run it in, before any of those assertions means
+/// anything: the program is invoked with a name of this helper's own, the file it should have
+/// written is required, and it is taken away again so the test starts with nothing.
+///
+/// # Panics
+///
+/// Panics when the marker does not record its own run.
+fn prove_the_marker_records(marker: &Path, sentinels: &Path) {
+    const CONTROL: &str = "the-recorder-itself";
+
+    let status = Command::new(marker)
+        .arg(CONTROL)
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("the planted marker runs");
+    assert!(status.success(), "the planted marker exits zero: {status}");
+    let recorded = sentinels.join(CONTROL);
+    assert!(
+        std::fs::symlink_metadata(&recorded).is_ok(),
+        "the planted marker records its own run at {}, so that finding no sentinel later is \
+         evidence that nothing ran rather than evidence that nothing could be written",
+        recorded.display()
+    );
+    std::fs::remove_file(&recorded).expect("the control the recorder left is taken away again");
 }
 
 fn plant_hooks(parent: &Path, name: &str, marker: &Path, fixture: &serde_json::Value) -> PathBuf {

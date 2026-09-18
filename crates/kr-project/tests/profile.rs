@@ -1082,3 +1082,30 @@ fn a_name_this_test_cannot_see_through_is_not_an_empty_directory() {
         "a name that is not a directory is not an empty directory"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_marker_that_could_not_record_is_not_a_helper_that_never_ran() {
+    // The restricted-profile assertions all say "no sentinel appeared". That is evidence only while
+    // a helper which ran would have left one, and the marker exits zero whatever happens to its
+    // write, because a helper that failed the command would hide itself behind an ordinary error.
+    // So the fixture proves the recorder before those assertions mean anything, and this is that
+    // proof failing: a directory nothing may be written into is refused at planting rather than
+    // reported later as a repository whose helpers never ran.
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let sentinels = directory.path().join("sentinels");
+    std::fs::create_dir_all(&sentinels).expect("the sentinel directory");
+    std::fs::set_permissions(&sentinels, std::fs::Permissions::from_mode(0o500))
+        .expect("a sentinel directory nothing may be written into");
+    let planted = std::panic::catch_unwind(|| {
+        support::plant_marker(directory.path(), "unrecordable", &sentinels)
+    });
+    std::fs::set_permissions(&sentinels, std::fs::Permissions::from_mode(0o700))
+        .expect("the directory is left removable");
+    assert!(
+        planted.is_err(),
+        "a marker that cannot record its own run is refused where it is planted"
+    );
+}

@@ -3,7 +3,7 @@
   "marker_program": {
     "unix": "marker.sh",
     "windows": "marker.cmd",
-    "how_it_is_planted": "The script is copied into the fixture repository with @SENTINELS@ replaced by an absolute directory on the internal disk. It takes one argument, the name of the entry that invoked it, and appends that name to a file of the same name inside that directory. It exits zero, so a helper that runs does not also fail the command and hide itself."
+    "how_it_is_planted": "The script is copied into the fixture repository with @SENTINELS@ replaced by an absolute directory on the internal disk. It takes one argument, the name of the entry that invoked it, and appends that name to a file of the same name inside that directory. It exits zero, so a helper that runs does not also fail the command and hide itself. Because it exits zero whatever becomes of its write, the planting runs it once with a name of its own and requires the file it should have left: finding no sentinel afterwards is then evidence that nothing ran, rather than evidence that nothing could be written."
   },
   "sentinel_directory": "sentinels",
   "neutralised": [

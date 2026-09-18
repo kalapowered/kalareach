@@ -2766,15 +2766,64 @@ mod tests {
 
     #[test]
     fn an_existing_destination_is_refused_for_a_creation_and_required_for_an_adoption() {
-        // The table is the rule, tested without a filesystem: a creation needs an absent
-        // destination, and an adoption needs a checkout to adopt.
+        // The table is the rule: a creation needs a destination that is not there at all, and an
+        // adoption needs a checkout to adopt. Section 14 refuses a nonempty *or existing*
+        // destination for a creation, so an empty directory is refused too, and the refusal names
+        // the flow that would take it.
+        let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+        let destination = Destination::resolve(
+            &DestinationRequest {
+                environment_id: EnvironmentId::new(Uuid::from_bytes([1; 16])),
+                parent_path: directory.path().display().to_string(),
+                name: "where".to_owned(),
+            },
+            EnvironmentId::new(Uuid::from_bytes([1; 16])),
+        )
+        .expect("the destination resolves");
+        let creation = CreatePlan::Initialise {
+            initial_branch: None,
+        };
+        let adoption = CreatePlan::Adopt {
+            flow: AdoptionFlow::ExistingCheckout,
+        };
         for (state, creation_allowed, adoption_allowed) in [
             (DestinationState::Absent, true, false),
             (DestinationState::EmptyDirectory, false, false),
             (DestinationState::NonEmptyDirectory, false, true),
             (DestinationState::Occupied, false, false),
         ] {
-            let _ = (state, creation_allowed, adoption_allowed);
+            let created = check_destination(&creation, state, &destination);
+            assert_eq!(
+                created.is_ok(),
+                creation_allowed,
+                "a creation at {state:?}: {created:?}"
+            );
+            if let Err(refusal) = created {
+                assert_eq!(
+                    refusal.code(),
+                    kr_protocol::error::ErrorCode::InvalidArgument
+                );
+                assert!(
+                    refusal.to_string().contains("flow"),
+                    "a creation's refusal names the flow that would take it: {refusal}"
+                );
+            }
+            let adopted = check_destination(&adoption, state, &destination);
+            assert_eq!(
+                adopted.is_ok(),
+                adoption_allowed,
+                "an adoption at {state:?}: {adopted:?}"
+            );
+            if let Err(refusal) = adopted {
+                assert_eq!(
+                    refusal.code(),
+                    kr_protocol::error::ErrorCode::InvalidArgument
+                );
+                assert!(
+                    refusal.to_string().contains("adopt"),
+                    "an adoption's refusal says there is nothing to adopt: {refusal}"
+                );
+            }
         }
     }
 }
