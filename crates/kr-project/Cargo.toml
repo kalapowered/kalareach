@@ -26,6 +26,21 @@ libc.workspace = true
 # Linux and `renameatx_np(RENAME_EXCL)` on Apple, both as safe wrappers.
 rustix = { workspace = true, features = ["fs", "process"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# The boundary every Git invocation runs inside on this platform.
+landlock.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+# The boundary every Git invocation runs inside on this platform: an application container with its
+# own grants, inside a job object that ends every descendant.
+windows-sys = { workspace = true, features = [
+    "Win32_Security_Isolation",
+    "Win32_Security_Authorization",
+    "Win32_System_Environment",
+    "Win32_System_Memory",
+    "Win32_System_SystemServices",
+] }
+
 [dev-dependencies]
 kr-ipc = { workspace = true, features = ["testing"] }
 # The recovery tests put the journal into the state a crash leaves, which means writing the rows a
@@ -42,5 +57,13 @@ tempfile.workspace = true
 default = ["git-fixtures"]
 git-fixtures = []
 
-[lints]
-workspace = true
+# The workspace forbids unsafe code, which a crate that applies an operating-system boundary to a
+# child process cannot honour: each platform's mechanism is a call with no safe form. This crate
+# denies it instead and allows it in the four modules of `boundary` that own those calls. Nothing
+# else in this crate may relax the rule.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

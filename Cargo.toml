@@ -70,6 +70,10 @@ kr-term = { path = "crates/kr-term", version = "=0.1.0" }
 kr-transfer = { path = "crates/kr-transfer", version = "=0.1.0" }
 kr-transport = { path = "crates/kr-transport", version = "=0.1.0" }
 kr-worker = { path = "crates/kr-worker", version = "=0.1.0" }
+# The kernel's own filesystem and network confinement, which the project service encloses every Git
+# invocation in. A safe wrapper over three system calls; the ruleset is built from opened directory
+# handles in the parent and applied by the child before Git exists.
+landlock = "=0.4.7"
 libc = "=0.2.189"
 libproc = "=0.14.11"
 libsodium-sys-stable = "=1.24.0"

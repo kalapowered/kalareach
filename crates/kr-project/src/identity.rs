@@ -127,7 +127,7 @@ impl OpenedRepository {
             git_dir: git_dir.identity(),
             work_tree: tree.identity(),
         };
-        let audit = ConfigurationAudit::take(profile, &top_level)?;
+        let audit = ConfigurationAudit::take(profile, &top_level, Some(identity.work_tree))?;
         // A driver whose name this host cannot express as an override is one whose override would
         // be for a different key. Reading the repository beside it could be reading it *through*
         // it, so nothing is read at all: this is the bar for every operation rather than only for
@@ -253,7 +253,9 @@ impl OpenedRepository {
             OsStr::new("--git-common-dir"),
             OsStr::new("--show-toplevel"),
         ];
-        let reported = profile.run_checked(&GitRequest::read(&self.top_level, &arguments))?;
+        let reported = profile.run_checked(
+            &GitRequest::read(&self.top_level, &arguments).expecting(self.identity.work_tree),
+        )?;
         let mut lines = reported.lines();
         let git_dir_path = PathBuf::from(lines.next().unwrap_or_default());
         let top_level = PathBuf::from(lines.next().unwrap_or_default());
@@ -280,7 +282,7 @@ impl OpenedRepository {
             git_dir: git_dir.identity(),
             work_tree: tree.identity(),
         })?;
-        let later = ConfigurationAudit::take(profile, &top_level)?;
+        let later = ConfigurationAudit::take(profile, &top_level, Some(self.identity.work_tree))?;
         self.audit.unchanged(&later)
     }
 
@@ -298,21 +300,32 @@ impl OpenedRepository {
     /// Returns [`ProjectError::IdentityChanged`] when the configuration changed, or
     /// [`ProjectError::ConfigurationRejected`] when what it now holds cannot be neutralised.
     pub fn recheck(&self, profile: &RestrictedProfile) -> Result<()> {
-        let later = ConfigurationAudit::take(profile, &self.top_level)?;
+        let later =
+            ConfigurationAudit::take(profile, &self.top_level, Some(self.identity.work_tree))?;
         later.require_expressible()?;
         self.audit.unchanged(&later)
     }
 
     /// Builds a read that runs under this repository's own driver overrides.
+    ///
+    /// The invocation is started in the working tree this record names, as the object rather than
+    /// as the path, and its boundary lets it write in that tree and in the repository's own Git
+    /// directory and nowhere else.
     #[must_use]
     pub fn read<'a>(&'a self, arguments: &'a [&'a OsStr]) -> GitRequest<'a> {
-        GitRequest::read(&self.top_level, arguments).with_drivers(self.audit.drivers.clone())
+        GitRequest::read(&self.top_level, arguments)
+            .with_drivers(self.audit.drivers.clone())
+            .writing(&[self.git_dir_path.as_path()])
+            .expecting(self.identity.work_tree)
     }
 
     /// Builds a write that runs under this repository's own driver overrides.
     #[must_use]
     pub fn write<'a>(&'a self, arguments: &'a [&'a OsStr]) -> GitRequest<'a> {
-        GitRequest::write(&self.top_level, arguments).with_drivers(self.audit.drivers.clone())
+        GitRequest::write(&self.top_level, arguments)
+            .with_drivers(self.audit.drivers.clone())
+            .writing(&[self.git_dir_path.as_path()])
+            .expecting(self.identity.work_tree)
     }
 
     /// Returns the revision `HEAD` names, and the reference it was named by.

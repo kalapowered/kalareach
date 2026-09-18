@@ -158,7 +158,7 @@ impl ProjectService {
         let root = Self::root_of(paths);
         kr_ipc::paths::create_private_tree(paths.state_root(), &root)
             .map_err(ProjectError::staging)?;
-        let profile = RestrictedProfile::prepare(&root)?;
+        let profile = RestrictedProfile::prepare(&root, paths.environment_id())?;
         let brokers = BrokerRegistry::discover(profile.git());
         let store = Store::open(
             root.join(crate::store::STORE_FILE_NAME),
@@ -1712,6 +1712,11 @@ impl ProjectService {
                         self.profile.run_checked(
                             &repository
                                 .write(&arguments)
+                                // The directory this host reserved a moment ago, which is where
+                                // the worktree goes. Nothing else outside the repository is
+                                // writable, so a `core.worktree` or an argument naming somewhere
+                                // else is refused by the boundary rather than noticed afterwards.
+                                .writing(&[reserved.display_path()])
                                 .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
                                 .with_cancellation(Arc::clone(&cancel)),
                         )?;
@@ -1753,11 +1758,7 @@ impl ProjectService {
                         self.profile.run_checked(
                             &GitRequest::write(staging.path(), &arguments)
                                 .with_ceiling(staging.path())
-                                .with_transport(
-                                    kr_protocol::project::RemoteTransport::LocalPath,
-                                    None,
-                                    None,
-                                )
+                                .with_transport(crate::git::RemoteAccess::local())
                                 .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
                                 .with_cancellation(Arc::clone(&cancel)),
                         )?;

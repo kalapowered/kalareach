@@ -195,7 +195,7 @@ pub fn named_broker() -> BrokerRegistry {
     BrokerRegistry::from_brokers(vec![BrokerRegistry::broker(
         OS_SECRET_STORE,
         Some(git.exec_path().join("git-credential-cache")),
-        Some(std::ffi::OsString::from("/usr/bin/ssh")),
+        Some(std::path::PathBuf::from("/usr/bin/ssh")),
     )])
 }
 
@@ -209,7 +209,7 @@ pub fn broker_without_a_credential_helper() -> BrokerRegistry {
     BrokerRegistry::from_brokers(vec![BrokerRegistry::broker(
         OS_SECRET_STORE,
         None,
-        Some(std::ffi::OsString::from("/usr/bin/ssh")),
+        Some(std::path::PathBuf::from("/usr/bin/ssh")),
     )])
 }
 

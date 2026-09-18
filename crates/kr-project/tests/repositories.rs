@@ -1018,7 +1018,13 @@ fn a_cancellation_ends_the_subprocess_this_host_started() {
         ];
         let outcome = profile.run(
             &GitRequest::write(&work, &arguments)
-                .with_transport(RemoteTransport::Https, None, None)
+                .with_transport(kr_project::git::RemoteAccess {
+                    transport: RemoteTransport::Https,
+                    credential_helper: None,
+                    ssh_command: None,
+                    ssh_program: None,
+                    port: Some(port),
+                })
                 .with_deadline(Duration::from_secs(120))
                 .with_cancellation(watched),
         );

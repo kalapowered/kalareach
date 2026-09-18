@@ -384,7 +384,7 @@ fn the_audit_reads_the_repositorys_own_configuration_through_the_profile() {
     // repository's own file the same way.
     let fixture = Fixture::create();
     let planted = planted_repository(fixture.work(), "read-back", false);
-    let audit = ConfigurationAudit::take(fixture.service().profile(), &planted.path)
+    let audit = ConfigurationAudit::take(fixture.service().profile(), &planted.path, None)
         .expect("the configuration is read");
     assert!(
         audit
@@ -961,6 +961,11 @@ fn nothing_a_caller_or_a_repository_supplied_reaches_a_refusal() {
     let _ = path;
 }
 
+/// An environment for a profile a test prepares outside a host tree.
+fn an_environment() -> kr_protocol::ids::EnvironmentId {
+    kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes(*uuid::Uuid::new_v4().as_bytes()))
+}
+
 #[test]
 fn preparing_the_profile_repeats_no_part_of_a_path_it_was_given() {
     // The profile is prepared inside a directory this host is told to use, and a refusal names the
@@ -976,7 +981,7 @@ fn preparing_the_profile_repeats_no_part_of_a_path_it_was_given() {
         "[url \"https://token@host/\"]\n\tinsteadOf = https://host/\n",
     )
     .expect("a file the profile requires to be empty");
-    let refusal = kr_project::git::RestrictedProfile::prepare(&root)
+    let refusal = kr_project::git::RestrictedProfile::prepare(&root, an_environment())
         .expect_err("a configuration file with bytes in it is refused");
     let said = refusal.to_string();
     assert!(
@@ -1030,7 +1035,7 @@ fn a_git_invocation_names_an_absolute_directory_and_leaves_the_profiles_own_one_
         );
     }
     // The profile's own root is under the same rule, for the same reason.
-    let root_refusal = kr_project::git::RestrictedProfile::prepare(relative)
+    let root_refusal = kr_project::git::RestrictedProfile::prepare(relative, an_environment())
         .expect_err("a relative profile root is refused");
     assert_eq!(
         root_refusal.code(),

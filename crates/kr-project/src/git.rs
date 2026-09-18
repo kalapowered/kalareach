@@ -52,8 +52,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use kr_protocol::ids::EnvironmentId;
 use kr_protocol::project::{GIT_READ_DEADLINE, MAX_GIT_OUTPUT_BYTES, RemoteTransport};
+use kr_transfer::ObjectIdentity;
 
+use crate::boundary::{Confinement, Reach, WorkingDirectory};
 use crate::error::{ProjectError, Result};
 
 /// The minimum Git version this host will use.
@@ -76,6 +79,9 @@ pub const TEMPLATE_DIRECTORY: &str = "template";
 
 /// The empty directory the child's home is set to.
 pub const HOME_DIRECTORY: &str = "home";
+
+/// The directory each invocation's own private temporary directory is created in.
+pub const TEMPORARY_DIRECTORY: &str = "temporary";
 
 /// How a repository's execution-capable key is dealt with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -365,6 +371,7 @@ impl Cancellation {
 #[derive(Clone, Debug)]
 pub struct GitProgram {
     program: PathBuf,
+    executable: PathBuf,
     exec_path: PathBuf,
     version: String,
 }
@@ -438,17 +445,31 @@ impl GitProgram {
                 .into(),
             });
         }
+        let executable = handed_off_to(&program, &exec_path, &version);
         Ok(Self {
             program,
+            executable,
             exec_path,
             version,
         })
     }
 
-    /// Returns the absolute path of the Git binary.
+    /// Returns the absolute path of the Git binary as this host resolved it.
     #[must_use]
     pub fn program(&self) -> &Path {
         &self.program
+    }
+
+    /// Returns the Git binary an invocation actually executes.
+    ///
+    /// Usually the same object as [`Self::program`] under another name. On a host where the Git on
+    /// the search path is a stand-in that hands off to the Git of a selected toolchain, it is the
+    /// one under Git's own helper directory: the same version, reporting the same helper directory,
+    /// reached without the stand-in's own lookups. What matters here is that the boundary's
+    /// execution list holds one program rather than a program and whatever it decides to become.
+    #[must_use]
+    pub fn executable(&self) -> &Path {
+        &self.executable
     }
 
     /// Returns the helper directory the binary reported for itself.
@@ -468,10 +489,40 @@ impl GitProgram {
 #[derive(Clone, Debug)]
 pub struct RestrictedProfile {
     git: GitProgram,
+    environment_id: EnvironmentId,
     empty_config: PathBuf,
     hooks: PathBuf,
     template: PathBuf,
     home: PathBuf,
+    temporary: PathBuf,
+    #[cfg(feature = "git-fixtures")]
+    interposition: Option<Interposition>,
+}
+
+/// Something the fixtures do to a repository between the moment its configuration was read and the
+/// moment Git starts.
+///
+/// The window between those two is what the boundary exists for, and a test that could not reach
+/// into it could only prove that a repository planted *before* the reading is neutralised, which is
+/// the weaker claim. It is compiled with the fixtures and is never set by the service.
+#[cfg(feature = "git-fixtures")]
+#[derive(Clone)]
+pub struct Interposition(Arc<dyn Fn(&Path) + Send + Sync>);
+
+#[cfg(feature = "git-fixtures")]
+impl Interposition {
+    /// Builds one from what it does, which is given this invocation's private temporary directory.
+    #[must_use]
+    pub fn new(act: Arc<dyn Fn(&Path) + Send + Sync>) -> Self {
+        Self(act)
+    }
+}
+
+#[cfg(feature = "git-fixtures")]
+impl std::fmt::Debug for Interposition {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Interposition")
+    }
 }
 
 impl RestrictedProfile {
@@ -485,8 +536,8 @@ impl RestrictedProfile {
     ///
     /// Returns [`ProjectError::StagingUnavailable`] when a directory or the empty file cannot be
     /// created, or [`ProjectError::GitUnavailable`] when Git cannot be resolved.
-    pub fn prepare(root: &Path) -> Result<Self> {
-        Self::prepare_with(root, GitProgram::discover()?)
+    pub fn prepare(root: &Path, environment_id: EnvironmentId) -> Result<Self> {
+        Self::prepare_with(root, environment_id, GitProgram::discover()?)
     }
 
     /// Prepares the profile around one already-resolved Git program.
@@ -495,7 +546,7 @@ impl RestrictedProfile {
     ///
     /// Returns [`ProjectError::StagingUnavailable`] when a directory or the empty file cannot be
     /// created, or when one of them is not empty.
-    pub fn prepare_with(root: &Path, git: GitProgram) -> Result<Self> {
+    pub fn prepare_with(root: &Path, environment_id: EnvironmentId, git: GitProgram) -> Result<Self> {
         // Every directory in the profile is derived from this one, and one of them is where each
         // Git child starts. A relative root would name a different directory depending on where
         // this process happens to be, so it is refused rather than resolved into one.
@@ -555,13 +606,36 @@ impl RestrictedProfile {
             }
             Err(error) => return Err(ProjectError::staging(error)),
         }
+        // Each invocation makes a directory of its own in here and takes it away again. What is
+        // left in it belongs to a daemon that died mid-invocation, and is swept now rather than
+        // kept: one daemon owns this environment's state directory, so nothing else is using it.
+        let temporary = profile.join(TEMPORARY_DIRECTORY);
+        if let Ok(entries) = std::fs::read_dir(&temporary) {
+            for entry in entries.flatten() {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+        std::fs::create_dir_all(&temporary).map_err(ProjectError::staging)?;
         Ok(Self {
             git,
+            environment_id,
             empty_config,
             hooks,
             template,
             home,
+            temporary,
+            #[cfg(feature = "git-fixtures")]
+            interposition: None,
         })
+    }
+
+    /// Runs something between the reading of a repository's configuration and the start of a Git
+    /// child, which is the window the boundary exists for.
+    ///
+    /// Compiled with the fixtures. Nothing in the service sets it.
+    #[cfg(feature = "git-fixtures")]
+    pub fn interpose(&mut self, interposition: Interposition) {
+        self.interposition = Some(interposition);
     }
 
     /// Returns the resolved Git program.
@@ -600,12 +674,11 @@ impl RestrictedProfile {
     /// caller often needs the exit code.
     pub fn run(&self, request: &GitRequest<'_>) -> Result<GitOutput> {
         // The allowlist is checked here rather than at each call site, because here is the one
-        // place a subprocess is started.
+        // place a subprocess starts.
         check_arguments(request.arguments)?;
-        // The child starts in a directory this host owns rather than in this process's own, so a
-        // relative directory would name something other than what the caller meant by it, and a
-        // directory the type could leave out would name the host's own. The type requires one; this
-        // requires it to be absolute.
+        // The child starts in the directory this invocation names, as the object rather than as
+        // the path, so a relative directory would name something other than what the caller meant
+        // by it. The type requires one; this requires it to be absolute.
         if !request.directory.is_absolute() {
             return Err(ProjectError::InvalidArgument(
                 format!(
@@ -615,33 +688,34 @@ impl RestrictedProfile {
                 .into(),
             ));
         }
-        let mut command = Command::new(&self.git.program);
-        command.env_clear();
-        // The child starts in a directory this host owns and keeps empty, rather than wherever this
-        // process happens to be. Every path an invocation names is absolute or the one `-C` names,
-        // so nothing depends on the working directory; what this takes away is a child holding a
-        // directory nobody chose for it, and an inherited one is exactly how a subprocess reaches
-        // somewhere the host never meant it to.
-        command.current_dir(&self.home);
-        for (name, value) in self.environment(request) {
-            command.env(name, value);
+        // Opened once, here, and handed to the child. Everything the boundary is built from is
+        // resolved in this moment rather than one after another.
+        let working =
+            WorkingDirectory::open(self.environment_id, request.directory, request.expected)?;
+        // One directory per invocation, which nothing else can reach and which goes away with the
+        // invocation. It is where Git puts its temporary files, so a Git that needed one does not
+        // reach for a shared directory it is not confined to.
+        let temporary = PrivateTemporary::create(&self.temporary, &request.describe())?;
+        let confinement = self.confinement(request, &working, temporary.path())?;
+        let arguments = self.argument_vector(request);
+        let environment = self.environment(request, temporary.path());
+        let described = request.describe();
+        #[cfg(feature = "git-fixtures")]
+        if let Some(interposition) = self.interposition.as_ref() {
+            interposition.0(temporary.path());
         }
-        command.args(self.argument_vector(request));
-        // A Git subprocess never gets a terminal: it cannot prompt, it cannot page, and a helper
-        // that wanted to read from one finds nothing to read.
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        // The child leads its own process group, so ending it ends everything it started: a
-        // remote helper, an ssh process, a credential helper. Killing the child alone would leave
-        // those holding the connection this cancellation was meant to drop.
-        own_process_group(&mut command);
-        let mut child = command.spawn().map_err(|error| ProjectError::GitFailed {
-            detail: format!("{} could not start: {error}", request.describe()).into(),
-        })?;
-        let out = child.stdout.take().map(read_bounded);
-        let err = child.stderr.take().map(read_bounded);
+        let mut child = crate::boundary::start(
+            &crate::boundary::Invocation {
+                program: self.git.executable(),
+                arguments: &arguments,
+                environment: &environment,
+                described: &described,
+            },
+            &confinement,
+            &working,
+        )?;
+        let out = child.stdout().map(read_bounded);
+        let err = child.stderr().map(read_bounded);
         let deadline = Instant::now() + request.deadline;
         let status = loop {
             match child.try_wait() {
@@ -649,24 +723,22 @@ impl RestrictedProfile {
                 Ok(None) => {}
                 Err(error) => {
                     return Err(ProjectError::GitFailed {
-                        detail: format!("{} could not be waited on: {error}", request.describe())
-                            .into(),
+                        detail: format!("{described} could not be waited on: {error}").into(),
                     });
                 }
             }
             if let Some(cancel) = request.cancel.as_ref()
                 && cancel.requested()
             {
-                // This host started the group, so this host ends it, by the identity it recorded
+                // This host started the child, so this host ends it, by the identity it recorded
                 // rather than by a name or a pattern that could match somebody else's work.
-                let stopped = end_group(&mut child);
+                let stopped = child.end();
                 if stopped {
                     cancel.record_stop();
                 }
                 return Err(ProjectError::Cancelled {
                     detail: format!(
-                        "{} was stopped by its owner{}",
-                        request.describe(),
+                        "{described} was stopped by its owner{}",
                         if stopped {
                             ""
                         } else {
@@ -677,7 +749,7 @@ impl RestrictedProfile {
                 });
             }
             if Instant::now() >= deadline {
-                let stopped = end_group(&mut child);
+                let stopped = child.end();
                 if let Some(cancel) = request.cancel.as_ref()
                     && stopped
                 {
@@ -685,8 +757,7 @@ impl RestrictedProfile {
                 }
                 return Err(ProjectError::GitFailed {
                     detail: format!(
-                        "{} ran longer than {} milliseconds and was stopped{}",
-                        request.describe(),
+                        "{described} ran longer than {} milliseconds and was stopped{}",
                         request.deadline.as_millis(),
                         if stopped {
                             ""
@@ -699,8 +770,8 @@ impl RestrictedProfile {
             }
             std::thread::sleep(Duration::from_millis(5));
         };
-        let out = join(out, request)?;
-        let err = join(err, request)?;
+        let out = join(out, &described)?;
+        let err = join(err, &described)?;
         let stderr = git_said(&String::from_utf8_lossy(&err.bytes));
         Ok(GitOutput {
             status: status.code(),
@@ -712,7 +783,45 @@ impl RestrictedProfile {
             } else {
                 stderr
             },
-            command: request.describe(),
+            command: described,
+        })
+    }
+
+    /// Builds everything the boundary confines one invocation to.
+    ///
+    /// The directory the child runs in is always writable, because that is the repository or the
+    /// staging area the operation is for. Whatever else this operation reserved is writable because
+    /// the caller named it; a destination a repository's own configuration names and this host did
+    /// not is not in the list, so the boundary refuses the write rather than this host noticing it
+    /// afterwards.
+    fn confinement(
+        &self,
+        request: &GitRequest<'_>,
+        working: &WorkingDirectory,
+        temporary: &Path,
+    ) -> Result<Confinement> {
+        let mut writable = vec![working.path().to_owned()];
+        for directory in &request.writable {
+            let resolved =
+                std::fs::canonicalize(directory).map_err(|error| ProjectError::Destination {
+                    detail: format!(
+                        "{} could not be resolved as a directory this invocation may write in: \
+                         {error}",
+                        redact(&directory.display().to_string())
+                    )
+                    .into(),
+                })?;
+            if !writable.contains(&resolved) {
+                writable.push(resolved);
+            }
+        }
+        Ok(Confinement {
+            program: self.git.executable().to_owned(),
+            exec_path: self.git.exec_path().to_owned(),
+            helpers: helpers(request),
+            writable,
+            temporary: temporary.to_owned(),
+            reach: Reach::for_transport(request.transport, request.remote_port),
         })
     }
 
@@ -737,8 +846,12 @@ impl RestrictedProfile {
     #[must_use]
     pub fn argument_vector(&self, request: &GitRequest<'_>) -> Vec<OsString> {
         let mut argv: Vec<OsString> = vec![OsString::from("--no-pager")];
+        // The child is already in the directory this invocation names: the parent opened it and
+        // the child moved into that open directory before Git existed. `.` is therefore the object
+        // this host verified rather than a path Git resolves for itself, and a tree substituted at
+        // the path afterwards is not what Git is working in.
         argv.push(OsString::from("-C"));
-        argv.push(request.directory.as_os_str().to_owned());
+        argv.push(OsString::from("."));
         if request.read_only {
             // No index write, no reference-log rewrite, no optional lock: a read leaves the
             // repository exactly as it found it.
@@ -866,8 +979,15 @@ impl RestrictedProfile {
     }
 
     /// Builds the complete environment one invocation runs with.
+    ///
+    /// The temporary directory is this invocation's own, so a Git that needs one writes inside the
+    /// boundary rather than reaching for a directory shared with everything else on this machine.
     #[must_use]
-    pub fn environment(&self, request: &GitRequest<'_>) -> Vec<(OsString, OsString)> {
+    pub fn environment(
+        &self,
+        request: &GitRequest<'_>,
+        temporary: &Path,
+    ) -> Vec<(OsString, OsString)> {
         let mut path = OsString::from(
             self.git
                 .program
@@ -922,6 +1042,9 @@ impl RestrictedProfile {
             (OsString::from("LANG"), OsString::from("C")),
             (OsString::from("TZ"), OsString::from("UTC")),
             (OsString::from("HOME"), self.home.as_os_str().to_owned()),
+            (OsString::from("TMPDIR"), temporary.as_os_str().to_owned()),
+            (OsString::from("TEMP"), temporary.as_os_str().to_owned()),
+            (OsString::from("TMP"), temporary.as_os_str().to_owned()),
             // The transport allowlist, stated in the environment as well as in the configuration,
             // because this is the form a helper's own child inherits.
             (
@@ -962,52 +1085,6 @@ impl RestrictedProfile {
     }
 }
 
-/// Puts the child in a process group of its own, so ending it ends its descendants.
-///
-/// On Windows there is no equivalent that stays inside safe Rust: the containment there is a Job
-/// Object, which is a call into `kernel32`, and this crate does not leave safe Rust. So a
-/// cancellation on Windows ends the Git process and says it could not confirm the rest; the
-/// qualification pass on Windows owns closing that.
-#[cfg(unix)]
-fn own_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt as _;
-
-    command.process_group(0);
-}
-
-/// Puts the child in a process group of its own, so ending it ends its descendants.
-#[cfg(not(unix))]
-fn own_process_group(_command: &mut Command) {}
-
-/// Ends a child and everything it started, and says whether it could confirm that.
-#[cfg(unix)]
-fn end_group(child: &mut std::process::Child) -> bool {
-    let Ok(raw) = i32::try_from(child.id()) else {
-        return false;
-    };
-    // The child leads its own group, so its identifier is the group's. Nothing else on this
-    // machine is in it.
-    let Some(pid) = rustix::process::Pid::from_raw(raw) else {
-        return false;
-    };
-    let killed = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL).is_ok();
-    let reaped = child.wait().is_ok();
-    killed && reaped
-}
-
-/// Ends a child and everything it started, and says whether it could confirm that.
-///
-/// It could not: containment here is a Job Object, which is a call outside safe Rust and therefore
-/// not in this crate. Ending the Git process leaves a remote helper, an ssh process or a credential
-/// helper that Git started still running, so this returns false and the caller says the host could
-/// not confirm that everything it started ended.
-#[cfg(not(unix))]
-fn end_group(child: &mut std::process::Child) -> bool {
-    let _ = child.kill();
-    let _ = child.wait();
-    false
-}
-
 /// The separator between two entries of `PATH` on this platform.
 #[cfg(windows)]
 const PATH_SEPARATOR: &str = ";";
@@ -1041,8 +1118,6 @@ fn inherited_platform_environment(home: &Path) -> Vec<(OsString, OsString)> {
         "PATHEXT",
         "NUMBER_OF_PROCESSORS",
         "PROCESSOR_ARCHITECTURE",
-        "TEMP",
-        "TMP",
     ] {
         if let Some(value) = std::env::var_os(name) {
             passed.push((OsString::from(name), value));
@@ -1058,6 +1133,38 @@ fn inherited_platform_environment(home: &Path) -> Vec<(OsString, OsString)> {
 #[cfg(not(windows))]
 fn inherited_platform_environment(_home: &Path) -> Vec<(OsString, OsString)> {
     Vec::new()
+}
+
+/// What an operation's validated remote lends one invocation.
+#[derive(Clone, Copy, Debug)]
+pub struct RemoteAccess<'a> {
+    /// The one transport the invocation may use.
+    pub transport: RemoteTransport,
+    /// The approved broker's credential helper, when the transport needs one.
+    pub credential_helper: Option<&'a OsStr>,
+    /// The ssh command the broker lends, when the transport is ssh.
+    pub ssh_command: Option<&'a OsStr>,
+    /// The program inside that command.
+    pub ssh_program: Option<&'a Path>,
+    /// The port the remote named, when it named one of its own.
+    pub port: Option<u16>,
+}
+
+impl RemoteAccess<'_> {
+    /// Returns the access a clone between two directories of this machine runs with.
+    ///
+    /// No credential helper, no ssh program and no port: a local clone reaches no address, so the
+    /// boundary gives it nothing to reach one through.
+    #[must_use]
+    pub const fn local() -> Self {
+        Self {
+            transport: RemoteTransport::LocalPath,
+            credential_helper: None,
+            ssh_command: None,
+            ssh_program: None,
+            port: None,
+        }
+    }
 }
 
 /// One Git invocation, as the profile runs it.
@@ -1080,6 +1187,19 @@ pub struct GitRequest<'a> {
     pub credential_helper: Option<&'a OsStr>,
     /// The approved broker's ssh program, when the transport is ssh.
     pub ssh_command: Option<&'a OsStr>,
+    /// The program inside that command, which is the one thing outside Git's own installation the
+    /// boundary lets this invocation execute.
+    pub ssh_program: Option<&'a Path>,
+    /// The port the validated remote named, when it named one of its own.
+    pub remote_port: Option<u16>,
+    /// The directories this invocation may write in besides the one it runs in.
+    ///
+    /// The repository's Git common directory for a linked worktree, and the destination an
+    /// operation reserved. Everything else is outside the boundary, so a write there is refused by
+    /// the operating system rather than noticed afterwards.
+    pub writable: Vec<&'a Path>,
+    /// The object the directory must still be, when the caller recorded one.
+    pub expected: Option<ObjectIdentity>,
     /// The driver sections and names the audit found, each blanked by name.
     pub drivers: Vec<(String, String)>,
     /// Where repository discovery stops.
@@ -1101,6 +1221,10 @@ impl<'a> GitRequest<'a> {
             transport: None,
             credential_helper: None,
             ssh_command: None,
+            ssh_program: None,
+            remote_port: None,
+            writable: Vec::new(),
+            expected: None,
             drivers: Vec::new(),
             ceiling: None,
             deadline: Duration::from_millis(GIT_READ_DEADLINE.get()),
@@ -1145,17 +1269,33 @@ impl<'a> GitRequest<'a> {
         self
     }
 
-    /// Sets the one transport this invocation may use and the broker programs for it.
+    /// Sets the one transport this invocation may use, the broker programs for it, and the port
+    /// the remote named.
     #[must_use]
-    pub const fn with_transport(
-        mut self,
-        transport: RemoteTransport,
-        credential_helper: Option<&'a OsStr>,
-        ssh_command: Option<&'a OsStr>,
-    ) -> Self {
-        self.transport = Some(transport);
-        self.credential_helper = credential_helper;
-        self.ssh_command = ssh_command;
+    pub const fn with_transport(mut self, access: RemoteAccess<'a>) -> Self {
+        self.transport = Some(access.transport);
+        self.credential_helper = access.credential_helper;
+        self.ssh_command = access.ssh_command;
+        self.ssh_program = access.ssh_program;
+        self.remote_port = access.port;
+        self
+    }
+
+    /// Adds directories this invocation may write in besides the one it runs in.
+    #[must_use]
+    pub fn writing(mut self, writable: &[&'a Path]) -> Self {
+        for directory in writable {
+            if !self.writable.contains(directory) {
+                self.writable.push(directory);
+            }
+        }
+        self
+    }
+
+    /// Sets the object the directory must still be for this invocation to start in it.
+    #[must_use]
+    pub const fn expecting(mut self, identity: ObjectIdentity) -> Self {
+        self.expected = Some(identity);
         self
     }
 
@@ -1305,13 +1445,18 @@ impl ConfigurationAudit {
     /// # Errors
     ///
     /// Returns [`ProjectError::GitFailed`] when the configuration cannot be read.
-    pub fn take(profile: &RestrictedProfile, directory: &Path) -> Result<Self> {
+    pub fn take(
+        profile: &RestrictedProfile,
+        directory: &Path,
+        expected: Option<ObjectIdentity>,
+    ) -> Result<Self> {
         let arguments: [&OsStr; 3] = [
             OsStr::new("config"),
             OsStr::new("--list"),
             OsStr::new("--null"),
         ];
-        let request = GitRequest::read(directory, &arguments);
+        let mut request = GitRequest::read(directory, &arguments);
+        request.expected = expected;
         let output = profile.run(&request)?;
         output.require_success()?;
         // The listing is classified from its bytes. Git accepts a configuration subsection that is
@@ -1722,7 +1867,7 @@ struct Reader {
 /// of the output or the part of it that arrived before something Git started stopped closing the
 /// pipe. A short read is reported: `truncated` is what every checked caller refuses on, so a
 /// partial answer is never mistaken for a complete one.
-fn join(reader: Option<Reader>, request: &GitRequest<'_>) -> Result<Bounded> {
+fn join(reader: Option<Reader>, described: &str) -> Result<Bounded> {
     let Some(reader) = reader else {
         return Ok(Bounded::default());
     };
@@ -1739,11 +1884,7 @@ fn join(reader: Option<Reader>, request: &GitRequest<'_>) -> Result<Bounded> {
     }
     if ran_out {
         let held = reader.read.lock().map_err(|_| ProjectError::GitFailed {
-            detail: format!(
-                "{} produced output this host could not read",
-                request.describe()
-            )
-            .into(),
+            detail: format!("{described} produced output this host could not read").into(),
         })?;
         return Ok(Bounded {
             bytes: held.bytes.clone(),
@@ -1751,18 +1892,10 @@ fn join(reader: Option<Reader>, request: &GitRequest<'_>) -> Result<Bounded> {
         });
     }
     let outcome = reader.handle.join().map_err(|_| ProjectError::GitFailed {
-        detail: format!(
-            "{} produced output this host could not read",
-            request.describe()
-        )
-        .into(),
+        detail: format!("{described} produced output this host could not read").into(),
     })?;
     let held = reader.read.lock().map_err(|_| ProjectError::GitFailed {
-        detail: format!(
-            "{} produced output this host could not read",
-            request.describe()
-        )
-        .into(),
+        detail: format!("{described} produced output this host could not read").into(),
     })?;
     outcome?;
     Ok(Bounded {
@@ -1817,6 +1950,119 @@ fn search_path(file_name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|directory| directory.join(file_name))
         .find(|candidate| candidate.is_file())
+}
+
+/// Returns the programs outside Git's own installation one invocation may execute.
+///
+/// Two, and only for an invocation that reaches a repository over Git's transport: the approved
+/// broker's ssh program, and the shell Git starts its connection through. Every such invocation is
+/// a clone that checks nothing out, so nothing in it consults a repository's attributes and there
+/// is no driver, filter or hook for a repository to reach either program through. Every other
+/// invocation executes Git and the helpers under Git's own directory and nothing else at all.
+fn helpers(request: &GitRequest<'_>) -> Vec<PathBuf> {
+    let mut helpers = Vec::new();
+    if let Some(program) = request.ssh_program {
+        helpers.push(program.to_owned());
+    }
+    if request.transport.is_some_and(|transport| {
+        matches!(
+            transport,
+            RemoteTransport::LocalPath | RemoteTransport::Ssh
+        )
+    }) {
+        // An https remote needs none: Git executes its own `git-remote-https` directly. A local
+        // path and an ssh remote are both started as a command string, which is the shell.
+        for shell in crate::boundary::CONNECTION_SHELL {
+            helpers.push(PathBuf::from(shell));
+        }
+    }
+    helpers
+}
+
+/// One invocation's own temporary directory, which exists only while the invocation does.
+///
+/// Git writes temporary files for several ordinary reasons, and a shared temporary directory is
+/// both outside the boundary and a place anybody on this machine can put a program. So each
+/// invocation gets one of its own, named after nothing, reachable by nothing else, inside the
+/// boundary's write list, and taken away when the invocation ends.
+#[derive(Debug)]
+struct PrivateTemporary {
+    path: PathBuf,
+}
+
+impl PrivateTemporary {
+    /// Creates one inside the profile's own temporary directory.
+    fn create(root: &Path, described: &str) -> Result<Self> {
+        let mut name = String::with_capacity(32);
+        for byte in uuid::Uuid::new_v4().as_bytes() {
+            name.push_str(&format!("{byte:02x}"));
+        }
+        let path = root.join(&name);
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+
+            builder.mode(0o700);
+        }
+        builder
+            .create(&path)
+            .map_err(|error| ProjectError::StagingUnavailable {
+                detail: format!(
+                    "{described} could not be given a temporary directory of its own: {error}"
+                )
+                .into(),
+            })?;
+        // The boundary's rules are written against a path with no link left in it, and the state
+        // directory above this one may reach it through one.
+        let path = std::fs::canonicalize(&path).map_err(|error| ProjectError::StagingUnavailable {
+            detail: format!(
+                "{described}'s own temporary directory could not be resolved: {error}"
+            )
+            .into(),
+        })?;
+        Ok(Self { path })
+    }
+
+    /// Returns where it is.
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for PrivateTemporary {
+    fn drop(&mut self) {
+        // Nothing but this invocation's Git could have written here, because nothing else was ever
+        // told where it is and the boundary let nothing else in.
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+/// Returns the Git binary an invocation executes.
+///
+/// Git installs a copy of itself in its own helper directory on every platform, and on some hosts
+/// the Git on the search path is a stand-in that re-executes the Git of a selected toolchain rather
+/// than being it. A boundary whose execution list held only the stand-in would refuse Git before it
+/// started, and one that held the stand-in and everything it might become would not be a list at
+/// all. So the copy under the helper directory is asked whether it is the same program: the same
+/// version, reporting the same helper directory. It runs when it is. Where there is no such copy,
+/// or it answers differently, the program this host resolved is what runs, and a stand-in that
+/// then cannot hand off is an honest failure rather than a widened list.
+fn handed_off_to(program: &Path, exec_path: &Path, version: &str) -> PathBuf {
+    let Ok(candidate) = exec_path.join(GIT_FILE_NAME).canonicalize() else {
+        return program.to_owned();
+    };
+    if candidate == program {
+        return program.to_owned();
+    }
+    let same_version = ask(&candidate, &["--version"]).is_ok_and(|reported| reported.trim_end() == version);
+    let same_helpers = ask(&candidate, &["--exec-path"])
+        .is_ok_and(|reported| Path::new(reported.trim_end()) == exec_path);
+    if same_version && same_helpers {
+        candidate
+    } else {
+        program.to_owned()
+    }
 }
 
 /// Asks the resolved binary one question with an environment of nothing.
@@ -2083,7 +2329,7 @@ mod tests {
         assert!(argv.contains(&OsString::from("--no-optional-locks")));
         assert!(argv.contains(&OsString::from("--no-pager")));
         // The environment is built rather than inherited, so what Git reads is exactly this.
-        let environment = profile.environment(&request);
+        let environment = profile.environment(&request, Path::new("/state/git-profile/temporary/one"));
         let value = |name: &str| {
             environment
                 .iter()
@@ -2170,9 +2416,13 @@ mod tests {
         let arguments: [&OsStr; 1] = [OsStr::new("clone")];
         let helper = OsString::from("/usr/libexec/git-core/git-credential-osxkeychain");
         let request = GitRequest::write(Path::new("/stage"), &arguments).with_transport(
-            RemoteTransport::Https,
-            Some(helper.as_os_str()),
-            None,
+            RemoteAccess {
+                transport: RemoteTransport::Https,
+                credential_helper: Some(helper.as_os_str()),
+                ssh_command: None,
+                ssh_program: None,
+                port: None,
+            },
         );
         let overrides = profile.overrides(&request);
         let helpers: Vec<&OsString> = overrides
@@ -2200,7 +2450,7 @@ mod tests {
                 .iter()
                 .any(|(key, value)| key == "core.sshCommand" && value.is_empty())
         );
-        let environment = profile.environment(&request);
+        let environment = profile.environment(&request, Path::new("/state/git-profile/temporary/one"));
         assert!(
             environment
                 .iter()
@@ -2338,7 +2588,7 @@ mod tests {
         );
         // A key holding an equals sign is expressible only in the environment form, which is why
         // the overrides travel there: the key and the value are separate variables.
-        let environment = profile.environment(&request);
+        let environment = profile.environment(&request, Path::new("/state/git-profile/temporary/one"));
         let keys: Vec<String> = environment
             .iter()
             .filter(|(name, _)| name.to_string_lossy().starts_with("GIT_CONFIG_KEY_"))
@@ -2433,13 +2683,18 @@ mod tests {
         RestrictedProfile {
             git: GitProgram {
                 program: PathBuf::from("/usr/bin/git"),
+                executable: PathBuf::from("/usr/libexec/git-core/git"),
                 exec_path: PathBuf::from("/usr/libexec/git-core"),
                 version: "git version 2.50.1".to_owned(),
             },
+            environment_id: EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16])),
             empty_config: PathBuf::from("/state/git-profile/empty-config"),
             hooks: PathBuf::from("/state/git-profile/hooks"),
             template: PathBuf::from("/state/git-profile/template"),
             home: PathBuf::from("/state/git-profile/home"),
+            temporary: PathBuf::from("/state/git-profile/temporary"),
+            #[cfg(feature = "git-fixtures")]
+            interposition: None,
         }
     }
 

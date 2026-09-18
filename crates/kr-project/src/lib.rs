@@ -91,6 +91,7 @@
 //! ```
 
 pub mod answer;
+pub mod boundary;
 pub mod credential;
 pub mod error;
 pub mod git;

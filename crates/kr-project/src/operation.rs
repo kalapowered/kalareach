@@ -733,6 +733,11 @@ pub fn stage_clone(
         // A template directory's hooks are copied into the new repository, so no template is used
         // beyond the empty one the profile already names.
         OsStr::new("--template="),
+        // Nothing is checked out here. A checkout consults the repository's attributes and is the
+        // one thing that makes Git look for a driver, and a clone is the one invocation whose
+        // boundary holds the shell Git starts its connection through. Keeping them apart means no
+        // invocation ever has both: `check_out` below runs with no shell in its list at all.
+        OsStr::new("--no-checkout"),
         OsStr::new(&origin),
     ];
     if matches!(remote.specification.transport, RemoteTransport::LocalPath) {
@@ -746,11 +751,7 @@ pub fn stage_clone(
     let request = GitRequest::write(staging.path(), &arguments)
         .with_ceiling(staging.path())
         .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
-        .with_transport(
-            remote.specification.transport,
-            remote.credential_helper(),
-            remote.ssh_command(),
-        )
+        .with_transport(remote.access())
         .with_cancellation(Arc::clone(cancel));
     profile.run_checked(&request)?;
     // The URL the repository stored has to be the one this host passed. A rewrite, a helper or a
@@ -778,6 +779,63 @@ pub fn stage_clone(
             .into(),
         });
     }
+    check_out(profile, staging, cancel)
+}
+
+/// Populates the working tree of a repository that was cloned without one.
+///
+/// A separate invocation, and the reason is the boundary: a clone starts Git's own connection
+/// through the system shell, and a checkout is what makes Git consult a repository's attributes and
+/// look for a driver. This one's execution list holds Git and the helpers under Git's own directory
+/// and nothing else, so a driver planted in the clone's own configuration while it ran has nothing
+/// to run through.
+///
+/// A remote with no commit in it has nothing to check out, which is what a newly created repository
+/// on the other end looks like, and that is not a failure.
+///
+/// # Errors
+///
+/// Returns whatever the invocation failed with.
+fn check_out(
+    profile: &RestrictedProfile,
+    staging: &StagingSibling,
+    cancel: &Arc<Cancellation>,
+) -> Result<()> {
+    let tree = staging.tree_path();
+    let arguments: [&OsStr; 3] = [
+        OsStr::new("rev-parse"),
+        OsStr::new("--verify"),
+        OsStr::new("HEAD"),
+    ];
+    let head = profile.run(&GitRequest::read(&tree, &arguments).with_ceiling(staging.path()))?;
+    head.require_complete()?;
+    if !head.success {
+        return Ok(());
+    }
+    let revision = head.text().trim().to_owned();
+    let arguments: [&OsStr; 4] = [
+        OsStr::new("symbolic-ref"),
+        OsStr::new("--quiet"),
+        OsStr::new("--short"),
+        OsStr::new("HEAD"),
+    ];
+    let named = profile.run(&GitRequest::read(&tree, &arguments).with_ceiling(staging.path()))?;
+    named.require_complete()?;
+    let branch = named.text().trim().to_owned();
+    // A remote whose own HEAD is detached gives no branch name, and the revision is then what the
+    // working tree is put at. Either argument goes through the same argument check as every other.
+    let mut arguments: Vec<&OsStr> = vec![OsStr::new("checkout")];
+    if named.success && !branch.is_empty() {
+        arguments.push(OsStr::new(&branch));
+    } else {
+        arguments.push(OsStr::new("--detach"));
+        arguments.push(OsStr::new(&revision));
+    }
+    let request = GitRequest::write(&tree, &arguments)
+        .with_ceiling(staging.path())
+        .with_deadline(Duration::from_millis(OPERATION_DEADLINE.get()))
+        .with_cancellation(Arc::clone(cancel));
+    profile.run_checked(&request)?;
     Ok(())
 }
 

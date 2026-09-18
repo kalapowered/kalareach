@@ -60,6 +60,7 @@ const PLATFORM_HELPERS: &[&str] = &[
 pub struct CredentialBroker {
     name: String,
     helper: Option<PathBuf>,
+    ssh: Option<PathBuf>,
     ssh_command: Option<OsString>,
 }
 
@@ -76,10 +77,19 @@ impl CredentialBroker {
         self.helper.as_deref()
     }
 
-    /// Returns the ssh program, when this broker has one.
+    /// Returns the ssh command, which is the program and the settings it is run with.
     #[must_use]
     pub fn ssh_command(&self) -> Option<&std::ffi::OsStr> {
         self.ssh_command.as_deref()
+    }
+
+    /// Returns the ssh program inside that command.
+    ///
+    /// The boundary's execution list holds programs rather than command lines, and this is the one
+    /// program outside Git's own installation that an ssh remote lets Git run.
+    #[must_use]
+    pub fn ssh_program(&self) -> Option<&Path> {
+        self.ssh.as_deref()
     }
 }
 
@@ -110,26 +120,13 @@ impl BrokerRegistry {
             })
             .find(|candidate| candidate.is_file());
         let ssh = ssh_program(git);
-        let ssh_command = ssh.map(|program| {
-            let mut command = OsString::from("\"");
-            command.push(program.as_os_str());
-            // No user or system ssh configuration file, no interactive prompt, no agent
-            // forwarding and no host-key question a process with no terminal cannot answer.
-            // `-F` names the configuration file ssh reads, and this is the platform's empty
-            // device: a `ProxyCommand` in the user's own `~/.ssh/config` is a program this host
-            // did not grant, so no user or system file is read at all.
-            command.push(if cfg!(windows) {
-                "\" -F NUL -o BatchMode=yes -o StrictHostKeyChecking=yes -o ForwardAgent=no"
-            } else {
-                "\" -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=yes -o ForwardAgent=no"
-            });
-            command
-        });
+        let ssh_command = ssh.as_ref().map(|program| ssh_settings(program));
         let mut brokers = Vec::new();
         if helper.is_some() || ssh_command.is_some() {
             brokers.push(CredentialBroker {
                 name: OS_SECRET_STORE.to_owned(),
                 helper,
+                ssh,
                 ssh_command,
             });
         }
@@ -147,11 +144,13 @@ impl BrokerRegistry {
     pub fn broker(
         name: impl Into<String>,
         helper: Option<PathBuf>,
-        ssh_command: Option<OsString>,
+        ssh: Option<PathBuf>,
     ) -> CredentialBroker {
+        let ssh_command = ssh.as_ref().map(|program| ssh_settings(program));
         CredentialBroker {
             name: name.into(),
             helper,
+            ssh,
             ssh_command,
         }
     }
@@ -278,6 +277,7 @@ impl BrokerRegistry {
                 credential_broker: requested.credential_broker.clone(),
             },
             broker,
+            port: parsed.port,
         })
     }
 }
@@ -289,6 +289,12 @@ pub struct ValidatedRemote {
     pub specification: RemoteSpecification,
     /// The broker, when the transport needs one.
     pub broker: Option<CredentialBroker>,
+    /// The port the URL named, when it named one of its own.
+    ///
+    /// The boundary lets a remote operation reach the ports its transport uses, and a repository
+    /// served on another one would otherwise be unreachable. It comes from the URL this host
+    /// validated rather than from anything the repository chose afterwards.
+    pub port: Option<u16>,
 }
 
 impl ValidatedRemote {
@@ -313,13 +319,33 @@ impl ValidatedRemote {
             && self.credential_helper().is_none()
     }
 
-    /// Returns the ssh program Git runs, when the transport is ssh.
+    /// Returns the ssh command Git runs, when the transport is ssh.
     #[must_use]
     pub fn ssh_command(&self) -> Option<&std::ffi::OsStr> {
         if matches!(self.specification.transport, RemoteTransport::Ssh) {
             self.broker.as_ref().and_then(CredentialBroker::ssh_command)
         } else {
             None
+        }
+    }
+
+    /// Returns everything one invocation needs to reach this remote, in one piece.
+    ///
+    /// The transport, the programs the broker lends and the port the URL named. An invocation
+    /// built from this is the only kind that can reach a network at all: without it the boundary
+    /// gives the child nothing to connect through.
+    #[must_use]
+    pub fn access(&self) -> crate::git::RemoteAccess<'_> {
+        crate::git::RemoteAccess {
+            transport: self.specification.transport,
+            credential_helper: self.credential_helper(),
+            ssh_command: self.ssh_command(),
+            ssh_program: if matches!(self.specification.transport, RemoteTransport::Ssh) {
+                self.broker.as_ref().and_then(CredentialBroker::ssh_program)
+            } else {
+                None
+            },
+            port: self.port,
         }
     }
 }
@@ -334,6 +360,8 @@ pub struct ProjectRemote {
     /// The provider, which is the host name for a network transport and the empty string for a
     /// local path.
     pub provider: String,
+    /// The port the URL named, when it named one of its own.
+    pub port: Option<u16>,
 }
 
 /// Validates one remote URL and says what transport it is.
@@ -397,6 +425,7 @@ pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
             transport: RemoteTransport::LocalPath,
             url: trimmed.to_owned(),
             provider: String::new(),
+            port: None,
         });
     }
     // The `scp`-like form `user@host:path`, which is how ssh remotes are usually written. It is
@@ -429,6 +458,8 @@ pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
             transport: RemoteTransport::Ssh,
             url: trimmed.to_owned(),
             provider: host.to_ascii_lowercase(),
+            // The `user@host:path` form has no port in it: what follows the colon is a path.
+            port: None,
         });
     }
     // The refusal below names what is wrong and not the URL: a URL this host could not parse is
@@ -478,6 +509,7 @@ pub fn parse_remote(url: &str) -> Result<ProjectRemote> {
         transport,
         url: trimmed.to_owned(),
         provider: host.to_ascii_lowercase(),
+        port: parsed.port(),
     })
 }
 
@@ -515,6 +547,23 @@ pub fn require_no_credential(remote_name: &str, stored: &str) -> Result<()> {
             )
             .into(),
         })
+}
+
+/// Returns the ssh command Git runs: the program, quoted, and the settings it runs with.
+///
+/// No user or system ssh configuration file, no interactive prompt, no agent forwarding and no
+/// host-key question a process with no terminal cannot answer. `-F` names the configuration file
+/// ssh reads, and this is the platform's empty device: a `ProxyCommand` in the user's own
+/// `~/.ssh/config` is a program this host did not grant, so no user or system file is read at all.
+fn ssh_settings(program: &Path) -> OsString {
+    let mut command = OsString::from("\"");
+    command.push(program.as_os_str());
+    command.push(if cfg!(windows) {
+        "\" -F NUL -o BatchMode=yes -o StrictHostKeyChecking=yes -o ForwardAgent=no"
+    } else {
+        "\" -F /dev/null -o BatchMode=yes -o StrictHostKeyChecking=yes -o ForwardAgent=no"
+    });
+    command
 }
 
 /// Returns the ssh program beside Git's own binary, when there is one.
@@ -686,7 +735,7 @@ mod tests {
             Some(PathBuf::from(
                 "/usr/libexec/git-core/git-credential-osxkeychain",
             )),
-            Some(OsString::from("/usr/bin/ssh -F /dev/null")),
+            Some(PathBuf::from("/usr/bin/ssh")),
         )]);
         let good = registry
             .validate(&RemoteSpecification {
@@ -728,7 +777,7 @@ mod tests {
         let registry = BrokerRegistry::from_brokers(vec![BrokerRegistry::broker(
             OS_SECRET_STORE,
             None,
-            Some(OsString::from("/usr/bin/ssh")),
+            Some(PathBuf::from("/usr/bin/ssh")),
         )]);
         let fetched = registry
             .validate(&RemoteSpecification {
@@ -830,7 +879,7 @@ mod tests {
             Some(PathBuf::from(
                 "/usr/libexec/git-core/git-credential-osxkeychain",
             )),
-            Some(OsString::from("/usr/bin/ssh")),
+            Some(PathBuf::from("/usr/bin/ssh")),
         )]);
         let refusal = registry
             .validate(&RemoteSpecification {
