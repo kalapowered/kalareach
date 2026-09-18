@@ -991,7 +991,9 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
         .await;
         assert!(
             outcome.is_err(),
-            "the clone is still running when the daemon is ended"
+            "the clone is still running when the daemon is ended, and instead it answered \
+             {outcome:?}; the daemon's own log says: {}",
+            std::fs::read_to_string(&log).unwrap_or_else(|error| format!("<unreadable: {error}>"))
         );
     }
     // The operation row exists before anything is on disk, which is what makes the create token
