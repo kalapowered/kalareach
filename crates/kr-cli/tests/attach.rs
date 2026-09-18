@@ -704,9 +704,7 @@ fn answer_keyboard_and_mode_queries(
 ) {
     let output = output.clone();
     std::thread::spawn(move || {
-        if !output.wait_for(b"\x1b[c", Duration::from_secs(20)) {
-            return;
-        }
+        output.expect_within(b"\x1b[c", LIVENESS_DEADLINE, QUERY_EXPECTED);
         // DECRPM: one is set, two is reset.
         let _ = writer.write_all(
             b"\x1b[?5u\x1b[>4;2m\x1b[?25;2$y\x1b[?1000;1$y\x1b[?1002;2$y\x1b[?1003;2$y\x1b[?1006;2$y\x1b[?2004;1$y\x1b[?62;22c",
@@ -1049,14 +1047,13 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
         .expect("starts the shell");
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     answer_keyboard_and_mode_queries(&output, pty.master.take_writer().expect("a writer"));
-    assert!(
-        output.wait_for(b"ready", Duration::from_secs(30)),
-        "the session's output reached the terminal: {}",
-        output.text()
+    output.expect_within(
+        b"ready",
+        LIVENESS_DEADLINE,
+        "the session's output reached the terminal",
     );
 
-    let attach = attach_process(shell.process_id().expect("the shell has an identifier"))
-        .expect("the shell started the attach command");
+    let attach = attach_process(shell.process_id().expect("the shell has an identifier"));
     assert_eq!(
         guards_of(attach),
         1,
@@ -1070,10 +1067,10 @@ async fn a_terminal_that_reported_its_modes_is_put_back_into_them_after_a_kill()
 
     // The guard writes the reset block and then this terminal's own values over it. Waiting for the
     // cursor's own value is waiting for the whole of that, because it is written in one go.
-    assert!(
-        output.wait_for(b"\x1b[?25l", Duration::from_secs(20)),
-        "the guard hid the cursor again, because that is how it found it: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        b"\x1b[?25l",
+        LIVENESS_DEADLINE,
+        "the guard hid the cursor again, because that is how it found it",
     );
     let modes = final_modes(&output.bytes());
     for (mode, expected) in REPORTED_MODES {
@@ -1156,11 +1153,7 @@ async fn an_attach_that_fails_after_the_handshake_leaves_the_terminal_the_modes_
     let output = TerminalOutput::collect(pty.master.try_clone_reader().expect("a reader"));
     answer_keyboard_and_mode_queries(&output, pty.master.take_writer().expect("a writer"));
 
-    assert!(
-        output.wait_for(b"attach-finished-", Duration::from_secs(60)),
-        "the attach ended: {}",
-        output.text().escape_debug()
-    );
+    output.expect_within(b"attach-finished-", LIVENESS_DEADLINE, "the attach ended");
     assert!(
         !output.contains(b"attach-finished-0"),
         "and it failed, because nothing is listening on that endpoint: {}",
@@ -1291,13 +1284,10 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
     // the cursor and bracketed paste went back to their documented defaults rather than to values
     // anybody read. That is a smaller promise than a terminal that answers gets, and the attachment
     // says which promise it made rather than leaving it to be assumed.
-    assert!(
-        output.wait_for(
-            b"put back to the documented default",
-            Duration::from_secs(10)
-        ),
-        "the attachment reported the modes it had to default: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        b"put back to the documented default",
+        LIVENESS_DEADLINE,
+        "the attachment reported the modes it had to default",
     );
     for mode in ["25", "1000", "1002", "1003", "1006", "2004"] {
         assert!(
@@ -1749,9 +1739,7 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
         let output = output.clone();
         let keyboard = Arc::clone(&keyboard);
         std::thread::spawn(move || {
-            if !output.wait_for(b"\x1b[c", Duration::from_secs(20)) {
-                return;
-            }
+            output.expect_within(b"\x1b[c", LIVENESS_DEADLINE, QUERY_EXPECTED);
             if let Ok(mut writer) = keyboard.lock() {
                 let _ = writer.write_all(b"\x1b[?5u\x1b[>4;2m\x1b[?62;22c");
                 let _ = writer.flush();
@@ -1763,10 +1751,10 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
         writer.write_all(bytes).expect("types");
         writer.flush().expect("flushes");
     };
-    assert!(
-        output.wait_for(b"kr-outer.", Duration::from_secs(30)),
-        "the outer session's screen reached the terminal: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        b"kr-outer.",
+        LIVENESS_DEADLINE,
+        "the outer session's screen reached the terminal",
     );
     // The outer attachment owns this terminal's driver state. Whatever the inner one does, this is
     // what has to still be true afterwards.
@@ -1786,10 +1774,10 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
         inner_display.get()
     );
     types(inner_command.as_bytes());
-    assert!(
-        output.wait_for(b"kr-inner.", Duration::from_secs(40)),
-        "the inner session's screen reached the same terminal: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        b"kr-inner.",
+        LIVENESS_DEADLINE,
+        "the inner session's screen reached the same terminal",
     );
 
     // Typed with the inner command in the foreground. It reaches the inner session's application,
@@ -1916,10 +1904,10 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
         "the detach succeeded: {}",
         String::from_utf8_lossy(&detach.stderr)
     );
-    assert!(
-        output.wait_for(b"inner-finished-0", Duration::from_secs(30)),
-        "the inner command ended, and an ordinary detach is not a failure: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        b"inner-finished-0",
+        LIVENESS_DEADLINE,
+        "the inner command ended, and an ordinary detach is not a failure",
     );
     assert!(
         !output.contains(b"outer-finished-"),
@@ -1937,10 +1925,10 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
     // And the keys go back to the outer session's shell, which is what was in the foreground
     // before the inner command took it.
     types(b"printf 'kr-back.'\n");
-    assert!(
-        output.wait_for(b"kr-back.", Duration::from_secs(30)),
-        "the outer session's shell is reading again: {}",
-        output.text().escape_debug()
+    output.expect_within(
+        b"kr-back.",
+        LIVENESS_DEADLINE,
+        "the outer session's shell is reading again",
     );
     let _ = shell.kill();
     let _ = shell.wait();

@@ -196,13 +196,9 @@ impl RestorationGuard {
         let started = std::time::Instant::now();
         let deadline = started + GUARD_ARM_TIMEOUT;
         while !answer.is_finished() {
-            // A guard that has died is the case this is waiting for, and it says so twice: its end
-            // of the pipe closes, which ends the read above, and the child itself is gone, which is
-            // what this looks at. Neither is a clock, because the time a process takes to start is
-            // not this process's to predict.
-            if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return false;
-            }
+            // A guard that has died ends this wait without a clock: its end of the pipe closes with
+            // it, the read above returns nothing, and the answer below says it ended. What the
+            // deadline bounds is the other case, a guard that is running and has not answered.
             if std::time::Instant::now() >= deadline {
                 return Err(format!(
                     "it was still running and had not answered after {:?}",

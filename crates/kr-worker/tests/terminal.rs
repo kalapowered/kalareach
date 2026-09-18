@@ -304,56 +304,6 @@ async fn collect_projection_until(
     (bytes, header, rows)
 }
 
-/// Collects payloads until one of them carries `marker`, and then for `window` longer.
-///
-/// The same two halves as [`collect_until`], kept apart for the same reason, with the payload
-/// boundaries preserved: a test that asks what a repaint carried needs the repaints themselves and
-/// not one run-together stream.
-async fn collect_payloads_until(
-    client: &mut LocalClient,
-    marker: &[u8],
-    window: Duration,
-) -> Vec<Vec<u8>> {
-    let started = tokio::time::Instant::now();
-    let deadline = started + LIVENESS_DEADLINE;
-    let mut seen: Vec<Vec<u8>> = Vec::new();
-    while !seen
-        .iter()
-        .any(|payload| payload.windows(marker.len()).any(|slice| slice == marker))
-    {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "waited {:?} for a payload carrying {:?}: {:?}",
-            started.elapsed(),
-            String::from_utf8_lossy(marker),
-            seen.iter()
-                .map(|payload| String::from_utf8_lossy(payload).into_owned())
-                .collect::<Vec<_>>()
-        );
-        let remaining = deadline - tokio::time::Instant::now();
-        match tokio::time::timeout(remaining.min(Duration::from_secs(1)), client.recv()).await {
-            Ok(Ok(ControlFrame::Notification(notification)))
-                if notification.event_type.as_str() == "session.output" =>
-            {
-                if let Ok(event) = notification
-                    .payload
-                    .to_typed::<kr_protocol::recovery::OutputEvent>()
-                {
-                    seen.push(event.bytes.as_slice().to_vec());
-                }
-            }
-            Ok(Ok(_)) | Err(_) => {}
-            Ok(Err(error)) => panic!(
-                "waited {:?} for a payload carrying {:?} and the connection ended ({error})",
-                started.elapsed(),
-                String::from_utf8_lossy(marker)
-            ),
-        }
-    }
-    seen.extend(collect_payloads(client, window).await);
-    seen
-}
-
 /// Collects until `marker` has arrived, and then for `window` longer.
 ///
 /// The two halves answer different questions. Whether the marker arrives at all is a liveness wait,
