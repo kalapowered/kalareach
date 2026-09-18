@@ -1395,8 +1395,9 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
 
     // The reader is waiting for a key with nothing in progress, so there is nothing of the old
     // lease's for this cancellation to end and nothing for it to throw away.
-    session.type_bytes(b"echo kr-");
+    session.type_bytes(b"echo kr-$((6*7))");
     std::thread::sleep(Duration::from_millis(120));
+    session.forget_events();
     let idle = session.ask(WorkerRequest::Cancel(CancelKeyWait {
         session_id: session.session_id,
         sequence: U64::new(1),
@@ -1416,6 +1417,15 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
         report.discarded_bytes,
         U64::new(0),
         "a cancellation that ended nothing reported input it had discarded"
+    );
+    // A reader that came out of its wait would report itself idle on the way back in. This one
+    // never left it, so there is nothing new to report.
+    assert!(
+        !session.saw_event(Duration::from_millis(600), |event| matches!(
+            event,
+            BridgeEvent::ReaderIdle(_)
+        )),
+        "the reader left a wait that the cancellation had nothing to end"
     );
 
     // The person then starts a sequence of their own, and the mailbox is read while it is
@@ -1449,9 +1459,11 @@ pub fn a_cancellation_that_ends_nothing_leaves_the_next_sequence_alone(kind: She
         "the cancellation did not end the sequence it found: {:?}",
         report.cancelled
     );
-    session.type_line("idle-ok");
+    // The rest of the line is typed and the whole command runs: the shell's own answer, which is
+    // in none of the keystrokes, is what proves it ran rather than an echo of the typing.
+    session.type_line("-ok");
     assert!(
-        session.wait_for_output("kr-idle-ok", REPLY),
+        session.wait_for_output("kr-42-ok", REPLY),
         "the edit buffer did not survive the cancellations:\n{}",
         session.terminal_output()
     );
