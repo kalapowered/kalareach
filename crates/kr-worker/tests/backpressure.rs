@@ -215,35 +215,40 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         read_at_overflow > 0,
         "the client that kept reading had received output by the time the other one's queue filled"
     );
-    // Waited for rather than sampled over a fixed window: what this asserts is that more arrives
-    // after the overflow, not how quickly a loaded machine delivers it. There are two allowed
-    // answers and either ends the wait - more output reaching the client that kept up, or that
-    // client falling behind too and being told so - because what is being measured is the session,
-    // not which of its clients kept pace.
+    // Waited for rather than sampled over a fixed window: what this asserts is what happens after
+    // the overflow, not how quickly a loaded machine gets there. Two things have to happen, and
+    // they are waited for together under one deadline, because either one alone can be true of a
+    // moment rather than of the session: the terminal goes on being read, which is the cursor
+    // moving past where it stood when the queue filled, and the client that kept up either
+    // receives more or falls behind too and is told so. A wait that ended on the second alone
+    // could end on output buffered before the overflow.
     let started = Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
-    while received.load(std::sync::atomic::Ordering::Relaxed) <= read_at_overflow
-        && !draining.is_finished()
-    {
+    let (afterwards, read_after) = loop {
+        let afterwards = runtime.session().output_cursor();
+        let read_after = received.load(std::sync::atomic::Ordering::Relaxed);
+        if afterwards > at_overflow && (read_after > read_at_overflow || draining.is_finished()) {
+            break (afterwards, read_after);
+        }
         assert!(
             Instant::now() < deadline,
-            "waited {:?} for more output to reach the client that kept reading while the other \
-             was not reading",
-            started.elapsed()
+            "waited {:?} for the session to read past {at_overflow} - it is at {afterwards} - and \
+             for the client that kept reading either to receive more than {read_at_overflow} \
+             batches or to be told it had fallen behind too, on {}",
+            started.elapsed(),
+            finished(&draining)
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let afterwards = runtime.session().output_cursor();
+    };
     assert!(
         afterwards > at_overflow,
-        "and the pseudo-terminal was still being read afterwards: the output cursor stood at \
-         {at_overflow} when the queue filled and is at {afterwards} after {:?}, on {}",
+        "the pseudo-terminal was still being read after the queue filled: the output cursor stood \
+         at {at_overflow} and is at {afterwards} after {:?}, on {}",
         started.elapsed(),
         finished(&draining)
     );
     assert!(
-        received.load(std::sync::atomic::Ordering::Relaxed) > read_at_overflow
-            || draining.is_finished(),
+        read_after > read_at_overflow || draining.is_finished(),
         "and output still reached the client that was reading, or that client had fallen behind \
          too and been told so, after {:?}",
         started.elapsed()
