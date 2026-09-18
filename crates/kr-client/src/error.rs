@@ -3,6 +3,8 @@
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::method::{Method, MethodVersion};
 
+use crate::retry::{Decision, Failure, Origin, RequestClass, UserAction};
+
 /// A client failure.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -109,6 +111,50 @@ impl ClientError {
             Self::ResyncRequired => ErrorCode::ResyncRequired,
             Self::ServiceNotConfigured(_) => ErrorCode::HostNotConfigured,
         }
+    }
+
+    /// Returns who refused.
+    ///
+    /// A managed service and a host can answer with the same code and mean different things to a
+    /// person, so the policy is told which one this was.
+    #[must_use]
+    pub fn origin(&self) -> Origin {
+        match self {
+            Self::Refused { .. } | Self::ServiceNotConfigured(_) => Origin::ManagedService,
+            _ => Origin::Host,
+        }
+    }
+
+    /// Returns what the retry policy makes of this failure for a request of `class`.
+    ///
+    /// This is how a caller reaches the policy for everything the library does not retry itself:
+    /// the recovery step, and the direct action a user interface offers instead of the code.
+    #[must_use]
+    pub fn decision(&self, class: RequestClass) -> Decision {
+        let retry_after = match self {
+            Self::Refused {
+                retry_after_seconds,
+                ..
+            } => Some(std::time::Duration::from_secs(*retry_after_seconds)),
+            _ => None,
+        };
+        crate::retry::decision(
+            Failure {
+                code: self.code(),
+                retry_after,
+                origin: self.origin(),
+            },
+            class,
+        )
+    }
+
+    /// Returns the direct action a user interface offers for this failure.
+    ///
+    /// Section 23: the interface translates a code into a direct action and does not display raw
+    /// protocol internals by default. The plain message is still there for a log or a details view.
+    #[must_use]
+    pub fn user_action(&self) -> UserAction {
+        crate::retry::user_action(self.code(), self.origin())
     }
 }
 

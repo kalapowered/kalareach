@@ -12,6 +12,7 @@ use std::time::Duration;
 use iroh::{Endpoint, EndpointAddr};
 use kr_client::cursors::{Restoration, RestorationStep};
 use kr_client::error::ClientError;
+use kr_client::retry::{Recovery, RequestClass, UserAction};
 use kr_client::services::{NullService, RelayLeaseService, ServiceClients};
 use kr_client::session::Session;
 use kr_client::transport::NetworkTransport;
@@ -746,6 +747,130 @@ async fn an_unsettled_submission_carries_the_intent_it_was_made_for() {
 
     let carried = kr_client::reconnect::ClientState::from_session(&session, None).await;
     assert_eq!(carried.unresolved_actions(), vec![receipt.action_id]);
+
+    session.close();
+    serving.abort();
+}
+
+#[tokio::test]
+async fn a_transient_refusal_of_an_idempotent_read_is_sent_again_and_never_reaches_the_caller() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    // The host refuses the first read with a transient code and answers the next one.
+    *script.refuse_reads_with.lock().await = Some(ErrorCode::ResourceUnavailable);
+    let listing: SessionList = session
+        .read(Method::SessionList, &Empty {})
+        .await
+        .expect("the retry succeeded within the bound");
+    assert_eq!(listing, SessionList { count: 2 });
+    assert_eq!(
+        script.reads.load(Ordering::Acquire),
+        2,
+        "the read was sent exactly once more"
+    );
+
+    session.close();
+    serving.abort();
+}
+
+#[tokio::test]
+async fn a_refusal_that_a_retry_cannot_change_comes_straight_back_with_its_action() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    // A configuration failure. Sending it again cannot change the answer, so the library does not,
+    // even though the host would have answered the second attempt.
+    *script.refuse_reads_with.lock().await = Some(ErrorCode::PermissionDenied);
+    let error = session
+        .read::<_, SessionList>(Method::SessionList, &Empty {})
+        .await
+        .expect_err("a refusal");
+    assert_eq!(error.code(), ErrorCode::PermissionDenied);
+    assert_eq!(script.reads.load(Ordering::Acquire), 1);
+    assert_eq!(error.user_action(), UserAction::FixConfiguration);
+    let decision = error.decision(RequestClass::IdempotentRead);
+    assert_eq!(decision.recovery, Recovery::Stop);
+    assert!(!decision.retries_automatically());
+
+    session.close();
+    serving.abort();
+}
+
+#[tokio::test]
+async fn a_mutation_is_never_sent_again_by_the_library() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    // A transient code, which is the one case an automatic retry would be legal for a read. A
+    // mutation may already have been dispatched, so the library hands the decision back instead.
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::ResourceUnavailable);
+    let error = session
+        .mutate(
+            Method::SessionCreate,
+            ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("a refusal");
+    assert_eq!(error.code(), ErrorCode::ResourceUnavailable);
+    assert_eq!(
+        script.actions.lock().await.len(),
+        1,
+        "one intent reached the host once"
+    );
+    assert!(
+        !error
+            .decision(RequestClass::Dispatchable)
+            .retries_automatically()
+    );
+
+    session.close();
+    serving.abort();
+}
+
+#[tokio::test]
+async fn an_unknown_outcome_is_never_retried_and_names_the_action_to_ask_about() {
+    let host = side(1, true).await;
+    let client = side(2, false).await;
+    let script = Arc::new(HostScript::default());
+    let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
+    let session = connect(&client, &host).await;
+
+    *script.refuse_mutations_with.lock().await = Some(ErrorCode::OutcomeUnknown);
+    let error = session
+        .mutate(
+            Method::SessionCreate,
+            ActionTarget::environment(EnvironmentId::new(Uuid::from_bytes([9; 16]))),
+            None,
+            &Empty {},
+            &Empty {},
+            DurationMs::new(120_000),
+        )
+        .await
+        .expect_err("an uncertain outcome");
+    assert_eq!(error.code(), ErrorCode::OutcomeUnknown);
+    assert_eq!(script.actions.lock().await.len(), 1);
+    let decision = error.decision(RequestClass::Dispatchable);
+    assert_eq!(decision.recovery, Recovery::QueryOutcome);
+    assert_eq!(error.user_action(), UserAction::CheckTheOutcome);
+
+    // The action stays on the unresolved list, because nothing decided what became of it.
+    let submitted = session.submitted_actions().await;
+    assert_eq!(submitted.len(), 1);
+    assert_eq!(submitted[0].action_id, script.actions.lock().await[0]);
 
     session.close();
     serving.abort();

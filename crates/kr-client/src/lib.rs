@@ -25,6 +25,7 @@
 //! | [`session`] | Requests, receipts, events and the action window |
 //! | [`cursors`] | Cursors, receipts and the order state is restored in |
 //! | [`reconnect`] | The reconnect loop and what it refuses to carry across |
+//! | [`retry`] | What a failure means for the request, and what it means for the person |
 //! | [`services`] | Replaceable service clients and the null implementation |
 //!
 //! # What this crate does not do
@@ -41,6 +42,7 @@ pub mod error;
 pub mod ipc;
 pub mod projection;
 pub mod reconnect;
+pub mod retry;
 pub mod services;
 pub mod session;
 pub mod transport;

@@ -35,6 +35,7 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::cursors::{Delivery, ReceiptTracker, StreamCursors};
 use crate::error::{ClientError, Result};
+use crate::retry::{Attempts, Failure, Recovery, RequestClass};
 use crate::transport::ControlTransport;
 
 /// How many events the session buffers for each subscriber.
@@ -371,6 +372,11 @@ impl Session {
 
     /// Calls a read method and parses its result.
     ///
+    /// A read the registry marks idempotent is sent again when the host refuses it with a
+    /// transient code, under [`crate::retry`]'s bounded attempt count and jittered backoff. The
+    /// caller sees the last answer rather than each attempt. Every other refusal comes straight
+    /// back, and [`ClientError::decision`] says what the policy makes of it.
+    ///
     /// # Errors
     ///
     /// Returns [`ClientError::WrongEffect`] when the registry says the method mutates, and the
@@ -388,20 +394,58 @@ impl Session {
                 actual: "read",
             });
         }
+        // The registry decides the class, not this call site. A read it does not mark idempotent
+        // is not one section 23 permits an automatic retry for, whatever its effect class says.
+        let class =
+            if entry.idempotency == kr_protocol::authority::IdempotencyBehaviour::IdempotentRead {
+                RequestClass::IdempotentRead
+            } else {
+                RequestClass::Dispatchable
+            };
+        // Encoded once. Each attempt is the same request, and encoding it again per attempt would
+        // let a caller's value change under the retry.
+        let params = ParamsValue::from_typed(params)?;
+        let mut attempts = Attempts::new();
+        loop {
+            match self.send_read(method, entry.version, &params).await? {
+                Ok(value) => return Ok(value.to_typed()?),
+                Err(error) => {
+                    let decision = attempts.decide(Failure::new(error.code), class);
+                    let Recovery::Retry { delay } = decision.recovery else {
+                        return Err(ClientError::from(error));
+                    };
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    /// Sends one read and returns the host's answer, or the client-side failure that stopped it.
+    ///
+    /// The two failures are separated because only one of them is a decision the policy makes: a
+    /// host that refused said why, and a connection that ended did not. A transport failure is
+    /// never retried here — the reconnect loop owns that, and a second request on a connection
+    /// that has gone would fail the same way.
+    async fn send_read(
+        &self,
+        method: Method,
+        version: kr_protocol::method::MethodVersion,
+        params: &ParamsValue,
+    ) -> Result<std::result::Result<ParamsValue, kr_protocol::error::ProtocolError>> {
         let request_id = self.next_request_id();
         let waiter = self.register(request_id)?;
         let request = Request {
             request_id,
             method: method.into(),
-            method_version: entry.version,
-            params: ParamsValue::from_typed(params)?,
+            method_version: version,
+            params: params.clone(),
         };
         self.transport.send(&ControlFrame::Request(request)).await?;
 
         match waiter.wait().await? {
             Answer::Response(response) => match response.outcome {
-                Outcome::Ok(value) => Ok(value.to_typed()?),
-                Outcome::Error(error) => Err(ClientError::from(error)),
+                Outcome::Ok(value) => Ok(Ok(value)),
+                Outcome::Error(error) => Ok(Err(error)),
             },
             Answer::Receipt(_) => Err(ClientError::Host(kr_protocol::error::ProtocolError::new(
                 kr_protocol::error::ErrorCode::InvalidArgument,
@@ -415,6 +459,12 @@ impl Session {
     /// The identifier is generated here and recorded before the request is sent. A retry is a new
     /// request with the same identifier, which the host de-duplicates; a new intent is a new
     /// identifier.
+    ///
+    /// This library never sends a mutation again by itself, whatever the host refused it with.
+    /// Section 23 permits an automatic retry for idempotent reads, transfer chunks and requests
+    /// whose receipt proves no dispatch, and a mutation is none of those until its receipt says so.
+    /// The caller decides, with [`ClientError::decision`] for
+    /// [`crate::retry::RequestClass::Dispatchable`] to hand it the policy's answer.
     ///
     /// # Errors
     ///
