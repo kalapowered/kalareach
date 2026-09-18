@@ -1661,13 +1661,29 @@ fn an_https_clone_reaches_the_remote_where_the_broker_lends_no_credential_helper
         "the failure is the remote's rather than a refusal to try: {refusal}"
     );
     assert!(
-        refusal.to_string().contains("lends no credential helper"),
-        "and it says the fetch carried no credential, because Git's own words are not repeated: \
-         {refusal}"
+        refusal.to_string().contains("no credential was available"),
+        "and it says what the attempt carried, because Git's own words are not repeated: {refusal}"
     );
-    // The staged sibling is gone and the destination was never made.
+    // What this establishes is that the host got as far as running Git rather than refusing the
+    // broker; whether the connection itself was made is Git's business and this does not read it.
+    // The destination was never made, and the private sibling the attempt staged into is one the
+    // journal accounts for, so the next recovery takes it away rather than leaving it for nobody.
     support::assert_absent(
         &fixture.work().join("unauthenticated"),
         "a clone that failed published nothing",
+    );
+    let staged: Vec<String> = support::names_in(fixture.work())
+        .into_iter()
+        .filter(|name| name.starts_with(STAGING_PREFIX))
+        .collect();
+    assert_eq!(staged.len(), 1, "the attempt staged into one sibling");
+    fixture.service().recover().expect("recovery runs");
+    assert_eq!(
+        support::names_in(fixture.work())
+            .into_iter()
+            .filter(|name| name.starts_with(STAGING_PREFIX))
+            .collect::<Vec<String>>(),
+        Vec::<String>::new(),
+        "and the recovery removed it"
     );
 }

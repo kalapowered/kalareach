@@ -2639,19 +2639,21 @@ fn origin_of_method(method: &str) -> ProjectOrigin {
     }
 }
 
-/// Says that a failed fetch was one this host could not authenticate, where that is so.
+/// Says that the attempt carried no credential, where that is so.
 ///
-/// The broker a caller named is approved and lends no credential helper on this host, so the fetch
-/// reached the remote with no credential at all. A repository that wanted one refuses, and Git's own
-/// words about it are not repeated, so the reason is this host's to give.
+/// The broker a caller named is approved and lends no credential helper on this host, so nothing in
+/// the attempt could have authenticated. This is context rather than a diagnosis: it says what was
+/// available, not that the absence is why the attempt failed, because Git's own words are not
+/// repeated and this host cannot tell a refused authentication from a remote that was never
+/// reached.
 fn unauthenticated_fetch(error: ProjectError, remote: &ValidatedRemote) -> ProjectError {
     if !remote.unauthenticated() || !matches!(error, ProjectError::GitFailed { .. }) {
         return error;
     }
     ProjectError::GitFailed {
         detail: format!(
-            "{error}; the approved broker {} lends no credential helper on this host, so this \
-             fetch carried no credential, and a remote that wants one refuses it",
+            "{error}; the approved broker {} lends no credential helper on this host, so no \
+             credential was available for this attempt",
             crate::git::redact(&remote.specification.credential_broker)
         )
         .into(),

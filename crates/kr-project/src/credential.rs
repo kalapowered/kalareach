@@ -37,8 +37,11 @@ pub const OS_SECRET_STORE: &str = "os-secret-store";
 
 /// The credential helper program each platform's secret store is reached through.
 ///
-/// Every one of them ships with Git and lives in Git's own helper directory, so the program is
-/// resolved there rather than found on a path.
+/// Where one is present it lives in Git's own helper directory, so the program is resolved there
+/// rather than found on a path. Presence is a packaging decision rather than a promise: Apple's Git
+/// ships the keychain helper, and most Linux distributions package the libsecret one separately or
+/// not at all. A host with none still has a broker where it has ssh, and an https remote is then
+/// fetched carrying no credential rather than refused.
 const PLATFORM_HELPERS: &[&str] = &[
     // Apple platforms.
     "git-credential-osxkeychain",
