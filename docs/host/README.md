@@ -589,12 +589,16 @@ repository while Git is running.
   listen. An operation that reaches a remote may open outbound connections on the ports its
   transport uses and resolve the remote's name, and nothing may listen there either. Which part of
   that each platform enforces, and what it leaves, is in `crates/kr-project/README.md`: the ports
-  are enforced on two of the three platforms, and on Linux a socket is made only of a family this
-  host accounts for, so the ports are a guarantee about the protocol the transports use rather than
-  about every packet a name resolution sends.
+  are enforced on two of the three platforms, and on Linux a socket is made only of what this host
+  can account for, so the ports are a guarantee about the protocol the transports use rather than
+  about every packet a name resolution sends. A host whose name service cannot fall back from the
+  caches it reaches over a local socket to the resolver itself cannot turn a name into an address
+  inside the boundary, and says so.
 * **Only this operation's directories are written.** The repository's working tree and its Git
-  directory, the destination the operation reserved, and one temporary directory that exists for the
-  length of the invocation and is taken away with it. Everything else is read-only.
+  directory, the destination the operation reserved, and one temporary directory that exists for
+  the length of the invocation. Everything else is read-only. That temporary directory is taken
+  away by the record this host wrote before it made it, and never by descending into it:
+  `crates/kr-project/README.md` says what is left behind instead, and why.
 
 The enclosure is what makes the checks around it sufficient rather than advisory. This host reads a
 repository's configuration before it runs Git and reads it again afterwards, and it always could; a

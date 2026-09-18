@@ -95,7 +95,7 @@ two and why. The table below describes what is written for that platform, not wh
 | | macOS | Linux | Windows (refused) |
 | --- | --- | --- | --- |
 | Execution | A sandbox profile permitting `process-exec` on this invocation's own execution list and nothing else, applied by the system's own launcher before it runs Git | Landlock, with the execute right on this invocation's own execution list, on Git's helper directory and on the system's program loader, and nowhere else | An application container granted read and write on the repository, and **refused** the execute right there, so a permission inherited from the same directory cannot add it back, though one written on a file itself can |
-| Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that makes a socket only of a family the boundary accounts for: the two that reach no machine but this one for any operation, the internet ones for a remote operation and only as a stream socket, and nothing else at all, listening included | The container's capabilities: none at all for a local operation, and the client capability for a remote one, which does not bound ports — one of the two reasons the service refuses here |
+| Network | The same profile: no rule at all for a local operation, and one outbound rule per port for a remote one | Landlock's TCP connect rules per port for a remote operation, and a system-call filter that makes a socket only of what the boundary can account for: a connected pair of local ones for any operation, the kernel's own address answers and the internet families for a remote one and on those only a TCP stream socket, and nothing else at all, listening included | The container's capabilities: none at all for a local operation, and the client capability for a remote one, which does not bound ports — one of the two reasons the service refuses here |
 | Writes | The same profile, which permits `file-write` under the operation's own directories and nowhere else | Landlock's write rights, attached to the opened objects rather than to their names, and never carrying the execute right | The container's grants on those directories |
 | Descendants | The child leads its own process group, and ending it ends the group | The same | A job object the process is created inside, which it cannot leave and which ends everything in it |
 
@@ -148,51 +148,70 @@ every permission that reaches those files the way it does. What it does not beat
 file itself, which Windows consults first, and a writer who can create files in the repository can
 write one. That is why the service refuses on Windows rather than claiming the guarantee.
 
-**On Linux a socket is made only of a family the boundary accounts for.** Landlock's rules are about
+**On Linux a socket is made only of what the boundary can account for.** Landlock's rules are about
 TCP, and a system-call filter reads scalar arguments while an address is behind a pointer, so
 nothing there could bound where a datagram goes. Rather than permit one, the boundary refuses it,
 and it refuses by naming what may be made rather than what may not: a filter written the other way
-round would permit every family it had not heard of, the ones that reach the machine this one runs
-inside among them. Two families are accounted for whatever the operation is — the one that reaches
-this machine's own services by a path rather than an address, and the one a C library asks the
-kernel about this machine's own addresses on. A remote operation adds the internet families, on
-which the only socket is a stream socket of the protocol Landlock's port rules govern, because a
-stream socket of another protocol is one those rules would say nothing about. Everything else is
-refused, listening included, and the call that makes a pair of sockets is judged by the same
-families as the one that makes a single socket. Turning a name into an address goes over the same
-kind of connection, which the child is told to do and for which the port a resolver answers on is
-added to the rules, on any address, because which machine answers a name is not this service's to
-decide. A system whose resolver will not take that instruction cannot resolve a name inside the
-boundary, and the operation fails saying so.
+round would permit everything it had not heard of, the sockets that reach the machine this one runs
+inside among them. What may be made is short.
+
+* A **connected pair of local sockets**, for either kind of operation, of the stream kind and of no
+  protocol besides. Such a pair is joined to its own other half and has no address.
+* For a **remote** operation, the family the kernel answers questions about this machine's own
+  addresses on, and only for that; and the internet families, and on those only a stream socket of
+  the protocol the port rules govern, because a stream socket of another protocol is one those
+  rules would say nothing about.
+
+Everything else is refused, listening included: a single local socket, a pair of the kind that
+carries a destination on every message, and every family this list does not name. A local socket
+with an address is the one a program reaches another program on this machine by name with, and a
+proxy on one — or a connection handed over one already made — would be a way past every port rule
+here.
+
+What that costs is what a C library asks over a local socket. Its name service cache and a
+resolver's own interface are each reached that way, and each is a step a C library falls back from:
+to the files, and to the resolver itself over TCP, which the child is told to use
+(`RES_OPTIONS=use-vc`) and for which the port a resolver answers on is added to the rules, on any
+address, because which machine answers a name is not this service's to decide. **A host whose name
+service has no fallback to the resolver, or whose resolver will not take that instruction, cannot
+turn a name into an address inside this boundary**, and the operation fails saying so. A credential
+broker that would reach an agent or a secret service over a local socket cannot do so either; the
+brokers this service supports read what they need from their own configuration, and the child is
+given no address for an agent in any case.
 
 **An invocation's temporary directory is this service's mark, not its birth certificate.** Neither
 macOS nor Linux offers a call that creates a directory and hands back the object it created, so
 creating one and opening it are two acts and nothing can prove the object that opened is the object
 that was made. What this service does instead: the name goes into a record of its own *before*
 anything of that name is created; the directory is made through the handle this service holds on the
-directory above it, under a name of thirty-two random characters; a second such name is written
-inside it as a mark; and the directory is then opened and required to hold that mark and nothing
-else and to be one object across two opens. What that establishes is that the directory the
-invocation gets is one object carrying this service's own mark — not that this service created it,
-because a directory put at the name before the mark was written would be marked as readily. The
-directory they are all made in is the service's own, open to the account the service runs as and to
-nobody else, so putting anything at a name in there is already that account's own doing.
+directory above it, under a name of thirty-two random characters; a *second empty directory* of
+another such name is created inside it as a mark, which fails outright if anything is at that name
+already; and the outer directory is then opened and required to hold that mark and nothing else and
+to be one object across two opens. What that establishes is that the directory the invocation gets
+is one object carrying this service's own mark — not that this service created it, because a
+directory put at the name before the mark was made would be marked as readily. The directory they
+are all made in is the service's own, open to the account the service runs as and to nobody else,
+so putting anything at a name in there is already that account's own doing.
 
-**Nothing in there is removed that this service has no record of making, and nothing is removed by
-descending.** When an invocation ends, and again when the service starts and sweeps what a daemon
-that died mid-invocation left, the name is opened, the object is required to be the one the record
-names, the directory is required to hold this service's own mark and nothing besides, the mark is
-required to be the object the record names as well, and only then is the mark taken out and the
-directory removed. A directory holding what Git left behind, a directory that is no longer the
-object the record names, a mark that is not the file this service made, and a directory this service
-never recorded making are all left where they are, each with a line saying which and why. What was
-left stays in the record, so the next start tries again rather than forgetting it. A record this
-service cannot read takes nothing away at all.
+**Nothing in there is removed that this service has no record of making, nothing is removed by
+descending, and nothing that holds what anybody wrote is removed at all.** When an invocation ends,
+and again when the service starts and sweeps what a daemon that died mid-invocation left, the name
+is opened, the object is required to be the one the record names, it is required to hold this
+service's own mark and nothing besides, the mark is required to be the object the record names as
+well, and only then is the mark taken away and the directory after it. Both of those removals are
+the kind that takes only an empty directory, so this path cannot destroy a single byte anybody
+wrote: a name holding a file, or a directory with something in it, fails the removal instead. A
+directory holding what Git left behind, a directory that is no longer the object the record names, a
+mark that is not the object this service made, a file where a mark should be, and a directory this
+service never recorded making are all left where they are, each with a line saying which and why.
+What was left stays in the record, so the next start tries again rather than forgetting it. A record
+this service cannot read takes nothing away at all.
 
-One act in that is still by name: removing the directory itself. Neither platform removes a
-directory that an open handle names, so an empty directory a same-account writer puts at that name
-in the instant between the check and the removal is one this service would remove. It cannot remove
-anything that is not empty.
+Two acts in that are still by name: taking away the mark, and taking away the directory. Neither
+platform removes a directory that an open handle names, so an empty directory a same-account writer
+puts at one of those names in the instant between the check and the removal is one this service
+would remove. That is the whole of what this can cost, because neither removal takes anything that
+is not an empty directory.
 
 **The port list would not be enforced on Windows.** An application container's capability permits
 reaching the network or nothing at all; bounding which ports it reaches needs a system-wide filtering
