@@ -478,6 +478,12 @@ impl TerminalEngine {
         viewport
     }
 
+    /// The stable identifier of the live screen's first row.
+    #[must_use]
+    pub fn live_top_row(&self) -> i64 {
+        self.engine.grid().visible_top_row()
+    }
+
     /// The stable row an anchor names right now.
     fn resolve(&self, anchor: ViewportAnchor) -> i64 {
         let live = self.engine.grid().visible_top_row();
@@ -555,11 +561,14 @@ impl TerminalEngine {
                 viewport.top_row,
                 viewport.rows as usize,
             );
-            crate::snapshot::install(&snapshot, viewport, reason, degraded, budget, scope, &rows)?
+            crate::snapshot::install(
+                &snapshot, viewport, live, reason, degraded, budget, scope, &rows,
+            )?
         } else {
             crate::snapshot::install(
                 &snapshot,
                 viewport,
+                live,
                 reason,
                 degraded,
                 budget,
@@ -598,9 +607,9 @@ impl TerminalEngine {
                 viewport.top_row,
                 viewport.rows as usize,
             );
-            return crate::snapshot::minimum_install(&state, viewport, scope, &rows);
+            return crate::snapshot::minimum_install(&state, viewport, live, scope, &rows);
         }
-        crate::snapshot::minimum_install(&state, viewport, scope, &self.engine)
+        crate::snapshot::minimum_install(&state, viewport, live, scope, &self.engine)
     }
 
     /// Builds what one client is owed, given the screen it already holds.
@@ -618,6 +627,7 @@ impl TerminalEngine {
         scope: crate::render::Scope,
     ) -> Result<crate::snapshot::Owed> {
         let viewport = self.anchored_viewport(window);
+        let live = self.engine.grid().visible_top_row();
         // A window above the live page does not move on its own: the rows it holds keep their
         // identifiers however much the application writes. The one thing that moves it is the
         // session giving up the oldest rows it was holding, and the client cannot be sent those
@@ -626,6 +636,19 @@ impl TerminalEngine {
         if window.anchor.is_history() && viewport != held.viewport {
             return Ok(crate::snapshot::Owed::Snapshot(
                 ProjectionResetReason::HistoryEvicted,
+            ));
+        }
+        // A window above the live page can still reach *into* it, and a row that changed and then
+        // scrolled out of the live screen is a row no update can carry: an update names the rows
+        // the live screen holds now. Such a window is drawn again rather than advanced, so what it
+        // shows is what the session retained rather than what the screen held before the scroll. A
+        // window entirely above the live page shows only retained rows, whose identifiers and
+        // content a scroll does not touch, so it is advanced like any other.
+        let reaches_the_live_page = viewport.top_row.saturating_add(i64::from(viewport.rows))
+            > live.min(held.screen_top_row);
+        if window.anchor.is_history() && reaches_the_live_page && live != held.screen_top_row {
+            return Ok(crate::snapshot::Owed::Snapshot(
+                ProjectionResetReason::Repaint,
             ));
         }
         let Ok(delta) = self.engine.delta(held.base.cursor, held.base.generation) else {
@@ -640,6 +663,7 @@ impl TerminalEngine {
             &delta,
             self.active_buffer(),
             viewport,
+            live,
             oldest,
             oldest > 0,
             self.resident_state_truncated(),
@@ -1142,6 +1166,7 @@ mod projection_tests {
             &delta,
             kr_term::snapshot::ActiveBuffer::Alternate,
             window,
+            window.top_row,
             0,
             false,
             false,
@@ -1417,6 +1442,7 @@ mod projection_tests {
         let held = Held {
             base: update.base,
             viewport: engine.anchored_viewport(Window::live(dimensions(40, 10))),
+            screen_top_row: engine.live_top_row(),
         };
         // One batch later the client can still be continued from.
         let mut cursor = engine.output_cursor();
@@ -1531,6 +1557,7 @@ mod projection_tests {
         let held = Held {
             base: update.base,
             viewport: engine.anchored_viewport(Window::live(dimensions(40, 10))),
+            screen_top_row: engine.live_top_row(),
         };
         assert_eq!(
             engine
@@ -1565,6 +1592,7 @@ mod projection_tests {
                 generation: update.base.generation.saturating_sub(1),
             },
             viewport: engine.anchored_viewport(Window::live(dimensions(40, 10))),
+            screen_top_row: engine.live_top_row(),
         };
         assert_eq!(
             engine

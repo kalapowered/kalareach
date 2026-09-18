@@ -127,6 +127,10 @@ impl Attachment {
                 if carryable
                     && self.restoration_continues
                     && !self.forwarding_held
+                    // A window above the live page is not the live byte stream, whatever this
+                    // terminal's size is: what it shows is rows the session retained, which no
+                    // stream of what the application is writing now can produce.
+                    && self.history_top_row.is_none()
                     && own == geometry
                     && self
                         .terminal_profile_id

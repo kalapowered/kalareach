@@ -144,6 +144,30 @@ impl ProjectedDisplay {
         self.projection.screen().is_some()
     }
 
+    /// Whether the buffer this terminal is showing is the one with a history above it.
+    ///
+    /// The shell's buffer keeps a scrollback; a full-screen application's does not, and its keys
+    /// are its own. A terminal holding no screen at all answers true, because the session it is
+    /// about to be shown starts on the shell's buffer.
+    #[must_use]
+    pub fn showing_history_buffer(&self) -> bool {
+        self.projection.screen().is_none_or(|screen| {
+            screen.active_buffer == kr_protocol::projection::ProjectedBuffer::Primary
+        })
+    }
+
+    /// The stable row the window this terminal is showing starts at.
+    ///
+    /// `None` until a whole screen has arrived. It is where the window actually is, which is not
+    /// always where this terminal last asked for: the session gives up its oldest rows, and a
+    /// window that was over them is moved to the oldest ones that survive.
+    #[must_use]
+    pub fn window_top_row(&self) -> Option<u64> {
+        self.projection
+            .screen()
+            .map(|screen| screen.viewport.top_row.get())
+    }
+
     /// Discards the screen, because the session has said this terminal's view is no longer it.
     ///
     /// Called when the command is told to resynchronise or cannot decode an update. Drawing what

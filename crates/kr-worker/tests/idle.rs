@@ -201,6 +201,7 @@ fn install_for(
         kr_worker::snapshot::Held {
             base: update.base,
             viewport: engine.anchored_viewport(kr_worker::projection::Window::live(window)),
+            screen_top_row: engine.live_top_row(),
         },
     );
 }

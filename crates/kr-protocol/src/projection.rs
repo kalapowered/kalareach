@@ -257,6 +257,13 @@ pub struct ProjectedCursor {
 pub struct ProjectedViewport {
     /// The stable identifier of the first row shown.
     pub top_row: U64,
+    /// The stable identifier of the live screen's first row.
+    ///
+    /// The two are the same for a window on the live screen and different for one above it. Both
+    /// are needed because they are the origins of two different things: the rows a client draws
+    /// are named by [`Self::top_row`], and the cursor's own row is a line of the live screen. A
+    /// client with only one of them would put the cursor on a line of its history.
+    pub screen_top_row: U64,
     /// How many rows are shown.
     pub rows: U64,
     /// The first canonical column shown, for a display narrower than the grid.

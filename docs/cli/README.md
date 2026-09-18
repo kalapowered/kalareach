@@ -107,8 +107,14 @@ the window this terminal is looking through and never reach the session. The com
 new position through `attachment.viewport`, the host installs the pages that cover it, and the
 input lease does not move — section 8 puts passive scrollback among the things that never seize it,
 so a terminal that may not type can still read what is above the live page. A step is one window
-less the line that joins the two pages. An unshifted Page Up is the application's, as it always
-was.
+less the line that joins the two pages, and several keys in one read move the window once, because
+a window is in one place.
+
+They are this terminal's keys only while the shell's buffer is showing. A full-screen application
+runs on a buffer that keeps no history and has its own use for those keys, so there they are the
+application's. Inside a bracketed paste nothing is a key at all: pasted text reaches the session
+byte for byte, whatever it happens to contain. An unshifted Page Up is the application's, as it
+always was, and a lone Escape is never held back waiting for a key that might follow it.
 
 A window stays where the person put it while the session goes on writing underneath. `--follow-live`
 brings it back to the live screen as soon as the session writes something, for a person who would

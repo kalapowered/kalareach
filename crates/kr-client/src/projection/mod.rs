@@ -643,6 +643,7 @@ mod tests {
             dimensions: Dimensions::new(4, 2),
             viewport: ProjectedViewport {
                 top_row: U64::ZERO,
+                screen_top_row: U64::ZERO,
                 rows: U64::new(2),
                 left_column: U64::ZERO,
                 columns: U64::new(4),
@@ -740,6 +741,7 @@ mod tests {
             buffer: ProjectedBuffer::Primary,
             viewport: ProjectedViewport {
                 top_row: U64::ZERO,
+                screen_top_row: U64::ZERO,
                 rows: U64::new(2),
                 left_column: U64::ZERO,
                 columns: U64::new(4),

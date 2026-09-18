@@ -174,9 +174,10 @@ pub const fn cursor(value: CursorState) -> ProjectedCursor {
 /// # Errors
 ///
 /// Returns an error when the top row's identifier is not a forward count.
-pub fn viewport(value: Viewport) -> Result<ProjectedViewport> {
+pub fn viewport(value: Viewport, screen_top_row: i64) -> Result<ProjectedViewport> {
     Ok(ProjectedViewport {
         top_row: row_id(value.top_row)?,
+        screen_top_row: row_id(screen_top_row)?,
         rows: cells(value.rows),
         left_column: cells(value.left_col),
         columns: cells(value.cols),

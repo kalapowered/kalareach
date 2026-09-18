@@ -1083,6 +1083,20 @@ impl Session {
         let before = self.presentation_of_attachment(attachment_id);
         let before_dimensions = self.attachments.own_dimensions(attachment_id).flatten();
         let before_top_row = self.attachments.history_top_row(attachment_id);
+        // What this attachment's caller may be shown decides whether it may look above the live
+        // page at all. A caller narrowed to the live screen is served the screen that is showing
+        // and no retained content beyond it, and a window in the session's history is exactly that
+        // content: it is refused rather than quietly answered with the live screen, because a
+        // client told its window moved would draw as though it had.
+        if position.is_some()
+            && self.content_scope(attachment_id) == crate::render::Scope::LiveScreen
+        {
+            return Err(WorkerError::PresentationUnsupported {
+                detail: "this attachment is shown the live screen and no retained rows above it, \
+                         so its window cannot be placed in the session's history"
+                    .to_owned(),
+            });
+        }
         // Resolved against the session as it stands now: an offset above the live screen is a
         // place, and the row it names is what the attachment holds from here.
         let top_row = self.engine.resolve_position(position);
@@ -1949,6 +1963,7 @@ impl Session {
             viewport: self
                 .engine
                 .anchored_viewport(self.window_of(attachment_id, dimensions)),
+            screen_top_row: self.engine.live_top_row(),
         };
         for outgoing in update.events {
             let cursor = outgoing.event.cursor();

@@ -138,6 +138,12 @@ pub struct Held {
     pub base: Base,
     /// The window that base was built for.
     pub viewport: Viewport,
+    /// Where the live screen began when that base was built.
+    ///
+    /// A window above the live page can still reach into it, and a scroll moves rows out of the
+    /// screen an update can name. Holding the origin the base was built against is what lets the
+    /// next update tell a scroll from a change in place.
+    pub screen_top_row: i64,
 }
 
 /// What every projected attachment holds.
@@ -375,9 +381,17 @@ fn outgoing(event: ProjectionEvent) -> Outgoing {
 ///
 /// Returns an error when a row's stable identifier is not a forward count, which this engine
 /// cannot produce.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "an installation is the screen, the window it is drawn for, where the live screen \
+              begins, why it is being sent, whether the session has shortened anything, what the \
+              subscriber's queue holds, how much of the screen this client may see and where its \
+              rows come from; every one of those decides part of what arrives"
+)]
 pub fn install(
     snapshot: &Snapshot,
     viewport: Viewport,
+    screen_top_row: i64,
     reason: ProjectionResetReason,
     degraded: bool,
     budget: usize,
@@ -402,7 +416,7 @@ pub fn install(
                 u64::from(snapshot.dimensions.cols),
                 u64::from(snapshot.dimensions.rows),
             ),
-            viewport: wire::viewport(viewport)?,
+            viewport: wire::viewport(viewport, screen_top_row)?,
             cursor: wire::cursor(snapshot.cursor),
             saved_cursors: wire::saved_cursors_within(
                 &snapshot.saved_cursors,
@@ -630,6 +644,7 @@ pub fn install(
 pub fn minimum_install(
     snapshot: &Snapshot,
     viewport: Viewport,
+    screen_top_row: i64,
     scope: crate::render::Scope,
     rows: &impl RowSource,
 ) -> Result<usize> {
@@ -639,6 +654,7 @@ pub fn minimum_install(
     Ok(install(
         snapshot,
         viewport,
+        screen_top_row,
         ProjectionResetReason::longest(),
         true,
         0,
@@ -738,13 +754,15 @@ pub enum Owed {
 #[expect(
     clippy::too_many_arguments,
     reason = "a bounded update is the engine's change, the buffer it belongs to, the window it is \
-              drawn for, the retention that came with it, how much of it this client may see and \
-              what that client already holds; every one of those decides part of the answer"
+              drawn for, where the live screen begins, the retention that came with it, how much \
+              of it this client may see and what that client already holds; every one of those \
+              decides part of the answer"
 )]
 pub fn advance(
     delta: &Delta,
     buffer: ActiveBuffer,
     viewport: Viewport,
+    screen_top_row: i64,
     oldest_retained_row: i64,
     evicted: bool,
     degraded: bool,
@@ -770,7 +788,7 @@ pub fn advance(
         next_cursor: U64::new(delta.next_cursor),
         projection_generation: U64::new(generation),
         buffer: wire::buffer(buffer),
-        viewport: wire::viewport(viewport)?,
+        viewport: wire::viewport(viewport, screen_top_row)?,
         rows,
         cursor: wire::cursor(delta.cursor),
         modes: delta.modes.iter().map(|entry| wire::mode(*entry)).collect(),
@@ -1104,6 +1122,7 @@ mod tests {
                     generation: 4,
                 },
                 viewport: window,
+                screen_top_row: window.top_row,
             },
         );
         assert_eq!(
@@ -1179,6 +1198,7 @@ mod tests {
                 &delta,
                 ActiveBuffer::Primary,
                 window,
+                window.top_row,
                 0,
                 false,
                 false,
@@ -1239,6 +1259,7 @@ mod tests {
                 &delta,
                 ActiveBuffer::Primary,
                 window,
+                window.top_row,
                 0,
                 false,
                 false,

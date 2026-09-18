@@ -10473,6 +10473,10 @@
           "$ref": "#/$defs/U64",
           "description": "How many rows are shown."
         },
+        "screen_top_row": {
+          "$ref": "#/$defs/U64",
+          "description": "The stable identifier of the live screen's first row.\n\nThe two are the same for a window on the live screen and different for one above it. Both\nare needed because they are the origins of two different things: the rows a client draws\nare named by [`Self::top_row`], and the cursor's own row is a line of the live screen. A\nclient with only one of them would put the cursor on a line of its history."
+        },
         "top_row": {
           "$ref": "#/$defs/U64",
           "description": "The stable identifier of the first row shown."
@@ -10480,6 +10484,7 @@
       },
       "required": [
         "top_row",
+        "screen_top_row",
         "rows",
         "left_column",
         "columns"

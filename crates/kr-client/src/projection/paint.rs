@@ -851,14 +851,17 @@ impl<'a> Writer<'a> {
         let column = cursor.column.get();
         let left = self.window.left_column;
         let right = left.saturating_add(u64::from(self.window.columns));
-        // The cursor's row is a line of the session's screen, and the window says which canonical
+        // The cursor's row is a line of the *live screen*, and the window says which canonical
         // rows it shows. Going through the window's own mapping is what keeps the cursor on the
         // right line when the window is panned: taking the screen line as a destination line would
-        // put it one line out for every row the window has scrolled past.
+        // put it one line out for every row the window has scrolled past. The two origins are
+        // different for a window above the live page, which is why the screen's own first row
+        // travels with the window: adding the cursor's line to the window's top row would put the
+        // cursor on a line of somebody's history.
         let stable = self
             .screen
             .viewport
-            .top_row
+            .screen_top_row
             .get()
             .saturating_add(cursor.row.get());
         let Some(line) = self.window.line_of(stable) else {
@@ -1609,8 +1612,17 @@ mod fixtures {
 
     fn screen_of(case: &serde_json::Value) -> (Screen, Window) {
         let window = &case["window"];
+        let top_row = window["top_row"].as_u64().expect("a top row");
         let viewport = ProjectedViewport {
-            top_row: U64::new(window["top_row"].as_u64().expect("a top row")),
+            top_row: U64::new(top_row),
+            // A fixture window is on the live screen unless it says otherwise, which is what a
+            // window that names no separate screen origin means.
+            screen_top_row: U64::new(
+                window
+                    .get("screen_top_row")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(top_row),
+            ),
             rows: U64::new(window["rows"].as_u64().expect("rows")),
             left_column: U64::new(window["left_column"].as_u64().expect("a left column")),
             columns: U64::new(window["columns"].as_u64().expect("columns")),
@@ -2356,6 +2368,7 @@ mod safety {
             dimensions: kr_protocol::session::Dimensions::new(20, 1),
             viewport: ProjectedViewport {
                 top_row: U64::ZERO,
+                screen_top_row: U64::ZERO,
                 rows: U64::new(1),
                 left_column: U64::ZERO,
                 columns: U64::new(20),

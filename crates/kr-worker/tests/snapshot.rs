@@ -1831,8 +1831,8 @@ async fn a_queue_too_small_for_any_screen_is_refused_when_it_is_asked_for() {
 
 /// Reports where one attachment's window is looking, and returns where the host put it.
 ///
-/// The same method a terminal reports its size through: section 23's method table is closed, and a
-/// window's position is part of what a viewport report is.
+/// The same method a terminal reports its size through: a window's position is part of what a
+/// viewport report is.
 async fn report_viewport(
     host: &Host,
     attached: &mut Attached,
@@ -2265,5 +2265,193 @@ async fn scrolling_back_does_not_seize_the_input_lease() {
     assert_eq!(
         after.epoch, held.epoch,
         "and its epoch did not move, so nothing was taken over"
+    );
+}
+
+/// Reports a window position and returns the answer, refusal and all.
+async fn try_viewport(
+    host: &Host,
+    attached: &mut Attached,
+    dimensions: Dimensions,
+    position: Option<kr_protocol::attachment::ViewportPosition>,
+) -> std::result::Result<
+    kr_protocol::attachment::AttachmentViewportResult,
+    kr_protocol::error::ProtocolError,
+> {
+    attached
+        .client
+        .mutate(
+            Method::AttachmentViewport,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(host),
+            &kr_protocol::attachment::AttachmentViewportParams {
+                attachment_id: attached.attachment_id,
+                dimensions,
+                position: Nullable(position),
+            },
+        )
+        .await
+        .expect("the call reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+}
+
+/// Section 10's live-screen exception: a narrowed attachment is not shown retained rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attachment_shown_only_the_live_screen_cannot_look_above_it() {
+    let host = host_with(
+        &numbered(300),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let _ = collect_until_installed(&mut watcher.client, Duration::from_secs(5)).await;
+    // The same narrowing a forwarded caller is given: the screen that is showing, and no retained
+    // content beyond it.
+    host.runtime
+        .session()
+        .narrow_content(watcher.attachment_id, kr_worker::render::Scope::LiveScreen);
+
+    let refusal = try_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(40),
+        )),
+    )
+    .await
+    .expect_err("a narrowed attachment cannot place its window in the history");
+    assert_eq!(
+        refusal.code,
+        kr_protocol::error::ErrorCode::UnsupportedCapability,
+        "the refusal is about what this attachment may be shown: {refusal}"
+    );
+    assert!(
+        refusal.message.contains("retained rows"),
+        "and it says so: {refusal}"
+    );
+
+    // The live screen is still its own: a report with no position changes nothing and is answered.
+    let answer = try_viewport(&host, &mut watcher, window, None)
+        .await
+        .expect("the live screen is what this attachment is shown");
+    assert!(answer.position.0.is_none());
+}
+
+/// A window above the live page is not the live byte stream, whatever this terminal's size is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_terminal_reading_its_history_is_served_the_grid_rather_than_the_stream() {
+    let host = host_with(
+        &numbered(300),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // The session's own size and a qualified profile: this terminal takes the stream directly.
+    let canonical = Dimensions::new(CANONICAL.0, CANONICAL.1);
+    let mut direct = attach(&host, canonical, Some("xterm-256color")).await;
+    assert_eq!(
+        direct.presentation,
+        Some(TerminalPresentationMode::Direct),
+        "a terminal of the session's size takes the stream"
+    );
+
+    let answer = report_viewport(
+        &host,
+        &mut direct,
+        canonical,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(50),
+        )),
+    )
+    .await;
+    assert!(
+        matches!(
+            answer.position.0,
+            Some(kr_protocol::attachment::ViewportPosition::Row(_))
+        ),
+        "the window is above the live page: {:?}",
+        answer.position.0
+    );
+    assert_eq!(
+        answer.presentation,
+        TerminalPresentationMode::Viewport,
+        "and a terminal reading its history is drawn the canonical grid, because the session's own \
+         bytes cannot produce rows that have scrolled off it"
+    );
+
+    // And back: the live screen is the stream again.
+    let back = report_viewport(&host, &mut direct, canonical, None).await;
+    assert!(back.position.0.is_none());
+    assert_eq!(
+        back.presentation,
+        TerminalPresentationMode::Direct,
+        "a window on the live screen takes the stream once more"
+    );
+}
+
+/// The cursor's row is a line of the live screen, and a window above it says where that begins.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_above_the_live_page_says_where_the_live_screen_begins() {
+    let host = host_with(
+        &numbered(300),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let live = collect_until_installed(&mut watcher.client, Duration::from_secs(5)).await;
+    let installed = live
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            Event::Snapshot(header) => Some(header.viewport),
+            _ => None,
+        })
+        .expect("a snapshot");
+    assert_eq!(
+        installed.screen_top_row, installed.top_row,
+        "a window on the live screen has one origin"
+    );
+
+    let answer = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(60),
+        )),
+    )
+    .await;
+    let landed = match answer.position.0 {
+        Some(kr_protocol::attachment::ViewportPosition::Row(row)) => row.get(),
+        other => panic!("a window above the live page lands on a row: {other:?}"),
+    };
+    let history = collect_until_installed(&mut watcher.client, Duration::from_secs(5)).await;
+    let parked = history
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            Event::Snapshot(header) => Some(header.viewport),
+            _ => None,
+        })
+        .expect("a snapshot");
+    assert_eq!(parked.top_row.get(), landed, "the window is where it asked");
+    assert_eq!(
+        parked.screen_top_row.get(),
+        landed + 60,
+        "and the live screen still begins where it did, sixty rows below"
     );
 }

@@ -603,7 +603,8 @@ A client reads its scrollback through the report it already makes about its wind
 viewport` carries a `position` beside the physical dimensions: `{"row": …}`, a stable identifier
 from the pages the client holds, or `{"above": …}`, how many rows above the live screen's first row
 the window starts. No position at all is the live screen, which is where every attachment starts.
-There is no history method; section 23's table is closed.
+The retained rows of a terminal come this way, through the window that shows them, rather than
+through a request for rows on their own.
 
 An `above` distance is resolved once, against the live screen as it stands at the moment of the
 report, and the answer says which row the window landed on. That is what a client keeps: a distance
@@ -624,9 +625,34 @@ it is the session giving up rows below it, and that installs the window again wi
 `history_evicted` as the reason rather than sending an update naming rows the client has dropped.
 
 Live output goes on arriving the whole time. A client parked in its history is still sent every
-bounded update, and what it draws is its own decision. Moving the window is not input: section 8
-puts passive scrollback with focus events and terminal replies among the things that never seize
-the input lease, and nothing on this path touches it.
+bounded update, and what it draws is its own decision. What its pages carry is the window: rows
+outside it are not maintained while the window is elsewhere, and every move of the window installs
+the rows it now covers, so a client never draws a row it was not sent for where it is looking.
+
+Two origins travel with every window, because two different things are measured from them. The
+rows a client draws are named by the window's own first row; the cursor's row is a line of the
+*live* screen. A window above the live page has those two apart, so the viewport carries the live
+screen's first row as well and a client places the cursor against that. Without it a cursor would
+land on a line of somebody's history.
+
+A window above the live page can still reach into it, and a row that changed and then scrolled out
+of the live screen is a row no bounded update can carry: an update names the rows the screen holds
+now. Such a window is drawn again rather than advanced. A window entirely above the live page shows
+only retained rows, whose identifiers and content a scroll does not touch, so it is advanced like
+any other.
+
+A window above the live page is not the live byte stream, whatever this terminal's size is. An
+equal-size terminal that was being handed the session's own bytes is therefore served the canonical
+grid while it is reading its history, and returns to the byte stream — at a parser-ground boundary,
+like every other transition into forwarding — when its window comes back to the live screen.
+
+An attachment that is shown the live screen and no retained content beyond it cannot place its
+window in the history at all. That is section 10's live-screen exception: the rows above the screen
+are content the exception never reached, so the report is refused rather than quietly answered with
+the live screen, which would leave the client drawing as though it had moved.
+
+Moving the window is not input: section 8 puts passive scrollback with focus events and terminal
+replies among the things that never seize the input lease, and nothing on this path touches it.
 
 Ordinary output is one delta per batch, and never a repaint. A row larger than a page bound is cut
 and marked truncated rather than dropped, so a reader can get past it, and the marker is what makes
