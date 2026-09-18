@@ -125,7 +125,13 @@ async fn host_with(
             .expect("the palette is chosen before the session produces anything");
     }
     session.launch().expect("launches the shell");
-    let runtime = Arc::new(SessionRuntime::start(session).expect("starts the runtime"));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts the runtime"),
+    );
 
     let endpoint = environment
         .worker_endpoint(DisplayNumber::new(1))

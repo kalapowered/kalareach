@@ -754,6 +754,10 @@ export type PairStatus =
       }
     }
 /**
+ * How an isolated workspace is separated from the user's own tree.
+ */
+export type IsolationMechanism = 'git_worktree' | 'independent_clone'
+/**
  * Every body a signed push method carries.
  *
  * One type, so there is one rule for what a service-request signature covers: the signature's
@@ -1120,6 +1124,7 @@ export interface KalaReachProtocol {
     workflow_run_id?: WorkflowRunId
     workspace_id?: WorkspaceId
   }
+  inclusion_preview?: InclusionPreview
   input_acquire_params?: InputAcquireParams
   input_acquire_result?: InputAcquireResult
   input_interrupt_params?: InputInterruptParams
@@ -1135,6 +1140,7 @@ export interface KalaReachProtocol {
   method_entry?: MethodEntry
   mutation_request?: MutationRequest
   notification?: Notification
+  operation_record?: OperationRecord
   organisation_policy?: OrganisationPolicy
   output_event?: OutputEvent
   owner_confirmation_proof?: OwnerConfirmationProof
@@ -1146,6 +1152,20 @@ export interface KalaReachProtocol {
   pair_status_params?: PairStatusParams
   pair_status_result?: PairStatusResult
   policy_authority?: PolicyAuthority
+  preview_entry?: PreviewEntry
+  project_adopt_params?: ProjectAdoptParams
+  project_adopt_result?: ProjectAdoptResult
+  project_clone_params?: ProjectCloneParams
+  project_clone_result?: ProjectCloneResult
+  project_init_params?: ProjectInitParams
+  project_init_result?: ProjectInitResult
+  project_list_params?: ProjectListParams
+  project_list_result?: ProjectListResult
+  project_operation_cancel_params?: ProjectOperationCancelParams
+  project_operation_cancel_result?: ProjectOperationCancelResult
+  project_read_params?: ProjectReadParams
+  project_read_result?: ProjectReadResult
+  project_summary?: ProjectSummary3
   projection_delta?: ProjectionDelta
   projection_reset?: ProjectionReset
   projection_row_page?: ProjectionRowPage
@@ -1248,6 +1268,15 @@ export interface KalaReachProtocol {
   worker_rendezvous?: WorkerRendezvous
   worker_verify_challenge?: WorkerVerifyChallenge
   worker_verify_proof?: WorkerVerifyProof
+  workspace_create_params?: WorkspaceCreateParams
+  workspace_create_result?: WorkspaceCreateResult
+  workspace_list_params?: WorkspaceListParams
+  workspace_list_result?: WorkspaceListResult
+  workspace_read_params?: WorkspaceReadParams
+  workspace_read_result?: WorkspaceReadResult
+  workspace_remove_params?: WorkspaceRemoveParams
+  workspace_remove_result?: WorkspaceRemoveResult
+  workspace_summary?: WorkspaceSummary
 }
 /**
  * What `action.cancel` names.
@@ -5083,6 +5112,150 @@ export interface ProtocolVersion4 {
   minor: number
 }
 /**
+ * What a reviewer would see, before the workspace exists.
+ *
+ * Section 14 requires the create interface to preview what will be included. This is that
+ * preview as data: exact counts per class, a bounded sample of paths, and the base the
+ * materialisation would start from. It is a read, so it creates nothing and changes nothing.
+ */
+export interface InclusionPreview {
+  /**
+   * The change-set version an isolated workspace would materialise, when it names one.
+   */
+  base_change_set_id: ChangeSetId | null
+  /**
+   * The reference that revision was named by, when it was named by one.
+   */
+  base_reference: string | null
+  /**
+   * The revision an isolated workspace would start from, as the repository resolved it.
+   */
+  base_revision: string
+  /**
+   * One row per class, with exact counts.
+   */
+  counts: PreviewCount[]
+  /**
+   * True when every count above is the whole of its class.
+   *
+   * False when a bound was reached: an ignored directory deeper or larger than the walk
+   * covers, or a directory this host could not list. Then each count is a lower bound and the
+   * limitations say which bound was reached.
+   */
+  counts_complete: boolean
+  /**
+   * A bounded sample of the paths, grouped by class in [`InclusionClass::EVERY`] order.
+   */
+  entries: PreviewEntry[]
+  /**
+   * The kind of workspace it was taken for.
+   */
+  kind: 'shared_existing' | 'isolated'
+  /**
+   * What this preview cannot promise, in the host's own words.
+   *
+   * A shared workspace is not a sandbox; a worktree shares repository metadata; a working tree
+   * can change between the preview and the creation. A client shows this rather than deciding
+   * for the user.
+   */
+  limitations: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted_entries: string
+  policy: InclusionPolicy
+  /**
+   * The repository the preview was taken on.
+   */
+  project_repository_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  taken_at_ms: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  unknown_content: string
+}
+/**
+ * One class's counts in a preview.
+ */
+export interface PreviewCount {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  byte_len: string
+  /**
+   * The class.
+   */
+  class: 'dirty_file' | 'untracked_file' | 'submodule' | 'binary_file' | 'generated_artefact'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  included: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  total: string
+}
+/**
+ * One path an inclusion preview names.
+ */
+export interface PreviewEntry {
+  /**
+   * Its size in bytes, when the host could read one.
+   */
+  byte_len: U64 | null
+  /**
+   * What change the working tree holds for it.
+   */
+  change: 'present' | 'deleted' | 'unmerged'
+  /**
+   * Which class it belongs to: where in the working tree it came from.
+   */
+  class: 'dirty_file' | 'untracked_file' | 'submodule' | 'binary_file' | 'generated_artefact'
+  /**
+   * What its content is.
+   *
+   * This cuts across the other classes rather than replacing them: a dirty file may be binary,
+   * and a policy that includes dirty files and excludes binaries leaves this one out.
+   */
+  content: 'text' | 'binary' | 'unknown'
+  /**
+   * Whether the policy in force would copy it into the new workspace.
+   */
+  included: boolean
+  /**
+   * The path, relative to the repository's top level.
+   */
+  path: string
+}
+/**
+ * The policy it was taken under.
+ */
+export interface InclusionPolicy {
+  /**
+   * Files whose content Git reports as binary.
+   */
+  binary_files: 'include' | 'exclude'
+  /**
+   * Tracked files with uncommitted modifications.
+   */
+  dirty_files: 'include' | 'exclude'
+  /**
+   * Files an ignore rule covers, which is what a build usually produces.
+   */
+  generated_artefacts: 'include' | 'exclude'
+  /**
+   * Submodule working trees.
+   */
+  submodules: 'include' | 'exclude'
+  /**
+   * Files Git does not track and does not ignore.
+   */
+  untracked_files: 'include' | 'exclude'
+}
+/**
  * Parameters of `input.acquire`.
  */
 export interface InputAcquireParams {
@@ -5637,6 +5810,90 @@ export interface RequiredRight {
     | 'issuing_owner'
 }
 /**
+ * One repository operation, as a read or a cancellation returns it.
+ */
+export interface OperationRecord {
+  /**
+   * One submitted intent and its receipt, generated as a UUIDv4.
+   */
+  action_id: string
+  /**
+   * The destination's state when the operation was admitted.
+   */
+  destination_state: 'absent' | 'empty_directory' | 'non_empty_directory' | 'occupied'
+  /**
+   * Why it ended, when it ended for a reason.
+   */
+  detail: string | null
+  /**
+   * When it ended, once it has.
+   */
+  ended_at_ms: TimestampMs | null
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * Which method started it.
+   */
+  method: string
+  /**
+   * The repository it creates, allocated when the operation begins.
+   */
+  project_repository_id: string
+  /**
+   * The remote it reaches, when it reaches one.
+   */
+  remote: RemoteSpecification | null
+  /**
+   * The staging paths this host removed.
+   */
+  removed_staging_paths: string[]
+  /**
+   * The staging paths that still exist, for a person to find.
+   */
+  retained_staging_paths: string[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at_ms: string
+  /**
+   * What state it is in.
+   */
+  state: 'staging' | 'publishing' | 'completed' | 'cancelled' | 'failed' | 'expired' | 'unknown'
+}
+/**
+ * A remote a repository operation reaches, and who authenticates it.
+ *
+ * The URL is here; a credential is not, and there is no field one could travel in. What the host
+ * records and what a diagnostic shows is this object, so a credential cannot leak through either.
+ */
+export interface RemoteSpecification {
+  /**
+   * The approved credential broker that authenticates it, when the transport needs one.
+   *
+   * Empty for a transport that needs no credential. A named broker is one the host has, and a
+   * name it does not have is refused before anything is executed.
+   */
+  credential_broker: string
+  /**
+   * The provider that serves it, as the host resolved it from the host name.
+   */
+  provider: string
+  /**
+   * The remote's name inside the repository, conventionally `origin`.
+   */
+  remote_name: string
+  /**
+   * The validated transport.
+   */
+  transport: 'https' | 'ssh' | 'local_path'
+  /**
+   * The URL, with no user information and no credential.
+   */
+  url: string
+}
+/**
  * One organisation's host policy, signed by its policy-signing key.
  *
  * A host that pinned the organisation's policy-signing authority follows the chain to the revision
@@ -6092,6 +6349,800 @@ export interface PolicyAuthorityHeadPayload {
    * The organisation this statement belongs to.
    */
   organisation_id: string
+}
+/**
+ * Parameters of `project.adopt`.
+ */
+export interface ProjectAdoptParams {
+  destination: DestinationRequest
+  /**
+   * The flow the user explicitly chose.
+   *
+   * There is no default. A destination that already exists is refused unless this names a flow,
+   * which is what section 14 requires.
+   */
+  flow: 'existing_checkout'
+  /**
+   * The label the user gave it.
+   */
+  label: string
+}
+/**
+ * The checkout to adopt, named the same way a destination is.
+ */
+export interface DestinationRequest {
+  /**
+   * The environment the repository will belong to.
+   */
+  environment_id: string
+  /**
+   * The single name inside it. No separators, no traversal segment, no reserved device name.
+   */
+  name: string
+  /**
+   * The parent directory, as an absolute host path the caller chose.
+   */
+  parent_path: string
+}
+/**
+ * Result of `project.adopt`.
+ */
+export interface ProjectAdoptResult {
+  operation: OperationRecord1
+  project: ProjectSummary
+}
+/**
+ * The operation that registered it.
+ */
+export interface OperationRecord1 {
+  /**
+   * One submitted intent and its receipt, generated as a UUIDv4.
+   */
+  action_id: string
+  /**
+   * The destination's state when the operation was admitted.
+   */
+  destination_state: 'absent' | 'empty_directory' | 'non_empty_directory' | 'occupied'
+  /**
+   * Why it ended, when it ended for a reason.
+   */
+  detail: string | null
+  /**
+   * When it ended, once it has.
+   */
+  ended_at_ms: TimestampMs | null
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * Which method started it.
+   */
+  method: string
+  /**
+   * The repository it creates, allocated when the operation begins.
+   */
+  project_repository_id: string
+  /**
+   * The remote it reaches, when it reaches one.
+   */
+  remote: RemoteSpecification | null
+  /**
+   * The staging paths this host removed.
+   */
+  removed_staging_paths: string[]
+  /**
+   * The staging paths that still exist, for a person to find.
+   */
+  retained_staging_paths: string[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at_ms: string
+  /**
+   * What state it is in.
+   */
+  state: 'staging' | 'publishing' | 'completed' | 'cancelled' | 'failed' | 'expired' | 'unknown'
+}
+/**
+ * The repository that is now known here.
+ */
+export interface ProjectSummary {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The path it was created or adopted at, for a person to read.
+   *
+   * Diagnostics only. Re-resolving it would let a rename hand a grant to an unrelated tree,
+   * which is why every operation uses the recorded identity and an opened handle instead.
+   */
+  display_path: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  filesystem_identity: FilesystemIdentity
+  /**
+   * The label the user gave it.
+   */
+  label: string
+  /**
+   * How it came to be known here.
+   */
+  origin: 'initialised' | 'cloned' | 'adopted'
+  /**
+   * Its environment-local identity.
+   */
+  project_repository_id: string
+  /**
+   * The remote it was cloned from, when it has one.
+   */
+  remote: RemoteSpecification | null
+  /**
+   * What state the record is in.
+   */
+  state: 'ready' | 'creating' | 'detached'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  workspace_count: string
+}
+/**
+ * The stable filesystem identity of its Git directory.
+ */
+export interface FilesystemIdentity {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  device: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  file_id: string
+}
+/**
+ * Parameters of `project.clone`.
+ */
+export interface ProjectCloneParams {
+  destination: DestinationRequest1
+  /**
+   * The label the user gave it.
+   */
+  label: string
+  remote: RemoteSpecification1
+}
+/**
+ * Where the clone goes.
+ */
+export interface DestinationRequest1 {
+  /**
+   * The environment the repository will belong to.
+   */
+  environment_id: string
+  /**
+   * The single name inside it. No separators, no traversal segment, no reserved device name.
+   */
+  name: string
+  /**
+   * The parent directory, as an absolute host path the caller chose.
+   */
+  parent_path: string
+}
+/**
+ * A remote a repository operation reaches, and who authenticates it.
+ *
+ * The URL is here; a credential is not, and there is no field one could travel in. What the host
+ * records and what a diagnostic shows is this object, so a credential cannot leak through either.
+ */
+export interface RemoteSpecification1 {
+  /**
+   * The approved credential broker that authenticates it, when the transport needs one.
+   *
+   * Empty for a transport that needs no credential. A named broker is one the host has, and a
+   * name it does not have is refused before anything is executed.
+   */
+  credential_broker: string
+  /**
+   * The provider that serves it, as the host resolved it from the host name.
+   */
+  provider: string
+  /**
+   * The remote's name inside the repository, conventionally `origin`.
+   */
+  remote_name: string
+  /**
+   * The validated transport.
+   */
+  transport: 'https' | 'ssh' | 'local_path'
+  /**
+   * The URL, with no user information and no credential.
+   */
+  url: string
+}
+/**
+ * Result of `project.clone`.
+ */
+export interface ProjectCloneResult {
+  operation: OperationRecord2
+  project: ProjectSummary1
+}
+/**
+ * The operation that created it.
+ */
+export interface OperationRecord2 {
+  /**
+   * One submitted intent and its receipt, generated as a UUIDv4.
+   */
+  action_id: string
+  /**
+   * The destination's state when the operation was admitted.
+   */
+  destination_state: 'absent' | 'empty_directory' | 'non_empty_directory' | 'occupied'
+  /**
+   * Why it ended, when it ended for a reason.
+   */
+  detail: string | null
+  /**
+   * When it ended, once it has.
+   */
+  ended_at_ms: TimestampMs | null
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * Which method started it.
+   */
+  method: string
+  /**
+   * The repository it creates, allocated when the operation begins.
+   */
+  project_repository_id: string
+  /**
+   * The remote it reaches, when it reaches one.
+   */
+  remote: RemoteSpecification | null
+  /**
+   * The staging paths this host removed.
+   */
+  removed_staging_paths: string[]
+  /**
+   * The staging paths that still exist, for a person to find.
+   */
+  retained_staging_paths: string[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at_ms: string
+  /**
+   * What state it is in.
+   */
+  state: 'staging' | 'publishing' | 'completed' | 'cancelled' | 'failed' | 'expired' | 'unknown'
+}
+/**
+ * The repository that now exists.
+ */
+export interface ProjectSummary1 {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The path it was created or adopted at, for a person to read.
+   *
+   * Diagnostics only. Re-resolving it would let a rename hand a grant to an unrelated tree,
+   * which is why every operation uses the recorded identity and an opened handle instead.
+   */
+  display_path: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  filesystem_identity: FilesystemIdentity
+  /**
+   * The label the user gave it.
+   */
+  label: string
+  /**
+   * How it came to be known here.
+   */
+  origin: 'initialised' | 'cloned' | 'adopted'
+  /**
+   * Its environment-local identity.
+   */
+  project_repository_id: string
+  /**
+   * The remote it was cloned from, when it has one.
+   */
+  remote: RemoteSpecification | null
+  /**
+   * What state the record is in.
+   */
+  state: 'ready' | 'creating' | 'detached'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  workspace_count: string
+}
+/**
+ * Parameters of `project.init`.
+ */
+export interface ProjectInitParams {
+  destination: DestinationRequest2
+  /**
+   * The name of the initial branch, when the user chose one.
+   */
+  initial_branch: string | null
+  /**
+   * The label the user gave it.
+   */
+  label: string
+}
+/**
+ * Where the repository goes.
+ */
+export interface DestinationRequest2 {
+  /**
+   * The environment the repository will belong to.
+   */
+  environment_id: string
+  /**
+   * The single name inside it. No separators, no traversal segment, no reserved device name.
+   */
+  name: string
+  /**
+   * The parent directory, as an absolute host path the caller chose.
+   */
+  parent_path: string
+}
+/**
+ * Result of `project.init`.
+ */
+export interface ProjectInitResult {
+  operation: OperationRecord3
+  project: ProjectSummary2
+}
+/**
+ * The operation that created it.
+ */
+export interface OperationRecord3 {
+  /**
+   * One submitted intent and its receipt, generated as a UUIDv4.
+   */
+  action_id: string
+  /**
+   * The destination's state when the operation was admitted.
+   */
+  destination_state: 'absent' | 'empty_directory' | 'non_empty_directory' | 'occupied'
+  /**
+   * Why it ended, when it ended for a reason.
+   */
+  detail: string | null
+  /**
+   * When it ended, once it has.
+   */
+  ended_at_ms: TimestampMs | null
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * Which method started it.
+   */
+  method: string
+  /**
+   * The repository it creates, allocated when the operation begins.
+   */
+  project_repository_id: string
+  /**
+   * The remote it reaches, when it reaches one.
+   */
+  remote: RemoteSpecification | null
+  /**
+   * The staging paths this host removed.
+   */
+  removed_staging_paths: string[]
+  /**
+   * The staging paths that still exist, for a person to find.
+   */
+  retained_staging_paths: string[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at_ms: string
+  /**
+   * What state it is in.
+   */
+  state: 'staging' | 'publishing' | 'completed' | 'cancelled' | 'failed' | 'expired' | 'unknown'
+}
+/**
+ * The repository that now exists.
+ */
+export interface ProjectSummary2 {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The path it was created or adopted at, for a person to read.
+   *
+   * Diagnostics only. Re-resolving it would let a rename hand a grant to an unrelated tree,
+   * which is why every operation uses the recorded identity and an opened handle instead.
+   */
+  display_path: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  filesystem_identity: FilesystemIdentity
+  /**
+   * The label the user gave it.
+   */
+  label: string
+  /**
+   * How it came to be known here.
+   */
+  origin: 'initialised' | 'cloned' | 'adopted'
+  /**
+   * Its environment-local identity.
+   */
+  project_repository_id: string
+  /**
+   * The remote it was cloned from, when it has one.
+   */
+  remote: RemoteSpecification | null
+  /**
+   * What state the record is in.
+   */
+  state: 'ready' | 'creating' | 'detached'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  workspace_count: string
+}
+/**
+ * Parameters of `project.list`.
+ */
+export interface ProjectListParams {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+}
+/**
+ * Result of `project.list`.
+ */
+export interface ProjectListResult {
+  /**
+   * The repositories, oldest first.
+   */
+  projects: ProjectSummary3[]
+}
+/**
+ * One repository, as a scoped read returns it.
+ */
+export interface ProjectSummary3 {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The path it was created or adopted at, for a person to read.
+   *
+   * Diagnostics only. Re-resolving it would let a rename hand a grant to an unrelated tree,
+   * which is why every operation uses the recorded identity and an opened handle instead.
+   */
+  display_path: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  filesystem_identity: FilesystemIdentity
+  /**
+   * The label the user gave it.
+   */
+  label: string
+  /**
+   * How it came to be known here.
+   */
+  origin: 'initialised' | 'cloned' | 'adopted'
+  /**
+   * Its environment-local identity.
+   */
+  project_repository_id: string
+  /**
+   * The remote it was cloned from, when it has one.
+   */
+  remote: RemoteSpecification | null
+  /**
+   * What state the record is in.
+   */
+  state: 'ready' | 'creating' | 'detached'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  workspace_count: string
+}
+/**
+ * Parameters of `project.operation.cancel`.
+ */
+export interface ProjectOperationCancelParams {
+  /**
+   * One submitted intent and its receipt, generated as a UUIDv4.
+   */
+  operation_action_id: string
+}
+/**
+ * Result of `project.operation.cancel`.
+ */
+export interface ProjectOperationCancelResult {
+  operation: OperationRecord4
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  stopped_processes: string
+}
+/**
+ * The operation, with its retained and removed staging paths.
+ */
+export interface OperationRecord4 {
+  /**
+   * One submitted intent and its receipt, generated as a UUIDv4.
+   */
+  action_id: string
+  /**
+   * The destination's state when the operation was admitted.
+   */
+  destination_state: 'absent' | 'empty_directory' | 'non_empty_directory' | 'occupied'
+  /**
+   * Why it ended, when it ended for a reason.
+   */
+  detail: string | null
+  /**
+   * When it ended, once it has.
+   */
+  ended_at_ms: TimestampMs | null
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * Which method started it.
+   */
+  method: string
+  /**
+   * The repository it creates, allocated when the operation begins.
+   */
+  project_repository_id: string
+  /**
+   * The remote it reaches, when it reaches one.
+   */
+  remote: RemoteSpecification | null
+  /**
+   * The staging paths this host removed.
+   */
+  removed_staging_paths: string[]
+  /**
+   * The staging paths that still exist, for a person to find.
+   */
+  retained_staging_paths: string[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at_ms: string
+  /**
+   * What state it is in.
+   */
+  state: 'staging' | 'publishing' | 'completed' | 'cancelled' | 'failed' | 'expired' | 'unknown'
+}
+/**
+ * Parameters of `project.read`.
+ */
+export interface ProjectReadParams {
+  /**
+   * The repository to read.
+   */
+  project_repository_id: string
+}
+/**
+ * Result of `project.read`.
+ */
+export interface ProjectReadResult {
+  /**
+   * The operation that created it, when this host still has the record.
+   */
+  operation: OperationRecord | null
+  project: ProjectSummary4
+  /**
+   * Its workspaces.
+   */
+  workspaces: WorkspaceSummary[]
+}
+/**
+ * One repository, as a scoped read returns it.
+ */
+export interface ProjectSummary4 {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The path it was created or adopted at, for a person to read.
+   *
+   * Diagnostics only. Re-resolving it would let a rename hand a grant to an unrelated tree,
+   * which is why every operation uses the recorded identity and an opened handle instead.
+   */
+  display_path: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  filesystem_identity: FilesystemIdentity
+  /**
+   * The label the user gave it.
+   */
+  label: string
+  /**
+   * How it came to be known here.
+   */
+  origin: 'initialised' | 'cloned' | 'adopted'
+  /**
+   * Its environment-local identity.
+   */
+  project_repository_id: string
+  /**
+   * The remote it was cloned from, when it has one.
+   */
+  remote: RemoteSpecification | null
+  /**
+   * What state the record is in.
+   */
+  state: 'ready' | 'creating' | 'detached'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  workspace_count: string
+}
+/**
+ * One workspace, as a scoped read returns it.
+ */
+export interface WorkspaceSummary {
+  /**
+   * The change-set version it materialised, when it named one.
+   */
+  base_change_set_id: ChangeSetId | null
+  /**
+   * The revision it started from.
+   */
+  base_revision: string
+  /**
+   * The automation runs bound to it that are still live.
+   *
+   * Section 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace
+   * between two sessions or after its last one ended, so it is recorded separately and refuses
+   * a removal in the same way.
+   */
+  bound_runs: WorkflowRunId[]
+  /**
+   * The sessions bound to it that are still live.
+   *
+   * A removal is refused while this is not empty, whatever retention policy it carries.
+   */
+  bound_sessions: SessionId[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * Why it is in the state it is in, when it ended up there for a reason.
+   */
+  detail: string | null
+  /**
+   * The path it was created at, for a person to read.
+   */
+  display_path: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The stable filesystem identity of its working tree, once this host has one.
+   *
+   * Absent while the workspace is being materialised, and absent afterwards only when the
+   * materialisation did not get as far as creating the tree. An absent identity is what refuses
+   * a removal: this host does not delete a directory it cannot prove it created.
+   */
+  filesystem_identity: FilesystemIdentity1 | null
+  /**
+   * How an isolated workspace is separated, when it is one.
+   */
+  isolation: IsolationMechanism | null
+  /**
+   * Which kind it is.
+   */
+  kind: 'shared_existing' | 'isolated'
+  /**
+   * The label the user gave it.
+   */
+  label: string
+  policy: InclusionPolicy1
+  /**
+   * The repository it is a working copy of.
+   */
+  project_repository_id: string
+  /**
+   * What it holds that a removal would have to account for.
+   */
+  retained: RetainedItem[]
+  /**
+   * What state it is in.
+   */
+  state: 'ready' | 'materialising' | 'removal_pending' | 'removed'
+  /**
+   * Its identity.
+   */
+  workspace_id: string
+}
+/**
+ * A repository's stable environment-local identity, as a client may show it.
+ *
+ * The two numbers are the device and the object number of the Git directory: the inode on Unix
+ * and the file index on Windows. They are metadata a client can display and compare; they are
+ * never an authority, because authority is the opened handle the host holds.
+ */
+export interface FilesystemIdentity1 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  device: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  file_id: string
+}
+/**
+ * The inclusion policy it was created under.
+ */
+export interface InclusionPolicy1 {
+  /**
+   * Files whose content Git reports as binary.
+   */
+  binary_files: 'include' | 'exclude'
+  /**
+   * Tracked files with uncommitted modifications.
+   */
+  dirty_files: 'include' | 'exclude'
+  /**
+   * Files an ignore rule covers, which is what a build usually produces.
+   */
+  generated_artefacts: 'include' | 'exclude'
+  /**
+   * Submodule working trees.
+   */
+  submodules: 'include' | 'exclude'
+  /**
+   * Files Git does not track and does not ignore.
+   */
+  untracked_files: 'include' | 'exclude'
+}
+/**
+ * One thing a workspace holds that its removal would have to account for.
+ */
+export interface RetainedItem {
+  /**
+   * The change set it belongs to, when it belongs to one.
+   */
+  change_set_id: ChangeSetId | null
+  /**
+   * What it is, in the host's own words.
+   */
+  detail: string
+  /**
+   * What kind of thing it is.
+   */
+  kind: 'dirty_content' | 'pinned_change_set' | 'review_evidence'
 }
 /**
  * A bounded update against a known base.
@@ -11340,4 +12391,411 @@ export interface ProtocolVersion5 {
    * The minor version. A peer selects the highest minor both sides support.
    */
   minor: number
+}
+/**
+ * Parameters of `workspace.preview`, which is a read `workspace.create` shares its shape with.
+ *
+ * This is not a method of its own: `workspace.create` carries the same fields and the daemon
+ * answers the preview from the create parameters when `preview_only` is set. One shape is a
+ * convenience rather than a binding: a preview and a creation are two independent requests, and
+ * a creation returns the preview it was created under, which is what a client shows.
+ */
+export interface WorkspaceCreateParams {
+  /**
+   * The change-set version an isolated workspace materialises, when it names one.
+   */
+  base_change_set_id: ChangeSetId | null
+  /**
+   * The revision an isolated workspace starts from, when it names one directly.
+   */
+  base_revision: string | null
+  /**
+   * Where an isolated workspace's working tree goes.
+   *
+   * A shared workspace names none: it is the repository's own tree.
+   */
+  destination: DestinationRequest3 | null
+  /**
+   * How an isolated workspace is separated. Ignored for a shared one.
+   */
+  isolation: IsolationMechanism | null
+  /**
+   * Which kind it is. Explicit, with no default.
+   */
+  kind: 'shared_existing' | 'isolated'
+  /**
+   * The label the user gave it.
+   */
+  label: string
+  policy: InclusionPolicy2
+  /**
+   * Return the preview and create nothing.
+   *
+   * The create interface previews first, and the preview is this method with nothing written.
+   * It is still a mutation in the registry, because the parameters are the same object and a
+   * caller that may not create a workspace has no business measuring one.
+   */
+  preview_only: boolean
+  /**
+   * The repository to make a working copy of.
+   */
+  project_repository_id: string
+}
+/**
+ * Where a repository operation puts what it creates.
+ *
+ * A parent the caller already holds authority over, and one single-component name inside it. The
+ * parent is named by a path the host resolves **once**, with its own ambient authority, into a
+ * directory handle; everything after that is relative to the handle. A multi-component name is
+ * refused, because the operation that creates the entry must not depend on a prefix resolved
+ * after the check.
+ */
+export interface DestinationRequest3 {
+  /**
+   * The environment the repository will belong to.
+   */
+  environment_id: string
+  /**
+   * The single name inside it. No separators, no traversal segment, no reserved device name.
+   */
+  name: string
+  /**
+   * The parent directory, as an absolute host path the caller chose.
+   */
+  parent_path: string
+}
+/**
+ * The inclusion policy, one decision per class.
+ */
+export interface InclusionPolicy2 {
+  /**
+   * Files whose content Git reports as binary.
+   */
+  binary_files: 'include' | 'exclude'
+  /**
+   * Tracked files with uncommitted modifications.
+   */
+  dirty_files: 'include' | 'exclude'
+  /**
+   * Files an ignore rule covers, which is what a build usually produces.
+   */
+  generated_artefacts: 'include' | 'exclude'
+  /**
+   * Submodule working trees.
+   */
+  submodules: 'include' | 'exclude'
+  /**
+   * Files Git does not track and does not ignore.
+   */
+  untracked_files: 'include' | 'exclude'
+}
+/**
+ * Result of `workspace.create`.
+ */
+export interface WorkspaceCreateResult {
+  preview: InclusionPreview1
+  /**
+   * The paths the policy included that this host could not carry into the workspace.
+   *
+   * A symbolic link, a device, a submodule's own working tree, and a path whose destination
+   * this host could not replace. The workspace exists and is usable; what it does not hold is
+   * named here rather than left for a reviewer to notice.
+   */
+  unapplied: string[]
+  /**
+   * The workspace, or nothing when this was a preview.
+   */
+  workspace: WorkspaceSummary | null
+}
+/**
+ * What a reviewer would see, always.
+ */
+export interface InclusionPreview1 {
+  /**
+   * The change-set version an isolated workspace would materialise, when it names one.
+   */
+  base_change_set_id: ChangeSetId | null
+  /**
+   * The reference that revision was named by, when it was named by one.
+   */
+  base_reference: string | null
+  /**
+   * The revision an isolated workspace would start from, as the repository resolved it.
+   */
+  base_revision: string
+  /**
+   * One row per class, with exact counts.
+   */
+  counts: PreviewCount[]
+  /**
+   * True when every count above is the whole of its class.
+   *
+   * False when a bound was reached: an ignored directory deeper or larger than the walk
+   * covers, or a directory this host could not list. Then each count is a lower bound and the
+   * limitations say which bound was reached.
+   */
+  counts_complete: boolean
+  /**
+   * A bounded sample of the paths, grouped by class in [`InclusionClass::EVERY`] order.
+   */
+  entries: PreviewEntry[]
+  /**
+   * The kind of workspace it was taken for.
+   */
+  kind: 'shared_existing' | 'isolated'
+  /**
+   * What this preview cannot promise, in the host's own words.
+   *
+   * A shared workspace is not a sandbox; a worktree shares repository metadata; a working tree
+   * can change between the preview and the creation. A client shows this rather than deciding
+   * for the user.
+   */
+  limitations: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted_entries: string
+  policy: InclusionPolicy
+  /**
+   * The repository the preview was taken on.
+   */
+  project_repository_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  taken_at_ms: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  unknown_content: string
+}
+/**
+ * Parameters of `workspace.list`.
+ */
+export interface WorkspaceListParams {
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * One repository to list, or none for every repository in the environment.
+   */
+  project_repository_id: ProjectRepositoryId | null
+}
+/**
+ * Result of `workspace.list`.
+ */
+export interface WorkspaceListResult {
+  /**
+   * The workspaces, oldest first.
+   */
+  workspaces: WorkspaceSummary[]
+}
+/**
+ * Parameters of `workspace.read`.
+ */
+export interface WorkspaceReadParams {
+  /**
+   * The workspace to read.
+   */
+  workspace_id: string
+}
+/**
+ * Result of `workspace.read`.
+ */
+export interface WorkspaceReadResult {
+  workspace: WorkspaceSummary1
+}
+/**
+ * One workspace, as a scoped read returns it.
+ */
+export interface WorkspaceSummary1 {
+  /**
+   * The change-set version it materialised, when it named one.
+   */
+  base_change_set_id: ChangeSetId | null
+  /**
+   * The revision it started from.
+   */
+  base_revision: string
+  /**
+   * The automation runs bound to it that are still live.
+   *
+   * Section 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace
+   * between two sessions or after its last one ended, so it is recorded separately and refuses
+   * a removal in the same way.
+   */
+  bound_runs: WorkflowRunId[]
+  /**
+   * The sessions bound to it that are still live.
+   *
+   * A removal is refused while this is not empty, whatever retention policy it carries.
+   */
+  bound_sessions: SessionId[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * Why it is in the state it is in, when it ended up there for a reason.
+   */
+  detail: string | null
+  /**
+   * The path it was created at, for a person to read.
+   */
+  display_path: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The stable filesystem identity of its working tree, once this host has one.
+   *
+   * Absent while the workspace is being materialised, and absent afterwards only when the
+   * materialisation did not get as far as creating the tree. An absent identity is what refuses
+   * a removal: this host does not delete a directory it cannot prove it created.
+   */
+  filesystem_identity: FilesystemIdentity1 | null
+  /**
+   * How an isolated workspace is separated, when it is one.
+   */
+  isolation: IsolationMechanism | null
+  /**
+   * Which kind it is.
+   */
+  kind: 'shared_existing' | 'isolated'
+  /**
+   * The label the user gave it.
+   */
+  label: string
+  policy: InclusionPolicy1
+  /**
+   * The repository it is a working copy of.
+   */
+  project_repository_id: string
+  /**
+   * What it holds that a removal would have to account for.
+   */
+  retained: RetainedItem[]
+  /**
+   * What state it is in.
+   */
+  state: 'ready' | 'materialising' | 'removal_pending' | 'removed'
+  /**
+   * Its identity.
+   */
+  workspace_id: string
+}
+/**
+ * Parameters of `workspace.remove`.
+ */
+export interface WorkspaceRemoveParams {
+  /**
+   * What the removal does with what the workspace holds.
+   */
+  retention: 'keep_everything' | 'remove_retained'
+  /**
+   * The workspace to remove.
+   */
+  workspace_id: string
+}
+/**
+ * Result of `workspace.remove`.
+ */
+export interface WorkspaceRemoveResult {
+  /**
+   * What is still held, and is waiting for the user's approval.
+   */
+  retained: RetainedItem[]
+  /**
+   * True when this workspace's own working files are gone.
+   *
+   * Read from the filesystem rather than from what the removal did: the tree is not there any
+   * more, whether this call removed it, an earlier one did, or the user did. A removal never
+   * touches a *shared* workspace's tree, because that tree is the user's own, so this is
+   * ordinarily false for one; it says false whenever the host could not establish that the
+   * directory is absent.
+   */
+  working_files_removed: boolean
+  workspace: WorkspaceSummary2
+}
+/**
+ * One workspace, as a scoped read returns it.
+ */
+export interface WorkspaceSummary2 {
+  /**
+   * The change-set version it materialised, when it named one.
+   */
+  base_change_set_id: ChangeSetId | null
+  /**
+   * The revision it started from.
+   */
+  base_revision: string
+  /**
+   * The automation runs bound to it that are still live.
+   *
+   * Section 14 makes cleanup wait for every bound session *and run*. A run can hold a workspace
+   * between two sessions or after its last one ended, so it is recorded separately and refuses
+   * a removal in the same way.
+   */
+  bound_runs: WorkflowRunId[]
+  /**
+   * The sessions bound to it that are still live.
+   *
+   * A removal is refused while this is not empty, whatever retention policy it carries.
+   */
+  bound_sessions: SessionId[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * Why it is in the state it is in, when it ended up there for a reason.
+   */
+  detail: string | null
+  /**
+   * The path it was created at, for a person to read.
+   */
+  display_path: string
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * The stable filesystem identity of its working tree, once this host has one.
+   *
+   * Absent while the workspace is being materialised, and absent afterwards only when the
+   * materialisation did not get as far as creating the tree. An absent identity is what refuses
+   * a removal: this host does not delete a directory it cannot prove it created.
+   */
+  filesystem_identity: FilesystemIdentity1 | null
+  /**
+   * How an isolated workspace is separated, when it is one.
+   */
+  isolation: IsolationMechanism | null
+  /**
+   * Which kind it is.
+   */
+  kind: 'shared_existing' | 'isolated'
+  /**
+   * The label the user gave it.
+   */
+  label: string
+  policy: InclusionPolicy1
+  /**
+   * The repository it is a working copy of.
+   */
+  project_repository_id: string
+  /**
+   * What it holds that a removal would have to account for.
+   */
+  retained: RetainedItem[]
+  /**
+   * What state it is in.
+   */
+  state: 'ready' | 'materialising' | 'removal_pending' | 'removed'
+  /**
+   * Its identity.
+   */
+  workspace_id: string
 }
