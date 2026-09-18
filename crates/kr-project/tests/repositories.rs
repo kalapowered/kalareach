@@ -309,12 +309,9 @@ fn a_clone_names_the_remote_the_provider_and_the_broker_and_stores_no_credential
     );
     assert_eq!(stored.trim(), source.display().to_string());
     // A local clone that shared the source's objects would not be a separate repository.
-    assert!(
-        !fixture
-            .work()
-            .join("clone/.git/objects/info/alternates")
-            .exists(),
-        "the clone has its own object store"
+    support::assert_absent(
+        &fixture.work().join("clone/.git/objects/info/alternates"),
+        "the clone has its own object store",
     );
     // The commit came across.
     assert!(fixture.work().join("clone/README.md").is_file());
