@@ -125,6 +125,7 @@ async fn host_on(temp: kr_ipc::testing::TempHost, work: Arc<tempfile::TempDir>) 
             worker_program: PathBuf::from("/nonexistent/kr-worker"),
             build_id: build(),
             release: "0".to_owned(),
+            shell_packages: None,
         })
         .await;
         match attempt {
