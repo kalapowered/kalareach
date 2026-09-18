@@ -25,7 +25,9 @@
 //!    remote's name, and nothing may listen.
 //! 3. **Only this operation's directories are written.** The repository's working tree and its Git
 //!    common directory, the destination this operation reserved, and one private temporary
-//!    directory that exists for the length of the invocation. Everything else is read-only.
+//!    directory made for the invocation. Everything else is read-only. That temporary directory is
+//!    taken away again by the record this host wrote before it made it, and `README.md` in this
+//!    crate says what is left behind instead, and why.
 //!
 //! Reads are not confined on macOS or Linux, and this is deliberate: Git reads the system's shared
 //! libraries, its locale data and its certificate store, and a read confinement that missed one of
@@ -73,8 +75,12 @@
 //! | Platform | Execution | Network | Writes |
 //! | --- | --- | --- | --- |
 //! | macOS | A per-invocation sandbox profile, applied by the system's own launcher before it runs Git | The same profile | The same profile |
-//! | Linux | Landlock, with the execute right only on Git's own program and helper directory | Landlock's TCP rules for a remote operation, and a system-call filter that refuses a local one an internet socket | Landlock, from the opened directory handles |
-//! | Windows | An application container whose grants on the repository carry no execute right | The container's capabilities: none at all for a local operation | The container's grants, inside a job object that ends every descendant |
+//! | Linux | Landlock, with the execute right only on Git's own program and helper directory | Landlock's TCP rules for a remote operation, and a system-call filter that makes a socket only of what the boundary can account for | Landlock, from the opened directory handles |
+//! | Windows — **refused, and never run** | An application container whose grants on the repository carry no execute right | The container's capabilities: none at all for a local operation | The container's grants, inside a job object that ends every descendant |
+//!
+//! The Windows row is what the code there would do. **It has never been executed, and this host
+//! runs no repository operation on that platform**: two of the three guarantees are not things an
+//! application container can hold, and `README.md` in this crate says which and why.
 //!
 //! A platform that cannot establish its boundary refuses the invocation. Nothing here falls back to
 //! reading the configuration and hoping.

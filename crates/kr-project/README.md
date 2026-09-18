@@ -168,16 +168,22 @@ with an address is the one a program reaches another program on this machine by 
 proxy on one — or a connection handed over one already made — would be a way past every port rule
 here.
 
-What that costs is what a C library asks over a local socket. Its name service cache and a
-resolver's own interface are each reached that way, and each is a step a C library falls back from:
-to the files, and to the resolver itself over TCP, which the child is told to use
-(`RES_OPTIONS=use-vc`) and for which the port a resolver answers on is added to the rules, on any
-address, because which machine answers a name is not this service's to decide. **A host whose name
-service has no fallback to the resolver, or whose resolver will not take that instruction, cannot
-turn a name into an address inside this boundary**, and the operation fails saying so. A credential
-broker that would reach an agent or a secret service over a local socket cannot do so either; the
-brokers this service supports read what they need from their own configuration, and the child is
-given no address for an agent in any case.
+What that costs is what a C library asks over a local socket or over that family: its name service
+cache, a resolver's own interface, and the kernel's list of this machine's addresses. Each is a step
+a C library falls back from — to the files, to the resolver itself over TCP, and to asking about
+both kinds of address — and the child is told to use that connection (`RES_OPTIONS=use-vc`), with
+the port a resolver answers on added to the rules on any address, because which machine answers a
+name is not this service's to decide. An address written out in full, and a name the files answer,
+are reached either way. **A host whose name service has no fallback to the resolver, or whose
+resolver will not take that instruction, cannot turn a name that needs the resolver into an address
+inside this boundary**, and the operation fails saying so.
+
+A credential broker that would reach an agent or a secret service over a local socket cannot do so
+inside the boundary either. That is a real limit and not a theoretical one:
+`git-credential-libsecret` is one of the brokers this service will run, and what it asks over a
+local socket it will not get here. A broker whose answer comes from its own store on disk works; one
+that needs another program on this machine does not, and the operation fails rather than the
+credential being found some other way.
 
 **An invocation's temporary directory is this service's mark, not its birth certificate.** Neither
 macOS nor Linux offers a call that creates a directory and hands back the object it created, so
@@ -193,25 +199,30 @@ directory put at the name before the mark was made would be marked as readily. T
 are all made in is the service's own, open to the account the service runs as and to nobody else,
 so putting anything at a name in there is already that account's own doing.
 
-**Nothing in there is removed that this service has no record of making, nothing is removed by
-descending, and nothing that holds what anybody wrote is removed at all.** When an invocation ends,
-and again when the service starts and sweeps what a daemon that died mid-invocation left, the name
-is opened, the object is required to be the one the record names, it is required to hold this
-service's own mark and nothing besides, the mark is required to be the object the record names as
-well, and only then is the mark taken away and the directory after it. Both of those removals are
-the kind that takes only an empty directory, so this path cannot destroy a single byte anybody
-wrote: a name holding a file, or a directory with something in it, fails the removal instead. A
-directory holding what Git left behind, a directory that is no longer the object the record names, a
-mark that is not the object this service made, a file where a mark should be, and a directory this
-service never recorded making are all left where they are, each with a line saying which and why.
-What was left stays in the record, so the next start tries again rather than forgetting it. A record
-this service cannot read takes nothing away at all.
+**Nothing in there is removed unless the record names both objects, nothing is removed by
+descending, and no file and no directory with anything in it is removed at all.** When an invocation
+ends, and again when the service starts and sweeps what a daemon that died mid-invocation left, the
+record has to name the directory *and* the mark inside it; the name is opened and the object is
+required to be the one recorded; it is required to hold this service's own mark and nothing besides;
+the mark is required to be the object recorded as well; and only then is the mark taken away and the
+directory after it. Both of those removals are the kind that takes only an empty directory, so this
+path cannot destroy a file's contents or anything held in a directory: a name holding a file, or a
+directory with something in it, fails the removal instead.
+
+What is left where it is, each with a line saying which and why: a directory holding what Git left
+behind, a directory that is no longer the object the record names, a mark that is not the object
+this service made, a file where a mark should be, a directory this service was recorded as *about
+to* make but never got as far as identifying, and a directory this service never recorded at all.
+What is left stays in the record, so the next start tries again rather than forgetting it. A record
+this service cannot read takes nothing away and stops the service rather than being written into.
 
 Two acts in that are still by name: taking away the mark, and taking away the directory. Neither
 platform removes a directory that an open handle names, so an empty directory a same-account writer
 puts at one of those names in the instant between the check and the removal is one this service
-would remove. That is the whole of what this can cost, because neither removal takes anything that
-is not an empty directory.
+would remove, along with whatever a directory carries that is not an entry in it. In the same
+instant a writer can move this service's own directory elsewhere and leave an empty one behind, and
+the record then says the directory has gone while it is in fact somewhere else. Those are the whole
+of what this can cost, because neither removal takes a file or a directory with anything in it.
 
 **The port list would not be enforced on Windows.** An application container's capability permits
 reaching the network or nothing at all; bounding which ports it reaches needs a system-wide filtering

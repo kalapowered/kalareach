@@ -592,8 +592,11 @@ repository while Git is running.
   are enforced on two of the three platforms, and on Linux a socket is made only of what this host
   can account for, so the ports are a guarantee about the protocol the transports use rather than
   about every packet a name resolution sends. A host whose name service cannot fall back from the
-  caches it reaches over a local socket to the resolver itself cannot turn a name into an address
-  inside the boundary, and says so.
+  caches it reaches over a local socket to the resolver itself cannot turn a name that needs the
+  resolver into an address inside the boundary, and says so; an address written out in full, and a
+  name the files answer, are reached either way. A credential broker that would ask another program
+  on this machine over a local socket cannot do that inside the boundary, and the operation fails
+  rather than the credential being found some other way.
 * **Only this operation's directories are written.** The repository's working tree and its Git
   directory, the destination the operation reserved, and one temporary directory that exists for
   the length of the invocation. Everything else is read-only. That temporary directory is taken
