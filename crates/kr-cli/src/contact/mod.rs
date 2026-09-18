@@ -72,29 +72,33 @@ fn declared_deadline() -> Option<DurationMs> {
         .map(DurationMs::new)
 }
 
-/// Returns how long one poll may run.
+/// Returns how long one wait may run, against its own ceiling.
 ///
-/// Three bounds, whichever is shortest: what the caller asked for, the host's own ceiling, and the
-/// client deadline the installation established, less the room an answer needs to travel back in.
-/// A caller that asked for nothing gets the host's default where that deadline is known and a
-/// short wait where it is not.
-fn poll_within(asked: Option<DurationMs>, declared: Option<DurationMs>) -> DurationMs {
-    let qualified = declared.and_then(|declared| {
-        declared
-            .get()
-            .checked_sub(DEADLINE_MARGIN.get())
-            .filter(|remaining| *remaining > 0)
-            .map(DurationMs::new)
-    });
-    let requested = match (asked, qualified) {
-        (Some(asked), _) => asked,
-        (None, Some(_)) => kr_protocol::question::DEFAULT_WAIT,
-        (None, None) => UNQUALIFIED_WAIT,
+/// Three bounds, whichever is shortest: what the caller asked for, the ceiling of the call it is
+/// for, and the client deadline the installation established less the room an answer needs to
+/// travel back in. Where no deadline was established nothing here knows what the client allows, so
+/// the conservative bound applies to what the caller asked for as well as to what it did not: an
+/// agent that needs longer asks again, and the question is durable either way. A declared deadline
+/// with nothing left in it after that room is a budget of nothing, not an absent one.
+fn wait_within(
+    asked: Option<DurationMs>,
+    declared: Option<DurationMs>,
+    ceiling: DurationMs,
+) -> DurationMs {
+    let Some(declared) = declared else {
+        let unqualified = UNQUALIFIED_WAIT.get().min(ceiling.get());
+        return DurationMs::new(asked.map_or(unqualified, |asked| asked.get().min(unqualified)));
     };
-    let ceiling = qualified.map_or(MAX_WAIT.get(), |deadline| {
-        deadline.get().min(MAX_WAIT.get())
+    let budget = declared.get().saturating_sub(DEADLINE_MARGIN.get());
+    let requested = asked.map_or(kr_protocol::question::DEFAULT_WAIT.get(), |asked| {
+        asked.get()
     });
-    DurationMs::new(requested.get().min(ceiling))
+    DurationMs::new(requested.min(budget).min(ceiling.get()))
+}
+
+/// Returns how long one long poll may run.
+fn poll_within(asked: Option<DurationMs>, declared: Option<DurationMs>) -> DurationMs {
+    wait_within(asked, declared, MAX_WAIT)
 }
 
 /// Returns how long one poll may run, against what this installation declared.
@@ -345,10 +349,11 @@ impl Contact {
         )
         .await?;
         let token = encode_token(&created.caller_token);
+        // The wait on a creation is bounded by the same deadline every other wait is, and by its
+        // own thirty-second ceiling.
         let wait = params
             .wait_seconds
-            .map(seconds)
-            .map(|asked| DurationMs::new(asked.get().min(MAX_CREATE_WAIT.get())));
+            .map(|asked| wait_within(Some(seconds(asked)), declared_deadline(), MAX_CREATE_WAIT));
         // The optional wait on creation is the same long poll, bounded to 30 seconds. It reuses
         // the question it just created rather than asking again.
         let question = match wait {
@@ -671,13 +676,33 @@ mod tests {
     }
 
     #[test]
-    fn an_unqualified_wait_is_short_and_an_explicit_one_is_still_bounded() {
+    fn an_unqualified_wait_is_short_however_long_the_caller_asked_for() {
+        // Nothing here knows what this client allows, so a request for longer is not honoured.
         assert_eq!(poll_within(None, None), UNQUALIFIED_WAIT);
         assert_eq!(
-            poll_within(Some(DurationMs::new(120_000)), None),
-            DurationMs::new(120_000)
+            poll_within(Some(DurationMs::new(600_000)), None),
+            UNQUALIFIED_WAIT
         );
-        assert_eq!(poll_within(Some(DurationMs::new(u64::MAX)), None), MAX_WAIT);
+        assert_eq!(
+            poll_within(Some(DurationMs::new(5_000)), None),
+            DurationMs::new(5_000)
+        );
+    }
+
+    #[test]
+    fn a_creation_wait_is_bounded_by_its_own_ceiling_and_by_the_client() {
+        assert_eq!(
+            wait_within(Some(DurationMs::new(600_000)), None, MAX_CREATE_WAIT),
+            MAX_CREATE_WAIT
+        );
+        assert_eq!(
+            wait_within(
+                Some(DurationMs::new(30_000)),
+                Some(DurationMs::new(20_000)),
+                MAX_CREATE_WAIT
+            ),
+            DurationMs::new(5_000)
+        );
     }
 
     #[test]
@@ -698,10 +723,16 @@ mod tests {
         assert_eq!(poll_within(None, short), expected);
         assert_eq!(poll_within(Some(DurationMs::new(600_000)), short), expected);
 
-        // A deadline shorter than the answer's own room leaves nothing to qualify with.
+        // A deadline with nothing left in it after the answer's own room is a budget of nothing,
+        // not an absent one: the question comes back at once rather than after a wait the client
+        // would cut off.
         assert_eq!(
             poll_within(None, Some(DurationMs::new(5_000))),
-            UNQUALIFIED_WAIT
+            DurationMs::new(0)
+        );
+        assert_eq!(
+            poll_within(Some(DurationMs::new(600_000)), Some(DurationMs::new(5_000))),
+            DurationMs::new(0)
         );
     }
 

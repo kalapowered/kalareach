@@ -1663,6 +1663,10 @@ impl Controller {
         // From here to the recorded outcome is one sequence. Two callers cannot both find no
         // record and both change the same files.
         let _admission = self.agent_tools.lock().await;
+        // Waiting for that lock takes time, and what happens next is either a read of somebody's
+        // completed action or a change to their files. Both need current authority, so it is
+        // checked here rather than before the wait.
+        self.authorised(connection_id).await?;
         if let Some(retained) = installer.retained(actor_id, mutation.action_id, &digest)? {
             return Ok(retained);
         }
@@ -1672,11 +1676,18 @@ impl Controller {
             installer.check(&params)?;
         }
         // Everything above can wait: for this task to be scheduled, for the lock, for the checks
-        // to read the agent's tree. The authority behind the connection and the deadline this
-        // action was admitted under are revalidated here, immediately before anything durable,
-        // rather than left as they were when the request arrived. The authority lookup is awaited,
-        // so the deadline is read after it and not before.
-        self.authorised(connection_id).await?;
+        // to read the agent's tree. The deadline this action was admitted under is read after
+        // those waits, and the dispatch marker is written while this daemon's authority store is
+        // held, so a revocation cannot complete between the check and the marker: withdrawing a
+        // registration takes the same lock.
+        let registrations = self.admitted.lock().await;
+        if !registrations.contains_key(&connection_id) {
+            return Err(ControllerError::PermissionDenied {
+                detail: "the authority this connection was admitted under has been withdrawn; \
+                         open a new connection"
+                    .to_owned(),
+            });
+        }
         if self.clock.now() >= accepted.deadline {
             return Err(ControllerError::WindowExpired {
                 detail: "the deadline this installation was admitted under passed before it could \
@@ -1685,6 +1696,7 @@ impl Controller {
             });
         }
         installer.mark_dispatching(actor_id, mutation.action_id, &digest)?;
+        drop(registrations);
         let result = match method {
             Method::AgentToolsInstall => encode(&installer.install(&params)?)?,
             Method::AgentToolsRemove => encode(&installer.remove(&params)?)?,

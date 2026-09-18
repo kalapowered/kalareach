@@ -184,10 +184,11 @@ Three properties make an installation safe to undo:
   editor, so ordering and comments are untouched. A JSON configuration is reparsed and rewritten:
   every setting survives, and the document's key order and indentation are normalised. The
   replacement keeps the permission bits of the document it replaces, because an agent's
-  configuration can hold a credential. It does **not** carry an access-control list or a Windows
-  security descriptor across that replacement: a document protected by one of those is protected by
-  its directory afterwards, and a host that relies on one should install with the agent's own
-  command instead.
+  configuration can hold a credential. It does **not** carry an access-control list across that
+  replacement, and on Windows, where a security descriptor is how a file is protected at all, an
+  existing document is not replaced: the installation refuses and says to add the server with the
+  agent's own command. On Unix an extended access-control list beyond the mode bits is likewise not
+  carried.
 
 A directory the installation created is removed only when it is empty. A project's `.mcp.json` is
 read by more than one agent, so the entry in one is written identically whichever installation
@@ -200,10 +201,12 @@ whose outcome was not is reported as unknown rather than repeated. One installat
 on a host, and the authority behind it and the deadline it was admitted under are checked again
 immediately before anything durable happens.
 
-The plan is written before the first change and marked complete after the last, so an installation
-interrupted part way through is not mistaken for a finished one: `kr skill status` says it did not
-finish, `kr skill remove` undoes whatever of it reached the disk, and installing again finishes the
-work.
+Each change is noted in the record before it happens and recorded after it, and the record is marked
+complete only when the last one is. An installation interrupted part way through is therefore not
+mistaken for a finished one: `kr skill status` says it did not finish, `kr skill remove` undoes what
+was recorded, and installing again finishes the work. The one change that was in flight is named by
+both, and left alone: a digest proves what a file contains, not who wrote it, and removing something
+this host may never have written would delete somebody else's file.
 
 ## What contact is not
 
