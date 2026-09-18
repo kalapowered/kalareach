@@ -294,7 +294,7 @@ impl ManagedService {
     }
 }
 
-/// Whether one managed service is there, and what to do about it when it is not.
+/// Whether one managed service has an implementation, and what to do about it when it has not.
 ///
 /// Section 17: client entitlement state explains availability; it does not protect the business
 /// model. This is an explanation and only an explanation. Nothing in this library consults it
@@ -305,8 +305,12 @@ pub struct Availability {
     /// Which service.
     pub service: ManagedService,
     /// Whether an implementation is configured.
-    pub available: bool,
-    /// What a person is told: the service, and what they can do instead.
+    ///
+    /// Configured, which is the only thing a client can know without asking. It is not a claim that
+    /// the service is reachable, that an account is entitled to it or that a call will succeed:
+    /// [`NullService`] is configured and answers nothing. Those answers come from the calls.
+    pub configured: bool,
+    /// What a person is told: the service, and what they can do instead of it.
     pub explanation: String,
 }
 
@@ -358,9 +362,9 @@ impl ServiceClients {
     /// Returns what to say about one service.
     #[must_use]
     pub fn availability_of(&self, service: ManagedService) -> Availability {
-        let available = self.holds(service);
-        let explanation = if available {
-            format!("{} is configured.", service.as_str())
+        let configured = self.holds(service);
+        let explanation = if configured {
+            format!("A {} service is configured.", service.as_str())
         } else {
             format!(
                 "No {} service is configured. You can {}.",
@@ -370,7 +374,7 @@ impl ServiceClients {
         };
         Availability {
             service,
-            available,
+            configured,
             explanation,
         }
     }

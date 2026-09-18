@@ -69,9 +69,12 @@ client makes, and an association cannot outlive the connection that produced the
 - A draft is one file, written to a temporary name, flushed, and renamed over its own. Every change
   takes an exclusive lock on the store and every read takes a shared one, so reading a draft,
   comparing its revision and replacing it is one step against every other window and every other
-  process. A second editor that lost the comparison is told so and overwrites nothing.
-- Losing a connection clears every association and touches no draft. The same device binds a draft
-  to a new attachment on reconnect.
+  process. A second editor that lost the comparison is told so and overwrites nothing. The contents
+  are flushed before the rename on every platform; on Unix the directory entry is flushed too, and
+  on Windows this build does not flush one and claims no durability for the rename itself.
+- `Associations::connection_lost` clears every association and touches no draft. A `Session` does
+  not own the associations and does not clear them: whoever holds both calls it when a connection
+  ends, which is the same caller that binds a draft to a new attachment on reconnect.
 - A changed application or binding revision marks the draft conflicted; a target that is gone marks
   it orphaned. Either way the text is kept and `Draft::submission` refuses until a caller retargets
   it explicitly. Rebinding is not retargeting: only a person decides whether text written for one
@@ -107,8 +110,10 @@ The document node union, the control model and the visibility grammar are the pa
   recheck the condition against the control the person actually saw. A hidden or disabled control
   produces none.
 
-Hiding is a courtesy either way. The host rechecks the condition and the actor's rights when the
-action arrives, so a control that appears when it should not is a control that then fails.
+Hiding is a courtesy either way, and it is a client-side one: what `invoke` produces is a value
+carrying the control's revision, which is what section 11 requires a host to recheck the condition
+against when the invocation reaches it. Rechecking is the host's, so a control this client shows
+that it should not have is a control the host then refuses.
 
 ## Managed services
 
@@ -119,10 +124,12 @@ because a lease is the one managed resource a client cannot do without and still
 
 A field left `None` is a service this client does not use, and nothing degrades. Direct connections,
 local sessions, drafts, plugins, local descriptions and user-operated alternatives need none of
-them. `ServiceClients::availability` reports every service in one shape, naming the service and what
-to do instead of it. It explains availability and nothing more: no code path consults it before
-doing local work, and a client that deleted every field would lose the managed resources and keep
-the product.
+them. `ServiceClients::availability` reports every service in one shape. A service with no implementation
+is named along with what to do instead; a service with one is reported as configured, which is the
+only thing a client can know without asking — `NullService` is configured and answers nothing, and
+whether a call succeeds is what the call says. It explains and nothing more: no code path consults
+it before doing local work, and a client that deleted every field would lose the managed resources
+and keep the product.
 
 `services::NullService` implements every trait by saying so. It exists so a caller can hold a
 service client unconditionally and get an honest answer rather than a silent default.
@@ -133,6 +140,6 @@ service client unconditionally and get an honest answer rather than a silent def
 | --- | --- |
 | KR-REQ-04.23 | `crates/kr-cli/tests/client_paths.rs`, and `the_local_path_is_a_socket_and_the_remote_path_is_iroh_behind_one_seam` in `crates/kr-client/tests/session.rs` |
 | KR-REQ-11.46 | `crates/kr-client/src/controls.rs` tests |
-| KR-REQ-17.14 | `every_local_operation_works_with_no_managed_service_and_with_every_one_replaced` in `crates/kr-client/tests/session.rs` |
+| KR-REQ-17.14 | `a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_change_with_one` in `crates/kr-client/tests/session.rs` |
 | KR-REQ-23.57 | `crates/kr-client/src/retry.rs` tests, and the retry tests in `crates/kr-client/tests/session.rs` |
 | KR-REQ-24.13 | `crates/kr-client/src/drafts.rs` tests, and `a_draft_outlives_its_attachment_its_connection_and_another_devices_write` in `crates/kr-client/tests/session.rs` |

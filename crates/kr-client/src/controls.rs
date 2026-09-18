@@ -276,14 +276,19 @@ fn truth(predicate: &Predicate, state: &ControlState) -> Truth {
     }
 }
 
-/// Names the first fact the client has no value for, for the diagnostic.
+/// Names the first fact the client has no value for *that the answer turned on*.
+///
+/// Only a branch whose own truth is unknown is followed. A branch a known term already settled can
+/// still contain an unknown leaf, and naming that leaf would tell a person the control is waiting on
+/// something it is not waiting on.
 fn unknown_fact(predicate: &Predicate, state: &ControlState) -> Option<String> {
     match predicate {
         Predicate::Always {} | Predicate::Never {} => None,
         Predicate::Not { term } => unknown_fact(term, state),
-        Predicate::All { terms } | Predicate::Any { terms } => {
-            terms.iter().find_map(|term| unknown_fact(term, state))
-        }
+        Predicate::All { terms } | Predicate::Any { terms } => terms
+            .iter()
+            .filter(|term| truth(term, state) == Truth::Unknown)
+            .find_map(|term| unknown_fact(term, state)),
         Predicate::Capability { capability, .. } => (state
             .capabilities
             .iter()
@@ -507,7 +512,31 @@ mod tests {
             Some(Hidden::OutsideTheGrammar(PredicateError::EmptyCombinator))
         ));
 
-        // Exactly at the bounds is inside them.
+        // Exactly at the depth bound is inside it, and one level past is not. The grammar admits
+        // four levels, so the deepest legal shape nests three combinators over a leaf.
+        // Wrapped rather than negated, so the nesting is what is under test rather than the
+        // parity of the negations.
+        let nested = |levels: usize| {
+            let mut predicate = Predicate::Always {};
+            for _ in 0..levels {
+                predicate = Predicate::All {
+                    terms: vec![predicate],
+                };
+            }
+            predicate
+        };
+        assert_eq!(nested(3).depth(), 4);
+        assert_eq!(
+            evaluate(&nested(3), &ControlState::new()),
+            Visibility::Shown
+        );
+        assert_eq!(nested(4).depth(), 5);
+        assert!(matches!(
+            evaluate(&nested(4), &ControlState::new()).hidden(),
+            Some(Hidden::OutsideTheGrammar(PredicateError::TooDeep { .. }))
+        ));
+
+        // Exactly at the width bound is inside it.
         let at_the_limit = Predicate::All {
             terms: vec![
                 Predicate::Any {
@@ -520,6 +549,46 @@ mod tests {
             evaluate(&at_the_limit, &ControlState::new()),
             Visibility::Shown
         );
+
+        // The bounds are checked before the truth, so a predicate a term would have settled as
+        // false is still reported as outside the grammar. A package whose visibility rule cannot
+        // be read is not one whose controls are hidden for an ordinary reason.
+        let false_and_over_budget = Predicate::All {
+            terms: vec![Predicate::Never {}; 32],
+        };
+        assert!(matches!(
+            evaluate(&false_and_over_budget, &ControlState::new()).hidden(),
+            Some(Hidden::OutsideTheGrammar(
+                PredicateError::TooManyTerms { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn the_fact_a_control_is_waiting_on_is_the_one_the_answer_turned_on() {
+        // `never` settles the first branch, so the unknown inside it is not what this control is
+        // waiting for. What it is waiting for is the second branch.
+        let predicate = Predicate::Any {
+            terms: vec![
+                Predicate::All {
+                    terms: vec![
+                        Predicate::Never {},
+                        Predicate::Flag {
+                            flag: PresentationFlag::HoldsInputLease,
+                        },
+                    ],
+                },
+                Predicate::Flag {
+                    flag: PresentationFlag::DraftNotEmpty,
+                },
+            ],
+        };
+        let hidden = evaluate(&predicate, &ControlState::new());
+        let Some(Hidden::UnknownFact { fact }) = hidden.hidden() else {
+            panic!("the answer turned on something the client does not know: {hidden:?}");
+        };
+        assert!(fact.contains("DraftNotEmpty"), "{fact}");
+        assert!(!fact.contains("HoldsInputLease"), "{fact}");
     }
 
     #[test]
@@ -740,8 +809,40 @@ mod tests {
                 }]
             }
         });
-        let rendered = read_document(&[smuggled]);
+        // The same control inside a kind this build does know, so an implementation that simply
+        // never found a control anywhere would pass neither half of this test.
+        let ordinary = serde_json::json!({
+            "id": "buttons",
+            "revision": "1",
+            "body": {
+                "kind": "action_button",
+                "control": {
+                    "id": "wipe",
+                    "revision": "1",
+                    "label": "Tidy up",
+                    "icon": "play",
+                    "accessible_description": "Tidy up",
+                    "action_id": "repository.delete",
+                    "parameters": { "parameters": [] },
+                    "priority": "primary",
+                    "visible_when": { "op": "always" },
+                    "enabled_when": { "op": "always" },
+                    "disabled_reason": null
+                }
+            }
+        });
+
+        let rendered = read_document(&[smuggled, ordinary]);
         assert!(rendered[0].is_unsupported());
         assert!(rendered[0].controls().is_empty());
+
+        assert!(!rendered[1].is_unsupported());
+        let controls = rendered[1].controls();
+        assert_eq!(controls.len(), 1);
+        let invocation = invoke(&controls[0], &ControlState::new()).expect("a press");
+        assert_eq!(
+            invocation.action_id,
+            ActionName::new("repository.delete").expect("a literal action name")
+        );
     }
 }

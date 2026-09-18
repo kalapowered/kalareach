@@ -688,6 +688,28 @@ impl DraftStore {
         outcome
     }
 
+    /// Reads a draft and where it has reached on the service, together.
+    ///
+    /// Together, because a publication decides from both: the revision it is sending and the
+    /// generation it expects to replace. Read separately, another publisher could advance the
+    /// object between them, and this one would send an older revision against the newer
+    /// generation, which is a comparison it would win, replacing content it had never seen.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::load`] and [`Self::checkpoint`].
+    pub fn draft_and_checkpoint(
+        &self,
+        draft_id: DraftId,
+    ) -> Result<(Draft, Option<SyncCheckpoint>)> {
+        let guard = self.exclusive()?;
+        let outcome = self
+            .read(draft_id)
+            .and_then(|draft| Ok((draft, self.read_checkpoint(draft_id)?)));
+        drop(guard);
+        outcome
+    }
+
     /// Returns where a draft last reached on the synchronisation service, when it has.
     ///
     /// A note this build cannot read is removed and reported as absent. It is a cache: the next
@@ -1154,62 +1176,63 @@ impl DraftSync {
 
     /// Publishes a draft, under compare and swap on the generation this device last saw.
     ///
-    /// A refused comparison is not a failure: it is the answer that another device wrote first, and
-    /// it brings that content down beside the local draft rather than over it. Every other refusal
-    /// is returned as it came.
+    /// What goes to the service is the record the store holds, not a value the caller supplied:
+    /// the caller names which draft and which revision it means, and the bytes are the ones on
+    /// disk. A caller that had edited a copy in memory would otherwise put content on the service
+    /// that this device does not hold, and the note beside it would name a revision whose text is
+    /// somewhere else.
+    ///
+    /// The draft and the note are read together, so the generation this sends against is the one
+    /// that went with the revision it validated. A refused comparison is not a failure: it is the
+    /// answer that another device wrote first, and it brings that content down beside the local
+    /// draft rather than over it. Every other refusal is returned as it came.
     ///
     /// # Errors
     ///
-    /// Returns the service's refusal, [`DraftError::NotTheStoredRevision`] when the draft offered
-    /// is not the one this device holds, [`DraftError::NotOwned`] when it belongs to another
+    /// Returns the service's refusal, [`DraftError::NotTheStoredRevision`] when the revision named
+    /// is not the one this device holds, [`DraftError::NotOwned`] when the draft belongs to another
     /// device, [`DraftError::TooLarge`] when it does not fit the contract, and
     /// [`DraftError::Storage`] when a conflict copy or the note cannot be written.
     pub async fn publish(
         &self,
         store: &DraftStore,
-        draft: &Draft,
+        draft_id: DraftId,
+        expected_revision: DraftRevision,
         now: TimestampMs,
     ) -> Result<Published> {
-        // What this device holds is what it publishes. A caller that kept an older copy of its own
-        // draft would otherwise put it on the service under a generation the service accepts, and
-        // the newest text would be gone from the object every other device reads. The store's own
-        // record is the answer to that, and it is the answer whether or not a note survives.
-        let stored = store.load(draft.draft_id)?;
+        let (stored, note) = store.draft_and_checkpoint(draft_id)?;
         if stored.device_id != store.device_id() {
             return Err(DraftError::NotOwned {
-                draft_id: draft.draft_id,
+                draft_id,
                 owner: stored.device_id,
                 device_id: store.device_id(),
             }
             .into());
         }
-        if stored.revision != draft.revision {
+        if stored.revision != expected_revision {
             return Err(DraftError::NotTheStoredRevision {
-                draft_id: draft.draft_id,
+                draft_id,
                 stored: stored.revision,
-                offered: draft.revision,
+                offered: expected_revision,
             }
             .into());
         }
-        let plaintext = DraftStore::encode_payload(draft)?;
+        let plaintext = DraftStore::encode_payload(&stored)?;
         let ciphertext = self.sealer.seal(&plaintext)?;
-        let collection = draft_collection(draft.draft_id);
-        // What this device last saw the service hold. A draft that has never been published expects
-        // nothing to be there, which is generation zero.
-        let expected = store
-            .checkpoint(draft.draft_id)?
-            .map_or(0, |note| note.generation.get());
+        // What this device last saw the service hold, read with the draft above. A draft that has
+        // never been published expects nothing to be there, which is generation zero.
+        let expected = note.map_or(0, |note| note.generation.get());
         match self
             .service
-            .compare_exchange(&collection, expected, &ciphertext)
+            .compare_exchange(&draft_collection(draft_id), expected, &ciphertext)
             .await
         {
             Ok(accepted) => {
                 store.record_checkpoint(
-                    draft.draft_id,
+                    draft_id,
                     SyncCheckpoint {
                         generation: U64::new(accepted),
-                        published_revision: Nullable::some(draft.revision),
+                        published_revision: Nullable::some(stored.revision),
                     },
                 )?;
                 Ok(Published::Accepted {
@@ -1217,7 +1240,7 @@ impl DraftSync {
                 })
             }
             Err(error) if error.code() == ErrorCode::DraftConflict => {
-                let fetched = self.fetch_beside(store, draft.draft_id, now).await?;
+                let fetched = self.fetch_beside(store, draft_id, now).await?;
                 Ok(Published::Conflicted {
                     copy: fetched.copy.draft_id,
                     remote_revision: fetched.remote.revision,
@@ -1650,12 +1673,25 @@ mod tests {
     }
 
     /// The longest text whose payload is still within the bound, for a draft of that shape.
+    ///
+    /// Found by halving rather than by growing a byte at a time: the answer is the same and the
+    /// work is a few dozen encodings instead of sixty-five thousand.
     fn text_at_the_payload_limit(revision: u64, at: u64) -> String {
-        let mut text = String::new();
-        while DraftStore::encode_payload(&sample(revision, at, format!("{text}x"))).is_ok() {
-            text.push('x');
+        let fits = |length: usize| {
+            DraftStore::encode_payload(&sample(revision, at, "x".repeat(length))).is_ok()
+        };
+        let (mut low, mut high) = (0, MAX_STORED_DRAFT_BYTES + 1);
+        assert!(fits(low), "an empty draft fits");
+        assert!(!fits(high), "a draft past the storage bound does not");
+        while high - low > 1 {
+            let middle = low + (high - low) / 2;
+            if fits(middle) {
+                low = middle;
+            } else {
+                high = middle;
+            }
         }
-        text
+        "x".repeat(low)
     }
 
     #[test]

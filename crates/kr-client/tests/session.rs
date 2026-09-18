@@ -1035,7 +1035,7 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
 
     let sync = DraftSync::new(Arc::clone(&service) as Arc<_>, Arc::new(ReversingSealer));
     let published = sync
-        .publish(&store, &draft, TimestampMs::new(3))
+        .publish(&store, draft.draft_id, draft.revision, TimestampMs::new(3))
         .await
         .expect("an answer");
     let Published::Conflicted {
@@ -1103,7 +1103,7 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         .expect("an edit");
     assert_eq!(fresh.revision, DraftRevision::new(2));
     assert_eq!(
-        sync.publish(&store, &fresh, TimestampMs::new(6))
+        sync.publish(&store, fresh.draft_id, fresh.revision, TimestampMs::new(6))
             .await
             .expect("an answer"),
         Published::Accepted { generation: 1 }
@@ -1120,25 +1120,25 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         }
     );
     assert_eq!(
-        sync.publish(&store, &fresh, TimestampMs::new(7))
+        sync.publish(&store, fresh.draft_id, fresh.revision, TimestampMs::new(7))
             .await
             .expect("an answer"),
         Published::Accepted { generation: 2 }
     );
 
-    // An older copy of this device's own draft is refused rather than sent. The service would take
-    // it, because its generation is right and a draft revision means nothing to it, and the newest
-    // text would be gone from the object every other device reads. What decides it is the store's
-    // own record, so a fetch that cleared the note does not clear the protection.
-    let stale = Draft {
-        revision: DraftRevision::new(1),
-        text: "what this window still had on screen".to_owned(),
-        ..fresh.clone()
-    };
+    // An older revision of this device's own draft is refused rather than sent. The service would
+    // take it, because its generation is right and a draft revision means nothing to it, and the
+    // newest text would be gone from the object every other device reads. What decides it is the
+    // store's own record.
     let error = sync
-        .publish(&store, &stale, TimestampMs::new(8))
+        .publish(
+            &store,
+            fresh.draft_id,
+            DraftRevision::new(1),
+            TimestampMs::new(8),
+        )
         .await
-        .expect_err("an older copy");
+        .expect_err("an older revision");
     assert!(
         error.to_string().contains("is not what this device holds"),
         "{error}"
@@ -1152,7 +1152,12 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
     )
     .expect("a store");
     let error = sync
-        .publish(&other_device, &fresh, TimestampMs::new(8))
+        .publish(
+            &other_device,
+            fresh.draft_id,
+            fresh.revision,
+            TimestampMs::new(8),
+        )
         .await
         .expect_err("another device's draft");
     assert!(error.to_string().contains("belongs to device"), "{error}");
@@ -1163,7 +1168,7 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         .forget_checkpoint(fresh.draft_id)
         .expect("the note is gone");
     let published = sync
-        .publish(&store, &fresh, TimestampMs::new(9))
+        .publish(&store, fresh.draft_id, fresh.revision, TimestampMs::new(9))
         .await
         .expect("an answer");
     assert!(
@@ -1175,8 +1180,32 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
         store.load(fresh.draft_id).expect("the draft").text,
         "a second draft, edited"
     );
+    // The fetch cleared the revision on the note, and the older revision is still refused: what
+    // decides that is the stored draft rather than the note.
+    let error = sync
+        .publish(
+            &store,
+            fresh.draft_id,
+            DraftRevision::new(1),
+            TimestampMs::new(9),
+        )
+        .await
+        .expect_err("an older revision, after a fetch");
+    assert!(
+        error.to_string().contains("is not what this device holds"),
+        "{error}"
+    );
     assert_eq!(
-        sync.publish(&store, &fresh, TimestampMs::new(10))
+        store
+            .checkpoint(fresh.draft_id)
+            .expect("a note")
+            .expect("a fetch wrote one")
+            .published_revision,
+        Nullable::null(),
+        "the note names no revision of this device's after a fetch"
+    );
+    assert_eq!(
+        sync.publish(&store, fresh.draft_id, fresh.revision, TimestampMs::new(10))
             .await
             .expect("an answer"),
         Published::Accepted { generation: 3 },
@@ -1397,7 +1426,7 @@ fn kr_cli_build_id() -> BuildId {
 }
 
 #[tokio::test]
-async fn every_local_operation_works_with_no_managed_service_and_with_every_one_replaced() {
+async fn a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_change_with_one() {
     let host = side(1, true).await;
     let client = side(2, false).await;
     let directory = tempfile::tempdir().expect("a directory");
@@ -1405,7 +1434,9 @@ async fn every_local_operation_works_with_no_managed_service_and_with_every_one_
 
     // The same work, twice: once with nothing configured, once with every service replaced by a
     // client that answers nothing. Section 17 says the local product is complete without any of
-    // them, so the two runs have to be indistinguishable.
+    // them, so what a session, a draft store and a control decide has to be the same both times.
+    // None of these paths reaches a service at all, which is the claim: not that every observable
+    // in the library is unchanged, but that this work never asks.
     let mut observed = Vec::new();
     for (round, clients) in [
         ("nothing configured", ServiceClients::none()),
@@ -1487,7 +1518,7 @@ async fn every_local_operation_works_with_no_managed_service_and_with_every_one_
         assert_eq!(availability.len(), ManagedService::ALL.len(), "{round}");
         for report in &availability {
             assert_eq!(
-                report.available,
+                report.configured,
                 clients.holds(report.service),
                 "{round}: {report:?}"
             );
@@ -1499,7 +1530,7 @@ async fn every_local_operation_works_with_no_managed_service_and_with_every_one_
         if clients.is_empty() {
             // Nothing configured: each report says so and says what to do instead.
             assert!(
-                availability.iter().all(|report| !report.available),
+                availability.iter().all(|report| !report.configured),
                 "{round}"
             );
             assert!(
@@ -1512,7 +1543,7 @@ async fn every_local_operation_works_with_no_managed_service_and_with_every_one_
             // A service replaced by one that answers nothing is configured, and says which service
             // it is refusing for when it is called. Neither is a claim that anything is entitled.
             assert!(
-                availability.iter().all(|report| report.available),
+                availability.iter().all(|report| report.configured),
                 "{round}"
             );
             let refusal = clients
