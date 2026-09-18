@@ -21,6 +21,9 @@ the invocation ends.
 
 ## What it holds
 
+Three guarantees, on the platforms that can hold them. macOS and Linux can; Windows cannot, and the
+service refuses there rather than claiming them, which the table and the section after it explain.
+
 **Only Git executes.** The Git program, the helpers under Git's own `--exec-path`, and the approved
 credential broker's ssh program for a remote that needs one. A driver, filter, hook, credential
 helper, pager, filesystem monitor or `core.sshCommand` planted anywhere else — in the repository, in
