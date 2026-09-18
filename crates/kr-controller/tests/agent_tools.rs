@@ -42,6 +42,20 @@ impl WorkerSupervisor for NoWorkers {
     }
 }
 
+/// What this platform refuses such a removal with.
+///
+/// Everywhere the skill can be installed, the request is what is wrong with it. On Windows nothing
+/// gets as far as the request: this host cannot make a change there it could account for after a
+/// crash, so it makes none. Either way the refusal comes before the dispatch marker, which is what
+/// this test is about.
+fn refusal() -> ErrorCode {
+    if cfg!(windows) {
+        ErrorCode::PermissionDenied
+    } else {
+        ErrorCode::InvalidArgument
+    }
+}
+
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
@@ -118,7 +132,7 @@ async fn a_removal_the_daemon_will_not_do_leaves_no_dispatch_marker() {
         .expect("the call reaches the daemon")
         .expect_err("and is refused");
 
-    assert_eq!(refused.code, ErrorCode::InvalidArgument, "{refused:?}");
+    assert_eq!(refused.code, refusal(), "{refused:?}");
     let actions = host.state_dir.join("agent-tools/actions");
     assert!(
         !actions.exists()
@@ -136,5 +150,5 @@ async fn a_removal_the_daemon_will_not_do_leaves_no_dispatch_marker() {
         .await
         .expect("the call reaches the daemon")
         .expect_err("and is refused again");
-    assert_eq!(again.code, ErrorCode::InvalidArgument, "{again:?}");
+    assert_eq!(again.code, refusal(), "{again:?}");
 }
