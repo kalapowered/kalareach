@@ -9,10 +9,12 @@
 use std::sync::Arc;
 
 use kr_ipc::client::LocalClient;
+use kr_protocol::attachment::ViewportPosition;
 use kr_protocol::envelope::ControlFrame;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{InputLeaseEpoch, SessionId};
 use kr_protocol::method::Method;
+use kr_protocol::scalars::{Nullable, U64};
 use kr_protocol::session::Dimensions;
 use kr_protocol::worker::WorkerDescriptor;
 
@@ -83,6 +85,93 @@ pub struct AttachOptions {
     pub take_geometry: bool,
     /// Skip the outer terminal's capability probe and use the conservative profile.
     pub no_probe: bool,
+    /// Come back to the live screen as soon as the session writes something.
+    ///
+    /// Off by default, because a person reading their scrollback has asked to look at what is
+    /// above the live page and a chatty session would pull them off it on the next line. It is the
+    /// client's own choice: nothing on the wire follows or does not follow, and the host goes on
+    /// delivering live output either way.
+    pub follow_live: bool,
+}
+
+/// How far one scroll-back step moves this terminal's window.
+///
+/// A whole window less one line. The line that stays is the join: a person reading upwards keeps
+/// one line of what they have just read at the other edge, and knows the two pages are continuous.
+fn scroll_step(rows: u16) -> u64 {
+    u64::from(rows.saturating_sub(1)).max(1)
+}
+
+/// What one key the person pressed asks of this terminal's own scroll-back.
+///
+/// It asks nothing of the session: section 8 puts passive scrollback with focus events and
+/// terminal replies among the things that do not seize the input lease, so these keys are answered
+/// by reporting where this window is looking and never by writing input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scroll {
+    /// Back, towards the oldest rows the session still holds.
+    Back,
+    /// Forward, towards the live screen.
+    Forward,
+}
+
+/// Shift and Page Up, which is what a terminal sends for the usual scroll-back key.
+const SCROLL_BACK_KEY: &[u8] = b"\x1b[5;2~";
+
+/// Shift and Page Down.
+const SCROLL_FORWARD_KEY: &[u8] = b"\x1b[6;2~";
+
+/// Takes the scroll-back keys out of what the terminal sent, leaving the session's own input.
+///
+/// A key is recognised inside the read it arrived in. A terminal writes the bytes of one key in
+/// one go, and holding back the beginning of a sequence in case the rest of it is coming would
+/// delay an Escape the person meant - which is the one key an editor cannot wait for.
+fn split_scrollback(bytes: &[u8]) -> (Vec<Scroll>, Vec<u8>) {
+    let mut scrolls = Vec::new();
+    let mut input = Vec::with_capacity(bytes.len());
+    let mut at = 0_usize;
+    while at < bytes.len() {
+        let rest = &bytes[at..];
+        if rest.starts_with(SCROLL_BACK_KEY) {
+            scrolls.push(Scroll::Back);
+            at += SCROLL_BACK_KEY.len();
+        } else if rest.starts_with(SCROLL_FORWARD_KEY) {
+            scrolls.push(Scroll::Forward);
+            at += SCROLL_FORWARD_KEY.len();
+        } else {
+            input.push(bytes[at]);
+            at += 1;
+        }
+    }
+    (scrolls, input)
+}
+
+/// The row an answer says this window landed on, or `None` for the live screen.
+const fn landed(position: Option<ViewportPosition>) -> Option<u64> {
+    match position {
+        None => None,
+        Some(ViewportPosition::Row(row) | ViewportPosition::Above(row)) => Some(row.get()),
+    }
+}
+
+/// Where a scroll-back step puts this terminal's window.
+///
+/// `parked` is the row the host last said this window starts at, and `None` means it is on the
+/// live screen. Going back from the live screen is the one case that cannot name a row: this
+/// client has not been given one above the page it is looking at, so it asks by distance and the
+/// host answers with the row it landed on.
+fn scrolled(parked: Option<u64>, scroll: Scroll, step: u64) -> Option<ViewportPosition> {
+    match (parked, scroll) {
+        (None, Scroll::Back) => Some(ViewportPosition::Above(U64::new(step))),
+        (Some(row), Scroll::Back) => {
+            Some(ViewportPosition::Row(U64::new(row.saturating_sub(step))))
+        }
+        // Already on the live screen, which is as far forward as a window goes.
+        (None, Scroll::Forward) => None,
+        (Some(row), Scroll::Forward) => {
+            Some(ViewportPosition::Row(U64::new(row.saturating_add(step))))
+        }
+    }
 }
 
 /// Attaches this terminal to a session and drives it until the attachment ends.
@@ -257,6 +346,7 @@ pub async fn run(
         &terminal,
         resized.as_mut(),
         &mut display,
+        options.follow_live,
     )
     .await;
 
@@ -321,6 +411,8 @@ enum Outstanding {
     Viewport,
     /// A fresh screen this terminal asked for after a resynchronisation marker.
     Resubscribe,
+    /// Where this terminal's window is now looking, after a scroll-back key.
+    Scrollback,
 }
 
 /// Runs the attachment's input, output and connection in one loop.
@@ -338,6 +430,7 @@ async fn drive(
     terminal: &ControllingTerminal,
     resized: Option<&mut WindowChanges>,
     display: &mut crate::render::ProjectedDisplay,
+    follow_live: bool,
 ) -> AttachOutcome {
     use std::io::Write as _;
 
@@ -356,6 +449,10 @@ async fn drive(
     let mut outstanding: std::collections::BTreeMap<kr_protocol::ids::RequestId, Outstanding> =
         std::collections::BTreeMap::new();
     let mut next_request = 1_u64;
+    // The row this terminal's window starts at while it is looking above the live page. `None` is
+    // the live screen. It is reported with every size report as well, so a window the person has
+    // scrolled back to stays where they put it when they resize their terminal.
+    let mut parked: Option<u64> = None;
 
     // What the person typed while the host was asking the terminal what it was. It was buffered
     // rather than discarded, and it is the first thing the application receives, in the order it
@@ -424,7 +521,43 @@ async fn drive(
                                 outstanding.insert(request_id, Outstanding::Resubscribe);
                                 continue;
                             };
+                            let changed = notification.event_type.as_str()
+                                == kr_protocol::projection::PROJECTION_DELTA_EVENT;
                             let drawn = display.apply(event);
+                            // The client's own choice, not the session's: a person who asked to
+                            // follow the live screen is taken back to it the moment the session
+                            // writes, and one who did not stays where they scrolled to while the
+                            // output goes on arriving underneath.
+                            if follow_live && changed && parked.is_some() {
+                                let request_id = kr_protocol::ids::RequestId::new(next_request);
+                                next_request += 1;
+                                if let Ok(size) = terminal.size()
+                                    && size.columns > 0
+                                    && size.rows > 0
+                                {
+                                    let params =
+                                        kr_protocol::attachment::AttachmentViewportParams {
+                                            attachment_id,
+                                            dimensions: Dimensions::new(
+                                                u64::from(size.columns),
+                                                u64::from(size.rows),
+                                            ),
+                                            position: Nullable(None),
+                                        };
+                                    if !send_geometry(
+                                        client,
+                                        descriptor,
+                                        request_id,
+                                        Method::AttachmentViewport,
+                                        &params,
+                                    )
+                                    .await
+                                    {
+                                        return AttachOutcome::Disconnected;
+                                    }
+                                    outstanding.insert(request_id, Outstanding::Scrollback);
+                                }
+                            }
                             if !drawn.bytes.is_empty() {
                                 let mut handle = output.as_ref();
                                 if handle.write_all(&drawn.bytes).is_err() {
@@ -512,6 +645,11 @@ async fn drive(
                                                 u64::from(size.columns),
                                                 u64::from(size.rows),
                                             ),
+                                            position: Nullable(
+                                                parked.map(|row| {
+                                                    ViewportPosition::Row(U64::new(row))
+                                                }),
+                                            ),
                                         };
                                     if !send_geometry(
                                         client,
@@ -536,6 +674,7 @@ async fn drive(
                                         kr_protocol::attachment::AttachmentViewportResult,
                                     >()
                                 {
+                                    parked = landed(result.position.0);
                                     geometry_epoch = result.geometry.epoch;
                                     owns_geometry =
                                         result.geometry.owner.as_ref() == Some(&attachment_id);
@@ -592,6 +731,20 @@ async fn drive(
                                 };
                             }
                             (Outstanding::Input(_), kr_protocol::envelope::Outcome::Ok(_)) => {}
+                            // A scroll-back report answers with the row the window actually
+                            // landed on, which is not always the one it asked for: a row the
+                            // session has given up becomes the oldest one it still holds, and a
+                            // row inside the live page becomes the live screen. The pages that
+                            // cover it arrive as ordinary output.
+                            (Outstanding::Scrollback, outcome) => {
+                                if let kr_protocol::envelope::Outcome::Ok(value) = outcome
+                                    && let Ok(result) = value.to_typed::<
+                                        kr_protocol::attachment::AttachmentViewportResult,
+                                    >()
+                                {
+                                    parked = landed(result.position.0);
+                                }
+                            }
                             // The screen follows as ordinary output. A refusal means the session no
                             // longer has this attachment, which is the end of it.
                             (Outstanding::Resubscribe, outcome) => {
@@ -646,6 +799,9 @@ async fn drive(
                     let params = kr_protocol::attachment::AttachmentViewportParams {
                         attachment_id,
                         dimensions,
+                        position: Nullable(
+                            parked.map(|row| ViewportPosition::Row(U64::new(row))),
+                        ),
                     };
                     (
                         send_geometry(
@@ -669,6 +825,47 @@ async fn drive(
                     // The terminal's own input ended. Nothing is left to forward.
                     return AttachOutcome::Detached;
                 };
+                // The scroll-back keys first. They belong to this terminal's own presentation:
+                // they move the window it is looking through and never reach the session, so an
+                // attachment that may not type can still read what is above the live page.
+                let (scrolls, bytes) = split_scrollback(&bytes);
+                for scroll in scrolls {
+                    let Ok(size) = terminal.size() else {
+                        continue;
+                    };
+                    if size.columns == 0 || size.rows == 0 {
+                        continue;
+                    }
+                    let Some(position) = scrolled(parked, scroll, scroll_step(size.rows)) else {
+                        // Already on the live screen, which is as far forward as a window goes.
+                        continue;
+                    };
+                    let request_id = kr_protocol::ids::RequestId::new(next_request);
+                    next_request += 1;
+                    let params = kr_protocol::attachment::AttachmentViewportParams {
+                        attachment_id,
+                        dimensions: Dimensions::new(
+                            u64::from(size.columns),
+                            u64::from(size.rows),
+                        ),
+                        position: Nullable(Some(position)),
+                    };
+                    if !send_geometry(
+                        client,
+                        descriptor,
+                        request_id,
+                        Method::AttachmentViewport,
+                        &params,
+                    )
+                    .await
+                    {
+                        return AttachOutcome::Disconnected;
+                    }
+                    outstanding.insert(request_id, Outstanding::Scrollback);
+                }
+                if bytes.is_empty() {
+                    continue;
+                }
                 let Some(epoch) = epoch else {
                     // This terminal may not type. The bytes go nowhere, and the attachment goes on
                     // watching rather than ending on a refusal it already knows about.

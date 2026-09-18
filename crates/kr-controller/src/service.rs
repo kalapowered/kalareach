@@ -2279,6 +2279,13 @@ impl Controller {
         carried: crate::authority::AdmittedMutation,
     ) -> Result<ParamsValue> {
         let create: SessionCreateParams = parse(&mutation.params)?;
+        // Before the reservation, because this is a request that can never be served rather than
+        // one this environment happens to have no room for. The palette travels to the worker in
+        // the launch specification and is recorded there; what cannot travel is a provenance
+        // nothing measured.
+        if let Some(refusal) = create.palette_refusal() {
+            return Err(ControllerError::InvalidArgument(refusal));
+        }
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         // The create request itself is recorded with the reservation, before anything is spawned.
@@ -3368,6 +3375,7 @@ mod a_create_that_launches_nothing {
             dimensions: Nullable::null(),
             worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
             environment_snapshot: Vec::new(),
+            palette: Nullable::null(),
         }
     }
 

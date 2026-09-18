@@ -112,6 +112,21 @@ export type AttachmentCapability = 'observe_terminal' | 'observe_semantic' | 'in
  */
 export type TerminalPresentationMode = 'direct' | 'viewport'
 /**
+ * Where an attachment's window sits in the session's rows.
+ *
+ * A window is normally on the live screen, which is what no position at all means. A client
+ * looking through its scrollback names where it is looking instead, and the host installs the
+ * history pages that cover it. Scrolling is a presentation choice and never touches the input
+ * lease: section 8 puts passive scrollback with focus events and terminal replies.
+ */
+export type ViewportPosition =
+  | {
+      row: U64
+    }
+  | {
+      above: U64
+    }
+/**
  * One CLI or application attachment, independently of its device.
  */
 export type AttachmentId = string
@@ -242,6 +257,25 @@ export type ControlEvent =
       action_window_renewed: ActionWindow
     }
   | 'keepalive'
+/**
+ * A palette a session can be started with, chosen before the shell has produced anything.
+ *
+ * Section 8 fixes the palette at creation and records where it came from. A preset is what a
+ * no-probe or invisible creation selects, because neither has a terminal whose colours could be
+ * asked for; the probe form carries the foreground and background a client learned from its own
+ * bounded probe of the terminal the person is sitting at.
+ */
+export type PaletteRequest =
+  | {
+      preset: PalettePreset
+    }
+  | {
+      probe: ProbedPalette
+    }
+/**
+ * One of the two palettes a creation can select without asking a terminal anything.
+ */
+export type PalettePreset = 'light' | 'dark'
 /**
  * What one of the control daemon's connections to a worker is for.
  *
@@ -2587,6 +2621,10 @@ export interface AttachmentViewportParams {
    */
   attachment_id: string
   dimensions: Dimensions1
+  /**
+   * Where its window sits. Null is the live screen.
+   */
+  position: ViewportPosition | null
 }
 /**
  * A terminal geometry in columns and rows.
@@ -2609,6 +2647,14 @@ export interface Dimensions1 {
  */
 export interface AttachmentViewportResult {
   geometry: GeometryState
+  /**
+   * Where the window ended up, as a row identifier, or null for the live screen.
+   *
+   * A request above the oldest row the session still holds is answered with the oldest one
+   * there is rather than refused, and a request at or below the live screen's first row is
+   * answered with the live screen. Either way this says where the window actually is.
+   */
+  position: ViewportPosition | null
   /**
    * How a terminal attachment displays the canonical grid.
    */
@@ -3642,6 +3688,14 @@ export interface SessionCreateParams {
    */
   environment_snapshot: EnvironmentVariable[]
   /**
+   * The palette this session starts with. Null takes the profile default.
+   *
+   * This is the one moment the palette can be chosen: section 8 fixes it at creation, and
+   * afterwards only an authorised explicit change moves it. The provenance is recorded either
+   * way, so a palette query can say where the session's colours came from.
+   */
+  palette: PaletteRequest | null
+  /**
    * How the session is presented locally.
    */
   presentation: 'attach' | 'terminal' | 'invisible'
@@ -3670,6 +3724,47 @@ export interface EnvironmentVariable {
    * The value.
    */
   value: string
+}
+/**
+ * The default foreground and background a client's bounded probe established.
+ */
+export interface ProbedPalette {
+  background: Rgb
+  foreground: Rgb1
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb1 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
 }
 /**
  * What a worker reports once its root shell is running.
@@ -7631,56 +7726,22 @@ export interface ProjectedMode {
  * The session's canonical palette and where it came from.
  */
 export interface PaletteState {
-  background: Rgb
-  cursor: Rgb1
-  foreground: Rgb2
+  background: Rgb2
+  cursor: Rgb3
+  foreground: Rgb4
   /**
    * The indexed colours that differ from the profile default.
    */
   overrides: PaletteOverride[]
-  pointer_background: Rgb4
-  pointer_foreground: Rgb5
-  selection_background: Rgb6
-  selection_foreground: Rgb7
+  pointer_background: Rgb6
+  pointer_foreground: Rgb7
+  selection_background: Rgb8
+  selection_foreground: Rgb9
   /**
    * Where this palette came from.
    */
   source:
     'profile_default' | 'client_preference' | 'light_preset' | 'dark_preset' | 'explicit_change'
-}
-/**
- * A direct colour.
- */
-export interface Rgb {
-  /**
-   * Blue.
-   */
-  blue: number
-  /**
-   * Green.
-   */
-  green: number
-  /**
-   * Red.
-   */
-  red: number
-}
-/**
- * A direct colour.
- */
-export interface Rgb1 {
-  /**
-   * Blue.
-   */
-  blue: number
-  /**
-   * Green.
-   */
-  green: number
-  /**
-   * Red.
-   */
-  red: number
 }
 /**
  * A direct colour.
@@ -7698,16 +7759,6 @@ export interface Rgb2 {
    * Red.
    */
   red: number
-}
-/**
- * One indexed colour that differs from the profile default.
- */
-export interface PaletteOverride {
-  colour: Rgb3
-  /**
-   * The palette index.
-   */
-  index: number
 }
 /**
  * A direct colour.
@@ -7742,6 +7793,16 @@ export interface Rgb4 {
    * Red.
    */
   red: number
+}
+/**
+ * One indexed colour that differs from the profile default.
+ */
+export interface PaletteOverride {
+  colour: Rgb5
+  /**
+   * The palette index.
+   */
+  index: number
 }
 /**
  * A direct colour.
@@ -7795,6 +7856,40 @@ export interface Rgb7 {
   red: number
 }
 /**
+ * A direct colour.
+ */
+export interface Rgb8 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb9 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
  * The graphic rendition of a run of cells.
  */
 export interface CellRendition {
@@ -7807,7 +7902,7 @@ export interface CellRendition {
         indexed: number
       }
     | {
-        direct: Rgb8
+        direct: Rgb10
       }
   /**
    * The blink rate.
@@ -7830,7 +7925,7 @@ export interface CellRendition {
         indexed: number
       }
     | {
-        direct: Rgb8
+        direct: Rgb10
       }
   /**
    * Invisible.
@@ -7865,7 +7960,7 @@ export interface CellRendition {
         indexed: number
       }
     | {
-        direct: Rgb8
+        direct: Rgb10
       }
   /**
    * The position against the baseline.
@@ -7875,7 +7970,7 @@ export interface CellRendition {
 /**
  * A direct colour.
  */
-export interface Rgb8 {
+export interface Rgb10 {
   /**
    * Blue.
    */
@@ -7951,7 +8046,7 @@ export interface CellRendition1 {
         indexed: number
       }
     | {
-        direct: Rgb8
+        direct: Rgb10
       }
   /**
    * The blink rate.
@@ -7974,7 +8069,7 @@ export interface CellRendition1 {
         indexed: number
       }
     | {
-        direct: Rgb8
+        direct: Rgb10
       }
   /**
    * Invisible.
@@ -8009,7 +8104,7 @@ export interface CellRendition1 {
         indexed: number
       }
     | {
-        direct: Rgb8
+        direct: Rgb10
       }
   /**
    * The position against the baseline.
@@ -8077,7 +8172,7 @@ export interface CellRendition2 {
         indexed: number
       }
     | {
-        direct: Rgb8
+        direct: Rgb10
       }
   /**
    * The blink rate.
@@ -8100,7 +8195,7 @@ export interface CellRendition2 {
         indexed: number
       }
     | {
-        direct: Rgb8
+        direct: Rgb10
       }
   /**
    * Invisible.
@@ -8135,7 +8230,7 @@ export interface CellRendition2 {
         indexed: number
       }
     | {
-        direct: Rgb8
+        direct: Rgb10
       }
   /**
    * The position against the baseline.
@@ -8418,17 +8513,17 @@ export interface MarginState1 {
  * The session's canonical palette and where it came from.
  */
 export interface PaletteState1 {
-  background: Rgb
-  cursor: Rgb1
-  foreground: Rgb2
+  background: Rgb2
+  cursor: Rgb3
+  foreground: Rgb4
   /**
    * The indexed colours that differ from the profile default.
    */
   overrides: PaletteOverride[]
-  pointer_background: Rgb4
-  pointer_foreground: Rgb5
-  selection_background: Rgb6
-  selection_foreground: Rgb7
+  pointer_background: Rgb6
+  pointer_foreground: Rgb7
+  selection_background: Rgb8
+  selection_foreground: Rgb9
   /**
    * Where this palette came from.
    */
@@ -8448,7 +8543,7 @@ export interface CellRendition3 {
         indexed: number
       }
     | {
-        direct: Rgb8
+        direct: Rgb10
       }
   /**
    * The blink rate.
@@ -8471,7 +8566,7 @@ export interface CellRendition3 {
         indexed: number
       }
     | {
-        direct: Rgb8
+        direct: Rgb10
       }
   /**
    * Invisible.
@@ -8506,7 +8601,7 @@ export interface CellRendition3 {
         indexed: number
       }
     | {
-        direct: Rgb8
+        direct: Rgb10
       }
   /**
    * The position against the baseline.
@@ -11399,6 +11494,14 @@ export interface SessionCreateParams1 {
    * KalaReach variables out of it, and execution-context values take precedence over it.
    */
   environment_snapshot: EnvironmentVariable[]
+  /**
+   * The palette this session starts with. Null takes the profile default.
+   *
+   * This is the one moment the palette can be chosen: section 8 fixes it at creation, and
+   * afterwards only an authorised explicit change moves it. The provenance is recorded either
+   * way, so a palette query can say where the session's colours came from.
+   */
+  palette: PaletteRequest | null
   /**
    * How the session is presented locally.
    */

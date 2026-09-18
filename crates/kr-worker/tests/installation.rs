@@ -179,6 +179,7 @@ fn building_an_installation_holds_a_run_of_rows_rather_than_the_screen() {
     let (short_install, short_peak) = peak_of(|| {
         short.projection_install(
             dimensions(320, 16),
+            kr_worker::projection::ViewportAnchor::LiveScreen,
             ProjectionResetReason::Attached,
             LaneGate::default(),
             0,
@@ -189,6 +190,7 @@ fn building_an_installation_holds_a_run_of_rows_rather_than_the_screen() {
     let (tall_install, tall_peak) = peak_of(|| {
         tall.projection_install(
             dimensions(320, 160),
+            kr_worker::projection::ViewportAnchor::LiveScreen,
             ProjectionResetReason::Attached,
             LaneGate::default(),
             0,

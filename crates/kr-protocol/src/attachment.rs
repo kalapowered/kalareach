@@ -186,6 +186,25 @@ pub struct SessionDetachResult {
     pub remaining: U64,
 }
 
+/// Where an attachment's window sits in the session's rows.
+///
+/// A window is normally on the live screen, which is what no position at all means. A client
+/// looking through its scrollback names where it is looking instead, and the host installs the
+/// history pages that cover it. Scrolling is a presentation choice and never touches the input
+/// lease: section 8 puts passive scrollback with focus events and terminal replies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ViewportPosition {
+    /// The stable identifier of the first row shown, taken from the pages the client holds.
+    Row(U64),
+    /// How many rows above the live screen's first row the window starts.
+    ///
+    /// For a client that has not yet been given a row identifier to name. The host resolves it
+    /// against the live screen at the moment of the report and answers with the row it landed on,
+    /// so the window stays where the person put it while the session goes on writing.
+    Above(U64),
+}
+
 /// Parameters of `attachment.viewport`.
 ///
 /// Every terminal attachment reports its own physical dimensions, whether or not it owns the size.
@@ -196,6 +215,8 @@ pub struct AttachmentViewportParams {
     pub attachment_id: AttachmentId,
     /// Its current physical dimensions.
     pub dimensions: Dimensions,
+    /// Where its window sits. Null is the live screen.
+    pub position: Nullable<ViewportPosition>,
 }
 
 /// The result of `attachment.viewport`.
@@ -206,6 +227,12 @@ pub struct AttachmentViewportResult {
     pub geometry: GeometryState,
     /// How this attachment now displays the canonical grid.
     pub presentation: TerminalPresentationMode,
+    /// Where the window ended up, as a row identifier, or null for the live screen.
+    ///
+    /// A request above the oldest row the session still holds is answered with the oldest one
+    /// there is rather than refused, and a request at or below the live screen's first row is
+    /// answered with the live screen. Either way this says where the window actually is.
+    pub position: Nullable<ViewportPosition>,
 }
 
 /// Parameters of `attachment.configure`.

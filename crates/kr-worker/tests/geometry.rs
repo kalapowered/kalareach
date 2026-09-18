@@ -361,9 +361,9 @@ async fn only_the_owners_resize_moves_the_pseudo_terminal() {
     {
         let mut session = runtime.session();
         let presentation = session
-            .viewport(watcher, Dimensions::new(52, 14))
+            .viewport(watcher, Dimensions::new(52, 14), None)
             .expect("every terminal attachment reports its own size");
-        assert_eq!(presentation, TerminalPresentationMode::Viewport);
+        assert_eq!(presentation.0, TerminalPresentationMode::Viewport);
         assert_eq!(
             session.geometry().dimensions,
             CANONICAL,
@@ -1133,6 +1133,7 @@ async fn a_window_that_changed_presentation_is_told_while_the_application_is_idl
             ActionId::new(kr_ipc::new_uuid()),
             wired.target(),
             &AttachmentViewportParams {
+                position: kr_protocol::scalars::Nullable::null(),
                 attachment_id: attachment,
                 dimensions: Dimensions::new(40, 12),
             },
@@ -1161,6 +1162,7 @@ async fn a_window_that_changed_presentation_is_told_while_the_application_is_idl
             ActionId::new(kr_ipc::new_uuid()),
             wired.target(),
             &AttachmentViewportParams {
+                position: kr_protocol::scalars::Nullable::null(),
                 attachment_id: attachment,
                 dimensions: CANONICAL,
             },
@@ -1279,6 +1281,7 @@ async fn the_attachment_methods_answer_with_the_geometry_and_the_epoch_they_prod
             ActionId::new(kr_ipc::new_uuid()),
             wired.target(),
             &AttachmentViewportParams {
+                position: kr_protocol::scalars::Nullable::null(),
                 attachment_id: owner,
                 dimensions: Dimensions::new(52, 14),
             },

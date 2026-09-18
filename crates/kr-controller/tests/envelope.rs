@@ -92,6 +92,7 @@ fn create_params(environment_id: EnvironmentId) -> SessionCreateParams {
         dimensions: Nullable::null(),
         worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
         environment_snapshot: Vec::new(),
+        palette: Nullable::null(),
     }
 }
 

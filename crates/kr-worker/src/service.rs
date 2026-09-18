@@ -3261,11 +3261,20 @@ impl WorkerService {
             }
             Method::AttachmentViewport => {
                 let params: AttachmentViewportParams = parse(params)?;
-                let presentation = session.viewport(params.attachment_id, params.dimensions)?;
+                let (presentation, top_row) =
+                    session.viewport(params.attachment_id, params.dimensions, params.position.0)?;
                 Ok((
                     encode(&AttachmentViewportResult {
                         geometry: session.geometry(),
                         presentation,
+                        // Where the window actually landed, which is not always where it was
+                        // asked to go: a row the session has given up becomes the oldest one it
+                        // still holds, and a row inside the live page becomes the live page.
+                        position: Nullable(top_row.map(|row| {
+                            kr_protocol::attachment::ViewportPosition::Row(U64::new(
+                                u64::try_from(row).unwrap_or_default(),
+                            ))
+                        })),
                     })?,
                     AfterEffect::None,
                 ))

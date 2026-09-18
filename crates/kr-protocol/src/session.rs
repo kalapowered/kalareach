@@ -572,6 +572,74 @@ pub struct SessionSummary {
     pub closure: Nullable<ClosureRecord>,
 }
 
+/// A palette a session can be started with, chosen before the shell has produced anything.
+///
+/// Section 8 fixes the palette at creation and records where it came from. A preset is what a
+/// no-probe or invisible creation selects, because neither has a terminal whose colours could be
+/// asked for; the probe form carries the foreground and background a client learned from its own
+/// bounded probe of the terminal the person is sitting at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum PaletteRequest {
+    /// One of the two presets.
+    Preset(PalettePreset),
+    /// The colours a client shared from its bounded probe.
+    Probe(ProbedPalette),
+}
+
+impl PaletteRequest {
+    /// Whether this form needs a terminal to have been asked.
+    ///
+    /// An invisible creation has no terminal, so colours attributed to a probe of one would be an
+    /// invented provenance rather than a shared measurement.
+    #[must_use]
+    pub const fn needs_a_terminal(self) -> bool {
+        matches!(self, Self::Probe(_))
+    }
+}
+
+/// One of the two palettes a creation can select without asking a terminal anything.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum PalettePreset {
+    /// Dark text on a light background.
+    Light,
+    /// Light text on a dark background.
+    Dark,
+}
+
+impl PalettePreset {
+    /// Both presets, in declaration order.
+    pub const ALL: [Self; 2] = [Self::Light, Self::Dark];
+
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Light => "light",
+            Self::Dark => "dark",
+        }
+    }
+}
+
+impl fmt::Display for PalettePreset {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The default foreground and background a client's bounded probe established.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ProbedPalette {
+    /// The default foreground the terminal reported.
+    pub foreground: crate::projection::Rgb,
+    /// The default background the terminal reported.
+    pub background: crate::projection::Rgb,
+}
+
 /// Parameters of `session.create`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -593,6 +661,28 @@ pub struct SessionCreateParams {
     /// The creator's environment snapshot. The host filters terminal identity and reserved
     /// KalaReach variables out of it, and execution-context values take precedence over it.
     pub environment_snapshot: Vec<EnvironmentVariable>,
+    /// The palette this session starts with. Null takes the profile default.
+    ///
+    /// This is the one moment the palette can be chosen: section 8 fixes it at creation, and
+    /// afterwards only an authorised explicit change moves it. The provenance is recorded either
+    /// way, so a palette query can say where the session's colours came from.
+    pub palette: Nullable<PaletteRequest>,
+}
+
+impl SessionCreateParams {
+    /// Why this request's palette does not suit the presentation it asks for, when it does not.
+    ///
+    /// An invisible session has no terminal, so colours attributed to a bounded probe of one would
+    /// record a provenance nothing measured. Such a creation selects a preset instead.
+    #[must_use]
+    pub fn palette_refusal(&self) -> Option<String> {
+        let request = self.palette.as_ref()?;
+        (self.presentation == Presentation::Invisible && request.needs_a_terminal()).then(|| {
+            "an invisible session has no terminal to probe, so its palette is a light or dark \
+             preset rather than probed colours"
+                .to_owned()
+        })
+    }
 }
 
 /// The result of `session.create`.

@@ -184,7 +184,10 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     // run out reads it.
     let shared_clock: std::sync::Arc<dyn kr_ipc::clock::SharedClock> =
         std::sync::Arc::new(kr_ipc::clock::SystemSharedClock);
-    let runtime = match start_or_record(config, std::sync::Arc::clone(&shared_clock)) {
+    // The palette the create request named, or the profile default when it named none. It is
+    // applied before the shell runs, because a session's palette is fixed at creation.
+    let palette = kr_worker::snapshot::PaletteChoice::from_request(specification.create.palette.0);
+    let runtime = match start_or_record(config, palette, std::sync::Arc::clone(&shared_clock)) {
         Ok(runtime) => runtime,
         Err(failure) => {
             let error = ProtocolError::new(failure.error.code(), failure.error.to_string());

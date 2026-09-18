@@ -98,6 +98,15 @@ async fn run(cli: Cli) -> Result<Completion> {
             // before anything connects. A selector that is ignored would create the session
             // somewhere else and say nothing about it.
             let environment = kr_cli::resolve::select(&paths, arguments.environment.as_deref())?;
+            // The palette before the geometry, because the probe form asks this terminal a
+            // question and a refusal should come before a session exists rather than after.
+            let palette = match arguments.palette.as_deref() {
+                Some(value) => Some(kr_cli::create::resolve(
+                    kr_cli::create::PaletteChoice::parse(value)?,
+                    presentation,
+                )?),
+                None => None,
+            };
             let dimensions = match presentation {
                 Presentation::Attach => {
                     // The creating terminal's size is registered before the shell starts, so the
@@ -122,6 +131,9 @@ async fn run(cli: Cli) -> Result<Completion> {
                 dimensions: Nullable(dimensions),
                 worker_profile: worker_profile(presentation),
                 environment_snapshot: snapshot(),
+                // Chosen here, before anything connects, because a probe of this terminal is part
+                // of choosing it and a session's palette is fixed at creation.
+                palette: Nullable(palette),
             };
             let mut client = open_controller(&environment.paths, build_id()).await?;
             let outcome = client
@@ -180,6 +192,7 @@ async fn run(cli: Cli) -> Result<Completion> {
                 AttachOptions {
                     take_geometry: arguments.take_geometry,
                     no_probe: arguments.no_probe,
+                    follow_live: arguments.follow_live,
                 },
             )
             .await?;
@@ -451,6 +464,9 @@ async fn present(
                     // geometry, which is what section 8 makes the default for a creating client.
                     take_geometry: true,
                     no_probe: false,
+                    // A terminal that has just created a session has nothing above its live page
+                    // to look at, so there is nothing to come back from.
+                    follow_live: false,
                 },
             )
             .await?;

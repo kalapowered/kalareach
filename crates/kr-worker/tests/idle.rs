@@ -189,6 +189,7 @@ fn install_for(
     let (update, _) = engine
         .projection_install(
             window,
+            kr_worker::projection::ViewportAnchor::LiveScreen,
             ProjectionResetReason::Attached,
             LaneGate::default(),
             0,
@@ -200,7 +201,8 @@ fn install_for(
         attachment,
         kr_worker::snapshot::Held {
             base: update.base,
-            viewport: engine.anchored_viewport(window),
+            viewport: engine
+                .anchored_viewport(window, kr_worker::projection::ViewportAnchor::LiveScreen),
         },
     );
 }

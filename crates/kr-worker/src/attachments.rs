@@ -56,6 +56,12 @@ pub struct Attachment {
     /// only *begin* at a boundary, so this is about the moment the transition would happen rather
     /// than about the attachment, and it is cleared the moment a boundary arrives.
     pub forwarding_held: bool,
+    /// The stable row this attachment's window starts at, when it is looking above the live page.
+    ///
+    /// `None` is the live screen, which is where every attachment starts. It is a row identifier
+    /// rather than a distance, because the live screen moves whenever the application writes and a
+    /// window measured from it would slide away from what the person is reading.
+    pub history_top_row: Option<i64>,
 }
 
 impl Attachment {
@@ -393,6 +399,7 @@ impl AttachmentTable {
             attached_at_ms: now,
             restoration_continues: true,
             forwarding_held: false,
+            history_top_row: None,
         };
         let eligible = attachment.is_eligible();
         self.attachments.insert(ordinal, attachment);
@@ -474,6 +481,7 @@ impl AttachmentTable {
         &mut self,
         id: AttachmentId,
         dimensions: Dimensions,
+        history_top_row: Option<i64>,
     ) -> Result<TerminalPresentationMode> {
         self.check_viewport(id, dimensions)?;
         let ordinal = *self.by_id.get(&id).ok_or_else(|| unknown(id))?;
@@ -484,6 +492,7 @@ impl AttachmentTable {
                 .get_mut(&ordinal)
                 .ok_or_else(|| unknown(id))?;
             attachment.dimensions = Some(dimensions);
+            attachment.history_top_row = history_top_row;
         }
         let carryable = self.carryable;
         let attachment = self
@@ -497,6 +506,13 @@ impl AttachmentTable {
                     "a semantic attachment has no terminal presentation".to_owned(),
                 )
             })
+    }
+
+    /// The stable row one attachment's window starts at, or `None` for the live screen.
+    #[must_use]
+    pub fn history_top_row(&self, id: AttachmentId) -> Option<i64> {
+        let ordinal = self.by_id.get(&id)?;
+        self.attachments.get(ordinal)?.history_top_row
     }
 
     /// Returns every terminal attachment being shown a rendering rather than the raw stream.
@@ -875,7 +891,7 @@ mod tests {
         assert_eq!(change.state.dimensions, Dimensions::new(100, 30));
         assert_eq!(
             table
-                .viewport(identifier(2), Dimensions::new(40, 20))
+                .viewport(identifier(2), Dimensions::new(40, 20), None)
                 .expect("reports"),
             TerminalPresentationMode::Viewport
         );
@@ -1000,7 +1016,7 @@ mod tests {
         attach(&mut table, 1, &terminal(120, 40, true));
         assert_eq!(
             table
-                .viewport(identifier(1), Dimensions::new(120, 40))
+                .viewport(identifier(1), Dimensions::new(120, 40), None)
                 .expect("reports"),
             TerminalPresentationMode::Direct
         );
@@ -1018,7 +1034,7 @@ mod tests {
         attach(&mut table, 1, &unqualified);
         assert_eq!(
             table
-                .viewport(identifier(1), Dimensions::new(120, 40))
+                .viewport(identifier(1), Dimensions::new(120, 40), None)
                 .expect("reports"),
             TerminalPresentationMode::Viewport
         );
@@ -1036,7 +1052,7 @@ mod tests {
         attach(&mut table, 1, &unprobed);
         assert_eq!(
             table
-                .viewport(identifier(1), Dimensions::new(120, 40))
+                .viewport(identifier(1), Dimensions::new(120, 40), None)
                 .expect("reports"),
             TerminalPresentationMode::Viewport
         );
@@ -1049,7 +1065,7 @@ mod tests {
         assert!(table.set_carryable(false), "the answer changed");
         assert_eq!(
             table
-                .viewport(identifier(1), Dimensions::new(120, 40))
+                .viewport(identifier(1), Dimensions::new(120, 40), None)
                 .expect("reports"),
             TerminalPresentationMode::Viewport
         );

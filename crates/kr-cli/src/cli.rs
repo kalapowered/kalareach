@@ -186,6 +186,11 @@ pub struct NewArguments {
     /// The shell integration mode. This build implements `native_compat`.
     #[arg(long, default_value = "native_compat")]
     pub shell_mode: String,
+    /// The palette the session starts with: `light`, `dark`, or `probe` to adopt this terminal's
+    /// own foreground and background. The profile default is used when this is absent, and an
+    /// invisible session cannot probe because it has no terminal.
+    #[arg(long)]
+    pub palette: Option<String>,
 }
 
 /// `kr attach`.
@@ -201,6 +206,10 @@ pub struct AttachArguments {
     /// Take size ownership for this terminal. Ordinary attach never moves it.
     #[arg(long)]
     pub take_geometry: bool,
+    /// Come back to the live screen as soon as the session writes something. Without this a window
+    /// scrolled back with Shift and Page Up stays where it was put.
+    #[arg(long)]
+    pub follow_live: bool,
     /// The environment, when a display number is ambiguous.
     #[arg(long)]
     pub environment: Option<String>,

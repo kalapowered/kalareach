@@ -75,6 +75,33 @@ pub enum PaletteChoice {
 }
 
 impl PaletteChoice {
+    /// The choice a create request carries, or the profile default when it carries none.
+    ///
+    /// The three forms on the wire are the three a session can honestly record: a preset, the
+    /// colours a client shared from its bounded probe, and nothing at all.
+    #[must_use]
+    pub fn from_request(request: Option<kr_protocol::session::PaletteRequest>) -> Self {
+        use kr_protocol::session::{PalettePreset, PaletteRequest};
+
+        match request {
+            None => Self::ProfileDefault,
+            Some(PaletteRequest::Preset(PalettePreset::Light)) => Self::LightPreset,
+            Some(PaletteRequest::Preset(PalettePreset::Dark)) => Self::DarkPreset,
+            Some(PaletteRequest::Probe(shared)) => Self::Shared {
+                foreground: Rgb::new(
+                    shared.foreground.red,
+                    shared.foreground.green,
+                    shared.foreground.blue,
+                ),
+                background: Rgb::new(
+                    shared.background.red,
+                    shared.background.green,
+                    shared.background.blue,
+                ),
+            },
+        }
+    }
+
     /// The palette this choice starts a session with.
     #[must_use]
     pub fn palette(self) -> Palette {
@@ -221,6 +248,62 @@ pub trait RowSource {
 impl RowSource for kr_term::engine::Engine {
     fn rows_from(&self, buffer: ProjectedBuffer, first: usize, max_rows: usize) -> Vec<GridRow> {
         self.rows_within(wire::active_buffer(buffer), first, max_rows)
+    }
+}
+
+/// The rows of a window that starts above the live screen.
+///
+/// A client looking through its scrollback is installed exactly as one looking at the live page
+/// is: the same pages, the same bounds, the same subscriber's queue. What changes is where the
+/// active buffer's rows come from - the retained rows the session still holds, from the window's
+/// own first row - and how many of them there are, which is the window's height and no more. The
+/// buffer that is not showing keeps no scrollback, so it is read exactly as it is for a live
+/// window.
+pub struct HistoryWindow<'a> {
+    engine: &'a kr_term::engine::Engine,
+    active: ProjectedBuffer,
+    top_row: i64,
+    rows: usize,
+}
+
+impl<'a> HistoryWindow<'a> {
+    /// A window of `rows` rows starting at the stable row `top_row`.
+    #[must_use]
+    pub const fn new(
+        engine: &'a kr_term::engine::Engine,
+        active: ProjectedBuffer,
+        top_row: i64,
+        rows: usize,
+    ) -> Self {
+        Self {
+            engine,
+            active,
+            top_row,
+            rows,
+        }
+    }
+}
+
+impl RowSource for HistoryWindow<'_> {
+    fn rows_from(&self, buffer: ProjectedBuffer, first: usize, max_rows: usize) -> Vec<GridRow> {
+        if buffer != self.active {
+            return self
+                .engine
+                .rows_within(wire::active_buffer(buffer), first, max_rows);
+        }
+        let remaining = self.rows.saturating_sub(first);
+        if remaining == 0 {
+            return Vec::new();
+        }
+        let from = self
+            .top_row
+            .saturating_add(i64::try_from(first).unwrap_or(i64::MAX));
+        // The grid answers a request below its oldest retained row from the oldest one there is,
+        // which is what makes a window naming an evicted row a page of what survives rather than
+        // a refusal.
+        self.engine
+            .grid()
+            .history_rows(from, max_rows.min(remaining))
     }
 }
 

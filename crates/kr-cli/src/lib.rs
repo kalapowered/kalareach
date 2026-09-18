@@ -10,6 +10,7 @@
 //! | [`cli`] | The command surface: the commands, their short forms and the standard options |
 //! | [`resolve`] | Finding a session by number or identifier, and reaching its worker |
 //! | [`contact`] | The contact tools an agent reaches its person through, over the Model Context Protocol |
+//! | [`create`] | The palette a new session starts with |
 //! | [`question`] | Reading and answering an agent's questions from the terminal |
 //! | [`skill`] | Installing the contact skill and its tool configuration for an agent |
 //! | [`attach`] | Attaching a terminal, forwarding bytes, and the restoration guard |
@@ -23,6 +24,7 @@
 pub mod attach;
 pub mod cli;
 pub mod contact;
+pub mod create;
 pub mod error;
 pub mod platform;
 pub mod question;

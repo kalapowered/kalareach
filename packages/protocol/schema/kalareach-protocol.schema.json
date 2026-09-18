@@ -1476,11 +1476,23 @@
         "dimensions": {
           "$ref": "#/$defs/Dimensions",
           "description": "Its current physical dimensions."
+        },
+        "position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ViewportPosition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where its window sits. Null is the live screen."
         }
       },
       "required": [
         "attachment_id",
-        "dimensions"
+        "dimensions",
+        "position"
       ],
       "type": "object"
     },
@@ -1492,6 +1504,17 @@
           "$ref": "#/$defs/GeometryState",
           "description": "The canonical geometry, which a viewport report never changes."
         },
+        "position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ViewportPosition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where the window ended up, as a row identifier, or null for the live screen.\n\nA request above the oldest row the session still holds is answered with the oldest one\nthere is rather than refused, and a request at or below the live screen's first row is\nanswered with the live screen. Either way this says where the window actually is."
+        },
         "presentation": {
           "$ref": "#/$defs/TerminalPresentationMode",
           "description": "How this attachment now displays the canonical grid."
@@ -1499,7 +1522,8 @@
       },
       "required": [
         "geometry",
-        "presentation"
+        "presentation",
+        "position"
       ],
       "type": "object"
     },
@@ -9281,6 +9305,21 @@
       ],
       "type": "object"
     },
+    "PalettePreset": {
+      "description": "One of the two palettes a creation can select without asking a terminal anything.",
+      "oneOf": [
+        {
+          "const": "light",
+          "description": "Dark text on a light background.",
+          "type": "string"
+        },
+        {
+          "const": "dark",
+          "description": "Light text on a dark background.",
+          "type": "string"
+        }
+      ]
+    },
     "PaletteProvenance": {
       "description": "Where the session's palette came from.\n\nProvenance travels with the palette because succession must not change it. A second attachment\nwith different colours is shown the session's palette, not its own, and the source says which\none that is.",
       "oneOf": [
@@ -9308,6 +9347,37 @@
           "const": "explicit_change",
           "description": "An authorised, explicit palette change made after creation.",
           "type": "string"
+        }
+      ]
+    },
+    "PaletteRequest": {
+      "description": "A palette a session can be started with, chosen before the shell has produced anything.\n\nSection 8 fixes the palette at creation and records where it came from. A preset is what a\nno-probe or invisible creation selects, because neither has a terminal whose colours could be\nasked for; the probe form carries the foreground and background a client learned from its own\nbounded probe of the terminal the person is sitting at.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "One of the two presets.",
+          "properties": {
+            "preset": {
+              "$ref": "#/$defs/PalettePreset"
+            }
+          },
+          "required": [
+            "preset"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The colours a client shared from its bounded probe.",
+          "properties": {
+            "probe": {
+              "$ref": "#/$defs/ProbedPalette"
+            }
+          },
+          "required": [
+            "probe"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -9800,6 +9870,25 @@
           "type": "string"
         }
       ]
+    },
+    "ProbedPalette": {
+      "additionalProperties": false,
+      "description": "The default foreground and background a client's bounded probe established.",
+      "properties": {
+        "background": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The default background the terminal reported."
+        },
+        "foreground": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The default foreground the terminal reported."
+        }
+      },
+      "required": [
+        "foreground",
+        "background"
+      ],
+      "type": "object"
     },
     "ProcessStartIdentity": {
       "additionalProperties": false,
@@ -15273,6 +15362,17 @@
           },
           "type": "array"
         },
+        "palette": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaletteRequest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The palette this session starts with. Null takes the profile default.\n\nThis is the one moment the palette can be chosen: section 8 fixes it at creation, and\nafterwards only an authorised explicit change moves it. The provenance is recorded either\nway, so a palette query can say where the session's colours came from."
+        },
         "presentation": {
           "$ref": "#/$defs/Presentation",
           "description": "How the session is presented locally."
@@ -15305,7 +15405,8 @@
         "cwd",
         "dimensions",
         "worker_profile",
-        "environment_snapshot"
+        "environment_snapshot",
+        "palette"
       ],
       "type": "object"
     },
@@ -16880,6 +16981,37 @@
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "ViewportPosition": {
+      "description": "Where an attachment's window sits in the session's rows.\n\nA window is normally on the live screen, which is what no position at all means. A client\nlooking through its scrollback names where it is looking instead, and the host installs the\nhistory pages that cover it. Scrolling is a presentation choice and never touches the input\nlease: section 8 puts passive scrollback with focus events and terminal replies.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The stable identifier of the first row shown, taken from the pages the client holds.",
+          "properties": {
+            "row": {
+              "$ref": "#/$defs/U64"
+            }
+          },
+          "required": [
+            "row"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "How many rows above the live screen's first row the window starts.\n\nFor a client that has not yet been given a row identifier to name. The host resolves it\nagainst the live screen at the moment of the report and answers with the row it landed on,\nso the window stays where the person put it while the session goes on writing.",
+          "properties": {
+            "above": {
+              "$ref": "#/$defs/U64"
+            }
+          },
+          "required": [
+            "above"
+          ],
+          "type": "object"
+        }
+      ]
     },
     "WallClockTrust": {
       "description": "Whether this host can prove what its wall clock reads.",

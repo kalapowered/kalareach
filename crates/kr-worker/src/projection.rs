@@ -116,6 +116,37 @@ impl Filtered {
     }
 }
 
+/// Where one client's window sits in the session's rows.
+///
+/// The live screen is where every attachment starts and where it returns to. A window above it is
+/// named by a stable row identifier, because the live screen moves whenever the application writes
+/// and a window measured from it would slide away from what the person is reading.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ViewportAnchor {
+    /// The live screen.
+    #[default]
+    LiveScreen,
+    /// The retained row the window starts at.
+    History(i64),
+}
+
+impl ViewportAnchor {
+    /// The anchor for a recorded top row, where `None` is the live screen.
+    #[must_use]
+    pub const fn of(top_row: Option<i64>) -> Self {
+        match top_row {
+            None => Self::LiveScreen,
+            Some(row) => Self::History(row),
+        }
+    }
+
+    /// Whether this window is above the live screen.
+    #[must_use]
+    pub const fn is_history(self) -> bool {
+        matches!(self, Self::History(_))
+    }
+}
+
 /// The canonical grid of one session.
 pub struct TerminalEngine {
     engine: Engine,
@@ -408,16 +439,58 @@ impl TerminalEngine {
         }
     }
 
-    /// The window a client of these dimensions is looking at, anchored at the visible page.
+    /// The window a client of these dimensions is looking at.
     ///
     /// The top row is read from the grid rather than guessed at, because eviction and scrolling
     /// both move it and a client holding rows by their identifiers has to be told which of them
-    /// the page now holds.
+    /// the page now holds. A window anchored above the live page is resolved the same way: it is
+    /// held between the oldest row the session still retains and the live page's own first row, so
+    /// a client that names an evicted row is shown the oldest page there is and one that names a
+    /// row inside the live page is shown the live page.
     #[must_use]
-    pub fn anchored_viewport(&self, dimensions: Dimensions) -> Viewport {
+    pub fn anchored_viewport(&self, dimensions: Dimensions, anchor: ViewportAnchor) -> Viewport {
         let mut viewport = self.viewport_for(dimensions);
-        viewport.top_row = self.engine.grid().visible_top_row();
+        viewport.top_row = self.resolve(anchor);
         viewport
+    }
+
+    /// The stable row an anchor names right now.
+    fn resolve(&self, anchor: ViewportAnchor) -> i64 {
+        let live = self.engine.grid().visible_top_row();
+        match anchor {
+            ViewportAnchor::LiveScreen => live,
+            ViewportAnchor::History(row) => {
+                let (oldest, _) = self.engine.grid().stable_range();
+                row.clamp(oldest, live)
+            }
+        }
+    }
+
+    /// Where a reported position lands, as a retained row, or `None` for the live screen.
+    ///
+    /// `above` is resolved here, once, against the live screen as it stands at the moment of the
+    /// report: it is the spelling for a client that has not been given a row identifier to name
+    /// yet, and what it means is a place rather than a distance kept.
+    #[must_use]
+    pub fn resolve_position(
+        &self,
+        position: Option<kr_protocol::attachment::ViewportPosition>,
+    ) -> Option<i64> {
+        use kr_protocol::attachment::ViewportPosition;
+
+        let live = self.engine.grid().visible_top_row();
+        let asked = match position? {
+            ViewportPosition::Row(row) => i64::try_from(row.get()).unwrap_or(i64::MAX),
+            ViewportPosition::Above(rows) => {
+                live.saturating_sub(i64::try_from(rows.get()).unwrap_or(i64::MAX))
+            }
+        };
+        let (oldest, _) = self.engine.grid().stable_range();
+        let landed = asked.clamp(oldest, live);
+        // A window at the live page's first row is the live screen, and saying so is what lets a
+        // client that has scrolled back down stop naming a row and start following the session
+        // again.
+        (landed < live).then_some(landed)
     }
 
     /// Builds the events that install the canonical screen on a projected client.
@@ -432,6 +505,7 @@ impl TerminalEngine {
     pub fn projection_install(
         &mut self,
         dimensions: Dimensions,
+        anchor: ViewportAnchor,
         reason: ProjectionResetReason,
         gate: LaneGate,
         now_ms: u64,
@@ -445,18 +519,31 @@ impl TerminalEngine {
         let (mut snapshot, settled) = self.engine.snapshot_without_rows(viewport, now_ms);
         let settled = self.collect(&settled, gate, now_ms);
         let mut viewport = viewport;
-        viewport.top_row = self.engine.grid().visible_top_row();
+        viewport.top_row = self.resolve(anchor);
         snapshot.viewport = viewport;
         let degraded = self.resident_state_truncated();
-        let update = crate::snapshot::install(
-            &snapshot,
-            viewport,
-            reason,
-            degraded,
-            budget,
-            scope,
-            &self.engine,
-        )?;
+        let live = self.engine.grid().visible_top_row();
+        let update = if viewport.top_row < live {
+            // A window above the live page. The same pages, the same bounds and the same queue;
+            // the active buffer's rows are the retained ones this window covers.
+            let rows = crate::snapshot::HistoryWindow::new(
+                &self.engine,
+                crate::snapshot::wire::buffer(snapshot.active_buffer),
+                viewport.top_row,
+                viewport.rows as usize,
+            );
+            crate::snapshot::install(&snapshot, viewport, reason, degraded, budget, scope, &rows)?
+        } else {
+            crate::snapshot::install(
+                &snapshot,
+                viewport,
+                reason,
+                degraded,
+                budget,
+                scope,
+                &self.engine,
+            )?
+        };
         Ok((update, settled))
     }
 
@@ -475,11 +562,22 @@ impl TerminalEngine {
     pub fn minimum_projection_install(
         &self,
         dimensions: Dimensions,
+        anchor: ViewportAnchor,
         scope: crate::render::Scope,
     ) -> Result<usize> {
-        let viewport = self.anchored_viewport(dimensions);
+        let viewport = self.anchored_viewport(dimensions, anchor);
         let mut state = self.engine.screen_state(viewport);
         state.viewport = viewport;
+        let live = self.engine.grid().visible_top_row();
+        if viewport.top_row < live {
+            let rows = crate::snapshot::HistoryWindow::new(
+                &self.engine,
+                crate::snapshot::wire::buffer(state.active_buffer),
+                viewport.top_row,
+                viewport.rows as usize,
+            );
+            return crate::snapshot::minimum_install(&state, viewport, scope, &rows);
+        }
         crate::snapshot::minimum_install(&state, viewport, scope, &self.engine)
     }
 
@@ -495,8 +593,20 @@ impl TerminalEngine {
         &self,
         held: crate::snapshot::Held,
         dimensions: Dimensions,
+        anchor: ViewportAnchor,
         scope: crate::render::Scope,
     ) -> Result<crate::snapshot::Owed> {
+        let viewport = self.anchored_viewport(dimensions, anchor);
+        // A window above the live page does not move on its own: the rows it holds keep their
+        // identifiers however much the application writes. The one thing that moves it is the
+        // session giving up the oldest rows it was holding, and the client cannot be sent those
+        // rows in an update - it has already dropped them. So it is installed again, with the
+        // reason, and the fresh pages carry the oldest row that survives.
+        if anchor.is_history() && viewport != held.viewport {
+            return Ok(crate::snapshot::Owed::Snapshot(
+                ProjectionResetReason::HistoryEvicted,
+            ));
+        }
         let Ok(delta) = self.engine.delta(held.base.cursor, held.base.generation) else {
             // The base is outside the engine's replay window, or the projection was reset since
             // then. Either way there is nothing to continue from.
@@ -508,7 +618,7 @@ impl TerminalEngine {
         crate::snapshot::advance(
             &delta,
             self.active_buffer(),
-            self.anchored_viewport(dimensions),
+            viewport,
             oldest,
             oldest > 0,
             self.resident_state_truncated(),
@@ -787,6 +897,7 @@ mod projection_tests {
         let (update, _) = engine
             .projection_install(
                 dimensions(80, 24),
+                ViewportAnchor::LiveScreen,
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
                 0,
@@ -857,6 +968,7 @@ mod projection_tests {
             let (update, _) = engine
                 .projection_install(
                     dimensions(80, 24),
+                    ViewportAnchor::LiveScreen,
                     ProjectionResetReason::Attached,
                     LaneGate::default(),
                     0,
@@ -1006,7 +1118,7 @@ mod projection_tests {
                 hyperlink: None,
             }),
         ]);
-        let window = engine.anchored_viewport(dimensions(80, 24));
+        let window = engine.anchored_viewport(dimensions(80, 24), ViewportAnchor::LiveScreen);
         let Ok(crate::snapshot::Owed::Update(update)) = crate::snapshot::advance(
             &delta,
             kr_term::snapshot::ActiveBuffer::Alternate,
@@ -1086,6 +1198,7 @@ mod projection_tests {
         let (update, _) = engine
             .projection_install(
                 dimensions(80, 24),
+                ViewportAnchor::LiveScreen,
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
                 0,
@@ -1151,6 +1264,7 @@ mod projection_tests {
         let (update, _) = engine
             .projection_install(
                 dimensions(80, 24),
+                ViewportAnchor::LiveScreen,
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
                 0,
@@ -1169,6 +1283,7 @@ mod projection_tests {
         let (tight, _) = engine
             .projection_install(
                 dimensions(80, 24),
+                ViewportAnchor::LiveScreen,
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
                 0,
@@ -1201,6 +1316,7 @@ mod projection_tests {
         let smallest: usize = engine
             .projection_install(
                 dimensions(80, 24),
+                ViewportAnchor::LiveScreen,
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
                 0,
@@ -1218,6 +1334,7 @@ mod projection_tests {
             let (tried, _) = engine
                 .projection_install(
                     dimensions(80, 24),
+                    ViewportAnchor::LiveScreen,
                     ProjectionResetReason::Attached,
                     LaneGate::default(),
                     0,
@@ -1276,6 +1393,7 @@ mod projection_tests {
         let (update, _) = engine
             .projection_install(
                 dimensions(40, 10),
+                ViewportAnchor::LiveScreen,
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
                 0,
@@ -1285,7 +1403,7 @@ mod projection_tests {
             .expect("a snapshot");
         let held = Held {
             base: update.base,
-            viewport: engine.anchored_viewport(dimensions(40, 10)),
+            viewport: engine.anchored_viewport(dimensions(40, 10), ViewportAnchor::LiveScreen),
         };
         // One batch later the client can still be continued from.
         let mut cursor = engine.output_cursor();
@@ -1295,7 +1413,12 @@ mod projection_tests {
         assert!(
             matches!(
                 engine
-                    .projection_advance(held, dimensions(40, 10), crate::render::Scope::WholeScreen)
+                    .projection_advance(
+                        held,
+                        dimensions(40, 10),
+                        ViewportAnchor::LiveScreen,
+                        crate::render::Scope::WholeScreen
+                    )
                     .expect("an answer"),
                 Owed::Update(_)
             ),
@@ -1310,7 +1433,12 @@ mod projection_tests {
         }
         assert_eq!(
             engine
-                .projection_advance(held, dimensions(40, 10), crate::render::Scope::WholeScreen)
+                .projection_advance(
+                    held,
+                    dimensions(40, 10),
+                    ViewportAnchor::LiveScreen,
+                    crate::render::Scope::WholeScreen
+                )
                 .expect("an answer"),
             Owed::Snapshot(ProjectionResetReason::ReplayGap),
             "and a base past the window is a gap, which discards what the client holds"
@@ -1382,6 +1510,7 @@ mod projection_tests {
         let (update, _) = engine
             .projection_install(
                 dimensions(40, 10),
+                ViewportAnchor::LiveScreen,
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
                 0,
@@ -1391,11 +1520,16 @@ mod projection_tests {
             .expect("a snapshot");
         let held = Held {
             base: update.base,
-            viewport: engine.anchored_viewport(dimensions(40, 10)),
+            viewport: engine.anchored_viewport(dimensions(40, 10), ViewportAnchor::LiveScreen),
         };
         assert_eq!(
             engine
-                .projection_advance(held, dimensions(40, 10), crate::render::Scope::WholeScreen)
+                .projection_advance(
+                    held,
+                    dimensions(40, 10),
+                    ViewportAnchor::LiveScreen,
+                    crate::render::Scope::WholeScreen
+                )
                 .expect("an answer"),
             Owed::Nothing,
             "a quiet stream is not an update"
@@ -1409,6 +1543,7 @@ mod projection_tests {
         let (update, _) = engine
             .projection_install(
                 dimensions(40, 10),
+                ViewportAnchor::LiveScreen,
                 ProjectionResetReason::Attached,
                 LaneGate::default(),
                 0,
@@ -1421,11 +1556,16 @@ mod projection_tests {
                 cursor: update.base.cursor,
                 generation: update.base.generation.saturating_sub(1),
             },
-            viewport: engine.anchored_viewport(dimensions(40, 10)),
+            viewport: engine.anchored_viewport(dimensions(40, 10), ViewportAnchor::LiveScreen),
         };
         assert_eq!(
             engine
-                .projection_advance(stale, dimensions(40, 10), crate::render::Scope::WholeScreen)
+                .projection_advance(
+                    stale,
+                    dimensions(40, 10),
+                    ViewportAnchor::LiveScreen,
+                    crate::render::Scope::WholeScreen,
+                )
                 .expect("an answer"),
             Owed::Snapshot(ProjectionResetReason::ReplayGap),
             "the same cursor in another generation is another screen"

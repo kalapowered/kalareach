@@ -416,6 +416,7 @@ fn create_params(environment_id: EnvironmentId, cwd: &Path) -> SessionCreatePara
         cwd: Nullable::some(cwd.display().to_string()),
         dimensions: Nullable::null(),
         worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        palette: Nullable::null(),
         environment_snapshot: vec![
             kr_protocol::session::EnvironmentVariable {
                 name: "PATH".to_owned(),

@@ -1140,12 +1140,18 @@ pub struct LaunchFailure {
 
 /// Starts a session and reports a launch failure with its closure record.
 ///
+/// `palette` is where the session's colours come from, and it is applied between opening the
+/// session and launching its shell. That is the only moment it can be applied: section 8 fixes the
+/// palette at creation, and the first byte the shell writes is already a screen somebody could be
+/// looking at.
+///
 /// # Errors
 ///
 /// Returns the launch failure. A session whose shell never started is already recorded as closed
 /// with `root_launch_failed`, so a failed creation leaves a record rather than a stuck `creating`.
 pub fn start_or_record(
     config: crate::session::SessionConfig,
+    palette: crate::snapshot::PaletteChoice,
     shared_clock: Arc<dyn kr_ipc::clock::SharedClock>,
 ) -> std::result::Result<Arc<SessionRuntime>, Box<LaunchFailure>> {
     let mut session = match Session::open(config) {
@@ -1157,6 +1163,12 @@ pub fn start_or_record(
             }));
         }
     };
+    if let Err(error) = session.set_initial_palette(palette) {
+        return Err(Box::new(LaunchFailure {
+            error,
+            closure: session.closure().cloned(),
+        }));
+    }
     if let Err(error) = session.launch() {
         let closure = session.closure().cloned();
         return Err(Box::new(LaunchFailure { error, closure }));

@@ -869,8 +869,16 @@ impl Session {
     /// spelled on the wire.
     pub fn minimum_projection_install(&self, attachment_id: AttachmentId) -> Result<usize> {
         let dimensions = self.attachment_dimensions(attachment_id)?;
-        self.engine
-            .minimum_projection_install(dimensions, self.content_scope(attachment_id))
+        self.engine.minimum_projection_install(
+            dimensions,
+            self.viewport_anchor(attachment_id),
+            self.content_scope(attachment_id),
+        )
+    }
+
+    /// Where one attachment's window sits: the live screen, or a retained row above it.
+    fn viewport_anchor(&self, attachment_id: AttachmentId) -> crate::projection::ViewportAnchor {
+        crate::projection::ViewportAnchor::of(self.attachments.history_top_row(attachment_id))
     }
 
     /// Returns one attachment's own dimensions, falling back to the session's canonical geometry.
@@ -1062,10 +1070,17 @@ impl Session {
         &mut self,
         attachment_id: AttachmentId,
         dimensions: Dimensions,
-    ) -> Result<TerminalPresentationMode> {
+        position: Option<kr_protocol::attachment::ViewportPosition>,
+    ) -> Result<(TerminalPresentationMode, Option<i64>)> {
         let before = self.presentation_of_attachment(attachment_id);
         let before_dimensions = self.attachments.own_dimensions(attachment_id).flatten();
-        let presentation = self.attachments.viewport(attachment_id, dimensions)?;
+        let before_top_row = self.attachments.history_top_row(attachment_id);
+        // Resolved against the session as it stands now: an offset above the live screen is a
+        // place, and the row it names is what the attachment holds from here.
+        let top_row = self.engine.resolve_position(position);
+        let presentation = self
+            .attachments
+            .viewport(attachment_id, dimensions, top_row)?;
         // A window that changed size is looking at a different part of the grid, and one that
         // changed presentation is being served a different thing altogether. Either way what it
         // holds is no longer continuous with what it is about to be sent, so it is told now rather
@@ -1083,8 +1098,14 @@ impl Session {
             let oldest = self.history.oldest_retained_cursor();
             self.hub
                 .require_resync(attachment_id, ResyncReason::ProjectionReset, next, oldest);
+        } else if before_top_row != top_row {
+            // The window moved without the terminal changing. Nothing about the session changed
+            // either, so there is nothing for the client to ask again for: the pages that cover
+            // where it is now looking are queued through its own subscription, charged to its own
+            // bound, exactly as the first screen was.
+            self.install_projection(attachment_id)?;
         }
-        Ok(presentation)
+        Ok((presentation, top_row))
     }
 
     /// Returns how one attachment is currently being shown the session, without changing anything.
@@ -1860,7 +1881,12 @@ impl Session {
         let owed = match held {
             Some(held) if reset.is_none() => self
                 .engine
-                .projection_advance(held, dimensions, self.content_scope(attachment_id))
+                .projection_advance(
+                    held,
+                    dimensions,
+                    self.viewport_anchor(attachment_id),
+                    self.content_scope(attachment_id),
+                )
                 .unwrap_or(crate::snapshot::Owed::Snapshot(
                     ProjectionResetReason::ReplayGap,
                 )),
@@ -1882,9 +1908,10 @@ impl Session {
                 // And how much of the screen this client's authority reaches: a caller drawn the
                 // live screen alone is paged the buffer that is showing and never the other one.
                 let scope = self.content_scope(attachment_id);
+                let anchor = self.viewport_anchor(attachment_id);
                 match self
                     .engine
-                    .projection_install(dimensions, reason, gate, now, budget, scope)
+                    .projection_install(dimensions, anchor, reason, gate, now, budget, scope)
                 {
                     Ok((update, settled)) => {
                         // Taking a snapshot settles the screen. It changes no display state here,
@@ -1912,7 +1939,9 @@ impl Session {
         };
         let held = crate::snapshot::Held {
             base: update.base,
-            viewport: self.engine.anchored_viewport(dimensions),
+            viewport: self
+                .engine
+                .anchored_viewport(dimensions, self.viewport_anchor(attachment_id)),
         };
         for outgoing in update.events {
             let cursor = outgoing.event.cursor();
