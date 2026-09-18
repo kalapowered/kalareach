@@ -16,14 +16,18 @@
 //! association cannot outlive the connection that produced the attachment. Putting the attachment
 //! inside the draft record would make losing a connection a change to durable state.
 //!
-//! # One revision, one file
+//! # One draft, one file, one lock
 //!
-//! A draft is stored as `<draft_id>.<revision>.draft`, published by linking a fully written
-//! temporary file to that name. A link fails when the name is taken, on every platform, so two
-//! editors that both read revision *n* and both write *n + 1* do not both succeed: one publishes
-//! and the other is told its comparison lost. The comparison is the filesystem's, so it holds
-//! between two processes as well as between two threads. A reader takes the highest revision it
-//! finds, which is why a crash between publishing and tidying up costs nothing.
+//! A draft is stored as `<draft_id>.draft`, written to a temporary file, flushed, and renamed over
+//! its name. Every change takes an exclusive lock on the store's own `.lock` file and every read
+//! takes a shared one, so reading a revision, comparing it and replacing it is one step against
+//! every other window of the application and against another process. Without that a second editor
+//! could pass the comparison a moment before the first one wrote, and the text it replaced would be
+//! gone with no trace that it had ever been there.
+//!
+//! The lock is the operating system's, so it is as good as the filesystem holding it: on a local
+//! disk it is exact, and on a network mount it is whatever that mount implements. A draft store
+//! belongs on the device, which is what section 24 means by a device-owned draft.
 //!
 //! # Nothing here submits
 //!
@@ -52,24 +56,26 @@ use crate::retry::UserAction;
 ///
 /// Section 20 gives a synchronised object 64 KiB of plaintext before padding, and a draft is one of
 /// the three kinds it may be. A draft too large to synchronise would be a draft this contract
-/// cannot carry, so the bound applies on the device as well as on the wire, and it applies to the
-/// encoded record rather than to the text alone: attachments and a target take space too.
+/// cannot carry, so the bound applies to every edit a person makes on the device as well as on the
+/// wire, and it applies to the encoded record rather than to the text alone: attachments and a
+/// target take space too.
 pub const MAX_DRAFT_BYTES: usize = 64 * 1024;
 
-/// What this device's own note on a conflict copy costs in an encoded record.
+/// What this device's own notes on a stored draft may add to an encoded record.
 ///
-/// [`Draft::conflict_of`] is local: it says which draft a copy belongs beside, and the service
-/// never carries it. Allowing for it separately is what keeps a payload that is exactly at the
-/// limit storable when it arrives here as a copy.
-const CONFLICT_MARK_BYTES: usize = 64;
+/// [`Draft::conflict_of`] is local: it says which draft a copy belongs beside, and the service never
+/// carries it. A copy also carries its own identity and the time it arrived. Allowing for those
+/// separately is what keeps a payload that is exactly at the limit storable when it arrives here as
+/// a copy, rather than refusing to keep content the service was already carrying.
+const LOCAL_FIELDS_BYTES: usize = 64;
 
 /// The most a stored draft record may carry, in bytes.
-pub const MAX_STORED_DRAFT_BYTES: usize = MAX_DRAFT_BYTES + CONFLICT_MARK_BYTES;
+pub const MAX_STORED_DRAFT_BYTES: usize = MAX_DRAFT_BYTES + LOCAL_FIELDS_BYTES;
 
 /// The most attachments one draft may hold.
 pub const MAX_DRAFT_ATTACHMENTS: usize = 64;
 
-/// The extension every stored draft revision carries.
+/// The extension every stored draft carries.
 const DRAFT_EXTENSION: &str = "draft";
 
 /// The extension of the note recording where a draft reached on the synchronisation service.
@@ -77,6 +83,9 @@ const CHECKPOINT_EXTENSION: &str = "sync";
 
 /// The extension of a draft being written, which is not yet a draft.
 const PARTIAL_EXTENSION: &str = "partial";
+
+/// The name of the store's lock.
+const LOCK_NAME: &str = "store.lock";
 
 /// What a draft is for.
 ///
@@ -289,7 +298,7 @@ impl Associations {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DraftError {
-    /// The directory or a draft file could not be read or written.
+    /// The directory, the lock or a draft file could not be read or written.
     #[error("the draft store at {path} could not be used: {source}")]
     Storage {
         /// What was being read or written.
@@ -322,6 +331,16 @@ pub enum DraftError {
         owner: DeviceId,
         /// The device this store belongs to.
         device_id: DeviceId,
+    },
+    /// An older copy of a draft was offered to the service after a newer one was accepted.
+    #[error("draft {draft_id} was published at revision {published}; {offered} is older")]
+    StalePublication {
+        /// The draft.
+        draft_id: DraftId,
+        /// The revision the service was last given.
+        published: DraftRevision,
+        /// The revision that was offered now.
+        offered: DraftRevision,
     },
     /// The draft is larger than the contract carries.
     #[error("the draft encodes to {len} bytes; the limit is {limit}")]
@@ -366,7 +385,9 @@ impl DraftError {
             | Self::TooManyAttachments { .. }
             | Self::NotOwned { .. }
             | Self::Corrupt { .. } => ErrorCode::InvalidArgument,
-            Self::RevisionConflict { .. } => ErrorCode::DraftConflict,
+            Self::RevisionConflict { .. } | Self::StalePublication { .. } => {
+                ErrorCode::DraftConflict
+            }
         }
     }
 
@@ -384,6 +405,7 @@ impl DraftError {
             // copy to keep, or look at a draft that is still there.
             Self::Unknown { .. }
             | Self::RevisionConflict { .. }
+            | Self::StalePublication { .. }
             | Self::NotOwned { .. }
             | Self::TooLarge { .. }
             | Self::TooManyAttachments { .. }
@@ -395,26 +417,42 @@ impl DraftError {
 /// Where a draft has reached on the synchronisation service.
 ///
 /// It is a note, not content: losing it costs a comparison and a fetch, never text. That is why it
-/// is written beside the draft rather than inside it, and why it is replaced in place while a
-/// draft revision never is.
+/// is written beside the draft rather than inside it, and why a draft's own revision is never the
+/// generation a comparison names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncCheckpoint {
-    /// The generation the service accepted.
+    /// The generation the service holds.
     pub generation: U64,
-    /// The draft revision that generation carries.
-    pub revision: DraftRevision,
+    /// The revision *this device* published at that generation.
+    ///
+    /// Null when the generation came from another device's write, which this device only fetched.
+    /// A revision counter belongs to the device that keeps it, so the number another device reached
+    /// says nothing about which of this device's own copies is the newest.
+    pub published_revision: Nullable<DraftRevision>,
+}
+
+/// What a listing found, including what it could not read.
+///
+/// One damaged file does not hide the drafts beside it, and it is not dropped either: it is named,
+/// so a client can say which one it cannot open rather than quietly showing one draft fewer.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Listing {
+    /// The drafts that were read, oldest first.
+    pub drafts: Vec<Draft>,
+    /// The files that are not drafts this build reads.
+    pub unreadable: Vec<PathBuf>,
 }
 
 /// Drafts this device owns, on this device's disk.
 ///
 /// The directory is the caller's: a desktop application puts it under its own support directory, a
 /// command line under the user's state directory, a test under a temporary one. The store creates
-/// it if it is not there, owner-only where the platform expresses that, and publishes every draft
-/// revision whole or not at all.
+/// it if it is not there, owner-only where the platform expresses that, and writes every draft
+/// whole or not at all.
 ///
-/// Every method blocks. A draft is a few kilobytes and the calls are a person's own edits, so a
-/// caller on an asynchronous runtime that cares about the difference runs them on a blocking task;
-/// nothing here holds anything across one.
+/// Every method blocks, on the filesystem and on the store's lock. A draft is a few kilobytes and
+/// the calls are a person's own edits, so a caller on an asynchronous runtime that cares about the
+/// difference runs them on a blocking task.
 #[derive(Clone, Debug)]
 pub struct DraftStore {
     directory: PathBuf,
@@ -425,11 +463,12 @@ impl DraftStore {
     /// Opens or creates a store in `directory` for one device.
     ///
     /// Opening tidies up: a temporary file a previous run was interrupted while writing is removed,
-    /// because it is not a draft and nothing will ever publish it.
+    /// because it is not a draft and nothing will ever publish it. The sweep runs under the same
+    /// exclusive lock every write takes, so it cannot remove a file another writer is using.
     ///
     /// # Errors
     ///
-    /// Returns [`DraftError::Storage`] when the directory cannot be created, read or made
+    /// Returns [`DraftError::Storage`] when the directory cannot be created, read, locked or made
     /// owner-only.
     pub fn open(directory: impl Into<PathBuf>, device_id: DeviceId) -> Result<Self> {
         let directory = directory.into();
@@ -438,7 +477,9 @@ impl DraftStore {
             directory,
             device_id,
         };
+        let guard = store.exclusive()?;
         store.sweep_partials()?;
+        drop(guard);
         Ok(store)
     }
 
@@ -473,75 +514,77 @@ impl DraftStore {
             created_at_ms: now,
             updated_at_ms: now,
         };
-        self.publish(&draft)?;
+        // An edit a person made has to be one the service could carry, so it is held to the payload
+        // bound rather than to the larger one a stored record may reach.
+        Self::encode_payload(&draft)?;
+        let guard = self.exclusive()?;
+        self.write(&draft)?;
+        drop(guard);
         Ok(draft)
     }
 
-    /// Reads a draft's highest stored revision.
+    /// Reads one draft.
     ///
     /// # Errors
     ///
     /// Returns [`DraftError::Unknown`] when nothing is stored under that identity, and
     /// [`DraftError::Corrupt`] when the file is not a draft this build reads.
     pub fn load(&self, draft_id: DraftId) -> Result<Draft> {
-        let mut highest: Option<(u64, PathBuf)> = None;
-        for (stored_id, revision, path) in self.revisions()? {
-            if stored_id != draft_id {
-                continue;
-            }
-            if highest.as_ref().is_none_or(|(held, _)| revision > *held) {
-                highest = Some((revision, path));
-            }
-        }
-        let Some((_, path)) = highest else {
-            return Err(DraftError::Unknown { draft_id }.into());
-        };
-        self.read(&path)
+        let guard = self.shared()?;
+        let draft = self.read(draft_id);
+        drop(guard);
+        draft
     }
 
-    /// Reads every stored draft at its highest revision, oldest first.
+    /// Reads every stored draft, oldest first, and names what it could not read.
     ///
     /// # Errors
     ///
-    /// Returns [`DraftError::Storage`] when the directory cannot be read, and
-    /// [`DraftError::Corrupt`] when one of its files is not a draft this build reads.
-    pub fn list(&self) -> Result<Vec<Draft>> {
-        let mut highest: HashMap<DraftId, (u64, PathBuf)> = HashMap::new();
-        for (draft_id, revision, path) in self.revisions()? {
-            match highest.get(&draft_id) {
-                Some((held, _)) if *held >= revision => {}
-                _ => {
-                    highest.insert(draft_id, (revision, path));
-                }
+    /// Returns [`DraftError::Storage`] when the directory cannot be read.
+    pub fn list(&self) -> Result<Listing> {
+        let guard = self.shared()?;
+        let mut listing = Listing::default();
+        let entries = std::fs::read_dir(&self.directory)
+            .map_err(|source| storage(&self.directory, source))?;
+        for entry in entries {
+            let entry = entry.map_err(|source| storage(&self.directory, source))?;
+            let path = entry.path();
+            let Some(draft_id) = path
+                .file_name()
+                .and_then(std::ffi::OsStr::to_str)
+                .and_then(parse_draft_name)
+            else {
+                continue;
+            };
+            match self.read(draft_id) {
+                Ok(draft) => listing.drafts.push(draft),
+                Err(_) => listing.unreadable.push(path),
             }
         }
-        let mut drafts = Vec::with_capacity(highest.len());
-        for (_, path) in highest.into_values() {
-            drafts.push(self.read(&path)?);
-        }
-        drafts.sort_by(|left, right| {
+        drop(guard);
+        listing.drafts.sort_by(|left, right| {
             left.created_at_ms
                 .get()
                 .cmp(&right.created_at_ms.get())
                 .then_with(|| left.draft_id.cmp(&right.draft_id))
         });
-        Ok(drafts)
+        listing.unreadable.sort();
+        Ok(listing)
     }
 
     /// Replaces a draft, and advances its revision.
     ///
-    /// The expected revision is the one the caller last read. The new revision is published under
-    /// its own name, which a link creates only if nothing holds it: a second editor, in this
-    /// process or another, that read the same revision and wrote first has taken that name, and
-    /// this call is told its comparison lost rather than overwriting what the other one wrote.
+    /// The expected revision is the one the caller last read. Reading the stored draft, comparing
+    /// its revision and writing the result happen under one exclusive lock, so a second editor in
+    /// this process or another either wrote before this call read or is told its comparison lost.
+    /// Neither overwrites the other's text.
     ///
     /// # Errors
     ///
-    /// Returns [`DraftError::RevisionConflict`] when the stored draft has moved on or another
-    /// writer published this revision first, [`DraftError::NotOwned`] when the draft belongs to
-    /// another device, [`DraftError::TooLarge`] or [`DraftError::TooManyAttachments`] when the
-    /// result does not fit the contract, and [`DraftError::Storage`] when the file cannot be
-    /// written.
+    /// Returns [`DraftError::RevisionConflict`] when the stored draft has moved on,
+    /// [`DraftError::NotOwned`] when the draft belongs to another device, [`DraftError::TooLarge`]
+    /// or [`DraftError::TooManyAttachments`] when the result does not fit the contract, and
+    /// [`DraftError::Storage`] when the file cannot be written.
     pub fn update(
         &self,
         draft_id: DraftId,
@@ -549,47 +592,48 @@ impl DraftStore {
         now: TimestampMs,
         edit: impl FnOnce(&mut Draft),
     ) -> Result<Draft> {
-        let mut draft = self.load(draft_id)?;
-        if draft.device_id != self.device_id {
-            return Err(DraftError::NotOwned {
-                draft_id,
-                owner: draft.device_id,
-                device_id: self.device_id,
+        let guard = self.exclusive()?;
+        let outcome = (|| {
+            let mut draft = self.read(draft_id)?;
+            self.check_owner(&draft)?;
+            if draft.revision != expected {
+                return Err(DraftError::RevisionConflict {
+                    draft_id,
+                    expected,
+                    current: draft.revision,
+                }
+                .into());
             }
-            .into());
-        }
-        if draft.revision != expected {
-            return Err(DraftError::RevisionConflict {
-                draft_id,
-                expected,
-                current: draft.revision,
-            }
-            .into());
-        }
-        edit(&mut draft);
-        // The identity, the owner and the revision are the store's, not an editor's. A closure
-        // that changed one of them would produce a draft the store could not find or a comparison
-        // nothing could win.
-        draft.draft_id = draft_id;
-        draft.device_id = self.device_id;
-        draft.revision = DraftRevision::new(expected.get().saturating_add(1));
-        draft.updated_at_ms = now;
-        self.publish(&draft)?;
-        // The revision this one replaced is no longer the answer to anything, and a reader already
-        // takes the highest. Failing to remove it costs a file, not a draft.
-        let _ = std::fs::remove_file(self.revision_path(draft_id, expected));
-        Ok(draft)
+            edit(&mut draft);
+            // The identity, the owner and the revision are the store's, not an editor's. A closure
+            // that changed one of them would produce a draft the store could not find or a
+            // comparison nothing could win.
+            draft.draft_id = draft_id;
+            draft.device_id = self.device_id;
+            draft.revision = DraftRevision::new(expected.get().saturating_add(1));
+            draft.updated_at_ms = now;
+            Self::encode_payload(&draft)?;
+            self.write(&draft)?;
+            Ok(draft)
+        })();
+        drop(guard);
+        outcome
     }
 
     /// Writes a draft whose content came from somewhere else, under a fresh identity.
     ///
-    /// This is what a lost synchronisation race produces: the content that won is kept *beside*
-    /// the local draft rather than over it, because section 24 says reconnection never replaces the
+    /// This is what a lost synchronisation race produces: the content that won is kept *beside* the
+    /// local draft rather than over it, because section 24 says reconnection never replaces the
     /// user's draft with remote input. The person chooses between them.
+    ///
+    /// The copy is held to the storage bound rather than to the payload bound. Content the service
+    /// was already carrying is content this device keeps: refusing it because this device's own note
+    /// beside it costs a few bytes would lose the very thing the person is meant to choose from.
     ///
     /// # Errors
     ///
-    /// As [`Self::create`].
+    /// Returns [`DraftError::Storage`] when the file cannot be written, and
+    /// [`DraftError::TooLarge`] when the content does not fit the storage bound.
     pub fn keep_copy(&self, of: DraftId, content: &Draft, now: TimestampMs) -> Result<Draft> {
         let copy = Draft {
             draft_id: DraftId::new(fresh_uuid()?),
@@ -603,71 +647,79 @@ impl DraftStore {
             created_at_ms: now,
             updated_at_ms: now,
         };
-        self.publish(&copy)?;
+        let guard = self.exclusive()?;
+        let written = self.write(&copy);
+        drop(guard);
+        written?;
         Ok(copy)
     }
 
-    /// Removes a draft, every revision of it, and its synchronisation note.
+    /// Removes a draft and its synchronisation note.
     ///
     /// # Errors
     ///
-    /// Returns [`DraftError::Storage`] when a file cannot be removed. Removing a draft that is not
-    /// there succeeds: the caller asked for it to be gone and it is.
+    /// Returns [`DraftError::NotOwned`] when the draft belongs to another device, and
+    /// [`DraftError::Storage`] when a file cannot be removed. Removing a draft that is not there
+    /// succeeds: the caller asked for it to be gone and it is.
     pub fn remove(&self, draft_id: DraftId) -> Result<()> {
-        for (stored_id, _, path) in self.revisions()? {
-            if stored_id == draft_id {
-                remove_if_present(&path)?;
+        let guard = self.exclusive()?;
+        let outcome = (|| {
+            // A draft that is not there, or one this build cannot read, is one the caller may still
+            // ask to be rid of. Neither leaves an owner to consult.
+            if let Ok(draft) = self.read(draft_id) {
+                self.check_owner(&draft)?;
             }
-        }
-        remove_if_present(&self.checkpoint_path(draft_id))
+            remove_if_present(&self.draft_path(draft_id))?;
+            remove_if_present(&self.checkpoint_path(draft_id))
+        })();
+        drop(guard);
+        outcome
     }
 
     /// Returns where a draft last reached on the synchronisation service, when it has.
     ///
+    /// A note this build cannot read is removed and reported as absent. It is a cache: the next
+    /// publication compares against nothing, learns where the object stands from the service, and
+    /// writes the note again.
+    ///
     /// # Errors
     ///
-    /// Returns [`DraftError::Storage`] when the note cannot be read, and [`DraftError::Corrupt`]
-    /// when it is not one this build reads.
+    /// Returns [`DraftError::Storage`] when the note cannot be read or removed.
     pub fn checkpoint(&self, draft_id: DraftId) -> Result<Option<SyncCheckpoint>> {
-        let path = self.checkpoint_path(draft_id);
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(storage(&path, error).into()),
-        };
-        kr_cbor::from_canonical_slice::<SyncCheckpoint>(
-            &bytes,
-            &kr_cbor::Limits::DEFAULT.with_max_message_len(MAX_STORED_DRAFT_BYTES),
-        )
-        .map(Some)
-        .map_err(|error| {
-            DraftError::Corrupt {
-                path,
-                reason: error.to_string(),
-            }
-            .into()
-        })
+        let guard = self.exclusive()?;
+        let outcome = self.read_checkpoint(draft_id);
+        drop(guard);
+        outcome
     }
 
     /// Records where a draft reached on the synchronisation service.
-    ///
-    /// The note is replaced in place. It is not the person's text, so replacing it loses nothing: a
-    /// note that never arrives costs the next publication a comparison and a fetch.
     ///
     /// # Errors
     ///
     /// Returns [`DraftError::Storage`] when the note cannot be written.
     pub fn record_checkpoint(&self, draft_id: DraftId, checkpoint: SyncCheckpoint) -> Result<()> {
         let bytes = kr_cbor::to_canonical_vec(&checkpoint)?;
-        let path = self.checkpoint_path(draft_id);
-        let temporary = self.temporary_path()?;
-        write_whole(&temporary, &bytes).map_err(|source| storage(&temporary, source))?;
-        if let Err(source) = std::fs::rename(&temporary, &path) {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(storage(&path, source).into());
-        }
-        sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))?;
-        Ok(())
+        let guard = self.exclusive()?;
+        let written = self.write_bytes(&self.checkpoint_path(draft_id), &bytes);
+        drop(guard);
+        written
+    }
+
+    /// Forgets where a draft reached on the synchronisation service.
+    ///
+    /// A device that has been signed out of the service, or that is starting again against a
+    /// different one, has a note that names a generation nothing holds. Forgetting it costs the
+    /// next publication a comparison and a fetch; keeping it would cost a comparison against a
+    /// number that means nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DraftError::Storage`] when the note cannot be removed.
+    pub fn forget_checkpoint(&self, draft_id: DraftId) -> Result<()> {
+        let guard = self.exclusive()?;
+        let removed = remove_if_present(&self.checkpoint_path(draft_id));
+        drop(guard);
+        removed
     }
 
     /// Returns the bytes a synchronised copy of this draft is sealed from.
@@ -687,7 +739,7 @@ impl DraftStore {
         encode_within(&payload, MAX_DRAFT_BYTES)
     }
 
-    /// Returns the bytes one stored revision holds.
+    /// Returns the bytes one stored draft holds.
     ///
     /// # Errors
     ///
@@ -696,74 +748,112 @@ impl DraftStore {
         encode_within(draft, MAX_STORED_DRAFT_BYTES)
     }
 
-    /// Reads a draft from the bytes [`Self::encode_payload`] or [`Self::encode_record`] produced.
+    /// Reads a draft from the bytes [`Self::encode_record`] produced.
     ///
     /// # Errors
     ///
     /// Returns [`ClientError::Cbor`] when the bytes are not a draft this build reads.
     pub fn decode(bytes: &[u8]) -> Result<Draft> {
+        Self::decode_within(bytes, MAX_STORED_DRAFT_BYTES)
+    }
+
+    /// Reads a draft the service carried, against the bound a synchronised payload has.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClientError::Cbor`] when the bytes are not a draft this build reads, including
+    /// one larger than section 20 lets a service carry.
+    pub fn decode_payload(bytes: &[u8]) -> Result<Draft> {
+        Self::decode_within(bytes, MAX_DRAFT_BYTES)
+    }
+
+    fn decode_within(bytes: &[u8], limit: usize) -> Result<Draft> {
         Ok(kr_cbor::from_canonical_slice(
             bytes,
-            &kr_cbor::Limits::DEFAULT.with_max_message_len(MAX_STORED_DRAFT_BYTES),
+            &kr_cbor::Limits::DEFAULT.with_max_message_len(limit),
         )?)
     }
 
-    /// Publishes one revision under a name nothing else holds.
-    fn publish(&self, draft: &Draft) -> Result<()> {
-        let bytes = Self::encode_record(draft)?;
-        let path = self.revision_path(draft.draft_id, draft.revision);
-        let temporary = self.temporary_path()?;
-        write_whole(&temporary, &bytes).map_err(|source| storage(&temporary, source))?;
-        // A link is the one portable atomic no-replace publish: it fails when the name is taken,
-        // on every platform, so the writer that got there first keeps its revision.
-        let linked = std::fs::hard_link(&temporary, &path);
-        let _ = std::fs::remove_file(&temporary);
-        match linked {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                return Err(DraftError::RevisionConflict {
-                    draft_id: draft.draft_id,
-                    expected: DraftRevision::new(draft.revision.get().saturating_sub(1)),
-                    current: draft.revision,
-                }
-                .into());
+    /// Reads one stored draft. The caller holds the lock.
+    fn read(&self, draft_id: DraftId) -> Result<Draft> {
+        let path = self.draft_path(draft_id);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(DraftError::Unknown { draft_id }.into());
             }
             Err(error) => return Err(storage(&path, error).into()),
+        };
+        let draft = Self::decode(&bytes).map_err(|error| DraftError::Corrupt {
+            path: path.clone(),
+            reason: error.to_string(),
+        })?;
+        // The name and the record have to agree. A record that names another draft is a file this
+        // store cannot act on, whatever put it there.
+        if draft.draft_id != draft_id {
+            return Err(DraftError::Corrupt {
+                path,
+                reason: format!("it holds draft {}, not {draft_id}", draft.draft_id),
+            }
+            .into());
+        }
+        Ok(draft)
+    }
+
+    /// Reads a draft's note. The caller holds the exclusive lock, because a note this build cannot
+    /// read is removed rather than returned.
+    fn read_checkpoint(&self, draft_id: DraftId) -> Result<Option<SyncCheckpoint>> {
+        let path = self.checkpoint_path(draft_id);
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(storage(&path, error).into()),
+        };
+        match kr_cbor::from_canonical_slice::<SyncCheckpoint>(
+            &bytes,
+            &kr_cbor::Limits::DEFAULT.with_max_message_len(MAX_STORED_DRAFT_BYTES),
+        ) {
+            Ok(checkpoint) => Ok(Some(checkpoint)),
+            Err(_) => {
+                remove_if_present(&path)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn check_owner(&self, draft: &Draft) -> Result<()> {
+        if draft.device_id == self.device_id {
+            return Ok(());
+        }
+        Err(DraftError::NotOwned {
+            draft_id: draft.draft_id,
+            owner: draft.device_id,
+            device_id: self.device_id,
+        }
+        .into())
+    }
+
+    /// Writes one draft. The caller holds the exclusive lock.
+    fn write(&self, draft: &Draft) -> Result<()> {
+        let bytes = Self::encode_record(draft)?;
+        self.write_bytes(&self.draft_path(draft.draft_id), &bytes)
+    }
+
+    /// Replaces one file's contents, whole or not at all. The caller holds the exclusive lock.
+    fn write_bytes(&self, path: &Path, bytes: &[u8]) -> Result<()> {
+        let temporary = self.temporary_path()?;
+        write_whole(&temporary, bytes).map_err(|source| storage(&temporary, source))?;
+        // A rename within one directory replaces the name in one step, so a reader sees the old
+        // contents or the new ones and never a file half written.
+        if let Err(source) = std::fs::rename(&temporary, path) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(storage(path, source).into());
         }
         sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))?;
         Ok(())
     }
 
-    fn read(&self, path: &Path) -> Result<Draft> {
-        let bytes = std::fs::read(path).map_err(|source| storage(path, source))?;
-        Self::decode(&bytes).map_err(|error| {
-            DraftError::Corrupt {
-                path: path.to_path_buf(),
-                reason: error.to_string(),
-            }
-            .into()
-        })
-    }
-
-    /// Returns every stored revision: its draft, its number and its path.
-    fn revisions(&self) -> Result<Vec<(DraftId, u64, PathBuf)>> {
-        let entries = std::fs::read_dir(&self.directory)
-            .map_err(|source| storage(&self.directory, source))?;
-        let mut found = Vec::new();
-        for entry in entries {
-            let entry = entry.map_err(|source| storage(&self.directory, source))?;
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(std::ffi::OsStr::to_str) else {
-                continue;
-            };
-            if let Some((draft_id, revision)) = parse_revision_name(name) {
-                found.push((draft_id, revision, path));
-            }
-        }
-        Ok(found)
-    }
-
-    /// Removes what an interrupted write left behind.
+    /// Removes what an interrupted write left behind. The caller holds the exclusive lock.
     fn sweep_partials(&self) -> Result<()> {
         let entries = std::fs::read_dir(&self.directory)
             .map_err(|source| storage(&self.directory, source))?;
@@ -771,19 +861,26 @@ impl DraftStore {
             let entry = entry.map_err(|source| storage(&self.directory, source))?;
             let path = entry.path();
             if path.extension().and_then(std::ffi::OsStr::to_str) == Some(PARTIAL_EXTENSION) {
-                // A temporary file another process is writing at this moment would also match.
-                // Removing it costs that writer its publication and nothing else: the name it is
-                // about to link to is untouched, and it reports the failure rather than publishing
-                // half a draft.
-                let _ = std::fs::remove_file(&path);
+                // Nothing else can be writing one: every write holds this lock from the moment it
+                // creates its temporary file until the rename has landed.
+                remove_if_present(&path)?;
             }
         }
         Ok(())
     }
 
-    fn revision_path(&self, draft_id: DraftId, revision: DraftRevision) -> PathBuf {
-        self.directory
-            .join(format!("{draft_id}.{}.{DRAFT_EXTENSION}", revision.get()))
+    /// Takes the store's lock for writing.
+    fn exclusive(&self) -> Result<Lock> {
+        Lock::take(&self.directory.join(LOCK_NAME), true)
+    }
+
+    /// Takes the store's lock for reading.
+    fn shared(&self) -> Result<Lock> {
+        Lock::take(&self.directory.join(LOCK_NAME), false)
+    }
+
+    fn draft_path(&self, draft_id: DraftId) -> PathBuf {
+        self.directory.join(format!("{draft_id}.{DRAFT_EXTENSION}"))
     }
 
     fn checkpoint_path(&self, draft_id: DraftId) -> PathBuf {
@@ -798,11 +895,39 @@ impl DraftStore {
     }
 }
 
-/// Returns the draft and revision one stored name belongs to.
-fn parse_revision_name(name: &str) -> Option<(DraftId, u64)> {
-    let rest = name.strip_suffix(&format!(".{DRAFT_EXTENSION}"))?;
-    let (draft_id, revision) = rest.rsplit_once('.')?;
-    Some((draft_id.parse().ok()?, revision.parse().ok()?))
+/// The store's lock, held for as long as this value is.
+///
+/// Dropping it closes the file, and closing the file releases the lock on every platform the
+/// standard library supports.
+#[derive(Debug)]
+struct Lock {
+    _file: std::fs::File,
+}
+
+impl Lock {
+    fn take(path: &Path, exclusive: bool) -> Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|source| storage(path, source))?;
+        let taken = if exclusive {
+            file.lock()
+        } else {
+            file.lock_shared()
+        };
+        taken.map_err(|source| storage(path, source))?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// Returns the draft one stored name belongs to.
+fn parse_draft_name(name: &str) -> Option<DraftId> {
+    name.strip_suffix(&format!(".{DRAFT_EXTENSION}"))?
+        .parse()
+        .ok()
 }
 
 fn encode_within(draft: &Draft, limit: usize) -> Result<Vec<u8>> {
@@ -847,8 +972,9 @@ fn fresh_uuid() -> Result<Uuid> {
 ///
 /// Unsent text a person has written. A directory anything on the machine could read would be one
 /// this store had no business writing into, so an existing directory is narrowed rather than
-/// accepted. On Windows the directory inherits the parent's access list, which is that platform's
-/// own expression of the same thing.
+/// accepted. On Windows the directory takes whatever access list it inherits, which this store does
+/// not narrow: what protects it there is the access list of the directory the caller chose, so a
+/// caller puts the store under its own per-user application data rather than somewhere shared.
 fn private_directory(directory: &Path) -> std::io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -869,10 +995,12 @@ fn private_directory(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Writes a new file whole, and flushes it to the device before anything can link to it.
+/// Writes a new file whole, and flushes it to the device before anything renames it into place.
 ///
-/// The file is created exclusively and, on Unix, owner-only from the moment it exists rather than
-/// a moment afterwards: a file that was briefly readable is a file that was readable.
+/// The file is created exclusively and, on Unix, owner-only from the moment it exists rather than a
+/// moment afterwards: a file that was briefly readable is a file that was readable. A failure after
+/// it was created removes it; a process that dies here leaves it, and the next
+/// [`DraftStore::open`] sweeps it away.
 fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
 
@@ -883,23 +1011,22 @@ fn write_whole(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         use std::os::unix::fs::OpenOptionsExt as _;
         options.mode(0o600);
     }
-    let written = (|| -> std::io::Result<()> {
-        let mut file = options.open(path)?;
-        file.write_all(bytes)?;
-        file.sync_all()
-    })();
+    let mut file = options.open(path)?;
+    let written = file.write_all(bytes).and_then(|()| file.sync_all());
     if written.is_err() {
+        // Only this call could have created the file, because `create_new` refused an existing
+        // name, so removing it here removes nothing another writer is using.
         let _ = std::fs::remove_file(path);
     }
     written
 }
 
-/// Flushes a directory entry, so a name that was published survives a crash.
+/// Flushes a directory entry, so a name that was replaced survives a crash.
 ///
-/// Unix only. Windows offers no directory handle to flush, so a publication there rests on the
-/// filesystem's own ordering of the link against the file's contents, which is weaker: a crash can
-/// leave a name whose contents are not all there. A reader takes the highest revision it can
-/// decode, so what that costs is the newest revision rather than the draft.
+/// Unix only. Windows offers no directory handle to flush, so what a replacement rests on there is
+/// the filesystem's own ordering of the rename against the file's contents. The contents are
+/// flushed before the rename on both, so a crash leaves the old draft or the new one; what Windows
+/// does not promise is that the rename itself is durable.
 fn sync_directory(directory: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -959,12 +1086,15 @@ pub enum Published {
     /// Another device had written first.
     ///
     /// The local draft is exactly as it was. What the service held is kept beside it under `copy`,
-    /// for the person to choose from.
+    /// for the person to choose from, and the note now names the generation that content is at, so
+    /// a caller that has chosen can publish against it.
     Conflicted {
         /// The copy that was kept.
         copy: DraftId,
         /// The revision the other device's draft carried.
         remote_revision: DraftRevision,
+        /// The generation the service holds.
+        generation: u64,
     },
 }
 
@@ -973,18 +1103,24 @@ pub enum Published {
 pub struct Fetched {
     /// The draft as the service held it.
     pub remote: Draft,
+    /// The generation the service holds it at.
+    pub generation: u64,
     /// The copy this device kept beside its own.
     pub copy: Draft,
 }
 
 /// One device's synchronised half of its drafts.
 ///
-/// The comparison is against the generation this device last saw accepted, which is kept beside the
-/// draft as a [`SyncCheckpoint`] and is *not* the draft's own revision: a draft edited three times
-/// offline is at revision four and has still only ever been published once. Section 20 keeps the
-/// loser of a comparison rather than resolving it by whichever clock was further ahead, and section
-/// 24 adds the direction that matters on a device: what is kept is kept *beside* the local draft,
-/// so reconnecting never replaces the person's text with what was on the service.
+/// The comparison is against the generation this device last saw, which is kept beside the draft as
+/// a [`SyncCheckpoint`] and is *not* the draft's own revision: a draft edited three times offline is
+/// at revision four and has still only ever been published once. Section 20 keeps the loser of a
+/// comparison rather than resolving it by whichever clock was further ahead, and section 24 adds
+/// the direction that matters on a device: what is kept is kept *beside* the local draft, so
+/// reconnecting never replaces the person's text with what was on the service.
+///
+/// A note that is lost or was never written costs a comparison, not a draft: the publication is
+/// refused, the content the service holds comes down beside the local draft, and the note is written
+/// from the generation that fetch reported. The next publication then compares against it.
 #[derive(Clone, Debug)]
 pub struct DraftSync {
     service: std::sync::Arc<dyn crate::services::SyncBackupService>,
@@ -1009,8 +1145,10 @@ impl DraftSync {
     ///
     /// # Errors
     ///
-    /// Returns the service's refusal, [`DraftError::TooLarge`] when the draft does not fit the
-    /// contract, and [`DraftError::Storage`] when a conflict copy or the note cannot be written.
+    /// Returns the service's refusal, [`DraftError::StalePublication`] when an older copy of a
+    /// draft is offered after a newer one was accepted, [`DraftError::TooLarge`] when the draft does
+    /// not fit the contract, and [`DraftError::Storage`] when a conflict copy or the note cannot be
+    /// written.
     pub async fn publish(
         &self,
         store: &DraftStore,
@@ -1020,11 +1158,23 @@ impl DraftSync {
         let plaintext = DraftStore::encode_payload(draft)?;
         let ciphertext = self.sealer.seal(&plaintext)?;
         let collection = draft_collection(draft.draft_id);
-        // What this device last saw the service accept. A draft that has never been published
-        // expects nothing to be there, which is generation zero.
-        let expected = store
-            .checkpoint(draft.draft_id)?
-            .map_or(0, |checkpoint| checkpoint.generation.get());
+        // What this device last saw the service hold. A draft that has never been published expects
+        // nothing to be there, which is generation zero.
+        let note = store.checkpoint(draft.draft_id)?;
+        if let Some(published) = note.and_then(|note| note.published_revision.0)
+            && draft.revision < published
+        {
+            // A caller holding an older copy of its own draft. The service would accept it, because
+            // the generation is right and the draft's revision means nothing to it, and the newest
+            // text would be gone from the object every other device reads.
+            return Err(DraftError::StalePublication {
+                draft_id: draft.draft_id,
+                published,
+                offered: draft.revision,
+            }
+            .into());
+        }
+        let expected = note.map_or(0, |note| note.generation.get());
         match self
             .service
             .compare_exchange(&collection, expected, &ciphertext)
@@ -1035,7 +1185,7 @@ impl DraftSync {
                     draft.draft_id,
                     SyncCheckpoint {
                         generation: U64::new(accepted),
-                        revision: draft.revision,
+                        published_revision: Nullable::some(draft.revision),
                     },
                 )?;
                 Ok(Published::Accepted {
@@ -1047,6 +1197,7 @@ impl DraftSync {
                 Ok(Published::Conflicted {
                     copy: fetched.copy.draft_id,
                     remote_revision: fetched.remote.revision,
+                    generation: fetched.generation,
                 })
             }
             Err(error) => Err(error),
@@ -1059,21 +1210,39 @@ impl DraftSync {
     /// beside, which is what keeps a reconnect from putting remote input where the person's text
     /// was. Section 24 makes that the rule rather than a preference.
     ///
+    /// The note is written from the generation the service reported, so a device that had lost track
+    /// of where the object stood knows again.
+    ///
     /// # Errors
     ///
     /// Returns the service's refusal, [`ClientError::Cbor`] when the object is not a draft this
-    /// build reads, and [`DraftError::Storage`] when the copy cannot be written.
+    /// build reads or is larger than section 20 lets a service carry, and [`DraftError::Storage`]
+    /// when the copy or the note cannot be written.
     pub async fn fetch_beside(
         &self,
         store: &DraftStore,
         draft_id: DraftId,
         now: TimestampMs,
     ) -> Result<Fetched> {
-        let ciphertext = self.service.fetch(&draft_collection(draft_id)).await?;
+        let (generation, ciphertext) = self.service.fetch(&draft_collection(draft_id)).await?;
         let plaintext = self.sealer.open(&ciphertext)?;
-        let remote = DraftStore::decode(&plaintext)?;
+        let remote = DraftStore::decode_payload(&plaintext)?;
         let copy = store.keep_copy(draft_id, &remote, now)?;
-        Ok(Fetched { remote, copy })
+        // The generation is this device's to remember; the revision beside it is not, because the
+        // revision that fetch carried is the other device's counter and nothing about this device's
+        // own copies follows from it.
+        store.record_checkpoint(
+            draft_id,
+            SyncCheckpoint {
+                generation: U64::new(generation),
+                published_revision: Nullable::null(),
+            },
+        )?;
+        Ok(Fetched {
+            remote,
+            generation,
+            copy,
+        })
     }
 }
 
@@ -1101,6 +1270,12 @@ mod tests {
         DraftTarget::session(session()).in_application(application(), AgentBindingRevision::new(1))
     }
 
+    fn drafts(store: &DraftStore) -> Vec<Draft> {
+        let listing = store.list().expect("a listing");
+        assert!(listing.unreadable.is_empty(), "{:?}", listing.unreadable);
+        listing.drafts
+    }
+
     #[test]
     fn a_draft_survives_the_process_that_wrote_it() {
         let directory = tempfile::tempdir().expect("a directory");
@@ -1121,7 +1296,7 @@ mod tests {
             .expect("the draft is still there");
         assert_eq!(loaded, draft);
         assert_eq!(loaded.text, "half a thought");
-        assert_eq!(store.list().expect("a listing").len(), 1);
+        assert_eq!(drafts(&store).len(), 1);
     }
 
     #[test]
@@ -1153,28 +1328,22 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_revision_is_owner_only() {
+    fn a_stored_draft_is_owner_only() {
         let directory = tempfile::tempdir().expect("a directory");
         let store = store(&directory);
         let draft = store
             .create(open_target(), "private".to_owned(), TimestampMs::new(1))
             .expect("a draft");
+        let path = store.draft_path(draft.draft_id);
+        assert!(path.is_file());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
-            let mode = std::fs::metadata(store.revision_path(draft.draft_id, draft.revision))
+            let mode = std::fs::metadata(&path)
                 .expect("the file")
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
-        }
-        #[cfg(not(unix))]
-        {
-            assert!(
-                store
-                    .revision_path(draft.draft_id, draft.revision)
-                    .is_file()
-            );
         }
     }
 
@@ -1217,42 +1386,49 @@ mod tests {
     }
 
     #[test]
-    fn two_writers_at_the_same_revision_do_not_both_win() {
+    fn a_writer_that_paused_while_another_moved_on_twice_overwrites_nothing() {
         let directory = tempfile::tempdir().expect("a directory");
         // Two stores over one directory: two windows of one application, or two processes.
-        let first = store(&directory);
-        let second = DraftStore::open(directory.path().join("drafts"), device()).expect("a store");
-        let draft = first
+        let paused = store(&directory);
+        let moving = DraftStore::open(directory.path().join("drafts"), device()).expect("a store");
+        let draft = moving
             .create(open_target(), "shared".to_owned(), TimestampMs::new(1))
             .expect("a draft");
 
-        first
+        // The first window read revision one and stopped there. The second wrote twice, so the
+        // revision the first would have written has been and gone.
+        let held = paused.load(draft.draft_id).expect("the draft");
+        assert_eq!(held.revision, DraftRevision::new(1));
+        for (revision, text) in [(1, "the second window, once"), (2, "and again")] {
+            moving
+                .update(
+                    draft.draft_id,
+                    DraftRevision::new(revision),
+                    TimestampMs::new(revision + 1),
+                    |draft| draft.text = text.to_owned(),
+                )
+                .expect("a publication");
+        }
+
+        let error = paused
             .update(
                 draft.draft_id,
-                draft.revision,
-                TimestampMs::new(2),
+                held.revision,
+                TimestampMs::new(9),
                 |draft| {
                     draft.text = "what the first window wrote".to_owned();
-                },
-            )
-            .expect("the first publication");
-        // The second writer read revision one before the first published, so it tries to publish
-        // revision two as well.
-        let error = second
-            .update(
-                draft.draft_id,
-                draft.revision,
-                TimestampMs::new(3),
-                |draft| {
-                    draft.text = "what the second window wrote".to_owned();
                 },
             )
             .expect_err("a lost comparison");
         assert!(error.to_string().contains("revision"));
         assert_eq!(
-            second.load(draft.draft_id).expect("the draft").text,
-            "what the first window wrote",
+            paused.load(draft.draft_id).expect("the draft").text,
+            "and again",
             "the writer that lost overwrote nothing"
+        );
+        assert_eq!(
+            paused.load(draft.draft_id).expect("the draft").revision,
+            DraftRevision::new(3)
         );
     }
 
@@ -1278,11 +1454,11 @@ mod tests {
         assert_eq!(updated.draft_id, draft.draft_id);
         assert_eq!(updated.device_id, device());
         assert_eq!(updated.revision, DraftRevision::new(2));
-        assert_eq!(store.list().expect("a listing").len(), 1);
+        assert_eq!(drafts(&store).len(), 1);
     }
 
     #[test]
-    fn a_store_does_not_take_over_another_devices_draft() {
+    fn a_store_neither_changes_nor_removes_another_devices_draft() {
         let directory = tempfile::tempdir().expect("a directory");
         let mine = store(&directory);
         let draft = mine
@@ -1303,6 +1479,10 @@ mod tests {
                     draft.text = "not yours to change".to_owned();
                 },
             )
+            .expect_err("another device's draft");
+        assert!(error.to_string().contains("belongs to device"));
+        let error = other
+            .remove(draft.draft_id)
             .expect_err("another device's draft");
         assert!(error.to_string().contains("belongs to device"));
         assert_eq!(mine.load(draft.draft_id).expect("the draft"), draft);
@@ -1390,18 +1570,36 @@ mod tests {
     }
 
     #[test]
-    fn a_draft_larger_than_the_contract_carries_is_refused_rather_than_truncated() {
+    fn an_edit_the_service_could_not_carry_is_refused_where_it_is_made() {
         let directory = tempfile::tempdir().expect("a directory");
         let store = store(&directory);
+        // Between the payload bound and the storage bound: it would fit the file and could never be
+        // published, so it is refused at the edit rather than hours later at a synchronisation.
         let error = store
             .create(
                 open_target(),
-                "x".repeat(MAX_STORED_DRAFT_BYTES + 1),
+                "x".repeat(MAX_DRAFT_BYTES),
                 TimestampMs::new(1),
             )
-            .expect_err("too large");
+            .expect_err("larger than the service carries");
         assert!(error.to_string().contains("limit"));
-        assert!(store.list().expect("a listing").is_empty());
+        assert!(drafts(&store).is_empty());
+
+        let draft = store
+            .create(open_target(), "short".to_owned(), TimestampMs::new(1))
+            .expect("a draft");
+        let error = store
+            .update(
+                draft.draft_id,
+                draft.revision,
+                TimestampMs::new(2),
+                |draft| {
+                    draft.text = "x".repeat(MAX_DRAFT_BYTES);
+                },
+            )
+            .expect_err("larger than the service carries");
+        assert!(error.to_string().contains("limit"));
+        assert_eq!(store.load(draft.draft_id).expect("the draft").text, "short");
     }
 
     #[test]
@@ -1417,8 +1615,10 @@ mod tests {
             text,
             attachments: Vec::new(),
             conflict_of: Nullable::null(),
-            created_at_ms: TimestampMs::new(1),
-            updated_at_ms: TimestampMs::new(1),
+            // Ten digits of milliseconds, which is what a real clock produces and the widest a
+            // timestamp encodes to.
+            created_at_ms: TimestampMs::new(1_760_000_000_000),
+            updated_at_ms: TimestampMs::new(1_760_000_000_000),
         };
         // Grow the text until one more byte would take the payload past the limit.
         let mut text = String::new();
@@ -1426,22 +1626,30 @@ mod tests {
             text.push('x');
         }
         let remote = sample(text);
-        let payload = DraftStore::encode_payload(&remote).expect("exactly at the limit");
+        let payload = DraftStore::encode_payload(&remote).expect("at the limit");
         assert!(payload.len() <= MAX_DRAFT_BYTES);
-        assert!(payload.len() > MAX_DRAFT_BYTES - 16);
+        assert!(
+            payload.len() > MAX_DRAFT_BYTES - 8,
+            "the sample is at the limit, not near it: {}",
+            payload.len()
+        );
 
         let local = store
             .create(open_target(), "mine".to_owned(), TimestampMs::new(1))
             .expect("a draft");
         let copy = store
-            .keep_copy(local.draft_id, &remote, TimestampMs::new(2))
-            .expect("a copy of a draft the service would carry");
+            .keep_copy(local.draft_id, &remote, TimestampMs::new(1_760_000_000_001))
+            .expect("a copy of a draft the service was carrying");
         assert_eq!(copy.conflict_of, Nullable::some(local.draft_id));
-        // The note is local, so the copy publishes the same payload the service carried.
-        assert_eq!(
-            DraftStore::encode_payload(&copy).expect("a payload").len(),
-            payload.len()
-        );
+        assert_eq!(copy.text, remote.text);
+        assert_eq!(copy.target, remote.target);
+        assert_eq!(copy.state, remote.state);
+        assert_eq!(copy.attachments, remote.attachments);
+        // The copy is this device's, so its identity, owner, revision and times are this device's.
+        assert_ne!(copy.draft_id, remote.draft_id);
+        assert_eq!(copy.device_id, device());
+        assert_eq!(copy.revision, DraftRevision::new(1));
+        assert_eq!(store.load(copy.draft_id).expect("the copy"), copy);
     }
 
     #[test]
@@ -1471,7 +1679,7 @@ mod tests {
             "what I wrote",
             "the local draft is never replaced"
         );
-        assert_eq!(store.list().expect("a listing").len(), 2);
+        assert_eq!(drafts(&store).len(), 2);
     }
 
     #[test]
@@ -1508,11 +1716,7 @@ mod tests {
         // What a process killed part way through a write leaves behind.
         let abandoned = store.directory().join("half-a-draft.partial");
         std::fs::write(&abandoned, b"not a draft").expect("an interrupted write");
-        assert_eq!(
-            store.list().expect("a listing").len(),
-            1,
-            "a partial file is not a draft"
-        );
+        assert_eq!(drafts(&store).len(), 1, "a partial file is not a draft");
         // The next run removes it.
         let reopened = DraftStore::open(store.directory(), device()).expect("a store");
         assert!(!abandoned.exists());
@@ -1520,7 +1724,43 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_draft_takes_every_revision_and_its_note() {
+    fn a_file_this_build_cannot_read_is_named_rather_than_hiding_the_drafts_beside_it() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = store(&directory);
+        let draft = store
+            .create(open_target(), "readable".to_owned(), TimestampMs::new(1))
+            .expect("a draft");
+        let damaged = DraftId::new(Uuid::from_bytes([6; 16]));
+        let damaged_path = store.draft_path(damaged);
+        std::fs::write(&damaged_path, b"not canonical bytes").expect("a damaged file");
+
+        let listing = store.list().expect("a listing");
+        assert_eq!(listing.drafts, vec![draft.clone()]);
+        assert_eq!(listing.unreadable, vec![damaged_path]);
+        // Asking for the damaged one says so rather than answering with somebody else's draft.
+        assert!(store.load(damaged).is_err());
+        assert_eq!(store.load(draft.draft_id).expect("the draft"), draft);
+    }
+
+    #[test]
+    fn a_record_that_names_another_draft_is_not_read_as_this_one() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = store(&directory);
+        let draft = store
+            .create(open_target(), "mine".to_owned(), TimestampMs::new(1))
+            .expect("a draft");
+        let impostor = DraftId::new(Uuid::from_bytes([2; 16]));
+        std::fs::write(
+            store.draft_path(impostor),
+            DraftStore::encode_record(&draft).expect("canonical bytes"),
+        )
+        .expect("a misfiled record");
+        let error = store.load(impostor).expect_err("a misfiled record");
+        assert!(error.to_string().contains("could not be read"));
+    }
+
+    #[test]
+    fn removing_a_draft_takes_its_note_with_it() {
         let directory = tempfile::tempdir().expect("a directory");
         let store = store(&directory);
         let draft = store
@@ -1538,7 +1778,7 @@ mod tests {
             .expect("an update");
         let checkpoint = SyncCheckpoint {
             generation: U64::new(3),
-            revision: DraftRevision::new(2),
+            published_revision: Nullable::some(DraftRevision::new(2)),
         };
         store
             .record_checkpoint(draft.draft_id, checkpoint)
@@ -1549,7 +1789,7 @@ mod tests {
         );
 
         store.remove(draft.draft_id).expect("removed");
-        assert!(store.list().expect("a listing").is_empty());
+        assert!(drafts(&store).is_empty());
         assert_eq!(store.checkpoint(draft.draft_id).expect("no note"), None);
         assert!(
             store.remove(draft.draft_id).is_ok(),
@@ -1558,16 +1798,32 @@ mod tests {
     }
 
     #[test]
-    fn a_stored_name_is_read_back_as_the_draft_and_revision_it_holds() {
+    fn a_note_this_build_cannot_read_is_treated_as_no_note_at_all() {
+        let directory = tempfile::tempdir().expect("a directory");
+        let store = store(&directory);
+        let draft = store
+            .create(open_target(), "one".to_owned(), TimestampMs::new(1))
+            .expect("a draft");
+        std::fs::write(store.checkpoint_path(draft.draft_id), b"not a note")
+            .expect("a damaged note");
+        // It is a cache: a publication then compares against nothing and learns where the object
+        // stands from the service, rather than stopping because a cache is unreadable.
+        assert_eq!(store.checkpoint(draft.draft_id).expect("no note"), None);
+        assert!(!store.checkpoint_path(draft.draft_id).exists());
+        assert_eq!(store.load(draft.draft_id).expect("the draft").text, "one");
+    }
+
+    #[test]
+    fn a_stored_name_is_read_back_as_the_draft_it_holds() {
         let draft_id = DraftId::new(Uuid::from_bytes([5; 16]));
         assert_eq!(
-            parse_revision_name(&format!("{draft_id}.7.draft")),
-            Some((draft_id, 7))
+            parse_draft_name(&format!("{draft_id}.draft")),
+            Some(draft_id)
         );
-        assert_eq!(parse_revision_name(&format!("{draft_id}.sync")), None);
-        assert_eq!(parse_revision_name(&format!("{draft_id}.7.partial")), None);
-        assert_eq!(parse_revision_name("not-a-draft.1.draft"), None);
-        assert_eq!(parse_revision_name(&format!("{draft_id}.x.draft")), None);
+        assert_eq!(parse_draft_name(&format!("{draft_id}.sync")), None);
+        assert_eq!(parse_draft_name(&format!("{draft_id}.partial")), None);
+        assert_eq!(parse_draft_name("store.lock"), None);
+        assert_eq!(parse_draft_name("not-a-draft.draft"), None);
     }
 
     #[test]
@@ -1580,11 +1836,26 @@ mod tests {
         };
         assert_eq!(too_long.user_action(), UserAction::Nothing);
         assert_eq!(too_long.code(), ErrorCode::InvalidArgument);
+        assert_eq!(
+            ClientError::from(too_long).user_action(),
+            UserAction::Nothing,
+            "a client failure carries the store's answer, not the code's"
+        );
+
         let unwritable = DraftError::Storage {
             path: PathBuf::from("/drafts"),
             source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
         };
         assert_eq!(unwritable.user_action(), UserAction::FixConfiguration);
         assert_eq!(unwritable.code(), ErrorCode::StorageUnavailable);
+        let client_error = ClientError::from(unwritable);
+        assert_eq!(client_error.user_action(), UserAction::FixConfiguration);
+        assert_eq!(
+            client_error
+                .decision(crate::retry::RequestClass::IdempotentRead)
+                .action,
+            UserAction::FixConfiguration,
+            "the decision and the action agree"
+        );
     }
 }

@@ -215,8 +215,12 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
         ciphertext: &'a [u8],
     ) -> ServiceFuture<'a, u64>;
 
-    /// Fetches an encrypted object.
-    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, Vec<u8>>;
+    /// Fetches an encrypted object and the generation it is held at.
+    ///
+    /// The generation comes back with the bytes because a caller that fetched after losing a
+    /// comparison needs it to make the next one: without it, the only way to learn where the object
+    /// stands is to lose again.
+    fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (u64, Vec<u8>)>;
 }
 
 /// Where managed inference is brokered.
@@ -322,7 +326,7 @@ impl SyncBackupService for NullService {
         unconfigured("sync and backup")
     }
 
-    fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, Vec<u8>> {
+    fn fetch<'a>(&'a self, _collection: &'a str) -> ServiceFuture<'a, (u64, Vec<u8>)> {
         unconfigured("sync and backup")
     }
 }

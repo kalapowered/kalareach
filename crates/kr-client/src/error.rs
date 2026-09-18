@@ -3,7 +3,7 @@
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::method::{Method, MethodVersion};
 
-use crate::retry::{Decision, Failure, Origin, RequestClass, UserAction};
+use crate::retry::{Decision, Failure, RequestClass, UserAction};
 
 /// A client failure.
 #[derive(Debug, thiserror::Error)]
@@ -33,6 +33,13 @@ pub enum ClientError {
         error: ProtocolError,
         /// Seconds to wait before sending the same request again, when the service said.
         retry_after_seconds: Option<u64>,
+        /// What a person does about it.
+        ///
+        /// The service classifies its own refusal, because it is the only thing that can. Section
+        /// 23's required codes have one `PERMISSION_DENIED`, and a service uses it both for a
+        /// caller that is not signed in and for an account that may not do this; the code cannot
+        /// carry the difference and the service already knows it.
+        action: UserAction,
     },
     /// A value could not be encoded or decoded as KR-CBOR-1.
     #[error("the message was not canonical: {0}")]
@@ -123,22 +130,12 @@ impl ClientError {
         }
     }
 
-    /// Returns who refused.
-    ///
-    /// A managed service and a host can answer with the same code and mean different things to a
-    /// person, so the policy is told which one this was.
-    #[must_use]
-    pub fn origin(&self) -> Origin {
-        match self {
-            Self::Refused { .. } | Self::ServiceNotConfigured(_) => Origin::ManagedService,
-            _ => Origin::Host,
-        }
-    }
-
     /// Returns what the retry policy makes of this failure for a request of `class`.
     ///
     /// This is how a caller reaches the policy for everything the library does not retry itself:
-    /// the recovery step, and the direct action a user interface offers instead of the code.
+    /// the recovery step, and the direct action a user interface offers instead of the code. The
+    /// action is [`Self::user_action`]'s, so a caller reading the decision and a caller reading the
+    /// action are told the same thing.
     #[must_use]
     pub fn decision(&self, class: RequestClass) -> Decision {
         let retry_after = match self {
@@ -148,23 +145,33 @@ impl ClientError {
             } => retry_after_seconds.map(std::time::Duration::from_secs),
             _ => None,
         };
-        crate::retry::decision(
+        let mut decision = crate::retry::decision(
             Failure {
                 code: self.code(),
                 retry_after,
-                origin: self.origin(),
             },
             class,
-        )
+        );
+        decision.action = self.user_action();
+        decision
     }
 
     /// Returns the direct action a user interface offers for this failure.
     ///
     /// Section 23: the interface translates a code into a direct action and does not display raw
     /// protocol internals by default. The plain message is still there for a log or a details view.
+    ///
+    /// Most failures are translated by the code alone. The two that are not are the ones whose
+    /// refuser knows more than its code can say: a managed service classifies its own refusal, and
+    /// this device's draft store has its own answers, because a draft that will not fit is not a
+    /// reason to update the application.
     #[must_use]
     pub fn user_action(&self) -> UserAction {
-        crate::retry::user_action(self.code(), self.origin())
+        match self {
+            Self::Refused { action, .. } => *action,
+            Self::Draft(error) => error.user_action(),
+            other => crate::retry::user_action(other.code()),
+        }
     }
 }
 

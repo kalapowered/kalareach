@@ -52,6 +52,7 @@ use serde::{Deserialize, Serialize};
 use super::ServiceFuture;
 use super::{LeaseEndReason, LeasePayer, LeaseRequest, RelayDirection, RelayLeaseService};
 use crate::error::{ClientError, Result};
+use crate::retry::UserAction;
 
 /// The domain a lease request's body digest covers.
 pub const RELAY_LEASE_REQUEST_DOMAIN: &str = "kr-relay-lease-request/1";
@@ -657,33 +658,44 @@ fn data_of(answer: &ServiceHttpAnswer) -> Result<serde_json::Value> {
         return Err(unreadable(answer.status, "its refusal names no error"));
     };
 
-    let error = ProtocolError::new(code_of(&refusal.code, answer.status), refusal.message);
+    let (code, action) = classify(&refusal.code, answer.status);
+    let error = ProtocolError::new(code, refusal.message);
 
     // Always the service's own variant, with or without a delay. What a person is told about a
-    // refusal turns on who refused, so a refusal that named no delay is still a refusal from here
-    // rather than one that reads as the host's.
+    // refusal turns on who refused and why, and the service's own code says more than the protocol
+    // code it maps to, so the action is decided here rather than from the code afterwards.
     Err(ClientError::Refused {
         error,
         retry_after_seconds: refusal.retry_after_seconds,
+        action,
     })
 }
 
-/// The protocol code one service error code means.
+/// The protocol code one service error code means, and what a person does about it.
 ///
 /// The status decides the codes this service does not name, because a body carrying an unknown code
 /// is either a newer service or something in front of it: a fault is not a field the caller chose.
-fn code_of(code: &str, status: u16) -> ErrorCode {
+///
+/// Two of the service's codes map to one protocol code and mean different things to a person. A
+/// caller that is not authenticated signs in; an authenticated account that may not spend here does
+/// not, and telling it to sign in again would send somebody round a loop they are already through.
+/// Section 23's required set has one `PERMISSION_DENIED`, so the difference is carried as the
+/// action beside it rather than as a code the protocol does not define.
+fn classify(code: &str, status: u16) -> (ErrorCode, UserAction) {
     match code {
-        "UNAUTHENTICATED" | "FORBIDDEN" | "REAUTHENTICATION_REQUIRED" => {
-            ErrorCode::PermissionDenied
+        "UNAUTHENTICATED" | "REAUTHENTICATION_REQUIRED" => {
+            (ErrorCode::PermissionDenied, UserAction::SignIn)
         }
-        "RATE_LIMITED" => ErrorCode::RateLimited,
-        "QUOTA_EXHAUSTED" => ErrorCode::QuotaExceeded,
-        "NOT_CONFIGURED" => ErrorCode::HostNotConfigured,
-        "INTERNAL" => ErrorCode::UpstreamUnavailable,
-        "INVALID_REQUEST" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" => ErrorCode::InvalidArgument,
-        _ if status >= 500 => ErrorCode::UpstreamUnavailable,
-        _ => ErrorCode::InvalidArgument,
+        "FORBIDDEN" => (ErrorCode::PermissionDenied, UserAction::FixConfiguration),
+        "RATE_LIMITED" => (ErrorCode::RateLimited, UserAction::Wait),
+        "QUOTA_EXHAUSTED" => (ErrorCode::QuotaExceeded, UserAction::Wait),
+        "NOT_CONFIGURED" => (ErrorCode::HostNotConfigured, UserAction::FixConfiguration),
+        "INTERNAL" => (ErrorCode::UpstreamUnavailable, UserAction::Wait),
+        "INVALID_REQUEST" | "NOT_FOUND" | "METHOD_NOT_ALLOWED" => {
+            (ErrorCode::InvalidArgument, UserAction::Update)
+        }
+        _ if status >= 500 => (ErrorCode::UpstreamUnavailable, UserAction::Wait),
+        _ => (ErrorCode::InvalidArgument, UserAction::Update),
     }
 }
 

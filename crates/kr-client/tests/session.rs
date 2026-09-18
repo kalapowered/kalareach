@@ -12,8 +12,8 @@ use std::time::Duration;
 use iroh::{Endpoint, EndpointAddr};
 use kr_client::cursors::{Restoration, RestorationStep};
 use kr_client::drafts::{
-    Associations, DraftSealer, DraftStore, DraftSync, DraftTarget, Published, SyncCheckpoint,
-    draft_collection,
+    Associations, Draft, DraftSealer, DraftStore, DraftSync, DraftTarget, Published,
+    SyncCheckpoint, draft_collection,
 };
 use kr_client::error::ClientError;
 use kr_client::retry::{Recovery, RequestClass, UserAction};
@@ -916,13 +916,16 @@ impl kr_client::services::SyncBackupService for RemoteObjects {
         })
     }
 
-    fn fetch<'a>(&'a self, collection: &'a str) -> kr_client::services::ServiceFuture<'a, Vec<u8>> {
+    fn fetch<'a>(
+        &'a self,
+        collection: &'a str,
+    ) -> kr_client::services::ServiceFuture<'a, (u64, Vec<u8>)> {
         Box::pin(async move {
             self.objects
                 .lock()
                 .await
                 .get(collection)
-                .map(|(_, ciphertext)| ciphertext.clone())
+                .map(|(generation, ciphertext)| (*generation, ciphertext.clone()))
                 .ok_or_else(|| {
                     ClientError::Host(ProtocolError::new(
                         ErrorCode::InvalidArgument,
@@ -1046,10 +1049,12 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
     let Published::Conflicted {
         copy,
         remote_revision,
+        generation,
     } = published
     else {
         panic!("this device was overtaken: {published:?}");
     };
+    assert_eq!(generation, 1, "the note now names where the object stands");
     assert_eq!(
         remote_revision, theirs.revision,
         "the revision reported is the other device's, not the copy's"
@@ -1061,7 +1066,9 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
     assert_eq!(kept.text, "what the other device had");
     assert_eq!(kept.conflict_of, Nullable::some(draft.draft_id));
     assert_ne!(kept.draft_id, draft.draft_id);
-    assert_eq!(store.list().expect("a listing").len(), 2);
+    let listing = store.list().expect("a listing");
+    assert!(listing.unreadable.is_empty());
+    assert_eq!(listing.drafts.len(), 2);
 
     // A draft this device edited offline is published against the generation this device last saw,
     // which is none: its own revision counter has nothing to do with the service's.
@@ -1091,7 +1098,7 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
             .expect("published once"),
         SyncCheckpoint {
             generation: U64::new(1),
-            revision: fresh.revision,
+            published_revision: Nullable::some(fresh.revision),
         }
     );
     assert_eq!(
@@ -1099,6 +1106,43 @@ async fn a_draft_outlives_its_attachment_its_connection_and_another_devices_writ
             .await
             .expect("an answer"),
         Published::Accepted { generation: 2 }
+    );
+
+    // An older copy of this device's own draft is refused rather than sent. The service would take
+    // it, because its generation is right and a draft revision means nothing to it, and the newest
+    // text would be gone from the object every other device reads.
+    let stale = store
+        .load(fresh.draft_id)
+        .map(|draft| Draft {
+            revision: DraftRevision::new(1),
+            ..draft
+        })
+        .expect("an older copy");
+    let error = sync
+        .publish(&store, &stale, TimestampMs::new(8))
+        .await
+        .expect_err("an older copy");
+    assert!(error.to_string().contains("is older"), "{error}");
+
+    // A device that lost its note compares against nothing, is overtaken by what is already there,
+    // keeps that content beside its own and learns the generation. The next publication works.
+    store
+        .forget_checkpoint(fresh.draft_id)
+        .expect("the note is gone");
+    let published = sync
+        .publish(&store, &fresh, TimestampMs::new(9))
+        .await
+        .expect("an answer");
+    assert!(
+        matches!(published, Published::Conflicted { generation: 2, .. }),
+        "{published:?}"
+    );
+    assert_eq!(
+        sync.publish(&store, &fresh, TimestampMs::new(10))
+            .await
+            .expect("an answer"),
+        Published::Accepted { generation: 3 },
+        "the note the fetch wrote is what the next comparison names"
     );
 
     assert!(script.actions.lock().await.is_empty());

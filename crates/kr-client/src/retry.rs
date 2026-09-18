@@ -48,11 +48,15 @@ pub const RETRY_BACKOFF_MAX: Duration = Duration::from_secs(5);
 /// call that never returns, and the caller would have nothing to show for the wait.
 pub const MAX_AUTOMATIC_RETRIES: u32 = 3;
 
-/// The longest delay the library will wait inside a call before handing the decision back.
+/// The longest single delay the library will wait inside a call before handing the decision back.
 ///
 /// A managed service may legitimately ask for a delay of minutes. Honouring it inside a call would
 /// hold the caller for minutes with no way to change its mind, so a longer delay is reported as a
 /// repeat the caller schedules rather than performed as a retry the caller cannot see.
+///
+/// It bounds each delay rather than their sum. [`MAX_AUTOMATIC_RETRIES`] delays of this length add
+/// up, so the longest a call waits on the policy's account is the two multiplied together, and the
+/// requests themselves take whatever they take.
 pub const MAX_AUTOMATIC_DELAY: Duration = Duration::from_secs(10);
 
 /// Which class a request belongs to, which decides whether an automatic retry is legal at all.
@@ -261,19 +265,6 @@ impl Decision {
     }
 }
 
-/// Who refused.
-///
-/// The step is the same either way, because it follows from the code. What differs is what a
-/// person does about it, and for that it matters whether the refusal came from the host this
-/// device is paired with or from a managed service it buys a resource from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub enum Origin {
-    /// The host this client is connected to.
-    Host,
-    /// A managed service client.
-    ManagedService,
-}
-
 /// One failure, as the policy reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Failure {
@@ -285,18 +276,15 @@ pub struct Failure {
     /// stands in for it. A delay inside a message is a delay nothing can act on, which is why this
     /// is a field.
     pub retry_after: Option<Duration>,
-    /// Who refused.
-    pub origin: Origin,
 }
 
 impl Failure {
-    /// A failure the host said nothing more about.
+    /// A failure the refuser said nothing more about.
     #[must_use]
     pub const fn new(code: ErrorCode) -> Self {
         Self {
             code,
             retry_after: None,
-            origin: Origin::Host,
         }
     }
 
@@ -306,15 +294,7 @@ impl Failure {
         Self {
             code,
             retry_after: Some(retry_after),
-            origin: Origin::Host,
         }
-    }
-
-    /// Names who refused.
-    #[must_use]
-    pub const fn refused_by(mut self, origin: Origin) -> Self {
-        self.origin = origin;
-        self
     }
 }
 
@@ -399,18 +379,15 @@ pub const fn entry(code: ErrorCode) -> Entry {
     Entry { step, action }
 }
 
-/// Returns the direct action a user interface offers for one code from one refuser.
+/// Returns the direct action a user interface offers for one code.
 ///
-/// One code can mean two things depending on who refused. A host that answers `PERMISSION_DENIED`
-/// is saying this device does not hold the right, and the person changes a setting. A managed
-/// service that answers it is saying the account is not signed in, and the person signs in. The
-/// step is the same either way — neither is retried — so only the action differs.
+/// It is what the code alone supports. A refuser that knows more than its code says carries its own
+/// action instead: a managed service that answered `PERMISSION_DENIED` because the account is not
+/// signed in knows that, and the code it had to answer with does not, so
+/// [`crate::ClientError::user_action`] takes the service's rather than this.
 #[must_use]
-pub const fn user_action(code: ErrorCode, origin: Origin) -> UserAction {
-    match (origin, code) {
-        (Origin::ManagedService, ErrorCode::PermissionDenied) => UserAction::SignIn,
-        (_, other) => entry(other).action,
-    }
+pub const fn user_action(code: ErrorCode) -> UserAction {
+    entry(code).action
 }
 
 /// One request's attempt budget and backoff.
@@ -466,8 +443,7 @@ impl Attempts {
     /// A decision that retries spends one of the budget. Everything else leaves it alone, because
     /// nothing was sent again.
     pub fn decide(&mut self, failure: Failure, class: RequestClass) -> Decision {
-        let step = entry(failure.code).step;
-        let action = user_action(failure.code, failure.origin);
+        let Entry { step, action } = entry(failure.code);
         let category = failure.code.retry_category();
         let recovery = match step {
             Step::NewSnapshot => Recovery::NewSnapshot,
@@ -538,31 +514,29 @@ mod tests {
             );
             assert!(!decision.action.as_str().is_empty());
         }
-        // Every action the vocabulary names must be reachable from some code: an action no code
-        // produces is a string a client would translate for nothing.
+        // Every action the table can produce must be reachable from some code: one no code
+        // produces is a string a client would translate for nothing. Signing in is the exception,
+        // and deliberately so. Section 23's required codes have no "not authenticated", so a host
+        // error never means it; a managed service that knows its caller is signed out carries the
+        // action itself, which `crates/kr-client/tests/relay_service.rs` checks.
         for action in UserAction::ALL {
+            if action == UserAction::SignIn {
+                assert!(
+                    !ErrorCode::ALL
+                        .iter()
+                        .any(|code| user_action(*code) == action),
+                    "no code should mean the account is signed out"
+                );
+                continue;
+            }
             assert!(
-                ErrorCode::ALL.iter().any(|code| {
-                    user_action(*code, Origin::Host) == action
-                        || user_action(*code, Origin::ManagedService) == action
-                }),
+                ErrorCode::ALL
+                    .iter()
+                    .any(|code| user_action(*code) == action),
                 "no code produces {}",
                 action.as_str()
             );
         }
-        // A refusal from a managed service is the one place signing in is the answer, and it is
-        // the only code the two origins disagree about.
-        assert_eq!(
-            user_action(ErrorCode::PermissionDenied, Origin::ManagedService),
-            UserAction::SignIn
-        );
-        let differing: Vec<&ErrorCode> = ErrorCode::ALL
-            .iter()
-            .filter(|code| {
-                user_action(**code, Origin::Host) != user_action(**code, Origin::ManagedService)
-            })
-            .collect();
-        assert_eq!(differing, vec![&ErrorCode::PermissionDenied]);
     }
 
     #[test]
