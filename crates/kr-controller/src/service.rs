@@ -1559,6 +1559,12 @@ impl Controller {
         claim: &WorkerRendezvous,
         ready: &WorkerReady,
     ) -> Result<()> {
+        // The same guard a look for unresolved claims holds, for the same reason and against the
+        // same thing. A report that arrives after its create gave up on waiting is still this
+        // worker's own word, and a look that started before it would otherwise challenge the
+        // worker while this is publishing it: two connections to one worker, and the second
+        // generation token fences the first.
+        let _recovering = self.recovering.lock().await;
         let mut registry = self.registry.lock().await;
         let reservation = registry
             .reservation(reservation_id)?

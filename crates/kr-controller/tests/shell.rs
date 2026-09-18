@@ -790,6 +790,28 @@ async fn a_worker_that_has_not_qualified_proves_nothing_and_is_found_when_it_doe
     assert_eq!(read.session.session_id, session_id);
     assert_eq!(read.session.state, SessionState::Live);
 
+    // A list is the other way somebody finds a session, and it sees the same one.
+    let listed: kr_protocol::session::SessionListResult = client
+        .request(
+            Method::SessionList,
+            &kr_protocol::session::SessionListParams {
+                environment_id: Nullable::some(environment_id),
+                include_closed: false,
+            },
+        )
+        .await
+        .expect("reaches the daemon")
+        .expect("lists")
+        .to_typed()
+        .expect("decodes");
+    assert!(
+        listed
+            .sessions
+            .iter()
+            .any(|summary| summary.session_id == session_id),
+        "the recovered session is in the list too"
+    );
+
     runtime
         .close(kr_protocol::session::ClosureReason::CloseRequested)
         .1
