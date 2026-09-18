@@ -641,35 +641,37 @@ async fn drive(
                             // follow the live screen is taken back to it the moment the session
                             // writes, and one who did not stays where they scrolled to while the
                             // output goes on arriving underneath.
-                            if follow_live && changed && parked.is_some() {
-                                let request_id = kr_protocol::ids::RequestId::new(next_request);
+                            if follow_live
+                                && changed
+                                && parked.is_some()
+                                && let Ok(size) = terminal.size()
+                                && size.columns > 0
+                                && size.rows > 0
+                            {
+                                let request_id =
+                                    kr_protocol::ids::RequestId::new(next_request);
                                 next_request += 1;
-                                if let Ok(size) = terminal.size()
-                                    && size.columns > 0
-                                    && size.rows > 0
+                                let params =
+                                    kr_protocol::attachment::AttachmentViewportParams {
+                                        attachment_id,
+                                        dimensions: Dimensions::new(
+                                            u64::from(size.columns),
+                                            u64::from(size.rows),
+                                        ),
+                                        position: Nullable(None),
+                                    };
+                                if !send_geometry(
+                                    client,
+                                    descriptor,
+                                    request_id,
+                                    Method::AttachmentViewport,
+                                    &params,
+                                )
+                                .await
                                 {
-                                    let params =
-                                        kr_protocol::attachment::AttachmentViewportParams {
-                                            attachment_id,
-                                            dimensions: Dimensions::new(
-                                                u64::from(size.columns),
-                                                u64::from(size.rows),
-                                            ),
-                                            position: Nullable(None),
-                                        };
-                                    if !send_geometry(
-                                        client,
-                                        descriptor,
-                                        request_id,
-                                        Method::AttachmentViewport,
-                                        &params,
-                                    )
-                                    .await
-                                    {
-                                        return AttachOutcome::Disconnected;
-                                    }
-                                    outstanding.insert(request_id, Outstanding::Scrollback);
+                                    return AttachOutcome::Disconnected;
                                 }
+                                outstanding.insert(request_id, Outstanding::Scrollback);
                             }
                             if !drawn.bytes.is_empty() {
                                 let mut handle = output.as_ref();
