@@ -187,6 +187,14 @@ pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(
 
 /// The control daemon.
 pub struct Controller {
+    /// This daemon, as something a task started from a method that has no counted reference can
+    /// take one from.
+    ///
+    /// Recording a closure is the one place that needs it: a closure is written from paths that
+    /// hold only a borrow, and every one of them ends work this host may be holding an assertion
+    /// for. Weak, because a review must never be what keeps a daemon, and its environment lock,
+    /// alive.
+    me: std::sync::Weak<Self>,
     registry: Mutex<Registry>,
     directory: Mutex<Directory>,
     /// One authenticated connection per worker.
@@ -365,7 +373,13 @@ impl Controller {
         let authority_revision = registry.authority_revision()?;
         let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths).await?);
         let project = Arc::new(crate::project::ProjectModule::open(&setup.paths).await?);
-        let controller = Arc::new(Self {
+        // The executable the daemon was told to start, resolved here rather than at the launch: a
+        // worker runs in a directory of its own, so a relative name would be looked for beneath
+        // that instead of beneath the directory this daemon was started in. It is resolved before
+        // the daemon is built, because what builds it cannot fail.
+        let worker_program = kr_ipc::paths::resolve_here(setup.worker_program)?;
+        let controller = Arc::new_cyclic(|me| Self {
+            me: me.clone(),
             registry: Mutex::new(registry),
             directory: Mutex::new(Directory::default()),
             connections: Mutex::new(BTreeMap::new()),
@@ -386,10 +400,7 @@ impl Controller {
             transfer,
             project,
             agent_tools: tokio::sync::Mutex::new(()),
-            // The executable the daemon was told to start, resolved here rather than at the
-            // launch: a worker runs in a directory of its own, so a relative name would be looked
-            // for beneath that instead of beneath the directory this daemon was started in.
-            worker_program: kr_ipc::paths::resolve_here(setup.worker_program)?,
+            worker_program,
             build_id: setup.build_id,
             release: setup.release,
             started_at_ms,
@@ -2788,14 +2799,7 @@ impl Controller {
             match self.read_from_worker(&worker).await {
                 Ok(summary) => sessions.push(summary),
                 Err(_) => {
-                    // A read that settles a session's closure is the moment that session stopped
-                    // being work outstanding, and nothing else is watching for it here.
-                    if matches!(
-                        self.reconcile(worker.descriptor.session_id).await,
-                        Ok(Some(_))
-                    ) {
-                        self.review_power_soon();
-                    }
+                    let _ = self.reconcile(worker.descriptor.session_id).await;
                 }
             }
         }
@@ -2835,12 +2839,9 @@ impl Controller {
                 // A worker that cannot be reached is not necessarily gone. Reconciliation asks the
                 // kernel; only a confirmed death produces a closure record.
                 Err(error) => {
-                    // As in the listing above: a reconciliation that recorded a closure ended work
-                    // this host was counting, and the setting is looked at for it.
                     if self.reconcile(params.session_id).await?.is_none() {
                         return Err(error);
                     }
-                    self.review_power_soon();
                 }
             }
         }
@@ -3663,6 +3664,13 @@ impl Controller {
         let mut registry = self.registry.lock().await;
         registry.record_closure(record)?;
         drop(registry);
+        // The closure is now recorded, which is the moment a session stops being work this host
+        // counts. Every path that records one reaches this line, and the look at the setting
+        // happens here rather than at each of them, so a path that ends in an error below, or one
+        // added later, cannot leave an assertion held for a session that has finished.
+        if let Some(controller) = self.me.upgrade() {
+            controller.review_power_soon();
+        }
         // This daemon's own view of the session goes as soon as the closure is recorded, before
         // the published descriptor is removed and whether or not that succeeds. The closure is
         // the fact; a worker kept in the directory after it would be a session this daemon still
