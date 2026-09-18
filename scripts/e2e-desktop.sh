@@ -162,14 +162,15 @@ if [ "$answered" -eq 0 ]; then
   tail -20 "$run_root/evidence/controller.log" || true
   echo "--- what kr said ---"
   tail -5 "$run_root/evidence/doctor.json" || true
-  # A daemon that printed nothing at all has not reached the point of serving. The step before
-  # that is opening this platform's credential store for its own signing key, which is where a
-  # start waits longest: the store can be locked by another process writing to it, and on a
-  # platform that prompts it can be waiting on the person at the machine. Saying which of those it
-  # is takes looking at the process, so this says where it stopped rather than why.
+  # A daemon that printed nothing at all has not reached the line it prints once it is serving.
+  # Where it stopped before that is not established from an empty file: the longest of those steps
+  # is opening this platform's credential store for its own signing key, which another process
+  # writing to the store can hold and which on a platform that prompts can wait on the person at
+  # the machine, but saying so takes looking at the process itself.
   if [ ! -s "$run_root/evidence/controller.log" ]; then
-    echo "the daemon printed nothing, so it had not started serving: it had not got past opening"
-    echo "this platform's credential store for its own key"
+    echo "the daemon printed nothing, so it never reached the line it prints once it is serving;"
+    echo "where it stopped takes looking at the process, and its longest step is opening this"
+    echo "platform's credential store"
   fi
   exit 1
 fi
