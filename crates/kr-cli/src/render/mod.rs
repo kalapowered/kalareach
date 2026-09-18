@@ -156,6 +156,17 @@ impl ProjectedDisplay {
         })
     }
 
+    /// How many canonical rows this terminal is being shown.
+    ///
+    /// `None` until a whole screen has arrived. A terminal taller than the session is shown the
+    /// session's rows and blank space below them, so this is fewer than its own lines.
+    #[must_use]
+    pub fn window_rows(&self) -> Option<u64> {
+        self.projection
+            .screen()
+            .map(|screen| screen.viewport.rows.get())
+    }
+
     /// The stable row the window this terminal is showing starts at.
     ///
     /// `None` until a whole screen has arrived. It is where the window actually is, which is not

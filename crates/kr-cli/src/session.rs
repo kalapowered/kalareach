@@ -106,8 +106,12 @@ pub struct AttachOptions {
 ///
 /// A whole window less one line. The line that stays is the join: a person reading upwards keeps
 /// one line of what they have just read at the other edge, and knows the two pages are continuous.
-fn scroll_step(rows: u16) -> u64 {
-    u64::from(rows.saturating_sub(1)).max(1)
+///
+/// `rows` is the window this terminal is *shown*, which is not always the window it has: a
+/// terminal taller than the session is shown the session's rows and blank space below them, and a
+/// step measured from its own height would skip the rows in between.
+fn scroll_step(rows: u64) -> u64 {
+    rows.saturating_sub(1).max(1)
 }
 
 /// Shift and Page Up, which is what a terminal sends for the usual scroll-back key.
@@ -144,6 +148,19 @@ fn scroll_keys(bytes: &[u8]) -> Option<i64> {
         }
     }
     None
+}
+
+/// Whether a read is a report about the pointer, which addresses a cell of the live screen.
+///
+/// The two encodings this host advertises: xterm's SGR reports, and the legacy form.
+fn is_mouse_report(bytes: &[u8]) -> bool {
+    let sgr = bytes.starts_with(b"\x1b[<")
+        && (bytes.ends_with(b"M") || bytes.ends_with(b"m"))
+        && bytes[3..bytes.len() - 1]
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b';');
+    let legacy = bytes.len() == 6 && bytes.starts_with(b"\x1b[M");
+    sgr || legacy
 }
 
 /// The row an answer says this window landed on, or `None` for the live screen.
@@ -219,11 +236,9 @@ impl Drop for UndeliveredTyping {
 /// Returns the host's refusal, a terminal failure, or the failure the attachment ended with.
 pub async fn run(
     descriptor: &WorkerDescriptor,
+    mut owed: UndeliveredTyping,
     options: AttachOptions,
 ) -> Result<(AttachOutcome, SessionId)> {
-    // Whatever the creation left for this attachment to deliver. Every way out of this function
-    // before the loop that forwards it reports the count rather than losing it.
-    let mut owed = UndeliveredTyping::new(options.typed_before.len());
     let terminal = ControllingTerminal::open()?;
     let size = terminal.size()?;
     let dimensions = Dimensions::new(u64::from(size.columns), u64::from(size.rows));
@@ -375,11 +390,8 @@ pub async fn run(
     let outcome = drive(
         &mut client,
         descriptor,
-        {
-            // The loop has them now, and delivers them in front of the handshake's own typing.
-            owed.delivered();
-            [options.typed_before, probe.typed].concat()
-        },
+        &mut owed,
+        [options.typed_before, probe.typed].concat(),
         Attached {
             attachment_id: attachment.attachment_id,
             lease_epoch: epoch,
@@ -468,6 +480,7 @@ enum Outstanding {
 async fn drive(
     client: &mut LocalClient,
     descriptor: &WorkerDescriptor,
+    owed: &mut UndeliveredTyping,
     typed_during_the_probe: Vec<u8>,
     attached: Attached,
     input: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
@@ -505,6 +518,8 @@ async fn drive(
     if !typed_during_the_probe.is_empty()
         && let Some(epoch) = epoch
     {
+        // It is on its way to the application, so nothing is owed for it any more.
+        owed.delivered();
         let request_id = kr_protocol::ids::RequestId::new(next_request);
         next_request += 1;
         if !send_input(
@@ -586,11 +601,15 @@ async fn drive(
                             // back to the live screen with it: that buffer keeps no history, and
                             // its rows are numbered from its own beginning, so a row identifier
                             // taken from it would name a row of another screen.
-                            if parked.is_some() {
-                                parked = display
-                                    .showing_history_buffer()
-                                    .then(|| display.window_top_row())
-                                    .flatten();
+                            //
+                            // Only a screen that has arrived whole says anything. Between a reset
+                            // and the last of its pages this terminal holds no screen at all, and
+                            // reading a position out of that would forget where the window is
+                            // half way through being told.
+                            if parked.is_some()
+                                && let Some(top) = display.window_top_row()
+                            {
+                                parked = display.showing_history_buffer().then_some(top);
                             }
                             // The client's own choice, not the session's: a person who asked to
                             // follow the live screen is taken back to it the moment the session
@@ -652,6 +671,46 @@ async fn drive(
                         // a window would lose their session — so the marker is answered by asking
                         // for the screen again, which is what the marker is for.
                         if notification.event_type.as_str() == "session.resync" {
+                            // A marker that follows no request of this terminal's is the session
+                            // having gone on without it: its queue overflowed, or its screen was
+                            // replaced for a reason nobody here asked for. A person following the
+                            // live screen is taken back to it, because the screen that is about to
+                            // arrive is where the session got to.
+                            let mine = outstanding.values().any(|what| {
+                                matches!(what, Outstanding::Viewport | Outstanding::Scrollback)
+                            });
+                            if follow_live && !mine && parked.is_some() {
+                                parked = None;
+                                if let Ok(size) = terminal.size()
+                                    && size.columns > 0
+                                    && size.rows > 0
+                                {
+                                    let request_id =
+                                        kr_protocol::ids::RequestId::new(next_request);
+                                    next_request += 1;
+                                    let params =
+                                        kr_protocol::attachment::AttachmentViewportParams {
+                                            attachment_id,
+                                            dimensions: Dimensions::new(
+                                                u64::from(size.columns),
+                                                u64::from(size.rows),
+                                            ),
+                                            position: Nullable(None),
+                                        };
+                                    if !send_geometry(
+                                        client,
+                                        descriptor,
+                                        request_id,
+                                        Method::AttachmentViewport,
+                                        &params,
+                                    )
+                                    .await
+                                    {
+                                        return AttachOutcome::Disconnected;
+                                    }
+                                    outstanding.insert(request_id, Outstanding::Scrollback);
+                                }
+                            }
                             // A marker means this terminal fell behind or was moved, which is the
                             // session having gone on without it. A person following the live
                             // screen is taken back to it; the fresh screen that follows is then
@@ -916,7 +975,12 @@ async fn drive(
                     && size.columns > 0
                     && size.rows > 0
                 {
-                    if let Some(position) = scrolled(parked, steps, scroll_step(size.rows)) {
+                    // The rows the session is drawing here, which a terminal taller than the
+                    // session has fewer of than it has lines.
+                    let shown = display
+                        .window_rows()
+                        .unwrap_or_else(|| u64::from(size.rows));
+                    if let Some(position) = scrolled(parked, steps, scroll_step(shown)) {
                         let request_id = kr_protocol::ids::RequestId::new(next_request);
                         next_request += 1;
                         let params = kr_protocol::attachment::AttachmentViewportParams {
@@ -946,6 +1010,15 @@ async fn drive(
                     }
                     // The key was this terminal's, so nothing of it reaches the session, whether
                     // or not the window had anywhere to go.
+                    continue;
+                }
+                // A click addresses a cell of the live screen, and a window above it is showing
+                // rows the application's grid does not have. Section 8 gives that its answer:
+                // input outside the visible grid has no application effect. Whole reads again,
+                // for the same reason the keys are: a report the terminal wrote on its own is a
+                // read of its own, and looking inside a batch is how a command starts altering
+                // what somebody typed.
+                if parked.is_some() && is_mouse_report(&bytes) {
                     continue;
                 }
                 if bytes.is_empty() {
@@ -1229,6 +1302,32 @@ mod tests {
         assert!(
             matches!(floor, ViewportPosition::Row(row) if row.get() == 0),
             "which asks for the first row rather than for one below it: {floor:?}"
+        );
+    }
+
+    /// Section 8: input outside the visible grid has no application effect.
+    #[test]
+    fn a_pointer_report_is_recognised_whole_or_not_at_all() {
+        use super::is_mouse_report;
+
+        assert!(is_mouse_report(b"\x1b[<0;10;4M"), "a press");
+        assert!(is_mouse_report(b"\x1b[<0;10;4m"), "and a release");
+        assert!(is_mouse_report(b"\x1b[M !!"), "and the legacy form");
+        assert!(!is_mouse_report(b"ls -l"), "ordinary typing is not");
+        assert!(
+            !is_mouse_report(b"\x1b[<0;10;4Mls"),
+            "and neither is a report with typing after it"
+        );
+        assert!(!is_mouse_report(b"\x1b[<0;10"), "nor half of one");
+    }
+
+    /// The step is the window this terminal is shown, not the lines it happens to have.
+    #[test]
+    fn a_step_measures_the_window_the_session_draws() {
+        assert_eq!(
+            scroll_step(40),
+            39,
+            "a terminal taller than the session moves by the session's rows"
         );
     }
 

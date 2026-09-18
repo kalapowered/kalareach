@@ -614,9 +614,12 @@ while a row identifier stays over the same text.
 
 The host then installs the pages that cover the window, through the subscription the client already
 holds and charged to its own send queue: the same reset, header and bounded pages a live screen
-arrives as, and the same refusal for a queue too small to carry the smallest of them. The rows come
+arrives as. Such a window carries more than a live screen does, so its smallest installation is
+measured against the queue that subscription already has, and a window that could not cross it is
+refused there rather than accepted and then resynchronised. The rows come
 from the retained rows the session still holds, a bounded run at a time, so a window above the live
-page costs what a window on it costs.
+page is built the same way a window on it is, a bounded run at a time, whatever the session is
+holding.
 
 A window that names a row the session has given up is answered with the oldest row there is, and
 its pages carry that cutoff and the eviction marker. It is never an error: the rows are gone, and
@@ -629,10 +632,10 @@ Live output goes on arriving the whole time. A client parked in its history is s
 bounded update, and what it draws is its own decision. A screen installed for such a window carries
 two runs of rows: the window's own, from the rows the session retained, and the live screen's
 behind them, so a client that has to be drawn again while it is reading its history is still sent
-what the session has written. The window's rows are converted first, so a queue that runs out part
-way through arrives with the window whole and the live screen behind it emptied. A screen that is
-still too large once its pages are built is shortened row by row, every row to the same share of
-what is left, and it says so.
+what the session has written. The window's rows are converted first, against a running total of
+what the queue has left, so what a queue that runs out gives up is the part furthest from what the
+person is looking at. A screen that is still too large once its pages are built is shortened row by
+row, every row to the same share of what is left, and it says so either way.
 
 Two origins travel with every window, because two different things are measured from them. The
 rows a client draws are named by the window's own first row; the cursor's row is a line of the

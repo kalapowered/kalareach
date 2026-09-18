@@ -512,6 +512,18 @@ impl AttachmentTable {
             })
     }
 
+    /// Brings every window back to the live screen.
+    ///
+    /// A buffer switch is what this is for. The buffer a full-screen application takes keeps no
+    /// history and numbers its rows from its own beginning, so a window above the shell's live
+    /// page has nothing to be above any more; it comes back to the live screen with the screen
+    /// that program took, rather than waiting to be restored to rows the person has left.
+    pub fn clear_history_windows(&mut self) {
+        for attachment in self.attachments.values_mut() {
+            attachment.history_top_row = None;
+        }
+    }
+
     /// The stable row one attachment's window starts at, or `None` for the live screen.
     #[must_use]
     pub fn history_top_row(&self, id: AttachmentId) -> Option<i64> {

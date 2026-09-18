@@ -1100,11 +1100,20 @@ impl Session {
         // Resolved against the session as it stands now: an offset above the live screen is a
         // place, and the row it names is what the attachment holds from here.
         let top_row = self.engine.resolve_position(position);
+        // The dimensions this report carries are checked before anything is built for them: a
+        // report that violates a constraint is refused for that, and naming a limit is the answer
+        // section 8 asks for rather than a figure about a queue.
+        let violations = dimensions.violations();
+        if let Some(violation) = violations.into_iter().next() {
+            return Err(WorkerError::Dimensions(violation));
+        }
         // And the screen that window needs has to cross the queue this attachment already has. A
         // window above the live page carries the rows it shows and the live screen behind them, so
         // it can be a larger screen than the one this subscriber was admitted for; being told the
         // window moved and then that the queue is full is two answers where there should be one.
-        if top_row.is_some() && top_row != before_top_row {
+        // The size is part of the question: the same row in a taller window is a larger screen.
+        if top_row.is_some() && (top_row != before_top_row || before_dimensions != Some(dimensions))
+        {
             let limit = self.hub.limit_of(attachment_id);
             let minimum = self.engine.minimum_projection_install(
                 crate::projection::Window {
@@ -1950,6 +1959,11 @@ impl Session {
                 // And how much of the screen this client's authority reaches: a caller drawn the
                 // live screen alone is paged the buffer that is showing and never the other one.
                 let scope = self.content_scope(attachment_id);
+                if reason == ProjectionResetReason::BufferSwitch {
+                    // The screen was replaced rather than changed, and the buffer that replaced it
+                    // has no history above it. Every window comes back to the live screen with it.
+                    self.attachments.clear_history_windows();
+                }
                 let window = self.window_of(attachment_id, dimensions);
                 match self
                     .engine

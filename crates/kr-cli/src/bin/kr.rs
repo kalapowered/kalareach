@@ -158,9 +158,17 @@ async fn run(cli: Cli) -> Result<Completion> {
             // The session exists. Presenting it is a separate step, and a presentation that fails
             // never produces a second session: the failure is reported against the one that was
             // created.
-            // The attachment takes them, and says so itself. Nothing is owed here any more.
+            // The presentation takes responsibility for them, and reports what it could not
+            // deliver. Nothing is owed here once it has been handed over.
             undelivered.delivered();
-            let presented = present(&paths, &created, presentation, typed_while_asking).await;
+            let presented = present(
+                &paths,
+                &created,
+                presentation,
+                kr_cli::session::UndeliveredTyping::new(typed_while_asking.len()),
+                typed_while_asking,
+            )
+            .await;
             if cli.json {
                 let mut document = report::session(&created.session);
                 if let Some(object) = document.as_object_mut() {
@@ -199,6 +207,7 @@ async fn run(cli: Cli) -> Result<Completion> {
             let (_, descriptor) = find(&paths, &selector, wanted)?;
             let (outcome, session_id) = kr_cli::session::run(
                 &descriptor,
+                kr_cli::session::UndeliveredTyping::new(0),
                 AttachOptions {
                     take_geometry: arguments.take_geometry,
                     no_probe: arguments.no_probe,
@@ -464,6 +473,7 @@ async fn present(
     paths: &HostPaths,
     created: &SessionCreateResult,
     presentation: Presentation,
+    owed: kr_cli::session::UndeliveredTyping,
     typed_before: Vec<u8>,
 ) -> Result<()> {
     match presentation {
@@ -473,6 +483,7 @@ async fn present(
             let (_, descriptor) = find(paths, &selector, Some(created.session.environment_id))?;
             let (outcome, _) = kr_cli::session::run(
                 &descriptor,
+                owed,
                 AttachOptions {
                     // A terminal that created the session is the session's terminal: it claims the
                     // geometry, which is what section 8 makes the default for a creating client.
@@ -492,9 +503,9 @@ async fn present(
         Presentation::Terminal => {
             // Nothing here forwards input, so anything the person typed while the terminal was
             // being asked for its colours has nowhere to go. They are owed the number rather than
-            // left to wonder where those keystrokes went, which is what this reports on its way
+            // left to wonder where those keystrokes went, which is what `owed` reports on its way
             // out of scope.
-            let _owed = kr_cli::session::UndeliveredTyping::new(typed_before.len());
+            let _ = typed_before;
             open_terminal_application(created.session.session_id, created.session.environment_id)
         }
     }

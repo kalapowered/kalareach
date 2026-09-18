@@ -2459,3 +2459,57 @@ async fn a_window_above_the_live_page_says_where_the_live_screen_begins() {
         "and the live screen still begins where it did, sixty rows below"
     );
 }
+
+/// A window that needs a larger screen than the queue this attachment holds is refused, once.
+///
+/// A window above the live page carries the rows it shows and the live screen behind them, so it
+/// can be a larger screen than the one a subscriber was admitted for. Being told the window moved
+/// and then that the queue is full is two answers where there should be one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_too_large_for_this_queue_is_refused_rather_than_resynchronised() {
+    let host = host_with(
+        &numbered(400),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let _ = collect_until_installed(&mut watcher.client, Duration::from_secs(5)).await;
+
+    let mut session = host.runtime.session();
+    // A queue of exactly the live screen, which is what this attachment is being shown.
+    let live_minimum = session
+        .minimum_projection_install(watcher.attachment_id)
+        .expect("the smallest live screen");
+    let _stream = session
+        .subscribe_within(watcher.attachment_id, live_minimum)
+        .expect("a queue of exactly the live screen is enough for the live screen");
+
+    let refusal = session
+        .viewport(
+            watcher.attachment_id,
+            window,
+            Some(kr_protocol::attachment::ViewportPosition::Above(
+                kr_protocol::scalars::U64::new(100),
+            )),
+        )
+        .expect_err("a window this queue cannot carry is refused");
+    assert_eq!(
+        refusal.code(),
+        kr_protocol::error::ErrorCode::InvalidArgument,
+        "the refusal is definite: {refusal}"
+    );
+    assert!(
+        refusal.to_string().contains("cannot carry this window"),
+        "and it says what it is about: {refusal}"
+    );
+    // Nothing was recorded, so the attachment is still looking at the live screen.
+    let (_, landed) = session
+        .viewport(watcher.attachment_id, window, None)
+        .expect("the live screen is still where this window is");
+    assert!(landed.is_none());
+}
