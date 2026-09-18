@@ -1986,6 +1986,29 @@ mod tests {
     }
 
     #[test]
+    fn the_planned_entry_matches_the_entry_that_is_written() {
+        // The plan is written before the entry exists, and a removal after an interrupted
+        // installation compares that planned digest with what it finds. The two renderings have to
+        // agree, for the JSON documents and for the TOML one.
+        let tree = Tree::create();
+        let installer = tree.installer();
+        for agent in AgentTarget::ALL {
+            let params = params(*agent, InstallScope::User);
+            let layout = installer.layout(&params).expect("a layout");
+            let Some(configuration) = layout.configuration.as_ref() else {
+                continue;
+            };
+            let planned = installer.planned_entry_digest(configuration, *agent);
+            installer.install(&params).expect("installs");
+            let written = installer
+                .entry_digest_under(&configuration.path, configuration.format.key())
+                .expect("reads")
+                .expect("the entry");
+            assert_eq!(planned, written, "{agent}'s planned entry is what it wrote");
+        }
+    }
+
+    #[test]
     fn a_project_scope_installation_needs_the_project_directory() {
         let tree = Tree::create();
         let error = tree
