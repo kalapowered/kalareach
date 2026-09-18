@@ -175,8 +175,10 @@ Three properties make an installation safe to undo:
 
 * **Every change is recorded with the digest of what it wrote.** The record lives in this host's
   own state directory, not in the agent's, so an agent that rewrites its configuration cannot lose
-  it. A removal replays the record in reverse and stops at anything whose digest no longer matches,
-  because a changed file is somebody's edit.
+  it. A removal undoes what the record owns, taking files and server entries before the directories
+  that hold them and a deeper directory before a shallower one, and stops at anything whose digest
+  no longer matches, because a changed file is somebody's edit. `kr skill status` prints that order
+  before anything is undone.
 * **Nothing is written until everything has been checked.** An installation refuses a file or a
   server entry that is already there and that this host did not write, and it refuses before its
   first write, so a refusal leaves the agent's tree exactly as it found it.
