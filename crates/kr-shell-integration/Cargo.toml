@@ -19,5 +19,13 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 
+[dev-dependencies]
+# The package tests drive a built shell in a real pseudo-terminal and check its proof against the
+# transcript this contract defines.
+hmac.workspace = true
+portable-pty.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+
 [lints]
 workspace = true
