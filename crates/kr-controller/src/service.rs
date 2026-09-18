@@ -2788,7 +2788,14 @@ impl Controller {
             match self.read_from_worker(&worker).await {
                 Ok(summary) => sessions.push(summary),
                 Err(_) => {
-                    let _ = self.reconcile(worker.descriptor.session_id).await;
+                    // A read that settles a session's closure is the moment that session stopped
+                    // being work outstanding, and nothing else is watching for it here.
+                    if matches!(
+                        self.reconcile(worker.descriptor.session_id).await,
+                        Ok(Some(_))
+                    ) {
+                        self.review_power_soon();
+                    }
                 }
             }
         }
@@ -2828,9 +2835,12 @@ impl Controller {
                 // A worker that cannot be reached is not necessarily gone. Reconciliation asks the
                 // kernel; only a confirmed death produces a closure record.
                 Err(error) => {
+                    // As in the listing above: a reconciliation that recorded a closure ended work
+                    // this host was counting, and the setting is looked at for it.
                     if self.reconcile(params.session_id).await?.is_none() {
                         return Err(error);
                     }
+                    self.review_power_soon();
                 }
             }
         }
@@ -3397,6 +3407,9 @@ impl Controller {
                     .map(|record| record.process_identity)
             };
             let Some(identity) = identity else {
+                // The session has left this daemon's directory, which is what recording a closure
+                // does, so something else finished what this watcher was waiting for.
+                self.review_power_soon();
                 return;
             };
             match kr_ipc::identity::process_state(&identity) {
@@ -3498,10 +3511,10 @@ impl Controller {
 
     /// Records a closure a worker handed over, unless one is already recorded.
     ///
-    /// This and [`Self::record_final`] are the only two writers, and both hold the same lock for
-    /// the whole of their check and their write. A worker's own account of how its session ended
-    /// carries the root's result and what it stopped, and a record written from outside knows
-    /// neither, so one must never be able to replace the other.
+    /// This, [`Self::record_final`] and [`Self::retire`] are the three entry points that write one,
+    /// and each holds the same lock for the whole of its check and its write. A worker's own
+    /// account of how its session ended carries the root's result and what it stopped, and a record
+    /// written from outside knows neither, so one must never be able to replace the other.
     ///
     /// # Errors
     ///
@@ -3518,10 +3531,11 @@ impl Controller {
     /// Records how a session ended, once.
     ///
     /// The whole of it is one transaction: the closure already recorded is the answer where there
-    /// is one, and where there is not, the record written here is the only one written. Three
-    /// callers reach this point for the same session, because the closure watcher, this daemon's
-    /// own reconciliation and a worker handing over its own account all write one, and a second
-    /// record would replace the first rather than adding to it.
+    /// is one, and where there is not, the record written here is the only one written. Four paths
+    /// reach a closure for the same session, because the closure watcher, this daemon's own
+    /// reconciliation, a worker handing over its own account and the answer a worker gives a paired
+    /// device all produce one, and a second record would replace the first rather than adding to
+    /// it.
     async fn record_final(
         &self,
         session_id: SessionId,
@@ -3613,7 +3627,7 @@ impl Controller {
     ///
     /// Returns an error when the registry cannot be read or written.
     pub async fn retire(self: &Arc<Self>, record: &ClosureRecord) -> Result<()> {
-        {
+        let written = {
             let _finalising = self.finalising.lock().await;
             if self
                 .registry
@@ -3622,12 +3636,18 @@ impl Controller {
                 .closure(record.session_id)?
                 .is_some()
             {
-                return Ok(());
+                // Somebody else recorded this closure first. That it is recorded at all is what
+                // the setting is about, so the look below happens either way.
+                Ok(())
+            } else {
+                self.write_closure(record).await
             }
-            self.write_closure(record).await?;
-        }
+        };
+        // Outside the lock, and before the result is returned: the registry row is written before
+        // the descriptor is removed, so a failure after that point is a closure that counts as
+        // finished with an error to report about the tidying.
         self.review_power_soon();
-        Ok(())
+        written
     }
 
     /// Records a closed session, removes its descriptor and forgets its key.
