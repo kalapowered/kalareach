@@ -507,9 +507,6 @@ pub struct RestrictedProfile {
     /// rather than through a path is what keeps a link put at the record's name from deciding
     /// where this host writes.
     profile_root: Arc<cap_std::fs::Dir>,
-    /// Where that directory is, for the one act that needs a path: making its own list of names
-    /// durable, which a kernel will not do through the kind of handle held above.
-    profile_path: PathBuf,
     /// The directory each invocation's own temporary directory is made inside, opened once. Making
     /// one goes through this handle rather than through the path, so the directory an invocation
     /// gets is one this host made inside the object it opened.
@@ -617,7 +614,7 @@ fn open_record(profile: &cap_std::fs::Dir) -> std::io::Result<cap_std::fs::File>
 /// # Errors
 ///
 /// Returns [`ProjectError::StagingUnavailable`] when the record cannot be written.
-fn record(profile: &cap_std::fs::Dir, profile_path: &Path, line: &str) -> Result<()> {
+fn record(profile: &cap_std::fs::Dir, line: &str) -> Result<()> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
     use std::io::Write as _;
 
@@ -664,29 +661,51 @@ fn record(profile: &cap_std::fs::Dir, profile_path: &Path, line: &str) -> Result
     } else {
         // The record's own name has to survive a power failure as much as its lines do, and a file
         // is on the disk only once the directory that holds its name is.
-        durable(profile_path)
+        durable(profile)
     }
 }
 
 /// Makes a directory's own list of names durable.
 ///
-/// Opened here rather than taken as a handle: the handles this service holds on its directories are
-/// the kind a kernel will not synchronise, and this is the service's own directory being read
-/// rather than anything being decided by the name.
+/// The handle this service holds on a directory is not one a kernel will synchronise, so another is
+/// taken from it — `.` opened through the handle itself rather than resolved from a path, so that
+/// what is synchronised is the object the record was written in and not whatever now holds its
+/// name.
 ///
 /// # Errors
 ///
 /// Returns [`ProjectError::StagingUnavailable`] when the directory cannot be synchronised.
-fn durable(directory: &Path) -> Result<()> {
-    std::fs::File::open(directory)
-        .and_then(|handle| handle.sync_all())
-        .map_err(|error| ProjectError::StagingUnavailable {
-            detail: format!(
-                "this host's record of its own temporary directory could not be made durable: \
-                 {error}"
-            )
-            .into(),
-        })
+#[cfg(unix)]
+fn durable(directory: &cap_std::fs::Dir) -> Result<()> {
+    use rustix::fs::{Mode, OFlags};
+
+    rustix::fs::openat(
+        directory,
+        ".",
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(std::io::Error::from)
+    .and_then(|handle| std::fs::File::from(handle).sync_all())
+    .map_err(|error| ProjectError::StagingUnavailable {
+        detail: format!(
+            "this host's record of its own temporary directory could not be made durable: {error}"
+        )
+        .into(),
+    })
+}
+
+/// Makes a directory's own list of names durable.
+///
+/// This platform runs no Git, so nothing reads that record back here, and an ordinary open of a
+/// directory is not something it does.
+///
+/// # Errors
+///
+/// Never returns an error on this platform.
+#[cfg(not(unix))]
+fn durable(_directory: &cap_std::fs::Dir) -> Result<()> {
+    Ok(())
 }
 
 /// Reads the record back, or answers that it cannot be trusted.
@@ -859,7 +878,6 @@ fn remove_recorded(
 fn sweep(
     environment_id: EnvironmentId,
     profile: &cap_std::fs::Dir,
-    profile_path: &Path,
     root: &cap_std::fs::Dir,
     root_path: &Path,
     manifest_path: &Path,
@@ -922,7 +940,7 @@ fn sweep(
     if !text.is_empty() {
         text.push('\n');
     }
-    compact(profile, profile_path, &text)
+    compact(profile, &text)
 }
 
 /// Replaces the record with what is still true, in one act.
@@ -931,7 +949,7 @@ fn sweep(
 ///
 /// Returns [`ProjectError::StagingUnavailable`] when the replacement cannot be written or put in
 /// place.
-fn compact(profile: &cap_std::fs::Dir, profile_path: &Path, text: &str) -> Result<()> {
+fn compact(profile: &cap_std::fs::Dir, text: &str) -> Result<()> {
     use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
     use std::io::Write as _;
 
@@ -956,7 +974,7 @@ fn compact(profile: &cap_std::fs::Dir, profile_path: &Path, text: &str) -> Resul
     profile
         .rename(&beside, profile, TEMPORARY_MANIFEST_FILE)
         .map_err(ProjectError::staging)?;
-    durable(profile_path)
+    durable(profile)
 }
 
 /// Leaves a directory open to the account this service runs as and to nobody else.
@@ -1094,7 +1112,6 @@ impl RestrictedProfile {
         sweep(
             environment_id,
             &profile_root,
-            &profile,
             &temporary_root,
             &temporary,
             &profile.join(TEMPORARY_MANIFEST_FILE),
@@ -1108,7 +1125,6 @@ impl RestrictedProfile {
             home,
             temporary,
             profile_root,
-            profile_path: profile,
             temporary_root,
             #[cfg(feature = "git-fixtures")]
             interposition: None,
@@ -1197,7 +1213,6 @@ impl RestrictedProfile {
         let temporary = PrivateTemporary::create(
             self.environment_id,
             &self.profile_root,
-            &self.profile_path,
             &self.temporary_root,
             &self.temporary,
             &request.describe(),
@@ -2603,9 +2618,8 @@ struct PrivateTemporary {
     /// What this host wrote inside it, and which object that was: the one entry it may hold when
     /// this host comes to take it away.
     entry: Recorded,
-    /// The profile's own directory, where the record is, and where it is.
+    /// The profile's own directory, where the record is.
     profile: Arc<cap_std::fs::Dir>,
-    profile_path: PathBuf,
     /// The directory it was made in, held open so that taking it away is one act inside an object
     /// this host opened rather than a walk down a path.
     root: Arc<cap_std::fs::Dir>,
@@ -2622,7 +2636,6 @@ impl PrivateTemporary {
     fn create(
         environment_id: EnvironmentId,
         profile: &Arc<cap_std::fs::Dir>,
-        profile_path: &Path,
         root: &Arc<cap_std::fs::Dir>,
         root_path: &Path,
         described: &str,
@@ -2644,7 +2657,7 @@ impl PrivateTemporary {
         }
         // Before anything is created, so that nothing in there is ever a thing this host cannot
         // account for afterwards.
-        record(profile, profile_path, &format!("making {name} {token}"))?;
+        record(profile, &format!("making {name} {token}"))?;
         #[cfg(unix)]
         let made = {
             use cap_std::fs::DirBuilderExt as _;
@@ -2767,11 +2780,7 @@ impl PrivateTemporary {
                 }
             })?;
         drop(handle);
-        record(
-            profile,
-            profile_path,
-            &format!("made {name} {identity} {mark}"),
-        )?;
+        record(profile, &format!("made {name} {identity} {mark}"))?;
         Ok(Self {
             environment_id,
             path,
@@ -2783,7 +2792,6 @@ impl PrivateTemporary {
                 mark: Some(mark),
             },
             profile: Arc::clone(profile),
-            profile_path: profile_path.to_owned(),
             root: Arc::clone(root),
             root_path: root_path.to_owned(),
         })
@@ -2813,11 +2821,7 @@ impl Drop for PrivateTemporary {
             &self.name,
             &self.entry,
         ) {
-            let _ = record(
-                &self.profile,
-                &self.profile_path,
-                &format!("gone {}", self.name),
-            );
+            let _ = record(&self.profile, &format!("gone {}", self.name));
         }
     }
 }
@@ -3516,10 +3520,9 @@ mod tests {
 
         // One this host made, recorded, identified and marked.
         plant("mine", "aaaa");
-        record(&profile, &profile_path, "making mine aaaa").expect("the record");
+        record(&profile, "making mine aaaa").expect("the record");
         record(
             &profile,
-            &profile_path,
             &format!(
                 "made mine {} {}",
                 identity_of("mine"),
@@ -3531,16 +3534,15 @@ mod tests {
         // this host was about to make something says nothing about which object it ended up with,
         // so this one stays where it is.
         plant("half", "bbbb");
-        record(&profile, &profile_path, "making half bbbb").expect("the record");
+        record(&profile, "making half bbbb").expect("the record");
         // One this host never made.
         handle.create_dir("theirs").expect("somebody else's");
         handle.create("theirs/theirs.txt").expect("their file");
         // One this host recorded, which now holds something it did not put there.
         plant("used", "cccc");
-        record(&profile, &profile_path, "making used cccc").expect("the record");
+        record(&profile, "making used cccc").expect("the record");
         record(
             &profile,
-            &profile_path,
             &format!(
                 "made used {} {}",
                 identity_of("used"),
@@ -3551,19 +3553,13 @@ mod tests {
         handle.create("used/left-behind").expect("what Git left");
         // One this host recorded, which is no longer the object it recorded.
         plant("swapped", "dddd");
-        record(&profile, &profile_path, "making swapped dddd").expect("the record");
-        record(
-            &profile,
-            &profile_path,
-            &format!("made swapped {elsewhere} {elsewhere}"),
-        )
-        .expect("the record");
+        record(&profile, "making swapped dddd").expect("the record");
+        record(&profile, &format!("made swapped {elsewhere} {elsewhere}")).expect("the record");
         // One whose mark is at the right name and is not the object this host made.
         plant("foreign", "eeee");
-        record(&profile, &profile_path, "making foreign eeee").expect("the record");
+        record(&profile, "making foreign eeee").expect("the record");
         record(
             &profile,
-            &profile_path,
             &format!("made foreign {} {elsewhere}", identity_of("foreign")),
         )
         .expect("the record");
@@ -3571,17 +3567,10 @@ mod tests {
         // making a directory, somebody else took the mark's name first with a file of their own,
         // and the invocation failed before it could identify anything.
         plant_theirs("collided", "ffff");
-        record(&profile, &profile_path, "making collided ffff").expect("the record");
+        record(&profile, "making collided ffff").expect("the record");
 
-        sweep(
-            environment_id,
-            &profile,
-            &profile_path,
-            &handle,
-            &temporary,
-            &manifest,
-        )
-        .expect("the record is written out again");
+        sweep(environment_id, &profile, &handle, &temporary, &manifest)
+            .expect("the record is written out again");
 
         assert!(!temporary.join("mine").exists(), "the recorded one is gone");
         for left in ["half", "theirs", "used", "swapped", "foreign", "collided"] {
@@ -3630,24 +3619,12 @@ mod tests {
         let environment_id = EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([9; 16]));
         handle.create_dir("mine").expect("a directory");
         handle.create("mine/aaaa").expect("a mark");
-        record(&profile, &profile_path, "making mine aaaa").expect("the record");
-        record(
-            &profile,
-            &profile_path,
-            "something this host does not write",
-        )
-        .expect("the record");
+        record(&profile, "making mine aaaa").expect("the record");
+        record(&profile, "something this host does not write").expect("the record");
 
         assert!(recorded(&profile).is_none(), "the record is not readable");
-        sweep(
-            environment_id,
-            &profile,
-            &profile_path,
-            &handle,
-            &temporary,
-            &manifest,
-        )
-        .expect_err("and this host will not go on with a record it cannot read");
+        sweep(environment_id, &profile, &handle, &temporary, &manifest)
+            .expect_err("and this host will not go on with a record it cannot read");
         assert!(
             temporary.join("mine").exists(),
             "and nothing is taken away on the strength of it"
@@ -3666,7 +3643,7 @@ mod tests {
         let profile =
             cap_std::fs::Dir::open_ambient_dir(&profile_path, cap_std::ambient_authority())
                 .expect("the profile's own directory opens");
-        record(&profile, &profile_path, "making whole aaaa").expect("the record");
+        record(&profile, "making whole aaaa").expect("the record");
         {
             let mut file = profile
                 .open_with(
@@ -3700,7 +3677,6 @@ mod tests {
             template: PathBuf::from("/state/git-profile/template"),
             home: PathBuf::from("/state/git-profile/home"),
             temporary: PathBuf::from("/state/git-profile/temporary"),
-            profile_path: PathBuf::from("/state/git-profile"),
             profile_root: Arc::new(
                 cap_std::fs::Dir::open_ambient_dir(
                     std::env::temp_dir(),
