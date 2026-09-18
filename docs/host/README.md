@@ -584,7 +584,8 @@ repository while Git is running.
   credential helper as command strings for it. A driver, filter, hook, credential helper, pager or
   filesystem monitor planted anywhere else cannot be executed, whether it was planted before this
   host read the configuration, between that reading and the moment Git started, or while Git was
-  running.
+  running. On Windows that rests on permissions a repository can carry its own, which is weaker;
+  `crates/kr-project/README.md` says how much weaker and why the platform is not qualified.
 * **Only this operation's network.** A local operation reaches no address at all and nothing may
   listen. An operation that reaches a remote may open outbound connections on the ports its
   transport uses and resolve the remote's name, and nothing may listen there either. Which part of

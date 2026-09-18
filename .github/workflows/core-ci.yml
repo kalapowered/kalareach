@@ -75,6 +75,9 @@ jobs:
       # this runner's kernel and Git are, so a pass or a failure here names the system it happened
       # on rather than leaving it to be inferred.
       - name: Repository boundary
+        # Whatever the step before it did: a run that ends in an unrelated failure is still the run
+        # that says what this kernel and this Git are, and whether the boundary holds on them.
+        if: ${{ !cancelled() }}
         run: |
           uname -srm
           git --version
