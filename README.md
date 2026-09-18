@@ -4,6 +4,11 @@ KalaReach host, controller, workers, CLI, shared protocol and transport, Tauri d
 
 Licensed under the BSD 3-Clause License. See [LICENSE](LICENSE).
 
+The managed shell packages under `shells/` are the exception, because they are built from other
+people's shells. `shells/zsh/` carries the Zsh licence and `shells/bash/` the GNU General Public
+Licence, version 3 or later, each with its own `LICENSE` file; every crate, script and document
+here stays BSD 3-Clause, and no code under either of those licences is compiled into a crate.
+
 ## Repository layout
 
 A Cargo workspace and a pnpm workspace share one tree.
@@ -25,6 +30,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `crates/kr-plugin-host` | The plugin-runtime service: one lazily started per-environment process that owns component instances |
 | `crates/kr-term` | The terminal engine: the kr-vt/1 profile, sequence classes, canonical grid, query broker and snapshots |
 | `crates/kr-shell-integration` | The root-editor bridge contract: the handshake, the reader events, the fence and detach state machine and the cross-shell scenarios |
+| `shells/` | The managed shell packages: the reader patch sets, the bridge sources, the guarded startup entries and the build manifests |
 | `crates/kr-transfer` | The transfer service: uploads, verified downloads, handle-based filesystem authority and bounded previews |
 | `crates/kr-project` | The project service: repositories, workspaces, the restricted Git execution profile and staged publish |
 | `skills/kalareach-contact` | The installable contact skill: what an agent reads, its tool reference and its installation manifest |
@@ -39,7 +45,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `docs/transport/` | The transport reference |
 | `docs/plugins/` | The plugin reference |
 | `docs/terminal/` | The terminal reference |
-| `docs/shell-integration/` | The root-editor bridge contract for shell packages |
+| `docs/shell-integration/` | The root-editor bridge contract for shell packages, and what each managed package changes |
 | `docs/releases/` | How the generated packages are released, and how a consumer pins one |
 | `docs/transfer/` | The transfer reference |
 | `docs/project/` | The project reference |

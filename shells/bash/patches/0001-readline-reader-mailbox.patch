@@ -1,0 +1,254 @@
+Subject: [PATCH 1/3] readline: an idle-reader mailbox, reader events and a pre-EOF decision
+
+Readline returns pending and macro input without consulting the character callback, and
+rl_gather_tyi can call that callback while it fills a buffer, before preceding characters have
+changed rl_end. So a private mailbox is read at the one point where the reader has taken everything
+it had buffered and is waiting for the terminal, and the reader also waits on that mailbox
+alongside the terminal. The reader answers it in place: it publishes what its own queues hold,
+installs and accepts a line, and ends a pending key wait by returning a negative key, which every
+existing caller already turns into its own abort with the edit buffer intact.
+
+The end-of-file decision is taken immediately before Readline's own end-of-file branch, after the
+next character has been selected from its input sources. It answers native or consume and replaces
+no binding, so a shell's ignoreeof setting is left exactly as it is.
+
+This patch is a derivative work of GNU Readline as bundled with GNU Bash and carries the GNU
+General Public Licence, version 3 or later; see shells/bash/LICENSE.
+
+--- a/lib/readline/Makefile.in
++++ b/lib/readline/Makefile.in
+@@ -88,7 +88,9 @@
+ 	   $(srcdir)/shell.c $(srcdir)/tilde.c $(srcdir)/savestring.c \
+ 	   $(srcdir)/text.c $(srcdir)/misc.c $(srcdir)/compat.c \
+ 	   $(srcdir)/colors.c $(srcdir)/parse-colors.c \
+-	   $(srcdir)/mbutil.c $(srcdir)/xfree.c
++	   $(srcdir)/mbutil.c $(srcdir)/xfree.c \
++	   $(srcdir)/kr_bridge.c $(srcdir)/kr_bridge_cbor.c \
++	   $(srcdir)/kr_bridge_crypto.c $(srcdir)/kr_bridge_rl.c
+ 
+ # The header files for this library.
+ HSOURCES = readline.h rldefs.h chardefs.h keymaps.h history.h histlib.h \
+@@ -104,7 +106,8 @@
+ 	  rltty.o complete.o bind.o isearch.o display.o signals.o \
+ 	  util.o kill.o undo.o macro.o input.o callback.o terminal.o \
+ 	  text.o nls.o misc.o $(HISTOBJ) $(TILDEOBJ) $(COLORSOBJ) \
+-	  xmalloc.o xfree.o compat.o 
++	  xmalloc.o xfree.o compat.o \
++	  kr_bridge.o kr_bridge_cbor.o kr_bridge_crypto.o kr_bridge_rl.o 
+ 
+ # The texinfo files which document this library.
+ DOCSOURCE = doc/rlman.texinfo doc/rltech.texinfo doc/rluser.texinfo
+--- a/lib/readline/input.c
++++ b/lib/readline/input.c
+@@ -74,6 +74,9 @@
+ #include "rlshell.h"
+ #include "xmalloc.h"
+ 
++#include "kr_bridge.h"
++#include "kr_bridge_rl.h"
++
+ /* What kind of non-blocking I/O do we have? */
+ #if !defined (O_NDELAY) && defined (O_NONBLOCK)
+ #  define O_NDELAY O_NONBLOCK	/* Posix style */
+@@ -192,6 +195,19 @@
+   return (push_index != pop_index);
+ }
+ 
++/* How many bytes this reader has already taken and not yet used.  A fence rests on the reader's
++   own state, so the count has to come from the reader rather than from the kernel's idea of what
++   is readable. */
++int
++_rl_kr_buffered (void)
++{
++  int held = push_index - pop_index;
++
++  if (held < 0)
++    held += ibuffer_len;
++  return held;
++}
++
+ /* Return the amount of space available in the buffer for stuffing
+    characters. */
+ static int
+@@ -759,12 +775,16 @@
+     {
+       c = rl_pending_input;	/* XXX - cast to unsigned char if > 0? */
+       rl_clear_pending_input ();
++      kr_rl_source (KR_SOURCE_PUSHED_BACK);
+     }
+   else
+     {
+       /* If input is coming from a macro, then use that. */
+       if (c = _rl_next_macro_key ())
+-	return ((unsigned char)c);
++	{
++	  kr_rl_source (KR_SOURCE_MACRO);
++	  return ((unsigned char)c);
++	}
+ 
+       /* If the user has an event function, then call it periodically. */
+       if (rl_event_hook)
+@@ -786,13 +806,25 @@
+ 	      RL_CHECK_SIGNALS ();
+ 	      if (rl_done)		/* XXX - experimental */
+ 		return ('\n');
++	      /* The reader has nothing buffered, so its mailbox is read here too. */
++	      if (kr_rl_fd () >= 0)
++		{
++		  kr_rl_idle ();
++		  if (kr_rl_wait ())
++		    return (KR_RL_CANCEL);
++		}
+ 	      (*rl_event_hook) ();
+ 	    }
+ 	}
+       else
+ 	{
+ 	  if (rl_get_char (&c) == 0)
+-	    c = (*rl_getc_function) (rl_instream);
++	    {
++	      c = (*rl_getc_function) (rl_instream);
++	      kr_rl_source (KR_SOURCE_TERMINAL);
++	    }
++	  else
++	    kr_rl_source (KR_SOURCE_TYPEAHEAD);
+ /* fprintf(stderr, "rl_read_key: calling RL_CHECK_SIGNALS: _rl_caught_signal = %d\r\n", _rl_caught_signal); */
+ 	  RL_CHECK_SIGNALS ();
+ 	}
+@@ -810,9 +842,17 @@
+ #if defined (HAVE_PSELECT) || defined (HAVE_SELECT)
+   sigset_t empty_set;
+   fd_set readfds;
++  int kr_fd, kr_nfds;
+ #endif
+ 
+   fd = fileno (stream);
++  /*
++   * Everything this reader had buffered has been taken, so this is its idle point: the one place
++   * where reading a private mailbox says something true about the reader's own queues.  Readline
++   * returns pending and macro input without reaching here at all, which is exactly why the
++   * mailbox is read here rather than from a character callback.
++   */
++  kr_rl_idle ();
+   while (1)
+     {
+       RL_CHECK_SIGNALS ();
+@@ -829,15 +869,30 @@
+ 	 timeouts. We handled MinGW above. */
+       FD_ZERO (&readfds);
+       FD_SET (fd, &readfds);
++      /* The reader waits on its own mailbox as well as the terminal, so a fence, a cancellation
++	 or a launch reaches it without a keystroke. */
++      kr_fd = kr_rl_fd ();
++      if (kr_fd >= 0)
++	FD_SET (kr_fd, &readfds);
++      kr_nfds = (kr_fd > fd ? kr_fd : fd) + 1;
+ #  if defined (HANDLE_SIGNALS)
+-      result = _rl_timeout_select (fd + 1, &readfds, NULL, NULL, NULL, &_rl_orig_sigset);
++      result = _rl_timeout_select (kr_nfds, &readfds, NULL, NULL, NULL, &_rl_orig_sigset);
+ #  else
+       sigemptyset (&empty_set);
+       sigprocmask (SIG_BLOCK, (sigset_t *)NULL, &empty_set);
+-      result = _rl_timeout_select (fd + 1, &readfds, NULL, NULL, NULL, &empty_set);
++      result = _rl_timeout_select (kr_nfds, &readfds, NULL, NULL, NULL, &empty_set);
+ #  endif /* HANDLE_SIGNALS */
+       if (result == 0)
+         _rl_timeout_handle ();		/* check the timeout */
++      if (result > 0 && kr_fd >= 0 && FD_ISSET (kr_fd, &readfds))
++	{
++	  /* Answer what is in the mailbox.  A launch the reader installed and accepted, or a
++	     takeover that ended this key wait, means this read is over. */
++	  if (kr_rl_wait ())
++	    return (KR_RL_CANCEL);
++	  if (FD_ISSET (fd, &readfds) == 0)
++	    continue;
++	}
+ #endif
+       if (result >= 0)
+ 	result = read (fd, &c, sizeof (unsigned char));
+--- a/lib/readline/macro.c
++++ b/lib/readline/macro.c
+@@ -49,6 +49,8 @@
+ #include "rlprivate.h"
+ #include "xmalloc.h"
+ 
++#include "kr_bridge_rl.h"
++
+ #define MAX_MACRO_LEVEL 16
+ 
+ /* **************************************************************** */
+@@ -106,6 +108,16 @@
+   rl_executing_macro = string;
+   executing_macro_index = 0;
+   RL_SETSTATE(RL_STATE_MACROINPUT);
++}
++
++/* How much of the executing macro has still to be read.  Macro input is the reader's own, not the
++   person's, so a fence has to be able to say whether any is left. */
++int
++_rl_kr_macro_remaining (void)
++{
++  if (rl_executing_macro == 0)
++    return 0;
++  return (int) strlen (rl_executing_macro + executing_macro_index);
+ }
+ 
+ /* Return the next character available from a macro, or 0 if
+--- a/lib/readline/readline.c
++++ b/lib/readline/readline.c
+@@ -71,6 +71,9 @@
+ #include "rlprivate.h"
+ #include "rlshell.h"
+ #include "xmalloc.h"
++
++#include "kr_bridge.h"
++#include "kr_bridge_rl.h"
+ 
+ #if defined (COLOR_SUPPORT)
+ #  include "parse-colors.h"
+@@ -627,6 +630,34 @@
+ 	  RL_SETSTATE(RL_STATE_EOF);
+ 	  eof_found = 1;
+ 	  break;
++#endif
++	}
++
++      /* A read that produced no character: a takeover ended a pending key wait, or a launch was
++	 installed and accepted.  Readline's own abort path has already run, so the edit buffer is
++	 as it was and this call simply carries on. */
++      if (c == KR_RL_CANCEL)
++	{
++	  kr_rl_cancel_observed ();
++#if defined (READLINE_CALLBACKS)
++	  return (0);
++#else
++	  continue;
++#endif
++	}
++
++      /* The next character has been selected from the reader's own input sources and Readline is
++	 about to take its end-of-file decision.  This is the only point at which that decision can
++	 be taken: pending and macro input never reach a character callback, and rl_gather_tyi can
++	 call one while it fills a buffer, before preceding characters have changed rl_end.  The
++	 hook answers native or consume and replaces no binding; a consume continues this same
++	 readline call, so the shell's own ignoreeof setting is left exactly as it is. */
++      if (kr_rl_pre_eof (c) == KR_CONSUME)
++	{
++#if defined (READLINE_CALLBACKS)
++	  return (0);
++#else
++	  continue;
+ #endif
+ 	}
+ 
+@@ -730,7 +761,10 @@
+ readline_internal (void)
+ {
+   readline_internal_setup ();
++  kr_rl_enter ();
+   rl_eof_found = readline_internal_charloop ();
++  /* Before acceptance returns, so the accepted line is reported from inside the reader. */
++  kr_rl_leave (rl_eof_found == 0);
+   return (readline_internal_teardown (rl_eof_found));
+ }
+ 

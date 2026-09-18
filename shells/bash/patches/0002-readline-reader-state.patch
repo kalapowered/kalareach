@@ -1,0 +1,65 @@
+Subject: [PATCH 2/3] readline: report the reader states a detach condition is evaluated against
+
+The end-of-file gesture is a detach only at an empty primary prompt with nothing in progress, and a
+takeover has to say what it ended. Two of those states are otherwise invisible from outside the
+function that is in them: a quoted insertion waiting for its character, and an open bracketed
+paste.
+
+This patch is a derivative work of GNU Readline as bundled with GNU Bash and carries the GNU
+General Public Licence, version 3 or later; see shells/bash/LICENSE.
+
+--- a/lib/readline/text.c
++++ b/lib/readline/text.c
+@@ -58,6 +58,9 @@
+ #include "rlshell.h"
+ #include "xmalloc.h"
+ 
++#include "kr_bridge.h"
++#include "kr_bridge_rl.h"
++
+ /* Forward declarations. */
+ static int rl_change_case (int, int);
+ static int _rl_char_search (int, int, int);
+@@ -1041,9 +1044,13 @@
+ {
+   int c;
+ 
++  /* A quoted insertion is waiting for its character: an end-of-file gesture here belongs to the
++     insertion, and a takeover has to be able to say what it ended. */
++  kr_rl_pending_quoted_insertion (1);
+   RL_SETSTATE(RL_STATE_MOREINPUT);
+   c = rl_read_key ();
+   RL_UNSETSTATE(RL_STATE_MOREINPUT);
++  kr_rl_pending_quoted_insertion (0);
+ 
+   if (c < 0)
+     return 1;
+--- a/lib/readline/kill.c
++++ b/lib/readline/kill.c
+@@ -48,6 +48,9 @@
+ 
+ #include "rlprivate.h"
+ #include "xmalloc.h"
++
++#include "kr_bridge.h"
++#include "kr_bridge_rl.h"
+ 
+ /* **************************************************************** */
+ /*								    */
+@@ -715,6 +718,8 @@
+   buf = xmalloc (cap = 64);
+   buf[0] = '\0';
+ 
++  /* Every byte between the two paste markers is the terminal's, not a gesture a person made. */
++  kr_rl_pending_paste (1);
+   RL_SETSTATE (RL_STATE_MOREINPUT);
+   while ((c = rl_read_key ()) >= 0)
+     {
+@@ -736,6 +741,7 @@
+ 	}
+     }
+   RL_UNSETSTATE (RL_STATE_MOREINPUT);
++  kr_rl_pending_paste (0);
+ 
+   if (c >= 0)
+     {

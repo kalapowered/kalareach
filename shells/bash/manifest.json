@@ -1,0 +1,100 @@
+{
+  "shell": "bash",
+  "integration_version": "1",
+  "editor_abi": "readline-8.2",
+  "mailbox_mechanism": "idle_reader_mailbox",
+  "pre_eof_mechanism": "native_hook",
+  "upstream": {
+    "version": "5.2.37",
+    "revision": "bash-5.2.37",
+    "archive": "bash-5.2.37.tar.gz",
+    "url": "https://ftp.gnu.org/gnu/bash/bash-5.2.37.tar.gz",
+    "sha256": "9599b22ecd1d5787ad7d3b7bf0c59f312b3396d1e281175dd1f8a4014da621ff",
+    "directory": "bash-5.2.37"
+  },
+  "configure": [
+    "--without-bash-malloc"
+  ],
+  "cflags": [
+    "-g",
+    "-O2",
+    "-Wno-implicit-int",
+    "-Wno-implicit-function-declaration"
+  ],
+  "binary": "bin/bash",
+  "module_directory": "lib/bash",
+  "source_directory": "lib/readline",
+  "modules": [],
+  "patches": [
+    {
+      "name": "readline-reader-mailbox",
+      "file": "patches/0001-readline-reader-mailbox.patch",
+      "revision": "1",
+      "purpose": "A private mailbox the bundled Readline reads once it has consumed everything it had buffered and is waiting for the terminal, and which it waits on alongside the terminal; the counts the reader holds privately, for the fence proof; the input source of each character; a non-destructive cancellation through Readline's own abort path; the reader's own enter and leave boundaries; and the end-of-file decision immediately before Readline's own end-of-file branch, which leaves the shell's ignoreeof setting alone."
+    },
+    {
+      "name": "readline-reader-state",
+      "file": "patches/0002-readline-reader-state.patch",
+      "revision": "1",
+      "purpose": "The reader states the detach condition and the cancellation report are evaluated against, where Readline keeps no flag of its own: a quoted insertion waiting for its character, and an open bracketed paste."
+    },
+    {
+      "name": "bash-bridge-activation",
+      "file": "patches/0003-bash-bridge-activation.patch",
+      "revision": "1",
+      "purpose": "The bridge loads before the user's startup files and before the first primary reader; the `read` builtin says when it is the one reading through the editor; and the `kr-bridge` builtin the guarded startup entry activates the user-facing hooks through."
+    }
+  ],
+  "sources": [
+    {
+      "file": "src/kr_bridge.h",
+      "install": "lib/readline/kr_bridge.h"
+    },
+    {
+      "file": "src/kr_bridge.c",
+      "install": "lib/readline/kr_bridge.c"
+    },
+    {
+      "file": "src/kr_bridge_cbor.h",
+      "install": "lib/readline/kr_bridge_cbor.h"
+    },
+    {
+      "file": "src/kr_bridge_cbor.c",
+      "install": "lib/readline/kr_bridge_cbor.c"
+    },
+    {
+      "file": "src/kr_bridge_crypto.h",
+      "install": "lib/readline/kr_bridge_crypto.h"
+    },
+    {
+      "file": "src/kr_bridge_crypto.c",
+      "install": "lib/readline/kr_bridge_crypto.c"
+    },
+    {
+      "file": "src/kr_bridge_rl.h",
+      "install": "lib/readline/kr_bridge_rl.h"
+    },
+    {
+      "file": "src/kr_bridge_rl.c",
+      "install": "lib/readline/kr_bridge_rl.c"
+    },
+    {
+      "file": "src/kr_bridge_bash.c",
+      "install": "kr_bridge_bash.c"
+    },
+    {
+      "file": "src/kr_bridge.def",
+      "install": "builtins/kr_bridge.def"
+    }
+  ],
+  "startup": {
+    "file": "startup/kr-bashrc.bash",
+    "target": "$HOME/.bashrc, or the first login file read when that file does not source it",
+    "marker": "# >>> kalareach shell integration >>>",
+    "end_marker": "# <<< kalareach shell integration <<<"
+  },
+  "upstream_tests": {
+    "command": "tests",
+    "reason": ""
+  }
+}

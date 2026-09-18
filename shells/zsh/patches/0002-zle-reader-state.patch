@@ -1,0 +1,63 @@
+Subject: [PATCH 2/2] zle: report the reader states a detach condition is evaluated against
+
+The end-of-file gesture is a detach only at an empty primary prompt with nothing in progress, and a
+takeover has to say what it ended. Three of those states are otherwise invisible from outside the
+widget that is in them: a quoted insertion waiting for its character, a numeric argument being
+accumulated, and an open bracketed paste.
+
+This patch is a derivative work of Zsh and carries the Zsh licence; see shells/zsh/LICENSE.
+
+--- a/Src/Zle/zle_misc.c
++++ b/Src/Zle/zle_misc.c
+@@ -30,6 +30,9 @@
+ #include "zle.mdh"
+ #include "zle_misc.pro"
+ 
++#include "kr_bridge.h"
++#include "kr_bridge_zle.h"
++
+ /* insert a zle string, with repetition and suffix removal */
+ 
+ /**/
+@@ -753,6 +756,7 @@
+     size_t current = 0;
+     int next, timeout;
+ 
++    kr_zle_pending_paste(1);
+     while (endesc[endpos]) {
+ 	if (current + 1 >= psize)
+ 	    pbuf = zrealloc(pbuf, psize *= 2);
+@@ -768,6 +772,7 @@
+ 	else
+ 	    pbuf[current++] = next;
+     }
++    kr_zle_pending_paste(0);
+     pbuf[current-endpos] = '\0';
+     return pbuf;
+ }
+@@ -869,7 +874,9 @@
+     sob.sg_flags = (sob.sg_flags | RAW) & ~ECHO;
+     ioctl(SHTTY, TIOCSETN, &sob);
+ #endif
++    kr_zle_pending_quoted_insertion(1);
+     getfullchar(0);
++    kr_zle_pending_quoted_insertion(0);
+ #ifndef HAS_TIO
+     zsetterm();
+ #endif
+@@ -970,6 +977,7 @@
+      *
+      * Hence for now this remains byte-by-byte.
+      */
++    kr_zle_pending_numeric_argument(1);
+     while ((gotk = getbyte(0L, NULL, 1)) != EOF) {
+ 	if (gotk == '-' && !digcnt) {
+ 	    minus = -1;
+@@ -986,6 +994,7 @@
+ 	    }
+ 	}
+     }
++    kr_zle_pending_numeric_argument(0);
+     if (digcnt)
+ 	zmod.tmult = minus * (pref ? pref : 1);
+     else

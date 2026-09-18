@@ -1,0 +1,97 @@
+This file is kr_bridge.def, from which is created kr_bridge.c.
+It implements the builtin "kr-bridge" in Bash.
+
+Copyright (c) Kala Powered.
+
+This file is added to GNU Bash by the KalaReach reader patch set.
+
+Bash is free software: you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation, either version 3 of the License, or
+(at your option) any later version.
+
+Bash is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+
+You should have received a copy of the GNU General Public License
+along with Bash.  If not, see <http://www.gnu.org/licenses/>.
+
+$PRODUCES kr_bridge.c
+
+$BUILTIN kr-bridge
+$FUNCTION kr_bridge_builtin
+$DOCNAME kr_bridge
+$SHORT_DOC kr-bridge status|activated|lost [reason [detail]]
+Report the state of the KalaReach root-editor integration.
+
+The guarded startup entry uses this once, after the user's startup files have
+run, to say that the integration's own hooks are live. Until it does, the
+session is authenticated but not qualified.
+
+    status      succeed when this shell registered a root integration
+    activated   report that the user-facing hooks are live
+    lost        report that the integration lost its hooks
+
+Exit Status:
+Succeeds unless this shell has no registered root integration or the request
+is not one of the three above.
+$END
+
+#include <config.h>
+
+#include <stdio.h>
+#include <string.h>
+
+#include "../bashtypes.h"
+#include "../shell.h"
+
+#include <readline/kr_bridge.h>
+#include <readline/kr_bridge_rl.h>
+
+#include "common.h"
+#include "bashgetopt.h"
+
+int
+kr_bridge_builtin (list)
+     WORD_LIST *list;
+{
+  char *request, *reason, *detail;
+  int loss;
+
+  if (list == 0)
+    {
+      builtin_usage ();
+      return (EX_USAGE);
+    }
+
+  request = list->word->word;
+
+  if (strcmp (request, "status") == 0)
+    return (kr_bridge_registered () ? EXECUTION_SUCCESS : EXECUTION_FAILURE);
+
+  if (strcmp (request, "activated") == 0)
+    {
+      if (kr_bridge_registered () == 0)
+	return (EXECUTION_FAILURE);
+      kr_bridge_hooks_activated (kr_rl_prompt_generation () + 1);
+      return (EXECUTION_SUCCESS);
+    }
+
+  if (strcmp (request, "lost") == 0)
+    {
+      reason = list->next ? list->next->word->word : (char *)NULL;
+      detail = (list->next && list->next->next) ? list->next->next->word->word : "";
+      loss = KR_LOSS_SEMANTIC_HOOK_LOSS;
+      if (reason && strcmp (reason, "post-startup-failure") == 0)
+	loss = KR_LOSS_POST_STARTUP_FAILURE;
+      else if (reason && strcmp (reason, "unqualified-root-replacement") == 0)
+	loss = KR_LOSS_UNQUALIFIED_ROOT_REPLACEMENT;
+      kr_bridge_lost (loss, detail);
+      return (EXECUTION_SUCCESS);
+    }
+
+  builtin_usage ();
+  return (EX_USAGE);
+}

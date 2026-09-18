@@ -1,0 +1,92 @@
+{
+  "shell": "zsh",
+  "integration_version": "1",
+  "editor_abi": "zle-5.9",
+  "mailbox_mechanism": "key_sequence_boundary_mailbox",
+  "pre_eof_mechanism": "native_hook",
+  "upstream": {
+    "version": "5.9",
+    "revision": "zsh-5.9",
+    "archive": "zsh-5.9.tar.xz",
+    "url": "https://downloads.sourceforge.net/project/zsh/zsh/5.9/zsh-5.9.tar.xz",
+    "sha256": "9b8d1ecedd5b5e81fbf1918e876752a7dd948e05c1a0dba10ab863842d45acd5",
+    "directory": "zsh-5.9"
+  },
+  "configure": [
+    "--enable-multibyte",
+    "--disable-gdbm",
+    "--disable-pcre",
+    "--with-tcsetpgrp=yes"
+  ],
+  "cflags": [
+    "-O2",
+    "-Wall",
+    "-Wmissing-prototypes",
+    "-Wno-implicit-int",
+    "-Wno-implicit-function-declaration"
+  ],
+  "binary": "bin/zsh",
+  "module_directory": "lib/zsh/5.9",
+  "source_directory": "Src/Zle",
+  "modules": [
+    "zsh/zle"
+  ],
+  "patches": [
+    {
+      "name": "zle-reader-mailbox",
+      "file": "patches/0001-zle-reader-mailbox.patch",
+      "revision": "1",
+      "purpose": "A private mailbox the reader checks at every key-sequence boundary and while it waits for a key; immediate line acceptance that returns from the read loop; non-destructive cancellation of a pending key wait; reader enter, leave and idle events; the atomic snapshot of the invoking key sequence, the terminal's typeahead and the pushed-back keys; and the end-of-file decision immediately before ZLE's empty-EOF branch, which leaves the user's IGNORE_EOF setting alone."
+    },
+    {
+      "name": "zle-reader-state",
+      "file": "patches/0002-zle-reader-state.patch",
+      "revision": "1",
+      "purpose": "The reader states the detach condition and the cancellation report are evaluated against: a quoted insertion waiting for its character, a numeric argument being accumulated, and an open bracketed paste."
+    }
+  ],
+  "sources": [
+    {
+      "file": "src/kr_bridge.h",
+      "install": "Src/Zle/kr_bridge.h"
+    },
+    {
+      "file": "src/kr_bridge.c",
+      "install": "Src/Zle/kr_bridge.c"
+    },
+    {
+      "file": "src/kr_bridge_cbor.h",
+      "install": "Src/Zle/kr_bridge_cbor.h"
+    },
+    {
+      "file": "src/kr_bridge_cbor.c",
+      "install": "Src/Zle/kr_bridge_cbor.c"
+    },
+    {
+      "file": "src/kr_bridge_crypto.h",
+      "install": "Src/Zle/kr_bridge_crypto.h"
+    },
+    {
+      "file": "src/kr_bridge_crypto.c",
+      "install": "Src/Zle/kr_bridge_crypto.c"
+    },
+    {
+      "file": "src/kr_bridge_zle.h",
+      "install": "Src/Zle/kr_bridge_zle.h"
+    },
+    {
+      "file": "src/kr_bridge_zle.c",
+      "install": "Src/Zle/kr_bridge_zle.c"
+    }
+  ],
+  "startup": {
+    "file": "startup/kr-zshrc.zsh",
+    "target": "$ZDOTDIR/.zshrc",
+    "marker": "# >>> kalareach shell integration >>>",
+    "end_marker": "# <<< kalareach shell integration <<<"
+  },
+  "upstream_tests": {
+    "command": "check",
+    "reason": ""
+  }
+}

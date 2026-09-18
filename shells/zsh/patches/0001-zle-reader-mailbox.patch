@@ -1,0 +1,182 @@
+Subject: [PATCH 1/2] zle: a private reader mailbox, reader events and a pre-EOF decision
+
+Adds a mailbox the line editor reads at every key-sequence boundary and while it waits for a key,
+so a request can reach the reader thread without a keystroke and without the reader blocking on
+anything but its own input. The reader answers it in place: it publishes what its own queues hold,
+installs and accepts a line immediately, and ends a pending key wait without losing the edit
+buffer. It also reports when the reader starts and stops, and takes an end-of-file decision
+immediately before ZLE's empty-EOF branch, so the character is judged before either EOF branch
+runs and the user's IGNORE_EOF setting is left exactly as it was.
+
+This patch is a derivative work of Zsh and carries the Zsh licence; see shells/zsh/LICENSE.
+
+--- a/Src/Zle/zle.mdd
++++ b/Src/Zle/zle.mdd
+@@ -3,12 +3,13 @@
+ load=yes
+ functions='Functions/Zle/*'
+ 
+-autofeatures="b:bindkey b:vared b:zle"
++autofeatures="b:bindkey b:kr-bridge b:vared b:zle"
+ 
+ objects="zle_bindings.o zle_hist.o zle_keymap.o zle_main.o \
+ zle_misc.o zle_move.o zle_params.o zle_refresh.o \
+ zle_thingy.o zle_tricky.o zle_utils.o zle_vi.o zle_word.o \
+-textobjects.o"
++textobjects.o kr_bridge.o kr_bridge_cbor.o kr_bridge_crypto.o \
++kr_bridge_zle.o"
+ 
+ headers="zle.h zle_things.h"
+ 
+--- a/Src/Zle/zle_main.c
++++ b/Src/Zle/zle_main.c
+@@ -29,6 +29,9 @@
+ 
+ #include "zle.mdh"
+ #include "zle_main.pro"
++
++#include "kr_bridge.h"
++#include "kr_bridge_zle.h"
+ 
+ #ifdef HAVE_POLL_H
+ # include <poll.h>
+@@ -530,9 +533,10 @@
+      * timeouts may be external, so we may have both a permanent watched
+      * fd and a long-term timeout.
+      */
+-    if ((nwatch || tmout.tp != ZTM_NONE)) {
++    if ((nwatch || tmout.tp != ZTM_NONE || kr_zle_fd() >= 0)) {
+ #if defined(HAVE_SELECT) || defined(HAVE_POLL)
+ 	int i, errtry = 0, selret;
++	int kr_fd;
+ # ifdef HAVE_POLL
+ 	int nfds;
+ 	struct pollfd *fds;
+@@ -562,8 +566,15 @@
+ 	if (ret > 0)
+ 	    return 1;
+ # endif
++	/*
++	 * The reader's private mailbox is watched here, where the reader has taken everything
++	 * it had buffered and is waiting for the terminal.  Reading it at this point is what
++	 * lets a fence, a cancellation or a launch reach the reader thread without a keystroke,
++	 * and without the reader blocking on anything but its own input.
++	 */
++	kr_fd = kr_zle_fd();
+ # ifdef HAVE_POLL
+-	nfds = 1 + nwatch;
++	nfds = 1 + nwatch + (kr_fd >= 0 ? 1 : 0);
+ 	/* First pollfd is SHTTY, following are the nwatch fds */
+ 	fds = zalloc(sizeof(struct pollfd) * nfds);
+ 	fds[0].fd = SHTTY;
+@@ -575,6 +586,10 @@
+ 	for (i = 0; i < nwatch; i++) {
+ 	    fds[i+1].fd = watch_fds[i].fd;
+ 	    fds[i+1].events = POLLIN;
++	}
++	if (kr_fd >= 0) {
++	    fds[nfds-1].fd = kr_fd;
++	    fds[nfds-1].events = POLLIN;
+ 	}
+ # endif
+ 	for (;;) {
+@@ -605,6 +620,11 @@
+ 		    if (fd > fdmax)
+ 			fdmax = fd;
+ 		}
++		if (kr_fd >= 0) {
++		    FD_SET(kr_fd, &foofd);
++		    if (kr_fd > fdmax)
++			fdmax = kr_fd;
++		}
+ 	    }
+ 	    FD_ZERO(&errfd);
+ 
+@@ -714,6 +734,26 @@
+ # endif
+ 		 )
+ 		break;
++	    if (kr_fd >= 0 && !errtry &&
++# ifdef HAVE_POLL
++		(fds[nfds-1].revents & (POLLIN|POLLERR|POLLHUP|POLLNVAL))
++# else
++		FD_ISSET(kr_fd, &foofd)
++# endif
++		) {
++		/*
++		 * Answer what is in the mailbox.  A launch the reader installs and accepts, or
++		 * a takeover that ends this key wait, means the read is over; the reader
++		 * returns with its buffer intact and zlecore takes it from there.
++		 */
++		if (kr_zle_wait()) {
++		    selret = -2;
++		    break;
++		}
++# ifdef HAVE_POLL
++		fds[nfds-1].revents = 0;
++# endif
++	    }
+ 	    if (nwatch && !errtry) {
+ 		/*
+ 		 * Copy the details of the watch fds in case the
+@@ -875,9 +915,11 @@
+     lastchar_wide_valid = 0;
+ #endif
+ 
+-    if (kungetct)
++    if (kungetct) {
++	kr_zle_source_pushed_back();
+ 	ret = STOUC(kungetbuf[--kungetct]);
+-    else {
++    } else {
++	kr_zle_source_terminal();
+ 	for (;;) {
+ 	    int q = queue_signal_level();
+ 	    dont_queue_signals();
+@@ -1133,7 +1175,15 @@
+ 	    ? km : NULL);
+ 	bindk = getkeycmd();
+ 	selectlocalmap(NULL);
+-	if (bindk) {
++	if (kr_zle_boundary()) {
++	    /*
++	     * The reader's own mailbox was read here, at the boundary between two key sequences.
++	     * The gesture was consumed, a takeover ended a pending key wait, or a launch was
++	     * installed and accepted.  The reader continues with the buffer it had: no binding
++	     * runs and neither end-of-file branch below is reached, so the user's IGNORE_EOF
++	     * setting is left exactly as it is.
++	     */
++	} else if (bindk) {
+ 	    if (!zlell && isfirstln && !(zlereadflags & ZLRF_IGNOREEOF) &&
+ 		lastchar == eofchar) {
+ 		/*
+@@ -1353,8 +1403,12 @@
+ 
+     zrefresh();
+ 
++    kr_zle_enter();
++
+     zlecore();
+ 
++    kr_zle_leave(eofsent);
++
+     if (errflag)
+ 	setsparam((zlecontext == ZLCON_VARED) ?
+ 		  "ZLE_VARED_ABORTED" :
+@@ -2180,6 +2234,7 @@
+ 
+ static struct builtin bintab[] = {
+     BUILTIN("bindkey", 0, bin_bindkey, 0, -1, 0, "evaM:ldDANmrsLRp", NULL),
++    BUILTIN("kr-bridge", 0, bin_kr_bridge, 1, 3, 0, NULL, NULL),
+     BUILTIN("vared",   0, bin_vared,   1,  1, 0, "aAcef:ghi:M:m:p:r:t:", NULL),
+     BUILTIN("zle",     0, bin_zle,     0, -1, 0, "aAcCDfFgGIKlLmMNrRTUw", NULL),
+ };
+@@ -2247,6 +2302,8 @@
+     /* Intended to be global, no WARNCREATEGLOBAL check. */
+     assignaparam("zle_bracketed_paste", bpaste, 0);
+ 
++    kr_zle_setup();
++
+     return 0;
+ }
+ 

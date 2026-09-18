@@ -1,0 +1,98 @@
+Subject: [PATCH 3/3] bash: load the reader bridge and report which prompt the reader is at
+
+The bridge loads before the user's startup files and before the first primary reader, so a startup
+file finds it already there. A guarded entry in the startup file then reports, once, that the
+integration's own hooks are live, through a builtin this patch adds. The `read' builtin reading
+through the line editor says so, because that reader is not the root editor's prompt.
+
+This patch is a derivative work of GNU Bash and carries the GNU General Public Licence, version 3
+or later; see shells/bash/LICENSE.
+
+--- a/Makefile.in
++++ b/Makefile.in
+@@ -444,6 +444,7 @@
+ 
+ # The main source code for the Bourne Again SHell.
+ CSOURCES = shell.c eval.c parse.y general.c make_cmd.c print_cmd.c y.tab.c \
++	   kr_bridge_bash.c \
+ 	   dispose_cmd.c execute_cmd.c variables.c $(GLOBC) version.c \
+ 	   expr.c copy_cmd.c flags.c subst.c hashcmd.c hashlib.c mailcheck.c \
+ 	   test.c trap.c alias.c jobs.c nojobs.c $(ALLOC_FILES) braces.c \
+@@ -494,7 +495,7 @@
+ 	   trap.o input.o unwind_prot.o pathexp.o sig.o test.o version.o \
+ 	   alias.o $(ARRAY_O) arrayfunc.o assoc.o braces.o bracecomp.o bashhist.o \
+ 	   bashline.o $(SIGLIST_O) list.o stringlib.o locale.o findcmd.o redir.o \
+-	   pcomplete.o pcomplib.o syntax.o xmalloc.o $(SIGNAMES_O)
++	   pcomplete.o pcomplib.o syntax.o xmalloc.o kr_bridge_bash.o $(SIGNAMES_O)
+ 
+ # Where the source code of the shell builtins resides.
+ BUILTIN_SRCDIR=$(srcdir)/builtins
+--- a/shell.c
++++ b/shell.c
+@@ -83,6 +83,7 @@
+ 
+ #if defined (READLINE)
+ #  include <readline/readline.h>
++#  include <readline/kr_bridge_rl.h>
+ #  include "bashline.h"
+ #endif
+ 
+@@ -714,6 +715,13 @@
+ 	  t = dollar_vars[0];
+ 	  dollar_vars[0] = exec_argv0 ? savestring (exec_argv0) : savestring (shell_script_filename);
+ 	}
++      /* The reader's bridge loads before the user's startup files and before the first primary
++	 reader, so a startup file finds it already there and a guarded entry can report that its
++	 own hooks are live. */
++#if defined (READLINE)
++      if (interactive_shell)
++	kr_rl_setup ();
++#endif
+       run_startup_files ();
+       if (shell_script_filename)
+ 	{
+--- a/builtins/Makefile.in
++++ b/builtins/Makefile.in
+@@ -144,7 +144,8 @@
+ 	  $(srcdir)/times.def $(srcdir)/trap.def $(srcdir)/type.def \
+ 	  $(srcdir)/ulimit.def $(srcdir)/umask.def $(srcdir)/wait.def \
+ 	  $(srcdir)/reserved.def $(srcdir)/pushd.def $(srcdir)/shopt.def \
+-	  $(srcdir)/printf.def $(srcdir)/complete.def $(srcdir)/mapfile.def
++	  $(srcdir)/printf.def $(srcdir)/complete.def $(srcdir)/mapfile.def \
++	  $(srcdir)/kr_bridge.def
+ 
+ STATIC_SOURCE = common.c evalstring.c evalfile.c getopt.c bashgetopt.c \
+ 		getopt.h 
+@@ -156,7 +157,8 @@
+ 	jobs.o kill.o let.o mapfile.o \
+ 	pushd.o read.o return.o set.o setattr.o shift.o source.o \
+ 	suspend.o test.o times.o trap.o type.o ulimit.o umask.o \
+-	wait.o getopts.o shopt.o printf.o getopt.o bashgetopt.o complete.o
++	wait.o getopts.o shopt.o printf.o getopt.o bashgetopt.o complete.o \
++	kr_bridge.o
+ 
+ CREATED_FILES = builtext.h builtins.c psize.aux pipesize.h tmpbuiltins.c \
+ 	tmpbuiltins.h
+--- a/builtins/read.def
++++ b/builtins/read.def
+@@ -92,6 +92,9 @@
+ #include "../bashintl.h"
+ 
+ #include "../shell.h"
++
++#include <readline/kr_bridge.h>
++#include <readline/kr_bridge_rl.h>
+ #include "common.h"
+ #include "bashgetopt.h"
+ #include "trap.h"
+@@ -1188,7 +1191,10 @@
+       deftext = itext;
+     }
+ 
++  /* The `read' builtin reading through the line editor is not the root editor's own prompt. */
++  kr_rl_read_builtin (1);
+   ret = readline (p);
++  kr_rl_read_builtin (0);
+ 
+   rl_attempted_completion_function = old_attempted_completion_function;
+   old_attempted_completion_function = (rl_completion_func_t *)NULL;
