@@ -13,6 +13,9 @@ worker directly for what a session owns.
 | `kr close [id]` | `kr c` | Close a session and terminate the processes it owns |
 | `kr list` | `kr l` | List sessions with their display numbers, states and shells |
 | `kr status [id]` | `kr s` | Show one session's state |
+| `kr question [list/show/answer/cancel]` | — | Read and answer the questions agents are waiting on |
+| `kr skill [install/status/remove]` | — | Install the contact skill and its tool configuration for an agent |
+| `kr agent-tools --stdio` | — | Run the contact tools for the agent that launched this process |
 | `kr doctor` | — | Read-only diagnostics |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
@@ -146,6 +149,55 @@ reason to stop it.
 
 Its limit is stated plainly: nothing recovers a terminal whose emulator has died, because there is
 nothing left to restore.
+
+## `kr question`
+
+The companion app is the primary place to answer an agent's question. These commands are the same
+surface on the machine the session is on.
+
+| Command | What it does |
+| --- | --- |
+| `kr question list [--session <id>] [--include-resolved]` | Lists what is waiting |
+| `kr question show <question_id>` | One question in full |
+| `kr question answer <question_id> (--text \| --choice <id> \| --yes \| --no \| --other <text>)` | Answers it |
+| `kr question cancel <question_id>` | Withdraws it without answering |
+
+Exactly one answer flag is required. `--other` is the free-text option every `select` and `confirm`
+carries; it stays free text and is never read as a listed choice or as yes.
+
+Listings lead with the application identity the host verified — the executable the kernel names and
+its process identifier. The `agent_name` the caller supplied appears beside it as an unverified
+label.
+
+The revision the command read is the revision it submits. A question that was answered, cancelled
+or expired between reading and answering is refused with `QUESTION_RESOLVED` or `QUESTION_EXPIRED`
+rather than answered as though it had not moved.
+
+Questions belong to the session, so these reach the session's worker directly, the way attaching
+does; they keep working while the control daemon is restarting.
+
+## `kr skill`
+
+`kr skill install --agent <agent> --scope <user|project> [--project-dir <path>]` writes the
+`kalareach-contact` package and registers `kr agent-tools --stdio` as a tool server for that agent.
+The agents are `codex`, `claude-code`, `opencode`, `gemini-cli`, `kimi-code-cli` and `qoder-cli`. A
+project scope with no `--project-dir` means this directory.
+
+`kr skill status` reports what is installed and lists anything that has changed since. `kr skill
+remove` undoes exactly what the installation recorded, and leaves alone anything that changed after
+it was written. Both print the change manifest: every directory created, every file written, and
+the configuration entry added.
+
+## `kr agent-tools`
+
+`kr agent-tools --stdio` speaks the Model Context Protocol on standard input and output. It is what
+an installed agent runs; there is nothing to read in its output by hand, and it writes nothing else
+to that stream.
+
+It offers four tools — `ask_user`, `wait_for_answer`, `cancel_question` and `send_notification` —
+bound to the session this process is running in. Outside a session every tool answers
+`NOT_IN_KR_SESSION` with the instruction to start the agent inside one, and creates nothing.
+[docs/contact/README.md](../contact/README.md) explains the binding, the states and the limits.
 
 ## Exit codes
 

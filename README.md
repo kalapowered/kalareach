@@ -27,6 +27,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `crates/kr-shell-integration` | The root-editor bridge contract: the handshake, the reader events, the fence and detach state machine and the cross-shell scenarios |
 | `crates/kr-transfer` | The transfer service: uploads, verified downloads, handle-based filesystem authority and bounded previews |
 | `crates/kr-project` | The project service: repositories, workspaces, the restricted Git execution profile and staged publish |
+| `skills/kalareach-contact` | The installable contact skill: what an agent reads, its tool reference and its installation manifest |
 | `packages/protocol` | The generated TypeScript package: types, a byte-compatible codec and the JSON adapter |
 | `packages/plugin-sdk` | The generated plugin SDK package: types, the package contract as data and the published WIT file |
 | `fixtures/` | Cross-language conformance vectors and fixture packages that both languages test against |
@@ -42,6 +43,7 @@ A Cargo workspace and a pnpm workspace share one tree.
 | `docs/releases/` | How the generated packages are released, and how a consumer pins one |
 | `docs/transfer/` | The transfer reference |
 | `docs/project/` | The project reference |
+| `docs/contact/` | Agent contact: the skill, the tools, the question ledger and installation |
 
 Rust is canonical. The JSON Schema in `packages/protocol/schema/` and `packages/plugin-sdk/schema/`
 comes from the Rust types, and the TypeScript types come from those schemas. Every step has a check

@@ -1,0 +1,20 @@
+{
+  "fixture": "contact-skill-package",
+  "skill": "kalareach-contact",
+  "version": "0.1.0",
+  "note": "The digest of every file an installation writes. A change to the skill package changes these, and the check that reads them fails until they are updated on purpose.",
+  "files": [
+    {
+      "path": "SKILL.md",
+      "sha256": "ddb1cbfda0525ce3af9cbb9210c818c7a58c6d04a3af7ccfce9fd02646354fef"
+    },
+    {
+      "path": "TOOLS.md",
+      "sha256": "013f9e591d60604895945a52579bcb30385d97fc5e721f87aca378cc22b7f43a"
+    },
+    {
+      "path": "manifest.json",
+      "sha256": "a77f48d17f3d4d58e39dc2bdcced263aff15ea617f274f0c7060570f6845c491"
+    }
+  ]
+}

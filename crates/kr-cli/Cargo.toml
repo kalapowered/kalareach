@@ -40,7 +40,7 @@ kr-worker.workspace = true
 portable-pty.workspace = true
 # The contact tests drive `kr agent-tools --stdio` the way an installed agent does: as a child
 # process speaking the Model Context Protocol over its standard streams.
-rmcp = { workspace = true, features = ["client", "transport-child-process"] }
+rmcp = { workspace = true, features = ["client", "transport-async-rw", "transport-child-process"] }
 tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]

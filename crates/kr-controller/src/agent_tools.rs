@@ -868,6 +868,54 @@ mod tests {
         }
     }
 
+    /// The digests the fixture records, and the digests the manifest carries.
+    ///
+    /// Both are checked against the files this binary carries. A skill package that changed
+    /// without its manifest changing would install files whose hashes do not describe them, and a
+    /// removal reads those hashes to decide what is safe to delete.
+    #[test]
+    fn the_packaged_files_match_the_manifest_and_the_fixture() {
+        let manifest: Value = serde_json::from_str(MANIFEST_JSON).expect("the manifest is JSON");
+        let fixture: Value =
+            serde_json::from_str(include_str!("../../../fixtures/contact/skill-package.json"))
+                .expect("the fixture is JSON");
+        let recorded = |value: &Value, name: &str| -> Option<String> {
+            value["files"].as_array()?.iter().find_map(|file| {
+                (file["path"] == name)
+                    .then(|| file["sha256"].as_str().unwrap_or_default().to_owned())
+            })
+        };
+        for (name, contents) in files() {
+            let digest = hex(digest_of(contents.as_bytes()).as_bytes());
+            assert_eq!(
+                recorded(&fixture, name).as_deref(),
+                Some(digest.as_str()),
+                "{name} matches the fixture"
+            );
+            if name != "manifest.json" {
+                assert_eq!(
+                    recorded(&manifest, name).as_deref(),
+                    Some(digest.as_str()),
+                    "{name} matches the manifest"
+                );
+            }
+        }
+        assert_eq!(manifest["version"], SKILL_VERSION);
+        assert_eq!(manifest["entry_point"]["command"], "kr");
+        assert_eq!(manifest["entry_point"]["args"][0], ENTRY_ARGS[0]);
+        assert_eq!(manifest["entry_point"]["args"][1], ENTRY_ARGS[1]);
+        for agent in AgentTarget::ALL {
+            assert!(
+                manifest["agents"]
+                    .as_array()
+                    .expect("agents")
+                    .iter()
+                    .any(|entry| entry["agent"] == agent.as_str()),
+                "{agent} is in the manifest"
+            );
+        }
+    }
+
     #[test]
     fn an_installation_writes_the_skill_and_registers_the_server() {
         let tree = Tree::create();
