@@ -583,9 +583,12 @@ fn a_driver_named_in_a_spelling_an_override_could_miss_still_never_runs() {
             .profile()
             .run_checked(&repository.read(&arguments))
             .expect("the status is read");
-        support::assert_absent(
-            &sentinels,
-            &format!("the {key} driver never ran during the status"),
+        // The directory is there and empty: a marker that ran would have written into it, which is
+        // what `plant_named_driver` proved before the status was taken.
+        assert_eq!(
+            support::names_in(&sentinels),
+            Vec::<String>::new(),
+            "the {key} driver never ran during the status"
         );
     }
 }
@@ -1083,29 +1086,50 @@ fn a_name_this_test_cannot_see_through_is_not_an_empty_directory() {
     );
 }
 
-#[cfg(unix)]
 #[test]
 fn a_marker_that_could_not_record_is_not_a_helper_that_never_ran() {
     // The restricted-profile assertions all say "no sentinel appeared". That is evidence only while
-    // a helper which ran would have left one, and the marker exits zero whatever happens to its
+    // a helper which ran would have left one, and the marker exits zero whatever becomes of its
     // write, because a helper that failed the command would hide itself behind an ordinary error.
-    // So the fixture proves the recorder before those assertions mean anything, and this is that
-    // proof failing: a directory nothing may be written into is refused at planting rather than
-    // reported later as a repository whose helpers never ran.
-    use std::os::unix::fs::PermissionsExt as _;
-
+    // So the fixture proves the recorder where it plants it, and this is that proof failing: a name
+    // the marker cannot write into is refused at planting rather than reported later as a
+    // repository whose helpers never ran. A file at the directory's name is the condition, because
+    // it stops a write whatever the process's own privileges are.
     let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
     let sentinels = directory.path().join("sentinels");
-    std::fs::create_dir_all(&sentinels).expect("the sentinel directory");
-    std::fs::set_permissions(&sentinels, std::fs::Permissions::from_mode(0o500))
-        .expect("a sentinel directory nothing may be written into");
+    std::fs::write(&sentinels, "not a directory\n").expect("a file where the directory would be");
     let planted = std::panic::catch_unwind(|| {
         support::plant_marker(directory.path(), "unrecordable", &sentinels)
     });
-    std::fs::set_permissions(&sentinels, std::fs::Permissions::from_mode(0o700))
-        .expect("the directory is left removable");
     assert!(
         planted.is_err(),
         "a marker that cannot record its own run is refused where it is planted"
+    );
+}
+
+#[test]
+fn a_planted_marker_records_under_the_environment_git_gives_it() {
+    // The other half of the same evidence. A Git child runs with `PATH` set to `/usr/bin` and Git's
+    // own helper directory and nothing else, and on this platform `mkdir` is in `/bin`: a marker
+    // that had to create its own sentinel directory could not, and would leave no trace of having
+    // run. So the directory is there before anything runs, and the marker records into it with a
+    // shell redirection, which needs no program at all. This asserts that under an environment with
+    // *nothing* in it, which is barer than any Git child gets.
+    let directory = tempfile::TempDir::new().expect("a directory on the internal disk");
+    let sentinels = directory.path().join("sentinels");
+    let marker = support::plant_marker(directory.path(), "recording", &sentinels);
+    support::empty_the_sentinels(&sentinels);
+
+    let status = std::process::Command::new(&marker)
+        .arg("escaped-helper")
+        .env_clear()
+        .stdin(std::process::Stdio::null())
+        .status()
+        .expect("the planted marker runs");
+    assert!(status.success(), "the marker exits zero as it is meant to");
+    assert_eq!(
+        support::names_in(&sentinels),
+        vec!["escaped-helper".to_owned()],
+        "a helper that ran leaves its name behind, whatever its environment held"
     );
 }

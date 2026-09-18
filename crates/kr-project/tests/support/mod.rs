@@ -311,7 +311,10 @@ impl Planted {
     /// Panics when the sentinel directory cannot be read for a reason other than its absence.
     #[must_use]
     pub fn escaped(&self) -> Vec<String> {
-        names_in_if_any(&self.sentinels)
+        // The directory itself is required, not merely its emptiness: the fixture leaves it there
+        // because a marker cannot create it, and a directory that has gone is a fixture whose
+        // evidence has gone with it.
+        names_in(&self.sentinels)
     }
 }
 
@@ -405,8 +408,9 @@ pub fn planted_repository(parent: &Path, name: &str, include_refused: bool) -> P
         copy_marker(&marker, &own_hooks.join(hook), &format!("own-hook-{hook}"));
     }
     // Nothing the fixture builder did counts: the sentinel directory starts empty at the moment
-    // the service is first asked to do anything.
-    let _ = std::fs::remove_dir_all(&sentinels);
+    // the service is first asked to do anything, and it stays there, because a marker that has to
+    // create it cannot.
+    empty_the_sentinels(&sentinels);
     Planted {
         path,
         sentinels,
@@ -436,7 +440,10 @@ impl PlantedSubmodule {
     /// Panics when the sentinel directory cannot be read for a reason other than its absence.
     #[must_use]
     pub fn escaped(&self) -> Vec<String> {
-        names_in_if_any(&self.sentinels)
+        // The directory itself is required, not merely its emptiness: the fixture leaves it there
+        // because a marker cannot create it, and a directory that has gone is a fixture whose
+        // evidence has gone with it.
+        names_in(&self.sentinels)
     }
 }
 
@@ -514,7 +521,7 @@ pub fn planted_submodule(
         "changed inside the submodule
 ",
     );
-    let _ = std::fs::remove_dir_all(&sentinels);
+    empty_the_sentinels(&sentinels);
     PlantedSubmodule {
         parent,
         submodule_path: submodule_path.to_owned(),
@@ -559,11 +566,41 @@ pub fn plant_named_driver(parent: &Path, repository: &Path, name: &str, key: &st
         "changed after the commit
 ",
     );
-    let _ = std::fs::remove_dir_all(&sentinels);
+    empty_the_sentinels(&sentinels);
     sentinels
 }
 
 /// Copies the marker program out of the fixture with its sentinel directory substituted.
+/// Empties the sentinel directory without taking it away.
+///
+/// The marker records with a shell redirection, which needs no program, but it can only create the
+/// directory with `mkdir`, and the restricted profile's `PATH` is `/usr/bin` and Git's own helper
+/// directory: on this platform `mkdir` is in `/bin` and is not found there. A fixture that removed
+/// the directory would therefore leave a marker that cannot record, and every "no sentinel
+/// appeared" assertion would pass whether a helper ran or not. So the directory stays and only what
+/// is in it goes.
+///
+/// # Panics
+///
+/// Panics when the directory cannot be emptied or read.
+pub fn empty_the_sentinels(sentinels: &Path) {
+    std::fs::create_dir_all(sentinels).expect("the sentinel directory");
+    for name in names_in(sentinels) {
+        let path = sentinels.join(&name);
+        let found = std::fs::symlink_metadata(&path).expect("what the sentinel directory holds");
+        if found.is_dir() {
+            std::fs::remove_dir_all(&path).expect("a directory inside the sentinel directory goes");
+        } else {
+            std::fs::remove_file(&path).expect("a sentinel goes");
+        }
+    }
+    assert_eq!(
+        names_in(sentinels),
+        Vec::<String>::new(),
+        "the sentinel directory starts empty and stays where a marker can write into it"
+    );
+}
+
 /// Plants the marker program and proves it can record a run into the sentinel directory it is
 /// given.
 ///
@@ -604,8 +641,12 @@ pub fn plant_marker(parent: &Path, name: &str, sentinels: &Path) -> PathBuf {
 fn prove_the_marker_records(marker: &Path, sentinels: &Path) {
     const CONTROL: &str = "the-recorder-itself";
 
+    std::fs::create_dir_all(sentinels).expect("the sentinel directory");
+    // With nothing in its environment, which is at least as bare as the one the restricted profile
+    // gives a Git child: a marker that records under this records under that.
     let status = Command::new(marker)
         .arg(CONTROL)
+        .env_clear()
         .stdin(std::process::Stdio::null())
         .status()
         .expect("the planted marker runs");

@@ -3,7 +3,7 @@
   "marker_program": {
     "unix": "marker.sh",
     "windows": "marker.cmd",
-    "how_it_is_planted": "The script is copied into the fixture repository with @SENTINELS@ replaced by an absolute directory on the internal disk. It takes one argument, the name of the entry that invoked it, and appends that name to a file of the same name inside that directory. It exits zero, so a helper that runs does not also fail the command and hide itself. Because it exits zero whatever becomes of its write, the planting runs it once with a name of its own and requires the file it should have left: finding no sentinel afterwards is then evidence that nothing ran, rather than evidence that nothing could be written."
+    "how_it_is_planted": "The script is copied into the fixture repository with @SENTINELS@ replaced by an absolute directory on the internal disk. It takes one argument, the name of the entry that invoked it, and appends that name to a file of the same name inside that directory. It exits zero, so a helper that runs does not also fail the command and hide itself. Because it exits zero whatever becomes of its write, the planting runs it once with nothing in its environment and requires the file it should have left: finding no sentinel afterwards is then evidence that nothing ran, rather than evidence that nothing could be written. The directory stays where it is for the same reason. A Git child's PATH is /usr/bin and Git's own helper directory, which on some platforms holds no mkdir, so a marker that had to create the directory could not; it records with a shell redirection, which needs no program at all, and the fixture empties the directory rather than taking it away."
   },
   "sentinel_directory": "sentinels",
   "neutralised": [
