@@ -1083,8 +1083,9 @@ somebody could be looking at, and a palette chosen then would be a change rather
 An invisible creation cannot name probed colours. It has no terminal, so a provenance recorded as a
 client's measurement would be a measurement nobody took; the host refuses it with
 `INVALID_ARGUMENT` before it reserves anything, and such a session selects a preset instead. After
-creation this path is closed: only `terminal.palette.set`, with its own explicit right, moves a
-session's palette, and that change is a terminal mutation that broadcasts the new canonical state.
+creation this path is closed: the seam refuses a palette once the session has produced anything,
+and moving a live session's colours is a different thing altogether — an authorised, explicit
+palette change, which carries its own right and broadcasts the new canonical state.
 
 ## Diagnostics
 

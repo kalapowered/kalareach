@@ -52,11 +52,15 @@ themed terminal is shown what the session has rather than what it has itself.
 | `probe` | This terminal's own default foreground and background, as a client preference |
 | absent | The profile default |
 
-`probe` asks this terminal through the same bounded exchange an attach uses: one second for the
-whole of it, the replies never reach an application, and what the person typed around them comes
-back. A terminal that does not report both colours has shared no palette, and the command says so
-rather than recording a provenance nothing measured. `--invisible --palette probe` is refused for
-the same reason: there is no terminal to ask.
+`probe` asks this terminal through the same bounded exchange an attach uses, for its default
+foreground and its default background and nothing else: one second for the whole of it, a guard
+holding this terminal's state throughout, and the replies never reaching an application. What the
+person typed while the question was out is theirs, and with `--attach` it is the first input the
+attachment forwards, in front of its own handshake's typing; with `--terminal` there is nothing
+forwarding input here, so the command says how many bytes it could not deliver. A terminal that
+does not report both colours has shared no palette, and the command says so rather than recording a
+provenance nothing measured. `--invisible --palette probe` is refused for the same reason: there is
+no terminal to ask.
 
 ### Shell mode
 

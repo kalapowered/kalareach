@@ -768,13 +768,31 @@ mod unix {
             context: kr_term::probe::InputContext,
             profile: Option<&str>,
         ) -> Result<Probe> {
+            self.probe_asking(context, &super::profile_questions(profile))
+        }
+
+        /// Runs the same bounded exchange, asking exactly `asked`.
+        ///
+        /// For a caller whose questions are not a profile's: creating a session asks the terminal
+        /// for the colours the session will start with, and nothing else, because a question a
+        /// profile does not document an answer to is a question this command has no business
+        /// writing into somebody's stream. Device attributes terminate the exchange whether or not
+        /// the caller asked for them.
+        ///
+        /// # Errors
+        ///
+        /// The same failures as [`Self::probe`].
+        pub fn probe_asking(
+            &self,
+            context: kr_term::probe::InputContext,
+            asked: &[kr_term::probe::ProbeItem],
+        ) -> Result<Probe> {
             use kr_term::probe::ProbeSession;
 
             // The clock is monotonic and starts at zero, so the one-second deadline is one second
             // of elapsed time whatever the wall clock does while the terminal is being asked.
             let started = std::time::Instant::now();
-            let asked = super::profile_questions(profile);
-            let (mut session, request) = ProbeSession::start(0, context, &asked)
+            let (mut session, request) = ProbeSession::start(0, context, asked)
                 .map_err(|error| CliError::TerminalProbeFailed(error.to_string()))?;
 
             let saved = self.modes()?;

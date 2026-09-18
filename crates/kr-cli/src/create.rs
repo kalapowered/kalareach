@@ -8,8 +8,22 @@
 
 use kr_protocol::session::{PalettePreset, PaletteRequest, Presentation, ProbedPalette};
 
+use crate::attach::RestorationGuard;
 use crate::error::{CliError, Result};
 use crate::terminal::ControllingTerminal;
+
+/// What the palette this session starts with cost to establish.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Chosen {
+    /// The palette the create request carries.
+    pub palette: PaletteRequest,
+    /// What the person typed while the terminal was being asked, in the order they typed it.
+    ///
+    /// Section 8 keeps this separate rather than discarding it or letting it pass for a reply. It
+    /// is the first input the attachment that follows forwards, so a person who started typing
+    /// before the prompt appeared gets what they typed.
+    pub typed: Vec<u8>,
+}
 
 /// What `--palette` was given.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,10 +74,16 @@ impl PaletteChoice {
 ///
 /// Returns [`CliError::Usage`] when an invisible creation asks for probed colours, and
 /// [`CliError::TerminalProbeFailed`] when this terminal could not be asked or did not answer.
-pub fn resolve(choice: PaletteChoice, presentation: Presentation) -> Result<PaletteRequest> {
+pub fn resolve(choice: PaletteChoice, presentation: Presentation) -> Result<Chosen> {
+    let preset = |preset| {
+        Ok(Chosen {
+            palette: PaletteRequest::Preset(preset),
+            typed: Vec::new(),
+        })
+    };
     match choice {
-        PaletteChoice::Light => Ok(PaletteRequest::Preset(PalettePreset::Light)),
-        PaletteChoice::Dark => Ok(PaletteRequest::Preset(PalettePreset::Dark)),
+        PaletteChoice::Light => preset(PalettePreset::Light),
+        PaletteChoice::Dark => preset(PalettePreset::Dark),
         PaletteChoice::Probe => {
             if presentation == Presentation::Invisible {
                 return Err(CliError::Usage(
@@ -77,15 +97,37 @@ pub fn resolve(choice: PaletteChoice, presentation: Presentation) -> Result<Pale
     }
 }
 
+/// The questions this exchange asks, in the order they are written.
+///
+/// The two colours and the terminator, and nothing else. A session's palette is the only thing
+/// being established here, and a question a profile does not document an answer to is a question
+/// this command has no business writing into somebody's stream.
+const QUESTIONS: &[kr_term::probe::ProbeItem] = &[
+    kr_term::probe::ProbeItem::Foreground,
+    kr_term::probe::ProbeItem::Background,
+    kr_term::probe::ProbeItem::DeviceAttributes,
+];
+
 /// Asks this terminal for its own default foreground and background.
 ///
 /// The same bounded exchange an attach runs: one second for the whole of it, the replies never
-/// reach an application, and the typing around them comes back. Nothing else here reads what it
-/// found, so the answer this takes is the pair of colours.
-fn probed() -> Result<PaletteRequest> {
+/// reach an application, and the typing around them comes back. The exchange puts this terminal
+/// into raw mode to read the answers, so a guard holds its state first: a process killed in the
+/// middle of the exchange must still leave a terminal somebody can put back.
+fn probed() -> Result<Chosen> {
     let terminal = ControllingTerminal::open()?;
     let context = crate::terminal::input_context(&terminal);
-    let probe = terminal.probe(context, None)?;
+    let saved = terminal.modes()?;
+    let guard = RestorationGuard::arm(
+        &crate::attach::guard_program(),
+        &terminal,
+        &crate::terminal::SavedModes::from_state(&saved),
+    )?;
+    let asked = terminal.probe_asking(context, QUESTIONS);
+    // Whatever the exchange did, the guard is released here: the terminal is the person's again
+    // the moment the questions are over, and a guard left holding it would outlive the answer.
+    guard.release();
+    let probe = asked?;
     let Some((foreground, background)) = probe.palette else {
         return Err(CliError::TerminalProbeFailed(
             "this terminal did not report both its default foreground and its default background, \
@@ -93,10 +135,13 @@ fn probed() -> Result<PaletteRequest> {
                 .to_owned(),
         ));
     };
-    Ok(PaletteRequest::Probe(ProbedPalette {
-        foreground: colour(foreground),
-        background: colour(background),
-    }))
+    Ok(Chosen {
+        palette: PaletteRequest::Probe(ProbedPalette {
+            foreground: colour(foreground),
+            background: colour(background),
+        }),
+        typed: probe.typed,
+    })
 }
 
 /// The wire form of a colour the terminal reported.
@@ -139,11 +184,41 @@ mod tests {
         let Ok(light) = resolve(PaletteChoice::Light, Presentation::Invisible) else {
             panic!("a preset needs no terminal");
         };
-        assert_eq!(light, PaletteRequest::Preset(PalettePreset::Light));
+        assert_eq!(light.palette, PaletteRequest::Preset(PalettePreset::Light));
+        assert!(
+            light.typed.is_empty(),
+            "and it asks the terminal nothing, so there is nothing to have been typed around it"
+        );
         let Ok(dark) = resolve(PaletteChoice::Dark, Presentation::Invisible) else {
             panic!("a preset needs no terminal");
         };
-        assert_eq!(dark, PaletteRequest::Preset(PalettePreset::Dark));
+        assert_eq!(dark.palette, PaletteRequest::Preset(PalettePreset::Dark));
+    }
+
+    /// The exchange asks for exactly the two colours a session's palette is made of.
+    #[test]
+    fn the_creation_exchange_asks_for_the_colours_and_nothing_else() {
+        use kr_term::probe::ProbeItem;
+
+        assert_eq!(
+            QUESTIONS,
+            &[
+                ProbeItem::Foreground,
+                ProbeItem::Background,
+                ProbeItem::DeviceAttributes
+            ],
+            "the two colours, and the terminator that ends the exchange"
+        );
+        assert!(
+            QUESTIONS.contains(&ProbeItem::Foreground)
+                && QUESTIONS.contains(&ProbeItem::Background),
+            "a exchange that asked neither could never establish a palette"
+        );
+        assert_eq!(
+            QUESTIONS.last(),
+            Some(&ProbeItem::DeviceAttributes),
+            "device attributes are last, and nothing may follow them"
+        );
     }
 
     /// KR-REQ-08.44: an invisible creation has no terminal, so it cannot share probed colours.

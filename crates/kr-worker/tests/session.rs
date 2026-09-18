@@ -1682,3 +1682,77 @@ async fn a_shell_the_host_described_keeps_the_identity_the_kernel_gave_it() {
         record.terminated
     );
 }
+
+/// KR-REQ-08.44: the palette a create request names reaches the session the launch starts.
+///
+/// Through the path the worker process uses: the create request the controller admitted, converted
+/// into the choice the session is opened with, and applied by `start_or_record` between opening the
+/// session and starting its shell. A launch that carried the field and dropped it would leave every
+/// session on the profile default, which is what this asserts against.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_palette_a_create_request_names_reaches_the_launched_session() {
+    use kr_protocol::projection::Rgb as WireRgb;
+    use kr_protocol::session::{
+        EnvironmentVariable, PalettePreset, PaletteRequest, Presentation, ProbedPalette,
+        SessionCreateParams,
+    };
+    use kr_worker::snapshot::PaletteChoice;
+
+    let create = |palette| SessionCreateParams {
+        environment_id: kr_protocol::ids::EnvironmentId::new(kr_ipc::new_uuid()),
+        presentation: Presentation::Invisible,
+        shell: Nullable::null(),
+        shell_mode: ShellMode::NativeCompat,
+        cwd: Nullable::null(),
+        dimensions: Nullable::null(),
+        worker_profile: WorkerProfile::HeadlessUser,
+        environment_snapshot: Vec::<EnvironmentVariable>::new(),
+        palette: Nullable(palette),
+    };
+
+    for (request, expected) in [
+        (None, kr_term::palette::PaletteSource::ProfileDefault),
+        (
+            Some(PaletteRequest::Preset(PalettePreset::Light)),
+            kr_term::palette::PaletteSource::LightPreset,
+        ),
+        (
+            Some(PaletteRequest::Preset(PalettePreset::Dark)),
+            kr_term::palette::PaletteSource::DarkPreset,
+        ),
+        (
+            Some(PaletteRequest::Probe(ProbedPalette {
+                foreground: WireRgb {
+                    red: 0xd0,
+                    green: 0xd4,
+                    blue: 0xd8,
+                },
+                background: WireRgb {
+                    red: 0x10,
+                    green: 0x12,
+                    blue: 0x18,
+                },
+            })),
+            kr_term::palette::PaletteSource::ClientPreference,
+        ),
+    ] {
+        let host = kr_ipc::testing::TempHost::create();
+        let config = configuration(&host, "sleep 30");
+        // Exactly what the worker process does with the specification the controller sent it.
+        let choice = PaletteChoice::from_request(create(request).palette.0);
+        let runtime = kr_worker::runtime::start_or_record(
+            config,
+            choice,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("the session launches");
+        assert_eq!(
+            runtime.session().palette_source(),
+            expected,
+            "the form the create request named is what the launched session records"
+        );
+        let (_, gate) = runtime.close(ClosureReason::CloseRequested);
+        gate.release();
+        let _ = closure_record(&runtime, "the session closes").await;
+    }
+}

@@ -226,6 +226,19 @@ mod console {
             Probe::unasked(context)
         }
 
+        /// The same answer for a caller with its own questions: this console is asked none of them.
+        ///
+        /// # Errors
+        ///
+        /// Returns [`CliError::TerminalProbeFailed`] when a probe has already gone out here.
+        pub fn probe_asking(
+            &self,
+            context: kr_term::probe::InputContext,
+            _asked: &[kr_term::probe::ProbeItem],
+        ) -> Result<Probe> {
+            Probe::unasked(context)
+        }
+
         /// A name for this console that no other console shares while it exists.
         ///
         /// The console host has no device path and no session identifier of the kind a terminal

@@ -100,12 +100,16 @@ async fn run(cli: Cli) -> Result<Completion> {
             let environment = kr_cli::resolve::select(&paths, arguments.environment.as_deref())?;
             // The palette before the geometry, because the probe form asks this terminal a
             // question and a refusal should come before a session exists rather than after.
-            let palette = match arguments.palette.as_deref() {
+            let chosen = match arguments.palette.as_deref() {
                 Some(value) => Some(kr_cli::create::resolve(
                     kr_cli::create::PaletteChoice::parse(value)?,
                     presentation,
                 )?),
                 None => None,
+            };
+            let (palette, typed_while_asking) = match chosen {
+                Some(chosen) => (Some(chosen.palette), chosen.typed),
+                None => (None, Vec::new()),
             };
             let dimensions = match presentation {
                 Presentation::Attach => {
@@ -150,7 +154,7 @@ async fn run(cli: Cli) -> Result<Completion> {
             // The session exists. Presenting it is a separate step, and a presentation that fails
             // never produces a second session: the failure is reported against the one that was
             // created.
-            let presented = present(&paths, &created, presentation).await;
+            let presented = present(&paths, &created, presentation, typed_while_asking).await;
             if cli.json {
                 let mut document = report::session(&created.session);
                 if let Some(object) = document.as_object_mut() {
@@ -193,6 +197,9 @@ async fn run(cli: Cli) -> Result<Completion> {
                     take_geometry: arguments.take_geometry,
                     no_probe: arguments.no_probe,
                     follow_live: arguments.follow_live,
+                    // Attaching asks this terminal nothing before its own handshake, so there is
+                    // nothing owed from before it.
+                    typed_before: Vec::new(),
                 },
             )
             .await?;
@@ -451,6 +458,7 @@ async fn present(
     paths: &HostPaths,
     created: &SessionCreateResult,
     presentation: Presentation,
+    typed_before: Vec<u8>,
 ) -> Result<()> {
     match presentation {
         Presentation::Invisible => Ok(()),
@@ -467,12 +475,24 @@ async fn present(
                     // A terminal that has just created a session has nothing above its live page
                     // to look at, so there is nothing to come back from.
                     follow_live: false,
+                    // What the person typed while the creation was asking this terminal for its
+                    // colours. It is theirs, and this attachment is where it goes.
+                    typed_before,
                 },
             )
             .await?;
             outcome.into_error().map_or(Ok(()), Err)
         }
         Presentation::Terminal => {
+            // Nothing here forwards input, so anything the person typed while the terminal was
+            // being asked for its colours has nowhere to go. They are owed the number rather than
+            // left to wonder where those keystrokes went.
+            if !typed_before.is_empty() {
+                eprintln!(
+                    "kr: {} bytes typed while this terminal was asked for its colours could not be delivered; the session opens in its own window",
+                    typed_before.len()
+                );
+            }
             open_terminal_application(created.session.session_id, created.session.environment_id)
         }
     }

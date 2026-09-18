@@ -79,7 +79,7 @@ impl AttachOutcome {
 }
 
 /// How an attach presents the session.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AttachOptions {
     /// Take size ownership for this terminal.
     pub take_geometry: bool,
@@ -92,6 +92,13 @@ pub struct AttachOptions {
     /// client's own choice: nothing on the wire follows or does not follow, and the host goes on
     /// delivering live output either way.
     pub follow_live: bool,
+    /// What the person typed before this attachment began, which nothing has delivered yet.
+    ///
+    /// Creating a session with `--palette probe` asks this terminal a question of its own, and
+    /// what the person typed while it was being asked is theirs. It is carried here so the
+    /// attachment that follows delivers it in front of its own handshake's typing, in the order
+    /// it was typed.
+    pub typed_before: Vec<u8>,
 }
 
 /// How far one scroll-back step moves this terminal's window.
@@ -334,7 +341,7 @@ pub async fn run(
     let outcome = drive(
         &mut client,
         descriptor,
-        probe.typed,
+        [options.typed_before, probe.typed].concat(),
         Attached {
             attachment_id: attachment.attachment_id,
             lease_epoch: epoch,
