@@ -629,9 +629,12 @@ impl Controller {
         actor_id: &ActorId,
         mutation: &MutationRequest,
         method: Method,
+        connection_id: ConnectionId,
     ) -> Option<ControlFrame> {
         if matches!(method, Method::AgentToolsInstall | Method::AgentToolsRemove) {
-            return self.retained_installation(actor_id, mutation).await;
+            return self
+                .retained_installation(actor_id, mutation, connection_id)
+                .await;
         }
         if method != Method::SessionCreate {
             return None;
@@ -1442,7 +1445,10 @@ impl Controller {
         // Section 9 makes the freshness window the thing that admits a *new* action; applying it to
         // a retry would refuse a caller its own completed result because its window has since been
         // replaced, and replacing the window of an action already submitted is not allowed either.
-        if let Some(retained) = self.retained(actor_id, &mutation, method).await {
+        if let Some(retained) = self
+            .retained(actor_id, &mutation, method, connection_id)
+            .await
+        {
             return retained;
         }
         if crate::transfer::TransferModule::serves(method)
@@ -1490,10 +1496,17 @@ impl Controller {
         &self,
         actor_id: &ActorId,
         mutation: &MutationRequest,
+        connection_id: ConnectionId,
     ) -> Option<ControlFrame> {
         let installer = self.installer().ok()?;
         let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
         let _admission = self.agent_tools.lock().await;
+        // Waiting for that lock takes time, and a retained result is a read of somebody's action.
+        // Section 9 checks current authority before returning one, so it is checked after the wait
+        // rather than before it.
+        if let Err(error) = self.authorised(connection_id).await {
+            return Some(respond(mutation.request_id, Err(error)));
+        }
         match installer.retained(actor_id, mutation.action_id, &digest) {
             Ok(Some(result)) => Some(ControlFrame::Response(Response {
                 request_id: mutation.request_id,

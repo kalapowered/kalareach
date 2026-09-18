@@ -643,7 +643,7 @@ impl RemoteConnection {
         }
         if let Some(retained) = self
             .controller
-            .retained(&actor_id, mutation, entry.method)
+            .retained(&actor_id, mutation, entry.method, self.connection_id)
             .await
         {
             // The daemon's own retained answer is a read of what an earlier submission produced,
