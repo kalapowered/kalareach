@@ -620,21 +620,42 @@ fn record(profile: &cap_std::fs::Dir, line: &str) -> Result<()> {
 
     // Two invocations of this service write to the same record at the same time, and a line that
     // reached the disk in halves would be a record the next start refuses to read. One at a time,
-    // and each one whole.
+    // each one whole, and a write that only half happened is cut back to where it began before the
+    // next one is let in. A repair that itself fails ends the writing: appending after a half line
+    // would make a line nothing can read, and there would be no way back from that.
     static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
     let _writing = WRITING
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if BROKEN.load(std::sync::atomic::Ordering::SeqCst) {
+        return Err(ProjectError::StagingUnavailable {
+            detail: "this host's record of its own temporary directory was left part written and \
+                     could not be cut back, so nothing more is written to it"
+                .into(),
+        });
+    }
     let mut options = cap_std::fs::OpenOptions::new();
     options.create(true).append(true).follow(FollowSymlinks::No);
     let existed = profile.exists(TEMPORARY_MANIFEST_FILE);
     let mut file = profile
         .open_with(TEMPORARY_MANIFEST_FILE, &options)
         .map_err(ProjectError::staging)?;
-    file.write_all(format!("{line}\n").as_bytes())
+    let before = file
+        .metadata()
+        .map(|metadata| metadata.len())
         .map_err(ProjectError::staging)?;
-    file.sync_data().map_err(ProjectError::staging)?;
+    if let Err(error) = file
+        .write_all(format!("{line}\n").as_bytes())
+        .and_then(|()| file.sync_data())
+    {
+        // Back to where this began, so that what is on the disk is whole lines and nothing else.
+        if file.set_len(before).is_err() || file.sync_data().is_err() {
+            BROKEN.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        return Err(ProjectError::staging(error));
+    }
     if existed {
         Ok(())
     } else {
@@ -858,14 +879,28 @@ fn sweep(
             .into(),
         });
     };
-    let Ok(held) = root.entries() else {
-        return Ok(());
-    };
+    // What cannot be read cannot be accounted for, and a start that went on would append to a
+    // record whose interrupted tail is still on the disk.
+    let held =
+        root.entries().map_err(|error| {
+            ProjectError::StagingUnavailable {
+        detail: format!(
+            "{} is where this host makes each invocation's own temporary directory and it could \
+             not be read: {error}",
+            redact(&root_path.display().to_string())
+        )
+        .into(),
+    }
+        })?;
     for found in held {
-        let Ok(found) = found else {
-            left_in_place(root_path, "it could not be read");
-            return Ok(());
-        };
+        let found = found.map_err(|error| ProjectError::StagingUnavailable {
+            detail: format!(
+                "{} is where this host makes each invocation's own temporary directory and it \
+                 could not be read to the end: {error}",
+                redact(&root_path.display().to_string())
+            )
+            .into(),
+        })?;
         let name = found.file_name().to_string_lossy().into_owned();
         let Some(entry) = entries.get(&name) else {
             left_in_place(
