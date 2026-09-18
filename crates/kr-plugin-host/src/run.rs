@@ -36,7 +36,10 @@ use crate::options::Options;
 /// Returns the startup failure. A host that could not report in never served anything, which is
 /// what keeps a worker from talking to a process the daemon did not start.
 pub async fn run(options: Options) -> LaunchResult<()> {
-    let paths = HostPaths::new(&options.runtime_dir, &options.state_dir);
+    // The roots are resolved rather than taken as given: a relative path here would be resolved
+    // against whatever directory this process was started in, which is not a directory it has any
+    // claim on.
+    let paths = HostPaths::new(&options.runtime_dir, &options.state_dir)?;
     let environment = paths.environment(options.environment_id());
     environment.create()?;
 

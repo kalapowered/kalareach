@@ -146,6 +146,7 @@ impl Host {
                     program: plan.program.clone(),
                     arguments: plan.arguments.clone(),
                     jobs_directory: plan.jobs_directory.clone(),
+                    working_directory: plan.working_directory.clone(),
                 };
                 if let Ok(mut slot) = recorded.lock() {
                     *slot = Some(launch.clone());
@@ -498,7 +499,10 @@ impl WorkerSession {
         };
         let mut session = Session::open(config).expect("opens the session");
         session.launch().expect("launches the shell");
-        let runtime = Arc::new(SessionRuntime::start(session).expect("starts the runtime"));
+        let runtime = Arc::new(
+            SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
+                .expect("starts the runtime"),
+        );
 
         let endpoint = environment
             .worker_endpoint(DisplayNumber::new(1))
@@ -697,6 +701,28 @@ async fn kr_req_05_06_the_plugin_runtime_is_a_lazily_started_job_of_its_own() {
     // One reservation, one host. Nothing else claimed this one, and the launcher still holds the
     // endpoint a second claim would have to arrive on.
     assert_eq!(started.duplicate_claims(), 0);
+
+    // And it runs in a directory of its own, inside the environment's state directory: a process a
+    // service manager started would otherwise run in the system's directory, or in whatever
+    // directory the daemon that started it was in, which on this host is a removable volume.
+    let launch = started.launch.as_ref().expect("a launch plan");
+    assert!(
+        launch
+            .working_directory
+            .starts_with(environment.state_dir()),
+        "the host runs in {}, which is outside {}",
+        launch.working_directory.display(),
+        environment.state_dir().display()
+    );
+    assert!(
+        launch.working_directory.is_dir(),
+        "the host's own directory was not made before it was started"
+    );
+    assert!(
+        !launch.working_directory.starts_with("/Volumes"),
+        "the host runs on a removable volume: {}",
+        launch.working_directory.display()
+    );
 
     started.kill();
     let _ = launcher::retire_descriptor(&environment);

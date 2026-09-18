@@ -209,6 +209,14 @@ pub struct HostLaunchPlan {
     pub arguments: Vec<String>,
     /// Where a generated job definition is written.
     pub jobs_directory: PathBuf,
+    /// The directory the host process runs in.
+    ///
+    /// Its own, inside the environment's state directory, rather than whatever it would inherit: a
+    /// service manager's directory belongs to the system and a daemon's belongs to whoever started
+    /// the daemon. Neither is a directory this process has any claim on, and either can be a volume
+    /// the person at the machine expects to be able to unmount -- which, on a host whose workspace
+    /// is on a removable volume, is exactly what a launched process holding one prevents.
+    pub working_directory: PathBuf,
 }
 
 /// What starting the job produced.
@@ -705,6 +713,12 @@ impl HostReservation {
         format!("kr-plugin-host-{}", self.reservation_id)
     }
 
+    /// Returns the directory this launch's host process runs in.
+    #[must_use]
+    pub fn working_directory(&self, environment: &EnvironmentPaths) -> PathBuf {
+        environment.state_dir().join("services").join(self.label())
+    }
+
     /// Builds the launch plan for one host executable.
     #[must_use]
     pub fn plan(
@@ -718,6 +732,7 @@ impl HostReservation {
             program: program.into(),
             arguments: self.arguments(environment, packages),
             jobs_directory: environment.jobs_dir(),
+            working_directory: self.working_directory(environment),
         }
     }
 
@@ -945,6 +960,10 @@ pub async fn start(
     // instant it starts finds somebody listening.
     let reservation = HostReservation::open(environment)?;
     let plan = reservation.plan(environment, program, packages);
+    // Made before anything is started, so a launch cannot fail on a directory that does not exist
+    // yet. It is inside this environment's state directory, which this host owns and which holds
+    // nothing a person keeps.
+    kr_ipc::paths::create_private_tree(environment.state_root(), &plan.working_directory)?;
     let launched = match starter(&plan) {
         HostStartOutcome::Started(identity) => identity,
         HostStartOutcome::NotStarted { detail } => return Err(LaunchError::NotStarted { detail }),
