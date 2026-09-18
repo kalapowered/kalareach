@@ -64,18 +64,20 @@ returned. A directory substituted at one of those names is refused before anythi
 then does not start at a path either: it moves into the open working directory before the boundary
 is applied and before Git runs, with `-C .` as its only directory argument.
 
-What the kernel then enforces is this: a file is opened for writing only inside the subtree of one of
-those granted root objects, as the kernel works that out **when the file is opened** — by the object
-itself on Linux, where the rules are attached to the opened directories, and by the resolved path on
-macOS, where the profile names them. Neither kernel asks again on each write through a descriptor
-already open, so a file opened inside a granted subtree and then moved out of it is still written
-through that descriptor.
+What the kernels then enforce is this: **opens for writing succeed only inside the granted root
+objects' subtrees as they stand at open time; execution stays confined; the granted roots are
+re-confirmed by identity before the spawn and after the run.** Which object a subtree is, is decided
+by the opened directory on Linux, where Landlock's rules are attached to it, and by the resolved
+path on macOS, where the profile names it.
 
-After the child has gone, each granted root is required to still be the object it was before its
-result reaches a caller, and a root that is not ends the run with this service's declared honest
-result. That second reading is **detection** and is described as such: it says that a root changed,
-it does not keep one from changing, it is on those roots and not on every descendant of them, and
-two readings cannot tell a change made and undone from no change at all.
+Neither kernel asks again on each write through a file already open, so a file opened inside a
+granted subtree that a same-account writer then moves out of it is still written through that
+descriptor. That is an accepted limit: the writer who could move it already holds write access to
+it.
+
+The re-confirmation after the run is **detection** and is described as such: it says that a root
+changed, it does not keep one from changing, it is on those roots and not on every descendant of
+them, and two readings cannot tell a change made and undone from no change at all.
 
 **Reads are not confined on macOS or Linux.** Git reads the system's shared libraries, its locale
 data and its certificate store, and a read confinement that missed one of those would fail an

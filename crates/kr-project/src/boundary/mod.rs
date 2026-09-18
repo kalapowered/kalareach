@@ -44,17 +44,19 @@
 //! substituted at a name afterwards is therefore neither the tree Git works in nor a tree the
 //! boundary was built around.
 //!
-//! What the kernel enforces is narrower than the sentence above, and is stated as what it is: a
-//! file is opened for writing only inside the subtree of one of the granted root objects, as the
-//! kernel works that out **when the file is opened** — by the object itself on Linux, where the
-//! rules are attached to the opened directories, and by the resolved path on macOS, where the
-//! profile names them. Neither kernel asks again on each write through a descriptor already open,
-//! so a file opened inside a granted subtree and then moved out of it is still written through that
-//! descriptor. That is the mechanism's rule rather than a choice made here.
+//! What the kernels enforce is narrower than the sentence above, and is stated as what it is:
+//! **opens for writing succeed only inside the granted root objects' subtrees as they stand at open
+//! time; execution stays confined; the granted roots are re-confirmed by identity before the spawn
+//! and after the run.** Which object a subtree is, is decided by the opened directory on Linux,
+//! where Landlock's rules are attached to it, and by the resolved path on macOS, where the profile
+//! names it.
 //!
-//! The granted roots are confirmed by identity twice, before the child starts and after it has
-//! gone, and a root that is no longer the object it was ends the run with this service's declared
-//! honest result. That second reading is **detection**: it says that a root changed, it does not
+//! Neither kernel asks again on each write through a file already open, so a file opened inside a
+//! granted subtree that a same-account writer then moves out of it is still written through that
+//! descriptor. That is an accepted limit rather than a choice made here: the writer who could move
+//! it already holds write access to it. Excluding it needs isolation of another kind.
+//!
+//! The re-confirmation after the run is **detection**: it says that a root changed, it does not
 //! keep one from changing. Two readings cannot tell a change made and undone from no change at all,
 //! and waiting for Git establishes that Git has gone rather than that everything it started has.
 //!

@@ -600,15 +600,16 @@ The enclosure is what makes the checks around it sufficient rather than advisory
 repository's configuration before it runs Git and reads it again afterwards, and it always could; a
 writer racing the two readings is what those checks could notice and not prevent. Now the child
 starts inside the directory this host opened rather than at a name, so a tree put at that name
-afterwards is not the tree Git works in, and a file is opened for writing only inside the subtree of
-one of the granted root objects, as the kernel works that out when the file is opened. Neither
-kernel asks again on each write through a descriptor already open. Each granted root is read again
-by identity after the child has gone, and a root that is no longer the object it was ends the run
-with this host's declared honest result. That second reading is detection: it says a root changed,
-it does not keep one from changing. Inside a granted subtree the kernel draws no further line, so a
-directory put at an unrecorded name in a tree the operation owns is written to as the tree is; the
-only writer who could put it there is a writer under this same account, who could write those files
-directly.
+afterwards is not the tree Git works in. What the kernels enforce is that opens for writing succeed
+only inside the granted root objects' subtrees as they stand at open time, that execution stays
+confined, and that the granted roots are re-confirmed by identity before the spawn and after the
+run. Neither kernel asks again on each write through a file already open, so a file opened inside a
+granted subtree that a same-account writer then moves out of it is still written through that
+descriptor, which is an accepted limit: that writer already holds write access to the file. The
+re-confirmation after the run is detection: it says a root changed, it does not keep one from
+changing. Inside a granted subtree the kernels draw no further line, so a directory put at an
+unrecorded name in a tree the operation owns is written to as the tree is; the only writer who could
+put it there is a writer under this same account, who could write those files directly.
 
 What it does not confine, on the two platforms whose mechanism separates the two, is reading. Git
 reads the system's shared libraries, its locale data and its certificate store, and a read

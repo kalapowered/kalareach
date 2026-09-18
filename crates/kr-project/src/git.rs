@@ -3399,6 +3399,9 @@ mod tests {
             handle.create_dir(name).expect("a directory");
             handle.create(format!("{name}/{token}")).expect("a mark");
         };
+        // What somebody else put at the name this host's mark would have, which must still be
+        // there afterwards: a file at that name is not a licence to delete it.
+        let theirs = "not this host's, and not to be removed\n";
         let elsewhere = crate::boundary::ObjectIdentity {
             device: 0,
             file_id: 0,
@@ -3431,8 +3434,15 @@ mod tests {
         plant("swapped", "dddd");
         record(&profile, "making swapped dddd").expect("the record");
         record(&profile, &format!("made swapped {elsewhere} {elsewhere}")).expect("the record");
-        // One whose mark is at the right name and is not the object this host made.
-        plant("foreign", "eeee");
+        // One whose mark is at the right name and is not the object this host made, holding
+        // somebody else's bytes.
+        handle.create_dir("foreign").expect("a directory");
+        {
+            use std::io::Write as _;
+
+            let mut file = handle.create("foreign/eeee").expect("somebody else's file");
+            file.write_all(theirs.as_bytes()).expect("their bytes");
+        }
         record(&profile, "making foreign eeee").expect("the record");
         record(
             &profile,
@@ -3456,6 +3466,11 @@ mod tests {
         assert!(
             temporary.join("used/left-behind").exists(),
             "and nothing inside it was taken away either"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temporary.join("foreign/eeee")).expect("their file is there"),
+            theirs,
+            "a file at the name this host's own mark would have is not this host's to remove"
         );
         let kept = recorded(&profile).expect("the record reads");
         for name in ["used", "swapped", "foreign"] {
