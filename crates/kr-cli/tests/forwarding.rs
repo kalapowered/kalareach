@@ -186,6 +186,7 @@ async fn hosted(script: &str) -> Hosted {
                 controller_public_key: *controller.public_key(),
                 controller_generation: ControllerGeneration::new(1),
                 build_id: BuildId::new("kr-test/0").expect("a build identifier"),
+                journal_path: None,
             },
         )
         .expect("a worker service"),

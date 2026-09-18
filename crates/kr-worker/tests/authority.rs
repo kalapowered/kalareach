@@ -111,6 +111,7 @@ async fn host_producing(generation: u64, script: &str) -> Host {
                 controller_public_key: *controller.public_key(),
                 controller_generation: ControllerGeneration::new(generation),
                 build_id: build(),
+                journal_path: None,
             },
         )
         .expect("a worker service"),

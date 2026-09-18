@@ -109,6 +109,7 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
                 controller_public_key: *controller.public_key(),
                 controller_generation: ControllerGeneration::new(1),
                 build_id: build(),
+                journal_path: None,
             },
         )
         .expect("a worker service"),

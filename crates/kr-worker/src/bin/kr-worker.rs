@@ -239,6 +239,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             controller_public_key: specification.controller_public_key,
             controller_generation: specification.controller_generation,
             build_id: build_id(),
+            journal_path: Some(environment.journal_database(specification.session_id)),
         },
     )?);
     let serving = tokio::spawn(Arc::clone(&service).serve(listener));

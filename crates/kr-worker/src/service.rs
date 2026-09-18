@@ -163,6 +163,8 @@ pub struct WorkerService {
     /// attachment is not in here, because its authority is the operating-system identity the
     /// socket authenticated and no revision replaces that.
     remote_attachments: Mutex<std::collections::BTreeSet<AttachmentId>>,
+    /// The session's questions, and the sources bound to them.
+    questions: Arc<crate::questions::Questions>,
     build_id: kr_protocol::ids::BuildId,
 }
 
@@ -183,6 +185,12 @@ impl WorkerService {
     #[must_use]
     pub fn runtime(&self) -> &Arc<SessionRuntime> {
         &self.runtime
+    }
+
+    /// Returns this session's question ledger.
+    #[must_use]
+    pub fn questions(&self) -> &Arc<crate::questions::Questions> {
+        &self.questions
     }
 }
 
@@ -208,6 +216,15 @@ impl WorkerService {
         binding: ServiceBinding,
     ) -> Result<Self> {
         let boot_epoch = kr_ipc::identity::boot_epoch(&binding.boot_identity)?;
+        let (session_id, session_epoch) = {
+            let session = runtime.session();
+            (session.id(), session.epoch())
+        };
+        let questions = Arc::new(crate::questions::Questions::open(
+            binding.journal_path.as_deref(),
+            session_id,
+            session_epoch,
+        )?);
         let clock = Arc::new(SystemContinuousClock::new());
         // The session's own, not a second one: the check this service makes before a batch is
         // accepted and the fence the writer applies before it is written have to be reading the
@@ -234,6 +251,7 @@ impl WorkerService {
             connections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             admitted: Mutex::new(std::collections::BTreeMap::new()),
             remote_attachments: Mutex::new(std::collections::BTreeSet::new()),
+            questions,
             build_id: binding.build_id,
         })
     }
@@ -659,6 +677,11 @@ impl WorkerService {
                 Some(self.acknowledge_revision(state, &notice))
             }
             ControlFrame::Request(request) => {
+                // A source that asked to wait waits here: outside the session lock, outside the
+                // dispatch barrier and outside any transaction. Section 11 makes a long poll an
+                // asynchronous subscription, renewed in bounded steps, that returns the same
+                // durable question when it times out and notifies nobody a second time.
+                self.wait_for_answer(state, &request).await;
                 let caller = Caller::local(state.actor_id.clone());
                 Some(self.request(state, &request, &caller))
             }
@@ -675,6 +698,62 @@ impl WorkerService {
                     "a worker endpoint does not accept this message",
                 ),
             )),
+        }
+    }
+
+    /// Waits for a source's own question to move, when the request asked to wait.
+    ///
+    /// The caller's binding and its token are checked first, so a wait tells an unauthorised
+    /// caller nothing about somebody else's question; anything that fails here simply does not
+    /// wait, and the read that follows returns the failure. The wait is renewed in bounded steps
+    /// rather than held as one long sleep, so an expiry that falls due while nobody is asking is
+    /// still noticed, and the read that follows is the ordinary one.
+    async fn wait_for_answer(&self, state: &ConnectionState, request: &Request) {
+        if request.method.method() != Some(Method::QuestionReadOwn) {
+            return;
+        }
+        let Ok(params) = request
+            .params
+            .to_typed::<kr_protocol::question::QuestionReadOwnParams>()
+        else {
+            return;
+        };
+        let Some(wait) = params.wait_ms.as_ref().copied() else {
+            return;
+        };
+        let Ok(source) = self.bind_source(state) else {
+            return;
+        };
+        // The token is checked before anything waits. A caller that cannot read this question
+        // cannot learn when it was answered by timing a wait either.
+        if self
+            .questions
+            .read_own(
+                &source,
+                &kr_protocol::question::QuestionReadOwnParams {
+                    wait_ms: kr_protocol::scalars::Nullable::null(),
+                    ..params.clone()
+                },
+                self.question_clock(),
+            )
+            .is_err()
+        {
+            return;
+        }
+        let bounded =
+            kr_protocol::question::bounded_wait(Some(wait), kr_protocol::question::MAX_WAIT);
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(bounded.get());
+        let step = std::time::Duration::from_millis(kr_protocol::question::WAIT_RENEWAL.get());
+        while tokio::time::Instant::now() < deadline {
+            let _ = self.questions.sweep(self.question_clock());
+            match self.questions.question(params.question_id) {
+                Ok(question) if question.state.is_resolved() => return,
+                Err(_) => return,
+                Ok(_) => {}
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            self.questions.wait_for_change(remaining.min(step)).await;
         }
     }
 
@@ -1244,6 +1323,8 @@ impl WorkerService {
             Method::EventsSubscribe => self.events_subscribe(state, &request.params),
             Method::ActionRead => self.action_read(&caller.actor_id, &request.params),
             Method::InputWrite => self.input_write(state, &request.params, caller),
+            Method::QuestionReadOwn => self.question_read_own(state, &request.params),
+            Method::QuestionRead => self.question_read(&request.params),
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a read this worker serves",
                 method.as_str()
@@ -1629,7 +1710,17 @@ impl WorkerService {
                 // The result, the receipt revision and the event record are one commit. A crash
                 // between them would leave a receipt that claims an outcome beside a result no
                 // reader can retrieve.
+                //
+                // A created question is the exception, and it is deliberate. Its result carries
+                // the caller token, and section 11 keeps that token out of every durable record
+                // except the ledger's own sealed copy — a retained result is a durable record, and
+                // one a backup would carry. So the receipt is written without it. Nothing is lost:
+                // a question is de-duplicated by its source and its own request identifier, which
+                // returns the same question and the same token, and a repeated action identifier
+                // gets the receipt as it stands, which is what section 9 gives an action with no
+                // retained result.
                 let bytes = kr_cbor::encode(value.as_value());
+                let retainable = method != Method::QuestionCreate;
                 // A failure here cannot unwind the effect, which has already happened. It is
                 // recorded against the session rather than turned into a refusal the caller would
                 // read as "nothing happened".
@@ -1637,7 +1728,7 @@ impl WorkerService {
                     actor_id,
                     mutation.action_id,
                     kr_protocol::receipt::ReceiptState::Applied,
-                    Some(&bytes),
+                    retainable.then_some(bytes.as_slice()),
                     None,
                     now,
                 );
@@ -2010,6 +2101,31 @@ impl WorkerService {
                 let params: AttachmentViewportParams = parse(&mutation.params)?;
                 Self::check_attachment(state, params.attachment_id)
             }
+            // Every question method names the session it acts in, and this endpoint serves one
+            // session. What admits the *caller* is checked in the effect: a source is bound to
+            // this session from what the kernel says, and an answering actor's rights were
+            // checked before the request was forwarded here.
+            Method::QuestionCreate => {
+                let params: kr_protocol::question::QuestionCreateParams = parse(&mutation.params)?;
+                Self::check_session(session, params.session_id)
+            }
+            Method::QuestionCancelOwn => {
+                let params: kr_protocol::question::QuestionCancelOwnParams =
+                    parse(&mutation.params)?;
+                Self::check_session(session, params.session_id)
+            }
+            Method::AlertCreate => {
+                let params: kr_protocol::question::AlertCreateParams = parse(&mutation.params)?;
+                Self::check_session(session, params.session_id)
+            }
+            Method::QuestionAnswer => {
+                let params: kr_protocol::question::QuestionAnswerParams = parse(&mutation.params)?;
+                Self::check_session(session, params.session_id)
+            }
+            Method::QuestionCancel => {
+                let params: kr_protocol::question::QuestionCancelParams = parse(&mutation.params)?;
+                Self::check_session(session, params.session_id)
+            }
             // An action belongs to the actor that submitted it. Nothing else about the request
             // decides whether it may be cancelled, because the receipt itself is the subject.
             Method::ActionCancel => {
@@ -2206,6 +2322,74 @@ impl WorkerService {
         })
     }
 
+    /// Reads one question back to the source that created it.
+    ///
+    /// The source is bound again on every call, from what the kernel says about this connection.
+    /// A token alone reaches nothing: it has to be presented by the application the question was
+    /// created from.
+    fn question_read_own(
+        &self,
+        state: &ConnectionState,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::question::QuestionReadOwnParams = parse(params)?;
+        let source = self.bind_source(state)?;
+        let (result, _) = self
+            .questions
+            .read_own(&source, &params, self.question_clock())?;
+        encode(&result)
+    }
+
+    /// Reads the questions an answering actor may see.
+    fn question_read(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::question::QuestionReadParams = parse(params)?;
+        {
+            let session = self.runtime.session();
+            Self::check_session(&session, params.session_id)?;
+        }
+        let (result, _) = self.questions.read(&params, self.question_clock())?;
+        encode(&result)
+    }
+
+    /// Returns the two clocks a question's deadlines are measured on.
+    fn question_clock(&self) -> crate::questions::Now {
+        crate::questions::Now {
+            utc_ms: kr_ipc::now_ms(),
+            boot_ms: self.shared_clock.boot_elapsed_ms(),
+        }
+    }
+
+    /// Binds the caller on this connection to this session, for a source-side question method.
+    fn bind_source(&self, state: &ConnectionState) -> Result<crate::questions::VerifiedSource> {
+        let boundary = Self::session_boundary(&self.runtime.session());
+        Ok(crate::questions::binding::verify(
+            state.peer_pid,
+            state.connection_id,
+            boundary.as_ref(),
+        )?)
+    }
+
+    /// Binds the caller on this connection, with the session already held.
+    fn bind_source_in(
+        session: &Session,
+        state: &ConnectionState,
+    ) -> Result<crate::questions::VerifiedSource> {
+        let boundary = Self::session_boundary(session);
+        Ok(crate::questions::binding::verify(
+            state.peer_pid,
+            state.connection_id,
+            boundary.as_ref(),
+        )?)
+    }
+
+    /// Returns the process boundary this session owns, when its root shell is running.
+    fn session_boundary(session: &Session) -> Option<crate::questions::SessionBoundary> {
+        Some(crate::questions::SessionBoundary {
+            boundary: session.owned()?.boundary().clone(),
+            root: session.root_identity()?,
+        })
+    }
+
     fn input_write(
         &self,
         state: &mut ConnectionState,
@@ -2396,6 +2580,48 @@ impl WorkerService {
                     AfterEffect::None,
                 ))
             }
+            Method::QuestionCreate => {
+                let params: kr_protocol::question::QuestionCreateParams = parse(params)?;
+                let source = Self::bind_source_in(session, state)?;
+                let (result, _) = self
+                    .questions
+                    .create(&source, &params, self.question_clock())?;
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            Method::QuestionCancelOwn => {
+                let params: kr_protocol::question::QuestionCancelOwnParams = parse(params)?;
+                let source = Self::bind_source_in(session, state)?;
+                let (result, _) =
+                    self.questions
+                        .cancel_own(&source, &params, self.question_clock())?;
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            Method::AlertCreate => {
+                let params: kr_protocol::question::AlertCreateParams = parse(params)?;
+                let source = Self::bind_source_in(session, state)?;
+                let result = self
+                    .questions
+                    .alert(&source, &params, self.question_clock())?;
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            // The answering surface. It needs no caller token: what admits it is the actor the
+            // host verified and the rights that actor holds for this session, which is exactly why
+            // a source cannot reach it and answer its own question.
+            Method::QuestionAnswer => {
+                let params: kr_protocol::question::QuestionAnswerParams = parse(params)?;
+                let (result, _) = self.questions.answer(
+                    &caller.actor_id,
+                    caller.device(),
+                    &params,
+                    self.question_clock(),
+                )?;
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            Method::QuestionCancel => {
+                let params: kr_protocol::question::QuestionCancelParams = parse(params)?;
+                let (result, _) = self.questions.cancel(&params, self.question_clock())?;
+                Ok((encode(&result)?, AfterEffect::None))
+            }
             Method::ActionCancel => {
                 let params: kr_protocol::receipt::ActionCancelParams = parse(params)?;
                 let journal =
@@ -2463,6 +2689,11 @@ pub struct Caller {
     pub ingress: ActorIngress,
     /// The grant the daemon checked it against, when one applies.
     pub grant_id: Nullable<kr_protocol::ids::GrantId>,
+    /// The paired device the request came from, when it came from one.
+    ///
+    /// An answer records it beside the principal, because section 25 returns the answering device
+    /// as well as the actor to the agent that asked.
+    pub device_id: Nullable<kr_protocol::ids::DeviceId>,
     /// The authority revision the daemon validated that grant at.
     ///
     /// A forwarded request carries one; a local caller does not, because its authority is the
@@ -2485,6 +2716,7 @@ impl Caller {
             actor_id,
             ingress: ActorIngress::LocalIpc,
             grant_id: Nullable::null(),
+            device_id: Nullable::null(),
             validated_revision: None,
             authority_deadline_boot_ms: None,
         }
@@ -2497,6 +2729,7 @@ impl Caller {
             actor_id: actor.actor_id.clone(),
             ingress: actor.ingress,
             grant_id: actor.grant_id,
+            device_id: actor.device_id,
             validated_revision: actor.grant_revision.as_ref().copied(),
             authority_deadline_boot_ms: None,
         }
@@ -2513,6 +2746,15 @@ impl Caller {
     #[must_use]
     pub const fn is_remote(&self) -> bool {
         self.ingress.is_remote()
+    }
+
+    /// Returns the paired device this caller is, when it is one.
+    #[must_use]
+    pub const fn device(&self) -> Option<kr_protocol::ids::DeviceId> {
+        match self.device_id.as_ref() {
+            Some(device_id) => Some(*device_id),
+            None => None,
+        }
     }
 }
 
@@ -2623,6 +2865,11 @@ pub struct ServiceBinding {
     pub controller_generation: ControllerGeneration,
     /// The worker build.
     pub build_id: kr_protocol::ids::BuildId,
+    /// The session's private journal, which is also where its questions are kept.
+    ///
+    /// `None` keeps them for the life of this process alone, which is what a session without a
+    /// retained journal already does with its receipts.
+    pub journal_path: Option<std::path::PathBuf>,
 }
 
 /// What one connection knows about itself.
@@ -2670,6 +2917,11 @@ pub struct ConnectionState {
     /// It is built from the authenticated operating-system caller. A local caller never asserts
     /// its own provenance and never borrows a device identity.
     pub actor_id: ActorId,
+    /// The calling process the kernel named, where the platform reports one.
+    ///
+    /// It is what a question's source binding is established from, and it comes from the socket
+    /// rather than from anything the caller sent.
+    pub peer_pid: Option<u32>,
     next_request: u64,
 }
 
@@ -2704,6 +2956,7 @@ impl ConnectionState {
             delivery: None,
             actor_id: ActorId::new(format!("local:{}", peer.uid))
                 .unwrap_or_else(|_| ActorId::new("local").expect("a valid principal")),
+            peer_pid: peer.pid,
             next_request: 0,
         }
     }

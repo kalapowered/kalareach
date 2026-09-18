@@ -18,6 +18,7 @@
 //! | [`projection`] | The canonical grid, the filtered stream and the presentation a terminal is served |
 //! | [`render`] | Turning a side-effect-free restoration into terminal bytes |
 //! | [`pty`] | The pseudo-terminal, created before the root shell, and the shell it runs |
+//! | [`questions`] | The question ledger: what an agent asks, and what a person answers |
 //! | [`session`] | The session: lifecycle, the serial order every change shares, and closure |
 //! | [`runtime`] | The reader, the writer, the recogniser timer, the supervision and the closure sequence |
 //! | [`service`] | The private endpoint: the handshake, the challenge and the method dispatch |
@@ -35,6 +36,7 @@ pub mod output;
 pub mod ownership;
 pub mod projection;
 pub mod pty;
+pub mod questions;
 pub mod render;
 pub mod runtime;
 pub mod service;

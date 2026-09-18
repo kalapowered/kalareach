@@ -110,6 +110,9 @@ pub enum WorkerError {
     /// A worker or controller proof failed.
     #[error("{0}")]
     Verification(#[from] kr_ipc::verify::VerificationError),
+    /// A question could not be created, read or resolved.
+    #[error("{0}")]
+    Question(#[from] crate::questions::QuestionError),
 }
 
 impl WorkerError {
@@ -148,6 +151,7 @@ impl WorkerError {
             Self::StaleTarget { .. } => ErrorCode::StaleSession,
             Self::Ipc(error) => error.code(),
             Self::Verification(_) => ErrorCode::PermissionDenied,
+            Self::Question(error) => error.code(),
         }
     }
 
