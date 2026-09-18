@@ -190,7 +190,7 @@ and installs the result:
 ```bash
 scripts/build-shells.sh --zsh --bash     # both
 scripts/build-shells.sh --bash           # one
-scripts/build-shells.sh --check-patches  # apply the patches and stop
+scripts/build-shells.sh --zsh --bash --check-patches   # apply the patches and stop
 ```
 
 The identity is a SHA-256 over the inputs: the upstream archive's digest, the manifest, this build

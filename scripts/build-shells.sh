@@ -4,14 +4,15 @@
 #
 #   scripts/build-shells.sh --zsh --bash     build both
 #   scripts/build-shells.sh --zsh            build one
-#   scripts/build-shells.sh --check-patches  apply the patches to a scratch tree and stop
+#   scripts/build-shells.sh --zsh --bash --check-patches
+#                                            apply the patches to a scratch tree and stop
 #
 # Upstream is never vendored. Each package's manifest pins one release tarball by URL and SHA-256;
 # this script fetches it, verifies the digest, applies the ordered patches in shells/<shell>/patches
 # and copies the bridge sources from shells/<shell>/src into the tree.
 #
-# The identity is a digest of the inputs: the upstream archive, every patch, every added source,
-# the startup entry and the configure flags. The same inputs give the same identity, so a rebuild
+# The identity is a digest of the inputs: the upstream archive, this script, the manifest with the
+# flags it pins, every patch, every added source, the startup entry and the compiler. The same inputs give the same identity, so a rebuild
 # lands in the same place and reports that nothing changed. The identity record written beside the
 # binary is what the package declares in its handshake.
 #
