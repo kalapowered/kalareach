@@ -1659,9 +1659,11 @@ impl Controller {
             installer.check(&params)?;
         }
         // Everything above can wait: for this task to be scheduled, for the lock, for the checks
-        // to read the agent's tree. The deadline this action was admitted under and the authority
-        // behind its connection are revalidated here, immediately before anything durable, rather
-        // than left as they were when the request arrived.
+        // to read the agent's tree. The authority behind the connection and the deadline this
+        // action was admitted under are revalidated here, immediately before anything durable,
+        // rather than left as they were when the request arrived. The authority lookup is awaited,
+        // so the deadline is read after it and not before.
+        self.authorised(connection_id).await?;
         if self.clock.now() >= accepted.deadline {
             return Err(ControllerError::WindowExpired {
                 detail: "the deadline this installation was admitted under passed before it could \
@@ -1669,7 +1671,6 @@ impl Controller {
                 .to_owned(),
             });
         }
-        self.authorised(connection_id).await?;
         installer.mark_dispatching(actor_id, mutation.action_id, &digest)?;
         let result = match method {
             Method::AgentToolsInstall => encode(&installer.install(&params)?)?,

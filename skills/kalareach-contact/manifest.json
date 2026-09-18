@@ -20,7 +20,7 @@
     },
     {
       "path": "TOOLS.md",
-      "sha256": "d104a9999de4b2b492b19b131dbc8a42033a189eeb7dbad475eae72e9ab35509"
+      "sha256": "041919724b3edab4ca357073856b0beea6bb0dc7ad22743eaf70165621a8dc57"
     }
   ],
   "tools": [
@@ -40,7 +40,9 @@
     "timeout_preserves_question": true,
     "cancellation_ends_the_wait_not_the_question": true,
     "free_text_option": "something_else",
-    "unqualified_poll_ms": 45000
+    "unqualified_poll_ms": 45000,
+    "deadline_variable": "KR_TOOL_DEADLINE_MS",
+    "deadline_margin_ms": 15000
   },
   "scopes": [
     "user",

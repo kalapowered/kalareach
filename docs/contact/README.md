@@ -103,21 +103,25 @@ revision, so of two simultaneous answers exactly one changes the question and th
 | Lifetime | 24 hours, or the life of the application that asked, whichever ends first |
 | Wait on creation | 30 seconds |
 | Long poll | 300 seconds by default, 600 maximum, renewed in 20-second steps |
-| Helper poll with no duration named | 45 seconds |
-| Declared client deadline | 660 seconds, written into the agent's own server entry where it supports one |
+| Poll with no duration named | 300 seconds where the client's deadline is known, 45 where it is not |
+| Declared client deadline | 660 seconds, written into the agent's own server entry, and into the environment it launches the server with |
 
 A wait that runs out returns the same durable question. It recreates nothing and notifies nobody a
 second time.
 
 The client's own tool deadline is the other bound, and the shorter of the two decides. A server
-cannot read a deadline the client never sends, so two things bound it from this side. An
-installation declares 660 seconds in the agent's own configuration where the agent supports a
-per-server deadline: `tool_timeout_sec` for Codex, `toolTimeoutMs` for Kimi Code CLI, `timeout` for
-Claude Code, Qoder CLI and Gemini CLI. A document more than one agent reads carries none of them,
-because those agents do not share a spelling and the entry has to be the same entry all of them
-read. And a poll the agent puts no duration on runs for 45 seconds rather than the host's own
-five-minute default, so an agent whose client allows less loses nothing it was relying on. A call
-the client cuts off loses the wait, never the question.
+cannot read a deadline the client never sends, so the installation tells it. Where the agent
+supports a per-server deadline the installation declares 660 seconds in the agent's own
+configuration — `tool_timeout_sec` for Codex, `toolTimeoutMs` for Kimi Code CLI, `timeout` for
+Claude Code, Qoder CLI and Gemini CLI — and writes the same number into `KR_TOOL_DEADLINE_MS` in
+the environment that agent launches the server with. Every wait is then cut to that deadline less
+the room an answer needs to travel back in, whether the agent named a duration or not.
+
+A document more than one agent reads carries neither, because those agents do not spell the
+deadline the same way and the entry has to be the entry all of them read. Where nothing was
+declared, a poll the agent puts no duration on runs for 45 seconds instead of the host's
+five-minute default, so an agent whose client allows a minute loses nothing it was relying on. A
+call the client cuts off loses the wait, never the question.
 
 ## The caller token
 
@@ -179,8 +183,11 @@ Three properties make an installation safe to undo:
 * **Other settings survive.** A TOML configuration is edited in place with a format-preserving
   editor, so ordering and comments are untouched. A JSON configuration is reparsed and rewritten:
   every setting survives, and the document's key order and indentation are normalised. The
-  replacement keeps the permissions of the document it replaces, because an agent's configuration
-  can hold a credential.
+  replacement keeps the permission bits of the document it replaces, because an agent's
+  configuration can hold a credential. It does **not** carry an access-control list or a Windows
+  security descriptor across that replacement: a document protected by one of those is protected by
+  its directory afterwards, and a host that relies on one should install with the agent's own
+  command instead.
 
 A directory the installation created is removed only when it is empty. A project's `.mcp.json` is
 read by more than one agent, so the entry in one is written identically whichever installation
@@ -189,7 +196,14 @@ wrote it and is removed only when no other recorded installation still names it.
 Installing and removing are mutations, and they carry section 9's receipt contract: the same action
 retried returns what it produced the first time rather than changing anything again, the same
 identifier with a different payload is `ID_CONFLICT`, and an action whose marker was written and
-whose outcome was not is reported as unknown rather than repeated.
+whose outcome was not is reported as unknown rather than repeated. One installation runs at a time
+on a host, and the authority behind it and the deadline it was admitted under are checked again
+immediately before anything durable happens.
+
+The plan is written before the first change and marked complete after the last, so an installation
+interrupted part way through is not mistaken for a finished one: `kr skill status` says it did not
+finish, `kr skill remove` undoes whatever of it reached the disk, and installing again finishes the
+work.
 
 ## What contact is not
 

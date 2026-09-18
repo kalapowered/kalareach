@@ -127,11 +127,26 @@ pub fn verify(
         ));
     };
     let session_member = contains(&session.boundary, pid);
-    let ancestry = descends_from(pid, &session.root);
+    // The walk starts from the identity that was verified, not from a fresh reading of the
+    // identifier: the evidence has to be about the process that called, not about whatever holds
+    // its identifier now.
+    let ancestry = descends_from(&process, &session.root);
     if !session_member && !ancestry {
         return Err(QuestionError::unbound(
             "the calling process is not in this session's process boundary and does not descend \
              from its root shell",
+        ));
+    }
+    // Everything above read the operating system while this function ran, and the evidence is
+    // only about the caller if the caller is still the caller. Read once more, last.
+    let settled = kr_ipc::identity::process_start_identity(pid).map_err(|error| {
+        QuestionError::unbound(format!(
+            "the calling process could not be identified: {error}"
+        ))
+    })?;
+    if !settled.matches(&process) {
+        return Err(QuestionError::unbound(
+            "the process on this connection changed while its session was being established",
         ));
     }
     Ok(VerifiedSource {
@@ -175,11 +190,9 @@ fn contains(boundary: &OwnershipBoundary, pid: u32) -> bool {
 ///
 /// Each link is checked by start identity, so a parent identifier that has been recycled since the
 /// child was created does not complete the chain.
-fn descends_from(pid: u32, root: &ProcessStartIdentity) -> bool {
+fn descends_from(from: &ProcessStartIdentity, root: &ProcessStartIdentity) -> bool {
     let root_pid = u32::try_from(root.pid.get()).unwrap_or(u32::MAX);
-    let Ok(mut current) = kr_ipc::identity::process_start_identity(pid) else {
-        return false;
-    };
+    let mut current = from.clone();
     for _ in 0..MAX_ANCESTRY_DEPTH {
         let current_pid = u32::try_from(current.pid.get()).unwrap_or(u32::MAX);
         if current_pid == root_pid {
@@ -314,17 +327,18 @@ mod tests {
     fn this_process_descends_from_itself() {
         let identity =
             kr_ipc::identity::process_start_identity(std::process::id()).expect("an identity");
-        assert!(descends_from(std::process::id(), &identity));
+        assert!(descends_from(&identity, &identity));
     }
 
     #[test]
     fn a_process_that_is_not_an_ancestor_does_not_complete_the_chain() {
-        let mut identity =
+        let mine =
             kr_ipc::identity::process_start_identity(std::process::id()).expect("an identity");
+        let mut root = mine.clone();
         // The same process, with a start value the kernel never reported. A chain that reached the
         // identifier but not the identity must not complete.
-        identity.start_value = kr_protocol::scalars::U64::new(identity.start_value.get() ^ 0xFFFF);
-        assert!(!descends_from(std::process::id(), &identity));
+        root.start_value = kr_protocol::scalars::U64::new(root.start_value.get() ^ 0xFFFF);
+        assert!(!descends_from(&mine, &root));
     }
 
     #[test]

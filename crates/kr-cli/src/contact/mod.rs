@@ -38,20 +38,69 @@ use kr_protocol::question::{
     AlertCreateParams, AlertCreateResult, AlertSeverity, CallerToken, MAX_CREATE_WAIT, MAX_WAIT,
     Question, QuestionAnswer, QuestionCancelOwnParams, QuestionChoice, QuestionCreateParams,
     QuestionCreateResult, QuestionKind, QuestionOwnResult, QuestionReadOwnParams, WAIT_RENEWAL,
-    bounded_wait,
 };
 use kr_protocol::scalars::{DurationMs, Nullable};
 
 use crate::contact::bind::{Bound, SETUP_INSTRUCTION};
 
-/// How long a poll runs when the caller asks for no particular duration.
+/// The variable an installation names this client's tool deadline in.
 ///
-/// The host's own default is five minutes, and the specification shortens that to the installed
-/// client's qualified tool deadline. A server cannot read a deadline the client never sends, so an
-/// unasked-for wait is bounded here instead: an installation declares a longer deadline where the
-/// agent lets it, and an agent that knows its client allows more asks for more. A call the client
-/// cuts off loses the wait, never the question.
+/// It is written into the environment the agent launches this server with, beside the same number
+/// in the agent's own configuration, so what a wait is bounded by is the deadline the client
+/// actually enforces rather than a guess.
+const DEADLINE_VARIABLE: &str = "KR_TOOL_DEADLINE_MS";
+
+/// How long a poll runs when neither the caller nor the installation named a bound.
+///
+/// Section 11's default is five minutes, shortened to the installed client's qualified tool
+/// deadline. Where the installation could not establish one — an agent that lets no server declare
+/// a deadline, or a document shared by agents that do not spell it the same way — there is nothing
+/// to shorten to, and a client's own default is often a minute. A wait that outlives the client's
+/// deadline loses the call, so an unqualified one is kept short.
 const UNQUALIFIED_WAIT: DurationMs = DurationMs::new(45 * 1000);
+
+/// What a wait leaves for the answer to travel back in.
+const DEADLINE_MARGIN: DurationMs = DurationMs::new(15 * 1000);
+
+/// Returns the client deadline this installation established, when it established one.
+fn declared_deadline() -> Option<DurationMs> {
+    std::env::var(DEADLINE_VARIABLE)
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+        .map(DurationMs::new)
+}
+
+/// Returns how long one poll may run.
+///
+/// Three bounds, whichever is shortest: what the caller asked for, the host's own ceiling, and the
+/// client deadline the installation established, less the room an answer needs to travel back in.
+/// A caller that asked for nothing gets the host's default where that deadline is known and a
+/// short wait where it is not.
+fn poll_within(asked: Option<DurationMs>, declared: Option<DurationMs>) -> DurationMs {
+    let qualified = declared.and_then(|declared| {
+        declared
+            .get()
+            .checked_sub(DEADLINE_MARGIN.get())
+            .filter(|remaining| *remaining > 0)
+            .map(DurationMs::new)
+    });
+    let requested = match (asked, qualified) {
+        (Some(asked), _) => asked,
+        (None, Some(_)) => kr_protocol::question::DEFAULT_WAIT,
+        (None, None) => UNQUALIFIED_WAIT,
+    };
+    let ceiling = qualified.map_or(MAX_WAIT.get(), |deadline| {
+        deadline.get().min(MAX_WAIT.get())
+    });
+    DurationMs::new(requested.get().min(ceiling))
+}
+
+/// Returns how long one poll may run, against what this installation declared.
+fn poll_duration(asked: Option<DurationMs>) -> DurationMs {
+    poll_within(asked, declared_deadline())
+}
 use crate::error::{CliError, Result as CliResult};
 
 /// One choice an `ask_user` select offers.
@@ -123,8 +172,8 @@ pub struct WaitForAnswerParams {
     pub question_id: String,
     /// The caller token `ask_user` returned with it.
     pub caller_token: String,
-    /// How long to wait, in seconds. The default is 300 and the maximum is 600. A wait that times
-    /// out returns the same pending question; nothing is asked again.
+    /// How long to wait, in seconds. At most 600, and never past the deadline your own client
+    /// allows. A wait that times out returns the same pending question; nothing is asked again.
     #[serde(default)]
     pub wait_seconds: Option<u64>,
 }
@@ -332,12 +381,7 @@ impl Contact {
         let question_id = parse_question(&params.question_id)?;
         let token = decode_token(&params.caller_token)?;
         let mut client = bind::open(&bound, self.build_id.clone()).await?;
-        let wait = params
-            .wait_seconds
-            .map(seconds)
-            .map_or(UNQUALIFIED_WAIT, |asked| {
-                bounded_wait(Some(asked), MAX_WAIT)
-            });
+        let wait = poll_duration(params.wait_seconds.map(seconds));
         let question = self
             .poll(&bound, &mut client, question_id, &token, wait, cancelled)
             .await?;
@@ -624,6 +668,41 @@ mod tests {
         assert_eq!(content["code"], "NOT_IN_KR_SESSION");
         assert_eq!(content["setup"], SETUP_INSTRUCTION);
         assert_eq!(result.is_error, Some(true));
+    }
+
+    #[test]
+    fn an_unqualified_wait_is_short_and_an_explicit_one_is_still_bounded() {
+        assert_eq!(poll_within(None, None), UNQUALIFIED_WAIT);
+        assert_eq!(
+            poll_within(Some(DurationMs::new(120_000)), None),
+            DurationMs::new(120_000)
+        );
+        assert_eq!(poll_within(Some(DurationMs::new(u64::MAX)), None), MAX_WAIT);
+    }
+
+    #[test]
+    fn a_declared_deadline_bounds_both_the_default_and_an_explicit_wait() {
+        let generous = Some(DurationMs::new(660_000));
+        assert_eq!(
+            poll_within(None, generous),
+            kr_protocol::question::DEFAULT_WAIT
+        );
+        assert_eq!(
+            poll_within(Some(DurationMs::new(u64::MAX)), generous),
+            MAX_WAIT
+        );
+
+        // A client with a minute cuts every wait to what is left after the answer's own room.
+        let short = Some(DurationMs::new(60_000));
+        let expected = DurationMs::new(60_000 - DEADLINE_MARGIN.get());
+        assert_eq!(poll_within(None, short), expected);
+        assert_eq!(poll_within(Some(DurationMs::new(600_000)), short), expected);
+
+        // A deadline shorter than the answer's own room leaves nothing to qualify with.
+        assert_eq!(
+            poll_within(None, Some(DurationMs::new(5_000))),
+            UNQUALIFIED_WAIT
+        );
     }
 
     #[test]

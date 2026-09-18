@@ -1244,6 +1244,41 @@ mod tests {
     }
 
     #[test]
+    fn a_sweep_that_cannot_write_reports_the_failure_rather_than_success() {
+        let mut store = store();
+        create(&mut store, &creation("r-1", "shall I?"), 1_000);
+        // The feed's table is gone, so writing the expiry's event fails. A sweep that reported
+        // success here would leave a question past its deadline still answerable, because the
+        // caller that swept it goes on to read it as pending.
+        store
+            .connection
+            .execute_batch("DROP TABLE question_events")
+            .expect("drops the feed");
+        let error = store
+            .expire_due(now(1_000 + 60_001))
+            .expect_err("the sweep fails");
+        assert_eq!(
+            error.code(),
+            kr_protocol::error::ErrorCode::StorageUnavailable
+        );
+        assert_eq!(
+            store
+                .read(
+                    store
+                        .list(true)
+                        .expect("listed")
+                        .first()
+                        .expect("the question")
+                        .question_id
+                )
+                .expect("still there")
+                .state,
+            QuestionState::Pending,
+            "the transition rolled back with its event"
+        );
+    }
+
+    #[test]
     fn a_cancellation_is_not_an_expiry() {
         let mut store = store();
         let created = create(&mut store, &creation("r-1", "shall I?"), 1_000);

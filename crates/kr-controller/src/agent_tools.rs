@@ -46,6 +46,14 @@ pub const SKILL_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// The arguments the tool server is launched with.
 pub const ENTRY_ARGS: &[&str] = &["agent-tools", "--stdio"];
 
+/// The variable an installation tells the tool server its client's deadline through.
+///
+/// The server cannot see a deadline the client never sends, and guessing one would either cut a
+/// wait short or run past what the client allows. The installation knows: it is the side that
+/// writes the deadline into the agent's configuration, so it writes the same number into the
+/// environment the agent launches the server with.
+pub const DEADLINE_VARIABLE: &str = "KR_TOOL_DEADLINE_MS";
+
 /// Where one agent keeps its skills and its tool-server configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Layout {
@@ -143,54 +151,109 @@ impl Installer {
     pub fn install(&self, params: &AgentToolsParams) -> Result<AgentToolsInstallResult> {
         let layout = self.layout(params)?;
         self.check(params)?;
-        if let Some(existing) = self.recorded(params)?
-            && self.drift(&existing)?.is_empty()
+        let existing = self.recorded(params)?;
+        if let Some(existing) = existing.as_ref()
+            && existing.is_complete()
+            && self.drift(&existing.manifest)?.is_empty()
         {
             return Ok(AgentToolsInstallResult {
-                manifest: existing,
+                manifest: existing.manifest.clone(),
                 already_installed: true,
             });
         }
         let root = layout.skills.clone();
-        // The record grows with the work rather than after it. An installation interrupted part
-        // way through then leaves a record of exactly what it had changed, which `kr skill status`
-        // shows and `kr skill remove` undoes; a record written only at the end would leave those
-        // files with nothing describing them.
+        // The plan is written before the first effect, and it keeps whatever an earlier
+        // installation claimed. Recording after each change instead would leave every effect
+        // briefly unrecorded, and starting from an empty list would drop a claim this host still
+        // holds — its configuration entry among them, which it would then refuse to replace.
+        let mut planned: Vec<ChangeOperation> = existing
+            .as_ref()
+            .map(|record| record.manifest.operations.clone())
+            .unwrap_or_default();
+        let mut intended = Vec::new();
+        for directory in missing_ancestors(&root) {
+            intended.push(ChangeOperation::CreateDirectory {
+                path: display(&directory),
+            });
+        }
+        for (name, contents) in files() {
+            let path = root.join(name);
+            intended.push(ChangeOperation::WriteFile {
+                path: display(&path),
+                digest: digest_of(contents.as_bytes()),
+                replaced_digest: Nullable(read_digest(&path)?),
+            });
+        }
+        if let Some(configuration) = layout.configuration.as_ref() {
+            intended.push(ChangeOperation::AddConfigurationEntry {
+                path: display(&configuration.path),
+                entry: format!("{}.{SERVER_NAME}", configuration.format.key()),
+                digest: self.planned_entry_digest(configuration, params.agent),
+                created_document: !configuration.path.exists(),
+            });
+        }
+        for operation in &intended {
+            merge(&mut planned, operation.clone());
+        }
         let mut manifest = ChangeManifest {
             skill_version: SKILL_VERSION.to_owned(),
             agent: params.agent,
             scope: params.scope,
             root: display(&root),
             entry_point: self.entry_point(),
-            operations: Vec::new(),
+            operations: planned,
         };
+        self.write_record(params, InstallationRecord::INSTALLING, &manifest)?;
+
         for directory in missing_ancestors(&root) {
             std::fs::create_dir_all(&directory).map_err(storage)?;
-            manifest.operations.push(ChangeOperation::CreateDirectory {
-                path: display(&directory),
-            });
-            self.record(params, &manifest)?;
+            sync_directory(directory.parent().unwrap_or(&root))?;
         }
         for (name, contents) in files() {
-            let path = root.join(name);
-            let replaced = read_digest(&path)?;
-            write_atomically(&path, contents.as_bytes(), READABLE)?;
-            manifest.operations.push(ChangeOperation::WriteFile {
-                path: display(&path),
-                digest: digest_of(contents.as_bytes()),
-                replaced_digest: Nullable(replaced),
-            });
-            self.record(params, &manifest)?;
+            write_atomically(&root.join(name), contents.as_bytes(), READABLE)?;
         }
         if let Some(configuration) = layout.configuration.as_ref() {
             let entry = self.write_entry(configuration, params.agent)?;
-            manifest.operations.push(entry);
-            self.record(params, &manifest)?;
+            merge(&mut manifest.operations, entry);
         }
+        self.write_record(params, InstallationRecord::INSTALLED, &manifest)?;
         Ok(AgentToolsInstallResult {
             manifest,
             already_installed: false,
         })
+    }
+
+    /// Returns the digest the configuration entry will have once it is written.
+    ///
+    /// The plan carries it so a removal after an interrupted installation can tell the entry this
+    /// host wrote from one somebody else put there.
+    fn planned_entry_digest(&self, configuration: &Configuration, agent: AgentTarget) -> Digest256 {
+        let declaring = (!configuration.shared).then_some(agent);
+        if configuration.format == Format::CodexToml {
+            let mut entry = toml_edit::Table::new();
+            entry["command"] = toml_edit::value(self.executable.clone());
+            let mut args = toml_edit::Array::new();
+            for argument in ENTRY_ARGS {
+                args.push(*argument);
+            }
+            entry["args"] = toml_edit::value(args);
+            if let Some((field, seconds)) = declaring.and_then(deadline_field)
+                && let Some(seconds) = seconds.as_i64()
+            {
+                entry[field] = toml_edit::value(seconds);
+            }
+            if let Some(milliseconds) = declaring.and_then(deadline_milliseconds) {
+                let mut environment = toml_edit::InlineTable::new();
+                environment.insert(DEADLINE_VARIABLE, milliseconds.to_string().into());
+                entry["env"] = toml_edit::value(environment);
+            }
+            return digest_of(toml_edit::Item::Table(entry).to_string().trim().as_bytes());
+        }
+        digest_of(
+            self.entry_value(configuration.format, declaring)
+                .to_string()
+                .as_bytes(),
+        )
     }
 
     /// Reports what is installed, and what no longer matches what was written.
@@ -200,7 +263,7 @@ impl Installer {
     /// Returns an error when the record cannot be read.
     pub fn status(&self, params: &AgentToolsParams) -> Result<AgentToolsStatusResult> {
         let layout = self.layout(params)?;
-        let Some(manifest) = self.recorded(params)? else {
+        let Some(record) = self.recorded(params)? else {
             return Ok(AgentToolsStatusResult {
                 agent: params.agent,
                 scope: params.scope,
@@ -212,6 +275,7 @@ impl Installer {
                 removal: Vec::new(),
             });
         };
+        let manifest = &record.manifest;
         let mut files = Vec::new();
         for operation in &manifest.operations {
             if let ChangeOperation::WriteFile { path, digest, .. } = operation {
@@ -222,12 +286,19 @@ impl Installer {
                 });
             }
         }
-        let drift = self.drift(&manifest)?;
+        let mut drift = self.drift(manifest)?;
+        if !record.is_complete() {
+            drift.push(format!(
+                "an installation of {} at {} scope was begun and did not finish; `kr skill \
+                 remove` undoes what it managed to write",
+                params.agent, params.scope
+            ));
+        }
         Ok(AgentToolsStatusResult {
             agent: params.agent,
             scope: params.scope,
             root: manifest.root.clone(),
-            installed: true,
+            installed: record.is_complete(),
             skill_version: Nullable::some(manifest.skill_version.clone()),
             files,
             drift,
@@ -241,7 +312,7 @@ impl Installer {
     ///
     /// Returns an error when the record cannot be read or a file cannot be removed.
     pub fn remove(&self, params: &AgentToolsParams) -> Result<AgentToolsRemoveResult> {
-        let Some(manifest) = self.recorded(params)? else {
+        let Some(record) = self.recorded(params)? else {
             return Ok(AgentToolsRemoveResult {
                 agent: params.agent,
                 scope: params.scope,
@@ -254,7 +325,7 @@ impl Installer {
         };
         let mut removed = Vec::new();
         let mut retained = Vec::new();
-        for operation in manifest.operations.iter().rev() {
+        for operation in record.manifest.operations.iter().rev() {
             match operation {
                 ChangeOperation::WriteFile { path, digest, .. } => {
                     let present = read_digest(Path::new(path))?;
@@ -267,6 +338,9 @@ impl Installer {
                         }
                         Some(_) => {
                             std::fs::remove_file(path).map_err(storage)?;
+                            if let Some(parent) = Path::new(path).parent() {
+                                sync_directory(parent)?;
+                            }
                             removed.push(operation.clone());
                         }
                     }
@@ -295,7 +369,12 @@ impl Installer {
                     // Only when it is empty. A directory that holds anything else holds somebody
                     // else's file.
                     match std::fs::remove_dir(path) {
-                        Ok(()) => removed.push(operation.clone()),
+                        Ok(()) => {
+                            if let Some(parent) = Path::new(path).parent() {
+                                sync_directory(parent)?;
+                            }
+                            removed.push(operation.clone());
+                        }
                         Err(_) => retained.push(format!("{path} is not empty")),
                     }
                 }
@@ -304,6 +383,7 @@ impl Installer {
         let record = self.record_path(params);
         if record.exists() {
             std::fs::remove_file(&record).map_err(storage)?;
+            sync_directory(&self.records)?;
         }
         Ok(AgentToolsRemoveResult {
             agent: params.agent,
@@ -422,6 +502,11 @@ impl Installer {
         {
             entry[field] = toml_edit::value(seconds);
         }
+        if let Some(milliseconds) = agent.and_then(deadline_milliseconds) {
+            let mut environment = toml_edit::InlineTable::new();
+            environment.insert(DEADLINE_VARIABLE, milliseconds.to_string().into());
+            entry["env"] = toml_edit::value(environment);
+        }
         table.insert(SERVER_NAME, toml_edit::Item::Table(entry));
         write_atomically(path, document.to_string().as_bytes(), PRIVATE)?;
         self.entry_digest_under(path, Format::CodexToml.key())?
@@ -494,12 +579,15 @@ impl Installer {
             let Some(present) = read_digest(&path)? else {
                 continue;
             };
-            let ours = recorded.as_ref().is_some_and(|manifest| {
-                manifest.operations.iter().any(|operation| {
+            let wanted = display(&path);
+            // A file this host planned or wrote, at a digest it planned or wrote. Anything else
+            // there is somebody's own file, and an installation does not write over one.
+            let ours = recorded.as_ref().is_some_and(|record| {
+                record.manifest.operations.iter().any(|operation| {
                     matches!(
                         operation,
                         ChangeOperation::WriteFile { path: recorded_path, digest, .. }
-                            if recorded_path == &display(&path) && *digest == present
+                            if *recorded_path == wanted && *digest == present
                     )
                 })
             });
@@ -621,16 +709,24 @@ impl Installer {
         let mut found = Vec::new();
         for entry in listing {
             let entry = entry.map_err(storage)?;
-            if !entry.path().is_file() || except.is_some_and(|skip| skip == entry.path()) {
+            // Only this host's own installation records, by the name it gives them. A temporary
+            // file left by an interrupted write begins with a dot and is not one; the action
+            // records live in a directory of their own.
+            if !entry.path().is_file()
+                || !is_record_name(&entry.file_name().to_string_lossy())
+                || except.is_some_and(|skip| skip == entry.path())
+            {
                 continue;
             }
             let text = std::fs::read_to_string(entry.path()).map_err(storage)?;
-            let Ok(manifest) = serde_json::from_str::<ChangeManifest>(&text) else {
-                // An action record or anything else this host keeps here. Only a manifest claims
-                // a configuration entry.
-                continue;
-            };
-            let claims = manifest.operations.iter().any(|operation| {
+            // A record this host cannot read is a claim it cannot rule out, and removing an entry
+            // on the strength of that would take a server somebody else is using.
+            let record: InstallationRecord =
+                serde_json::from_str(&text).map_err(|error| ControllerError::Storage {
+                    operation: "read an installation record",
+                    detail: format!("{}: {error}", display(&entry.path())),
+                })?;
+            let claims = record.manifest.operations.iter().any(|operation| {
                 matches!(
                     operation,
                     ChangeOperation::AddConfigurationEntry {
@@ -743,6 +839,9 @@ impl Installer {
             if created_document && empty {
                 // This host created the document and nothing else was ever added to it.
                 std::fs::remove_file(path).map_err(storage)?;
+                if let Some(parent) = path.parent() {
+                    sync_directory(parent)?;
+                }
                 return Ok(Removal::Removed);
             }
             let text = serde_json::to_string_pretty(&document)
@@ -766,6 +865,17 @@ impl Installer {
                     "command": self.executable,
                     "args": arguments,
                 });
+                // The same number the entry declares, in the environment the agent launches the
+                // server with, so the server bounds its own waits by what this client allows
+                // instead of by a guess.
+                if let Some(object) = entry.as_object_mut()
+                    && let Some(milliseconds) = agent.and_then(deadline_milliseconds)
+                {
+                    object.insert(
+                        "env".to_owned(),
+                        json!({ DEADLINE_VARIABLE: milliseconds.to_string() }),
+                    );
+                }
                 // Section 11 shortens a long poll to the installed client's qualified tool
                 // deadline. Where an agent lets a server declare that deadline, the installation
                 // declares one long enough for the host's own ceiling, so a wait returns the
@@ -912,7 +1022,7 @@ impl Installer {
         self.records.join(format!("{}-{scope}.json", params.agent))
     }
 
-    fn recorded(&self, params: &AgentToolsParams) -> Result<Option<ChangeManifest>> {
+    fn recorded(&self, params: &AgentToolsParams) -> Result<Option<InstallationRecord>> {
         let Some(text) = read_to_string(&self.record_path(params))? else {
             return Ok(None);
         };
@@ -921,15 +1031,52 @@ impl Installer {
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))
     }
 
-    fn record(&self, params: &AgentToolsParams, manifest: &ChangeManifest) -> Result<()> {
+    fn write_record(
+        &self,
+        params: &AgentToolsParams,
+        state: &str,
+        manifest: &ChangeManifest,
+    ) -> Result<()> {
         std::fs::create_dir_all(&self.records).map_err(storage)?;
-        let text = serde_json::to_string_pretty(manifest)
+        sync_directory(&self.records)?;
+        let record = InstallationRecord {
+            state: state.to_owned(),
+            manifest: manifest.clone(),
+        };
+        let text = serde_json::to_string_pretty(&record)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         write_atomically(
             &self.record_path(params),
             format!("{text}\n").as_bytes(),
             PRIVATE,
         )
+    }
+}
+
+/// What this host recorded about one installation.
+///
+/// The plan is written before the first effect and the state is moved to `installed` after the
+/// last one, so an installation interrupted part way through is distinguishable from one that
+/// finished: `kr skill status` reports it as unfinished, `kr skill remove` undoes whatever of the
+/// plan actually reached the disk, and a later installation does not mistake it for complete.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct InstallationRecord {
+    /// `installing` while the plan is being carried out, `installed` once it has been.
+    state: String,
+    /// Every change the installation intends, and then made.
+    manifest: ChangeManifest,
+}
+
+impl InstallationRecord {
+    /// The state of a record whose plan has been carried out.
+    const INSTALLED: &'static str = "installed";
+
+    /// The state of a record whose plan was written and may not have been finished.
+    const INSTALLING: &'static str = "installing";
+
+    /// Returns true when the installation finished.
+    fn is_complete(&self) -> bool {
+        self.state == Self::INSTALLED
     }
 }
 
@@ -1039,6 +1186,8 @@ impl Installer {
         let path = self.action_path(actor_id, action_id);
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(storage)?;
+            // The directory entry itself, before anything inside it is claimed to be durable.
+            sync_directory(parent)?;
         }
         let text = serde_json::to_string_pretty(record)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
@@ -1078,6 +1227,72 @@ fn unhex(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
+/// Returns true when this file name is one this host gives an installation record.
+///
+/// The name is `<agent>-<scope>.json`, or `<agent>-<scope>-<digest>.json` for a project.
+fn is_record_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".json") else {
+        return false;
+    };
+    AgentTarget::ALL.iter().any(|agent| {
+        stem.strip_prefix(agent.as_str())
+            .and_then(|rest| rest.strip_prefix('-'))
+            .is_some_and(|rest| {
+                rest == "user"
+                    || rest == "project"
+                    || rest.strip_prefix("project-").is_some_and(|hash| {
+                        !hash.is_empty() && hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    })
+            })
+    })
+}
+
+/// Makes a directory's own entries durable.
+///
+/// A rename or an unlink is not on disk until the directory holding it is. On Unix that is an
+/// `fsync` of the directory itself; Windows offers no equivalent for a directory handle, and a
+/// record written there is durable only as far as the platform's own ordering makes it.
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let directory = std::fs::File::open(path).map_err(storage)?;
+        directory.sync_all().map_err(storage)?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// Adds an operation to a plan, replacing any earlier one for the same target.
+fn merge(operations: &mut Vec<ChangeOperation>, operation: ChangeOperation) {
+    let same = |left: &ChangeOperation, right: &ChangeOperation| match (left, right) {
+        (
+            ChangeOperation::AddConfigurationEntry {
+                path: left_path,
+                entry: left_entry,
+                ..
+            },
+            ChangeOperation::AddConfigurationEntry {
+                path: right_path,
+                entry: right_entry,
+                ..
+            },
+        ) => left_path == right_path && left_entry == right_entry,
+        (left, right) => {
+            std::mem::discriminant(left) == std::mem::discriminant(right)
+                && left.path() == right.path()
+        }
+    };
+    if let Some(existing) = operations
+        .iter_mut()
+        .find(|existing| same(existing, &operation))
+    {
+        *existing = operation;
+        return;
+    }
+    operations.push(operation);
+}
+
 /// What a removal did with one configuration entry.
 enum Removal {
     /// It was the entry that was written, and it is gone.
@@ -1112,6 +1327,15 @@ fn deadline_field(agent: AgentTarget) -> Option<(&'static str, Value)> {
         }
         AgentTarget::Opencode => None,
     }
+}
+
+/// The deadline this installation can promise the tool server, in milliseconds.
+///
+/// It is the declared deadline where the agent takes one. An agent that takes none gets nothing
+/// here either, and the server bounds its own waits conservatively instead of against a number
+/// nobody agreed to.
+fn deadline_milliseconds(agent: AgentTarget) -> Option<i64> {
+    deadline_field(agent).map(|_| QUALIFIED_DEADLINE_SECONDS * 1_000)
 }
 
 /// The files an installation writes, in the order it writes them.
@@ -1218,10 +1442,10 @@ fn write_atomically(path: &Path, bytes: &[u8], default_mode: u32) -> Result<()> 
     file.sync_all().map_err(storage)?;
     drop(file);
     std::fs::rename(&temporary, path).map_err(storage)?;
-    if let Ok(directory) = std::fs::File::open(parent) {
-        let _ = directory.sync_all();
-    }
-    Ok(())
+    // The rename is not on disk until the directory holding it is. A failure here is reported
+    // rather than swallowed: a record that claims durability it does not have is worse than one
+    // that says it could not be written.
+    sync_directory(parent)
 }
 
 fn file_name(path: &Path) -> String {
@@ -1677,6 +1901,87 @@ mod tests {
         assert_eq!(
             error.to_protocol_error().code,
             kr_protocol::error::ErrorCode::IdConflict
+        );
+    }
+
+    #[test]
+    fn repairing_a_deleted_file_keeps_the_entry_this_host_already_claimed() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        installer.install(&params).expect("installs");
+        std::fs::remove_file(
+            tree.home()
+                .join(".claude/skills/kalareach-contact/TOOLS.md"),
+        )
+        .expect("removes one file");
+        // The entry is still this host's, so the repair replaces the file rather than refusing to
+        // touch a server it would otherwise no longer recognise as its own.
+        let repaired = installer.install(&params).expect("repairs");
+        assert!(!repaired.already_installed);
+        assert!(
+            tree.home()
+                .join(".claude/skills/kalareach-contact/TOOLS.md")
+                .is_file()
+        );
+        assert!(installer.status(&params).expect("reads").drift.is_empty());
+    }
+
+    #[test]
+    fn an_installation_that_did_not_finish_is_not_reported_as_installed() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let params = params(AgentTarget::ClaudeCode, InstallScope::User);
+        installer.install(&params).expect("installs");
+        // What a crash between the plan and the last effect leaves behind.
+        let path = installer.record_path(&params);
+        let text = std::fs::read_to_string(&path).expect("the record");
+        std::fs::write(&path, text.replace("\"installed\"", "\"installing\"")).expect("writes");
+
+        let status = installer.status(&params).expect("reads");
+        assert!(!status.installed);
+        assert!(
+            status
+                .drift
+                .iter()
+                .any(|note| note.contains("did not finish"))
+        );
+        // And a second installation finishes the work rather than reporting it done.
+        let again = installer.install(&params).expect("installs");
+        assert!(!again.already_installed);
+        assert!(installer.status(&params).expect("reads").installed);
+    }
+
+    #[test]
+    fn an_unreadable_installation_record_stops_a_shared_removal() {
+        let tree = Tree::create();
+        let installer = tree.installer();
+        let project = tree.root.join("project");
+        std::fs::create_dir_all(&project).expect("a project");
+        let with_project = |agent| AgentToolsParams {
+            agent,
+            scope: InstallScope::Project,
+            project_dir: Nullable::some(display(&project)),
+        };
+        installer
+            .install(&with_project(AgentTarget::ClaudeCode))
+            .expect("installs");
+        installer
+            .install(&with_project(AgentTarget::QoderCli))
+            .expect("installs");
+        // Somebody's record is now unreadable. It still claims the shared entry, and a removal
+        // that treated it as absent would take a server that installation is using.
+        std::fs::write(
+            installer.record_path(&with_project(AgentTarget::QoderCli)),
+            "not a record",
+        )
+        .expect("writes");
+        let error = installer
+            .remove(&with_project(AgentTarget::ClaudeCode))
+            .expect_err("refuses");
+        assert_eq!(
+            error.to_protocol_error().code,
+            kr_protocol::error::ErrorCode::StorageUnavailable
         );
     }
 
