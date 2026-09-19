@@ -667,8 +667,9 @@ fn prove_the_marker_records(marker: &Path, sentinels: &Path) {
     // closes it, and Linux refuses to exec a file any process still holds open for writing with
     // ETXTBSY. Nothing about the marker or the product is wrong when that happens, and the window
     // closes as soon as that child execs, so the control run is attempted again for about a second
-    // before the error stands. This is not something to replace with a lock or with serial tests:
-    // the race is between processes rather than between these tests.
+    // before the error stands. Keeping the retry is what keeps these tests parallel: the
+    // alternative is coordinating every write against every child launch in the binary, which
+    // costs far more than waiting out a window that closes in milliseconds.
     const ATTEMPTS: usize = 100;
     const BETWEEN: std::time::Duration = std::time::Duration::from_millis(10);
 
