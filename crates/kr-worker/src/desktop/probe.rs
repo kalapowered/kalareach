@@ -696,12 +696,19 @@ mod platform {
                     "it obtained a {bytes}-byte image of the desktop and kept none of it"
                 ),
             },
-            (Outcome::Performed { .. }, _) => Outcome::PermissionRefused {
-                permission: "Screen & System Audio Recording".to_owned(),
-                detail: "the capture tool ran and produced no image, which is what this platform \
-                         does when the application asking has no recording grant"
-                    .to_owned(),
-            },
+            (Outcome::Performed { .. }, _) => refused_recording(
+                "the capture tool ran and produced no image, which is what this platform does \
+                 when the application asking has no recording grant",
+            ),
+            // What the tool prints when the platform will not give it the display. A context with
+            // no desktop at all was refused before this ran, so what is left is the grant.
+            (Outcome::NotAttempted { detail }, _)
+                if detail
+                    .to_ascii_lowercase()
+                    .contains("could not create image") =>
+            {
+                refused_recording(detail)
+            }
             _ => ran.outcome,
         };
         Ran {
@@ -758,6 +765,14 @@ mod platform {
         }
     }
 
+    /// The refusal for a screen image this platform would not produce.
+    fn refused_recording(said: &str) -> Outcome {
+        Outcome::PermissionRefused {
+            permission: "Screen & System Audio Recording".to_owned(),
+            detail: said.trim().to_owned(),
+        }
+    }
+
     /// Reads a refusal out of what the automation facility said.
     ///
     /// The two grants fail with different words, and a person sent to the wrong settings pane has
@@ -782,6 +797,22 @@ mod platform {
                 detail: said.trim().to_owned(),
             };
         }
+        if lowered.contains("connection is invalid")
+            || lowered.contains("-609")
+            || lowered.contains("-600")
+        {
+            // The platform did not refuse the grant; it could not reach the service the question
+            // was put to. Saying which is the difference between sending somebody to a settings
+            // pane that will not help and telling them what actually happened.
+            return Outcome::NotAttempted {
+                detail: format!(
+                    "the desktop's user-interface service could not be reached from this \
+                     execution context: {}. That is the service being unreachable rather than a \
+                     permission being refused",
+                    said.trim()
+                ),
+            };
+        }
         Outcome::NotAttempted {
             detail: said.trim().to_owned(),
         }
@@ -802,10 +833,23 @@ mod platform {
             };
         }
         let application = plan.application.as_deref().unwrap_or(DEFAULT_APPLICATION);
+        // A mark this check made up, passed to the instance it starts. It is how the instance this
+        // check is responsible for is told apart from one the person already had open, and it is
+        // the only thing this check will end.
+        // It carries no leading dash: the process lister takes its pattern as an argument of its
+        // own, and one that begins like an option is read as one.
+        let mark = format!(
+            "kalareach-capability-check-{}-{}",
+            std::process::id(),
+            kr_ipc::now_ms().get()
+        );
+        // Hidden, in the background, and without waiting. The launcher's own wait is for the
+        // application to exit, and an application that stays open would make a launch that worked
+        // look like a check that never answered.
         let ran = bounded(
             check,
             LAUNCHER,
-            &["-g", "-n", "-W", "-a", application, "--args", "-kr-check"],
+            &["-g", "-j", "-n", "-a", application, "--args", &mark],
             plan,
         );
         Ran {
@@ -813,12 +857,74 @@ mod platform {
             facility: ran.facility,
             outcome: match ran.outcome {
                 Outcome::Performed { .. } => Outcome::Performed {
-                    detail: format!("it started a new background instance of {application}"),
+                    detail: format!(
+                        "it started a new hidden instance of {application} and ended {}",
+                        end_marked(&mark, plan)
+                    ),
                 },
                 other => other,
             },
         }
     }
+
+    /// Ends the processes carrying this check's own mark, and says what it ended.
+    ///
+    /// The mark was made a moment ago by this check, so a process carrying it is one this check
+    /// started. Nothing else is looked for, and the processes are ended by the identifiers the
+    /// platform gave back rather than by any pattern of its own.
+    fn end_marked(mark: &str, plan: &Plan) -> String {
+        for _ in 0..LAUNCH_ATTEMPTS {
+            let listed = bounded(
+                Check::ApplicationLaunch,
+                "/usr/bin/pgrep",
+                &["-f", mark],
+                plan,
+            );
+            if let Outcome::Performed { detail } = listed.outcome {
+                let pids: Vec<String> = detail
+                    .split_whitespace()
+                    .filter(|word| word.chars().all(|character| character.is_ascii_digit()))
+                    .map(std::borrow::ToOwned::to_owned)
+                    .collect();
+                if !pids.is_empty() {
+                    let arguments: Vec<&str> = pids.iter().map(String::as_str).collect();
+                    let _ = bounded(Check::ApplicationLaunch, "/bin/kill", &arguments, plan);
+                    let named = if pids.len() == 1 {
+                        "the one instance it started".to_owned()
+                    } else {
+                        format!("the {} instances it started", pids.len())
+                    };
+                    // Asked to end is not ended. An application that is still there after being
+                    // asked is reported as still there rather than as tidied up.
+                    for _ in 0..LAUNCH_ATTEMPTS {
+                        std::thread::sleep(LAUNCH_POLL);
+                        let again = bounded(
+                            Check::ApplicationLaunch,
+                            "/usr/bin/pgrep",
+                            &["-f", mark],
+                            plan,
+                        );
+                        if !matches!(again.outcome, Outcome::Performed { .. }) {
+                            return named;
+                        }
+                    }
+                    return format!("{named}, which has not gone yet");
+                }
+            }
+            std::thread::sleep(LAUNCH_POLL);
+        }
+        "nothing, because the instance it started never appeared in the process table".to_owned()
+    }
+
+    /// How many times the launch check looks for the instance it started.
+    ///
+    /// The launcher answers as soon as the platform accepts the launch, which is well before the
+    /// application is a process, and a cold start of one takes seconds. Looking for a few seconds
+    /// would leave an application running that this check promised to end.
+    const LAUNCH_ATTEMPTS: usize = 150;
+
+    /// How long it waits between those looks.
+    const LAUNCH_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
     /// Delivers one keystroke, and only inside a context that owns its own application.
     fn synthetic_input(plan: &Plan) -> Ran {
@@ -1443,4 +1549,101 @@ mod tests {
             "the filesystem's own permissions on that path"
         );
     }
+}
+
+/// The disclosed checks, performed on the desktop this process is actually running on.
+///
+/// Everything else in this module's tests settles a rule; this one settles the machine. It runs
+/// the real operations, in this process's own execution context, and writes the records they
+/// produce to the file `KR_PROBE_OUT` names.
+///
+/// It is ignored by default, and deliberately. Two of these checks act on whatever is on the
+/// screen of whoever is at the machine, and a suite that took an image of somebody's desktop
+/// because they ran the tests would be a suite nobody should run. It is asked for by name, from
+/// inside a session's own shell, by the permissions demonstration.
+///
+/// * `KR_PROBE_OUT` — where the records are written, as JSON. Required.
+/// * `KR_PROBE_FILE` — the file the person authorised this context to read. Without one the read
+///   check is not performed, because there is no default file worth establishing anything about.
+/// * `KR_PROBE_SCRATCH` — the directory a check may put its own working files in. It defaults to
+///   the process's temporary directory, and it is never the workspace.
+/// * `KR_PROBE_APPLICATION` — the application the launch check starts a new instance of.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "performs the operations the permissions guard; asked for by the permissions demonstration"]
+fn the_disclosed_checks_on_this_desktop() {
+    use kr_protocol::ids::{CapabilityRevision, EnvironmentId};
+    use kr_protocol::scalars::{Nullable, Uuid};
+
+    let out = std::env::var("KR_PROBE_OUT").expect("KR_PROBE_OUT names where the records go");
+    let scratch = std::env::var("KR_PROBE_SCRATCH")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| std::env::temp_dir().join("kr-disclosed-checks"));
+    std::fs::create_dir_all(&scratch).expect("a directory of this check's own");
+    let plan = Plan {
+        authorised_file: std::env::var("KR_PROBE_FILE").ok().map(Into::into),
+        scratch,
+        application: std::env::var("KR_PROBE_APPLICATION").ok(),
+        isolated: None,
+    };
+
+    let boot = kr_ipc::identity::boot_identity().expect("this host's boot identity");
+    let desktop = super::context(WorkerProfile::DesktopBound, boot);
+    let subject = CapabilitySubject {
+        environment_id: EnvironmentId::new(Uuid::from_bytes([0; 16])),
+        desktop_session_id: desktop.desktop_session_id.clone(),
+        session_id: Nullable::null(),
+        application: Nullable::null(),
+        terminal: Nullable::null(),
+    };
+    let records = report(
+        &subject,
+        &desktop,
+        CapabilityRevision::new(1),
+        &plan,
+        &Platform,
+    );
+
+    let document = serde_json::json!({
+        "login_context": std::env::var("KR_PROBE_CONTEXT").unwrap_or_default(),
+        "desktop": desktop,
+        "checks": Check::all()
+            .into_iter()
+            .map(|check| {
+                let effects = check.effects();
+                serde_json::json!({
+                    "capability": check.capability(),
+                    "performs": effects.performs,
+                    "reads": effects.reads,
+                    "writes": effects.writes,
+                    "sends_input": effects.sends_input,
+                    "changes_user_data": effects.changes_user_data,
+                    "needs_isolated_context": effects.needs_isolated_context,
+                    "bound_seconds": effects.bound.as_secs(),
+                })
+            })
+            .collect::<Vec<_>>(),
+        "records": records,
+    });
+    std::fs::write(
+        &out,
+        serde_json::to_string_pretty(&document).expect("the records serialise"),
+    )
+    .unwrap_or_else(|error| panic!("{out} could not be written: {error}"));
+
+    // Every check answered, and the one that changes something did not run.
+    assert_eq!(records.len(), 5, "one record per check");
+    let injection = records
+        .iter()
+        .find(|record| record.capability.as_str() == capabilities::INPUT_INJECTION)
+        .expect("a record for synthetic input");
+    assert_eq!(
+        injection.state,
+        CapabilityState::NotTested,
+        "a check that changes something is withheld without a context of its own"
+    );
+    assert_eq!(
+        injection.evidence_source,
+        CapabilityEvidenceSource::NotProbed
+    );
 }

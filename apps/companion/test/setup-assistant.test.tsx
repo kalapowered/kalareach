@@ -26,11 +26,13 @@ function watched(port: HostPort): { port: HostPort; calls: string[] } {
   const calls: string[] = []
   const seen = new Proxy(port, {
     get(target, name: string) {
-      const value = target[name as keyof HostPort]
+      const value: unknown = Reflect.get(target, name) as unknown
       if (typeof value !== 'function') return value
+      const operation = value as (this: HostPort, ...rest: unknown[]) => unknown
+      // Bound to the port, so the operation runs exactly as the interface would have run it.
       return (...args: unknown[]) => {
         calls.push(name)
-        return (value as (...rest: unknown[]) => unknown).apply(target, args)
+        return Reflect.apply(operation, target, args)
       }
     }
   })
@@ -205,7 +207,9 @@ describe('what the machine can do, and how that is known', () => {
     start()
     await screen.findByTestId('setup-identity')
     await goTo('capabilities')
-    await userEvent.click(screen.getAllByRole('button', { name: 'What the checks do' })[0]!)
+    const [explain] = screen.getAllByRole('button', { name: 'What the checks do' })
+    if (!explain) throw new Error('the assistant offers to explain the checks')
+    await userEvent.click(explain)
     const effects = await screen.findByTestId('setup-effects')
     expect(effects.textContent).toMatch(/removes it before answering/)
     expect(effects.textContent).toMatch(/Selects nothing, moves nothing, clicks nothing/)

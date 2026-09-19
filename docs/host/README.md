@@ -269,6 +269,77 @@ either of them and cannot establish one, so an answer nothing has run says exact
 general desktop-control interface here either: desktop automation means the user's own tools
 running in the selected context under the permissions they were actually granted.
 
+## First-start permissions
+
+Selecting a desktop is not a permission, and neither is holding one permission evidence for
+another. On macOS, Accessibility, Screen & System Audio Recording, Full Disk Access and the
+Automation grants are four separate things granted to one signed application, and Full Disk Access
+does not stand in for the rest: an application holding it still cannot take a screen image or send
+a keystroke. The microphone and Remote Management belong to the features that use them and nothing
+asks for them until you do.
+
+None of these can be enabled by KalaReach. Some of them can only be set in System Settings at all,
+so setup takes you to the right pane and you set the switch.
+
+### What a check can establish, and what it cannot
+
+A permission cannot be verified without performing the operation it guards. Asking the platform
+what a permission is set to is not the same question, and on macOS it is not a question a program
+can put about itself. So the checks perform the operations:
+
+| Check | What it does | What it touches |
+| --- | --- | --- |
+| Read a file you authorised | opens the file you nominated and reads its first few thousand bytes | that file, and nothing else on the filesystem |
+| Take a screen image | takes one image of the desktop and measures it | writes the image into the check's own directory and removes it before answering |
+| Find an element | asks the accessibility tree for the name of one element | reads the tree; selects nothing, moves nothing, clicks nothing |
+| Open an application | starts one new hidden instance of an application and ends the instance it started | nothing you already have open |
+| Send a keystroke | delivers one keystroke | this one changes something, so it runs only inside a test context of its own |
+
+Each of them runs in the same execution context an agent's own tools run in, each declares what it
+does before it runs, each is bounded, and none sends input to an application you did not ask about
+or changes anything you own. The last one is the exception that proves the rule: without a test
+context of its own it is not run at all, and its record says nothing was established either way
+rather than claiming an answer.
+
+Every result is a capability record in the shared shape: the state, `disclosed_probe` as what
+produced it, the exact facility it was established about, and what makes it stale. That last part
+is what decides when a check runs again: the facility or the host agent being replaced, an
+operating-system permission changing, a new login, or a different execution profile. Time is not on
+the list. Nothing about a permission changes because an hour passed, and a check that re-ran on a
+clock would take an image of your screen for no reason.
+
+### What each answer means
+
+`ready` is an operation that was performed and worked. `permission_required` is one the operating
+system refused, and the record names which grant. `desktop_unavailable` is a desktop that is not
+there to act on. A capability nothing has performed the operation for says so, and that is an
+answer rather than a failure: it means nothing is known either way, which is different from knowing
+it cannot be done.
+
+One more answer belongs to the person rather than to the host. macOS gives a new grant to a process
+when that process starts, so an application that was already running when you granted something is
+still running without it. When a permission has been granted and the capability still reports that
+the permission is required, the answer is to open KalaReach again.
+
+A tool-specific permission stays its own record throughout. An accessibility grant this context
+holds says nothing about a screen image, and no part of this ever reports one as evidence for the
+other.
+
+### Where a grant is recorded
+
+An operating system files a permission under a signed application, which is why setup shows that
+identity before it guides you anywhere. An application whose identity moves between launches, such
+as one running from a build directory, is a different application to the operating system every
+time, and every grant given to it has to be given again. Install the application first.
+
+### Running the demonstration
+
+`scripts/e2e-permissions.sh` runs the whole of it on the machine it is run on: a real control
+daemon, a real worker in your own graphical login, the four checks performed from that session's
+own shell, the records read back through `kr doctor --json`, and the tools an agent reaches for on
+that desktop. It ends every process it started, it writes its artefacts under
+`KR_TEST_ARTIFACTS_DIR`, and it asks for no account of any kind.
+
 ## Sleep
 
 This host does not change the machine's sleep policy unless the owner asks it to. The setting is

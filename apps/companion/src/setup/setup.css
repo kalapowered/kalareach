@@ -22,6 +22,37 @@
   padding-bottom: var(--gap-6);
 }
 
+/*
+ * The heading. The question sits under the title rather than beside it, because it changes with
+ * the step and a line that moves belongs where the eye already is.
+ */
+.setup-heading {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-2);
+}
+
+.setup-heading h1 {
+  margin: 0;
+  /* Large text reads too loose at zero tracking, so it tightens as it grows. */
+  letter-spacing: -0.02em;
+  line-height: 1.1;
+}
+
+.setup-heading p {
+  margin: 0;
+  color: var(--muted);
+}
+
+/*
+ * A card in this flow is one thing among many, so its heading sits a step below the group heading
+ * above it rather than level with it.
+ */
+.setup .card-header h2 {
+  font-size: 0.9375rem;
+  letter-spacing: -0.005em;
+}
+
 /* ---- The rail --------------------------------------------------------------------------------- */
 
 .setup-rail {

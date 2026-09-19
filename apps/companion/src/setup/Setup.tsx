@@ -224,10 +224,10 @@ export function Setup(): ReactNode {
 
   return (
     <div className="setup" data-testid="setup">
-      <div className="page-heading">
+      <header className="setup-heading">
         <h1>Set up KalaReach on this Mac</h1>
         <p>{current.question}</p>
-      </div>
+      </header>
 
       <ol className="setup-rail" aria-label="Setup steps">
         {STEPS.map((each, index) => (
