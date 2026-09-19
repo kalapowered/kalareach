@@ -512,8 +512,10 @@ fn a_page_asked_for_again_before_its_cursor_is_recorded_is_applied_once() {
     for record in &fresh {
         consumer.note_applied(record);
     }
-    // The cursor write fails here, so the same page is asked for again inside this process: the
-    // window is what suppresses it.
+    // The cursor is not recorded here, so the same page is asked for again inside this process
+    // and the window is what suppresses it. What this stages is the omission rather than a write
+    // that failed: to the consumer they are the same thing, which is being handed a page it has
+    // not recorded as taken.
     let again = journal.outbox_after(0, 64).expect("a page");
     assert!(consumer.fresh(&again).is_empty());
     assert_eq!(consumer.applied(), 3);
