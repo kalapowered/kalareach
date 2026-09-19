@@ -20,6 +20,10 @@ export type DiagnosticId = string
 export type RejectionReason =
   'admission_failed' | 'expired' | 'cancelled' | 'revoked' | 'stale_preconditions'
 /**
+ * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+ */
+export type U64 = string
+/**
  * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
  */
 export type ParamsValue = unknown
@@ -44,6 +48,59 @@ export type SessionId = string
  */
 export type ApplicationInstanceId = string
 /**
+ * One change an installation makes, with its inverse implied by its kind.
+ */
+export type ChangeOperation =
+  | {
+      operation: 'create_directory'
+      /**
+       * The absolute path.
+       */
+      path: string
+    }
+  | {
+      /**
+       * The digest of the content written. A removal that finds different content stops.
+       */
+      digest: string
+      operation: 'write_file'
+      /**
+       * The absolute path.
+       */
+      path: string
+      /**
+       * The digest of what was there before, when the file already existed.
+       */
+      replaced_digest: Digest256 | null
+    }
+  | {
+      /**
+       * True when the document did not exist and this installation created it.
+       */
+      created_document: boolean
+      /**
+       * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+       */
+      digest: string
+      /**
+       * The dotted location of the entry inside it, for example `mcpServers.kalareach`.
+       */
+      entry: string
+      operation: 'add_configuration_entry'
+      /**
+       * The absolute path of the document.
+       */
+      path: string
+    }
+/**
+ * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+ */
+export type Digest256 = string
+/**
+ * Changes when the active upstream execution owner or selected thread changes.
+ */
+export type AgentBindingRevision = string
+/**
  * What an attachment asks to be able to do.
  *
  * A request is not a grant. The host intersects these with the actor's rights, and an attachment
@@ -54,6 +111,21 @@ export type AttachmentCapability = 'observe_terminal' | 'observe_semantic' | 'in
  * How a terminal attachment displays the canonical grid.
  */
 export type TerminalPresentationMode = 'direct' | 'viewport'
+/**
+ * Where an attachment's window sits in the session's rows.
+ *
+ * A window is normally on the live screen, which is what no position at all means. A client
+ * looking through its scrollback names where it is looking instead, and the host installs the
+ * history pages that cover it. Scrolling is a presentation choice and never touches the input
+ * lease: section 8 puts passive scrollback with focus events and terminal replies.
+ */
+export type ViewportPosition =
+  | {
+      row: U64
+    }
+  | {
+      above: U64
+    }
 /**
  * One CLI or application attachment, independently of its device.
  */
@@ -88,10 +160,6 @@ export type DesktopSessionId = string
  * A versioned capability name. Capabilities describe feasibility, never authority.
  */
 export type CapabilityId = string
-/**
- * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
- */
-export type U64 = string
 /**
  * The host's answer to a client proof.
  */
@@ -196,10 +264,6 @@ export type ControlFrame =
       acceptance_delivered: ActionId
     }
 /**
- * Changes when the active upstream execution owner or selected thread changes.
- */
-export type AgentBindingRevision = string
-/**
  * The session epoch, fixed at 1 in protocol version 1.
  */
 export type SessionEpoch = string
@@ -215,6 +279,25 @@ export type ControlEvent =
       action_window_renewed: ActionWindow
     }
   | 'keepalive'
+/**
+ * A palette a session can be started with, chosen before the shell has produced anything.
+ *
+ * Section 8 fixes the palette at creation and records where it came from. A preset is what a
+ * no-probe or invisible creation selects, because neither has a terminal whose colours could be
+ * asked for; the probe form carries the foreground and background a client learned from its own
+ * bounded probe of the terminal the person is sitting at.
+ */
+export type PaletteRequest =
+  | {
+      preset: PalettePreset
+    }
+  | {
+      probe: ProbedPalette
+    }
+/**
+ * One of the two palettes a creation can select without asking a terminal anything.
+ */
+export type PalettePreset = 'light' | 'dark'
 /**
  * What one of the control daemon's connections to a worker is for.
  *
@@ -806,6 +889,42 @@ export type PushRequest =
       }
     }
 /**
+ * What a person answered.
+ *
+ * The four arms stay four arms. Section 11 forbids coercing [`Self::Other`] into a listed choice
+ * or into a yes, so an answer that arrived as free text is read as free text by whatever consumes
+ * it.
+ */
+export type QuestionAnswer =
+  | {
+      kind: 'input'
+      /**
+       * What the person typed.
+       */
+      text: string
+    }
+  | {
+      /**
+       * The choice the person selected.
+       */
+      choice_id: string
+      kind: 'choice'
+    }
+  | {
+      /**
+       * True for yes.
+       */
+      decided: boolean
+      kind: 'decision'
+    }
+  | {
+      kind: 'other'
+      /**
+       * What the person typed instead of choosing.
+       */
+      text: string
+    }
+/**
  * What the payer's client sends to a relay's control endpoint.
  */
 export type RelayLeaseRequest =
@@ -818,6 +937,32 @@ export type RelayLeaseRequest =
       revoke: {
         revocation: SignedRelayLeaseRevocation
       }
+    }
+/**
+ * What is offered as grounds for returning a host's wall clock to trusted.
+ */
+export type RetrustEvidence =
+  | {
+      /**
+       * The authority as the host's configuration names it.
+       */
+      authority: string
+      kind: 'host_time_authority'
+      reading: TimeAdapterReading
+    }
+  | {
+      /**
+       * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+       */
+      action_digest: string
+      kind: 'owner_retrust'
+    }
+  | {
+      /**
+       * One paired device.
+       */
+      device_id: string
+      kind: 'paired_peer'
     }
 /**
  * One published editor fence. An identity from an unacknowledged exchange names no fence.
@@ -911,12 +1056,21 @@ export type SyncRevisionId = string
 export interface KalaReachProtocol {
   action_cancel_params?: ActionCancelParams
   action_cancel_result?: ActionCancelResult
+  action_observation?: ActionObservation
   action_read_params?: ActionReadParams
   action_read_result?: ActionReadResult
   action_window?: ActionWindow
   actor_envelope?: ActorEnvelope
   agent_draft_add_attachment_params?: AgentDraftAddAttachmentParams
   agent_draft_add_attachment_result?: AgentDraftAddAttachmentResult
+  agent_tools_install_result?: AgentToolsInstallResult
+  agent_tools_params?: AgentToolsParams
+  agent_tools_remove_result?: AgentToolsRemoveResult
+  agent_tools_status_result?: AgentToolsStatusResult
+  alert?: Alert
+  alert_create_params?: AlertCreateParams
+  alert_create_result?: AlertCreateResult
+  answer_record?: AnswerRecord
   archive_descriptor?: ArchiveDescriptor
   attachment_configure_params?: AttachmentConfigureParams
   attachment_contribution?: AttachmentContribution1
@@ -931,6 +1085,8 @@ export interface KalaReachProtocol {
   backup_generation_publication?: BackupGenerationPublication
   backup_writer_record?: BackupWriterRecord
   capability_record?: CapabilityRecord
+  change_manifest?: ChangeManifest1
+  change_operation?: ChangeOperation
   client_offer?: ClientOffer
   closure_record?: ClosureRecord
   connect_reply?: ConnectReply
@@ -959,6 +1115,9 @@ export interface KalaReachProtocol {
   events_snapshot_result?: EventsSnapshotResult
   events_subscribe_params?: EventsSubscribeParams
   events_subscribe_result?: EventsSubscribeResult
+  expiration_tombstone?: ExpirationTombstone
+  fence_evidence?: FenceEvidence
+  fenced_action?: FencedAction
   forwarded_mutation?: ForwardedMutation
   forwarded_request?: ForwardedRequest
   generation_accepted?: GenerationAccepted
@@ -1069,6 +1228,7 @@ export interface KalaReachProtocol {
   input_release_params?: InputReleaseParams
   input_write_params?: InputWriteParams
   input_write_result?: InputWriteResult
+  installed_file?: InstalledFile
   local_hello?: LocalHello
   local_hello_ack?: LocalHelloAck
   membership_lease?: MembershipLease
@@ -1101,6 +1261,10 @@ export interface KalaReachProtocol {
   project_read_params?: ProjectReadParams
   project_read_result?: ProjectReadResult
   project_summary?: ProjectSummary3
+  projection_delta?: ProjectionDelta
+  projection_reset?: ProjectionReset
+  projection_row_page?: ProjectionRowPage
+  projection_snapshot?: ProjectionSnapshot
   proposed_grant?: ProposedGrant
   protocol_error?: ProtocolError
   push_delivery_ack?: PushDeliveryAck
@@ -1113,6 +1277,21 @@ export interface KalaReachProtocol {
   push_sender_record?: PushSenderRecord
   push_sender_renewal?: PushSenderRenewal1
   push_sender_revocation?: PushSenderRevocation1
+  question?: Question
+  question_answer?: QuestionAnswer
+  question_answer_params?: QuestionAnswerParams
+  question_cancel_own_params?: QuestionCancelOwnParams
+  question_cancel_params?: QuestionCancelParams
+  question_choice?: QuestionChoice
+  question_create_params?: QuestionCreateParams
+  question_create_result?: QuestionCreateResult
+  question_event?: QuestionEvent
+  question_own_result?: QuestionOwnResult
+  question_read_own_params?: QuestionReadOwnParams
+  question_read_params?: QuestionReadParams
+  question_read_result?: QuestionReadResult
+  question_resolve_result?: QuestionResolveResult
+  question_source?: QuestionSource2
   receipt?: Receipt3
   receipt_response?: ReceiptResponse
   recovery_bundle?: RecoveryBundle
@@ -1124,7 +1303,9 @@ export interface KalaReachProtocol {
   request?: Request
   response?: Response
   resync_required?: ResyncRequired
+  retrust_evidence?: RetrustEvidence
   revocation_acknowledgement?: RevocationAcknowledgement
+  revocation_barrier?: RevocationBarrier
   revocation_request?: RevocationRequest
   root_command_accepted_params?: RootCommandAcceptedParams
   root_command_accepted_result?: RootCommandAcceptedResult
@@ -1169,6 +1350,8 @@ export interface KalaReachProtocol {
   sync_object_record?: SyncObjectRecord
   terminal_geometry_transfer_params?: TerminalGeometryTransferParams
   terminal_resize_params?: TerminalResizeParams
+  time_adapter_reading?: TimeAdapterReading1
+  time_checkpoint?: TimeCheckpoint
   upload_begin_params?: UploadBeginParams
   upload_begin_result?: UploadBeginResult
   upload_cancel_params?: UploadCancelParams
@@ -1332,6 +1515,43 @@ export interface ProtocolError {
    * How the client may react. It must equal [`ErrorCode::retry_category`] for the code.
    */
   retry: 'no_retry' | 'transient' | 'resync' | 'configuration_change' | 'outcome_unknown'
+}
+/**
+ * One piece of additive evidence about an action.
+ *
+ * The word in a user interface is "observed", and it means evidence was observed. It does not
+ * mean the mutation is confirmed, which is why every observation carries the provenance a reader
+ * needs in order to know which of the two it is looking at.
+ */
+export interface ActionObservation {
+  /**
+   * The action the evidence is about.
+   */
+  action_id: string
+  /**
+   * What the evidence claims happened.
+   */
+  claimed_result: 'applied' | 'refused' | 'indeterminate'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  observed_at_ms: string
+  /**
+   * Where the evidence came from.
+   */
+  provenance: 'authoritative_interface' | 'upstream_correlation' | 'inferred_screen' | 'user_report'
+  /**
+   * The position in the source stream the evidence was read from, when there is one.
+   */
+  source_cursor: U64 | null
+  /**
+   * The subject the evidence is about, named the way its own interface names it.
+   */
+  subject: string
+  /**
+   * The subject's version at the moment of the observation, when the subject has one.
+   */
+  subject_revision: U64 | null
 }
 /**
  * What `action.read` names.
@@ -1518,11 +1738,11 @@ export interface AttachmentContribution {
    */
   insertion_method: 'typed_submission' | 'verified_composer_insertion' | 'manual_terminal_workflow'
   /**
-   * The largest file the selected model accepts, in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_byte_len: string
   /**
-   * How many attachments one draft may carry.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_count: string
   /**
@@ -1585,7 +1805,7 @@ export interface DraftAttachment {
  */
 export interface AttachmentHandle {
   /**
-   * The verified length in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   byte_len: string
   /**
@@ -1643,7 +1863,7 @@ export interface AttachmentHandle {
  */
 export interface AttachmentPreview {
   /**
-   * The thumbnail's height in pixels.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   height: string
   /**
@@ -1651,11 +1871,11 @@ export interface AttachmentPreview {
    */
   source_format: 'png' | 'jpeg' | 'webp' | 'gif_first_frame'
   /**
-   * The source's height in pixels.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   source_height: string
   /**
-   * The source's width in pixels.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   source_width: string
   /**
@@ -1663,7 +1883,7 @@ export interface AttachmentPreview {
    */
   thumbnail: string
   /**
-   * The thumbnail's width in pixels.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   width: string
 }
@@ -1789,6 +2009,365 @@ export interface DraftAttachment1 {
   upstream_evidence: string | null
 }
 /**
+ * The result of `agent_tools.install`.
+ */
+export interface AgentToolsInstallResult {
+  /**
+   * True when the installation was already present and unchanged.
+   */
+  already_installed: boolean
+  manifest: ChangeManifest
+  /**
+   * What an earlier attempt may have written and this one could not account for.
+   *
+   * Empty in the ordinary case. A line here means the installation is not finished: the change
+   * it names is neither owned nor undone, and somebody has to look at it.
+   */
+  unresolved: string[]
+}
+/**
+ * What was changed, and how to undo it.
+ */
+export interface ChangeManifest {
+  /**
+   * The agent it was installed for.
+   */
+  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  /**
+   * The command the agent runs to reach the tools.
+   */
+  entry_point: string[]
+  /**
+   * Every change, in the order it was applied.
+   *
+   * A removal undoes them in the order it can carry out: files and server entries first, then
+   * the directories that held them, deepest first.
+   */
+  operations: ChangeOperation[]
+  /**
+   * The directory the scope resolved to.
+   */
+  root: string
+  /**
+   * The scope it was installed at.
+   */
+  scope: 'user' | 'project'
+  /**
+   * The skill version installed.
+   */
+  skill_version: string
+}
+/**
+ * Parameters of `agent_tools.install`, `agent_tools.status` and `agent_tools.remove`.
+ */
+export interface AgentToolsParams {
+  /**
+   * The agent.
+   */
+  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  /**
+   * The project directory, for project scope.
+   */
+  project_dir: string | null
+  /**
+   * The scope.
+   */
+  scope: 'user' | 'project'
+}
+/**
+ * The result of `agent_tools.remove`.
+ */
+export interface AgentToolsRemoveResult {
+  /**
+   * The agent.
+   */
+  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  /**
+   * What was undone.
+   */
+  removed: ChangeOperation[]
+  /**
+   * What was left alone, and why.
+   */
+  retained: string[]
+  /**
+   * The scope.
+   */
+  scope: 'user' | 'project'
+}
+/**
+ * The result of `agent_tools.status`.
+ */
+export interface AgentToolsStatusResult {
+  /**
+   * The agent.
+   */
+  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  /**
+   * What no longer matches the record, in the words a person reads.
+   */
+  drift: string[]
+  /**
+   * Each installed file and whether it is still what was written.
+   */
+  files: InstalledFile[]
+  /**
+   * True when a recorded installation is present.
+   */
+  installed: boolean
+  /**
+   * The operations a removal would run.
+   */
+  removal: ChangeOperation[]
+  /**
+   * The directory the scope resolved to.
+   */
+  root: string
+  /**
+   * The scope.
+   */
+  scope: 'user' | 'project'
+  /**
+   * The version recorded, when there is one.
+   */
+  skill_version: string | null
+}
+/**
+ * What one installed file looks like now.
+ */
+export interface InstalledFile {
+  /**
+   * The digest on disk now, or null when the path is gone.
+   */
+  actual_digest: Digest256 | null
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  expected_digest: string
+  /**
+   * The absolute path.
+   */
+  path: string
+}
+/**
+ * One alert. It reports; it asks for nothing.
+ */
+export interface Alert {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The source's own de-duplication identifier.
+   */
+  dedup_id: string
+  /**
+   * A link into this host's own session, when the source supplied one.
+   */
+  safe_session_link: string | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How urgent it is.
+   */
+  severity: 'info' | 'warning' | 'error'
+  source: QuestionSource
+  /**
+   * The concise text.
+   */
+  text: string
+}
+/**
+ * The verified source, and the unverified label beside it.
+ */
+export interface QuestionSource {
+  /**
+   * The agent thread or binding revision, when a qualified bridge supplied one.
+   *
+   * Null when no bridge did. A null here is not a claim that the thread never changed: without
+   * a bridge the question is application-scoped and thread-switch detection is not offered.
+   */
+  agent_binding_revision: AgentBindingRevision | null
+  /**
+   * The caller's own label for itself. Unverified, and never part of authority.
+   */
+  agent_label: string | null
+  /**
+   * True when the process's parent chain reaches the session's root shell.
+   *
+   * A checked hint, recorded for diagnostics. Section 11 is explicit that ancestry is not a
+   * defence against arbitrary code running under the same account, so nothing is admitted on
+   * this alone.
+   */
+  ancestry: boolean
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * The connection the question was created on.
+   */
+  connection_id: string
+  /**
+   * The executable that process is running, where the platform names it.
+   */
+  executable: string | null
+  /**
+   * True when the helper presented the private launch channel it inherited.
+   *
+   * False means the binding rests on the checks below instead; it does not mean the source is
+   * less bound, and it is recorded so a reader can tell which evidence was available.
+   */
+  launch_channel: boolean
+  process: ProcessStartIdentity
+  /**
+   * True when the process is inside the session's own ownership boundary, as the kernel
+   * reports it. This is what admits a source.
+   */
+  session_member: boolean
+}
+/**
+ * The process the kernel reports on the other end of the socket, with its start value.
+ */
+export interface ProcessStartIdentity {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  pid: string
+  /**
+   * Where the start value came from.
+   */
+  source: 'linux_proc_stat' | 'macos_proc_bsd_info' | 'windows_process_start_seconds'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_value: string
+}
+/**
+ * Parameters of `alert.create`.
+ */
+export interface AlertCreateParams {
+  /**
+   * The caller's label for itself. Unverified.
+   */
+  agent_name: string | null
+  /**
+   * The source's de-duplication identifier.
+   */
+  dedup_id: string
+  /**
+   * A link into this host's own session, when there is one.
+   */
+  safe_session_link: string | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How urgent it is.
+   */
+  severity: 'info' | 'warning' | 'error'
+  /**
+   * The concise text.
+   */
+  text: string
+}
+/**
+ * The result of `alert.create`.
+ */
+export interface AlertCreateResult {
+  alert: Alert1
+  /**
+   * True when an exact duplicate returned the existing alert rather than raising one.
+   */
+  deduplicated: boolean
+}
+/**
+ * The alert.
+ */
+export interface Alert1 {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The source's own de-duplication identifier.
+   */
+  dedup_id: string
+  /**
+   * A link into this host's own session, when the source supplied one.
+   */
+  safe_session_link: string | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How urgent it is.
+   */
+  severity: 'info' | 'warning' | 'error'
+  source: QuestionSource
+  /**
+   * The concise text.
+   */
+  text: string
+}
+/**
+ * The answer, who gave it and against which revision.
+ */
+export interface AnswerRecord {
+  /**
+   * The host-verified principal that answered. A caller never asserts its own.
+   */
+  actor_id: string
+  /**
+   * What was answered.
+   */
+  answer:
+    | {
+        kind: 'input'
+        /**
+         * What the person typed.
+         */
+        text: string
+      }
+    | {
+        /**
+         * The choice the person selected.
+         */
+        choice_id: string
+        kind: 'choice'
+      }
+    | {
+        /**
+         * True for yes.
+         */
+        decided: boolean
+        kind: 'decision'
+      }
+    | {
+        kind: 'other'
+        /**
+         * What the person typed instead of choosing.
+         */
+        text: string
+      }
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  answered_at_ms: string
+  /**
+   * The paired device that answered, when the answer came from one.
+   */
+  device_id: DeviceId | null
+  /**
+   * The revision of the question the person was shown.
+   */
+  question_revision: string
+}
+/**
  * The public descriptor of one archive.
  *
  * Everything outside it is opaque: the archive identity and encrypted-object references. The
@@ -1810,7 +2389,7 @@ export interface ArchiveDescriptor {
    */
   manifest_key_wraps: SealedKeyWrap[]
   /**
-   * The descriptor version.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   version: string
 }
@@ -1819,11 +2398,11 @@ export interface ArchiveDescriptor {
  */
 export interface EncryptedObjectRef {
   /**
-   * The stored size of the encrypted object, in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   encrypted_len: string
   /**
-   * The SHA-256 of the encrypted object, including its `secretstream` header.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   encrypted_object_hash: string
   /**
@@ -1861,7 +2440,7 @@ export interface KeyWrapContext {
    */
   backup_generation: string
   /**
-   * The SHA-256 of the encrypted object.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   encrypted_object_hash: string
   /**
@@ -1923,11 +2502,11 @@ export interface AttachmentContribution1 {
    */
   insertion_method: 'typed_submission' | 'verified_composer_insertion' | 'manual_terminal_workflow'
   /**
-   * The largest file the selected model accepts, in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_byte_len: string
   /**
-   * How many attachments one draft may carry.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_count: string
   /**
@@ -1952,7 +2531,7 @@ export interface AttachmentContribution1 {
  */
 export interface AttachmentHandle1 {
   /**
-   * The verified length in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   byte_len: string
   /**
@@ -2055,11 +2634,11 @@ export interface AttachmentSummary {
  */
 export interface Dimensions {
   /**
-   * Columns, from 1 to 2,048.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   columns: string
   /**
-   * Rows, from 1 to 1,024.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
 }
@@ -2074,6 +2653,10 @@ export interface AttachmentViewportParams {
    */
   attachment_id: string
   dimensions: Dimensions1
+  /**
+   * Where its window sits. Null is the live screen.
+   */
+  position: ViewportPosition | null
 }
 /**
  * A terminal geometry in columns and rows.
@@ -2083,11 +2666,11 @@ export interface AttachmentViewportParams {
  */
 export interface Dimensions1 {
   /**
-   * Columns, from 1 to 2,048.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   columns: string
   /**
-   * Rows, from 1 to 1,024.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
 }
@@ -2096,6 +2679,14 @@ export interface Dimensions1 {
  */
 export interface AttachmentViewportResult {
   geometry: GeometryState
+  /**
+   * Where the window ended up, as a row identifier, or null for the live screen.
+   *
+   * A request above the oldest row the session still holds is answered with the oldest one
+   * there is rather than refused, and a request at or below the live screen's first row is
+   * answered with the live screen. Either way this says where the window actually is.
+   */
+  position: ViewportPosition | null
   /**
    * How a terminal attachment displays the canonical grid.
    */
@@ -2123,18 +2714,39 @@ export interface GeometryState {
  */
 export interface Dimensions2 {
   /**
-   * Columns, from 1 to 2,048.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   columns: string
   /**
-   * Rows, from 1 to 1,024.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
 }
 /**
  * A worker's acknowledgement that it is acting under an authority revision.
+ *
+ * Section 9 makes the acknowledgement two statements rather than one: the revision is installed,
+ * **and** the undispatched actions it affects have been rejected or fenced. The two lists are
+ * therefore part of the acknowledgement rather than something a caller has to ask for
+ * afterwards. An action whose dispatch transition had already won the serial race is named in
+ * `possibly_executed`.
+ *
+ * The evidence defaults to absent on the wire. A worker keeps running across a controller
+ * replacement, so during an update a new daemon can be talking to a worker built before the
+ * evidence existed, and architecture decision C keeps local support until the last such worker
+ * exits. Defaulting lets that worker's two-field acknowledgement decode instead of failing the
+ * revocation outright, and the daemon can still tell it apart from a worker whose fence found
+ * nothing, because absent and empty are different values.
  */
 export interface AuthorityRevisionAck {
+  /**
+   * What the fence did, when this worker reports it.
+   *
+   * Absent is not the same as empty. Empty says the fence ran and found nothing; absent says
+   * this worker does not report fence evidence at all, and a daemon that read the two the same
+   * way would call a revocation complete on the strength of a worker that never said so.
+   */
+  fence?: FenceEvidence | null
   /**
    * The host's ordered authority revision. Only the host issues its own revisions.
    */
@@ -2143,6 +2755,80 @@ export interface AuthorityRevisionAck {
    * One KalaReach terminal session.
    */
   session_id: string
+}
+/**
+ * What a worker's fence did, as one acknowledgement carries it.
+ *
+ * The lists are the acknowledgement rather than an addition to it: section 9 makes the
+ * acknowledgement a statement that the revision is installed **and** that the undispatched
+ * actions it affects have been rejected or named. A worker that reports no evidence at all is a
+ * different thing from one that reports empty lists, which is why this travels as a whole.
+ */
+export interface FenceEvidence {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted: string
+  /**
+   * The actions whose dispatch transition had already won the serial race, in this page.
+   *
+   * Each one's receipt state says how much is known about what it did; the list is not only the
+   * uncertain ones.
+   */
+  possibly_executed: PossiblyExecutedAction[]
+  /**
+   * The undispatched intents the fence rejected, in this page.
+   */
+  rejected_actions: FencedAction[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  remaining: string
+}
+/**
+ * An action whose dispatch transition had already won the serial race when the fence ran.
+ *
+ * The set is defined by the race rather than by the outcome, which is what section 9 says: an
+ * action whose dispatch transition already won it is named in the result. [`Self::state`] is what
+ * says how much is known about what it did, from `dispatching` through `unknown` to an
+ * authoritative `applied` or `refused`, so a person reading a revocation sees which operations
+ * went out under the authority that has just been withdrawn and which of them are still
+ * uncertain.
+ */
+export interface PossiblyExecutedAction {
+  /**
+   * The action.
+   */
+  action_id: string
+  /**
+   * The actor that submitted it.
+   */
+  actor_id: string
+  /**
+   * The method it was submitted under.
+   */
+  method: string
+  /**
+   * The receipt state it stood at when the fence ran.
+   */
+  state: 'received' | 'accepted' | 'dispatching' | 'applied' | 'refused' | 'rejected' | 'unknown'
+}
+/**
+ * One action a fence named, with the actor whose action it was.
+ *
+ * The actor is part of the name because the de-duplication key is the actor and the action
+ * together: two actors may each have used one identifier, and an identifier on its own would name
+ * either of them.
+ */
+export interface FencedAction {
+  /**
+   * The action.
+   */
+  action_id: string
+  /**
+   * The actor whose action it was.
+   */
+  actor_id: string
 }
 /**
  * The host's current authority revision, announced to a worker by the controller that holds it.
@@ -2158,6 +2844,19 @@ export interface AuthorityRevisionNotice {
    * The environment whose authority changed.
    */
   environment_id: string
+  /**
+   * How many names of this revision's fence evidence the daemon already has.
+   *
+   * Nought asks for the first page, which is what a first announcement is. An announcement that
+   * carries more is asking for the rest of what the previous answer said remained, from the
+   * name after the last one it carried.
+   *
+   * It is absent from the wire when it is nought, so an announcement that asks for a first page
+   * is byte for byte what a worker built before paging existed expects. A daemon only ever
+   * sends a continuation to a worker whose own answer reported names remaining, and a worker
+   * that reports no evidence at all never does.
+   */
+  evidence_from?: number
   /**
    * The host's ordered authority revision. Only the host issues its own revisions.
    */
@@ -2238,7 +2937,7 @@ export interface ArchiveDescriptor1 {
    */
   manifest_key_wraps: SealedKeyWrap[]
   /**
-   * The descriptor version.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   version: string
 }
@@ -2337,7 +3036,7 @@ export interface CapabilityRecord {
     | 'not_tested'
   subject: CapabilitySubject
   /**
-   * The version of that capability's contract.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   version: string
 }
@@ -2392,6 +3091,38 @@ export interface CapabilitySubject {
   terminal: string | null
 }
 /**
+ * The exact set of changes one installation made, and how to undo them.
+ */
+export interface ChangeManifest1 {
+  /**
+   * The agent it was installed for.
+   */
+  agent: 'codex' | 'claude-code' | 'opencode' | 'gemini-cli' | 'kimi-code-cli' | 'qoder-cli'
+  /**
+   * The command the agent runs to reach the tools.
+   */
+  entry_point: string[]
+  /**
+   * Every change, in the order it was applied.
+   *
+   * A removal undoes them in the order it can carry out: files and server entries first, then
+   * the directories that held them, deepest first.
+   */
+  operations: ChangeOperation[]
+  /**
+   * The directory the scope resolved to.
+   */
+  root: string
+  /**
+   * The scope it was installed at.
+   */
+  scope: 'user' | 'project'
+  /**
+   * The skill version installed.
+   */
+  skill_version: string
+}
+/**
  * The client's complete `hello` offer.
  */
 export interface ClientOffer {
@@ -2426,23 +3157,23 @@ export interface ClientOffer {
  */
 export interface ReceiveLimits {
   /**
-   * Maximum complete attachment frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_attachment_frame_len: string
   /**
-   * Maximum complete control frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_control_frame_len: string
   /**
-   * Maximum complete input frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_input_frame_len: string
   /**
-   * Maximum outstanding mutations per session.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_outstanding_mutations: string
   /**
-   * Maximum queued bytes before the peer is resynchronised.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_send_queue_bytes: string
 }
@@ -2533,7 +3264,7 @@ export interface TerminatedProcess {
    * True when the process needed forced termination after the grace period.
    */
   forced: boolean
-  identity: ProcessStartIdentity
+  identity: ProcessStartIdentity1
   /**
    * The executable name, for diagnostics.
    */
@@ -2542,7 +3273,7 @@ export interface TerminatedProcess {
 /**
  * The process and its start identity, so a reused identifier is not mistaken for it.
  */
-export interface ProcessStartIdentity {
+export interface ProcessStartIdentity1 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -2624,23 +3355,23 @@ export interface LocalHello {
  */
 export interface ReceiveLimits1 {
   /**
-   * Maximum complete attachment frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_attachment_frame_len: string
   /**
-   * Maximum complete control frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_control_frame_len: string
   /**
-   * Maximum complete input frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_input_frame_len: string
   /**
-   * Maximum outstanding mutations per session.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_outstanding_mutations: string
   /**
-   * Maximum queued bytes before the peer is resynchronised.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_send_queue_bytes: string
 }
@@ -2721,23 +3452,23 @@ export interface BootIdentity {
  */
 export interface ReceiveLimits2 {
   /**
-   * Maximum complete attachment frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_attachment_frame_len: string
   /**
-   * Maximum complete control frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_control_frame_len: string
   /**
-   * Maximum complete input frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_input_frame_len: string
   /**
-   * Maximum outstanding mutations per session.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_outstanding_mutations: string
   /**
-   * Maximum queued bytes before the peer is resynchronised.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_send_queue_bytes: string
 }
@@ -2979,7 +3710,7 @@ export interface Notification {
  */
 export interface WorkerRendezvous {
   boot_identity: BootIdentity1
-  process_start_identity: ProcessStartIdentity1
+  process_start_identity: ProcessStartIdentity2
   /**
    * The reservation this worker was started for.
    */
@@ -3014,7 +3745,7 @@ export interface BootIdentity1 {
  * The worker's own process identity, which the controller compares with what the launcher
  * reported and with the connecting peer.
  */
-export interface ProcessStartIdentity1 {
+export interface ProcessStartIdentity2 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -3089,6 +3820,14 @@ export interface SessionCreateParams {
    */
   environment_snapshot: EnvironmentVariable[]
   /**
+   * The palette this session starts with. Null takes the profile default.
+   *
+   * This is the one moment the palette can be chosen: section 8 fixes it at creation, and
+   * afterwards only an authorised explicit change moves it. The provenance is recorded either
+   * way, so a palette query can say where the session's colours came from.
+   */
+  palette: PaletteRequest | null
+  /**
    * How the session is presented locally.
    */
   presentation: 'attach' | 'terminal' | 'invisible'
@@ -3123,6 +3862,47 @@ export interface EnvironmentVariable {
   value: string
 }
 /**
+ * The default foreground and background a client's bounded probe established.
+ */
+export interface ProbedPalette {
+  background: Rgb
+  foreground: Rgb1
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb1 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
  * What a worker reports once its root shell is running.
  */
 export interface WorkerReady {
@@ -3131,7 +3911,7 @@ export interface WorkerReady {
    * The worker's private endpoint.
    */
   endpoint: string
-  root_process: ProcessStartIdentity2
+  root_process: ProcessStartIdentity3
   /**
    * One KalaReach terminal session.
    */
@@ -3149,18 +3929,18 @@ export interface WorkerReady {
  */
 export interface Dimensions3 {
   /**
-   * Columns, from 1 to 2,048.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   columns: string
   /**
-   * Rows, from 1 to 1,024.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
 }
 /**
  * The root shell's process identity.
  */
-export interface ProcessStartIdentity2 {
+export interface ProcessStartIdentity3 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -3196,7 +3976,7 @@ export interface WorkerVerifyProof {
    * The endpoint the challenge arrived on.
    */
   endpoint: string
-  process_start_identity: ProcessStartIdentity3
+  process_start_identity: ProcessStartIdentity4
   protocol_version: ProtocolVersion2
   /**
    * The session epoch, fixed at 1 in protocol version 1.
@@ -3227,7 +4007,7 @@ export interface BootIdentity2 {
 /**
  * The worker's process identity.
  */
-export interface ProcessStartIdentity3 {
+export interface ProcessStartIdentity4 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -3816,7 +4596,7 @@ export interface DownloadBeginResult {
    */
   chunks: ChunkDescriptor[]
   /**
-   * The whole-file digest.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   content_digest: string
   /**
@@ -3846,15 +4626,15 @@ export interface DownloadBeginResult {
  */
 export interface ChunkDescriptor {
   /**
-   * Its exact length.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   byte_len: string
   /**
-   * The SHA-256 digest of exactly those bytes.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   digest: string
   /**
-   * The chunk's position in the layout.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   index: string
 }
@@ -3863,15 +4643,15 @@ export interface ChunkDescriptor {
  */
 export interface ChunkLayout {
   /**
-   * How many chunks the transfer has.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   chunk_count: string
   /**
-   * Bytes per chunk, except the last.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   chunk_len: string
   /**
-   * Length of the final chunk. Equal to `chunk_len` when the size divides exactly.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   last_chunk_len: string
 }
@@ -3907,15 +4687,15 @@ export interface DownloadChunkResult {
  */
 export interface ChunkDescriptor1 {
   /**
-   * Its exact length.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   byte_len: string
   /**
-   * The SHA-256 digest of exactly those bytes.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   digest: string
   /**
-   * The chunk's position in the layout.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   index: string
 }
@@ -3940,7 +4720,7 @@ export interface DownloadPlacement {
    */
   byte_len: string
   /**
-   * The verified whole-file digest the client must have computed.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   content_digest: string
   /**
@@ -4502,7 +5282,7 @@ export interface SessionSummary {
   /**
    * The root shell's process identity while the session is running.
    */
-  root_process: ProcessStartIdentity4 | null
+  root_process: ProcessStartIdentity5 | null
   /**
    * The session epoch, fixed at 1 in protocol version 1.
    */
@@ -4554,11 +5334,11 @@ export interface DesktopBinding {
  */
 export interface Dimensions4 {
   /**
-   * Columns, from 1 to 2,048.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   columns: string
   /**
-   * Rows, from 1 to 1,024.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
 }
@@ -4569,7 +5349,7 @@ export interface Dimensions4 {
  * unrelated program within milliseconds of the original exiting, so the host never terminates,
  * adopts or trusts a process on its identifier alone.
  */
-export interface ProcessStartIdentity4 {
+export interface ProcessStartIdentity5 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -4640,6 +5420,55 @@ export interface HistoryGap {
   to_cursor: string
 }
 /**
+ * The record an expired object leaves behind.
+ *
+ * It outlives a retrust deliberately. Section 9 keeps old expiration tombstones when the wall
+ * clock becomes trusted again, which is what stops a clock correction from reviving something
+ * that had already run out.
+ */
+export interface ExpirationTombstone {
+  boot_identity: BootIdentity5
+  /**
+   * Whether the object could still be presented in another boot.
+   *
+   * An object bounded only by a continuous deadline in one boot is refused in that boot by a
+   * clock that only moves forward, and in any other boot by the boot identity its deadline
+   * belongs to. Nothing but this record refuses one that also carries a trusted UTC deadline,
+   * which is why a host that has to bound its tombstone table can let the first kind go and
+   * never the second.
+   *
+   * A record that does not say defaults to `true`, which is the answer that keeps the
+   * tombstone: a host reading back a tombstone from a build that did not record this cannot
+   * tell which kind it was, and dropping one it should have kept is the failure that matters.
+   */
+  cross_reboot?: boolean
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expired_at_ms: string
+  /**
+   * The object, named the way its own store names it.
+   */
+  object: string
+  /**
+   * Why it expired.
+   */
+  reason: 'continuous_deadline' | 'trusted_utc_deadline'
+}
+/**
+ * The boot the expiry was observed in.
+ */
+export interface BootIdentity5 {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
+}
+/**
  * A stored backup checkpoint a pairing transfers.
  *
  * A fresh client needs a trusted latest-generation checkpoint to detect a service replaying an
@@ -4655,7 +5484,7 @@ export interface GenerationCheckpoint {
    */
   backup_generation: string
   /**
-   * The hash of that generation's encrypted manifest.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   encrypted_manifest_hash: string
   /**
@@ -4860,23 +5689,23 @@ export interface HostSelection {
  */
 export interface ReceiveLimits3 {
   /**
-   * Maximum complete attachment frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_attachment_frame_len: string
   /**
-   * Maximum complete control frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_control_frame_len: string
   /**
-   * Maximum complete input frame, in bytes, length prefix included.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_input_frame_len: string
   /**
-   * Maximum outstanding mutations per session.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_outstanding_mutations: string
   /**
-   * Maximum queued bytes before the peer is resynchronised.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   max_send_queue_bytes: string
 }
@@ -4978,7 +5807,7 @@ export interface DoctorCheck {
  * The result of `host.info`.
  */
 export interface HostInfoResult {
-  boot_identity: BootIdentity5
+  boot_identity: BootIdentity6
   /**
    * The controller build.
    */
@@ -5017,7 +5846,7 @@ export interface HostInfoResult {
 /**
  * The boot this host is running.
  */
-export interface BootIdentity5 {
+export interface BootIdentity6 {
   /**
    * Where the value came from.
    */
@@ -6021,7 +6850,7 @@ export interface OwnerConfirmationRequest {
     | 'grant_executable_capability'
     | 'change_host_authority'
   /**
-   * The digest of the exact action. One confirmation authorises one digest.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   action_digest: string
   /**
@@ -6092,7 +6921,7 @@ export interface OwnerConfirmationRequest1 {
     | 'grant_executable_capability'
     | 'change_host_authority'
   /**
-   * The digest of the exact action. One confirmation authorises one digest.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   action_digest: string
   /**
@@ -6137,11 +6966,11 @@ export interface PairFinishRequest {
    */
   binding_tag: string
   /**
-   * The SHA-256 of the canonical client bundle.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   client_bundle_hash: string
   /**
-   * The SHA-256 of the canonical host bundle.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   host_bundle_hash: string
   /**
@@ -6149,7 +6978,7 @@ export interface PairFinishRequest {
    */
   invitation_id: string
   /**
-   * The transcript both devices confirmed.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   transcript: string
 }
@@ -7120,6 +7949,1189 @@ export interface RetainedItem {
   kind: 'dirty_content' | 'pinned_change_set' | 'review_evidence'
 }
 /**
+ * A bounded update against a known base.
+ *
+ * This is what a projected attachment receives per batch of output: the rows that changed and the
+ * state that changed with them, never the whole screen.
+ */
+export interface ProjectionDelta {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  base_cursor: string
+  /**
+   * Which buffer the rows belong to.
+   */
+  buffer: 'primary' | 'alternate'
+  /**
+   * The designated character sets, when they changed.
+   */
+  charsets: CharsetState | null
+  cursor: ProjectedCursor
+  /**
+   * Whether the session has had to shorten content to stay inside a resident-state bound.
+   */
+  degraded: boolean
+  /**
+   * The canonical dimensions, when they changed.
+   */
+  dimensions: Dimensions | null
+  /**
+   * Whether rows below `oldest_retained_row` have been evicted.
+   */
+  evicted: boolean
+  /**
+   * The open hyperlink, when it changed.
+   */
+  hyperlink: HyperlinkChange | null
+  /**
+   * The hyperlink ranges of the rows carried here.
+   */
+  hyperlinks: HyperlinkRange[]
+  /**
+   * The keyboard negotiation, when it changed.
+   */
+  keyboard: ProjectedKeyboard | null
+  /**
+   * The scroll region, when it changed.
+   */
+  margins: MarginState | null
+  /**
+   * The modes that changed since the base.
+   */
+  modes: ProjectedMode[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  next_cursor: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  oldest_retained_row: string
+  /**
+   * The palette, when an authorised explicit change moved it.
+   */
+  palette: PaletteState | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  projection_generation: string
+  /**
+   * The pen, when it changed.
+   */
+  rendition: CellRendition | null
+  /**
+   * The rows that changed, by stable identifier. A row not named here is unchanged.
+   */
+  rows: ProjectedRow[]
+  /**
+   * The saved cursors, when one was saved or restored.
+   */
+  saved_cursors: SavedCursorState[] | null
+  /**
+   * The tab stops, when they changed.
+   */
+  tab_stops: U64[] | null
+  /**
+   * The titles, when they changed.
+   */
+  title: ProjectedTitle | null
+  /**
+   * The virtual title stack, when the titles changed.
+   */
+  title_stack: SavedTitleEntry[] | null
+  viewport: ProjectedViewport
+}
+/**
+ * The designated character sets and the locking shift.
+ */
+export interface CharsetState {
+  /**
+   * The set designated as G0.
+   */
+  g0: string
+  /**
+   * The set designated as G1.
+   */
+  g1: string
+  /**
+   * Whether the shift-out set is selected.
+   */
+  shift_out: boolean
+}
+/**
+ * The cursor after the update.
+ */
+export interface ProjectedCursor {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  column: string
+  /**
+   * Whether the next printable character wraps before it is placed.
+   *
+   * The same coordinates mean different things with and without it, so a renderer that left it
+   * out would put the next character in the wrong cell.
+   */
+  pending_wrap: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  row: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  style: string
+  /**
+   * Whether the cursor is shown.
+   */
+  visible: boolean
+}
+/**
+ * The hyperlink the next character printed belongs to, once it has changed.
+ *
+ * A null target is an open link that closed. Without the distinction a client could not tell a
+ * link that closed from one that was never mentioned.
+ */
+export interface HyperlinkChange {
+  /**
+   * The target, or null when no link is open.
+   */
+  uri: string | null
+}
+/**
+ * A hyperlink over a range of cells.
+ *
+ * It is inert metadata. A reconnection restores it so a later click still works; nothing here
+ * activates anything, and a scheme that would launch an external application needs the client's
+ * own policy before anything happens.
+ */
+export interface HyperlinkRange {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  end_column: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  row: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_column: string
+  /**
+   * The target.
+   */
+  uri: string
+}
+/**
+ * The keyboard negotiation an input encoder has to reproduce.
+ *
+ * Each buffer has its own stack, so a full-screen application's negotiation cannot leak into the
+ * shell's when it exits. A client that knew only the active one would send the wrong encoding the
+ * moment the application quit.
+ */
+export interface ProjectedKeyboard {
+  alternate: KittyKeyboardState
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  modify_other_keys: string
+  primary: KittyKeyboardState1
+}
+/**
+ * The alternate buffer's negotiation.
+ */
+export interface KittyKeyboardState {
+  /**
+   * The flags in force, when the protocol is in use.
+   */
+  flags: U64 | null
+  /**
+   * The flag stack, oldest first.
+   */
+  stack: U64[]
+}
+/**
+ * The primary buffer's negotiation.
+ */
+export interface KittyKeyboardState1 {
+  /**
+   * The flags in force, when the protocol is in use.
+   */
+  flags: U64 | null
+  /**
+   * The flag stack, oldest first.
+   */
+  stack: U64[]
+}
+/**
+ * The scroll region.
+ */
+export interface MarginState {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  bottom: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  left: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  right: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  top: string
+}
+/**
+ * One tracked mode and its value.
+ */
+export interface ProjectedMode {
+  /**
+   * Whether it is set.
+   */
+  enabled: boolean
+  /**
+   * Which spelling.
+   */
+  kind: 'ansi' | 'dec'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  mode: string
+}
+/**
+ * The session's canonical palette and where it came from.
+ */
+export interface PaletteState {
+  background: Rgb2
+  cursor: Rgb3
+  foreground: Rgb4
+  /**
+   * The indexed colours that differ from the profile default.
+   */
+  overrides: PaletteOverride[]
+  pointer_background: Rgb6
+  pointer_foreground: Rgb7
+  selection_background: Rgb8
+  selection_foreground: Rgb9
+  /**
+   * Where this palette came from.
+   */
+  source:
+    'profile_default' | 'client_preference' | 'light_preset' | 'dark_preset' | 'explicit_change'
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb2 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb3 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb4 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * One indexed colour that differs from the profile default.
+ */
+export interface PaletteOverride {
+  colour: Rgb5
+  /**
+   * The palette index.
+   */
+  index: number
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb5 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb6 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb7 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb8 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb9 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * The graphic rendition of a run of cells.
+ */
+export interface CellRendition {
+  /**
+   * The cell colour.
+   */
+  background:
+    | 'default'
+    | {
+        indexed: number
+      }
+    | {
+        direct: Rgb10
+      }
+  /**
+   * The blink rate.
+   */
+  blink: 'none' | 'slow' | 'rapid'
+  /**
+   * Bold.
+   */
+  bold: boolean
+  /**
+   * Faint.
+   */
+  faint: boolean
+  /**
+   * The text colour.
+   */
+  foreground:
+    | 'default'
+    | {
+        indexed: number
+      }
+    | {
+        direct: Rgb10
+      }
+  /**
+   * Invisible.
+   */
+  invisible: boolean
+  /**
+   * Italic.
+   */
+  italic: boolean
+  /**
+   * Overlined.
+   */
+  overline: boolean
+  /**
+   * Reverse video.
+   */
+  reverse: boolean
+  /**
+   * Struck through.
+   */
+  strikethrough: boolean
+  /**
+   * The underline style.
+   */
+  underline: 'none' | 'single' | 'double' | 'curly' | 'dotted' | 'dashed'
+  /**
+   * The underline colour, where it differs from the text.
+   */
+  underline_colour:
+    | 'default'
+    | {
+        indexed: number
+      }
+    | {
+        direct: Rgb10
+      }
+  /**
+   * The position against the baseline.
+   */
+  vertical_align: 'baseline' | 'superscript' | 'subscript'
+}
+/**
+ * A direct colour.
+ */
+export interface Rgb10 {
+  /**
+   * Blue.
+   */
+  blue: number
+  /**
+   * Green.
+   */
+  green: number
+  /**
+   * Red.
+   */
+  red: number
+}
+/**
+ * One row of the canonical grid.
+ */
+export interface ProjectedRow {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  row: string
+  /**
+   * The runs, left to right.
+   */
+  runs: CellRun[]
+  /**
+   * Whether the row ends in a soft wrap rather than a hard line break.
+   *
+   * A selection that copies two soft-wrapped rows copies one logical line, which is why the
+   * marker travels with the row instead of being inferred from its length.
+   */
+  soft_wrapped: boolean
+  /**
+   * Whether runs were dropped to keep the row inside a page's byte bound.
+   *
+   * The degradation is explicit: a client shows what it was given and knows it is not all of
+   * the row, rather than drawing a short row as though the application had written one.
+   */
+  truncated: boolean
+}
+/**
+ * One run of cells that share a rendition and a hyperlink.
+ */
+export interface CellRun {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  cells: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  column: string
+  /**
+   * The hyperlink this run is inside, as inert metadata.
+   */
+  hyperlink: string | null
+  rendition: CellRendition1
+  /**
+   * The text.
+   */
+  text: string
+}
+/**
+ * The rendition.
+ */
+export interface CellRendition1 {
+  /**
+   * The cell colour.
+   */
+  background:
+    | 'default'
+    | {
+        indexed: number
+      }
+    | {
+        direct: Rgb10
+      }
+  /**
+   * The blink rate.
+   */
+  blink: 'none' | 'slow' | 'rapid'
+  /**
+   * Bold.
+   */
+  bold: boolean
+  /**
+   * Faint.
+   */
+  faint: boolean
+  /**
+   * The text colour.
+   */
+  foreground:
+    | 'default'
+    | {
+        indexed: number
+      }
+    | {
+        direct: Rgb10
+      }
+  /**
+   * Invisible.
+   */
+  invisible: boolean
+  /**
+   * Italic.
+   */
+  italic: boolean
+  /**
+   * Overlined.
+   */
+  overline: boolean
+  /**
+   * Reverse video.
+   */
+  reverse: boolean
+  /**
+   * Struck through.
+   */
+  strikethrough: boolean
+  /**
+   * The underline style.
+   */
+  underline: 'none' | 'single' | 'double' | 'curly' | 'dotted' | 'dashed'
+  /**
+   * The underline colour, where it differs from the text.
+   */
+  underline_colour:
+    | 'default'
+    | {
+        indexed: number
+      }
+    | {
+        direct: Rgb10
+      }
+  /**
+   * The position against the baseline.
+   */
+  vertical_align: 'baseline' | 'superscript' | 'subscript'
+}
+/**
+ * A cursor an application saved, with the pen it saved alongside it.
+ */
+export interface SavedCursorState {
+  /**
+   * Which buffer saved it.
+   */
+  buffer: 'primary' | 'alternate'
+  charsets: CharsetDesignations
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  column: string
+  /**
+   * The hyperlink that was open when it was saved.
+   */
+  hyperlink: string | null
+  /**
+   * Whether origin mode was set when it was saved.
+   */
+  origin_mode: boolean
+  /**
+   * Whether the saved cursor had a pending wrap.
+   */
+  pending_wrap: boolean
+  rendition: CellRendition2
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  row: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  style: string
+}
+/**
+ * The character sets designated when it was saved.
+ */
+export interface CharsetDesignations {
+  /**
+   * The set designated as G0.
+   */
+  g0: string
+  /**
+   * The set designated as G1.
+   */
+  g1: string
+}
+/**
+ * The graphic rendition of a run of cells.
+ */
+export interface CellRendition2 {
+  /**
+   * The cell colour.
+   */
+  background:
+    | 'default'
+    | {
+        indexed: number
+      }
+    | {
+        direct: Rgb10
+      }
+  /**
+   * The blink rate.
+   */
+  blink: 'none' | 'slow' | 'rapid'
+  /**
+   * Bold.
+   */
+  bold: boolean
+  /**
+   * Faint.
+   */
+  faint: boolean
+  /**
+   * The text colour.
+   */
+  foreground:
+    | 'default'
+    | {
+        indexed: number
+      }
+    | {
+        direct: Rgb10
+      }
+  /**
+   * Invisible.
+   */
+  invisible: boolean
+  /**
+   * Italic.
+   */
+  italic: boolean
+  /**
+   * Overlined.
+   */
+  overline: boolean
+  /**
+   * Reverse video.
+   */
+  reverse: boolean
+  /**
+   * Struck through.
+   */
+  strikethrough: boolean
+  /**
+   * The underline style.
+   */
+  underline: 'none' | 'single' | 'double' | 'curly' | 'dotted' | 'dashed'
+  /**
+   * The underline colour, where it differs from the text.
+   */
+  underline_colour:
+    | 'default'
+    | {
+        indexed: number
+      }
+    | {
+        direct: Rgb10
+      }
+  /**
+   * The position against the baseline.
+   */
+  vertical_align: 'baseline' | 'superscript' | 'subscript'
+}
+/**
+ * The current titles.
+ */
+export interface ProjectedTitle {
+  /**
+   * The icon title.
+   */
+  icon: string
+  /**
+   * The window title.
+   */
+  window: string
+}
+/**
+ * One entry of the virtual title stack.
+ *
+ * A push saves only the titles it names, so each field is either a title that was saved or
+ * nothing at all. The two are different: a pop leaves the current title alone where nothing was
+ * saved for it, and a client that flattened the distinction would show the wrong title after one.
+ */
+export interface SavedTitleEntry {
+  /**
+   * The icon title, when this entry saved one.
+   */
+  icon: string | null
+  /**
+   * The window title, when this entry saved one.
+   */
+  window: string | null
+}
+/**
+ * The window this client is showing, which a scroll moves without changing any row.
+ */
+export interface ProjectedViewport {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  columns: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  left_column: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  rows: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  screen_top_row: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  top_row: string
+}
+/**
+ * Discard whatever is being shown; a snapshot follows.
+ */
+export interface ProjectionReset {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  cursor: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  projection_generation: string
+  /**
+   * Why.
+   */
+  reason: 'attached' | 'buffer_switch' | 'geometry' | 'replay_gap' | 'repaint' | 'history_evicted'
+}
+/**
+ * One page of rows belonging to one buffer of one snapshot.
+ */
+export interface ProjectionRowPage {
+  /**
+   * Which buffer they belong to.
+   */
+  buffer: 'primary' | 'alternate'
+  /**
+   * Whether rows below `oldest_retained_row` have been evicted.
+   */
+  evicted: boolean
+  /**
+   * Whether more pages of this snapshot follow.
+   *
+   * A client that has not seen a page with this clear does not yet hold the whole screen, and
+   * section 8 forbids mixing live output with an incomplete repaint.
+   */
+  more: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  oldest_retained_row: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  output_cursor: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  projection_generation: string
+  /**
+   * The rows, in stable-identifier order.
+   */
+  rows: ProjectedRow[]
+}
+/**
+ * Everything a screen is, apart from its rows.
+ *
+ * The rows follow in [`ProjectionRowPage`]s, because a canonical grid of 2,048 columns by 1,024
+ * rows in two buffers is not one message. A client installs the state here, paints the pages as
+ * they arrive, and applies deltas from `output_cursor` once the last page has landed.
+ */
+export interface ProjectionSnapshot {
+  /**
+   * Which buffer is active.
+   */
+  active_buffer: 'primary' | 'alternate'
+  charsets: CharsetState1
+  cursor: ProjectedCursor1
+  /**
+   * Whether the session has had to shorten content to stay inside a resident-state bound.
+   *
+   * Section 8 requires truncation to have an explicit projection degradation, and a client in
+   * projected mode cannot see it any other way: a cell whose combining marks were dropped at
+   * the per-cell bound, a title cut to its limit and a hyperlink the link table refused all
+   * arrive looking like content the application wrote. This says they do not.
+   */
+  degraded: boolean
+  dimensions: Dimensions5
+  /**
+   * Whether rows below `oldest_retained_row` have been evicted.
+   */
+  evicted: boolean
+  /**
+   * The hyperlink the next character printed belongs to.
+   */
+  hyperlink: string | null
+  keyboard: ProjectedKeyboard1
+  /**
+   * Whether the keypad is in application mode.
+   */
+  keypad_application: boolean
+  margins: MarginState1
+  /**
+   * Every tracked mode.
+   */
+  modes: ProjectedMode[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  oldest_retained_row: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  output_cursor: string
+  palette: PaletteState1
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  projection_generation: string
+  rendition: CellRendition3
+  /**
+   * The cursor each buffer has saved.
+   */
+  saved_cursors: SavedCursorState[]
+  /**
+   * The columns carrying a tab stop.
+   */
+  tab_stops: U64[]
+  title: ProjectedTitle1
+  /**
+   * The virtual title stack, oldest first.
+   */
+  title_stack: SavedTitleEntry[]
+  viewport: ProjectedViewport1
+}
+/**
+ * The designated character sets and the locking shift.
+ */
+export interface CharsetState1 {
+  /**
+   * The set designated as G0.
+   */
+  g0: string
+  /**
+   * The set designated as G1.
+   */
+  g1: string
+  /**
+   * Whether the shift-out set is selected.
+   */
+  shift_out: boolean
+}
+/**
+ * The cursor.
+ */
+export interface ProjectedCursor1 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  column: string
+  /**
+   * Whether the next printable character wraps before it is placed.
+   *
+   * The same coordinates mean different things with and without it, so a renderer that left it
+   * out would put the next character in the wrong cell.
+   */
+  pending_wrap: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  row: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  style: string
+  /**
+   * Whether the cursor is shown.
+   */
+  visible: boolean
+}
+/**
+ * A terminal geometry in columns and rows.
+ *
+ * Every constraint of section 8 is checked by [`Dimensions::validate`] before anything is
+ * allocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.
+ */
+export interface Dimensions5 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  columns: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  rows: string
+}
+/**
+ * The keyboard negotiation an input encoder has to reproduce.
+ *
+ * Each buffer has its own stack, so a full-screen application's negotiation cannot leak into the
+ * shell's when it exits. A client that knew only the active one would send the wrong encoding the
+ * moment the application quit.
+ */
+export interface ProjectedKeyboard1 {
+  alternate: KittyKeyboardState
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  modify_other_keys: string
+  primary: KittyKeyboardState1
+}
+/**
+ * The scroll region.
+ */
+export interface MarginState1 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  bottom: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  left: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  right: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  top: string
+}
+/**
+ * The session's canonical palette and where it came from.
+ */
+export interface PaletteState1 {
+  background: Rgb2
+  cursor: Rgb3
+  foreground: Rgb4
+  /**
+   * The indexed colours that differ from the profile default.
+   */
+  overrides: PaletteOverride[]
+  pointer_background: Rgb6
+  pointer_foreground: Rgb7
+  selection_background: Rgb8
+  selection_foreground: Rgb9
+  /**
+   * Where this palette came from.
+   */
+  source:
+    'profile_default' | 'client_preference' | 'light_preset' | 'dark_preset' | 'explicit_change'
+}
+/**
+ * The graphic rendition of a run of cells.
+ */
+export interface CellRendition3 {
+  /**
+   * The cell colour.
+   */
+  background:
+    | 'default'
+    | {
+        indexed: number
+      }
+    | {
+        direct: Rgb10
+      }
+  /**
+   * The blink rate.
+   */
+  blink: 'none' | 'slow' | 'rapid'
+  /**
+   * Bold.
+   */
+  bold: boolean
+  /**
+   * Faint.
+   */
+  faint: boolean
+  /**
+   * The text colour.
+   */
+  foreground:
+    | 'default'
+    | {
+        indexed: number
+      }
+    | {
+        direct: Rgb10
+      }
+  /**
+   * Invisible.
+   */
+  invisible: boolean
+  /**
+   * Italic.
+   */
+  italic: boolean
+  /**
+   * Overlined.
+   */
+  overline: boolean
+  /**
+   * Reverse video.
+   */
+  reverse: boolean
+  /**
+   * Struck through.
+   */
+  strikethrough: boolean
+  /**
+   * The underline style.
+   */
+  underline: 'none' | 'single' | 'double' | 'curly' | 'dotted' | 'dashed'
+  /**
+   * The underline colour, where it differs from the text.
+   */
+  underline_colour:
+    | 'default'
+    | {
+        indexed: number
+      }
+    | {
+        direct: Rgb10
+      }
+  /**
+   * The position against the baseline.
+   */
+  vertical_align: 'baseline' | 'superscript' | 'subscript'
+}
+/**
+ * The current titles.
+ */
+export interface ProjectedTitle1 {
+  /**
+   * The icon title.
+   */
+  icon: string
+  /**
+   * The window title.
+   */
+  window: string
+}
+/**
+ * The window this client is showing.
+ */
+export interface ProjectedViewport1 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  columns: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  left_column: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  rows: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  screen_top_row: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  top_row: string
+}
+/**
  * The rights an invitation proposes, before the host issues a grant.
  *
  * The client cannot enlarge the grant through its bundle: the host commits the grant it proposed,
@@ -7471,7 +9483,7 @@ export interface PushInstallationBinding {
    */
   state: 'active' | 'disabled'
   /**
-   * The token, as the gateway records it.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   token_digest: string
 }
@@ -7523,7 +9535,7 @@ export interface PushRegistrationAnswerPayload {
    */
   registration_id: string
   /**
-   * The token the challenge was sent to.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   token_digest: string
 }
@@ -7565,7 +9577,7 @@ export interface PushRegistrationChallenge {
    */
   registration_id: string
   /**
-   * The token the challenge was sent to.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   token_digest: string
 }
@@ -7801,6 +9813,644 @@ export interface PushSenderRevocation1 {
   signature: string
 }
 /**
+ * One durable question.
+ *
+ * This is the whole public view. The caller token is deliberately not a field: it is returned to
+ * the source once, in [`QuestionCreateResult`], and never appears in a read, an event or a log.
+ */
+export interface Question {
+  /**
+   * The answer, once there is one.
+   */
+  answer: AnswerRecord | null
+  /**
+   * The options, including the free-text one for `select` and `confirm`.
+   */
+  choices: QuestionChoice[]
+  /**
+   * The concise decision context the source supplied.
+   */
+  context: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * What kind of answer it asks for.
+   */
+  kind: 'input' | 'select' | 'confirm'
+  /**
+   * The question itself.
+   */
+  question: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * When it reached a terminal state.
+   */
+  resolved_at_ms: TimestampMs | null
+  /**
+   * Its revision. An answer names the exact revision it is answering.
+   */
+  revision: string
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  source: QuestionSource1
+  /**
+   * Where it is in its life.
+   */
+  state: 'pending' | 'answered' | 'cancelled' | 'expired'
+}
+/**
+ * One option a `select` question offers.
+ */
+export interface QuestionChoice {
+  /**
+   * The stable identifier an answer names. It does not change with the label.
+   */
+  choice_id: string
+  /**
+   * What the person reads.
+   */
+  label: string
+}
+/**
+ * The verified source, and the unverified label beside it.
+ */
+export interface QuestionSource1 {
+  /**
+   * The agent thread or binding revision, when a qualified bridge supplied one.
+   *
+   * Null when no bridge did. A null here is not a claim that the thread never changed: without
+   * a bridge the question is application-scoped and thread-switch detection is not offered.
+   */
+  agent_binding_revision: AgentBindingRevision | null
+  /**
+   * The caller's own label for itself. Unverified, and never part of authority.
+   */
+  agent_label: string | null
+  /**
+   * True when the process's parent chain reaches the session's root shell.
+   *
+   * A checked hint, recorded for diagnostics. Section 11 is explicit that ancestry is not a
+   * defence against arbitrary code running under the same account, so nothing is admitted on
+   * this alone.
+   */
+  ancestry: boolean
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * The connection the question was created on.
+   */
+  connection_id: string
+  /**
+   * The executable that process is running, where the platform names it.
+   */
+  executable: string | null
+  /**
+   * True when the helper presented the private launch channel it inherited.
+   *
+   * False means the binding rests on the checks below instead; it does not mean the source is
+   * less bound, and it is recorded so a reader can tell which evidence was available.
+   */
+  launch_channel: boolean
+  process: ProcessStartIdentity
+  /**
+   * True when the process is inside the session's own ownership boundary, as the kernel
+   * reports it. This is what admits a source.
+   */
+  session_member: boolean
+}
+/**
+ * Parameters of `question.answer`.
+ */
+export interface QuestionAnswerParams {
+  /**
+   * The answer.
+   */
+  answer:
+    | {
+        kind: 'input'
+        /**
+         * What the person typed.
+         */
+        text: string
+      }
+    | {
+        /**
+         * The choice the person selected.
+         */
+        choice_id: string
+        kind: 'choice'
+      }
+    | {
+        /**
+         * True for yes.
+         */
+        decided: boolean
+        kind: 'decision'
+      }
+    | {
+        kind: 'other'
+        /**
+         * What the person typed instead of choosing.
+         */
+        text: string
+      }
+  /**
+   * The revision the person was shown. A different current revision is refused.
+   */
+  expected_revision: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * Parameters of `question.cancel_own`.
+ */
+export interface QuestionCancelOwnParams {
+  /**
+   * The token issued when it was created.
+   */
+  caller_token: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * Parameters of `question.cancel`.
+ */
+export interface QuestionCancelParams {
+  /**
+   * The revision the person was shown.
+   */
+  expected_revision: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * Parameters of `question.create`.
+ */
+export interface QuestionCreateParams {
+  /**
+   * The caller's label for itself. Unverified.
+   */
+  agent_name: string | null
+  /**
+   * The choices, for a `select`. The free-text option is added by the host.
+   */
+  choices: QuestionChoice[]
+  /**
+   * The concise decision context.
+   */
+  context: string
+  /**
+   * What kind of answer it asks for.
+   */
+  kind: 'input' | 'select' | 'confirm'
+  /**
+   * The question itself.
+   */
+  question: string
+  /**
+   * The caller's own unpredictable identifier for this request.
+   *
+   * De-duplication is by the verified originating application and this value together. A caller
+   * label is not part of it.
+   */
+  request_id: string
+  /**
+   * How long the question should live. Bounded by [`MAX_EXPIRY`] and by the source's own
+   * lifetime.
+   */
+  requested_expiry_ms: DurationMs | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How long to wait for an answer before returning the pending question. Bounded by
+   * [`MAX_CREATE_WAIT`].
+   */
+  wait_ms: DurationMs | null
+}
+/**
+ * The result of `question.create`.
+ */
+export interface QuestionCreateResult {
+  /**
+   * The token that lets this source poll and cancel it.
+   */
+  caller_token: string
+  /**
+   * True when an exact duplicate returned the existing question rather than creating one.
+   */
+  deduplicated: boolean
+  question: Question1
+}
+/**
+ * The durable question.
+ */
+export interface Question1 {
+  /**
+   * The answer, once there is one.
+   */
+  answer: AnswerRecord | null
+  /**
+   * The options, including the free-text one for `select` and `confirm`.
+   */
+  choices: QuestionChoice[]
+  /**
+   * The concise decision context the source supplied.
+   */
+  context: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * What kind of answer it asks for.
+   */
+  kind: 'input' | 'select' | 'confirm'
+  /**
+   * The question itself.
+   */
+  question: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * When it reached a terminal state.
+   */
+  resolved_at_ms: TimestampMs | null
+  /**
+   * Its revision. An answer names the exact revision it is answering.
+   */
+  revision: string
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  source: QuestionSource1
+  /**
+   * Where it is in its life.
+   */
+  state: 'pending' | 'answered' | 'cancelled' | 'expired'
+}
+/**
+ * One question transition, as the attention engine reads it.
+ *
+ * Section 25's idle reminder fires after five minutes of a *verified pending* request, so the
+ * event carries the moment the question became pending and whether its source was verified.
+ * Nothing here is the reminder itself; the attention engine owns that rule.
+ */
+export interface QuestionEvent {
+  /**
+   * What happened.
+   */
+  kind: 'created' | 'answered' | 'cancelled' | 'expired'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  pending_since_ms: string
+  question: Question2
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  recorded_at_ms: string
+}
+/**
+ * The question at this revision.
+ */
+export interface Question2 {
+  /**
+   * The answer, once there is one.
+   */
+  answer: AnswerRecord | null
+  /**
+   * The options, including the free-text one for `select` and `confirm`.
+   */
+  choices: QuestionChoice[]
+  /**
+   * The concise decision context the source supplied.
+   */
+  context: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * What kind of answer it asks for.
+   */
+  kind: 'input' | 'select' | 'confirm'
+  /**
+   * The question itself.
+   */
+  question: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * When it reached a terminal state.
+   */
+  resolved_at_ms: TimestampMs | null
+  /**
+   * Its revision. An answer names the exact revision it is answering.
+   */
+  revision: string
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  source: QuestionSource1
+  /**
+   * Where it is in its life.
+   */
+  state: 'pending' | 'answered' | 'cancelled' | 'expired'
+}
+/**
+ * The result of `question.read_own` and `question.cancel_own`.
+ */
+export interface QuestionOwnResult {
+  question: Question3
+}
+/**
+ * The question as it now stands.
+ */
+export interface Question3 {
+  /**
+   * The answer, once there is one.
+   */
+  answer: AnswerRecord | null
+  /**
+   * The options, including the free-text one for `select` and `confirm`.
+   */
+  choices: QuestionChoice[]
+  /**
+   * The concise decision context the source supplied.
+   */
+  context: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * What kind of answer it asks for.
+   */
+  kind: 'input' | 'select' | 'confirm'
+  /**
+   * The question itself.
+   */
+  question: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * When it reached a terminal state.
+   */
+  resolved_at_ms: TimestampMs | null
+  /**
+   * Its revision. An answer names the exact revision it is answering.
+   */
+  revision: string
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  source: QuestionSource1
+  /**
+   * Where it is in its life.
+   */
+  state: 'pending' | 'answered' | 'cancelled' | 'expired'
+}
+/**
+ * Parameters of `question.read_own`.
+ */
+export interface QuestionReadOwnParams {
+  /**
+   * The token issued when it was created.
+   */
+  caller_token: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * How long to wait for a change before answering with the question as it stands.
+   *
+   * A wait that times out returns the same durable question. It does not recreate it, and it
+   * does not notify anybody again.
+   */
+  wait_ms: DurationMs | null
+}
+/**
+ * Parameters of `question.read`.
+ */
+export interface QuestionReadParams {
+  /**
+   * True to include questions that have already been resolved.
+   */
+  include_resolved: boolean
+  /**
+   * One question, or null for every question this actor may see.
+   */
+  question_id: QuestionId | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `question.read`.
+ */
+export interface QuestionReadResult {
+  /**
+   * The questions, oldest first.
+   */
+  questions: Question[]
+}
+/**
+ * The result of `question.answer` and `question.cancel`.
+ */
+export interface QuestionResolveResult {
+  question: Question4
+}
+/**
+ * One durable question.
+ *
+ * This is the whole public view. The caller token is deliberately not a field: it is returned to
+ * the source once, in [`QuestionCreateResult`], and never appears in a read, an event or a log.
+ */
+export interface Question4 {
+  /**
+   * The answer, once there is one.
+   */
+  answer: AnswerRecord | null
+  /**
+   * The options, including the free-text one for `select` and `confirm`.
+   */
+  choices: QuestionChoice[]
+  /**
+   * The concise decision context the source supplied.
+   */
+  context: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * What kind of answer it asks for.
+   */
+  kind: 'input' | 'select' | 'confirm'
+  /**
+   * The question itself.
+   */
+  question: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * When it reached a terminal state.
+   */
+  resolved_at_ms: TimestampMs | null
+  /**
+   * Its revision. An answer names the exact revision it is answering.
+   */
+  revision: string
+  /**
+   * The session epoch, fixed at 1 in protocol version 1.
+   */
+  session_epoch: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  source: QuestionSource1
+  /**
+   * Where it is in its life.
+   */
+  state: 'pending' | 'answered' | 'cancelled' | 'expired'
+}
+/**
+ * The application the host verified as the source of a question.
+ *
+ * Everything here except [`Self::agent_label`] comes from the operating system through the
+ * worker's private socket. The label comes from the caller and is displayed as unverified, which
+ * is the whole of the difference between the two.
+ */
+export interface QuestionSource2 {
+  /**
+   * The agent thread or binding revision, when a qualified bridge supplied one.
+   *
+   * Null when no bridge did. A null here is not a claim that the thread never changed: without
+   * a bridge the question is application-scoped and thread-switch detection is not offered.
+   */
+  agent_binding_revision: AgentBindingRevision | null
+  /**
+   * The caller's own label for itself. Unverified, and never part of authority.
+   */
+  agent_label: string | null
+  /**
+   * True when the process's parent chain reaches the session's root shell.
+   *
+   * A checked hint, recorded for diagnostics. Section 11 is explicit that ancestry is not a
+   * defence against arbitrary code running under the same account, so nothing is admitted on
+   * this alone.
+   */
+  ancestry: boolean
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * The connection the question was created on.
+   */
+  connection_id: string
+  /**
+   * The executable that process is running, where the platform names it.
+   */
+  executable: string | null
+  /**
+   * True when the helper presented the private launch channel it inherited.
+   *
+   * False means the binding rests on the checks below instead; it does not mean the source is
+   * less bound, and it is recorded so a reader can tell which evidence was available.
+   */
+  launch_channel: boolean
+  process: ProcessStartIdentity
+  /**
+   * True when the process is inside the session's own ownership boundary, as the kernel
+   * reports it. This is what admits a source.
+   */
+  session_member: boolean
+}
+/**
  * One action receipt.
  *
  * The de-duplication key is `(actor_id, action_id)`. An exact duplicate returns the stored
@@ -7902,7 +10552,7 @@ export interface ArchiveCheckpoint {
    */
   backup_generation: string
   /**
-   * The hash of that generation's encrypted manifest.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   encrypted_manifest_hash: string
   /**
@@ -8294,6 +10944,48 @@ export interface ResyncRequired {
   reason: 'send_queue_full' | 'history_evicted' | 'projection_reset'
 }
 /**
+ * The reading it produced.
+ */
+export interface TimeAdapterReading {
+  /**
+   * The service or interface the reading came from.
+   */
+  api: string
+  /**
+   * The platform's own estimate of its error, in microseconds, when it reports one.
+   */
+  estimated_error_us: U64 | null
+  /**
+   * Which platform adapter produced this reading.
+   */
+  platform: string
+  /**
+   * What the platform says is disciplining its clock.
+   */
+  source: 'network_time_service' | 'pulse_per_second' | 'unsynchronised' | 'unclassified'
+  /**
+   * What the platform says the state of that synchronisation is.
+   */
+  status:
+    | 'ok'
+    | 'insert_leap'
+    | 'delete_leap'
+    | 'leap_in_progress'
+    | 'leap_recovering'
+    | 'error'
+    | 'unavailable'
+  /**
+   * The platform's own bound on how wrong its clock may be, in microseconds.
+   *
+   * Null means the platform reported no bound, which is not the same as a bound of zero.
+   */
+  uncertainty_us: U64 | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  wall_clock_ms: string
+}
+/**
  * The host's acknowledgement of one revocation request.
  */
 export interface RevocationAcknowledgement {
@@ -8326,6 +11018,63 @@ export interface RevocationAcknowledgement {
    * One signed revocation request published by a remote owner.
    */
   request_id: string
+}
+/**
+ * The result of installing an authority revision across every affected worker.
+ *
+ * Until every barrier holds, this is `pending` with per-worker status. Cutting a network path or
+ * waiting for a lease timer is not completion, because a paused worker could already be inside a
+ * dispatch transition, so nothing here treats the absence of an answer as an answer.
+ */
+export interface RevocationBarrier {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * One entry per affected worker.
+   */
+  workers: WorkerBarrier[]
+}
+/**
+ * One worker's half of a revocation barrier.
+ */
+export interface WorkerBarrier {
+  /**
+   * The revision the worker has installed, when it has installed one.
+   */
+  acknowledged_revision: AuthorityRevision | null
+  /**
+   * Why this worker's barrier has not held, or what is still outstanding about one that has.
+   */
+  detail: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  names_pending: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted_actions: string
+  /**
+   * The actions whose dispatch transition had already won the serial race.
+   *
+   * Each one's receipt state says how much is known about what it did; the list is
+   * not only the uncertain ones.
+   */
+  possibly_executed: PossiblyExecutedAction[]
+  /**
+   * The undispatched intents the fence rejected.
+   */
+  rejected_actions: FencedAction[]
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * What this worker's barrier has reached.
+   */
+  state: 'acknowledged' | 'ended' | 'pending'
 }
 /**
  * A remote owner's signed revocation request.
@@ -8507,7 +11256,7 @@ export interface RootEditorEnterParams {
    * The revision of this reader inside that prompt.
    */
   reader_revision: string
-  root_process: ProcessStartIdentity5
+  root_process: ProcessStartIdentity6
   /**
    * One KalaReach terminal session.
    */
@@ -8571,7 +11320,7 @@ export interface PendingReaderInput {
  * unrelated program within milliseconds of the original exiting, so the host never terminates,
  * adopts or trusts a process on its identifier alone.
  */
-export interface ProcessStartIdentity5 {
+export interface ProcessStartIdentity6 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -8628,12 +11377,12 @@ export interface EditorFence {
    * The reader revision inside that prompt.
    */
   reader_revision: string
-  root_process: ProcessStartIdentity6
+  root_process: ProcessStartIdentity7
 }
 /**
  * The root shell process, with the kernel's record of when it started.
  */
-export interface ProcessStartIdentity6 {
+export interface ProcessStartIdentity7 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -8925,7 +11674,7 @@ export interface ServiceRequestSignature {
  */
 export interface ServiceRequestPayload {
   /**
-   * The SHA-256 of the canonical request body.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   body_digest: string
   /**
@@ -9235,6 +11984,14 @@ export interface SessionCreateParams1 {
    */
   environment_snapshot: EnvironmentVariable[]
   /**
+   * The palette this session starts with. Null takes the profile default.
+   *
+   * This is the one moment the palette can be chosen: section 8 fixes it at creation, and
+   * afterwards only an authorised explicit change moves it. The provenance is recorded either
+   * way, so a palette query can say where the session's colours came from.
+   */
+  palette: PaletteRequest | null
+  /**
    * How the session is presented locally.
    */
   presentation: 'attach' | 'terminal' | 'invisible'
@@ -9313,7 +12070,7 @@ export interface SessionSummary1 {
   /**
    * The root shell's process identity while the session is running.
    */
-  root_process: ProcessStartIdentity4 | null
+  root_process: ProcessStartIdentity5 | null
   /**
    * The session epoch, fixed at 1 in protocol version 1.
    */
@@ -9440,7 +12197,7 @@ export interface SessionSummary2 {
   /**
    * The root shell's process identity while the session is running.
    */
-  root_process: ProcessStartIdentity4 | null
+  root_process: ProcessStartIdentity5 | null
   /**
    * The session epoch, fixed at 1 in protocol version 1.
    */
@@ -9527,7 +12284,7 @@ export interface SessionSummary3 {
   /**
    * The root shell's process identity while the session is running.
    */
-  root_process: ProcessStartIdentity4 | null
+  root_process: ProcessStartIdentity5 | null
   /**
    * The session epoch, fixed at 1 in protocol version 1.
    */
@@ -9657,7 +12414,7 @@ export interface ArchiveManifest {
    */
   owner_device_id: string
   /**
-   * The manifest schema version.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   schema_version: string
 }
@@ -9676,11 +12433,11 @@ export interface ManifestObject {
  */
 export interface EncryptedObjectRef1 {
   /**
-   * The stored size of the encrypted object, in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   encrypted_len: string
   /**
-   * The SHA-256 of the encrypted object, including its `secretstream` header.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   encrypted_object_hash: string
   /**
@@ -9698,7 +12455,7 @@ export interface SignedClientBundle {
    */
   signature: string
   /**
-   * The transcript the signature covers.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   transcript: string
 }
@@ -9759,7 +12516,7 @@ export interface SignedHostBundle {
    */
   signature: string
   /**
-   * The transcript the signature covers.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   transcript: string
 }
@@ -10175,7 +12932,7 @@ export interface TerminalResizeParams {
    * One CLI or application attachment, independently of its device.
    */
   attachment_id: string
-  dimensions: Dimensions5
+  dimensions: Dimensions6
   /**
    * The geometry epoch the caller believes is current.
    */
@@ -10187,15 +12944,139 @@ export interface TerminalResizeParams {
  * Every constraint of section 8 is checked by [`Dimensions::validate`] before anything is
  * allocated: 1 to 2,048 columns, 1 to 1,024 rows and at most 262,144 cells, all three at once.
  */
-export interface Dimensions5 {
+export interface Dimensions6 {
   /**
-   * Columns, from 1 to 2,048.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   columns: string
   /**
-   * Rows, from 1 to 1,024.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
+}
+/**
+ * One reading of the platform time adapter.
+ *
+ * Every field is what the operating system reported, classified into this build's vocabulary. No
+ * field is a measurement of our own, and nothing here contacts a time server: section 9 requires
+ * the actual supported platform service and forbids an invented universal authenticated call.
+ */
+export interface TimeAdapterReading1 {
+  /**
+   * The service or interface the reading came from.
+   */
+  api: string
+  /**
+   * The platform's own estimate of its error, in microseconds, when it reports one.
+   */
+  estimated_error_us: U64 | null
+  /**
+   * Which platform adapter produced this reading.
+   */
+  platform: string
+  /**
+   * What the platform says is disciplining its clock.
+   */
+  source: 'network_time_service' | 'pulse_per_second' | 'unsynchronised' | 'unclassified'
+  /**
+   * What the platform says the state of that synchronisation is.
+   */
+  status:
+    | 'ok'
+    | 'insert_leap'
+    | 'delete_leap'
+    | 'leap_in_progress'
+    | 'leap_recovering'
+    | 'error'
+    | 'unavailable'
+  /**
+   * The platform's own bound on how wrong its clock may be, in microseconds.
+   *
+   * Null means the platform reported no bound, which is not the same as a bound of zero.
+   */
+  uncertainty_us: U64 | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  wall_clock_ms: string
+}
+/**
+ * A durable mark of what this host's wall clock read, and what stood behind it.
+ *
+ * The boot identity is part of it because a continuous reading means nothing outside the boot it
+ * was taken in: the clock restarts, so a deadline from another boot reads as long past rather
+ * than as time remaining.
+ */
+export interface TimeCheckpoint {
+  boot_identity: BootIdentity7
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  continuous_ms: string
+  reading: TimeAdapterReading2
+  /**
+   * Whether the wall clock was trusted at the mark.
+   */
+  trust: 'trusted' | 'unresolved'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  wall_clock_ms: string
+}
+/**
+ * The boot the mark was taken in.
+ */
+export interface BootIdentity7 {
+  /**
+   * Where the value came from.
+   */
+  source: 'linux_boot_id' | 'macos_boot_session_uuid' | 'boot_time'
+  /**
+   * The opaque value. Compared for equality, never interpreted.
+   */
+  value: string
+}
+/**
+ * The platform reading that stood behind the mark.
+ */
+export interface TimeAdapterReading2 {
+  /**
+   * The service or interface the reading came from.
+   */
+  api: string
+  /**
+   * The platform's own estimate of its error, in microseconds, when it reports one.
+   */
+  estimated_error_us: U64 | null
+  /**
+   * Which platform adapter produced this reading.
+   */
+  platform: string
+  /**
+   * What the platform says is disciplining its clock.
+   */
+  source: 'network_time_service' | 'pulse_per_second' | 'unsynchronised' | 'unclassified'
+  /**
+   * What the platform says the state of that synchronisation is.
+   */
+  status:
+    | 'ok'
+    | 'insert_leap'
+    | 'delete_leap'
+    | 'leap_in_progress'
+    | 'leap_recovering'
+    | 'error'
+    | 'unavailable'
+  /**
+   * The platform's own bound on how wrong its clock may be, in microseconds.
+   *
+   * Null means the platform reported no bound, which is not the same as a bound of zero.
+   */
+  uncertainty_us: U64 | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  wall_clock_ms: string
 }
 /**
  * Parameters of `upload.begin`.
@@ -10206,7 +13087,7 @@ export interface UploadBeginParams {
    */
   declared_byte_len: string
   /**
-   * The declared whole-file digest, verified before anything is published.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   declared_digest: string
   /**
@@ -10266,15 +13147,15 @@ export interface UploadBeginResult {
  */
 export interface ChunkLayout1 {
   /**
-   * How many chunks the transfer has.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   chunk_count: string
   /**
-   * Bytes per chunk, except the last.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   chunk_len: string
   /**
-   * Length of the final chunk. Equal to `chunk_len` when the size divides exactly.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   last_chunk_len: string
 }
@@ -10326,15 +13207,15 @@ export interface UploadChunkParams {
  */
 export interface ChunkDescriptor2 {
   /**
-   * Its exact length.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   byte_len: string
   /**
-   * The SHA-256 digest of exactly those bytes.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   digest: string
   /**
-   * The chunk's position in the layout.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   index: string
 }
@@ -10375,7 +13256,7 @@ export interface UploadFinishParams {
    */
   declared_byte_len: string
   /**
-   * The declared whole-file digest, which must match the one `upload.begin` recorded.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   declared_digest: string
   /**
@@ -10403,7 +13284,7 @@ export interface UploadFinishResult {
  */
 export interface AttachmentHandle2 {
   /**
-   * The verified length in bytes.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   byte_len: string
   /**
@@ -10511,15 +13392,15 @@ export interface UploadStatusResult {
  */
 export interface ChunkLayout2 {
   /**
-   * How many chunks the transfer has.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   chunk_count: string
   /**
-   * Bytes per chunk, except the last.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   chunk_len: string
   /**
-   * Length of the final chunk. Equal to `chunk_len` when the size divides exactly.
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   last_chunk_len: string
 }
@@ -10531,7 +13412,7 @@ export interface ChunkLayout2 {
  * against, and the identity fields are what the challenge's answer must match.
  */
 export interface WorkerDescriptor {
-  boot_identity: BootIdentity6
+  boot_identity: BootIdentity8
   /**
    * The local alias.
    */
@@ -10544,7 +13425,7 @@ export interface WorkerDescriptor {
    * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
-  process_start_identity: ProcessStartIdentity7
+  process_start_identity: ProcessStartIdentity8
   protocol_version: ProtocolVersion5
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
@@ -10575,7 +13456,7 @@ export interface WorkerDescriptor {
 /**
  * The boot the worker started in.
  */
-export interface BootIdentity6 {
+export interface BootIdentity8 {
   /**
    * Where the value came from.
    */
@@ -10592,7 +13473,7 @@ export interface BootIdentity6 {
  * unrelated program within milliseconds of the original exiting, so the host never terminates,
  * adopts or trusts a process on its identifier alone.
  */
-export interface ProcessStartIdentity7 {
+export interface ProcessStartIdentity8 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */

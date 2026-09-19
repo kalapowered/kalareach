@@ -82,6 +82,64 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "ActionObservation": {
+      "additionalProperties": false,
+      "description": "One piece of additive evidence about an action.\n\nThe word in a user interface is \"observed\", and it means evidence was observed. It does not\nmean the mutation is confirmed, which is why every observation carries the provenance a reader\nneeds in order to know which of the two it is looking at.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The action the evidence is about."
+        },
+        "claimed_result": {
+          "$ref": "#/$defs/ObservedResult",
+          "description": "What the evidence claims happened."
+        },
+        "observed_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the observation was recorded."
+        },
+        "provenance": {
+          "$ref": "#/$defs/ObservationProvenance",
+          "description": "Where the evidence came from."
+        },
+        "source_cursor": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The position in the source stream the evidence was read from, when there is one."
+        },
+        "subject": {
+          "description": "The subject the evidence is about, named the way its own interface names it.",
+          "type": "string"
+        },
+        "subject_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The subject's version at the moment of the observation, when the subject has one."
+        }
+      },
+      "required": [
+        "action_id",
+        "provenance",
+        "subject",
+        "subject_revision",
+        "source_cursor",
+        "claimed_result",
+        "observed_at_ms"
+      ],
+      "type": "object"
+    },
     "ActionReadParams": {
       "additionalProperties": false,
       "description": "What `action.read` names.",
@@ -503,17 +561,394 @@
       ],
       "type": "object"
     },
+    "AgentTarget": {
+      "description": "One agent an installation can target.",
+      "oneOf": [
+        {
+          "const": "codex",
+          "description": "Codex.",
+          "type": "string"
+        },
+        {
+          "const": "claude-code",
+          "description": "Claude Code.",
+          "type": "string"
+        },
+        {
+          "const": "opencode",
+          "description": "OpenCode.",
+          "type": "string"
+        },
+        {
+          "const": "gemini-cli",
+          "description": "Gemini CLI.",
+          "type": "string"
+        },
+        {
+          "const": "kimi-code-cli",
+          "description": "Kimi Code CLI.",
+          "type": "string"
+        },
+        {
+          "const": "qoder-cli",
+          "description": "Qoder CLI.",
+          "type": "string"
+        }
+      ]
+    },
     "AgentThreadId": {
       "description": "The upstream agent's conversation identifier, where available. Correlation data, not authority.",
       "maxLength": 256,
       "minLength": 1,
       "type": "string"
     },
+    "AgentToolsInstallResult": {
+      "additionalProperties": false,
+      "description": "The result of `agent_tools.install`.",
+      "properties": {
+        "already_installed": {
+          "description": "True when the installation was already present and unchanged.",
+          "type": "boolean"
+        },
+        "manifest": {
+          "$ref": "#/$defs/ChangeManifest",
+          "description": "What was changed, and how to undo it."
+        },
+        "unresolved": {
+          "description": "What an earlier attempt may have written and this one could not account for.\n\nEmpty in the ordinary case. A line here means the installation is not finished: the change\nit names is neither owned nor undone, and somebody has to look at it.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "manifest",
+        "already_installed",
+        "unresolved"
+      ],
+      "type": "object"
+    },
+    "AgentToolsParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `agent_tools.install`, `agent_tools.status` and `agent_tools.remove`.",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentTarget",
+          "description": "The agent."
+        },
+        "project_dir": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The project directory, for project scope."
+        },
+        "scope": {
+          "$ref": "#/$defs/InstallScope",
+          "description": "The scope."
+        }
+      },
+      "required": [
+        "agent",
+        "scope",
+        "project_dir"
+      ],
+      "type": "object"
+    },
+    "AgentToolsRemoveResult": {
+      "additionalProperties": false,
+      "description": "The result of `agent_tools.remove`.",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentTarget",
+          "description": "The agent."
+        },
+        "removed": {
+          "description": "What was undone.",
+          "items": {
+            "$ref": "#/$defs/ChangeOperation"
+          },
+          "type": "array"
+        },
+        "retained": {
+          "description": "What was left alone, and why.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "scope": {
+          "$ref": "#/$defs/InstallScope",
+          "description": "The scope."
+        }
+      },
+      "required": [
+        "agent",
+        "scope",
+        "removed",
+        "retained"
+      ],
+      "type": "object"
+    },
+    "AgentToolsStatusResult": {
+      "additionalProperties": false,
+      "description": "The result of `agent_tools.status`.",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentTarget",
+          "description": "The agent."
+        },
+        "drift": {
+          "description": "What no longer matches the record, in the words a person reads.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "files": {
+          "description": "Each installed file and whether it is still what was written.",
+          "items": {
+            "$ref": "#/$defs/InstalledFile"
+          },
+          "type": "array"
+        },
+        "installed": {
+          "description": "True when a recorded installation is present.",
+          "type": "boolean"
+        },
+        "removal": {
+          "description": "The operations a removal would run.",
+          "items": {
+            "$ref": "#/$defs/ChangeOperation"
+          },
+          "type": "array"
+        },
+        "root": {
+          "description": "The directory the scope resolved to.",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/InstallScope",
+          "description": "The scope."
+        },
+        "skill_version": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version recorded, when there is one."
+        }
+      },
+      "required": [
+        "agent",
+        "scope",
+        "root",
+        "installed",
+        "skill_version",
+        "files",
+        "drift",
+        "removal"
+      ],
+      "type": "object"
+    },
     "AgentTurnId": {
       "description": "The upstream agent's current turn identifier, where available.",
       "maxLength": 256,
       "minLength": 1,
       "type": "string"
+    },
+    "Alert": {
+      "additionalProperties": false,
+      "description": "One alert. It reports; it asks for nothing.",
+      "properties": {
+        "created_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was raised."
+        },
+        "dedup_id": {
+          "description": "The source's own de-duplication identifier.",
+          "type": "string"
+        },
+        "safe_session_link": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A link into this host's own session, when the source supplied one."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session it belongs to."
+        },
+        "severity": {
+          "$ref": "#/$defs/AlertSeverity",
+          "description": "How urgent it is."
+        },
+        "source": {
+          "$ref": "#/$defs/QuestionSource",
+          "description": "The verified source, and the unverified label beside it."
+        },
+        "text": {
+          "description": "The concise text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "dedup_id",
+        "session_id",
+        "source",
+        "text",
+        "severity",
+        "safe_session_link",
+        "created_at_ms"
+      ],
+      "type": "object"
+    },
+    "AlertCreateParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `alert.create`.",
+      "properties": {
+        "agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The caller's label for itself. Unverified."
+        },
+        "dedup_id": {
+          "description": "The source's de-duplication identifier.",
+          "type": "string"
+        },
+        "safe_session_link": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A link into this host's own session, when there is one."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        },
+        "severity": {
+          "$ref": "#/$defs/AlertSeverity",
+          "description": "How urgent it is."
+        },
+        "text": {
+          "description": "The concise text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "session_id",
+        "dedup_id",
+        "agent_name",
+        "text",
+        "severity",
+        "safe_session_link"
+      ],
+      "type": "object"
+    },
+    "AlertCreateResult": {
+      "additionalProperties": false,
+      "description": "The result of `alert.create`.",
+      "properties": {
+        "alert": {
+          "$ref": "#/$defs/Alert",
+          "description": "The alert."
+        },
+        "deduplicated": {
+          "description": "True when an exact duplicate returned the existing alert rather than raising one.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "alert",
+        "deduplicated"
+      ],
+      "type": "object"
+    },
+    "AlertSeverity": {
+      "description": "How urgent an alert is.",
+      "oneOf": [
+        {
+          "const": "info",
+          "description": "Something worth knowing.",
+          "type": "string"
+        },
+        {
+          "const": "warning",
+          "description": "Something that may need attention.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "Something that went wrong.",
+          "type": "string"
+        }
+      ]
+    },
+    "AnswerRecord": {
+      "additionalProperties": false,
+      "description": "The answer, who gave it and against which revision.",
+      "properties": {
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The host-verified principal that answered. A caller never asserts its own."
+        },
+        "answer": {
+          "$ref": "#/$defs/QuestionAnswer",
+          "description": "What was answered."
+        },
+        "answered_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the answer was recorded."
+        },
+        "device_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeviceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The paired device that answered, when the answer came from one."
+        },
+        "question_revision": {
+          "$ref": "#/$defs/QuestionRevision",
+          "description": "The revision of the question the person was shown."
+        }
+      },
+      "required": [
+        "answer",
+        "actor_id",
+        "device_id",
+        "question_revision",
+        "answered_at_ms"
+      ],
+      "type": "object"
     },
     "ApplicationInstanceId": {
       "description": "One foreground application within a terminal session.",
@@ -1041,11 +1476,23 @@
         "dimensions": {
           "$ref": "#/$defs/Dimensions",
           "description": "Its current physical dimensions."
+        },
+        "position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ViewportPosition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where its window sits. Null is the live screen."
         }
       },
       "required": [
         "attachment_id",
-        "dimensions"
+        "dimensions",
+        "position"
       ],
       "type": "object"
     },
@@ -1057,6 +1504,17 @@
           "$ref": "#/$defs/GeometryState",
           "description": "The canonical geometry, which a viewport report never changes."
         },
+        "position": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ViewportPosition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where the window ended up, as a row identifier, or null for the live screen.\n\nA request above the oldest row the session still holds is answered with the oldest one\nthere is rather than refused, and a request at or below the live screen's first row is\nanswered with the live screen. Either way this says where the window actually is."
+        },
         "presentation": {
           "$ref": "#/$defs/TerminalPresentationMode",
           "description": "How this attachment now displays the canonical grid."
@@ -1064,7 +1522,8 @@
       },
       "required": [
         "geometry",
-        "presentation"
+        "presentation",
+        "position"
       ],
       "type": "object"
     },
@@ -1087,8 +1546,20 @@
     },
     "AuthorityRevisionAck": {
       "additionalProperties": false,
-      "description": "A worker's acknowledgement that it is acting under an authority revision.",
+      "description": "A worker's acknowledgement that it is acting under an authority revision.\n\nSection 9 makes the acknowledgement two statements rather than one: the revision is installed,\n**and** the undispatched actions it affects have been rejected or fenced. The two lists are\ntherefore part of the acknowledgement rather than something a caller has to ask for\nafterwards. An action whose dispatch transition had already won the serial race is named in\n`possibly_executed`.\n\nThe evidence defaults to absent on the wire. A worker keeps running across a controller\nreplacement, so during an update a new daemon can be talking to a worker built before the\nevidence existed, and architecture decision C keeps local support until the last such worker\nexits. Defaulting lets that worker's two-field acknowledgement decode instead of failing the\nrevocation outright, and the daemon can still tell it apart from a worker whose fence found\nnothing, because absent and empty are different values.",
       "properties": {
+        "fence": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FenceEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "What the fence did, when this worker reports it.\n\nAbsent is not the same as empty. Empty says the fence ran and found nothing; absent says\nthis worker does not report fence evidence at all, and a daemon that read the two the same\nway would call a revocation complete on the strength of a worker that never said so."
+        },
         "revision": {
           "$ref": "#/$defs/AuthorityRevision",
           "description": "The revision the worker now holds."
@@ -1111,6 +1582,12 @@
         "environment_id": {
           "$ref": "#/$defs/EnvironmentId",
           "description": "The environment whose authority changed."
+        },
+        "evidence_from": {
+          "description": "How many names of this revision's fence evidence the daemon already has.\n\nNought asks for the first page, which is what a first announcement is. An announcement that\ncarries more is asking for the rest of what the previous answer said remained, from the\nname after the last one it carried.\n\nIt is absent from the wire when it is nought, so an announcement that asks for a first page\nis byte for byte what a worker built before paging existed expects. A daemon only ever\nsends a continuation to a worker whose own answer reported names remaining, and a worker\nthat reports no evidence at all never does.",
+          "format": "uint64",
+          "minimum": 0,
+          "type": "integer"
         },
         "revision": {
           "$ref": "#/$defs/AuthorityRevision",
@@ -1309,6 +1786,26 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "BarrierState": {
+      "description": "What one worker's half of a revocation barrier has reached.",
+      "oneOf": [
+        {
+          "const": "acknowledged",
+          "description": "The worker installed the revision and fenced the undispatched actions it affects.",
+          "type": "string"
+        },
+        {
+          "const": "ended",
+          "description": "The worker's execution has ended, so it can no longer dispatch anything.",
+          "type": "string"
+        },
+        {
+          "const": "pending",
+          "description": "Neither has been established. The revocation is not complete for this worker.",
+          "type": "string"
+        }
+      ]
+    },
     "BootEpoch": {
       "description": "The host boot epoch, which binds continuous-time deadlines to one boot.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -1364,6 +1861,10 @@
       "description": "An opaque byte string. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
       "pattern": "^[A-Za-z0-9_-]*$",
       "type": "string"
+    },
+    "CallerToken": {
+      "$ref": "#/$defs/Bytes",
+      "description": "The opaque token that lets one verified source poll or cancel its own question.\n\nIt is not authority over a session and it is not an answer: it permits exactly the two reads\nand the one cancellation that belong to the question it was issued for, and only from the same\nverified application. Section 11 keeps it out of events, push payloads, backups and logs, so\nthis type prints as a redaction and carries no `Display`."
     },
     "CapabilityEvidenceSource": {
       "description": "What produced a capability answer.",
@@ -1715,6 +2216,235 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "CellBlink": {
+      "description": "Whether and how a run of cells blinks.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "Not blinking.",
+          "type": "string"
+        },
+        {
+          "const": "slow",
+          "description": "The slow rate.",
+          "type": "string"
+        },
+        {
+          "const": "rapid",
+          "description": "The rapid rate.",
+          "type": "string"
+        }
+      ]
+    },
+    "CellColour": {
+      "description": "One cell colour.",
+      "oneOf": [
+        {
+          "const": "default",
+          "description": "The session's own default, which a client resolves against the palette it was given.",
+          "type": "string"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A palette index.",
+          "properties": {
+            "indexed": {
+              "format": "uint8",
+              "maximum": 255,
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "indexed"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "A direct colour.",
+          "properties": {
+            "direct": {
+              "$ref": "#/$defs/Rgb"
+            }
+          },
+          "required": [
+            "direct"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "CellRendition": {
+      "additionalProperties": false,
+      "description": "The graphic rendition of a run of cells.",
+      "properties": {
+        "background": {
+          "$ref": "#/$defs/CellColour",
+          "description": "The cell colour."
+        },
+        "blink": {
+          "$ref": "#/$defs/CellBlink",
+          "description": "The blink rate."
+        },
+        "bold": {
+          "description": "Bold.",
+          "type": "boolean"
+        },
+        "faint": {
+          "description": "Faint.",
+          "type": "boolean"
+        },
+        "foreground": {
+          "$ref": "#/$defs/CellColour",
+          "description": "The text colour."
+        },
+        "invisible": {
+          "description": "Invisible.",
+          "type": "boolean"
+        },
+        "italic": {
+          "description": "Italic.",
+          "type": "boolean"
+        },
+        "overline": {
+          "description": "Overlined.",
+          "type": "boolean"
+        },
+        "reverse": {
+          "description": "Reverse video.",
+          "type": "boolean"
+        },
+        "strikethrough": {
+          "description": "Struck through.",
+          "type": "boolean"
+        },
+        "underline": {
+          "$ref": "#/$defs/CellUnderline",
+          "description": "The underline style."
+        },
+        "underline_colour": {
+          "$ref": "#/$defs/CellColour",
+          "description": "The underline colour, where it differs from the text."
+        },
+        "vertical_align": {
+          "$ref": "#/$defs/CellVerticalAlign",
+          "description": "The position against the baseline."
+        }
+      },
+      "required": [
+        "foreground",
+        "background",
+        "underline_colour",
+        "underline",
+        "blink",
+        "vertical_align",
+        "bold",
+        "faint",
+        "italic",
+        "reverse",
+        "invisible",
+        "strikethrough",
+        "overline"
+      ],
+      "type": "object"
+    },
+    "CellRun": {
+      "additionalProperties": false,
+      "description": "One run of cells that share a rendition and a hyperlink.",
+      "properties": {
+        "cells": {
+          "$ref": "#/$defs/U64",
+          "description": "How many cells the run occupies, counting a wide cell as two.\n\nA client draws from `column` and advances by this, so a destination whose own width model\ndisagrees with the session's is corrected at the next run rather than shifting everything\nafter it."
+        },
+        "column": {
+          "$ref": "#/$defs/U64",
+          "description": "The canonical column of the first cell, zero-based."
+        },
+        "hyperlink": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The hyperlink this run is inside, as inert metadata."
+        },
+        "rendition": {
+          "$ref": "#/$defs/CellRendition",
+          "description": "The rendition."
+        },
+        "text": {
+          "description": "The text.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "column",
+        "cells",
+        "text",
+        "rendition",
+        "hyperlink"
+      ],
+      "type": "object"
+    },
+    "CellUnderline": {
+      "description": "How a run of cells is underlined.",
+      "oneOf": [
+        {
+          "const": "none",
+          "description": "Not underlined.",
+          "type": "string"
+        },
+        {
+          "const": "single",
+          "description": "One line.",
+          "type": "string"
+        },
+        {
+          "const": "double",
+          "description": "Two lines.",
+          "type": "string"
+        },
+        {
+          "const": "curly",
+          "description": "A curly line.",
+          "type": "string"
+        },
+        {
+          "const": "dotted",
+          "description": "A dotted line.",
+          "type": "string"
+        },
+        {
+          "const": "dashed",
+          "description": "A dashed line.",
+          "type": "string"
+        }
+      ]
+    },
+    "CellVerticalAlign": {
+      "description": "Where a run of cells sits against the baseline.",
+      "oneOf": [
+        {
+          "const": "baseline",
+          "description": "On the baseline.",
+          "type": "string"
+        },
+        {
+          "const": "superscript",
+          "description": "Raised.",
+          "type": "string"
+        },
+        {
+          "const": "subscript",
+          "description": "Lowered.",
+          "type": "string"
+        }
+      ]
+    },
     "ChangeKind": {
       "description": "What the working tree holds for one path.\n\nA copy is not the only way to carry an inclusion: a deletion is carried by removing the path\nfrom the new workspace, and a path this host cannot read is carried by neither.",
       "oneOf": [
@@ -1735,6 +2465,142 @@
         }
       ]
     },
+    "ChangeManifest": {
+      "additionalProperties": false,
+      "description": "The exact set of changes one installation made, and how to undo them.",
+      "properties": {
+        "agent": {
+          "$ref": "#/$defs/AgentTarget",
+          "description": "The agent it was installed for."
+        },
+        "entry_point": {
+          "description": "The command the agent runs to reach the tools.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "operations": {
+          "description": "Every change, in the order it was applied.\n\nA removal undoes them in the order it can carry out: files and server entries first, then\nthe directories that held them, deepest first.",
+          "items": {
+            "$ref": "#/$defs/ChangeOperation"
+          },
+          "type": "array"
+        },
+        "root": {
+          "description": "The directory the scope resolved to.",
+          "type": "string"
+        },
+        "scope": {
+          "$ref": "#/$defs/InstallScope",
+          "description": "The scope it was installed at."
+        },
+        "skill_version": {
+          "description": "The skill version installed.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "skill_version",
+        "agent",
+        "scope",
+        "root",
+        "entry_point",
+        "operations"
+      ],
+      "type": "object"
+    },
+    "ChangeOperation": {
+      "description": "One change an installation makes, with its inverse implied by its kind.",
+      "oneOf": [
+        {
+          "description": "A directory this installation created. Removal deletes it only when it is empty.",
+          "properties": {
+            "operation": {
+              "const": "create_directory",
+              "type": "string"
+            },
+            "path": {
+              "description": "The absolute path.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation",
+            "path"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A file this installation owns outright.",
+          "properties": {
+            "digest": {
+              "$ref": "#/$defs/Digest256",
+              "description": "The digest of the content written. A removal that finds different content stops."
+            },
+            "operation": {
+              "const": "write_file",
+              "type": "string"
+            },
+            "path": {
+              "description": "The absolute path.",
+              "type": "string"
+            },
+            "replaced_digest": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Digest256"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The digest of what was there before, when the file already existed."
+            }
+          },
+          "required": [
+            "operation",
+            "path",
+            "digest",
+            "replaced_digest"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "One entry added to an agent's configuration document, under the managed marker.\n\nNothing else in the document is read as this installation's, and nothing else is written.",
+          "properties": {
+            "created_document": {
+              "description": "True when the document did not exist and this installation created it.",
+              "type": "boolean"
+            },
+            "digest": {
+              "$ref": "#/$defs/Digest256",
+              "description": "The digest of the entry's value, so a removal can tell an unchanged entry from an\nedited one."
+            },
+            "entry": {
+              "description": "The dotted location of the entry inside it, for example `mcpServers.kalareach`.",
+              "type": "string"
+            },
+            "operation": {
+              "const": "add_configuration_entry",
+              "type": "string"
+            },
+            "path": {
+              "description": "The absolute path of the document.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "operation",
+            "path",
+            "entry",
+            "digest",
+            "created_document"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "ChangeSetId": {
       "description": "One immutable captured change set.",
       "format": "uuid",
@@ -1745,6 +2611,49 @@
       "description": "The exact version of a change set that was tested or reviewed.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "CharsetDesignations": {
+      "additionalProperties": false,
+      "description": "The character sets a saved cursor carries.",
+      "properties": {
+        "g0": {
+          "description": "The set designated as G0.",
+          "type": "string"
+        },
+        "g1": {
+          "description": "The set designated as G1.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "g0",
+        "g1"
+      ],
+      "type": "object"
+    },
+    "CharsetState": {
+      "additionalProperties": false,
+      "description": "The designated character sets and the locking shift.",
+      "properties": {
+        "g0": {
+          "description": "The set designated as G0.",
+          "type": "string"
+        },
+        "g1": {
+          "description": "The set designated as G1.",
+          "type": "string"
+        },
+        "shift_out": {
+          "description": "Whether the shift-out set is selected.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "g0",
+        "g1",
+        "shift_out"
+      ],
+      "type": "object"
     },
     "ChunkDescriptor": {
       "additionalProperties": false,
@@ -4819,6 +5728,55 @@
       ],
       "type": "object"
     },
+    "ExpirationTombstone": {
+      "additionalProperties": false,
+      "description": "The record an expired object leaves behind.\n\nIt outlives a retrust deliberately. Section 9 keeps old expiration tombstones when the wall\nclock becomes trusted again, which is what stops a clock correction from reviving something\nthat had already run out.",
+      "properties": {
+        "boot_identity": {
+          "$ref": "#/$defs/BootIdentity",
+          "description": "The boot the expiry was observed in."
+        },
+        "cross_reboot": {
+          "default": true,
+          "description": "Whether the object could still be presented in another boot.\n\nAn object bounded only by a continuous deadline in one boot is refused in that boot by a\nclock that only moves forward, and in any other boot by the boot identity its deadline\nbelongs to. Nothing but this record refuses one that also carries a trusted UTC deadline,\nwhich is why a host that has to bound its tombstone table can let the first kind go and\nnever the second.\n\nA record that does not say defaults to `true`, which is the answer that keeps the\ntombstone: a host reading back a tombstone from a build that did not record this cannot\ntell which kind it was, and dropping one it should have kept is the failure that matters.",
+          "type": "boolean"
+        },
+        "expired_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "What the wall clock read when the expiry was observed."
+        },
+        "object": {
+          "description": "The object, named the way its own store names it.",
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/ExpiryReason",
+          "description": "Why it expired."
+        }
+      },
+      "required": [
+        "object",
+        "reason",
+        "boot_identity",
+        "expired_at_ms"
+      ],
+      "type": "object"
+    },
+    "ExpiryReason": {
+      "description": "Why an object expired.",
+      "oneOf": [
+        {
+          "const": "continuous_deadline",
+          "description": "A continuous deadline in this boot passed.",
+          "type": "string"
+        },
+        {
+          "const": "trusted_utc_deadline",
+          "description": "A trusted UTC deadline passed.",
+          "type": "string"
+        }
+      ]
+    },
     "ExternalProviderPolicy": {
       "description": "What an organisation permits its members' clients to reach outside KalaReach.",
       "oneOf": [
@@ -4907,6 +5865,41 @@
           "type": "string"
         }
       ]
+    },
+    "FenceEvidence": {
+      "additionalProperties": false,
+      "description": "What a worker's fence did, as one acknowledgement carries it.\n\nThe lists are the acknowledgement rather than an addition to it: section 9 makes the\nacknowledgement a statement that the revision is installed **and** that the undispatched\nactions it affects have been rejected or named. A worker that reports no evidence at all is a\ndifferent thing from one that reports empty lists, which is why this travels as a whole.",
+      "properties": {
+        "omitted": {
+          "$ref": "#/$defs/U64",
+          "description": "How many affected actions this worker could hold no name for at all.\n\nNought in every ordinary case. Anything else says the fence affected more actions than one\nworker keeps names for, and their receipts are in its journal."
+        },
+        "possibly_executed": {
+          "description": "The actions whose dispatch transition had already won the serial race, in this page.\n\nEach one's receipt state says how much is known about what it did; the list is not only the\nuncertain ones.",
+          "items": {
+            "$ref": "#/$defs/PossiblyExecutedAction"
+          },
+          "type": "array"
+        },
+        "rejected_actions": {
+          "description": "The undispatched intents the fence rejected, in this page.",
+          "items": {
+            "$ref": "#/$defs/FencedAction"
+          },
+          "type": "array"
+        },
+        "remaining": {
+          "$ref": "#/$defs/U64",
+          "description": "How many names this worker holds that this page did not carry.\n\nNought means the evidence is complete as far as this worker holds it. Anything else is what\nthe next announcement asks for, from `evidence_from` = the number of names taken so far."
+        }
+      },
+      "required": [
+        "rejected_actions",
+        "possibly_executed",
+        "remaining",
+        "omitted"
+      ],
+      "type": "object"
     },
     "FenceId": {
       "description": "One published editor fence. An identity from an unacknowledged exchange names no fence.",
@@ -5074,6 +6067,25 @@
           "type": "string"
         }
       ]
+    },
+    "FencedAction": {
+      "additionalProperties": false,
+      "description": "One action a fence named, with the actor whose action it was.\n\nThe actor is part of the name because the de-duplication key is the actor and the action\ntogether: two actors may each have used one identifier, and an identifier on its own would name\neither of them.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The action."
+        },
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The actor whose action it was."
+        }
+      },
+      "required": [
+        "actor_id",
+        "action_id"
+      ],
+      "type": "object"
     },
     "FilesystemIdentity": {
       "additionalProperties": false,
@@ -5795,6 +6807,56 @@
       ],
       "type": "object"
     },
+    "HyperlinkChange": {
+      "additionalProperties": false,
+      "description": "The hyperlink the next character printed belongs to, once it has changed.\n\nA null target is an open link that closed. Without the distinction a client could not tell a\nlink that closed from one that was never mentioned.",
+      "properties": {
+        "uri": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The target, or null when no link is open."
+        }
+      },
+      "required": [
+        "uri"
+      ],
+      "type": "object"
+    },
+    "HyperlinkRange": {
+      "additionalProperties": false,
+      "description": "A hyperlink over a range of cells.\n\nIt is inert metadata. A reconnection restores it so a later click still works; nothing here\nactivates anything, and a scheme that would launch an external application needs the client's\nown policy before anything happens.",
+      "properties": {
+        "end_column": {
+          "$ref": "#/$defs/U64",
+          "description": "One past the last column."
+        },
+        "row": {
+          "$ref": "#/$defs/U64",
+          "description": "The stable row identifier."
+        },
+        "start_column": {
+          "$ref": "#/$defs/U64",
+          "description": "The first column, zero-based."
+        },
+        "uri": {
+          "description": "The target.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "row",
+        "start_column",
+        "end_column",
+        "uri"
+      ],
+      "type": "object"
+    },
     "IdempotencyBehaviour": {
       "description": "How a repeated request is resolved.",
       "oneOf": [
@@ -6332,11 +7394,57 @@
         }
       ]
     },
+    "InstallScope": {
+      "description": "Where an installation is written.",
+      "oneOf": [
+        {
+          "const": "user",
+          "description": "This operating-system user's own agent configuration.",
+          "type": "string"
+        },
+        {
+          "const": "project",
+          "description": "One project directory's agent configuration.",
+          "type": "string"
+        }
+      ]
+    },
     "InstallationId": {
       "description": "One native application installation registered with a push gateway.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "InstalledFile": {
+      "additionalProperties": false,
+      "description": "What one installed file looks like now.",
+      "properties": {
+        "actual_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest on disk now, or null when the path is gone."
+        },
+        "expected_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest the manifest recorded."
+        },
+        "path": {
+          "description": "The absolute path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "expected_digest",
+        "actual_digest"
+      ],
+      "type": "object"
     },
     "InterruptAction": {
       "description": "What an interrupt may do.\n\nThe method accepts only the configured native interrupt action. It never accepts arbitrary\ncommand bytes, and it bypasses the reader-transition hold.",
@@ -6472,6 +7580,35 @@
           "type": "string"
         }
       ]
+    },
+    "KittyKeyboardState": {
+      "additionalProperties": false,
+      "description": "One buffer's Kitty keyboard negotiation.",
+      "properties": {
+        "flags": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The flags in force, when the protocol is in use."
+        },
+        "stack": {
+          "description": "The flag stack, oldest first.",
+          "items": {
+            "$ref": "#/$defs/U64"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "flags",
+        "stack"
+      ],
+      "type": "object"
     },
     "LaunchCommand": {
       "description": "What a launch installs in the editor.\n\nAn argument vector is the safe form: the integration quotes it for its own shell. A quoted\ncommand is already the exact text to run, and neither form is assembled by interpolation.",
@@ -6776,6 +7913,35 @@
       "required": [
         "object",
         "filename"
+      ],
+      "type": "object"
+    },
+    "MarginState": {
+      "additionalProperties": false,
+      "description": "The scroll region.",
+      "properties": {
+        "bottom": {
+          "$ref": "#/$defs/U64",
+          "description": "The bottom row, zero-based and inclusive."
+        },
+        "left": {
+          "$ref": "#/$defs/U64",
+          "description": "The left column, zero-based and inclusive."
+        },
+        "right": {
+          "$ref": "#/$defs/U64",
+          "description": "The right column, zero-based and inclusive."
+        },
+        "top": {
+          "$ref": "#/$defs/U64",
+          "description": "The top row, zero-based and inclusive."
+        }
+      },
+      "required": [
+        "top",
+        "bottom",
+        "left",
+        "right"
       ],
       "type": "object"
     },
@@ -7982,6 +9148,51 @@
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
     },
+    "ObservationProvenance": {
+      "description": "Where an observation's evidence came from.\n\nOnly an authoritative answer can resolve an uncertain outcome. Everything else is evidence a\nperson may read and act on, and nothing more: section 9 says outright that an inferred screen\nobservation cannot change `unknown` to `applied`.",
+      "oneOf": [
+        {
+          "const": "authoritative_interface",
+          "description": "The interface that owns the subject answered for this operation.",
+          "type": "string"
+        },
+        {
+          "const": "upstream_correlation",
+          "description": "A connector matched its own upstream correlation identifier to this operation.",
+          "type": "string"
+        },
+        {
+          "const": "inferred_screen",
+          "description": "The host parsed a screen and inferred what it means. Inference, never confirmation.",
+          "type": "string"
+        },
+        {
+          "const": "user_report",
+          "description": "A person reported what they saw.",
+          "type": "string"
+        }
+      ]
+    },
+    "ObservedResult": {
+      "description": "What an observation claims the operation's result was.",
+      "oneOf": [
+        {
+          "const": "applied",
+          "description": "The evidence claims the operation took effect.",
+          "type": "string"
+        },
+        {
+          "const": "refused",
+          "description": "The evidence claims the operation was refused without the requested effect.",
+          "type": "string"
+        },
+        {
+          "const": "indeterminate",
+          "description": "The evidence says something about the subject without settling the operation.",
+          "type": "string"
+        }
+      ]
+    },
     "OperationRecord": {
       "additionalProperties": false,
       "description": "One repository operation, as a read or a cancellation returns it.",
@@ -8774,6 +9985,161 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "PaletteOverride": {
+      "additionalProperties": false,
+      "description": "One indexed colour that differs from the profile default.",
+      "properties": {
+        "colour": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The colour."
+        },
+        "index": {
+          "description": "The palette index.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "index",
+        "colour"
+      ],
+      "type": "object"
+    },
+    "PalettePreset": {
+      "description": "One of the two palettes a creation can select without asking a terminal anything.",
+      "oneOf": [
+        {
+          "const": "light",
+          "description": "Dark text on a light background.",
+          "type": "string"
+        },
+        {
+          "const": "dark",
+          "description": "Light text on a dark background.",
+          "type": "string"
+        }
+      ]
+    },
+    "PaletteProvenance": {
+      "description": "Where the session's palette came from.\n\nProvenance travels with the palette because succession must not change it. A second attachment\nwith different colours is shown the session's palette, not its own, and the source says which\none that is.",
+      "oneOf": [
+        {
+          "const": "profile_default",
+          "description": "The profile's own default palette.",
+          "type": "string"
+        },
+        {
+          "const": "client_preference",
+          "description": "A client's stated foreground and background, shared during the bounded probe.",
+          "type": "string"
+        },
+        {
+          "const": "light_preset",
+          "description": "The light preset, selected for a no-probe or invisible creation.",
+          "type": "string"
+        },
+        {
+          "const": "dark_preset",
+          "description": "The dark preset, selected for a no-probe or invisible creation.",
+          "type": "string"
+        },
+        {
+          "const": "explicit_change",
+          "description": "An authorised, explicit palette change made after creation.",
+          "type": "string"
+        }
+      ]
+    },
+    "PaletteRequest": {
+      "description": "A palette a session can be started with, chosen before the shell has produced anything.\n\nSection 8 fixes the palette at creation and records where it came from. A preset is what a\nno-probe or invisible creation selects, because neither has a terminal whose colours could be\nasked for; the probe form carries the foreground and background a client learned from its own\nbounded probe of the terminal the person is sitting at.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "One of the two presets.",
+          "properties": {
+            "preset": {
+              "$ref": "#/$defs/PalettePreset"
+            }
+          },
+          "required": [
+            "preset"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "The colours a client shared from its bounded probe.",
+          "properties": {
+            "probe": {
+              "$ref": "#/$defs/ProbedPalette"
+            }
+          },
+          "required": [
+            "probe"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "PaletteState": {
+      "additionalProperties": false,
+      "description": "The session's canonical palette and where it came from.",
+      "properties": {
+        "background": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The default background."
+        },
+        "cursor": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The cursor colour."
+        },
+        "foreground": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The default foreground."
+        },
+        "overrides": {
+          "description": "The indexed colours that differ from the profile default.",
+          "items": {
+            "$ref": "#/$defs/PaletteOverride"
+          },
+          "type": "array"
+        },
+        "pointer_background": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The pointer background."
+        },
+        "pointer_foreground": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The pointer foreground."
+        },
+        "selection_background": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The selection background."
+        },
+        "selection_foreground": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The selection foreground."
+        },
+        "source": {
+          "$ref": "#/$defs/PaletteProvenance",
+          "description": "Where this palette came from."
+        }
+      },
+      "required": [
+        "source",
+        "foreground",
+        "background",
+        "cursor",
+        "pointer_foreground",
+        "pointer_background",
+        "selection_background",
+        "selection_foreground",
+        "overrides"
+      ],
+      "type": "object"
+    },
     "ParamsValue": {
       "description": "An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.",
       "tsType": "unknown"
@@ -9058,6 +10424,35 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "PossiblyExecutedAction": {
+      "additionalProperties": false,
+      "description": "An action whose dispatch transition had already won the serial race when the fence ran.\n\nThe set is defined by the race rather than by the outcome, which is what section 9 says: an\naction whose dispatch transition already won it is named in the result. [`Self::state`] is what\nsays how much is known about what it did, from `dispatching` through `unknown` to an\nauthoritative `applied` or `refused`, so a person reading a revocation sees which operations\nwent out under the authority that has just been withdrawn and which of them are still\nuncertain.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The action."
+        },
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The actor that submitted it."
+        },
+        "method": {
+          "$ref": "#/$defs/MethodName",
+          "description": "The method it was submitted under."
+        },
+        "state": {
+          "$ref": "#/$defs/ReceiptState",
+          "description": "The receipt state it stood at when the fence ran."
+        }
+      },
+      "required": [
+        "action_id",
+        "actor_id",
+        "method",
+        "state"
+      ],
+      "type": "object"
+    },
     "PowerSource": {
       "description": "What the host is running on.",
       "oneOf": [
@@ -9197,6 +10592,25 @@
           "type": "string"
         }
       ]
+    },
+    "ProbedPalette": {
+      "additionalProperties": false,
+      "description": "The default foreground and background a client's bounded probe established.",
+      "properties": {
+        "background": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The default background the terminal reported."
+        },
+        "foreground": {
+          "$ref": "#/$defs/Rgb",
+          "description": "The default foreground the terminal reported."
+        }
+      },
+      "required": [
+        "foreground",
+        "background"
+      ],
+      "type": "object"
     },
     "ProcessStartIdentity": {
       "additionalProperties": false,
@@ -9628,6 +11042,661 @@
         "remote",
         "created_at_ms",
         "workspace_count"
+      ],
+      "type": "object"
+    },
+    "ProjectedBuffer": {
+      "description": "Which screen buffer something belongs to.",
+      "oneOf": [
+        {
+          "const": "primary",
+          "description": "The primary buffer, which has the scrollback.",
+          "type": "string"
+        },
+        {
+          "const": "alternate",
+          "description": "The alternate buffer, which has none.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProjectedCursor": {
+      "additionalProperties": false,
+      "description": "The cursor, as a projection carries it.",
+      "properties": {
+        "column": {
+          "$ref": "#/$defs/U64",
+          "description": "The canonical column, zero-based."
+        },
+        "pending_wrap": {
+          "description": "Whether the next printable character wraps before it is placed.\n\nThe same coordinates mean different things with and without it, so a renderer that left it\nout would put the next character in the wrong cell.",
+          "type": "boolean"
+        },
+        "row": {
+          "$ref": "#/$defs/U64",
+          "description": "The row within the visible page, zero-based."
+        },
+        "style": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor-style number."
+        },
+        "visible": {
+          "description": "Whether the cursor is shown.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "column",
+        "row",
+        "visible",
+        "style",
+        "pending_wrap"
+      ],
+      "type": "object"
+    },
+    "ProjectedKeyboard": {
+      "additionalProperties": false,
+      "description": "The keyboard negotiation an input encoder has to reproduce.\n\nEach buffer has its own stack, so a full-screen application's negotiation cannot leak into the\nshell's when it exits. A client that knew only the active one would send the wrong encoding the\nmoment the application quit.",
+      "properties": {
+        "alternate": {
+          "$ref": "#/$defs/KittyKeyboardState",
+          "description": "The alternate buffer's negotiation."
+        },
+        "modify_other_keys": {
+          "$ref": "#/$defs/U64",
+          "description": "The `modifyOtherKeys` level."
+        },
+        "primary": {
+          "$ref": "#/$defs/KittyKeyboardState",
+          "description": "The primary buffer's negotiation."
+        }
+      },
+      "required": [
+        "modify_other_keys",
+        "primary",
+        "alternate"
+      ],
+      "type": "object"
+    },
+    "ProjectedMode": {
+      "additionalProperties": false,
+      "description": "One tracked mode and its value.",
+      "properties": {
+        "enabled": {
+          "description": "Whether it is set.",
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/ProjectedModeKind",
+          "description": "Which spelling."
+        },
+        "mode": {
+          "$ref": "#/$defs/U64",
+          "description": "The mode number."
+        }
+      },
+      "required": [
+        "kind",
+        "mode",
+        "enabled"
+      ],
+      "type": "object"
+    },
+    "ProjectedModeKind": {
+      "description": "Which spelling a tracked mode has.",
+      "oneOf": [
+        {
+          "const": "ansi",
+          "description": "An ANSI mode, set with `CSI h` and reset with `CSI l`.",
+          "type": "string"
+        },
+        {
+          "const": "dec",
+          "description": "A DEC private mode, set with `CSI ? h` and reset with `CSI ? l`.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProjectedRow": {
+      "additionalProperties": false,
+      "description": "One row of the canonical grid.",
+      "properties": {
+        "row": {
+          "$ref": "#/$defs/U64",
+          "description": "The stable identifier, which survives scrollback eviction and names the same row in every\nlater update."
+        },
+        "runs": {
+          "description": "The runs, left to right.",
+          "items": {
+            "$ref": "#/$defs/CellRun"
+          },
+          "type": "array"
+        },
+        "soft_wrapped": {
+          "description": "Whether the row ends in a soft wrap rather than a hard line break.\n\nA selection that copies two soft-wrapped rows copies one logical line, which is why the\nmarker travels with the row instead of being inferred from its length.",
+          "type": "boolean"
+        },
+        "truncated": {
+          "description": "Whether runs were dropped to keep the row inside a page's byte bound.\n\nThe degradation is explicit: a client shows what it was given and knows it is not all of\nthe row, rather than drawing a short row as though the application had written one.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "row",
+        "soft_wrapped",
+        "truncated",
+        "runs"
+      ],
+      "type": "object"
+    },
+    "ProjectedTitle": {
+      "additionalProperties": false,
+      "description": "The current titles.",
+      "properties": {
+        "icon": {
+          "description": "The icon title.",
+          "type": "string"
+        },
+        "window": {
+          "description": "The window title.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "icon",
+        "window"
+      ],
+      "type": "object"
+    },
+    "ProjectedViewport": {
+      "additionalProperties": false,
+      "description": "The part of the canonical grid one client is showing.",
+      "properties": {
+        "columns": {
+          "$ref": "#/$defs/U64",
+          "description": "How many columns are shown."
+        },
+        "left_column": {
+          "$ref": "#/$defs/U64",
+          "description": "The first canonical column shown, for a display narrower than the grid."
+        },
+        "rows": {
+          "$ref": "#/$defs/U64",
+          "description": "How many rows are shown."
+        },
+        "screen_top_row": {
+          "$ref": "#/$defs/U64",
+          "description": "The stable identifier of the live screen's first row.\n\nThe two are the same for a window on the live screen and different for one above it. Both\nare needed because they are the origins of two different things: the rows a client draws\nare named by [`Self::top_row`], and the cursor's own row is a line of the live screen. A\nclient with only one of them would put the cursor on a line of its history."
+        },
+        "top_row": {
+          "$ref": "#/$defs/U64",
+          "description": "The stable identifier of the first row shown."
+        }
+      },
+      "required": [
+        "top_row",
+        "screen_top_row",
+        "rows",
+        "left_column",
+        "columns"
+      ],
+      "type": "object"
+    },
+    "ProjectionDelta": {
+      "additionalProperties": false,
+      "description": "A bounded update against a known base.\n\nThis is what a projected attachment receives per batch of output: the rows that changed and the\nstate that changed with them, never the whole screen.",
+      "properties": {
+        "base_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor this update continues from. A client holding another one asks for a snapshot."
+        },
+        "buffer": {
+          "$ref": "#/$defs/ProjectedBuffer",
+          "description": "Which buffer the rows belong to."
+        },
+        "charsets": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CharsetState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The designated character sets, when they changed."
+        },
+        "cursor": {
+          "$ref": "#/$defs/ProjectedCursor",
+          "description": "The cursor after the update."
+        },
+        "degraded": {
+          "description": "Whether the session has had to shorten content to stay inside a resident-state bound.",
+          "type": "boolean"
+        },
+        "dimensions": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Dimensions"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The canonical dimensions, when they changed."
+        },
+        "evicted": {
+          "description": "Whether rows below `oldest_retained_row` have been evicted.",
+          "type": "boolean"
+        },
+        "hyperlink": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HyperlinkChange"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The open hyperlink, when it changed."
+        },
+        "hyperlinks": {
+          "description": "The hyperlink ranges of the rows carried here.",
+          "items": {
+            "$ref": "#/$defs/HyperlinkRange"
+          },
+          "type": "array"
+        },
+        "keyboard": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectedKeyboard"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The keyboard negotiation, when it changed."
+        },
+        "margins": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MarginState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The scroll region, when it changed."
+        },
+        "modes": {
+          "description": "The modes that changed since the base.",
+          "items": {
+            "$ref": "#/$defs/ProjectedMode"
+          },
+          "type": "array"
+        },
+        "next_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor after it."
+        },
+        "oldest_retained_row": {
+          "$ref": "#/$defs/U64",
+          "description": "The oldest row still retained anywhere."
+        },
+        "palette": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaletteState"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The palette, when an authorised explicit change moved it."
+        },
+        "projection_generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The generation it belongs to."
+        },
+        "rendition": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/CellRendition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The pen, when it changed."
+        },
+        "rows": {
+          "description": "The rows that changed, by stable identifier. A row not named here is unchanged.",
+          "items": {
+            "$ref": "#/$defs/ProjectedRow"
+          },
+          "type": "array"
+        },
+        "saved_cursors": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/SavedCursorState"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The saved cursors, when one was saved or restored."
+        },
+        "tab_stops": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/U64"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The tab stops, when they changed."
+        },
+        "title": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ProjectedTitle"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The titles, when they changed."
+        },
+        "title_stack": {
+          "anyOf": [
+            {
+              "items": {
+                "$ref": "#/$defs/SavedTitleEntry"
+              },
+              "type": "array"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The virtual title stack, when the titles changed."
+        },
+        "viewport": {
+          "$ref": "#/$defs/ProjectedViewport",
+          "description": "The window this client is showing, which a scroll moves without changing any row."
+        }
+      },
+      "required": [
+        "base_cursor",
+        "next_cursor",
+        "projection_generation",
+        "buffer",
+        "viewport",
+        "rows",
+        "cursor",
+        "modes",
+        "margins",
+        "rendition",
+        "tab_stops",
+        "charsets",
+        "hyperlinks",
+        "hyperlink",
+        "title",
+        "title_stack",
+        "keyboard",
+        "palette",
+        "dimensions",
+        "saved_cursors",
+        "oldest_retained_row",
+        "evicted",
+        "degraded"
+      ],
+      "type": "object"
+    },
+    "ProjectionReset": {
+      "additionalProperties": false,
+      "description": "Discard whatever is being shown; a snapshot follows.",
+      "properties": {
+        "cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor the reset happened at."
+        },
+        "projection_generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The generation the client is now on."
+        },
+        "reason": {
+          "$ref": "#/$defs/ProjectionResetReason",
+          "description": "Why."
+        }
+      },
+      "required": [
+        "projection_generation",
+        "cursor",
+        "reason"
+      ],
+      "type": "object"
+    },
+    "ProjectionResetReason": {
+      "description": "Why a projection was reset.",
+      "oneOf": [
+        {
+          "const": "attached",
+          "description": "The attachment has just joined, or has just been moved into projected mode.",
+          "type": "string"
+        },
+        {
+          "const": "buffer_switch",
+          "description": "The screen buffer changed, which replaces the grid rather than changing it.",
+          "type": "string"
+        },
+        {
+          "const": "geometry",
+          "description": "The canonical geometry changed, which reflows every row.",
+          "type": "string"
+        },
+        {
+          "const": "replay_gap",
+          "description": "The client's base cursor is outside the bounded replay window.",
+          "type": "string"
+        },
+        {
+          "const": "repaint",
+          "description": "What changed is larger than one bounded update, so the screen is sent again.\n\nAn update carries the rows that changed. When that is most of the grid it is not an update,\nand sending it as one would mean one message larger than a page bound; the snapshot pages\ninstead.",
+          "type": "string"
+        },
+        {
+          "const": "history_evicted",
+          "description": "Retained rows the client was holding have been evicted.",
+          "type": "string"
+        }
+      ]
+    },
+    "ProjectionRowPage": {
+      "additionalProperties": false,
+      "description": "One page of rows belonging to one buffer of one snapshot.",
+      "properties": {
+        "buffer": {
+          "$ref": "#/$defs/ProjectedBuffer",
+          "description": "Which buffer they belong to."
+        },
+        "evicted": {
+          "description": "Whether rows below `oldest_retained_row` have been evicted.",
+          "type": "boolean"
+        },
+        "more": {
+          "description": "Whether more pages of this snapshot follow.\n\nA client that has not seen a page with this clear does not yet hold the whole screen, and\nsection 8 forbids mixing live output with an incomplete repaint.",
+          "type": "boolean"
+        },
+        "oldest_retained_row": {
+          "$ref": "#/$defs/U64",
+          "description": "The oldest row still retained anywhere."
+        },
+        "output_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor of the snapshot these rows complete."
+        },
+        "projection_generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The generation these rows belong to."
+        },
+        "rows": {
+          "description": "The rows, in stable-identifier order.",
+          "items": {
+            "$ref": "#/$defs/ProjectedRow"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "projection_generation",
+        "output_cursor",
+        "buffer",
+        "rows",
+        "oldest_retained_row",
+        "evicted",
+        "more"
+      ],
+      "type": "object"
+    },
+    "ProjectionSnapshot": {
+      "additionalProperties": false,
+      "description": "Everything a screen is, apart from its rows.\n\nThe rows follow in [`ProjectionRowPage`]s, because a canonical grid of 2,048 columns by 1,024\nrows in two buffers is not one message. A client installs the state here, paints the pages as\nthey arrive, and applies deltas from `output_cursor` once the last page has landed.",
+      "properties": {
+        "active_buffer": {
+          "$ref": "#/$defs/ProjectedBuffer",
+          "description": "Which buffer is active."
+        },
+        "charsets": {
+          "$ref": "#/$defs/CharsetState",
+          "description": "The designated character sets."
+        },
+        "cursor": {
+          "$ref": "#/$defs/ProjectedCursor",
+          "description": "The cursor."
+        },
+        "degraded": {
+          "description": "Whether the session has had to shorten content to stay inside a resident-state bound.\n\nSection 8 requires truncation to have an explicit projection degradation, and a client in\nprojected mode cannot see it any other way: a cell whose combining marks were dropped at\nthe per-cell bound, a title cut to its limit and a hyperlink the link table refused all\narrive looking like content the application wrote. This says they do not.",
+          "type": "boolean"
+        },
+        "dimensions": {
+          "$ref": "#/$defs/Dimensions",
+          "description": "The canonical dimensions."
+        },
+        "evicted": {
+          "description": "Whether rows below `oldest_retained_row` have been evicted.",
+          "type": "boolean"
+        },
+        "hyperlink": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The hyperlink the next character printed belongs to."
+        },
+        "keyboard": {
+          "$ref": "#/$defs/ProjectedKeyboard",
+          "description": "The keyboard negotiation an input encoder has to reproduce."
+        },
+        "keypad_application": {
+          "description": "Whether the keypad is in application mode.",
+          "type": "boolean"
+        },
+        "margins": {
+          "$ref": "#/$defs/MarginState",
+          "description": "The scroll region."
+        },
+        "modes": {
+          "description": "Every tracked mode.",
+          "items": {
+            "$ref": "#/$defs/ProjectedMode"
+          },
+          "type": "array"
+        },
+        "oldest_retained_row": {
+          "$ref": "#/$defs/U64",
+          "description": "The oldest row still retained anywhere."
+        },
+        "output_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The monotonic output cursor this snapshot describes. Updates resume from here."
+        },
+        "palette": {
+          "$ref": "#/$defs/PaletteState",
+          "description": "The canonical palette and its provenance."
+        },
+        "projection_generation": {
+          "$ref": "#/$defs/U64",
+          "description": "The generation this screen belongs to. Every later update names it."
+        },
+        "rendition": {
+          "$ref": "#/$defs/CellRendition",
+          "description": "The pen the next character would be drawn with."
+        },
+        "saved_cursors": {
+          "description": "The cursor each buffer has saved.",
+          "items": {
+            "$ref": "#/$defs/SavedCursorState"
+          },
+          "type": "array"
+        },
+        "tab_stops": {
+          "description": "The columns carrying a tab stop.",
+          "items": {
+            "$ref": "#/$defs/U64"
+          },
+          "type": "array"
+        },
+        "title": {
+          "$ref": "#/$defs/ProjectedTitle",
+          "description": "The current titles."
+        },
+        "title_stack": {
+          "description": "The virtual title stack, oldest first.",
+          "items": {
+            "$ref": "#/$defs/SavedTitleEntry"
+          },
+          "type": "array"
+        },
+        "viewport": {
+          "$ref": "#/$defs/ProjectedViewport",
+          "description": "The window this client is showing."
+        }
+      },
+      "required": [
+        "projection_generation",
+        "output_cursor",
+        "active_buffer",
+        "dimensions",
+        "viewport",
+        "cursor",
+        "saved_cursors",
+        "margins",
+        "rendition",
+        "tab_stops",
+        "charsets",
+        "modes",
+        "keypad_application",
+        "keyboard",
+        "title",
+        "title_stack",
+        "hyperlink",
+        "palette",
+        "oldest_retained_row",
+        "evicted",
+        "degraded"
       ],
       "type": "object"
     },
@@ -10806,16 +12875,673 @@
         }
       ]
     },
+    "Question": {
+      "additionalProperties": false,
+      "description": "One durable question.\n\nThis is the whole public view. The caller token is deliberately not a field: it is returned to\nthe source once, in [`QuestionCreateResult`], and never appears in a read, an event or a log.",
+      "properties": {
+        "answer": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AnswerRecord"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The answer, once there is one."
+        },
+        "choices": {
+          "description": "The options, including the free-text one for `select` and `confirm`.",
+          "items": {
+            "$ref": "#/$defs/QuestionChoice"
+          },
+          "type": "array"
+        },
+        "context": {
+          "description": "The concise decision context the source supplied.",
+          "type": "string"
+        },
+        "created_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was created."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it expires if nothing else resolves it."
+        },
+        "kind": {
+          "$ref": "#/$defs/QuestionKind",
+          "description": "What kind of answer it asks for."
+        },
+        "question": {
+          "description": "The question itself.",
+          "type": "string"
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId",
+          "description": "The question's identity."
+        },
+        "resolved_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When it reached a terminal state."
+        },
+        "revision": {
+          "$ref": "#/$defs/QuestionRevision",
+          "description": "Its revision. An answer names the exact revision it is answering."
+        },
+        "session_epoch": {
+          "$ref": "#/$defs/SessionEpoch",
+          "description": "The epoch that session was in when the question was created."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session that owns it."
+        },
+        "source": {
+          "$ref": "#/$defs/QuestionSource",
+          "description": "The verified source, and the unverified label beside it."
+        },
+        "state": {
+          "$ref": "#/$defs/QuestionState",
+          "description": "Where it is in its life."
+        }
+      },
+      "required": [
+        "question_id",
+        "revision",
+        "state",
+        "session_id",
+        "session_epoch",
+        "kind",
+        "context",
+        "question",
+        "choices",
+        "source",
+        "created_at_ms",
+        "expires_at_ms",
+        "answer",
+        "resolved_at_ms"
+      ],
+      "type": "object"
+    },
+    "QuestionAnswer": {
+      "description": "What a person answered.\n\nThe four arms stay four arms. Section 11 forbids coercing [`Self::Other`] into a listed choice\nor into a yes, so an answer that arrived as free text is read as free text by whatever consumes\nit.",
+      "oneOf": [
+        {
+          "description": "Free text, for an `input` question.",
+          "properties": {
+            "kind": {
+              "const": "input",
+              "type": "string"
+            },
+            "text": {
+              "description": "What the person typed.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "One of the listed choices, for a `select` question.",
+          "properties": {
+            "choice_id": {
+              "description": "The choice the person selected.",
+              "type": "string"
+            },
+            "kind": {
+              "const": "choice",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "choice_id"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "Yes or no, for a `confirm` question.",
+          "properties": {
+            "decided": {
+              "description": "True for yes.",
+              "type": "boolean"
+            },
+            "kind": {
+              "const": "decision",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "decided"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The free-text option, available on every `select` and `confirm`.",
+          "properties": {
+            "kind": {
+              "const": "other",
+              "type": "string"
+            },
+            "text": {
+              "description": "What the person typed instead of choosing.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "text"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "QuestionAnswerParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `question.answer`.",
+      "properties": {
+        "answer": {
+          "$ref": "#/$defs/QuestionAnswer",
+          "description": "The answer."
+        },
+        "expected_revision": {
+          "$ref": "#/$defs/QuestionRevision",
+          "description": "The revision the person was shown. A different current revision is refused."
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId",
+          "description": "The question."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "question_id",
+        "expected_revision",
+        "answer"
+      ],
+      "type": "object"
+    },
+    "QuestionCancelOwnParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `question.cancel_own`.",
+      "properties": {
+        "caller_token": {
+          "$ref": "#/$defs/CallerToken",
+          "description": "The token issued when it was created."
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId",
+          "description": "The question."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "question_id",
+        "caller_token"
+      ],
+      "type": "object"
+    },
+    "QuestionCancelParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `question.cancel`.",
+      "properties": {
+        "expected_revision": {
+          "$ref": "#/$defs/QuestionRevision",
+          "description": "The revision the person was shown."
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId",
+          "description": "The question."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "question_id",
+        "expected_revision"
+      ],
+      "type": "object"
+    },
+    "QuestionChoice": {
+      "additionalProperties": false,
+      "description": "One option a `select` question offers.",
+      "properties": {
+        "choice_id": {
+          "description": "The stable identifier an answer names. It does not change with the label.",
+          "type": "string"
+        },
+        "label": {
+          "description": "What the person reads.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "choice_id",
+        "label"
+      ],
+      "type": "object"
+    },
+    "QuestionCreateParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `question.create`.",
+      "properties": {
+        "agent_name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The caller's label for itself. Unverified."
+        },
+        "choices": {
+          "description": "The choices, for a `select`. The free-text option is added by the host.",
+          "items": {
+            "$ref": "#/$defs/QuestionChoice"
+          },
+          "type": "array"
+        },
+        "context": {
+          "description": "The concise decision context.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/QuestionKind",
+          "description": "What kind of answer it asks for."
+        },
+        "question": {
+          "description": "The question itself.",
+          "type": "string"
+        },
+        "request_id": {
+          "description": "The caller's own unpredictable identifier for this request.\n\nDe-duplication is by the verified originating application and this value together. A caller\nlabel is not part of it.",
+          "type": "string"
+        },
+        "requested_expiry_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DurationMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How long the question should live. Bounded by [`MAX_EXPIRY`] and by the source's own\nlifetime."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the source believes it is in. The host checks the binding regardless."
+        },
+        "wait_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DurationMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How long to wait for an answer before returning the pending question. Bounded by\n[`MAX_CREATE_WAIT`]."
+        }
+      },
+      "required": [
+        "session_id",
+        "request_id",
+        "agent_name",
+        "context",
+        "question",
+        "kind",
+        "choices",
+        "requested_expiry_ms",
+        "wait_ms"
+      ],
+      "type": "object"
+    },
+    "QuestionCreateResult": {
+      "additionalProperties": false,
+      "description": "The result of `question.create`.",
+      "properties": {
+        "caller_token": {
+          "$ref": "#/$defs/CallerToken",
+          "description": "The token that lets this source poll and cancel it."
+        },
+        "deduplicated": {
+          "description": "True when an exact duplicate returned the existing question rather than creating one.",
+          "type": "boolean"
+        },
+        "question": {
+          "$ref": "#/$defs/Question",
+          "description": "The durable question."
+        }
+      },
+      "required": [
+        "question",
+        "caller_token",
+        "deduplicated"
+      ],
+      "type": "object"
+    },
+    "QuestionEvent": {
+      "additionalProperties": false,
+      "description": "One question transition, as the attention engine reads it.\n\nSection 25's idle reminder fires after five minutes of a *verified pending* request, so the\nevent carries the moment the question became pending and whether its source was verified.\nNothing here is the reminder itself; the attention engine owns that rule.",
+      "properties": {
+        "kind": {
+          "$ref": "#/$defs/QuestionEventKind",
+          "description": "What happened."
+        },
+        "pending_since_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the question first became pending, which is when its idle timer starts."
+        },
+        "question": {
+          "$ref": "#/$defs/Question",
+          "description": "The question at this revision."
+        },
+        "recorded_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When this transition was recorded."
+        }
+      },
+      "required": [
+        "kind",
+        "question",
+        "pending_since_ms",
+        "recorded_at_ms"
+      ],
+      "type": "object"
+    },
+    "QuestionEventKind": {
+      "description": "What happened to a question, for the attention feed.",
+      "oneOf": [
+        {
+          "const": "created",
+          "description": "A verified source created it.",
+          "type": "string"
+        },
+        {
+          "const": "answered",
+          "description": "A person answered it.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "It was withdrawn.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "Its deadline passed or its source went.",
+          "type": "string"
+        }
+      ]
+    },
     "QuestionId": {
       "description": "One agent-to-user question.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "QuestionKind": {
+      "description": "What a question asks for.",
+      "oneOf": [
+        {
+          "const": "input",
+          "description": "Free text.",
+          "type": "string"
+        },
+        {
+          "const": "select",
+          "description": "One of the listed choices, or free text.",
+          "type": "string"
+        },
+        {
+          "const": "confirm",
+          "description": "Yes, no, or free text.",
+          "type": "string"
+        }
+      ]
+    },
+    "QuestionOwnResult": {
+      "additionalProperties": false,
+      "description": "The result of `question.read_own` and `question.cancel_own`.",
+      "properties": {
+        "question": {
+          "$ref": "#/$defs/Question",
+          "description": "The question as it now stands."
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "type": "object"
+    },
+    "QuestionReadOwnParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `question.read_own`.",
+      "properties": {
+        "caller_token": {
+          "$ref": "#/$defs/CallerToken",
+          "description": "The token issued when it was created."
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId",
+          "description": "The question."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        },
+        "wait_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DurationMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How long to wait for a change before answering with the question as it stands.\n\nA wait that times out returns the same durable question. It does not recreate it, and it\ndoes not notify anybody again."
+        }
+      },
+      "required": [
+        "session_id",
+        "question_id",
+        "caller_token",
+        "wait_ms"
+      ],
+      "type": "object"
+    },
+    "QuestionReadParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `question.read`.",
+      "properties": {
+        "include_resolved": {
+          "description": "True to include questions that have already been resolved.",
+          "type": "boolean"
+        },
+        "question_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QuestionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "One question, or null for every question this actor may see."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session."
+        }
+      },
+      "required": [
+        "session_id",
+        "question_id",
+        "include_resolved"
+      ],
+      "type": "object"
+    },
+    "QuestionReadResult": {
+      "additionalProperties": false,
+      "description": "The result of `question.read`.",
+      "properties": {
+        "questions": {
+          "description": "The questions, oldest first.",
+          "items": {
+            "$ref": "#/$defs/Question"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "questions"
+      ],
+      "type": "object"
+    },
+    "QuestionResolveResult": {
+      "additionalProperties": false,
+      "description": "The result of `question.answer` and `question.cancel`.",
+      "properties": {
+        "question": {
+          "$ref": "#/$defs/Question",
+          "description": "The question as it now stands."
+        }
+      },
+      "required": [
+        "question"
+      ],
+      "type": "object"
+    },
     "QuestionRevision": {
       "description": "The exact version of a question that a person answers.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "QuestionSource": {
+      "additionalProperties": false,
+      "description": "The application the host verified as the source of a question.\n\nEverything here except [`Self::agent_label`] comes from the operating system through the\nworker's private socket. The label comes from the caller and is displayed as unverified, which\nis the whole of the difference between the two.",
+      "properties": {
+        "agent_binding_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentBindingRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The agent thread or binding revision, when a qualified bridge supplied one.\n\nNull when no bridge did. A null here is not a claim that the thread never changed: without\na bridge the question is application-scoped and thread-switch detection is not offered."
+        },
+        "agent_label": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The caller's own label for itself. Unverified, and never part of authority."
+        },
+        "ancestry": {
+          "description": "True when the process's parent chain reaches the session's root shell.\n\nA checked hint, recorded for diagnostics. Section 11 is explicit that ancestry is not a\ndefence against arbitrary code running under the same account, so nothing is admitted on\nthis alone.",
+          "type": "boolean"
+        },
+        "application_instance_id": {
+          "$ref": "#/$defs/ApplicationInstanceId",
+          "description": "The application instance the worker minted for this verified process."
+        },
+        "connection_id": {
+          "$ref": "#/$defs/ConnectionId",
+          "description": "The connection the question was created on."
+        },
+        "executable": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The executable that process is running, where the platform names it."
+        },
+        "launch_channel": {
+          "description": "True when the helper presented the private launch channel it inherited.\n\nFalse means the binding rests on the checks below instead; it does not mean the source is\nless bound, and it is recorded so a reader can tell which evidence was available.",
+          "type": "boolean"
+        },
+        "process": {
+          "$ref": "#/$defs/ProcessStartIdentity",
+          "description": "The process the kernel reports on the other end of the socket, with its start value."
+        },
+        "session_member": {
+          "description": "True when the process is inside the session's own ownership boundary, as the kernel\nreports it. This is what admits a source.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "application_instance_id",
+        "process",
+        "executable",
+        "agent_label",
+        "connection_id",
+        "launch_channel",
+        "session_member",
+        "ancestry",
+        "agent_binding_revision"
+      ],
+      "type": "object"
+    },
+    "QuestionState": {
+      "description": "Where a question is in its life.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Waiting for a person. Dismissing the form leaves it here.",
+          "type": "string"
+        },
+        {
+          "const": "answered",
+          "description": "A person answered it. Terminal.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "The source or a person withdrew it. Terminal.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "Its deadline passed, or the application that asked has gone. Terminal.",
+          "type": "string"
+        }
+      ]
     },
     "QueueDrainReport": {
       "additionalProperties": false,
@@ -12153,6 +14879,70 @@
         }
       ]
     },
+    "RetrustEvidence": {
+      "description": "What is offered as grounds for returning a host's wall clock to trusted.",
+      "oneOf": [
+        {
+          "description": "A qualified reading from the configured host time authority.",
+          "properties": {
+            "authority": {
+              "description": "The authority as the host's configuration names it.",
+              "type": "string"
+            },
+            "kind": {
+              "const": "host_time_authority",
+              "type": "string"
+            },
+            "reading": {
+              "$ref": "#/$defs/TimeAdapterReading",
+              "description": "The reading it produced."
+            }
+          },
+          "required": [
+            "kind",
+            "authority",
+            "reading"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "The owner's explicit authenticated retrust, bound to the exact action they confirmed.",
+          "properties": {
+            "action_digest": {
+              "$ref": "#/$defs/Digest256",
+              "description": "The digest of the action the owner confirmed."
+            },
+            "kind": {
+              "const": "owner_retrust",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "action_digest"
+          ],
+          "type": "object"
+        },
+        {
+          "description": "A paired peer's claim about the time. Never grounds on its own.",
+          "properties": {
+            "device_id": {
+              "$ref": "#/$defs/DeviceId",
+              "description": "The peer that offered it."
+            },
+            "kind": {
+              "const": "paired_peer",
+              "type": "string"
+            }
+          },
+          "required": [
+            "kind",
+            "device_id"
+          ],
+          "type": "object"
+        }
+      ]
+    },
     "RetryCategory": {
       "description": "How a client may react to an error.\n\nOnly idempotent reads, transfer chunks and requests whose receipt proves no dispatch may retry\nautomatically.",
       "oneOf": [
@@ -12289,6 +15079,28 @@
         "authority_revision",
         "completion",
         "acknowledged_at_ms"
+      ],
+      "type": "object"
+    },
+    "RevocationBarrier": {
+      "additionalProperties": false,
+      "description": "The result of installing an authority revision across every affected worker.\n\nUntil every barrier holds, this is `pending` with per-worker status. Cutting a network path or\nwaiting for a lease timer is not completion, because a paused worker could already be inside a\ndispatch transition, so nothing here treats the absence of an answer as an answer.",
+      "properties": {
+        "authority_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The revision being installed."
+        },
+        "workers": {
+          "description": "One entry per affected worker.",
+          "items": {
+            "$ref": "#/$defs/WorkerBarrier"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "authority_revision",
+        "workers"
       ],
       "type": "object"
     },
@@ -12433,6 +15245,39 @@
           "type": "object"
         }
       ]
+    },
+    "Rgb": {
+      "additionalProperties": false,
+      "description": "A direct colour.",
+      "properties": {
+        "blue": {
+          "description": "Blue.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "green": {
+          "description": "Green.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        },
+        "red": {
+          "description": "Red.",
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "red",
+        "green",
+        "blue"
+      ],
+      "type": "object"
     },
     "RightCondition": {
       "description": "When a required authority applies.",
@@ -12757,6 +15602,100 @@
         "detached_attachment",
         "state",
         "discarded_input_bytes"
+      ],
+      "type": "object"
+    },
+    "SavedCursorState": {
+      "additionalProperties": false,
+      "description": "A cursor an application saved, with the pen it saved alongside it.",
+      "properties": {
+        "buffer": {
+          "$ref": "#/$defs/ProjectedBuffer",
+          "description": "Which buffer saved it."
+        },
+        "charsets": {
+          "$ref": "#/$defs/CharsetDesignations",
+          "description": "The character sets designated when it was saved."
+        },
+        "column": {
+          "$ref": "#/$defs/U64",
+          "description": "The column, zero-based."
+        },
+        "hyperlink": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The hyperlink that was open when it was saved."
+        },
+        "origin_mode": {
+          "description": "Whether origin mode was set when it was saved.",
+          "type": "boolean"
+        },
+        "pending_wrap": {
+          "description": "Whether the saved cursor had a pending wrap.",
+          "type": "boolean"
+        },
+        "rendition": {
+          "$ref": "#/$defs/CellRendition",
+          "description": "The rendition saved with it."
+        },
+        "row": {
+          "$ref": "#/$defs/U64",
+          "description": "The row, zero-based."
+        },
+        "style": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor-style number saved with it."
+        }
+      },
+      "required": [
+        "buffer",
+        "column",
+        "row",
+        "pending_wrap",
+        "rendition",
+        "charsets",
+        "origin_mode",
+        "style",
+        "hyperlink"
+      ],
+      "type": "object"
+    },
+    "SavedTitleEntry": {
+      "additionalProperties": false,
+      "description": "One entry of the virtual title stack.\n\nA push saves only the titles it names, so each field is either a title that was saved or\nnothing at all. The two are different: a pop leaves the current title alone where nothing was\nsaved for it, and a client that flattened the distinction would show the wrong title after one.",
+      "properties": {
+        "icon": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The icon title, when this entry saved one."
+        },
+        "window": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The window title, when this entry saved one."
+        }
+      },
+      "required": [
+        "icon",
+        "window"
       ],
       "type": "object"
     },
@@ -13179,6 +16118,17 @@
           },
           "type": "array"
         },
+        "palette": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PaletteRequest"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The palette this session starts with. Null takes the profile default.\n\nThis is the one moment the palette can be chosen: section 8 fixes it at creation, and\nafterwards only an authorised explicit change moves it. The provenance is recorded either\nway, so a palette query can say where the session's colours came from."
+        },
         "presentation": {
           "$ref": "#/$defs/Presentation",
           "description": "How the session is presented locally."
@@ -13211,7 +16161,8 @@
         "cwd",
         "dimensions",
         "worker_profile",
-        "environment_snapshot"
+        "environment_snapshot",
+        "palette"
       ],
       "type": "object"
     },
@@ -14321,6 +17272,163 @@
       ],
       "type": "object"
     },
+    "TimeAdapterReading": {
+      "additionalProperties": false,
+      "description": "One reading of the platform time adapter.\n\nEvery field is what the operating system reported, classified into this build's vocabulary. No\nfield is a measurement of our own, and nothing here contacts a time server: section 9 requires\nthe actual supported platform service and forbids an invented universal authenticated call.",
+      "properties": {
+        "api": {
+          "description": "The service or interface the reading came from.",
+          "type": "string"
+        },
+        "estimated_error_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The platform's own estimate of its error, in microseconds, when it reports one."
+        },
+        "platform": {
+          "description": "Which platform adapter produced this reading.",
+          "type": "string"
+        },
+        "source": {
+          "$ref": "#/$defs/TimeSyncSource",
+          "description": "What the platform says is disciplining its clock."
+        },
+        "status": {
+          "$ref": "#/$defs/TimeSyncStatus",
+          "description": "What the platform says the state of that synchronisation is."
+        },
+        "uncertainty_us": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The platform's own bound on how wrong its clock may be, in microseconds.\n\nNull means the platform reported no bound, which is not the same as a bound of zero."
+        },
+        "wall_clock_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "What the wall clock read when the reading was taken."
+        }
+      },
+      "required": [
+        "platform",
+        "api",
+        "source",
+        "status",
+        "uncertainty_us",
+        "estimated_error_us",
+        "wall_clock_ms"
+      ],
+      "type": "object"
+    },
+    "TimeCheckpoint": {
+      "additionalProperties": false,
+      "description": "A durable mark of what this host's wall clock read, and what stood behind it.\n\nThe boot identity is part of it because a continuous reading means nothing outside the boot it\nwas taken in: the clock restarts, so a deadline from another boot reads as long past rather\nthan as time remaining.",
+      "properties": {
+        "boot_identity": {
+          "$ref": "#/$defs/BootIdentity",
+          "description": "The boot the mark was taken in."
+        },
+        "continuous_ms": {
+          "$ref": "#/$defs/U64",
+          "description": "The boot-scoped continuous reading at the same moment."
+        },
+        "reading": {
+          "$ref": "#/$defs/TimeAdapterReading",
+          "description": "The platform reading that stood behind the mark."
+        },
+        "trust": {
+          "$ref": "#/$defs/WallClockTrust",
+          "description": "Whether the wall clock was trusted at the mark."
+        },
+        "wall_clock_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "What the wall clock read."
+        }
+      },
+      "required": [
+        "boot_identity",
+        "wall_clock_ms",
+        "continuous_ms",
+        "reading",
+        "trust"
+      ],
+      "type": "object"
+    },
+    "TimeSyncSource": {
+      "description": "What the operating system says is disciplining its clock.",
+      "oneOf": [
+        {
+          "const": "network_time_service",
+          "description": "The platform's own network time service is disciplining the clock.",
+          "type": "string"
+        },
+        {
+          "const": "pulse_per_second",
+          "description": "A pulse-per-second reference is disciplining the clock.",
+          "type": "string"
+        },
+        {
+          "const": "unsynchronised",
+          "description": "Nothing is disciplining the clock.",
+          "type": "string"
+        },
+        {
+          "const": "unclassified",
+          "description": "The platform answered with a state this build does not classify.",
+          "type": "string"
+        }
+      ]
+    },
+    "TimeSyncStatus": {
+      "description": "What the operating system says the state of that synchronisation is.\n\nThese are the states the platform time services actually report, which is why there is a\nseparate value for the answer never arriving. A host that cannot read its own time service\nknows less than one whose service says it is unsynchronised, and the two are not the same fact.",
+      "oneOf": [
+        {
+          "const": "ok",
+          "description": "The clock is synchronised and no leap second is pending.",
+          "type": "string"
+        },
+        {
+          "const": "insert_leap",
+          "description": "A leap second will be inserted.",
+          "type": "string"
+        },
+        {
+          "const": "delete_leap",
+          "description": "A leap second will be deleted.",
+          "type": "string"
+        },
+        {
+          "const": "leap_in_progress",
+          "description": "A leap second is in progress.",
+          "type": "string"
+        },
+        {
+          "const": "leap_recovering",
+          "description": "The clock is recovering from a leap second.",
+          "type": "string"
+        },
+        {
+          "const": "error",
+          "description": "The platform reports its clock as unsynchronised or in error.",
+          "type": "string"
+        },
+        {
+          "const": "unavailable",
+          "description": "The platform's time service could not be read.",
+          "type": "string"
+        }
+      ]
+    },
     "TimestampMs": {
       "description": "A UTC timestamp in milliseconds, as a decimal string in JSON.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -14737,6 +17845,52 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "ViewportPosition": {
+      "description": "Where an attachment's window sits in the session's rows.\n\nA window is normally on the live screen, which is what no position at all means. A client\nlooking through its scrollback names where it is looking instead, and the host installs the\nhistory pages that cover it. Scrolling is a presentation choice and never touches the input\nlease: section 8 puts passive scrollback with focus events and terminal replies.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "The stable identifier of the first row shown, taken from the pages the client holds.",
+          "properties": {
+            "row": {
+              "$ref": "#/$defs/U64"
+            }
+          },
+          "required": [
+            "row"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "How many rows above the live screen's first row the window starts.\n\nFor a client that has not yet been given a row identifier to name. The host resolves it\nagainst the live screen at the moment of the report and answers with the row it landed on,\nso the window stays where the person put it while the session goes on writing.",
+          "properties": {
+            "above": {
+              "$ref": "#/$defs/U64"
+            }
+          },
+          "required": [
+            "above"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "WallClockTrust": {
+      "description": "Whether this host can prove what its wall clock reads.",
+      "oneOf": [
+        {
+          "const": "trusted",
+          "description": "The checkpoint stands: the clock has not moved backwards beyond the tolerance.",
+          "type": "string"
+        },
+        {
+          "const": "unresolved",
+          "description": "A rollback beyond the tolerance was observed, so the wall clock proves nothing.",
+          "type": "string"
+        }
+      ]
+    },
     "WithheldReason": {
       "description": "Why a fence was not published after an exchange.",
       "oneOf": [
@@ -14796,6 +17950,68 @@
           "type": "string"
         }
       ]
+    },
+    "WorkerBarrier": {
+      "additionalProperties": false,
+      "description": "One worker's half of a revocation barrier.",
+      "properties": {
+        "acknowledged_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthorityRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The revision the worker has installed, when it has installed one."
+        },
+        "detail": {
+          "description": "Why this worker's barrier has not held, or what is still outstanding about one that has.",
+          "type": "string"
+        },
+        "names_pending": {
+          "$ref": "#/$defs/U64",
+          "description": "How many names this worker holds that have not reached this daemon yet.\n\nNought means the evidence is complete. Anything else says a page exchange has not happened\nyet or did not finish; the names are in the worker's journal and the next announcement\ncontinues from where the last page ended."
+        },
+        "omitted_actions": {
+          "$ref": "#/$defs/U64",
+          "description": "How many affected actions the worker could hold no name for.\n\nNought in every ordinary case, because the names are kept in the worker's journal and\ndelivered a page at a time. Anything else is a worker that could not record a name at all."
+        },
+        "possibly_executed": {
+          "description": "The actions whose dispatch transition had already won the serial race.\n\nEach one's receipt state says how much is known about what it did; the list is\nnot only the uncertain ones.",
+          "items": {
+            "$ref": "#/$defs/PossiblyExecutedAction"
+          },
+          "type": "array"
+        },
+        "rejected_actions": {
+          "description": "The undispatched intents the fence rejected.",
+          "items": {
+            "$ref": "#/$defs/FencedAction"
+          },
+          "type": "array"
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the worker owns."
+        },
+        "state": {
+          "$ref": "#/$defs/BarrierState",
+          "description": "What this worker's barrier has reached."
+        }
+      },
+      "required": [
+        "session_id",
+        "state",
+        "acknowledged_revision",
+        "rejected_actions",
+        "possibly_executed",
+        "omitted_actions",
+        "names_pending",
+        "detail"
+      ],
+      "type": "object"
     },
     "WorkerDescriptor": {
       "additionalProperties": false,
@@ -15488,6 +18704,9 @@
     "action_cancel_result": {
       "$ref": "#/$defs/ActionCancelResult"
     },
+    "action_observation": {
+      "$ref": "#/$defs/ActionObservation"
+    },
     "action_read_params": {
       "$ref": "#/$defs/ActionReadParams"
     },
@@ -15505,6 +18724,30 @@
     },
     "agent_draft_add_attachment_result": {
       "$ref": "#/$defs/AgentDraftAddAttachmentResult"
+    },
+    "agent_tools_install_result": {
+      "$ref": "#/$defs/AgentToolsInstallResult"
+    },
+    "agent_tools_params": {
+      "$ref": "#/$defs/AgentToolsParams"
+    },
+    "agent_tools_remove_result": {
+      "$ref": "#/$defs/AgentToolsRemoveResult"
+    },
+    "agent_tools_status_result": {
+      "$ref": "#/$defs/AgentToolsStatusResult"
+    },
+    "alert": {
+      "$ref": "#/$defs/Alert"
+    },
+    "alert_create_params": {
+      "$ref": "#/$defs/AlertCreateParams"
+    },
+    "alert_create_result": {
+      "$ref": "#/$defs/AlertCreateResult"
+    },
+    "answer_record": {
+      "$ref": "#/$defs/AnswerRecord"
     },
     "archive_descriptor": {
       "$ref": "#/$defs/ArchiveDescriptor"
@@ -15547,6 +18790,12 @@
     },
     "capability_record": {
       "$ref": "#/$defs/CapabilityRecord"
+    },
+    "change_manifest": {
+      "$ref": "#/$defs/ChangeManifest"
+    },
+    "change_operation": {
+      "$ref": "#/$defs/ChangeOperation"
     },
     "client_offer": {
       "$ref": "#/$defs/ClientOffer"
@@ -15631,6 +18880,15 @@
     },
     "events_subscribe_result": {
       "$ref": "#/$defs/EventsSubscribeResult"
+    },
+    "expiration_tombstone": {
+      "$ref": "#/$defs/ExpirationTombstone"
+    },
+    "fence_evidence": {
+      "$ref": "#/$defs/FenceEvidence"
+    },
+    "fenced_action": {
+      "$ref": "#/$defs/FencedAction"
     },
     "forwarded_mutation": {
       "$ref": "#/$defs/ForwardedMutation"
@@ -15953,6 +19211,9 @@
     "input_write_result": {
       "$ref": "#/$defs/InputWriteResult"
     },
+    "installed_file": {
+      "$ref": "#/$defs/InstalledFile"
+    },
     "local_hello": {
       "$ref": "#/$defs/LocalHello"
     },
@@ -16049,6 +19310,18 @@
     "project_summary": {
       "$ref": "#/$defs/ProjectSummary"
     },
+    "projection_delta": {
+      "$ref": "#/$defs/ProjectionDelta"
+    },
+    "projection_reset": {
+      "$ref": "#/$defs/ProjectionReset"
+    },
+    "projection_row_page": {
+      "$ref": "#/$defs/ProjectionRowPage"
+    },
+    "projection_snapshot": {
+      "$ref": "#/$defs/ProjectionSnapshot"
+    },
     "proposed_grant": {
       "$ref": "#/$defs/ProposedGrant"
     },
@@ -16085,6 +19358,51 @@
     "push_sender_revocation": {
       "$ref": "#/$defs/PushSenderRevocation"
     },
+    "question": {
+      "$ref": "#/$defs/Question"
+    },
+    "question_answer": {
+      "$ref": "#/$defs/QuestionAnswer"
+    },
+    "question_answer_params": {
+      "$ref": "#/$defs/QuestionAnswerParams"
+    },
+    "question_cancel_own_params": {
+      "$ref": "#/$defs/QuestionCancelOwnParams"
+    },
+    "question_cancel_params": {
+      "$ref": "#/$defs/QuestionCancelParams"
+    },
+    "question_choice": {
+      "$ref": "#/$defs/QuestionChoice"
+    },
+    "question_create_params": {
+      "$ref": "#/$defs/QuestionCreateParams"
+    },
+    "question_create_result": {
+      "$ref": "#/$defs/QuestionCreateResult"
+    },
+    "question_event": {
+      "$ref": "#/$defs/QuestionEvent"
+    },
+    "question_own_result": {
+      "$ref": "#/$defs/QuestionOwnResult"
+    },
+    "question_read_own_params": {
+      "$ref": "#/$defs/QuestionReadOwnParams"
+    },
+    "question_read_params": {
+      "$ref": "#/$defs/QuestionReadParams"
+    },
+    "question_read_result": {
+      "$ref": "#/$defs/QuestionReadResult"
+    },
+    "question_resolve_result": {
+      "$ref": "#/$defs/QuestionResolveResult"
+    },
+    "question_source": {
+      "$ref": "#/$defs/QuestionSource"
+    },
     "receipt": {
       "$ref": "#/$defs/Receipt"
     },
@@ -16118,8 +19436,14 @@
     "resync_required": {
       "$ref": "#/$defs/ResyncRequired"
     },
+    "retrust_evidence": {
+      "$ref": "#/$defs/RetrustEvidence"
+    },
     "revocation_acknowledgement": {
       "$ref": "#/$defs/RevocationAcknowledgement"
+    },
+    "revocation_barrier": {
+      "$ref": "#/$defs/RevocationBarrier"
     },
     "revocation_request": {
       "$ref": "#/$defs/RevocationRequest"
@@ -16252,6 +19576,12 @@
     },
     "terminal_resize_params": {
       "$ref": "#/$defs/TerminalResizeParams"
+    },
+    "time_adapter_reading": {
+      "$ref": "#/$defs/TimeAdapterReading"
+    },
+    "time_checkpoint": {
+      "$ref": "#/$defs/TimeCheckpoint"
     },
     "upload_begin_params": {
       "$ref": "#/$defs/UploadBeginParams"
