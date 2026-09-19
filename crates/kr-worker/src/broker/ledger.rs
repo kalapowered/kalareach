@@ -607,12 +607,16 @@ impl Ledger {
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when any part of the transaction fails.
+    /// Returns the gap's row, so the recovery that follows can mark that same row finished. A
+    /// gap the fault itself could not write is inserted here and its new row returned; without
+    /// that, a recovery nothing recorded the start of could never record its end either, and
+    /// every later restart would come back fenced over a recovery that had already finished.
     pub fn commit_recovery(
         &mut self,
         records: &[(PendingResource, Option<BrokerBindingId>, bool)],
         gap: &EvidenceGap,
         row: Option<i64>,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let transaction = self.connection.transaction().map_err(BrokerError::ledger)?;
         for (resource, decoder, dispatched) in records {
             transaction
@@ -642,7 +646,7 @@ impl Ledger {
                 )
                 .map_err(BrokerError::ledger)?;
         }
-        match row {
+        let sequence = match row {
             Some(row) => {
                 transaction
                     .execute(
@@ -656,6 +660,7 @@ impl Ledger {
                         ],
                     )
                     .map_err(BrokerError::ledger)?;
+                row
             }
             None => {
                 transaction
@@ -671,9 +676,11 @@ impl Ledger {
                         ],
                     )
                     .map_err(BrokerError::ledger)?;
+                transaction.last_insert_rowid()
             }
-        }
-        transaction.commit().map_err(BrokerError::ledger)
+        };
+        transaction.commit().map_err(BrokerError::ledger)?;
+        Ok(sequence)
     }
 
     /// Reads one pending resource.
@@ -1281,6 +1288,33 @@ mod tests {
                 .expect("the read succeeds")
                 .expect("the entry is still there"),
             entry(1)
+        );
+    }
+
+    /// A gap that the fault itself stopped being written still has to record that its recovery
+    /// finished. Otherwise every later restart comes back fenced over a recovery that ended.
+    #[test]
+    fn a_gap_first_written_during_recovery_can_still_be_finished() {
+        let mut ledger = Ledger::open(None).expect("the ledger opens");
+        let mut gap = EvidenceGap::open("the journal faulted", TimestampMs::new(1), 0);
+        gap.closed_at = Nullable::some(TimestampMs::new(2));
+        let row = ledger
+            .commit_recovery(&[], &gap, None)
+            .expect("the gap is committed");
+        assert!(
+            ledger
+                .unfinished_recovery()
+                .expect("the read succeeds")
+                .is_some(),
+            "a committed gap is unfinished until its upstreams are reconciled"
+        );
+        ledger.finish_recovery(row).expect("the recovery finishes");
+        assert!(
+            ledger
+                .unfinished_recovery()
+                .expect("the read succeeds")
+                .is_none(),
+            "the row the commit returned is the row the completion marks"
         );
     }
 

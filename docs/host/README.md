@@ -3072,12 +3072,11 @@ throughout: suspension is a state a client reads, not an error it hits.
 Downstream request identifiers are namespaced by connection, so two connections that both call
 their first request `1` are two different pending resources, and a restarted worker numbers its
 connections above every identifier its ledger holds rather than starting again at one. The
-upstream's own identifier is carried as the text it wrote; an upstream identifier never becomes a
-KalaReach identifier. One resource takes one response transition.
-
-What is not distinguished yet is a numeric `11` from a string `"11"`: both become the same
-identifier text, and a protocol that uses both spellings for different requests would have them
-correlated to one resource.
+upstream's own identifier is carried in the JSON form it wrote: a string identifier keeps its
+quotes, so the number `11` and the string `"11"` stay two requests. An upstream identifier never
+becomes a KalaReach identifier. One resource takes one response transition, and a frame that names
+a method is a request rather than a response, so it resolves nothing even when it carries a live
+identifier.
 
 A frame is read strictly: it is bounded in both directions, it must be a top-level object, and a
 frame that names a member twice is refused rather than resolved, because another participant in the
@@ -3184,14 +3183,20 @@ than its grant covers.
 The five agent mutations each carry the binding revision they were prepared against. A revision
 behind the one in force is `STALE_SESSION`; a draft that moved is `DRAFT_CONFLICT`. A steer or a
 cancellation names the turn it acts on and is refused rather than redirected when that turn is not
-the one running. An approval answer is one of the decisions the request actually offered, checked
+the one running. An approval answer names a resource that is still open, inside the
+upstream's own deadline, interpreted at the current source generation by a decoder that still holds
+the approval-interpreter grant, with a decision that interpretation actually offered; it is checked
 against the retained list before the claim is taken, and it happens once.
 
 Every refusal named above is decided before the dispatch marker, so a request this host can refuse
 leaves a rejection rather than an outcome nobody can establish. That includes an instance with no
 transport bound and one whose every component has had its rich capabilities disabled: both are
-refused before anything is marked. What a refusal after the marker still covers is the transport's
-own failure, which is what `OUTCOME_UNKNOWN` is for.
+refused before anything is marked, for a plugin action as well as for the five mutations. What a
+refusal after the marker still covers is the transport's own failure, which is what
+`OUTCOME_UNKNOWN` is for, and the narrow window between the last check and the submission: the
+checks and the submission take the broker's lock separately, so a fence, a suspension or a
+capability invalidation that lands between them is still discovered during dispatch. Making that
+one admission is the work that finishes it.
 
 What carries an admitted mutation to the upstream is the connector's own transport. The broker
 holds it under `UpstreamDispatch` and submits while the session lock is held, so a transport that

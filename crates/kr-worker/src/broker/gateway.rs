@@ -18,7 +18,7 @@
 //!   is reconciled, because the host does not know what the request did.
 //! * **The rich table is closed.** An unknown rich mutation is rejected rather than guessed at.
 //! * **Both mutators go through the gateway.** The native terminal and the rich client both
-//!   arrive here, upstream identifiers are preserved exactly as the upstream wrote them, and a
+//!   arrive here, an upstream identifier keeps its JSON type as well as its value, and a
 //!   resolution is fanned out to every attached observer.
 
 use std::collections::BTreeMap;
@@ -326,6 +326,14 @@ impl Gateway {
             .get(&connection)
             .ok_or_else(|| BrokerError::unknown(format!("no gateway connection {connection}")))?;
         let body = read_frame(frame)?;
+        // A request names a method; a response does not. Without this, a second request that
+        // happened to carry a live identifier would resolve the resource that identifier names.
+        if body.contains_key(&held.table.method_field) {
+            return Err(BrokerError::invalid(format!(
+                "this frame names a {} member, so it is a request and not a response",
+                held.table.method_field
+            )));
+        }
         let upstream =
             read_identifier(&body, &held.table.response_id_field).ok_or_else(|| {
                 BrokerError::invalid(format!(
@@ -408,17 +416,26 @@ impl Gateway {
 
 /// Reads one JSON member as an upstream request identifier.
 ///
-/// A JSON-RPC identifier is a string or a number, and both are kept exactly as the upstream wrote
-/// them: an upstream identifier never becomes a KalaReach identifier, so it is carried rather than
-/// converted.
+/// A JSON-RPC identifier is a string or a number, and an upstream identifier never becomes a
+/// KalaReach identifier: it is carried rather than converted. What is carried is the member's own
+/// JSON form, so the string `"11"` and the number `11` stay two identifiers. Writing both as the
+/// text `11` would let a response to one resolve the other's resource.
 fn read_identifier(
     body: &serde_json::Map<String, serde_json::Value>,
     field: &str,
 ) -> Option<Result<UpstreamRequestId>> {
     let member = body.get(field)?;
     let text = match member {
-        serde_json::Value::String(text) => text.clone(),
-        serde_json::Value::Number(number) => number.to_string(),
+        serde_json::Value::String(_) | serde_json::Value::Number(_) => {
+            match serde_json::to_string(member) {
+                Ok(text) => text,
+                Err(error) => {
+                    return Some(Err(BrokerError::invalid(format!(
+                        "{field} is not a request identifier: {error}"
+                    ))));
+                }
+            }
+        }
         _ => {
             return Some(Err(BrokerError::invalid(format!(
                 "{field} is not a request identifier"
@@ -663,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn an_upstream_identifier_is_carried_exactly_as_it_was_written() {
+    fn an_upstream_identifier_keeps_its_json_type_and_its_value() {
         let gateway = native_gateway();
         let numeric = gateway
             .forward_native(
@@ -683,7 +700,24 @@ mod tests {
             .expect("forwarded");
         assert_eq!(
             textual.request.expect("it carried one").upstream.as_str(),
-            "req-a"
+            "\"req-a\"",
+            "a string identifier keeps its quotes, so it is not the bare text of the same name"
+        );
+        // The string "11" and the number 11 are two identifiers, and a host that wrote both as
+        // the text 11 would answer one request with the other's response.
+        let same_digits = gateway
+            .forward_native(
+                GatewayConnectionId::new(1),
+                br#"{"id":"11","method":"fs/write_text_file"}"#,
+            )
+            .expect("forwarded");
+        assert_eq!(
+            same_digits
+                .request
+                .expect("it carried one")
+                .upstream
+                .as_str(),
+            "\"11\""
         );
     }
 

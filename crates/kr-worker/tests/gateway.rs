@@ -151,12 +151,15 @@ fn rich() -> RichMethodTable {
     }
 }
 
+/// One request frame. `id` is the identifier's JSON literal, so a caller chooses between the
+/// number `11` and the string `"11"` the way an upstream does.
 fn frame(id: &str, method_name: &str) -> String {
-    format!(r#"{{"id":"{id}","method":"{method_name}"}}"#)
+    format!(r#"{{"id":{id},"method":"{method_name}"}}"#)
 }
 
+/// One response frame, with the identifier written as the JSON literal `id`.
 fn response(id: &str) -> String {
-    format!(r#"{{"id":"{id}","result":{{"outcome":"allow"}}}}"#)
+    format!(r#"{{"id":{id},"result":{{"outcome":"allow"}}}}"#)
 }
 
 /// A worker with one instance, one authenticated native connection and one trusted decoder.
@@ -559,13 +562,14 @@ fn kr_req_12_11_both_mutators_are_admitted_by_the_gateway_and_observers_are_list
     let native = broker
         .forward_native(
             GatewayConnectionId::new(1),
-            frame("upstream-7", "fs/write_text_file").as_bytes(),
+            frame("\"upstream-7\"", "fs/write_text_file").as_bytes(),
             TimestampMs::new(2),
         )
         .expect("forwarded")
         .1
         .expect("it expects a response");
-    assert_eq!(native.request.upstream.as_str(), "upstream-7");
+    // A string identifier keeps its quotes, so it can never be the number of the same digits.
+    assert_eq!(native.request.upstream.as_str(), "\"upstream-7\"");
 
     // The rich client's mutation goes through the same gateway, against the closed table.
     let rich_call = broker
@@ -596,6 +600,68 @@ fn kr_req_12_11_both_mutators_are_admitted_by_the_gateway_and_observers_are_list
     assert_eq!(
         broker.observers(instance(3)),
         vec![GatewayConnectionId::new(3)]
+    );
+}
+
+/// KR-REQ-12.13: a JSON-RPC identifier is a string or a number, and the two are not the same
+/// identifier. A response also has to be a response: a frame naming a method is a request, and a
+/// request must never resolve the resource whose identifier it happens to carry.
+#[test]
+fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing() {
+    let broker = gateway(None);
+    let number = broker
+        .forward_native(
+            GatewayConnectionId::new(1),
+            frame("11", "fs/write_text_file").as_bytes(),
+            TimestampMs::new(2),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response");
+    let text = broker
+        .forward_native(
+            GatewayConnectionId::new(1),
+            frame("\"11\"", "fs/write_text_file").as_bytes(),
+            TimestampMs::new(3),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response");
+    assert_ne!(
+        number.request, text.request,
+        "the number 11 and the string \"11\" are two upstream requests"
+    );
+    assert_eq!(number.request.upstream.as_str(), "11");
+    assert_eq!(text.request.upstream.as_str(), "\"11\"");
+    assert_ne!(number.resource_id, text.resource_id);
+
+    // The upstream answers the numeric one. The string one is untouched.
+    let answered = broker
+        .native_answer(
+            GatewayConnectionId::new(1),
+            response("11").as_bytes(),
+            TimestampMs::new(4),
+        )
+        .expect("the response correlates");
+    assert_eq!(answered.resource_id, number.resource_id);
+    assert_eq!(
+        broker
+            .pending(text.resource_id)
+            .expect("the string request is still held")
+            .state,
+        PendingState::Pending
+    );
+
+    // A second request that carries a live identifier is still a request.
+    assert!(
+        broker
+            .native_answer(
+                GatewayConnectionId::new(1),
+                frame("\"11\"", "fs/write_text_file").as_bytes(),
+                TimestampMs::new(5),
+            )
+            .is_err(),
+        "a frame that names a method is a request and resolves nothing"
     );
 }
 

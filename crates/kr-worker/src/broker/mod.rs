@@ -106,7 +106,7 @@ pub const MAX_RETAINED_FRAMES: usize = 64;
 pub const MAX_RETAINED_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 /// One component bound to one application instance.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Binding {
     /// The binding.
     pub binding_id: BrokerBindingId,
@@ -1509,6 +1509,15 @@ impl Broker {
         Ok(reconciliation)
     }
 
+    /// Returns one binding as it stands now.
+    ///
+    /// A grant is checked against this rather than against whatever was recorded when a component
+    /// last acted, because a grant that has since been withdrawn is not a grant.
+    #[must_use]
+    pub fn binding_record(&self, binding_id: BrokerBindingId) -> Option<Binding> {
+        self.state().bindings.get(&binding_id).cloned()
+    }
+
     /// Returns one pending resource.
     #[must_use]
     pub fn pending(&self, resource_id: PendingResourceId) -> Option<PendingResource> {
@@ -1610,15 +1619,22 @@ impl Broker {
         let beginning = state.volatile.begin_recovery(now)?;
         let records = state.arbitration.volatile_records();
         let row = state.volatile.row();
-        if let Err(error) = state.ledger.commit_recovery(&records, &beginning.gap, row) {
-            // Nothing was committed, so the fence goes back over a ledger that has not
-            // half-recorded a recovery.
-            let (carried, _) = state.arbitration.enter_volatile();
-            state
-                .volatile
-                .fall_back("storage failed again during recovery", carried, now)?;
-            return Err(error);
-        }
+        let sequence = match state.ledger.commit_recovery(&records, &beginning.gap, row) {
+            Ok(sequence) => sequence,
+            Err(error) => {
+                // Nothing was committed, so the fence goes back over a ledger that has not
+                // half-recorded a recovery.
+                let (carried, _) = state.arbitration.enter_volatile();
+                state
+                    .volatile
+                    .fall_back("storage failed again during recovery", carried, now)?;
+                return Err(error);
+            }
+        };
+        // The gap this recovery closes is the row the ledger just wrote, whether it existed
+        // before or the fault itself was what stopped it being written. Holding it here is what
+        // lets the end of this recovery mark that same row finished.
+        state.volatile.set_row(sequence);
         // Every upstream that still has an unresolved resource owes a reconciliation before rich
         // work comes back. Reconciling one says nothing about another's pending identifiers.
         let owed: Vec<(ApplicationInstanceId, GatewayConnectionId)> = state

@@ -755,11 +755,14 @@ opaque_id!(
     "A single-use broker handle for one issued action token."
 );
 opaque_id!(
-    /// An upstream JSON-RPC request identifier, exactly as the upstream wrote it.
+    /// An upstream JSON-RPC request identifier, in the JSON form the upstream wrote it in.
     ///
-    /// It is correlation data. An upstream identifier never becomes a KalaReach identifier.
+    /// A JSON-RPC identifier is a string or a number, and the two are different identifiers, so
+    /// what is carried is the member's own JSON text: the string eleven is `"11"` and the number
+    /// eleven is `11`. It is correlation data. An upstream identifier never becomes a KalaReach
+    /// identifier.
     UpstreamRequestId,
-    "An upstream JSON-RPC request identifier, exactly as the upstream wrote it. Correlation data, not authority."
+    "An upstream JSON-RPC request identifier, in the JSON form the upstream wrote it in: a string identifier keeps its quotes, so a string and a number never collide. Correlation data, not authority."
 );
 opaque_id!(
     /// An upstream method name, as a connector's table names it.

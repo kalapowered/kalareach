@@ -537,7 +537,7 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
 fn kr_req_23_40_an_approval_answer_is_one_of_the_decisions_the_request_offered() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
-    let body = r#"{"id":"11","method":"session/request_permission"}"#;
+    let body = r#"{"id":11,"method":"session/request_permission"}"#;
     let opaque = broker
         .forward_native(
             GatewayConnectionId::new(1),
@@ -606,6 +606,84 @@ fn kr_req_23_40_an_approval_answer_is_one_of_the_decisions_the_request_offered()
                 TimestampMs::new(6),
             )
             .is_err()
+    );
+}
+
+/// KR-REQ-23.40 and KR-REQ-11.27: everything an approval answer can be refused for
+/// deterministically is refused before the receipt marker, so a refusal the host can make on its
+/// own is a rejection and not an outcome nobody can establish.
+#[test]
+fn kr_req_23_40_an_approval_that_cannot_be_answered_is_refused_before_the_marker() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+
+    // One request with a deadline the upstream stated.
+    let opaque = broker
+        .forward_native(
+            GatewayConnectionId::new(1),
+            r#"{"id":11,"method":"session/request_permission"}"#.as_bytes(),
+            TimestampMs::new(2),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response");
+    let resource = broker
+        .interpret(
+            binding(),
+            opaque.resource_id,
+            projection(),
+            Some(TimestampMs::new(50)),
+            TimestampMs::new(3),
+        )
+        .expect("interpreted");
+
+    // A decision the interpretation never offered.
+    assert!(
+        broker
+            .check_answerable(
+                &target(1),
+                resource.resource_id,
+                "allow_always",
+                TimestampMs::new(4)
+            )
+            .is_err()
+    );
+    // Past the upstream's own deadline, an answer would reach nothing.
+    assert!(
+        broker
+            .check_answerable(
+                &target(1),
+                resource.resource_id,
+                "allow",
+                TimestampMs::new(51)
+            )
+            .is_err(),
+        "an answer after the upstream's deadline is refused here, not discovered at dispatch"
+    );
+    // Inside it, the same answer is admissible.
+    broker
+        .check_answerable(
+            &target(1),
+            resource.resource_id,
+            "allow",
+            TimestampMs::new(5),
+        )
+        .expect("the decision was offered and the deadline has not passed");
+
+    // The interpretation is only worth acting on while its decoder still holds the grant.
+    broker
+        .withdraw_grant(binding(), BrokerGrant::ApprovalInterpreter)
+        .expect("the grant is withdrawn");
+    assert!(
+        broker
+            .check_answerable(
+                &target(1),
+                resource.resource_id,
+                "allow",
+                TimestampMs::new(6)
+            )
+            .is_err(),
+        "a withdrawn interpreter grant leaves nothing to act on"
     );
 }
 

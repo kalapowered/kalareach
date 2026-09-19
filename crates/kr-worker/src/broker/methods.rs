@@ -25,6 +25,7 @@ use kr_protocol::agent::{
 };
 use kr_protocol::authority::EffectClass;
 use kr_protocol::broker::{ActionName, ActionProvenance, BrokerGrant};
+use kr_protocol::gateway::PendingState;
 use kr_protocol::ids::{
     ActorId, ApplicationInstanceId, BrokerBindingId, CapabilityId, CapabilityRevision, GrantId,
     SessionId, StreamCursor,
@@ -532,15 +533,28 @@ impl Broker {
     ///
     /// Returns [`BrokerError::StaleBinding`] when the revision has moved,
     /// [`BrokerError::PreconditionFailed`] when rich mutations are suspended, and
-    /// [`BrokerError::UnsupportedCapability`] when the capability is not usable here.
-    pub fn check_mutation(
+    /// Checks what every rich operation on one instance needs, whatever the operation is.
+    ///
+    /// The subject exists, the journal is not fenced, something carries an operation to the
+    /// upstream, and at least one component still gives rich work its meaning. Each of these is a
+    /// refusal this host can make on its own, so it is made before any receipt marker is written
+    /// rather than discovered during dispatch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] for an instance this broker does not hold,
+    /// [`BrokerError::UpstreamUnavailable`] while the journal is fenced, and
+    /// [`BrokerError::UnsupportedCapability`] when no transport is bound or every component's
+    /// rich capabilities are disabled.
+    pub fn check_dispatchable(&self, target: &AgentMutationTarget) -> Result<()> {
+        self.check_dispatchable_for(target, UpstreamOperation::PluginAction)
+    }
+
+    fn check_dispatchable_for(
         &self,
-        caller: &Caller,
         target: &AgentMutationTarget,
-        capability: &str,
         action: UpstreamOperation,
-    ) -> Result<AgentMutationResult> {
-        let _ = caller;
+    ) -> Result<()> {
         self.check_subject(&target.subject)?;
         // Rich work is fenced while the journal is faulted, and a mutation is rich work. Without
         // this a prompt submitted during the gap would be answered as applied with no durable
@@ -572,6 +586,19 @@ impl Broker {
                 ),
             });
         }
+        Ok(())
+    }
+
+    /// [`BrokerError::UnsupportedCapability`] when the capability is not usable here.
+    pub fn check_mutation(
+        &self,
+        caller: &Caller,
+        target: &AgentMutationTarget,
+        capability: &str,
+        action: UpstreamOperation,
+    ) -> Result<AgentMutationResult> {
+        let _ = caller;
+        self.check_dispatchable_for(target, action)?;
         let binding = self.binding_state(target.subject.application_instance_id)?;
         if binding.rich_mutations_suspended {
             return Err(BrokerError::PreconditionFailed {
@@ -627,16 +654,26 @@ impl Broker {
 
     /// Checks that one pending resource can be answered with the decision named.
     ///
+    /// Everything this checks is checked before the receipt marker is written, so a refusal the
+    /// host can make deterministically is a rejection rather than an outcome nobody can
+    /// establish. It checks the resource's owner, that it is still open, that the upstream's own
+    /// deadline has not passed, that the interpretation came from a decoder still permitted to
+    /// create approvals at the generation it read, and that the decision is one that
+    /// interpretation actually offered.
+    ///
     /// # Errors
     ///
     /// Returns [`BrokerError::UnknownSubject`] when the resource is not one this broker holds,
-    /// [`BrokerError::PermissionDenied`] when it belongs to another instance, and
-    /// [`BrokerError::PreconditionFailed`] when the decision is not one the request offered.
+    /// [`BrokerError::PermissionDenied`] when it belongs to another instance or its decoder no
+    /// longer holds the approval-interpreter grant, [`BrokerError::QuestionResolved`] when it has
+    /// already been answered, and [`BrokerError::PreconditionFailed`] when the deadline has
+    /// passed, the source generation has moved or the decision is not one the request offered.
     pub fn check_answerable(
         &self,
         target: &AgentMutationTarget,
         resource_id: kr_protocol::ids::PendingResourceId,
         option_id: &str,
+        now: TimestampMs,
     ) -> Result<()> {
         let resource = self
             .pending(resource_id)
@@ -646,6 +683,27 @@ impl Broker {
                 "{resource_id} belongs to another application instance"
             )));
         }
+        // One resolution per pending resource. A resource that has already reached an answer,
+        // been cancelled or been left uncertain is not answerable again, and saying so here is
+        // what keeps the claim below from being the thing that discovers it.
+        if resource.state != PendingState::Pending {
+            return Err(BrokerError::Arbitration(
+                kr_protocol::gateway::ArbitrationError::AlreadyResolved {
+                    state: resource.state,
+                },
+            ));
+        }
+        if let Some(deadline) = resource.deadline_ms.as_ref()
+            && now.get() > deadline.get()
+        {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{resource_id}'s upstream deadline passed at {}, so this answer would reach \
+                     nothing",
+                    deadline.get()
+                ),
+            });
+        }
         let entry = self
             .decoding(resource_id)?
             .ok_or_else(|| BrokerError::PreconditionFailed {
@@ -653,6 +711,29 @@ impl Broker {
                     "{resource_id} has no recorded interpretation, so there is nothing to answer"
                 ),
             })?;
+        // The interpretation is only worth acting on while the decoder that produced it still
+        // holds the grant that let it, and while the frame it read is still the current one.
+        // Withdrawing the grant or a newer source frame both make the offered decisions stale.
+        let decoder = self.binding_record(entry.binding_id).ok_or_else(|| {
+            BrokerError::denied(format!(
+                "the component that interpreted {resource_id} is no longer bound"
+            ))
+        })?;
+        if !decoder.grants.holds(BrokerGrant::ApprovalInterpreter) {
+            return Err(BrokerError::denied(format!(
+                "the component that interpreted {resource_id} no longer holds the \
+                 approval-interpreter grant"
+            )));
+        }
+        if entry.source_generation != resource.source_generation {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{resource_id} was interpreted at source generation {} and the request is at \
+                     {}",
+                    entry.source_generation, resource.source_generation
+                ),
+            });
+        }
         if entry.offers(option_id) {
             Ok(())
         } else {

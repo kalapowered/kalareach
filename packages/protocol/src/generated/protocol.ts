@@ -48,7 +48,7 @@ export type AuthorityRevision = string
  */
 export type AgentTurnId = string
 /**
- * An upstream JSON-RPC request identifier, exactly as the upstream wrote it. Correlation data, not authority.
+ * An upstream JSON-RPC request identifier, in the JSON form the upstream wrote it in: a string identifier keeps its quotes, so a string and a number never collide. Correlation data, not authority.
  */
 export type UpstreamRequestId = string
 /**
@@ -7267,7 +7267,7 @@ export interface DecoderLedgerEntry {
    */
   source_generation: string
   /**
-   * An upstream JSON-RPC request identifier, exactly as the upstream wrote it. Correlation data, not authority.
+   * An upstream JSON-RPC request identifier, in the JSON form the upstream wrote it in: a string identifier keeps its quotes, so a string and a number never collide. Correlation data, not authority.
    */
   upstream_request_id: string
 }
@@ -12075,7 +12075,7 @@ export interface DownstreamRequestId {
    */
   connection: string
   /**
-   * An upstream JSON-RPC request identifier, exactly as the upstream wrote it. Correlation data, not authority.
+   * An upstream JSON-RPC request identifier, in the JSON form the upstream wrote it in: a string identifier keeps its quotes, so a string and a number never collide. Correlation data, not authority.
    */
   upstream: string
 }

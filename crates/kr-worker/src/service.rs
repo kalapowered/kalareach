@@ -3479,6 +3479,7 @@ impl WorkerService {
                     &params.target,
                     params.resource_id,
                     &params.option_id,
+                    kr_ipc::now_ms(),
                 )?;
                 Ok(())
             }
@@ -3489,6 +3490,7 @@ impl WorkerService {
                     params.target.subject.application_instance_id,
                 )?;
                 self.broker.check_action(binding_id, &params)?;
+                self.broker.check_dispatchable(&params.target)?;
                 Ok(())
             }
             Method::ActionCancel => {
