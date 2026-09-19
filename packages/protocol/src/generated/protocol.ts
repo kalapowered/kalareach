@@ -12156,11 +12156,22 @@ export interface ReviewState {
  */
 export interface ReviewReadParams {
   /**
+   * The subject to continue after, or null to start at the oldest.
+   *
+   * A subject this session no longer holds is refused rather than restarting the page, because
+   * a page that silently began again would read as the end of the list.
+   */
+  after: ReviewSubject | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_reviews: string
+  /**
    * One KalaReach terminal session.
    */
   session_id: string
   /**
-   * One subject, or null for every subject this session knows about.
+   * One subject, or null for a page of every subject this session knows about.
    */
   subject: ReviewSubject | null
 }
@@ -12172,6 +12183,10 @@ export interface ReviewReadResult {
    * The actor this state belongs to.
    */
   actor_id: string
+  /**
+   * Whether more subjects remain after the last one in this page.
+   */
+  more: boolean
   /**
    * The review state of each subject, oldest first.
    */

@@ -106,6 +106,13 @@ pub enum EventKind {
     QuestionResolved {
         /// The question.
         question_id: QuestionId,
+        /// The session it belonged to.
+        ///
+        /// It travels with the resolution rather than being looked up, because the reminder
+        /// record the engine keeps for a request is a working set with a bound of its own. A
+        /// question answered after its record left it is still a change since somebody's last
+        /// visit, and only the event still knows whose session it was.
+        session_id: SessionId,
         /// Whether a person answered it, as against it being cancelled or expiring.
         answered: bool,
     },

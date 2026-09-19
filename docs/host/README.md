@@ -1223,12 +1223,19 @@ keyed by each source's own cursor. Two sources reach it: the question ledger, wh
 the moment a request became pending, and the journal's host events, which are the terminal side
 effects that had no attachment to go to. A record that no rule covers moves the cursor and raises
 nothing, so a later record is not read as a range retention took. A pass reads bounded pages until
-it has caught up before it decides any timer, because deciding against a half-read history would
-raise a reminder for a request whose answer is in the next page.
+it has caught up, and only then decides any timer: deciding against a half-read history would raise
+a reminder for a request whose answer is in the next page. A page announces nothing by itself for
+the same reason - a question raised and answered inside a backlog is not a notification to send
+now - and the timer pass that follows a completed catch-up is what decides what is still owed.
 
-Maintenance wakes at the earlier of its own cadence and the moment the engine says a timer is due,
-so a five-minute reminder is five minutes from the request rather than five minutes rounded up to
-the next time the host happened to look.
+A pass that cannot finish decides nothing. A source it could not read, a page it could not write
+down and a backlog longer than one pass reads all leave the timers where they were, and maintenance
+comes back for the rest a couple of seconds later rather than treating the still-due deadline as an
+instruction to try again immediately.
+
+Maintenance otherwise wakes at the earlier of its own cadence and the moment the engine says a
+timer is due, so a five-minute reminder is five minutes from the request rather than five minutes
+rounded up to the next time the host happened to look.
 
 ### The rule set
 
@@ -1252,10 +1259,10 @@ the item rather than announced again.
 
 An application notice is the one untrusted rule. Any process writing to the terminal can emit one,
 so the item says so and the rule cannot raise any other kind of item; nothing a notice says makes
-it a pending approval. With an attachment holding the input lease the notice goes there, which is
-the destination a terminal side effect has. With no lease holder there is nobody to send it to, so
-it goes through the owner's configured notification policy, and it is retained in Attention either
-way.
+it a pending approval. A notice the host recorded as a side effect is one that had no attachment to
+go to: section 8 sends a notification to the attachment holding the input lease, and a record
+exists because nobody held it. With no lease holder there is nobody to send it to, so it goes
+through the owner's configured notification policy, and it is retained in Attention.
 
 ### Quiet hours
 
@@ -1290,8 +1297,9 @@ An acknowledgement affects only the actor that made it. It does not stop the hos
 anybody: the ladder and the repeats belong to the condition, and they end when the condition does.
 
 A refusal the host can decide is decided before anything is dispatched. A subject this session
-never held, a version nobody produced, a quiet-hours bound that is not a minute of the day and a
-log view past its own bounds are all rejections, not outcomes nobody can establish.
+never held, a version nobody produced, a counter the store could not write down as it was given, a
+quiet-hours bound that is not a minute of the day, a log view past its own bounds and one more
+actor than the store admits are all rejections, not outcomes nobody can establish.
 
 ### Changed since a visit
 
@@ -1321,9 +1329,12 @@ answer.
 A decided announcement stays written down until a delivery consumer says it has taken durable
 responsibility for it. Taking one is two steps for that reason: the host offers what is outstanding
 without forgetting it, and forgets it only once the consumer has settled it by its own identity,
-which is the item and the number of that item's announcement. A host that died at any point before
-that offers the announcement again. What becomes of it afterwards - the destinations, the attempts,
-the receipts - belongs to the delivery journal.
+which is the item and the announcement's number. That number comes from a counter of the store's
+own that only goes forward, so it outlives the item it was given for: a condition that ends and
+returns is a new item, and an identity a consumer already recorded can never settle a decision made
+after the condition came back. A host that died at any point before the settlement offers the
+announcement again. What becomes of it afterwards - the destinations, the attempts, the receipts -
+belongs to the delivery journal.
 
 A jump in a source's sequence means the records between were evicted. The engine records the range,
 marks every unresolved item from that same source uncertain, and leaves it in the inbox. A gap is
@@ -1342,12 +1353,21 @@ and oldest, weighing the item that has just arrived with the rest, so a fresh no
 displace anything merely by being the newest thing there. The read says how many items the host has
 let go of.
 
-What the bound never lets go of is a condition somebody or something is still waiting on: an
-unanswered approval, an unanswered request, an adapter still down, a host still out of contact.
-When the whole inbox is those, it goes over its bound rather than answering that nothing is
-waiting. Review subjects are bounded the same way, and a subject an inbox item points at or an
-actor has acknowledged is never let go of. A feature store admits two hundred and fifty-six actors;
-past that a new actor's acknowledgement is refused rather than an existing actor's being deleted.
+What the bound never lets go of is a condition somebody or something is still waiting on - an
+unanswered approval, an unanswered request, an adapter still down, a host still out of contact - or
+a decision about one that has not been delivered yet, whether it is waiting for a consumer to
+settle it or for quiet hours to release it. When the whole inbox is those, it goes over its bound
+rather than answering that nothing is waiting or losing an announcement nothing will offer again.
+
+Review subjects are bounded the same way. A subject an inbox item points at, one an actor has
+acknowledged and one the host has only just recorded a version of are all kept, so a session whose
+older work has all been read answers a new capture by holding it rather than by forgetting it the
+moment it arrives. What bounds the answer instead is the page: a review read returns at most two
+hundred subjects and continues after the last one it gave, and a subject the session no longer
+holds is refused as a continuation rather than silently restarting the list.
+
+A feature store admits two hundred and fifty-six actors; past that a new actor's acknowledgement is
+refused, before anything is dispatched, rather than an existing actor's being deleted.
 
 ### What a caller is served
 
@@ -1358,6 +1378,12 @@ retained history page to a paired device outright. An attention item is not a hi
 is narrowed rather than refused: a caller that did not arrive over the local socket is served the
 host's own record of a condition - which rule, at what level, how often, when - with the text left
 out and said to be left out, and no model summary either.
+
+An item's key carries none of that text either. A key has to be derived rather than allocated, so
+that rebuilding the inbox from the retained events lands on the items it had before, and it travels
+to every caller that may read the inbox at all. So it carries a digest of the subject rather than
+the subject: a command line or a notification body cannot reach a caller inside the key of the item
+whose text was withheld.
 
 ## Closure
 

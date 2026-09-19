@@ -108,6 +108,7 @@ impl Attention {
             pending: stored.pending_inputs,
             quiet: stored.quiet,
             dropped: stored.dropped,
+            next_announcement: stored.next_announcement,
         });
         engine.reanchor(reading);
         let mut reviews = Reviews::new();
@@ -293,6 +294,19 @@ impl Attention {
         self.state.engine.awaiting_delivery()
     }
 
+    /// Answers whether this store would admit one actor, without changing anything.
+    ///
+    /// The bound is on admission rather than on eviction: nothing anybody has acknowledged is
+    /// deleted to make room for somebody new. A host asks here before it dispatches, so an actor
+    /// past the bound is a refusal of the action rather than an outcome nobody can establish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::TooManyActors`] when this actor is new and the bound is reached.
+    pub fn check_actor(&self, actor: &ActorId) -> Result<()> {
+        admit(&self.state, actor)
+    }
+
     /// Records one actor's acknowledgement of each item it holds.
     ///
     /// # Errors
@@ -450,10 +464,22 @@ impl Attention {
         }
     }
 
-    /// Returns one actor's review state for every subject in one session.
-    #[must_use]
-    pub fn review_states(&self, actor: &ActorId, session_id: SessionId) -> Vec<ReviewState> {
-        self.state.reviews.states(actor, session_id)
+    /// Returns one page of one actor's review state for one session, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::UnknownContinuation`] when `after` names a subject this session no
+    /// longer holds.
+    pub fn review_states(
+        &self,
+        actor: &ActorId,
+        session_id: SessionId,
+        after: Option<&ReviewSubject>,
+        max: u64,
+    ) -> Result<(Vec<ReviewState>, bool)> {
+        self.state
+            .reviews
+            .states_page(actor, session_id, after, max)
     }
 
     /// Rebuilds the whole state by replaying the retained events over what the store holds.
@@ -534,9 +560,6 @@ fn consume(
         .engine
         .consumed(event.cursor.source)
         .is_none_or(|consumed| event.cursor.sequence > consumed);
-    // Read before the engine applies the event: a resolution names the question rather than the
-    // session, and the engine forgets a request the moment it resolves one.
-    let resolved_session = session_of_question(state, event);
     let produced = if replay {
         state.engine.replay(event, reading)
     } else {
@@ -545,8 +568,8 @@ fn consume(
     carry_gaps(state, &produced);
     outcomes.extend(produced);
     if fresh {
-        record_semantics(state, event, resolved_session);
-        bound_reviews(state);
+        let recorded = record_semantics(state, event);
+        bound_reviews(state, &recorded);
     }
 }
 
@@ -554,9 +577,13 @@ fn consume(
 ///
 /// The reference goes from the subject to the item, never the other way: a subject derives the key
 /// an `attention.review_ready` item for it would carry, and the engine is asked whether it holds
-/// one. Reading a subject back out of a key would not work, because a key whose subject was too
-/// long or carried a separator is a digest of it and names nothing.
-fn bound_reviews(state: &mut State) {
+/// one. Reading a subject back out of a key would not work at all, because a key carries a digest
+/// of its subject rather than the subject.
+///
+/// `recorded` names what this event just told the host about. It is held with the rest, so a
+/// session whose older subjects have all been read does not answer a new capture by forgetting it
+/// the moment it arrives.
+fn bound_reviews(state: &mut State, recorded: &BTreeSet<String>) {
     let referenced: BTreeSet<String> = state
         .reviews
         .subjects()
@@ -577,6 +604,7 @@ fn bound_reviews(state: &mut State) {
                 .item(&item)
                 .map(|_| crate::review::subject_key(&subject.subject))
         })
+        .chain(recorded.iter().cloned())
         .collect();
     state.reviews.enforce_bound(&referenced);
 }
@@ -590,20 +618,13 @@ fn carry_gaps(state: &mut State, outcomes: &[Outcome]) {
     }
 }
 
-/// Returns the session a resolved question belonged to, while the engine still holds it.
-fn session_of_question(state: &State, event: &SourceEvent) -> Option<SessionId> {
-    let EventKind::QuestionResolved { question_id, .. } = &event.kind else {
-        return None;
-    };
-    state
-        .engine
-        .pending_inputs()
-        .get(question_id)
-        .map(|pending| pending.session_id)
-}
-
 /// Records the review work and the semantic change one event produced.
-fn record_semantics(state: &mut State, event: &SourceEvent, resolved_session: Option<SessionId>) {
+///
+/// Returns the review subjects this event recorded a version of, which the bound then holds on to:
+/// review work the host has only just been told about is not what a retention bound should let go
+/// of to keep older work that has already been read.
+fn record_semantics(state: &mut State, event: &SourceEvent) -> BTreeSet<String> {
+    let mut recorded = BTreeSet::new();
     match &event.kind {
         EventKind::TurnCompleted {
             session_id,
@@ -612,23 +633,21 @@ fn record_semantics(state: &mut State, event: &SourceEvent, resolved_session: Op
             change_set,
             summary,
         } => {
-            state.reviews.record_version(
-                ReviewSubject::CompletedTurn {
-                    session_id: *session_id,
-                    turn_id: turn_id.clone(),
-                },
-                *version,
-                event.at_ms,
-            );
+            let turn = ReviewSubject::CompletedTurn {
+                session_id: *session_id,
+                turn_id: turn_id.clone(),
+            };
+            recorded.insert(crate::review::subject_key(&turn));
+            state.reviews.record_version(turn, *version, event.at_ms);
             if let Some((change_set_id, change_set_version)) = change_set {
-                state.reviews.record_version(
-                    ReviewSubject::ChangeSet {
-                        session_id: *session_id,
-                        change_set_id: *change_set_id,
-                    },
-                    *change_set_version,
-                    event.at_ms,
-                );
+                let captured = ReviewSubject::ChangeSet {
+                    session_id: *session_id,
+                    change_set_id: *change_set_id,
+                };
+                recorded.insert(crate::review::subject_key(&captured));
+                state
+                    .reviews
+                    .record_version(captured, *change_set_version, event.at_ms);
                 state.visits.record(
                     SemanticChangeKind::ChangeSetCaptured,
                     *session_id,
@@ -649,14 +668,14 @@ fn record_semantics(state: &mut State, event: &SourceEvent, resolved_session: Op
             version,
             summary,
         } => {
-            state.reviews.record_version(
-                ReviewSubject::ChangeSet {
-                    session_id: *session_id,
-                    change_set_id: *change_set_id,
-                },
-                *version,
-                event.at_ms,
-            );
+            let captured = ReviewSubject::ChangeSet {
+                session_id: *session_id,
+                change_set_id: *change_set_id,
+            };
+            recorded.insert(crate::review::subject_key(&captured));
+            state
+                .reviews
+                .record_version(captured, *version, event.at_ms);
             state.visits.record(
                 SemanticChangeKind::ChangeSetCaptured,
                 *session_id,
@@ -676,15 +695,17 @@ fn record_semantics(state: &mut State, event: &SourceEvent, resolved_session: Op
                 event.at_ms,
             );
         }
-        EventKind::QuestionResolved { answered: true, .. } => {
-            if let Some(session_id) = resolved_session {
-                state.visits.record(
-                    SemanticChangeKind::QuestionAnswered,
-                    session_id,
-                    "a question was answered".to_owned(),
-                    event.at_ms,
-                );
-            }
+        EventKind::QuestionResolved {
+            session_id,
+            answered: true,
+            ..
+        } => {
+            state.visits.record(
+                SemanticChangeKind::QuestionAnswered,
+                *session_id,
+                "a question was answered".to_owned(),
+                event.at_ms,
+            );
         }
         EventKind::AdapterFailed {
             session_id: Some(session_id),
@@ -700,6 +721,7 @@ fn record_semantics(state: &mut State, event: &SourceEvent, resolved_session: Op
         }
         _ => {}
     }
+    recorded
 }
 
 /// Returns everything the feature store writes down.
@@ -711,6 +733,7 @@ fn snapshot(state: &State) -> StoredState {
         consumed: state.engine.all_consumed().clone(),
         gaps: state.engine.gaps().to_vec(),
         dropped: state.engine.dropped(),
+        next_announcement: state.engine.next_announcement(),
         pending_inputs: state.engine.pending_inputs().clone(),
         quiet: state.engine.quiet_hours().cloned(),
         subjects: state

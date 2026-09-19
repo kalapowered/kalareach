@@ -9,13 +9,20 @@
 //! # Why the whole state is written at once
 //!
 //! Every write here replaces the stored state in one transaction. What makes that affordable is
-//! that every part of the state is bounded and the bounds are enforced where the state is built:
+//! that every part of the state carries a bound where it is built:
 //! [`kr_protocol::attention::MAX_RETAINED_ATTENTION_ITEMS`] items, each with a summary bounded by
 //! [`kr_protocol::attention::MAX_ATTENTION_SUMMARY_LEN`];
 //! [`crate::visit::MAX_RETAINED_CHANGES`] changes; [`crate::visit::MAX_OMITTED_RANGES`] omitted
 //! ranges; [`kr_protocol::attention::MAX_RETAINED_SUMMARIES`] summaries;
 //! [`kr_protocol::attention::MAX_RETAINED_REVIEW_SUBJECTS`] review subjects; and
 //! [`kr_protocol::attention::MAX_RETAINED_LOG_VIEWS`] views per actor.
+//!
+//! Three of those bounds hold back rather than forget, so the set they bound grows past its figure
+//! rather than losing something authoritative: the inbox keeps a condition somebody is waiting on
+//! and a decision nobody has delivered, the review table keeps a subject an item points at, an
+//! actor has acknowledged or the host has only just recorded, and the pending requests keep one
+//! whose reminder is still owed. What that costs is the whole-state write growing with them, which
+//! is the price of not forgetting work the host was asked to do.
 //!
 //! Writing all of it buys two properties that matter more than the saving. There is no partial
 //! write to reason about, so a crash leaves the store at the last complete state rather than at
@@ -79,6 +86,11 @@ pub struct StoredState {
     pub gaps: Vec<AttentionGap>,
     /// How many items the host has let go of to stay inside its bound.
     pub dropped: u64,
+    /// The highest identity this store has given an announcement.
+    ///
+    /// It only goes forward, and it outlives the item whose decision it named, so an identity a
+    /// delivery consumer recorded never comes back attached to a later decision.
+    pub next_announcement: u64,
     /// The questions waiting for an answer.
     pub pending_inputs: BTreeMap<QuestionId, PendingInput>,
     /// The configured quiet-hours window.
@@ -145,6 +157,10 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS attention_dropped (
         id INTEGER PRIMARY KEY CHECK (id = 0),
         items INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS attention_announcements (
+        id INTEGER PRIMARY KEY CHECK (id = 0),
+        next INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS attention_item_acks (
         actor TEXT NOT NULL,
@@ -230,6 +246,7 @@ const TABLES: &[&str] = &[
     "attention_items",
     "attention_actors",
     "attention_dropped",
+    "attention_announcements",
     "attention_item_acks",
     "attention_pending_inputs",
     "attention_quiet_hours",
@@ -369,6 +386,14 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
+        let announcement: Option<i64> = self
+            .connection
+            .query_row(
+                "SELECT next FROM attention_announcements WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
         Ok(StoredState {
             items: self.load_items()?,
             item_acks: self.load_item_acks()?,
@@ -377,6 +402,10 @@ impl Store {
             gaps: self.load_gaps()?,
             dropped: match dropped {
                 Some(value) => as_u64(value, "dropped count")?,
+                None => 0,
+            },
+            next_announcement: match announcement {
+                Some(value) => as_u64(value, "announcement counter")?,
                 None => 0,
             },
             pending_inputs: self.load_pending()?,
@@ -464,6 +493,10 @@ impl Store {
         transaction.execute(
             "INSERT INTO attention_dropped (id, items) VALUES (0, ?1)",
             params![as_i64(state.dropped, "dropped count")?],
+        )?;
+        transaction.execute(
+            "INSERT INTO attention_announcements (id, next) VALUES (0, ?1)",
+            params![as_i64(state.next_announcement, "announcement counter")?],
         )?;
         for (actor, acks) in &state.item_acks {
             for (key, ack) in acks {

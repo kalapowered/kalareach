@@ -484,6 +484,8 @@ async fn a_review_acknowledgement_binds_a_version_and_a_later_one_reopens_the_wo
     let params = ReviewReadParams {
         session_id: host.session_id,
         subject: Nullable::null(),
+        max_reviews: U64::new(50),
+        after: Nullable::null(),
     };
     let state: ReviewReadResult =
         ok(send_request(&mut client, request(Method::ReviewRead, typed(&params))).await);
@@ -608,6 +610,8 @@ async fn no_method_of_the_group_can_reach_a_right_that_changes_code() {
     let params = ReviewReadParams {
         session_id: host.session_id,
         subject: Nullable::some(turn_subject(host.session_id)),
+        max_reviews: U64::new(50),
+        after: Nullable::null(),
     };
     let before: ReviewReadResult =
         ok(send_request(&mut client, request(Method::ReviewRead, typed(&params))).await);
@@ -759,11 +763,20 @@ async fn a_question_in_the_ledger_becomes_pending_input_when_the_host_reads_its_
         .find(|item| item.rule == AttentionRule::PendingInput)
         .expect("the waiting question is in the inbox");
     assert!(item.trusted);
+    assert_eq!(
+        item.key,
+        kr_attention::key::attention_key(
+            AttentionRule::PendingInput,
+            &created.question.question_id.to_string()
+        ),
+        "and it is keyed on the question it is about, by derivation rather than by name"
+    );
     assert!(
-        item.key
+        !item
+            .key
             .as_str()
             .contains(&created.question.question_id.to_string()),
-        "and it is keyed on the question it is about"
+        "so nothing the session wrote travels inside the key"
     );
 
     // Answering it takes it out again.
@@ -975,5 +988,128 @@ async fn the_state_lives_in_the_session_s_journal_and_comes_back_from_it() {
         restored.engine().consumed(AttentionSource::Receipts),
         Some(1),
         "and the consumed cursor, so a replay is still idempotent"
+    );
+}
+
+#[tokio::test]
+async fn one_more_actor_than_the_store_admits_is_refused_before_the_action_is_dispatched() {
+    // The feature store bounds actors on admission, so nothing anybody has acknowledged is deleted
+    // to make room. The bound is asked about before the marker, so reaching it rejects the action
+    // rather than failing to store afterwards and settling as an outcome nobody can establish.
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let window = window(&client);
+    let time = Arc::clone(host.service.runtime().session().time());
+    for index in 0..kr_protocol::attention::MAX_RETAINED_ACTORS {
+        host.service
+            .attention()
+            .acknowledge(
+                &ActorId::new(format!("device:phone-{index}")).expect("a principal"),
+                &AttentionAcknowledgeParams {
+                    session_id: host.session_id,
+                    keys: Vec::new(),
+                },
+                &time,
+            )
+            .expect("the store admits an actor inside its bound");
+    }
+    let refused = mutation(
+        &window,
+        &host,
+        Method::AttentionAcknowledge,
+        typed(&AttentionAcknowledgeParams {
+            session_id: host.session_id,
+            keys: Vec::new(),
+        }),
+    );
+    let action_id = refused.action_id;
+    let answer = send_mutation(&mut client, refused).await;
+    let Outcome::Error(error) = answer else {
+        panic!("an actor past the bound cannot be admitted");
+    };
+    assert_eq!(error.code, ErrorCode::QuotaExceeded);
+    let read: kr_protocol::receipt::ActionReadResult = ok(send_request(
+        &mut client,
+        request(
+            Method::ActionRead,
+            typed(&kr_protocol::receipt::ActionReadParams { action_id }),
+        ),
+    )
+    .await);
+    assert_eq!(
+        read.receipt.state,
+        kr_protocol::receipt::ReceiptState::Rejected,
+        "a bound this host can weigh is a rejection, not an outcome nobody can establish"
+    );
+}
+
+#[tokio::test]
+async fn a_question_answered_inside_a_backlog_owes_no_reminder_when_the_host_catches_up() {
+    // A pass over the retained sources is history, not a notification to send now. A request that
+    // was raised and answered inside the backlog owes nothing once the host has read all of it,
+    // and one that is still open owes what it is due against the present.
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let now = kr_worker::questions::Now {
+        utc_ms: kr_ipc::now_ms(),
+        boot_ms: kr_ipc::clock::boot_elapsed_ms(),
+    };
+    let answered = host
+        .service
+        .questions()
+        .create(&verified_source(true), &question_params(&host, "r-1"), now)
+        .expect("a verified source creates a question")
+        .0;
+    host.service
+        .questions()
+        .answer(
+            &ActorId::new("local:501").expect("a principal"),
+            None,
+            &kr_protocol::question::QuestionAnswerParams {
+                session_id: host.session_id,
+                question_id: answered.question.question_id,
+                expected_revision: answered.question.revision,
+                answer: kr_protocol::question::QuestionAnswer::Decision { decided: true },
+            },
+            now,
+        )
+        .expect("a person answers it");
+    let open = host
+        .service
+        .questions()
+        .create(&verified_source(true), &question_params(&host, "r-2"), now)
+        .expect("a verified source creates a question")
+        .0;
+
+    // Nothing has been read yet: both transitions and the creation are one backlog.
+    assert_eq!(
+        host.service.attention_pass(),
+        kr_worker::service::AttentionPass::Complete,
+        "the whole backlog is inside one pass"
+    );
+    let read: AttentionReadResult = ok(send_request(
+        &mut client,
+        request(Method::AttentionRead, typed(&read_params(&host))),
+    )
+    .await);
+    let waiting: Vec<_> = read
+        .items
+        .iter()
+        .filter(|item| item.rule == AttentionRule::PendingInput)
+        .collect();
+    assert_eq!(waiting.len(), 1, "only the open request is waiting");
+    assert_eq!(
+        waiting[0].key,
+        kr_attention::key::attention_key(
+            AttentionRule::PendingInput,
+            &open.question.question_id.to_string()
+        )
+    );
+    assert!(
+        !read
+            .items
+            .iter()
+            .any(|item| item.rule == AttentionRule::InputIdleReminder),
+        "nothing inside the backlog raised a reminder the moment it was read"
     );
 }

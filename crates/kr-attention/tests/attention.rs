@@ -13,7 +13,8 @@ use kr_protocol::attention::{
     AttentionItem, AttentionKey, AttentionLevel, AttentionReadParams, AttentionRouting,
     AttentionRule, AttentionSource, IDLE_REMINDER_MS, LogViewState, MAX_ATTENTION_SUMMARY_LEN,
     MAX_RETAINED_ACTORS, MAX_RETAINED_ATTENTION_ITEMS, MAX_RETAINED_LOG_VIEWS,
-    MAX_RETAINED_REVIEW_SUBJECTS, NotificationState, QuietHours, ReviewSubject,
+    MAX_RETAINED_PENDING_INPUTS, MAX_RETAINED_REVIEW_SUBJECTS, MAX_REVIEW_SUBJECTS,
+    NotificationState, QuietHours, ReviewState, ReviewSubject,
 };
 use kr_protocol::ids::{
     ActorId, AgentTurnId, ApprovalRequestId, ChangeSetId, PluginId, QuestionId, SessionId,
@@ -138,8 +139,17 @@ fn adapter_failed(sequence: u64, at_ms: u64) -> SourceEvent {
     )
 }
 
+/// The key one rule and one subject land on, derived the way the engine derives it.
 fn key(id: AttentionRule, subject: &str) -> AttentionKey {
-    AttentionKey::of(id, subject).expect("a well-formed key")
+    kr_attention::key::attention_key(id, subject)
+}
+
+/// The key an unidentified notice of session one lands on.
+fn notice_key(body: &str) -> AttentionKey {
+    key(
+        AttentionRule::ApplicationNotice,
+        &format!("{}|{body}", session(1)),
+    )
 }
 
 fn raised(outcomes: &[Outcome]) -> BTreeSet<AttentionRule> {
@@ -168,6 +178,14 @@ fn engine() -> Attention {
 
 fn whole_inbox(attention: &Attention) -> Vec<AttentionItem> {
     attention.inbox(&actor("local:501"), true, Content::Whole)
+}
+
+/// Every review subject of one session, as one page the bound admits.
+fn review_states(attention: &Attention, who: &str, in_session: SessionId) -> Vec<ReviewState> {
+    attention
+        .review_states(&actor(who), in_session, None, MAX_REVIEW_SUBJECTS)
+        .expect("a page that starts at the oldest is never a continuation")
+        .0
 }
 
 // ----- The rule set ------------------------------------------------------------------------
@@ -583,6 +601,7 @@ fn an_answered_request_is_never_reminded_about() {
                 2_000,
                 EventKind::QuestionResolved {
                     question_id: question(9),
+                    session_id: session(1),
                     answered: true,
                 },
             ),
@@ -1069,7 +1088,7 @@ fn a_review_acknowledgement_binds_the_version_it_was_made_against() {
     attention
         .apply(&turn_completed(2, 2_000, 2), reading(2_000))
         .expect("the store records the decision");
-    let states = attention.review_states(&actor("local:501"), session(1));
+    let states = review_states(&attention, "local:501", session(1));
     let turn = states
         .iter()
         .find(|state| matches!(state.subject, ReviewSubject::CompletedTurn { .. }))
@@ -1219,11 +1238,12 @@ fn a_turn_s_change_set_carries_its_own_version() {
             reading(0),
         )
         .expect("the store records the decision");
-    let states = attention.review_states(&actor("local:501"), session(1));
-    let versions: Vec<_> = states
+    let states = review_states(&attention, "local:501", session(1));
+    let mut versions: Vec<_> = states
         .iter()
         .map(|state| state.current_version.get())
         .collect();
+    versions.sort_unstable();
     assert_eq!(versions, vec![2, 9], "each subject is at its own version");
 }
 
@@ -1516,8 +1536,8 @@ fn a_rebuild_from_nothing_holds_the_same_items_as_the_live_engine() {
     };
     assert_eq!(keys(&rebuilt), keys(&live));
     assert_eq!(
-        rebuilt.review_states(&actor("local:501"), session(1)),
-        live.review_states(&actor("local:501"), session(1))
+        review_states(&rebuilt, "local:501", session(1)),
+        review_states(&live, "local:501", session(1))
     );
     assert_eq!(
         rebuilt
@@ -1573,16 +1593,13 @@ fn the_state_comes_back_as_it_was_after_the_store_is_reopened() {
             .set_quiet_hours(Some(quiet_over_noon()), reading(1_000))
             .expect("the store records the window");
         items = whole_inbox(&attention);
-        states = attention.review_states(&actor("local:501"), session(1));
+        states = review_states(&attention, "local:501", session(1));
         assert_eq!(attention.revision(&actor("local:501")), 2);
     }
 
     let reopened = Attention::open(&path, reading(10_000)).expect("the feature store reopens");
     assert_eq!(whole_inbox(&reopened), items);
-    assert_eq!(
-        reopened.review_states(&actor("local:501"), session(1)),
-        states
-    );
+    assert_eq!(review_states(&reopened, "local:501", session(1)), states);
     assert_eq!(
         reopened.engine().quiet_hours(),
         Some(&quiet_over_noon()),
@@ -2278,5 +2295,424 @@ fn the_inbox_read_carries_the_escalation_the_quiet_window_and_the_gaps_together(
             .iter()
             .all(|item| item.notification == NotificationState::Deferred),
         "what quiet hours suppress is the audible delivery, not the item"
+    );
+}
+
+// ----- What a key carries ---------------------------------------------------------------------
+
+#[test]
+fn a_key_carries_none_of_the_text_the_condition_came_from() {
+    // A key reaches every caller that may read the inbox at all, including one the host cannot
+    // narrow retained content to. So the text a condition came from cannot travel inside it.
+    let mut attention = engine();
+    let secret = "deploying with token hunter2";
+    for source in [
+        command(1, 1_000, secret, 101),
+        notice(1, 2_000, secret, false),
+    ] {
+        attention
+            .apply(&source, reading(0))
+            .expect("the store records the decision");
+    }
+    let items = whole_inbox(&attention);
+    let keys: Vec<_> = items.iter().map(|item| item.key.clone()).collect();
+    assert_eq!(keys.len(), 2);
+    for key in &keys {
+        assert!(
+            !key.as_str().contains("hunter2") && !key.as_str().contains("deploying"),
+            "the subject does not travel inside its key: {key}"
+        );
+        let derived = key
+            .as_str()
+            .split_once('|')
+            .expect("a key names its rule")
+            .1;
+        assert!(derived.starts_with(DERIVED_MARKER));
+    }
+    // And a caller the host cannot narrow gets neither the text nor a key carrying it.
+    let narrowed = attention.inbox(&actor("device:phone"), true, Content::Narrowed);
+    assert!(narrowed.iter().all(|item| item.summary.0.is_none()));
+    assert!(
+        narrowed
+            .iter()
+            .all(|item| !item.key.as_str().contains("hunter2"))
+    );
+    // The derivation is still the engine's own, so acknowledging by the key it gave works.
+    let command_key = items
+        .iter()
+        .find(|item| item.rule == AttentionRule::CommandFailed)
+        .expect("the command is in the inbox")
+        .key
+        .clone();
+    assert_eq!(
+        command_key,
+        key(
+            AttentionRule::CommandFailed,
+            &format!("{}|{secret}", session(1))
+        )
+    );
+}
+
+// ----- Announcement identity ------------------------------------------------------------------
+
+#[test]
+fn an_announcement_identity_is_never_given_out_twice() {
+    // A condition that ends and comes back is a new item, and its first announcement is not the
+    // one a consumer recorded before. Settling the old identity must not settle the new decision.
+    let mut attention = engine();
+    let lost = |sequence: u64, at_ms: u64| {
+        event(
+            AttentionSource::Semantic,
+            sequence,
+            at_ms,
+            EventKind::HostContactLost {
+                detail: "the relay closed".to_owned(),
+            },
+        )
+    };
+    attention
+        .apply(&lost(1, 1_000), reading(0))
+        .expect("the store records the decision");
+    let first = attention.take_announcements();
+    assert_eq!(first.len(), 1);
+    attention
+        .apply(
+            &event(
+                AttentionSource::Semantic,
+                2,
+                2_000,
+                EventKind::HostContactRestored,
+            ),
+            reading(1_000),
+        )
+        .expect("the store records the decision");
+    assert_eq!(attention.awaiting_delivery(), 0, "the condition ended");
+    attention
+        .apply(&lost(3, 3_000), reading(2_000))
+        .expect("the store records the decision");
+    let second = attention.take_announcements();
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].key, first[0].key, "the same condition");
+    assert_ne!(
+        second[0].number, first[0].number,
+        "but not the same decision"
+    );
+
+    // The consumer that recorded the first one settles it late. The second is still outstanding.
+    attention
+        .settle_announcements(&[(first[0].key.clone(), first[0].number)])
+        .expect("the store records the settlement");
+    assert_eq!(
+        attention.awaiting_delivery(),
+        1,
+        "an identity from before the condition returned settles nothing after it"
+    );
+    attention
+        .settle_announcements(&[(second[0].key.clone(), second[0].number)])
+        .expect("the store records the settlement");
+    assert_eq!(attention.awaiting_delivery(), 0);
+}
+
+#[test]
+fn an_announcement_identity_keeps_going_forward_across_a_restart() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let taken;
+    {
+        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        attention
+            .apply(&command(1, 1_000, "cargo test", 101), reading(0))
+            .expect("the store records the decision");
+        taken = attention.take_announcements();
+        assert_eq!(taken.len(), 1);
+    }
+    let mut reopened = Attention::open(&path, reading(10_000)).expect("the feature store reopens");
+    reopened
+        .apply(&notice(1, 2_000, "build finished", false), reading(10_000))
+        .expect("the store records the decision");
+    let after = reopened.take_announcements();
+    let fresh = after
+        .iter()
+        .find(|one| one.rule == AttentionRule::ApplicationNotice)
+        .expect("the notice decided an announcement");
+    assert_ne!(
+        fresh.number, taken[0].number,
+        "no identity this store has given out comes back after a restart"
+    );
+}
+
+// ----- What the bound may never let go of -----------------------------------------------------
+
+#[test]
+fn a_decision_no_consumer_has_settled_is_never_let_go_of() {
+    // A notice is the most droppable thing in the set. One with an announcement nobody has taken
+    // is still the only record of that decision, so the bound holds it rather than losing it.
+    let mut attention = engine();
+    attention
+        .apply(&notice(1, 1_000, "the first notice", false), reading(0))
+        .expect("the store records the decision");
+    let held = notice_key("the first notice");
+    assert_eq!(attention.awaiting_delivery(), 1);
+    let bound = MAX_RETAINED_ATTENTION_ITEMS;
+    for sequence in 2..=bound + 10 {
+        attention
+            .apply(
+                &notice(
+                    sequence,
+                    1_000 + sequence,
+                    &format!("notice {sequence}"),
+                    false,
+                ),
+                reading(sequence * 60_001),
+            )
+            .expect("the store records the decision");
+        // Everything after the first is taken and settled at once, so only the first is held.
+        let taken = attention.take_announcements();
+        let settled: Vec<_> = taken
+            .iter()
+            .filter(|one| one.key != held)
+            .map(|one| (one.key.clone(), one.number))
+            .collect();
+        attention
+            .settle_announcements(&settled)
+            .expect("the store records the settlements");
+    }
+    assert!(
+        whole_inbox(&attention).iter().any(|item| item.key == held),
+        "the item whose decision nobody has taken is still there"
+    );
+    assert_eq!(attention.awaiting_delivery(), 1);
+}
+
+#[test]
+fn a_decision_quiet_hours_are_holding_is_never_let_go_of() {
+    let mut attention = engine();
+    attention
+        .set_quiet_hours(Some(quiet_over_noon()), reading(0))
+        .expect("the store records the window");
+    attention
+        .apply(&notice(1, 1_000, "the first notice", false), reading(0))
+        .expect("the store records the decision");
+    let held = notice_key("the first notice");
+    assert!(
+        whole_inbox(&attention)
+            .iter()
+            .any(|item| item.key == held && item.notification == NotificationState::Deferred),
+        "the window is holding its announcement"
+    );
+    let bound = MAX_RETAINED_ATTENTION_ITEMS;
+    for sequence in 2..=bound + 10 {
+        attention
+            .apply(
+                &command(
+                    sequence,
+                    1_000 + sequence,
+                    &format!("cargo test {sequence}"),
+                    101,
+                ),
+                reading(sequence * 60_001),
+            )
+            .expect("the store records the decision");
+    }
+    assert!(
+        whole_inbox(&attention).iter().any(|item| item.key == held),
+        "a held announcement is work in flight, not a record of one"
+    );
+}
+
+// ----- Review work the host has just been told about ------------------------------------------
+
+#[test]
+fn review_work_the_host_has_just_recorded_is_never_the_one_the_bound_lets_go_of() {
+    // Every older subject has been read, so none of them may be let go of. The new capture is the
+    // only unprotected one, and answering a capture by deleting it would lose review work outright.
+    let mut attention = engine();
+    let who = actor("local:501");
+    let captured = |sequence: u64, byte: u8, version: u64| {
+        event(
+            AttentionSource::Semantic,
+            sequence,
+            1_000 + sequence,
+            EventKind::ChangeSetCaptured {
+                session_id: session(1),
+                change_set_id: ChangeSetId::new(Uuid::from_bytes([byte; 16])),
+                version,
+                summary: "rewrote the parser".to_owned(),
+            },
+        )
+    };
+    let bound = u64::try_from(MAX_RETAINED_REVIEW_SUBJECTS).expect("a small bound");
+    for sequence in 1..=bound {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&sequence.to_be_bytes());
+        let change_set_id = ChangeSetId::new(Uuid::from_bytes(bytes));
+        attention
+            .apply(
+                &event(
+                    AttentionSource::Semantic,
+                    sequence,
+                    1_000 + sequence,
+                    EventKind::ChangeSetCaptured {
+                        session_id: session(1),
+                        change_set_id,
+                        version: 1,
+                        summary: "rewrote the parser".to_owned(),
+                    },
+                ),
+                reading(sequence),
+            )
+            .expect("the store records the decision");
+        attention
+            .acknowledge_review(
+                &who,
+                &ReviewSubject::ChangeSet {
+                    session_id: session(1),
+                    change_set_id,
+                },
+                1,
+                reading(sequence),
+            )
+            .expect("the actor reads it");
+    }
+    attention
+        .apply(&captured(bound + 1, 0xee, 3), reading(bound + 1))
+        .expect("the store records the decision");
+    let fresh = ReviewSubject::ChangeSet {
+        session_id: session(1),
+        change_set_id: ChangeSetId::new(Uuid::from_bytes([0xee; 16])),
+    };
+    let state = attention
+        .reviews()
+        .state(&who, &fresh)
+        .expect("the capture the host was just told about is review work it holds");
+    assert_eq!(state.current_version, U64::new(3));
+    assert!(state.outstanding);
+}
+
+#[test]
+fn a_review_read_is_one_bounded_page_that_continues_where_the_last_one_ended() {
+    let mut attention = engine();
+    let who = actor("local:501");
+    let total = MAX_REVIEW_SUBJECTS + 5;
+    for sequence in 1..=total {
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&sequence.to_be_bytes());
+        attention
+            .apply(
+                &event(
+                    AttentionSource::Semantic,
+                    sequence,
+                    1_000 + sequence,
+                    EventKind::ChangeSetCaptured {
+                        session_id: session(1),
+                        change_set_id: ChangeSetId::new(Uuid::from_bytes(bytes)),
+                        version: 1,
+                        summary: "rewrote the parser".to_owned(),
+                    },
+                ),
+                reading(sequence),
+            )
+            .expect("the store records the decision");
+    }
+    let (first, more) = attention
+        .review_states(&who, session(1), None, MAX_REVIEW_SUBJECTS * 4)
+        .expect("a page from the oldest");
+    assert_eq!(
+        first.len(),
+        usize::try_from(MAX_REVIEW_SUBJECTS).expect("a small bound"),
+        "a caller cannot ask for more than the page bound"
+    );
+    assert!(more, "and it says there is more");
+    let last = first.last().expect("a page").subject.clone();
+    let (second, more) = attention
+        .review_states(&who, session(1), Some(&last), MAX_REVIEW_SUBJECTS)
+        .expect("a page that continues");
+    assert_eq!(second.len(), 5);
+    assert!(!more, "that is the end of the list");
+    assert!(
+        second.iter().all(|state| !first.contains(state)),
+        "the second page is what the first did not carry"
+    );
+
+    // A continuation this session no longer holds is refused rather than restarting the list.
+    let unknown = ReviewSubject::ChangeSet {
+        session_id: session(1),
+        change_set_id: ChangeSetId::new(Uuid::from_bytes([0xfe; 16])),
+    };
+    assert!(matches!(
+        attention.review_states(&who, session(1), Some(&unknown), MAX_REVIEW_SUBJECTS),
+        Err(kr_attention::Error::UnknownContinuation { .. })
+    ));
+}
+
+// ----- What a resolution still knows ----------------------------------------------------------
+
+#[test]
+fn a_question_answered_after_its_reminder_record_left_is_still_a_change() {
+    // The reminder record is a working set with a bound. The answer is a change since somebody's
+    // last visit whether or not that record is still there, so the resolution carries its session.
+    let mut attention = engine();
+    let bound = MAX_RETAINED_PENDING_INPUTS;
+    let first = question(1);
+    for index in 0..bound {
+        let id = if index == 0 {
+            first
+        } else {
+            question(u8::try_from(index % 250).expect("a small index").max(2))
+        };
+        let sequence = u64::try_from(index + 1).expect("a small index");
+        attention
+            .apply(
+                &pending_question(sequence, sequence, id, true, sequence),
+                reading(sequence),
+            )
+            .expect("the store records the decision");
+    }
+    // Every reminder has been raised, so the oldest record is one the bound may take.
+    attention
+        .tick(reading(IDLE_REMINDER_MS * 2))
+        .expect("the store records the decisions");
+    let sequence = u64::try_from(bound).expect("a small bound") + 1;
+    attention
+        .apply(
+            &pending_question(sequence, sequence, question(251), true, sequence),
+            reading(IDLE_REMINDER_MS * 2),
+        )
+        .expect("the store records the decision");
+    assert!(
+        attention.engine().pending_inputs().len() <= bound,
+        "the bound held"
+    );
+    let before = attention
+        .changed_since(&actor("local:501"), 500, 0, Content::Whole)
+        .changes
+        .len();
+    attention
+        .apply(
+            &event(
+                AttentionSource::Questions,
+                sequence + 1,
+                sequence + 1,
+                EventKind::QuestionResolved {
+                    question_id: first,
+                    session_id: session(1),
+                    answered: true,
+                },
+            ),
+            reading(IDLE_REMINDER_MS * 3),
+        )
+        .expect("the store records the decision");
+    let after = attention.changed_since(&actor("local:501"), 500, 0, Content::Whole);
+    assert_eq!(
+        after.changes.len(),
+        before + 1,
+        "the answer is a change since a visit whatever the reminder record holds"
+    );
+    assert!(
+        after
+            .changes
+            .iter()
+            .any(|change| change.kind
+                == kr_protocol::attention::SemanticChangeKind::QuestionAnswered)
     );
 }

@@ -16273,6 +16273,21 @@
       "additionalProperties": false,
       "description": "Parameters of `review.read`.",
       "properties": {
+        "after": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReviewSubject"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The subject to continue after, or null to start at the oldest.\n\nA subject this session no longer holds is refused rather than restarting the page, because\na page that silently began again would read as the end of the list."
+        },
+        "max_reviews": {
+          "$ref": "#/$defs/U64",
+          "description": "The largest page the caller will accept, bounded by [`MAX_REVIEW_SUBJECTS`].\n\nIt is ignored when `subject` names one subject, because that answer is one row."
+        },
         "session_id": {
           "$ref": "#/$defs/SessionId",
           "description": "The session the review state belongs to."
@@ -16286,12 +16301,14 @@
               "type": "null"
             }
           ],
-          "description": "One subject, or null for every subject this session knows about."
+          "description": "One subject, or null for a page of every subject this session knows about."
         }
       },
       "required": [
         "session_id",
-        "subject"
+        "subject",
+        "max_reviews",
+        "after"
       ],
       "type": "object"
     },
@@ -16303,6 +16320,10 @@
           "$ref": "#/$defs/ActorId",
           "description": "The actor this state belongs to."
         },
+        "more": {
+          "description": "Whether more subjects remain after the last one in this page.",
+          "type": "boolean"
+        },
         "reviews": {
           "description": "The review state of each subject, oldest first.",
           "items": {
@@ -16313,7 +16334,8 @@
       },
       "required": [
         "actor_id",
-        "reviews"
+        "reviews",
+        "more"
       ],
       "type": "object"
     },

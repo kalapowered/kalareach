@@ -77,7 +77,15 @@ pub const MAX_ATTENTION_SUMMARY_LEN: usize = 512;
 pub const MAX_RETAINED_SUMMARIES: usize = 32;
 
 /// Largest number of review subjects the host keeps for one session.
+///
+/// It is where retention starts rather than where the table stops. A subject an inbox item points
+/// at, one an actor has acknowledged and one the host has only just recorded are all authoritative
+/// records rather than a working set, so the table holds them and grows past this figure instead
+/// of forgetting one. [`MAX_REVIEW_SUBJECTS`] is what bounds the answer.
 pub const MAX_RETAINED_REVIEW_SUBJECTS: usize = 500;
+
+/// Largest number of review subjects one review read returns.
+pub const MAX_REVIEW_SUBJECTS: u64 = 200;
 
 /// Largest number of semantic changes one changed-since-last-visit read returns.
 pub const MAX_VISIT_CHANGES: u64 = 500;
@@ -672,8 +680,17 @@ pub struct AttentionQuietHoursResult {
 pub struct ReviewReadParams {
     /// The session the review state belongs to.
     pub session_id: SessionId,
-    /// One subject, or null for every subject this session knows about.
+    /// One subject, or null for a page of every subject this session knows about.
     pub subject: Nullable<ReviewSubject>,
+    /// The largest page the caller will accept, bounded by [`MAX_REVIEW_SUBJECTS`].
+    ///
+    /// It is ignored when `subject` names one subject, because that answer is one row.
+    pub max_reviews: U64,
+    /// The subject to continue after, or null to start at the oldest.
+    ///
+    /// A subject this session no longer holds is refused rather than restarting the page, because
+    /// a page that silently began again would read as the end of the list.
+    pub after: Nullable<ReviewSubject>,
 }
 
 /// The result of `review.read`.
@@ -684,6 +701,8 @@ pub struct ReviewReadResult {
     pub actor_id: ActorId,
     /// The review state of each subject, oldest first.
     pub reviews: Vec<ReviewState>,
+    /// Whether more subjects remain after the last one in this page.
+    pub more: bool,
 }
 
 /// Parameters of `review.acknowledge`.

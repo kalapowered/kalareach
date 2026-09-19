@@ -99,8 +99,9 @@ pub struct Item {
     pub announced_level: Option<AttentionLevel>,
     /// How many announcements this item has produced.
     ///
-    /// It is what gives each decision an identity of its own: an item's key names a condition, and
-    /// one condition produces many announcements over its life.
+    /// It is the count a client shows: one condition is announced many times over its life. It is
+    /// not the identity of any of them, because an item that resolves and is raised again starts
+    /// counting from nought.
     pub announcements: u64,
     /// The announcement, by its own number, that no delivery consumer has settled yet.
     ///
@@ -109,6 +110,9 @@ pub struct Item {
     /// steps: [`Engine::take_announcements`] offers what is outstanding without forgetting it, and
     /// [`Engine::settle_announcements`] forgets it once the consumer has recorded it. A host that
     /// decided an announcement and died at any point before that offers it again.
+    ///
+    /// The number comes from a counter that only goes forward and outlives the item, so an
+    /// identity a consumer recorded never names a later decision about the same condition.
     pub pending_handoff: Option<u64>,
     /// Whether a gap in the retained events could have resolved it.
     pub uncertain: bool,
@@ -232,11 +236,13 @@ pub enum Outcome {
 pub struct Announcement {
     /// The item.
     pub key: AttentionKey,
-    /// Which of that item's announcements this is.
+    /// This decision's own number in the store that made it.
     ///
-    /// The pair of the key and this number is the decision's identity, and it is what a consumer
-    /// settles by: a newer decision about the same condition is a different announcement and is
-    /// not settled by an older one.
+    /// It comes from a counter that only goes forward and outlives the item it was given for, so
+    /// the pair of the key and this number is an identity the store never hands out twice: a newer
+    /// decision about the same condition is a different announcement, even when the condition ended
+    /// and returned in between, and an older identity settles none of it. The number is unique
+    /// inside one session's store; a consumer that combines several keys by the session too.
     pub number: u64,
     /// Its rule.
     pub rule: AttentionRule,
@@ -286,6 +292,7 @@ pub struct Engine {
     pending_inputs: BTreeMap<QuestionId, PendingInput>,
     quiet: Option<QuietHours>,
     dropped: u64,
+    next_announcement: u64,
 }
 
 /// Returns `text` clipped to the bound one summary carries, on a character boundary.
@@ -358,6 +365,12 @@ impl Engine {
     #[must_use]
     pub const fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    /// Returns the highest announcement identity this store has handed out.
+    #[must_use]
+    pub const fn next_announcement(&self) -> u64 {
+        self.next_announcement
     }
 
     /// Returns the highest sequence consumed from one source.
@@ -570,7 +583,9 @@ impl Engine {
     /// Forgets the announcements a consumer has taken durable responsibility for.
     ///
     /// An identity that names an announcement the item has since replaced settles nothing: the
-    /// newer decision is a different announcement, and it is still outstanding.
+    /// newer decision is a different announcement, and it is still outstanding. A number is never
+    /// reused, so an identity recorded before a condition ended cannot settle a decision made
+    /// after the same condition returned.
     pub fn settle_announcements(&mut self, settled: &[(AttentionKey, u64)]) {
         for (key, number) in settled {
             if let Some(item) = self.items.get_mut(key)
@@ -652,6 +667,13 @@ impl Engine {
         self.pending_inputs = restored.pending;
         self.quiet = restored.quiet;
         self.dropped = restored.dropped;
+        // Never behind an identity the restored items already carry: a counter that came back
+        // short would hand a second decision a number a consumer has already recorded.
+        self.next_announcement = self
+            .items
+            .values()
+            .filter_map(|item| item.pending_handoff)
+            .fold(restored.next_announcement, u64::max);
     }
 
     /// Re-anchors every interval at `reading`, from the wall-clock moments the store kept.
@@ -1015,6 +1037,9 @@ impl Engine {
     /// the count of what has gone is reported rather than hidden. The item that was just raised is
     /// weighed with the rest: a fresh informational notice does not displace an urgent approval
     /// merely by being the newest thing to arrive.
+    ///
+    /// Three things are never let go of: a condition somebody or something is still waiting on, a
+    /// decision no delivery consumer has settled, and a decision quiet hours are holding.
     fn enforce_bound(&mut self) -> Vec<Outcome> {
         let bound = usize::try_from(MAX_RETAINED_ATTENTION_ITEMS).unwrap_or(usize::MAX);
         let mut outcomes = Vec::new();
@@ -1022,7 +1047,12 @@ impl Engine {
             let Some(victim) = self
                 .items
                 .values()
-                .filter(|item| rule(item.rule).droppable)
+                .filter(|item| {
+                    // A decision nobody has taken responsibility for, and one quiet hours are
+                    // holding, are both work in flight. Letting go of the item would lose the
+                    // announcement with it, and nothing offers it again.
+                    rule(item.rule).droppable && item.pending_handoff.is_none() && !item.deferred
+                })
                 .min_by(|left, right| {
                     left.level
                         .cmp(&right.level)
@@ -1032,9 +1062,10 @@ impl Engine {
                 .map(|item| item.key.clone())
             else {
                 // Everything in the inbox is a condition somebody or something is still waiting
-                // on. The inbox goes over its bound rather than forgetting one of those: section
-                // 25 keeps an outstanding approval in the inbox, and a host that dropped one would
-                // be answering that nothing is waiting when something is.
+                // on, or a decision about one that has not been delivered yet. The inbox goes over
+                // its bound rather than forgetting one of those: section 25 keeps an outstanding
+                // approval in the inbox, and a host that dropped one would be answering that
+                // nothing is waiting when something is.
                 break;
             };
             self.items.remove(&victim);
@@ -1074,7 +1105,16 @@ impl Engine {
         item.notification = NotificationState::Delivered;
         item.announced_level = Some(level);
         item.announcements = item.announcements.saturating_add(1);
-        item.pending_handoff = Some(item.announcements);
+        // The identity comes from a counter of this store's own, not from the item's count. An
+        // item that resolves and is raised again starts its count at one, and a consumer that had
+        // recorded the earlier decision would settle the new one by the number they shared.
+        let number = self.next_announcement.saturating_add(1);
+        self.next_announcement = number;
+        let item = self
+            .items
+            .get_mut(key)
+            .expect("the item was read a moment ago");
+        item.pending_handoff = Some(number);
         vec![if released {
             Outcome::Released {
                 key: key.clone(),
@@ -1220,4 +1260,5 @@ pub(crate) struct Restored {
     pub(crate) pending: BTreeMap<QuestionId, PendingInput>,
     pub(crate) quiet: Option<QuietHours>,
     pub(crate) dropped: u64,
+    pub(crate) next_announcement: u64,
 }

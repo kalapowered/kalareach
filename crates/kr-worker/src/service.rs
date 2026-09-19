@@ -99,6 +99,36 @@ pub const HOST_MAINTENANCE: std::time::Duration = std::time::Duration::from_secs
 /// stops one pass reading a week of records in one go; what it does not read is read on the next.
 pub const ATTENTION_CATCH_UP_PAGES: usize = 64;
 
+/// How long maintenance waits after a pass that did not finish.
+///
+/// A pass that could not read a source, could not write its own state, or ran out of pages before
+/// the backlog ended has left its timers due now, so the deadline it reports is no wait at all.
+/// This is the wait instead: long enough that an unreadable store is retried rather than spun on,
+/// short enough that a backlog is worked through promptly.
+pub const ATTENTION_RETRY: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What one attention maintenance pass did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttentionPass {
+    /// It read every retained record it had not seen, and decided the timers against the present.
+    Complete,
+    /// It stopped before that, having run out of pages or been unable to read or write one. The
+    /// timers were not decided, because deciding them against a half-read history would answer
+    /// about a request whose answer is in the part that was not read.
+    Unfinished,
+}
+
+/// What one bounded page of the retained sources did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttentionPage {
+    /// It read everything the sources hold that the engine had not seen.
+    CaughtUp,
+    /// It read a full page, and more remains behind it.
+    More,
+    /// A source could not be read, or the page could not be written down.
+    Failed,
+}
+
 /// The event stream name output notifications carry.
 pub const OUTPUT_STREAM: &str = "session.output";
 
@@ -404,16 +434,25 @@ impl WorkerService {
             };
             // Outside the barrier: the attention engine reads the retained sources and writes its
             // own tables, and nothing a mutation does depends on the answer. A failure here is a
-            // failure of maintenance, which is retried on the next pass rather than reported to
-            // somebody who did not ask.
-            self.attention_pass();
+            // failure of maintenance, which is retried rather than reported to somebody who did
+            // not ask.
+            let pass = self.attention_pass();
             if closed {
                 break;
             }
             // The next pass is the earlier of this loop's own cadence and the moment the attention
             // engine says a timer is due. An idle reminder is five minutes from a request, not
             // five minutes rounded up to the next minute this loop happens to wake on.
-            match self.attention_deadline() {
+            //
+            // A pass that did not finish is the exception. It left a backlog it has not read or a
+            // source it could not read at all, and its timers are still due, so the deadline it
+            // reports is now. Waiting a short fixed interval instead is what stops an unreadable
+            // store turning into a loop that reads it as fast as the machine allows.
+            let wait = match pass {
+                AttentionPass::Complete => self.attention_deadline(),
+                AttentionPass::Unfinished => Some(ATTENTION_RETRY),
+            };
+            match wait {
                 Some(wait) => {
                     tokio::select! {
                         () = tokio::time::sleep(wait) => {}
@@ -457,52 +496,69 @@ impl WorkerService {
     /// a `kr_attention::event::SourceEvent` with its own source's cursor and calls
     /// [`crate::attention::Attention::observe`]; a record it consumed that no rule covers is
     /// `EventKind::Observed`, which moves the cursor and raises nothing.
-    pub fn attention_pass(&self) {
+    pub fn attention_pass(&self) -> AttentionPass {
         let time = Arc::clone(self.runtime.session().time());
         // Catch up before deciding anything. A pass takes a bounded page from each source, and a
         // host that has been away reads several: deciding the timers against a half-read history
-        // would raise a reminder for a request whose answer is still in the next page.
+        // would raise a reminder for a request whose answer is still in the next page. A pass that
+        // runs out of pages, or that cannot read or write a page at all, decides nothing and says
+        // so, and the caller comes back for the rest.
         for _ in 0..ATTENTION_CATCH_UP_PAGES {
-            if !self.attention_page(&time) {
-                break;
+            match self.attention_page(&time) {
+                AttentionPage::CaughtUp => {
+                    if self.attention.tick(&time).is_err() {
+                        return AttentionPass::Unfinished;
+                    }
+                    return AttentionPass::Complete;
+                }
+                AttentionPage::More => {}
+                AttentionPage::Failed => return AttentionPass::Unfinished,
             }
         }
-        let _ = self.attention.tick(&time);
+        AttentionPass::Unfinished
     }
 
-    /// Reads one bounded page from each retained source. Returns true when it read anything.
-    fn attention_page(&self, time: &Arc<crate::action::time::TimeContract>) -> bool {
+    /// Reads one bounded page from each retained source and gives it to the engine.
+    fn attention_page(&self, time: &Arc<crate::action::time::TimeContract>) -> AttentionPage {
         let mut events = Vec::new();
-        let from = self
+        let Ok(Some(from)) = self
             .attention
             .consumed(kr_protocol::attention::AttentionSource::Questions)
-            .ok()
-            .flatten()
-            .unwrap_or_default();
-        if let Ok(page) = self.questions.events_since(from, crate::attention::PAGE) {
-            events.extend(
-                page.iter()
-                    .map(|(sequence, event)| crate::attention::question_event(*sequence, event)),
-            );
-        }
+            .map(|consumed| Some(consumed.unwrap_or_default()))
+        else {
+            return AttentionPage::Failed;
+        };
+        let Ok(page) = self.questions.events_since(from, crate::attention::PAGE) else {
+            return AttentionPage::Failed;
+        };
+        let questions = page.len();
+        events.extend(
+            page.iter()
+                .map(|(sequence, event)| crate::attention::question_event(*sequence, event)),
+        );
         // Read under the session lock and translated outside it: the engine's own write must not
         // hold the lock the terminal needs.
-        let from = usize::try_from(
-            self.attention
-                .consumed(kr_protocol::attention::AttentionSource::HostEvents)
-                .ok()
-                .flatten()
-                .unwrap_or_default(),
-        )
-        .unwrap_or(usize::MAX);
+        let Ok(consumed) = self
+            .attention
+            .consumed(kr_protocol::attention::AttentionSource::HostEvents)
+        else {
+            return AttentionPage::Failed;
+        };
+        let from = usize::try_from(consumed.unwrap_or_default()).unwrap_or(usize::MAX);
         let (session_id, recorded) = {
             let session = self.runtime.session();
-            let recorded = session
+            let Some(recorded) = session
                 .journal()
-                .and_then(|journal| journal.host_events().ok())
-                .unwrap_or_default();
+                .map_or(Ok(Some(Vec::new())), |journal| {
+                    journal.host_events().map(Some)
+                })
+                .unwrap_or(None)
+            else {
+                return AttentionPage::Failed;
+            };
             (session.id(), recorded)
         };
+        let host_events = recorded.len().saturating_sub(from.min(recorded.len()));
         events.extend(
             recorded
                 .iter()
@@ -513,9 +569,13 @@ impl WorkerService {
                     crate::attention::host_event(index.saturating_add(1) as u64, session_id, event)
                 }),
         );
-        let read = events.len();
-        let _ = self.attention.feed(&events, time);
-        read >= crate::attention::PAGE
+        if self.attention.feed(&events, time).is_err() {
+            return AttentionPage::Failed;
+        }
+        if questions >= crate::attention::PAGE || host_events > crate::attention::PAGE {
+            return AttentionPage::More;
+        }
+        AttentionPage::CaughtUp
     }
 
     /// Looks at the host's clocks, and revalidates what a discontinuity invalidated.
@@ -3163,13 +3223,16 @@ impl WorkerService {
                 // attachment has no viewport to report.
                 session.viewportable(params.attachment_id, params.dimensions, params.position.0)
             }
-            // Everything about a review or a quiet-hours window this host can decide about. A
-            // subject this session never held, a version nobody produced and a window that is not
-            // minutes of a day are refusals rather than outcomes nobody can establish, so they are
-            // answered here rather than inside the effect.
+            // Everything about a review, a visit or a quiet-hours window this host can decide
+            // about. A subject this session never held, a version nobody produced, a counter the
+            // store could not write down as it was given, a window that is not minutes of a day
+            // and one more actor than the store admits are refusals rather than outcomes nobody
+            // can establish, so they are answered here rather than inside the effect.
+            Method::AttentionAcknowledge => self.attention.check_actor(&caller.actor_id),
             Method::ReviewAcknowledge => {
                 let params: kr_protocol::attention::ReviewAcknowledgeParams =
                     parse(&mutation.params)?;
+                self.attention.check_actor(&caller.actor_id)?;
                 self.attention.check_review(&params)
             }
             Method::AttentionQuietHours => {
@@ -3180,6 +3243,7 @@ impl WorkerService {
             Method::VisitAcknowledge => {
                 let params: kr_protocol::attention::VisitAcknowledgeParams =
                     parse(&mutation.params)?;
+                self.attention.check_actor(&caller.actor_id)?;
                 crate::attention::Attention::check_visit(&params)
             }
             Method::ActionCancel => {

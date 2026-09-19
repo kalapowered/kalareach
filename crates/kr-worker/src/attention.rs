@@ -132,7 +132,9 @@ fn translate(error: kr_attention::Error) -> WorkerError {
             detail: format!("the attention store holds a {field} this build cannot read"),
         },
         kr_attention::Error::UnknownContinuation { key } => WorkerError::PreconditionFailed {
-            detail: format!("this inbox no longer holds {key}, so a page cannot continue after it"),
+            detail: format!(
+                "this session no longer holds {key}, so a page cannot continue after it"
+            ),
         },
         kr_attention::Error::TooManyActors { bound } => WorkerError::QuotaExceeded {
             detail: format!(
@@ -237,6 +239,20 @@ impl Attention {
         self.locked()?
             .settle_announcements(settled)
             .map_err(translate)
+    }
+
+    /// Refuses, before anything is dispatched, an actor this session's store cannot admit.
+    ///
+    /// The store bounds how many actors it holds on admission rather than on eviction, so nothing
+    /// anybody has acknowledged is deleted to make room. Asking here makes one more actor than the
+    /// bound a rejection of the action rather than a storage failure after the marker, which
+    /// settles as an outcome nobody can establish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::QuotaExceeded`] when the actor is new and the bound is reached.
+    pub fn check_actor(&self, actor: &ActorId) -> Result<()> {
+        self.locked()?.check_actor(actor).map_err(translate)
     }
 
     /// Refuses, before anything is dispatched, a review acknowledgement this host can decide about.
@@ -377,20 +393,33 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::JournalUnavailable`] when the engine cannot be reached.
+    /// Returns [`WorkerError::JournalUnavailable`] when the engine cannot be reached, and
+    /// [`WorkerError::PreconditionFailed`] when the page continues after a subject this session no
+    /// longer holds.
     pub fn review_read(
         &self,
         actor: &ActorId,
         params: &ReviewReadParams,
     ) -> Result<ReviewReadResult> {
         let engine = self.locked()?;
-        let reviews = match params.subject.as_ref() {
-            Some(subject) => engine.reviews().state(actor, subject).into_iter().collect(),
-            None => engine.review_states(actor, params.session_id),
+        let (reviews, more) = match params.subject.as_ref() {
+            Some(subject) => (
+                engine.reviews().state(actor, subject).into_iter().collect(),
+                false,
+            ),
+            None => engine
+                .review_states(
+                    actor,
+                    params.session_id,
+                    params.after.as_ref(),
+                    params.max_reviews.get(),
+                )
+                .map_err(translate)?,
         };
         Ok(ReviewReadResult {
             actor_id: actor.clone(),
             reviews,
+            more,
         })
     }
 
@@ -457,21 +486,25 @@ impl Attention {
         ))
     }
 
-    /// Reads the retained sources this worker holds and gives the engine what it has not seen.
+    /// Gives the engine a page of retained records it has not seen, announcing none of them.
     ///
-    /// Returns the events it fed in, for a caller that wants to know a pass did something.
+    /// This is the catch-up path rather than the live one. A page of retained records is history
+    /// as far as the engine is concerned: a question raised and answered inside it is not a
+    /// notification to send now, and a request still open at the end of it is. So the page rebuilds
+    /// state without deciding anything, and the [`Attention::tick`] that follows a completed
+    /// catch-up decides what is owed against the present. A producer with a live event calls
+    /// [`Attention::observe`] instead.
+    ///
+    /// The whole page is one transaction, so a page that could not be written leaves the cursor
+    /// where it was and the same page is read again.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::JournalUnavailable`] when a decision cannot be written down. What
-    /// was already fed in stays fed in: the cursor moves with each event, so the pass resumes
-    /// where it stopped.
+    /// Returns [`WorkerError::JournalUnavailable`] when the page cannot be written down.
     pub fn feed(&self, events: &[SourceEvent], time: &TimeContract) -> Result<Vec<Outcome>> {
-        let mut produced = Vec::new();
-        for event in events {
-            produced.extend(self.observe(event, time)?);
-        }
-        Ok(produced)
+        self.locked()?
+            .rebuild(events, reading(time))
+            .map_err(translate)
     }
 
     fn locked(&self) -> Result<std::sync::MutexGuard<'_, Engine>> {
@@ -500,11 +533,13 @@ pub fn question_event(sequence: u64, event: &kr_protocol::question::QuestionEven
         },
         kr_protocol::question::QuestionEventKind::Answered => EventKind::QuestionResolved {
             question_id: event.question.question_id,
+            session_id: event.question.session_id,
             answered: true,
         },
         kr_protocol::question::QuestionEventKind::Cancelled
         | kr_protocol::question::QuestionEventKind::Expired => EventKind::QuestionResolved {
             question_id: event.question.question_id,
+            session_id: event.question.session_id,
             answered: false,
         },
     };

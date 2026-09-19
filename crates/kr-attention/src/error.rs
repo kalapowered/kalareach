@@ -25,8 +25,8 @@ pub enum Error {
         /// The bound.
         bound: usize,
     },
-    /// A page continues after a key that is no longer in the inbox it was read from.
-    #[error("the inbox no longer holds {key}, so a page cannot continue after it")]
+    /// A page continues after a key or subject the session no longer holds.
+    #[error("this session no longer holds {key}, so a page cannot continue after it")]
     UnknownContinuation {
         /// The key the page named.
         key: String,

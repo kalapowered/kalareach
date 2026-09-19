@@ -20,7 +20,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use kr_protocol::attention::{MAX_RETAINED_REVIEW_SUBJECTS, ReviewState, ReviewSubject};
+use kr_protocol::attention::{
+    MAX_RETAINED_REVIEW_SUBJECTS, MAX_REVIEW_SUBJECTS, ReviewState, ReviewSubject,
+};
 use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
@@ -126,14 +128,17 @@ impl Reviews {
     /// Keeps the subject table inside [`MAX_RETAINED_REVIEW_SUBJECTS`].
     ///
     /// `referenced` names the subjects something else still points at - an inbox item that says a
-    /// turn is waiting to be reviewed, most of all. Those are never let go of: an item that says
-    /// there is review work, beside a subject that has gone, is a review nobody can complete.
-    /// Neither is a subject any actor has acknowledged, because an acknowledgement is that actor's
-    /// own record of what it read and nothing here can reconstruct it. What is let go of is a
-    /// subject nobody has pointed at and nobody has read, whose version was recorded longest ago.
+    /// turn is waiting to be reviewed, and whatever the event being consumed has just recorded a
+    /// version of. Those are never let go of: an item that says there is review work, beside a
+    /// subject that has gone, is a review nobody can complete, and a capture answered by deleting
+    /// it is review work the host was told about and threw away. Neither is a subject any actor
+    /// has acknowledged, because an acknowledgement is that actor's own record of what it read and
+    /// nothing here can reconstruct it. What is let go of is a subject nobody has pointed at and
+    /// nobody has read, whose version was recorded longest ago.
     ///
     /// When everything left is referenced or acknowledged the table goes over its bound rather
-    /// than forgetting one of those.
+    /// than forgetting one of those, and [`Reviews::states_page`] is what keeps a response
+    /// bounded instead.
     ///
     /// Returns the subjects that were let go of.
     pub fn enforce_bound(&mut self, referenced: &BTreeSet<String>) -> Vec<String> {
@@ -214,17 +219,60 @@ impl Reviews {
         self.state_of(actor, &subject_key(subject))
     }
 
-    /// Returns one actor's state for every subject in one session, oldest first.
-    #[must_use]
-    pub fn states(&self, actor: &ActorId, session_id: SessionId) -> Vec<ReviewState> {
-        let mut states: Vec<_> = self
+    /// Returns one page of one actor's state for one session, oldest first.
+    ///
+    /// The table holds every subject an actor has acknowledged and every one an inbox item still
+    /// points at, so it has no bound a response could rely on. The page is what is bounded: a
+    /// caller asks for at most [`MAX_REVIEW_SUBJECTS`] and continues after the last subject it
+    /// was given.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnknownContinuation`] when `after` names a subject this session no longer
+    /// holds, because a page that silently restarted would look like the end of the list.
+    pub fn states_page(
+        &self,
+        actor: &ActorId,
+        session_id: SessionId,
+        after: Option<&ReviewSubject>,
+        max: u64,
+    ) -> Result<(Vec<ReviewState>, bool)> {
+        let ordered = self.ordered(session_id);
+        let start = match after {
+            None => 0,
+            Some(subject) => {
+                let key = subject_key(subject);
+                let at = ordered
+                    .iter()
+                    .position(|held| *held == key)
+                    .ok_or(Error::UnknownContinuation { key })?;
+                at.saturating_add(1)
+            }
+        };
+        let bound = usize::try_from(max.clamp(1, MAX_REVIEW_SUBJECTS)).unwrap_or(1);
+        let page: Vec<_> = ordered
+            .iter()
+            .skip(start)
+            .take(bound)
+            .filter_map(|key| self.state_of(actor, key))
+            .collect();
+        let more = ordered.len() > start.saturating_add(page.len());
+        Ok((page, more))
+    }
+
+    /// Returns the keys of one session's subjects, oldest recorded version first.
+    ///
+    /// The order is total: two subjects recorded in the same millisecond are separated by their
+    /// keys, so a page continues where the last one ended whatever the clock did.
+    fn ordered(&self, session_id: SessionId) -> Vec<String> {
+        let mut keys: Vec<_> = self
             .subjects
             .iter()
             .filter(|(_, held)| subject_session(&held.subject) == session_id)
-            .filter_map(|(key, _)| self.state_of(actor, key))
+            .map(|(key, held)| (held.at_ms.get(), key.clone()))
             .collect();
-        states.sort_by_key(|state| state.current_version.get());
-        states
+        keys.sort();
+        keys.into_iter().map(|(_, key)| key).collect()
     }
 
     /// Returns every subject the host holds a version of.
