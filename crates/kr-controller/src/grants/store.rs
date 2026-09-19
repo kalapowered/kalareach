@@ -244,12 +244,18 @@ impl GrantDirectory {
             .prepare("SELECT leased_at_ms FROM authority_receipts LIMIT 1")
             .is_ok();
         if !has_lease {
+            // One transaction, because the two statements are one change. An interruption between
+            // them would leave the column there and every existing lease at zero, and the next
+            // start would find the column and never run the backfill: every pending claim would
+            // read as stale for ever after.
             connection
                 .execute_batch(
-                    "ALTER TABLE authority_receipts
+                    "BEGIN IMMEDIATE;
+                     ALTER TABLE authority_receipts
                          ADD COLUMN leased_at_ms INTEGER NOT NULL DEFAULT 0;
                      UPDATE authority_receipts SET leased_at_ms = claimed_at_ms
-                      WHERE leased_at_ms = 0;",
+                      WHERE leased_at_ms = 0;
+                     COMMIT;",
                 )
                 .map_err(ControllerError::registry)?;
         }

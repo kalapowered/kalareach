@@ -167,16 +167,21 @@ impl ConfirmedTransfer {
         .map_err(|error| ControllerError::PermissionDenied {
             detail: format!("the owner's confirmation does not authorise this transfer: {error}"),
         })?;
-        // The lifetime the ledger enforces, measured from now on this host's own monotonic clock
-        // and bound to this boot. `expires_at_ms` inside the request is the same interval on the
-        // wall clock, for the signer to read.
+        // What is left of the challenge's **own** deadline, carried onto this host's monotonic
+        // clock. Starting a fresh lifetime at acceptance would give a challenge answered a second
+        // before it expired another two minutes of life, which is exactly what a short expiry is
+        // there to prevent. The wall clock is read once, here, to measure the remainder; the
+        // deadline the transfer enforces is monotonic and bound to this boot, so nothing the wall
+        // clock does afterwards lengthens it.
+        let remaining = request
+            .expires_at_ms
+            .get()
+            .saturating_sub(clock.wall_clock_ms());
         Ok(Self {
             action_digest,
             host_device_id: host.device_id,
             boot: clock.boot_identity(),
-            expires_at_monotonic_ms: clock
-                .monotonic_ms()
-                .saturating_add(kr_pairing::confirm::CONFIRMATION_LIFETIME_MS),
+            expires_at_monotonic_ms: clock.monotonic_ms().saturating_add(remaining),
         })
     }
 

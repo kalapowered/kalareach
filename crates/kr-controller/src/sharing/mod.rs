@@ -453,7 +453,10 @@ impl SharingService {
         now_ms: u64,
     ) -> Result<ControlTransfer> {
         // Against **this** host. Evidence accepted for another host, in another boot, or past the
-        // ceremony's own lifetime authorises nothing here.
+        // ceremony's own lifetime authorises nothing here. It is checked twice: once now, so an
+        // obviously stale confirmation is refused before anything is read, and again inside the
+        // transaction, because the deadline can pass while this waits for the store's lock and a
+        // check before a wait proves only what was true before the wait.
         confirmation.covers(plan, self.host_device_id, clock)?;
         // Built from the source rather than from the caller, so a transfer cannot widen the
         // environment or the history the source reached. The source is read again inside the

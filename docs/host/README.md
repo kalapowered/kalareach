@@ -1247,7 +1247,8 @@ holds authority, so it takes the owner's confirmation every time.
 The confirmation is accepted against an expectation built from what the caller states this host is:
 its device identity, its endpoint, the recipient's public keys, the rights the plan hands over and a
 digest covering the whole plan. A challenge that supplied its own answers to those does not satisfy
-it. What comes out of that acceptance is evidence bound to the host it was accepted for, to the boot
+it. The signer and the outstanding-challenge ledger are the caller's too, so the acceptance is only
+as strong as the caller's own enrolment record. What comes out of that acceptance is evidence bound to the host it was accepted for, to the boot
 it was accepted in, and to the ceremony's own monotonic deadline, and the transfer checks all three
 before it does anything. A confirmation accepted for another host, in an earlier boot, or past its
 lifetime authorises nothing.
@@ -1257,8 +1258,9 @@ and fences like any other revocation.
 
 **Nothing is lent through an intermediary.** The rule for a plugin action, an attachment action or a
 workflow is the *intersection* of what the actor holds and what the intermediary declares: an
-intermediary bounds a call and never funds one. The host states that rule in one place so every
-execution path decides it the same way.
+intermediary bounds a call and never funds one. `sharing::roles::effective_rights` and
+`check_indirect` are where the host states that rule, for an execution path to apply where it
+resolves the actor and the intermediary together.
 
 **Delegating needs the parent and the right to pass it on.** An issuer has to hold the grant it
 delegates from — naming one is not holding one — and that grant has to carry `session.share`.

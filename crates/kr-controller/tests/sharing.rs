@@ -196,6 +196,123 @@ fn confirm_transfer_for(
     .expect("the owner confirmed this transfer")
 }
 
+/// A confirmation keeps the challenge's own deadline, and dies with the boot it was accepted in.
+#[test]
+fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
+    /// A clock the test moves: the monotonic reading and the boot identity are both settable.
+    #[derive(Debug)]
+    struct Staged {
+        monotonic_ms: std::sync::atomic::AtomicU64,
+        wall_clock_ms: u64,
+        boot: std::sync::Mutex<[u8; 32]>,
+    }
+
+    impl kr_pairing::platform::PairingClock for Staged {
+        fn monotonic_ms(&self) -> u64 {
+            self.monotonic_ms.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn boot_identity(&self) -> kr_pairing::platform::BootIdentity {
+            kr_pairing::platform::BootIdentity(
+                *self.boot.lock().expect("the boot value is not poisoned"),
+            )
+        }
+
+        fn wall_clock_ms(&self) -> u64 {
+            self.wall_clock_ms
+        }
+    }
+
+    let owner_key = kr_crypto::keys::AuthorisationKeyPair::generate().expect("an owner key");
+    let keys = recipient_keys();
+    let host = transfer_host(&keys);
+    let plan = TransferPlan {
+        session_id: session_id(0xa0),
+        from_device_id: device_id(0xf1),
+        to_device_id: device_id(0xf2),
+        revoking_grant_id: grant_id(1),
+        issuing_grant_id: grant_id(9),
+        actions: [ActionRight::SessionView, ActionRight::SessionShare]
+            .into_iter()
+            .collect(),
+    };
+
+    // The challenge is issued at wall clock 1,000 and lives two minutes. It is accepted one second
+    // before it expires.
+    let lifetime = kr_pairing::confirm::CONFIRMATION_LIFETIME_MS;
+    let issuing = Staged {
+        monotonic_ms: std::sync::atomic::AtomicU64::new(5_000),
+        wall_clock_ms: 1_000,
+        boot: std::sync::Mutex::new([3; 32]),
+    };
+    let request = kr_pairing::confirm::request_confirmation(
+        &issuing,
+        TransferPlan::sensitive_action(),
+        plan.action_digest().expect("a digest"),
+        Some(keys),
+        plan.actions.iter().copied().collect(),
+        host.device_id,
+        host.endpoint_id,
+    )
+    .expect("a challenge");
+
+    let accepting = Staged {
+        monotonic_ms: std::sync::atomic::AtomicU64::new(5_000 + lifetime - 1_000),
+        wall_clock_ms: 1_000 + lifetime - 1_000,
+        boot: std::sync::Mutex::new([3; 32]),
+    };
+    let mut ledger = kr_pairing::confirm::ConfirmationLedger::new();
+    ledger.issue(&request, &issuing);
+    let proof = kr_pairing::confirm::sign_confirmation(
+        &owner_key,
+        &request,
+        kr_protocol::pairing::ConfirmationChannel::PairedOwnerDevice,
+    )
+    .expect("a proof");
+    let confirmed = ConfirmedTransfer::verify(
+        &plan,
+        &host,
+        &mut ledger,
+        &accepting,
+        &request,
+        &proof,
+        owner_key.public(),
+        kr_pairing::confirm::HostEnrolment::Enrolled,
+    )
+    .expect("accepted one second before the challenge expired");
+
+    // One second of the challenge's own life is left, not a fresh two minutes.
+    confirmed
+        .covers(&plan, host.device_id, &accepting)
+        .expect("still inside the challenge's own deadline");
+    accepting
+        .monotonic_ms
+        .store(5_000 + lifetime + 1, std::sync::atomic::Ordering::SeqCst);
+    let error = confirmed
+        .covers(&plan, host.device_id, &accepting)
+        .expect_err("the challenge's own deadline has passed");
+    assert!(
+        error.to_string().contains("expired"),
+        "unexpected refusal: {error}"
+    );
+
+    // And a reboot ends it, whatever the monotonic reading says.
+    accepting
+        .monotonic_ms
+        .store(5_000, std::sync::atomic::Ordering::SeqCst);
+    confirmed
+        .covers(&plan, host.device_id, &accepting)
+        .expect("inside its deadline again");
+    *accepting.boot.lock().expect("the boot value") = [4; 32];
+    let error = confirmed
+        .covers(&plan, host.device_id, &accepting)
+        .expect_err("a confirmation does not survive a reboot");
+    assert!(
+        error.to_string().contains("earlier boot"),
+        "unexpected refusal: {error}"
+    );
+}
+
 /// A challenge answered for another host does not confirm a transfer on this one.
 #[test]
 fn a_confirmation_issued_for_another_host_does_not_authorise_a_transfer_here() {

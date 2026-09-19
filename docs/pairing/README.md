@@ -313,7 +313,8 @@ This crate issues grants and validates the rules for the kind being issued. What
 after it exists belongs to the control daemon, and `docs/host/README.md` states it: the intersection
 it takes when it decides a request, the revocation cascade along the parent link, the per-worker
 dispatch barrier a revocation completes through, the organisation lease that stops a grant while the
-transport stays connected, and the bounded offline-validity policy an owner may choose.
+transport stays connected once the host holds one, and the bounded offline-validity policy an owner
+may choose.
 
 Two rules cross the boundary and are worth stating on both sides.
 
