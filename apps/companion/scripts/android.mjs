@@ -12,9 +12,17 @@
 // again.
 import { spawnSync } from 'node:child_process'
 import { existsSync, readdirSync, statSync } from 'node:fs'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 
 import { toolPath } from './tools.mjs'
+
+/** Every Android target this build could be asked for. */
+const ANDROID_TARGETS = {
+  aarch64: 'aarch64-linux-android',
+  armv7: 'armv7-linux-androideabi',
+  i686: 'i686-linux-android',
+  x86_64: 'x86_64-linux-android'
+}
 
 /** The toolchain's binaries, from whichever variable names the toolchain. */
 function archiveTools() {
@@ -30,19 +38,55 @@ function archiveTools() {
   return null
 }
 
-/** An archive a previous run left empty, which this build must not link against. */
-function emptyArchives() {
-  const target = process.env.CARGO_TARGET_DIR
-  if (!target) return []
+/**
+ * Where Cargo is actually putting its output.
+ *
+ * The environment variable is one of three answers and the least likely: a configuration file or
+ * the workspace's own directory decides it otherwise. Cargo will say which, so it is asked.
+ */
+function cargoTargetDirectory() {
+  const manifest = join(dirname(import.meta.dirname), 'src-tauri', 'Cargo.toml')
+  const answer = spawnSync(
+    'cargo',
+    ['metadata', '--no-deps', '--format-version', '1', '--manifest-path', manifest],
+    { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 }
+  )
+  if (answer.status !== 0 || !answer.stdout) return process.env.CARGO_TARGET_DIR ?? null
+  try {
+    return JSON.parse(answer.stdout).target_directory ?? null
+  } catch {
+    return process.env.CARGO_TARGET_DIR ?? null
+  }
+}
+
+/** The targets this invocation will build, which is all of them unless it names some. */
+function requestedTargets(args) {
+  const named = []
+  for (let index = 0; index < args.length; index += 1) {
+    if (args[index] !== '--target' && args[index] !== '-t') continue
+    for (let next = index + 1; next < args.length && !args[next].startsWith('-'); next += 1) {
+      const triple = ANDROID_TARGETS[args[next]]
+      if (triple) named.push(triple)
+    }
+  }
+  return named.length > 0 ? named : Object.values(ANDROID_TARGETS)
+}
+
+/** Archives a previous run left empty, which this build must not link against. */
+function emptyArchives(targets) {
+  const root = cargoTargetDirectory()
+  if (!root) return []
   const found = []
-  for (const profile of ['debug', 'release']) {
-    const builds = join(target, 'aarch64-linux-android', profile, 'build')
-    if (!existsSync(builds)) continue
-    for (const entry of readdirSync(builds)) {
-      if (!entry.startsWith('libsodium-sys')) continue
-      const archive = join(builds, entry, 'out', 'installed', 'lib', 'libsodium.a')
-      // An archive with no members is a few dozen bytes of header and nothing else.
-      if (existsSync(archive) && statSync(archive).size < 1024) found.push(archive)
+  for (const triple of targets) {
+    for (const profile of ['debug', 'release']) {
+      const builds = join(root, triple, profile, 'build')
+      if (!existsSync(builds)) continue
+      for (const entry of readdirSync(builds)) {
+        if (!entry.startsWith('libsodium-sys')) continue
+        const archive = join(builds, entry, 'out', 'installed', 'lib', 'libsodium.a')
+        // An archive with no members is a few dozen bytes of header and nothing else.
+        if (existsSync(archive) && statSync(archive).size < 1024) found.push({ triple, archive })
+      }
     }
   }
   return found
@@ -57,13 +101,17 @@ if (!tools) {
   process.exit(2)
 }
 
-const stale = emptyArchives()
+const stale = emptyArchives(requestedTargets(process.argv.slice(2)))
 if (stale.length > 0) {
+  const triples = [...new Set(stale.map((each) => each.triple))]
   console.error(
     'A previous build left an empty libsodium archive, and the build script that made it will ' +
       'not notice the tools have changed. Remove it first:\n' +
-      '  cargo clean -p libsodium-sys-stable --target aarch64-linux-android\n' +
-      stale.map((path) => `  (${path})`).join('\n')
+      triples
+        .map((triple) => `  cargo clean -p libsodium-sys-stable --target ${triple}`)
+        .join('\n') +
+      '\n' +
+      stale.map((each) => `  (${each.archive})`).join('\n')
   )
   process.exit(2)
 }
