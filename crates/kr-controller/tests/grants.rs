@@ -1592,6 +1592,7 @@ async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
         worker_program: std::path::PathBuf::from("/nonexistent/kr-worker"),
         build_id: BuildId::new("kr-test/0").expect("a build identifier"),
         release: "0".to_owned(),
+        shell_packages: None,
     })
     .await
     .expect("the daemon starts");
