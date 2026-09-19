@@ -1100,16 +1100,37 @@ fn a_submodule_whose_data_is_elsewhere_refuses_the_capture() {
         .expect("the submodule's own file");
 
         let workspace = fixture.workspace(&format!("{shape}-tree"));
-        let failure = fixture
-            .capture_with(
-                workspace,
-                &include_everything(),
-                &kr_protocol::changeset::FileGrant::default(),
-                None,
-                None,
-            )
-            .expect_err("a spelling this host cannot walk to is not captured around");
-        // Nothing of that repository's data is anywhere, because no version was made at all.
+        let outcome = fixture.capture_with(
+            workspace,
+            &include_everything(),
+            &kr_protocol::changeset::FileGrant::default(),
+            None,
+            None,
+        );
+        if shape == "commondir" {
+            // This one this host **can** descend to: the common directory is reached from the
+            // data directory, and what it is decides, so the capture runs and holds none of it.
+            let record = outcome.expect("a place this host can descend to is captured around");
+            let manifest = fixture
+                .service()
+                .manifest(record.change_set_id, record.version)
+                .expect("its manifest");
+            assert!(
+                manifest
+                    .paths
+                    .iter()
+                    .all(|entry| !entry.path.starts_with("vendor/repo-data/")),
+                "the common directory is not in the version: {:?}",
+                manifest
+                    .paths
+                    .iter()
+                    .map(|entry| entry.path.as_str())
+                    .collect::<Vec<_>>()
+            );
+            continue;
+        }
+        // The rest are places this host will not descend to, so no version is made at all.
+        let failure = outcome.expect_err("a spelling this host cannot walk to is not captured");
         assert!(
             failure
                 .to_string()

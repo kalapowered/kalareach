@@ -1183,23 +1183,32 @@ fn nested_repositories(
             // for.
             return Err(unplaceable(directory));
         };
+        // What kind of thing is at that name, asked before anything is opened: a file, a link and
+        // an absent name have nothing in them to be a repository, and everything else is a
+        // directory this host has to be able to look into.
+        match tree.probe(&name) {
+            Ok(kr_transfer::authority::ObjectKind::Directory) => {}
+            Ok(_) | Err(kr_transfer::Escape::NotFound { .. }) => continue,
+            Err(_) => return Err(unplaceable(directory)),
+        }
         match tree.subdirectory(&name) {
             Ok(held) => opened.push((directory, held)),
-            // Not a directory, or not there, or a link, which this host neither follows nor
-            // looks inside: none of them has anything in it to be a repository.
-            Err(
-                kr_transfer::Escape::NotFound { .. }
-                | kr_transfer::Escape::WrongKind { .. }
-                | kr_transfer::Escape::Link { .. }
-                | kr_transfer::Escape::Unopenable { .. },
-            ) => {}
+            // It was a directory a moment ago and this host cannot open it. It will not say a
+            // tree is free of another repository it could not look for.
             Err(_) => return Err(unplaceable(directory)),
         }
     }
 
     // What each nested repository **is**: its own tree, the directory its data is in, and the
-    // directory it keeps its common data in when it keeps one.
+    // directory it keeps its common data in when it keeps one. **This** repository's own data is
+    // in the set too, so a directory that is that object reaches the same refusal whatever it is
+    // called here.
     let mut refused: BTreeSet<(u64, u64)> = BTreeSet::new();
+    if let Ok(own) = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)
+        && let Ok(held) = tree.subdirectory(&own)
+    {
+        refused.insert(identity_of(&held));
+    }
     for (directory, held) in &opened {
         let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
         let kind = match held.probe(&administrative) {
@@ -1209,27 +1218,48 @@ fn nested_repositories(
             Err(_) => return Err(unplaceable(directory)),
         };
         refused.insert(identity_of(held));
-        let data = match kind {
+        // The handles from this working tree's root down to the directory the data is in, kept so
+        // a `commondir` beside that data is resolved from **there** rather than from the tree the
+        // repository happens to sit in.
+        let stack = match kind {
             // Its data is beside its tree, which is the ordinary nested repository.
-            kr_transfer::authority::ObjectKind::Directory => held
-                .subdirectory(&administrative)
-                .map_err(|_| unplaceable(directory))?,
-            // Its data is wherever its own file says, resolved by descending rather than by
-            // reading the name as arithmetic.
-            _ => match resolve_target(tree, held, directory, &administrative)? {
-                Some(data) => data,
-                // Nothing is there, so there is nothing of it to capture either.
-                None => continue,
-            },
+            kr_transfer::authority::ObjectKind::Directory => {
+                let mut stack = descend_to(tree, directory)?;
+                stack.push(
+                    held.subdirectory(&administrative)
+                        .map_err(|_| unplaceable(directory))?,
+                );
+                stack
+            }
+            // Its data is wherever its own file says, reached by descending rather than by reading
+            // the name as arithmetic.
+            _ => {
+                let from = descend_to(tree, directory)?;
+                match resolve_target(from, directory, held, &administrative)? {
+                    Some(stack) => stack,
+                    // Nothing is there, so there is nothing of it to capture either.
+                    None => continue,
+                }
+            }
         };
-        refused.insert(identity_of(&data));
+        let data = stack.last().ok_or_else(|| unplaceable(directory))?;
+        if stack.len() == 1 {
+            // Its data **is** this working tree, which is not something this host captures around.
+            return Err(unplaceable(directory));
+        }
+        refused.insert(identity_of(data));
         let common = RelativeName::parse("commondir")?;
         match data.probe(&common) {
             // It keeps everything in one place.
             Err(kr_transfer::Escape::NotFound { .. }) => {}
             Ok(_) => {
-                if let Some(elsewhere) = resolve_target(tree, &data, directory, &common)? {
-                    refused.insert(identity_of(&elsewhere));
+                let from = clone_stack(&stack)?;
+                if let Some(elsewhere) = resolve_target(from, directory, data, &common)? {
+                    let last = elsewhere.last().ok_or_else(|| unplaceable(directory))?;
+                    if elsewhere.len() == 1 {
+                        return Err(unplaceable(directory));
+                    }
+                    refused.insert(identity_of(last));
                 }
             }
             Err(_) => return Err(unplaceable(directory)),
@@ -1253,21 +1283,46 @@ fn identity_of(directory: &AuthorisedDirectory) -> (u64, u64) {
     (identity.device, identity.file_id)
 }
 
+/// Returns the handles from this working tree's root down to one directory it names.
+///
+/// Every step is taken with the handle above it, so nothing is resolved twice and nothing follows
+/// a link. The components come from this capture's own readings rather than from any file.
+fn descend_to(tree: &AuthorisedDirectory, directory: &str) -> Result<Vec<AuthorisedDirectory>> {
+    let mut stack = vec![clone_of(tree)?];
+    for component in directory.split('/') {
+        let step = RelativeName::parse(component)?;
+        let here = stack.last().ok_or_else(|| unplaceable(directory))?;
+        let next = here
+            .subdirectory(&step)
+            .map_err(|_| unplaceable(directory))?;
+        stack.push(next);
+    }
+    Ok(stack)
+}
+
+/// Returns a second set of handles over the same directories.
+fn clone_stack(stack: &[AuthorisedDirectory]) -> Result<Vec<AuthorisedDirectory>> {
+    stack.iter().map(clone_of).collect()
+}
+
 /// Resolves what one `gitdir:` or `commondir` file names, by descending to it.
 ///
-/// Nothing here is arithmetic on a path. The descent starts at this working tree's own handle,
-/// walks the directory the file is in, and then takes the file's own components one at a time:
-/// `.` is nothing, `..` steps back to the directory the descent actually came from, and every
-/// other component is **asked about first** and has to be a directory. A link anywhere along the
-/// way ends it, because a `..` after a link means something this descent cannot reproduce; so does
-/// a target that steps above the working tree, and so does an absolute one, which names a place
-/// outside what this handle can reach. Each of those refuses the whole capture.
+/// Nothing here is arithmetic on a path. The descent starts from the handles that reach the
+/// directory the file is in, and takes the file's own components one at a time: `.` is nothing,
+/// `..` steps back to the directory the descent actually came from, and every other component is
+/// **asked about first** and has to be a directory. A link anywhere along the way ends it, because
+/// a `..` after a link means something this descent cannot reproduce; so does a step above this
+/// working tree, and so does an absolute name, which names a place outside what this handle
+/// reaches. Each of those refuses the whole capture.
+///
+/// What comes back is the whole descent, so a file **beside** what it found is resolved from there
+/// rather than from where this one started.
 fn resolve_target(
-    tree: &AuthorisedDirectory,
-    holder: &AuthorisedDirectory,
+    from: Vec<AuthorisedDirectory>,
     directory: &str,
+    holder: &AuthorisedDirectory,
     file: &RelativeName,
-) -> Result<Option<AuthorisedDirectory>> {
+) -> Result<Option<Vec<AuthorisedDirectory>>> {
     use std::io::Read as _;
 
     let mut open = holder
@@ -1281,22 +1336,22 @@ fn resolve_target(
         .take(MAX_GIT_FILE_BYTES)
         .read_to_string(&mut text)
         .map_err(|_| unplaceable(directory))?;
-    let text = text.trim();
-    let target = text.strip_prefix("gitdir:").map_or(text, str::trim);
+    // Exactly what Git writes, and no more: one line, with the line ending taken off and nothing
+    // else touched. Trimming by what a language calls whitespace would change the name, because a
+    // filename may hold characters a trim would take away.
+    let line = text
+        .strip_suffix('\n')
+        .unwrap_or(&text)
+        .strip_suffix('\r')
+        .unwrap_or_else(|| text.strip_suffix('\n').unwrap_or(&text));
+    let target = match line.strip_prefix("gitdir:") {
+        Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
+        None => line,
+    };
     if target.is_empty() || std::path::Path::new(target).is_absolute() {
         return Err(unplaceable(directory));
     }
-    // The directory the file is in, reached from the tree's own handle. Its components came from
-    // this capture's own readings rather than from the file.
-    let mut stack: Vec<AuthorisedDirectory> = vec![clone_of(tree)?];
-    for component in directory.split('/') {
-        let step = RelativeName::parse(component)?;
-        let here = stack.last().ok_or_else(|| unplaceable(directory))?;
-        let next = here
-            .subdirectory(&step)
-            .map_err(|_| unplaceable(directory))?;
-        stack.push(next);
-    }
+    let mut stack = from;
     for component in target.split('/') {
         match component {
             "" | "." => continue,
@@ -1325,7 +1380,7 @@ fn resolve_target(
             }
         }
     }
-    stack.pop().map(Some).ok_or_else(|| unplaceable(directory))
+    Ok(Some(stack))
 }
 
 /// Returns a second authority over the same open directory.
