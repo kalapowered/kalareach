@@ -1859,13 +1859,7 @@ fn published_with(_directory: &AuthorisedDirectory, _name: &RelativeName, _mode:
 }
 
 /// Returns true when one destination file carries protection beyond its mode bits.
-///
-/// The two platforms answer differently because their lists are different things. An Apple
-/// platform keeps an access-control list beside the mode bits, so any list at all is protection a
-/// replacement would lose. A POSIX list includes the mode bits themselves: every file has the
-/// three base entries, and only a named entry or a mask beyond them is protection the mode bits
-/// do not already carry.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(target_os = "macos")]
 fn has_extended_access_control(
     _file: &kr_transfer::AuthorisedFile,
     destination: &AuthorisedDirectory,
@@ -1873,46 +1867,42 @@ fn has_extended_access_control(
 ) -> Result<bool> {
     // `exacl` reads a path rather than a descriptor, so this is the one question here that is
     // asked of a name. It is asked only to **refuse**: a name that answers "there is a list" ends
-    // the operation, and a name that answers otherwise is still replaced through the handle.
+    // the operation, and a name that answers otherwise is still replaced through the handle. An
+    // Apple platform keeps its list beside the mode bits, so any list at all is protection a
+    // replacement would lose.
     let path = destination.host_path(leaf);
     match exacl::getfacl(&path, None) {
-        Ok(entries) => Ok(beyond_mode_bits(&entries)),
+        Ok(entries) => Ok(!entries.is_empty()),
         // A file whose list this host could not read is one whose protection it cannot say it can
         // carry across.
         Err(_) => Ok(true),
     }
 }
 
-/// Returns true when an access-control list says more than the mode bits do.
-#[cfg(target_os = "macos")]
-fn beyond_mode_bits(entries: &[exacl::AclEntry]) -> bool {
-    !entries.is_empty()
-}
-
-/// Returns true when a POSIX access-control list says more than the mode bits do.
+/// Returns true when one destination file carries a POSIX access-control list.
 ///
-/// A minimal list is exactly the owner, the owning group and everybody else, each unnamed, and
-/// says precisely what the mode bits say. Anything else, a named user, a named group or a mask,
-/// is protection that carrying the mode bits across would drop.
+/// A POSIX list includes the mode bits themselves, and a file with nothing beyond them carries no
+/// list at all: the kernel keeps an extended one in `system.posix_acl_access` and writes that
+/// attribute only when there is something a mode cannot say. So the question is whether the
+/// attribute is there, asked of the **descriptor** this host already holds rather than of a name.
 #[cfg(target_os = "linux")]
-fn beyond_mode_bits(entries: &[exacl::AclEntry]) -> bool {
-    use exacl::AclEntryKind;
-    if entries.len() != 3 {
-        return true;
+fn has_extended_access_control(
+    file: &kr_transfer::AuthorisedFile,
+    _destination: &AuthorisedDirectory,
+    _leaf: &RelativeName,
+) -> Result<bool> {
+    match rustix::fs::fgetxattr(file.handle(), "system.posix_acl_access", &mut [0_u8; 0][..]) {
+        // There is a list, and this reports its length rather than reading it.
+        Ok(_) => Ok(true),
+        // The buffer is too small for a list that is there, which is the ordinary answer for a
+        // file that has one.
+        Err(rustix::io::Errno::RANGE) => Ok(true),
+        // No such attribute: the mode bits are the whole of this file's protection.
+        Err(rustix::io::Errno::NODATA) | Err(rustix::io::Errno::NOTSUP) => Ok(false),
+        // A file whose protection this host could not ask about is one it cannot say it can carry
+        // across.
+        Err(_) => Ok(true),
     }
-    let mut kinds = [false; 3];
-    for entry in entries {
-        if !entry.name.is_empty() || !entry.allow {
-            return true;
-        }
-        match entry.kind {
-            AclEntryKind::User => kinds[0] = true,
-            AclEntryKind::Group => kinds[1] = true,
-            AclEntryKind::Other => kinds[2] = true,
-            _ => return true,
-        }
-    }
-    !kinds.iter().all(|held| *held)
 }
 
 /// Returns false: this platform's extended access control is not read here.

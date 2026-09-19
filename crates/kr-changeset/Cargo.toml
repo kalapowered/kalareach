@@ -24,11 +24,17 @@ uuid.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 tempfile.workspace = true
 
-[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 # Reads a file's access-control list, so a destination whose protection this host cannot carry
 # across a replacement is refused rather than replaced with its mode bits alone. Used to refuse,
 # never to grant.
 exacl.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Asks an open file whether it carries a POSIX access-control list, through the extended attribute
+# the kernel keeps one in. The question is asked of the descriptor rather than of a name, and it is
+# asked only to refuse.
+rustix = { workspace = true, features = ["fs"] }
 
 [features]
 # The seam a test uses to stop an apply exactly where a crash would stop it, so the journal can be
