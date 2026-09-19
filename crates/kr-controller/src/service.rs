@@ -434,7 +434,6 @@ impl Controller {
         let host_device_id = kr_protocol::ids::DeviceId::new(setup.environment_id.get());
         let sharing = Arc::new(crate::sharing::SharingService::new(
             crate::grants::GrantDirectory::open(setup.paths.registry_database())?,
-            crate::sharing::InvitationLedger::open(setup.paths.registry_database())?,
             host_device_id,
         ));
         // The policy and the feed are read back from the store rather than rebuilt empty. A host
@@ -1143,11 +1142,17 @@ impl Controller {
         &self.sharing
     }
 
-    /// This host's policy, for the intersection every request takes.
-    pub fn policy(&self) -> std::sync::MutexGuard<'_, crate::grants::HostPolicy> {
+    /// This host's policy as it stands, for a caller that only reads it.
+    ///
+    /// A copy rather than a guard: every accepted *change* goes through
+    /// [`Self::update_policy`], which writes it down, and handing out a mutable guard would be a
+    /// way to change the policy without that happening.
+    #[must_use]
+    pub fn policy(&self) -> crate::grants::HostPolicy {
         self.policy
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// This host's half of the remote authority feed.
@@ -1182,7 +1187,12 @@ impl Controller {
     ) -> Result<kr_protocol::sharing::RevocationResult> {
         let now_ms = self.settled_now_ms();
         let revocation = self.sharing.revoke(grant_id, now_ms)?;
-        self.complete_revocation(revocation.revoked.iter().copied().collect(), false, now_ms)
+        // The debt is written before the fence is attempted, so a failure between the two leaves a
+        // record that a retry can see. Nothing newly revoked is not the same as nothing owed.
+        self.sharing
+            .grants()
+            .owe_fence(revocation.revoked.iter().copied(), now_ms)?;
+        self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
             .await
     }
 
@@ -1212,12 +1222,48 @@ impl Controller {
         // record changing is a withdrawal in its own right. Reading only the grant rows would let
         // exactly that device keep a live connection.
         let withdrawn = self.devices.revoke(device_id, TimestampMs::new(now_ms))?;
-        self.complete_revocation(
-            revocation.revoked.iter().copied().collect(),
-            withdrawn,
-            now_ms,
-        )
-        .await
+        // A device can hold its grant in the pairing record and have no row in the grant store, so
+        // its own withdrawal is a debt in its own right, keyed by the device's identity. Recording
+        // it before the fence is attempted is what lets a retry finish the work after a failure.
+        let mut owed: Vec<kr_protocol::ids::GrantId> = revocation.revoked.to_vec();
+        if withdrawn {
+            owed.push(kr_protocol::ids::GrantId::new(device_id.get()));
+        }
+        self.sharing.grants().owe_fence(owed, now_ms)?;
+        self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
+            .await
+    }
+
+    /// Transfers control of a session, then fences what the transfer took away.
+    ///
+    /// The store's half is one transaction: the replacement is issued and the source revoked
+    /// together. The daemon's half is the one every revocation takes, because a transfer *is* a
+    /// revocation for the device that gave it up: the revision advances, the connections admitted
+    /// under the old authority are fenced, and the answer carries the per-worker completion status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the transfer is refused or the registry cannot be written.
+    pub async fn transfer_control(
+        &self,
+        plan: &crate::sharing::TransferPlan,
+        confirmation: &crate::sharing::ConfirmedTransfer,
+    ) -> Result<(
+        crate::sharing::ControlTransfer,
+        kr_protocol::sharing::RevocationResult,
+    )> {
+        let now_ms = self.settled_now_ms();
+        let revision = self.policy().authority_revision();
+        let transfer = self
+            .sharing
+            .transfer_control(plan, confirmation, revision, now_ms)?;
+        self.sharing
+            .grants()
+            .owe_fence(transfer.revoked.revoked.iter().copied(), now_ms)?;
+        let completed = self
+            .complete_revocation(transfer.revoked.revoked.iter().copied().collect(), now_ms)
+            .await?;
+        Ok((transfer, completed))
     }
 
     /// Advances the revision, fences what was admitted under it, and reports the barrier.
@@ -1225,18 +1271,16 @@ impl Controller {
     /// Shared by both revocation paths so the order cannot drift between them.
     ///
     /// "Nothing changed" is not the same as "nothing is owed". A revocation that wrote its rows and
-    /// then failed before the revision advanced leaves revoked grants and no fence, and a retry
-    /// would see an empty set of *newly* revoked rows. So the store keeps the moment a fence last
-    /// completed, and a revocation recorded after it is still owed one.
+    /// then failed before the revision advanced leaves revoked authority and no fence, and a retry
+    /// would see an empty set of *newly* revoked rows. So each half of a revocation writes its debt
+    /// down by identity before the fence is attempted, and only a completed fence clears it.
     async fn complete_revocation(
         &self,
         revoked_grants: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,
-        device_withdrawn: bool,
         now_ms: u64,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
-        let owed =
-            !revoked_grants.is_empty() || device_withdrawn || self.sharing.grants().fence_owed()?;
-        if !owed {
+        let _ = now_ms;
+        if !self.sharing.grants().fence_owed()? {
             // The work was already done and fenced. The answer is the revision in force and the
             // barrier as it stands, with nothing newly withdrawn.
             let authority_revision = self.policy().authority_revision();
@@ -1260,7 +1304,7 @@ impl Controller {
         }
         // Last, because it is the record that this revocation's fence finished. Writing it before
         // the fence would let a failure in between look like completed work.
-        self.sharing.grants().note_fenced_through(now_ms)?;
+        self.sharing.grants().fence_completed()?;
         Ok(kr_protocol::sharing::RevocationResult {
             authority_revision: barrier.authority_revision,
             revoked_grants,
@@ -1281,14 +1325,15 @@ impl Controller {
         &self,
         change: impl FnOnce(&mut crate::grants::HostPolicy) -> T,
     ) -> Result<T> {
-        let snapshot;
-        let value = {
-            let mut policy = self.policy();
-            let value = change(&mut policy);
-            snapshot = policy.snapshot();
-            value
-        };
-        self.sharing.grants().store_policy(&snapshot)?;
+        // The lock is held across the write. Releasing it first would let two accepted changes
+        // reach the store out of order and leave the older one on disk, which is the restriction
+        // silently coming back after the next restart.
+        let mut policy = self
+            .policy
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let value = change(&mut policy);
+        self.sharing.grants().store_policy(&policy.snapshot())?;
         Ok(value)
     }
 
@@ -2763,6 +2808,12 @@ impl Controller {
             kr_ipc::now_ms().get(),
         )? {
             crate::grants::ActionClaim::Claimed { claimed_at_ms } => Ok(Ok(claimed_at_ms)),
+            // Somebody else is inside this action. Performing it again would advance the revision
+            // twice for one withdrawal; the caller retries and is answered from the record once
+            // the first attempt has finished.
+            crate::grants::ActionClaim::InFlight => Err(ControllerError::IdConflict {
+                token: mutation.action_id.to_string(),
+            }),
             crate::grants::ActionClaim::Answered { result } => {
                 let value = kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT)
                     .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;

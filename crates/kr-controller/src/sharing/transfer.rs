@@ -24,7 +24,7 @@ use kr_protocol::grant::Grant;
 use kr_protocol::ids::{DeviceId, GrantId, SessionId};
 use kr_protocol::pairing::SensitiveAction;
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::CanonicalSet;
+use kr_protocol::scalars::{CanonicalSet, Digest256};
 use kr_protocol::sharing::SessionRole;
 
 use crate::error::{ControllerError, Result};
@@ -52,6 +52,66 @@ impl TransferPlan {
     #[must_use]
     pub const fn sensitive_action() -> SensitiveAction {
         SensitiveAction::ChangeHostAuthority
+    }
+
+    /// The digest an owner's confirmation for this exact transfer covers.
+    ///
+    /// Every field of the plan, so a confirmation obtained for one transfer cannot authorise
+    /// another: not a different session, not a different recipient, not a wider set of actions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an encoding error when the plan cannot be represented in KR-CBOR-1.
+    pub fn action_digest(&self) -> Result<Digest256> {
+        let value = kr_cbor::to_canonical_value(&(
+            "kr-transfer/1",
+            self.session_id,
+            self.from_device_id,
+            self.to_device_id,
+            self.revoking_grant_id,
+            self.issuing_grant_id,
+            &self.actions,
+        ))
+        .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        Ok(Digest256::from_bytes(kr_cbor::sha256(&kr_cbor::encode(
+            &value,
+        ))))
+    }
+}
+
+/// Evidence that an owner confirmed one exact transfer.
+///
+/// Constructed only by the code that verified and consumed the confirmation ceremony, which is why
+/// it carries the digest rather than a flag: a Boolean is something any caller can write, and a
+/// confirmation is not. [`Self::covers`] is the check that this evidence is about *this* plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConfirmedTransfer {
+    action_digest: Digest256,
+}
+
+impl ConfirmedTransfer {
+    /// Records that an owner's confirmation for this digest was verified and consumed.
+    ///
+    /// The caller is the one that ran `kr_pairing::confirm::accept_confirmation` against the
+    /// host's own signer and ledger. Nothing here re-verifies it; what this type does is carry
+    /// *which* action was confirmed to the place that performs it.
+    #[must_use]
+    pub const fn accepted(action_digest: Digest256) -> Self {
+        Self { action_digest }
+    }
+
+    /// Checks that this confirmation is about this plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::PermissionDenied`] when it is about something else.
+    pub fn covers(&self, plan: &TransferPlan) -> Result<()> {
+        if plan.action_digest()? == self.action_digest {
+            return Ok(());
+        }
+        Err(ControllerError::PermissionDenied {
+            detail: "the owner's confirmation is for a different transfer".to_owned(),
+        })
     }
 }
 

@@ -252,7 +252,9 @@ fn installed_buffers(engine: &mut TerminalEngine, scope: Scope) -> Vec<Projected
 #[test]
 fn a_live_only_invitation_is_installed_the_visible_screen_only_when_the_issuer_selected_it() {
     // The exclusion case. No live screen in the grant, so the terminal-snapshot surface serves
-    // nothing at all: there is no retained history and no exception to fall back on.
+    // nothing at all: there is no retained history and no exception to fall back on. Nothing is
+    // installed for such a viewer, which is why there is no projection to inspect here: the
+    // refusal happens before an installation is asked for.
     let without = HistoryFilter::new(ViewerScope::from_grant(&grant(
         scope(None, false, &[], &[]),
         &[ActionRight::SessionView],

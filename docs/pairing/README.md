@@ -326,6 +326,9 @@ withdrawn.
 grant never expires, *and* no live grant the recipient already holds reaches everything it would.
 Comparing the rights by name alone would miss the case that matters most, where a device with a
 one-hour view of one session is handed a permanent view of every session. A bounded session
-invitation is not a persistent enlargement however wide it is. Transfer of control is separate and
-confirmed every time, because it changes who holds authority rather than adding to what somebody
-has.
+invitation is not a persistent enlargement however wide it is.
+
+Transfer of control is separate, because it changes who holds authority rather than adding to what
+somebody has. The digest an owner confirms for a transfer covers the whole plan: the session, both
+devices, both grants and every action handed over. A confirmation obtained for one transfer
+therefore authorises no other.

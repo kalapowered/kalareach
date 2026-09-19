@@ -20,15 +20,22 @@
 //!   not share mailbox expiry or notification coalescing, so [`AuthorityFeed::retained`] holds them
 //!   until [`AuthorityFeed::acknowledge`] has heard from each enrolled host or that host is
 //!   explicitly removed.
-//! * **Synchronise at reconnect, before affected remote access.**
-//!   [`AuthorityFeed::synchronisation_owed`] is what a connection asks before it serves remote
-//!   work, and it stays true until a synchronisation has actually happened.
+//! * **A synchronisation is owed from the moment a connection is established.**
+//!   [`AuthorityFeed::synchronisation_owed`] is the question a connection asks, and it stays true
+//!   until a synchronisation has actually happened.
 //! * **When the feed is unavailable, the status is stale and says so.** It is never reported as
 //!   up to date because nothing contradicted it.
 //!
-//! The web side of the feed - the durable service that stores and distributes these records - is
-//! the web repository's. What is here is the host's half: what it issues, what it accepts, what it
-//! retains and what it refuses to do before it has synchronised.
+//! # What this type is, and is not
+//!
+//! It is the host's **record**: which revisions it has issued and accepted, which revocation
+//! records it still owes delivery of, which enrolled hosts have answered, and whether what it is
+//! showing is current. It is not the transport. Validating a remote owner's authority over a
+//! published request, applying that request's revocation, signing an acknowledgement, holding
+//! remote work back until the synchronisation it says is owed has happened, and polling every
+//! thirty seconds are each somebody's to do with this record; none of them happens inside it. The
+//! web side of the feed - the durable service that stores and distributes these records - is the
+//! web repository's.
 
 use std::collections::{BTreeMap, BTreeSet};
 

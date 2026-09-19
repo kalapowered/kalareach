@@ -31,9 +31,12 @@ use std::path::Path;
 use rusqlite::{Connection, OptionalExtension, params};
 
 use kr_protocol::grant::Grant;
+use kr_protocol::ids::InvitationId;
 use kr_protocol::ids::{ActionId, ActorId, DeviceId, GrantId, SessionId};
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs};
-use kr_protocol::sharing::{GrantState, GrantSummary};
+use kr_protocol::sharing::{GrantState, GrantSummary, InvitationPreview, InvitationState};
+
+use crate::sharing::invitation::{InvitationRecord, state_of};
 
 use super::durable::{StoredFeed, StoredPolicy};
 
@@ -76,12 +79,15 @@ impl GrantRecord {
     pub fn state(&self, now_ms: u64) -> GrantState {
         if self.revoked_at_ms.is_some() {
             GrantState::Revoked
-        } else if !self.is_active() {
-            GrantState::Pending
-        } else if self.grant.expiry.is_valid_at(now_ms) {
+        } else if !self.grant.expiry.is_valid_at(now_ms) {
+            // Expiry comes before pending. A proposal whose deadline has passed is finished, and
+            // reporting it as still waiting for somebody would be an invitation list that never
+            // shrinks.
+            GrantState::Expired
+        } else if self.is_active() {
             GrantState::Active
         } else {
-            GrantState::Expired
+            GrantState::Pending
         }
     }
 
@@ -102,9 +108,16 @@ impl GrantRecord {
 pub enum ActionClaim {
     /// This caller now holds the claim, from the moment it was made.
     Claimed {
-        /// When the claim was made. A retry rebuilds its proposal from this.
+        /// When the claim was made. The effect builds its proposal from this, so a retry asks for
+        /// the same thing rather than one with a later deadline.
         claimed_at_ms: u64,
     },
+    /// Somebody else holds the claim and has not finished.
+    ///
+    /// Two requests under one action identifier must not both reach the effect. The second is told
+    /// the work is under way rather than performing it again, because two `grant.revoke` calls
+    /// that both ran would advance the revision twice and fence the host twice for one withdrawal.
+    InFlight,
     /// This action already happened, and here is what it produced.
     Answered {
         /// The encoded result.
@@ -203,6 +216,21 @@ impl GrantDirectory {
                  CREATE TABLE IF NOT EXISTS host_authority (
                      key   TEXT PRIMARY KEY NOT NULL,
                      value BLOB NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS session_invitations (
+                     invitation_id       BLOB PRIMARY KEY NOT NULL,
+                     issuer_device_id    BLOB NOT NULL,
+                     grant_id            BLOB NOT NULL,
+                     recipient_device_id BLOB NOT NULL,
+                     preview             BLOB NOT NULL,
+                     state               TEXT NOT NULL,
+                     redeemed_by         BLOB,
+                     issued_at_ms        INTEGER NOT NULL,
+                     expires_at_ms       INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS fence_debt (
+                     grant_id      BLOB PRIMARY KEY NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL
                  );",
             )
             .map_err(ControllerError::registry)?;
@@ -261,66 +289,13 @@ impl GrantDirectory {
     pub fn issue(&self, record: &GrantRecord) -> Result<()> {
         let encoded = kr_cbor::to_canonical_vec(&record.grant)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
-        let parent_grant_id = record.grant.parent_grant_id.as_ref().copied();
         // The parent check and the write are one transaction. Checking first and writing after
         // would prove the parent stood before the write rather than at it, and a revocation that
         // landed in between would leave a live child of a revoked parent.
-        let written = self.in_transaction(|connection| {
-            if let Some(parent_grant_id) = parent_grant_id {
-                let parent = read_one(connection, parent_grant_id)?.ok_or_else(|| {
-                    ControllerError::PermissionDenied {
-                        detail: "this grant names a parent this host does not hold".to_owned(),
-                    }
-                })?;
-                if parent.revoked_at_ms.is_some() {
-                    return Err(ControllerError::PermissionDenied {
-                        detail: "the grant this one delegates from has been revoked".to_owned(),
-                    });
-                }
-                if !parent.grant.expiry.is_valid_at(record.issued_at_ms) {
-                    return Err(ControllerError::PermissionDenied {
-                        detail: "the grant this one delegates from has expired".to_owned(),
-                    });
-                }
-                if !record.grant.narrows(&parent.grant) {
-                    return Err(ControllerError::PermissionDenied {
-                        detail: "a delegated grant narrows its parent; it never extends one"
-                            .to_owned(),
-                    });
-                }
-            }
-            connection
-                .execute(
-                    "INSERT OR IGNORE INTO grants (
-                     grant_id, parent_grant_id, recipient_device_id, session_id, grant,
-                     issued_at_ms, activated_at_ms, revoked_at_ms, revoked_by_parent
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
-                    params![
-                        record.grant.grant_id.get().as_bytes().as_slice(),
-                        record
-                            .grant
-                            .parent_grant_id
-                            .as_ref()
-                            .map(|parent| parent.get().as_bytes().to_vec()),
-                        record.grant.recipient_device_id.get().as_bytes().as_slice(),
-                        record
-                            .session_id
-                            .map(|session| session.get().as_bytes().to_vec()),
-                        encoded,
-                        i64::try_from(record.issued_at_ms).unwrap_or(i64::MAX),
-                        record
-                            .activated_at_ms
-                            .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
-                    ],
-                )
-                .map_err(ControllerError::registry)
-        })?;
-        if written == 0 {
-            return Err(ControllerError::InvalidArgument(
-                "that grant identity is already in use".to_owned(),
-            ));
-        }
-        Ok(())
+        self.in_transaction(|connection| {
+            check_parent(connection, record)?;
+            write_grant(connection, record, &encoded)
+        })
     }
 
     /// Returns one grant's record, revoked or not.
@@ -506,28 +481,152 @@ impl GrantDirectory {
         })
     }
 
-    /// Activates a proposal, once, for exactly the device it names.
+    /// Writes a proposal and the invitation that carries it, in one transaction.
     ///
-    /// The precondition is the whole of the `WHERE` clause, so two devices arriving at the same
-    /// moment produce one activation and one refusal rather than two live grants. The invitation
-    /// row and this one are changed inside one transaction by the caller, which is what makes
-    /// "single use" a fact about the grant and not only about the ledger.
+    /// One commit, because an invitation and the grant it carries are one thing. Two commits would
+    /// leave either a grant nobody previewed or an invitation nobody can redeem, and neither is a
+    /// state this host should be able to reach.
+    ///
+    /// The grant is written **unactivated**: it authorises nothing until [`Self::redeem`] runs.
     ///
     /// # Errors
     ///
-    /// Returns [`ControllerError::InvalidArgument`] when this host holds no such grant, and
-    /// [`ControllerError::PermissionDenied`] when it is revoked, expired, already active, or
-    /// belongs to another device.
-    pub fn activate(&self, grant_id: GrantId, device_id: DeviceId, now_ms: u64) -> Result<Grant> {
+    /// As [`Self::issue`], plus [`ControllerError::InvalidArgument`] when the preview promises
+    /// historical attachment keys, is not single use, has already expired, or names an identity
+    /// already in use.
+    pub fn issue_shared(
+        &self,
+        record: &GrantRecord,
+        preview: &InvitationPreview,
+        issuer_device_id: DeviceId,
+        now_ms: u64,
+    ) -> Result<()> {
+        if preview.historical_attachment_keys {
+            return Err(ControllerError::InvalidArgument(
+                "a new recipient does not receive historical attachment keys".to_owned(),
+            ));
+        }
+        if !preview.single_use {
+            return Err(ControllerError::InvalidArgument(
+                "a session invitation is redeemed once".to_owned(),
+            ));
+        }
+        if preview.expires_at_ms.get() <= now_ms {
+            return Err(ControllerError::InvalidArgument(
+                "a session invitation expires in the future".to_owned(),
+            ));
+        }
+        if record.activated_at_ms.is_some() {
+            return Err(ControllerError::InvalidArgument(
+                "a grant an invitation carries is not active until that invitation is redeemed"
+                    .to_owned(),
+            ));
+        }
+        let encoded_grant = kr_cbor::to_canonical_vec(&record.grant)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let encoded_preview = kr_cbor::to_canonical_vec(preview)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let recipient = record.grant.recipient_device_id;
         self.in_transaction(|connection| {
-            let record = read_one(connection, grant_id)?.ok_or_else(|| {
-                ControllerError::InvalidArgument("this host holds no such grant".to_owned())
-            })?;
-            if record.grant.recipient_device_id != device_id {
+            check_parent(connection, record)?;
+            write_grant(connection, record, &encoded_grant)?;
+            let written = connection
+                .execute(
+                    "INSERT OR IGNORE INTO session_invitations (
+                         invitation_id, issuer_device_id, grant_id, recipient_device_id, preview,
+                         state, redeemed_by, issued_at_ms, expires_at_ms
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, 'open', NULL, ?6, ?7)",
+                    params![
+                        preview.invitation_id.get().as_bytes().as_slice(),
+                        issuer_device_id.get().as_bytes().as_slice(),
+                        record.grant.grant_id.get().as_bytes().as_slice(),
+                        recipient.get().as_bytes().as_slice(),
+                        encoded_preview,
+                        i64::try_from(now_ms).unwrap_or(i64::MAX),
+                        i64::try_from(preview.expires_at_ms.get()).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(ControllerError::registry)?;
+            if written == 0 {
+                return Err(ControllerError::InvalidArgument(
+                    "that invitation identity is already in use".to_owned(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    /// Returns one invitation's record.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the row cannot be read.
+    pub fn invitation(&self, invitation_id: InvitationId) -> Result<Option<InvitationRecord>> {
+        let key = invitation_id.get().as_bytes().to_vec();
+        let row: Option<Result<InvitationRecord>> = self.with(|connection| {
+            connection
+                .query_row(
+                    "SELECT preview, issuer_device_id, state, redeemed_by, issued_at_ms,
+                            grant_id, recipient_device_id
+                     FROM session_invitations WHERE invitation_id = ?1",
+                    params![key],
+                    |row| Ok(read_invitation(row)),
+                )
+                .optional()
+        })?;
+        row.transpose()
+    }
+
+    /// Redeems an invitation and activates the grant it carries, once, in one transaction.
+    ///
+    /// The two changes are one commit, so a crash cannot consume an invitation without activating
+    /// its grant. The precondition travels in the `WHERE` clauses, so two devices racing the same
+    /// invitation produce one activation and one refusal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when this host holds no such invitation, and
+    /// [`ControllerError::PermissionDenied`] when it names another device, was withdrawn, has
+    /// expired, has already been redeemed, or carries a grant that is revoked or expired.
+    pub fn redeem(
+        &self,
+        invitation_id: InvitationId,
+        device_id: DeviceId,
+        now_ms: u64,
+    ) -> Result<Grant> {
+        self.in_transaction(|connection| {
+            let Some(invitation) = read_invitation_within(connection, invitation_id)? else {
+                return Err(ControllerError::InvalidArgument(
+                    "this host holds no such invitation".to_owned(),
+                ));
+            };
+            if invitation.recipient_device_id != device_id {
                 return Err(ControllerError::PermissionDenied {
                     detail: "that invitation was issued to another device".to_owned(),
                 });
             }
+            match invitation.state_at(now_ms) {
+                InvitationState::Open => {}
+                InvitationState::Redeemed => {
+                    return Err(ControllerError::PermissionDenied {
+                        detail: "this invitation has already been redeemed".to_owned(),
+                    });
+                }
+                InvitationState::Cancelled => {
+                    return Err(ControllerError::PermissionDenied {
+                        detail: "this invitation was withdrawn".to_owned(),
+                    });
+                }
+                InvitationState::Expired => {
+                    settle_invitation(connection, invitation_id, InvitationState::Expired)?;
+                    return Err(ControllerError::PermissionDenied {
+                        detail: "this invitation has expired".to_owned(),
+                    });
+                }
+            }
+            let record = read_one(connection, invitation.grant_id)?.ok_or_else(|| {
+                ControllerError::InvalidArgument("this host holds no such grant".to_owned())
+            })?;
             if record.revoked_at_ms.is_some() {
                 return Err(ControllerError::PermissionDenied {
                     detail: "that invitation's grant has been revoked".to_owned(),
@@ -538,70 +637,174 @@ impl GrantDirectory {
                     detail: "that invitation has expired".to_owned(),
                 });
             }
-            let changed = connection
+            let activated = connection
                 .execute(
                     "UPDATE grants SET activated_at_ms = ?2
                       WHERE grant_id = ?1 AND activated_at_ms IS NULL AND revoked_at_ms IS NULL",
                     params![
-                        grant_id.get().as_bytes().as_slice(),
+                        invitation.grant_id.get().as_bytes().as_slice(),
                         i64::try_from(now_ms).unwrap_or(i64::MAX),
                     ],
                 )
                 .map_err(ControllerError::registry)?;
-            if changed == 0 {
+            let consumed = connection
+                .execute(
+                    "UPDATE session_invitations SET state = 'redeemed', redeemed_by = ?2
+                      WHERE invitation_id = ?1 AND state = 'open'",
+                    params![
+                        invitation_id.get().as_bytes().as_slice(),
+                        device_id.get().as_bytes().as_slice(),
+                    ],
+                )
+                .map_err(ControllerError::registry)?;
+            if activated == 0 || consumed == 0 {
                 return Err(ControllerError::PermissionDenied {
-                    detail: "that invitation has already been redeemed".to_owned(),
+                    detail: "this invitation has already been redeemed".to_owned(),
                 });
             }
             Ok(record.grant)
         })
     }
 
-    // --- The fence watermark --------------------------------------------------------------
-
-    /// The moment up to which a revocation's fence has completed.
+    /// Withdraws an invitation and the proposal it carries, in one transaction.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the row cannot be read.
-    pub fn fenced_through_ms(&self) -> Result<u64> {
-        Ok(self
-            .stored::<TimestampMs>("fenced_through")?
-            .map_or(0, |at| at.get()))
+    /// Returns [`ControllerError::InvalidArgument`] when this host holds no such invitation, and
+    /// [`ControllerError::PermissionDenied`] when it is no longer open.
+    pub fn cancel_invitation(
+        &self,
+        invitation_id: InvitationId,
+        now_ms: u64,
+    ) -> Result<GrantRevocation> {
+        self.in_transaction(|connection| {
+            let Some(invitation) = read_invitation_within(connection, invitation_id)? else {
+                return Err(ControllerError::InvalidArgument(
+                    "this host holds no such invitation".to_owned(),
+                ));
+            };
+            let changed = connection
+                .execute(
+                    "UPDATE session_invitations SET state = 'cancelled'
+                      WHERE invitation_id = ?1 AND state = 'open'",
+                    params![invitation_id.get().as_bytes().as_slice()],
+                )
+                .map_err(ControllerError::registry)?;
+            if changed == 0 {
+                return Err(ControllerError::PermissionDenied {
+                    detail: "this invitation is no longer open".to_owned(),
+                });
+            }
+            // The proposal goes with it. It was never active, so this leaves nothing to fence.
+            Self::revoke_within(connection, invitation.grant_id, now_ms)
+        })
     }
 
-    /// Records that a fence has completed for every revocation up to `now_ms`.
+    /// Transfers control: issues the replacement authority and revokes the source, in one
+    /// transaction.
+    ///
+    /// One commit, because a transfer that issued without revoking would leave two devices in
+    /// control and one that revoked without issuing would leave none. The source is re-read inside
+    /// the transaction, so two transfers of the same grant produce one replacement and one
+    /// refusal.
     ///
     /// # Errors
     ///
-    /// Returns a storage error when the row cannot be written.
-    pub fn note_fenced_through(&self, now_ms: u64) -> Result<()> {
-        let held = self.fenced_through_ms()?;
-        if now_ms > held {
-            self.store("fenced_through", &TimestampMs::new(now_ms))?;
+    /// Returns [`ControllerError::PermissionDenied`] when the source is not this host's to
+    /// transfer at the moment the transaction reads it.
+    pub fn transfer(
+        &self,
+        source_grant_id: GrantId,
+        replacement: &GrantRecord,
+        now_ms: u64,
+        check: impl FnOnce(&GrantRecord) -> Result<()>,
+    ) -> Result<GrantRevocation> {
+        let encoded = kr_cbor::to_canonical_vec(&replacement.grant)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        self.in_transaction(|connection| {
+            let source = read_one(connection, source_grant_id)?.ok_or_else(|| {
+                ControllerError::PermissionDenied {
+                    detail: "this host holds no such grant".to_owned(),
+                }
+            })?;
+            if !source.is_active() {
+                return Err(ControllerError::PermissionDenied {
+                    detail: "a grant nobody has redeemed carries no control to transfer".to_owned(),
+                });
+            }
+            if source.revoked_at_ms.is_some() || !source.grant.expiry.is_valid_at(now_ms) {
+                return Err(ControllerError::PermissionDenied {
+                    detail: "that grant is no longer valid, so there is no control to transfer"
+                        .to_owned(),
+                });
+            }
+            check(&source)?;
+            write_grant(connection, replacement, &encoded)?;
+            Self::revoke_within(connection, source_grant_id, now_ms)
+        })
+    }
+
+    // --- Fence debt -------------------------------------------------------------------------
+
+    /// Records that a revocation needs a fence that has not happened yet.
+    ///
+    /// A revocation is two halves: the rows change here, and the daemon then advances the
+    /// authority revision and fences what was admitted under it. If the second half fails, a retry
+    /// would find nothing *newly* revoked and read the work as done. So the first half writes the
+    /// debt down, by grant, and only a completed fence clears it. A timestamp would not do: two
+    /// revocations in the same millisecond, or one while the host's time floor is holding the
+    /// reading constant, are indistinguishable by time and distinguishable by identity.
+    ///
+    /// A device revocation that touched no grant row still owes a fence, so it records the device's
+    /// identity in the same table under its own key.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be written.
+    pub fn owe_fence(&self, keys: impl IntoIterator<Item = GrantId>, now_ms: u64) -> Result<()> {
+        let keys: Vec<GrantId> = keys.into_iter().collect();
+        if keys.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        self.in_transaction(|connection| {
+            for key in keys {
+                connection
+                    .execute(
+                        "INSERT OR IGNORE INTO fence_debt (grant_id, recorded_at_ms)
+                         VALUES (?1, ?2)",
+                        params![
+                            key.get().as_bytes().as_slice(),
+                            i64::try_from(now_ms).unwrap_or(i64::MAX),
+                        ],
+                    )
+                    .map_err(ControllerError::registry)?;
+            }
+            Ok(())
+        })
     }
 
-    /// Returns true when a revocation was recorded that no fence has covered.
-    ///
-    /// A revocation that wrote its rows and then failed before the revision advanced leaves
-    /// exactly this: revoked grants and no fence. A retry that saw an empty set of *newly* revoked
-    /// rows would otherwise read the work as done and never fence at all.
+    /// Returns true when a revocation is still owed a fence.
     ///
     /// # Errors
     ///
     /// Returns a storage error when the rows cannot be read.
     pub fn fence_owed(&self) -> Result<bool> {
-        let through = i64::try_from(self.fenced_through_ms()?).unwrap_or(i64::MAX);
         let owed: i64 = self.with(|connection| {
-            connection.query_row(
-                "SELECT COUNT(*) FROM grants WHERE revoked_at_ms > ?1",
-                params![through],
-                |row| row.get(0),
-            )
+            connection.query_row("SELECT COUNT(*) FROM fence_debt", [], |row| row.get(0))
         })?;
         Ok(owed > 0)
+    }
+
+    /// Clears the fence debt, because a fence has completed.
+    ///
+    /// Called only after the revision advanced and the connections were fenced. Clearing it any
+    /// earlier would be recording completion of work that had not happened.
+    ///
+    /// # Errors
+    ///
+    /// Returns a storage error when the rows cannot be written.
+    pub fn fence_completed(&self) -> Result<()> {
+        self.with(|connection| connection.execute("DELETE FROM fence_debt", []).map(|_| ()))
     }
 
     // --- Retained results -------------------------------------------------------------------
@@ -645,11 +848,10 @@ impl GrantDirectory {
                         token: action_id.to_string(),
                     });
                 }
+                let _ = claimed_at_ms;
                 return Ok(match result {
                     Some(result) => ActionClaim::Answered { result },
-                    None => ActionClaim::Claimed {
-                        claimed_at_ms: u64::try_from(claimed_at_ms).unwrap_or_default(),
-                    },
+                    None => ActionClaim::InFlight,
                 });
             }
             connection
@@ -777,6 +979,143 @@ impl GrantDirectory {
 }
 
 type Row = Result<GrantRecord>;
+
+/// Checks a grant's parent inside a transaction the caller is already holding.
+///
+/// The parent has to exist, be **active**, be live, and be narrowed by the child. Active matters:
+/// a proposal nobody has redeemed authorises nothing, so delegating from one would turn authority
+/// that does not exist yet into authority that does.
+fn check_parent(connection: &Connection, record: &GrantRecord) -> Result<()> {
+    let Some(parent_grant_id) = record.grant.parent_grant_id.as_ref().copied() else {
+        return Ok(());
+    };
+    let parent = read_one(connection, parent_grant_id)?.ok_or_else(|| {
+        ControllerError::PermissionDenied {
+            detail: "this grant names a parent this host does not hold".to_owned(),
+        }
+    })?;
+    if !parent.is_active() {
+        return Err(ControllerError::PermissionDenied {
+            detail: "the grant this one delegates from has not been redeemed, so it carries \
+                     nothing to delegate"
+                .to_owned(),
+        });
+    }
+    if parent.revoked_at_ms.is_some() {
+        return Err(ControllerError::PermissionDenied {
+            detail: "the grant this one delegates from has been revoked".to_owned(),
+        });
+    }
+    if !parent.grant.expiry.is_valid_at(record.issued_at_ms) {
+        return Err(ControllerError::PermissionDenied {
+            detail: "the grant this one delegates from has expired".to_owned(),
+        });
+    }
+    if !record.grant.narrows(&parent.grant) {
+        return Err(ControllerError::PermissionDenied {
+            detail: "a delegated grant narrows its parent; it never extends one".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+/// Writes one grant row inside a transaction the caller is already holding.
+fn write_grant(connection: &Connection, record: &GrantRecord, encoded: &[u8]) -> Result<()> {
+    let written = connection
+        .execute(
+            "INSERT OR IGNORE INTO grants (
+                 grant_id, parent_grant_id, recipient_device_id, session_id, grant,
+                 issued_at_ms, activated_at_ms, revoked_at_ms, revoked_by_parent
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL, NULL)",
+            params![
+                record.grant.grant_id.get().as_bytes().as_slice(),
+                record
+                    .grant
+                    .parent_grant_id
+                    .as_ref()
+                    .map(|parent| parent.get().as_bytes().to_vec()),
+                record.grant.recipient_device_id.get().as_bytes().as_slice(),
+                record
+                    .session_id
+                    .map(|session| session.get().as_bytes().to_vec()),
+                encoded,
+                i64::try_from(record.issued_at_ms).unwrap_or(i64::MAX),
+                record
+                    .activated_at_ms
+                    .map(|at| i64::try_from(at).unwrap_or(i64::MAX)),
+            ],
+        )
+        .map_err(ControllerError::registry)?;
+    if written == 0 {
+        return Err(ControllerError::InvalidArgument(
+            "that grant identity is already in use".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// One invitation's record, on a connection the caller is already holding.
+fn read_invitation_within(
+    connection: &Connection,
+    invitation_id: InvitationId,
+) -> Result<Option<InvitationRecord>> {
+    let row: Option<Result<InvitationRecord>> = connection
+        .query_row(
+            "SELECT preview, issuer_device_id, state, redeemed_by, issued_at_ms,
+                    grant_id, recipient_device_id
+             FROM session_invitations WHERE invitation_id = ?1",
+            params![invitation_id.get().as_bytes().as_slice()],
+            |row| Ok(read_invitation(row)),
+        )
+        .optional()
+        .map_err(ControllerError::registry)?;
+    row.transpose()
+}
+
+/// Settles an invitation's state inside a transaction the caller is already holding.
+fn settle_invitation(
+    connection: &Connection,
+    invitation_id: InvitationId,
+    state: InvitationState,
+) -> Result<()> {
+    connection
+        .execute(
+            "UPDATE session_invitations SET state = ?2 WHERE invitation_id = ?1 AND state = 'open'",
+            params![invitation_id.get().as_bytes().as_slice(), state.as_str()],
+        )
+        .map(|_| ())
+        .map_err(ControllerError::registry)
+}
+
+fn read_invitation(row: &rusqlite::Row<'_>) -> Result<InvitationRecord> {
+    let encoded: Vec<u8> = row.get(0).map_err(ControllerError::registry)?;
+    let preview: InvitationPreview =
+        kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::DEFAULT)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+    let issuer: Vec<u8> = row.get(1).map_err(ControllerError::registry)?;
+    let state: String = row.get(2).map_err(ControllerError::registry)?;
+    let redeemed: Option<Vec<u8>> = row.get(3).map_err(ControllerError::registry)?;
+    let issued: i64 = row.get(4).map_err(ControllerError::registry)?;
+    let grant: Vec<u8> = row.get(5).map_err(ControllerError::registry)?;
+    let recipient: Vec<u8> = row.get(6).map_err(ControllerError::registry)?;
+    Ok(InvitationRecord {
+        preview,
+        issuer_device_id: DeviceId::new(uuid_of(&issuer).ok_or_else(|| {
+            ControllerError::InvalidArgument("a stored issuer identity is malformed".to_owned())
+        })?),
+        state: state_of(&state).ok_or_else(|| {
+            ControllerError::InvalidArgument("a stored invitation state is malformed".to_owned())
+        })?,
+        redeemed_by: redeemed.as_deref().and_then(uuid_of).map(DeviceId::new),
+        issued_at_ms: u64::try_from(issued).unwrap_or_default(),
+        grant_id: GrantId::new(uuid_of(&grant).ok_or_else(|| {
+            ControllerError::InvalidArgument("a stored grant identity is malformed".to_owned())
+        })?),
+        recipient_device_id: DeviceId::new(uuid_of(&recipient).ok_or_else(|| {
+            ControllerError::InvalidArgument("a stored recipient identity is malformed".to_owned())
+        })?),
+    })
+}
 
 /// One grant's record, on a connection the caller is already holding.
 fn read_one(connection: &Connection, grant_id: GrantId) -> Result<Option<GrantRecord>> {

@@ -1219,10 +1219,12 @@ a grant is written, and the grant carries no role afterwards. Only controller an
 carries the notice explaining that an answer, including free text, is input the agent may act on
 under its own permissions.
 
-**An issuer is shown what it is sharing.** `grant.create` computes the preview with the same code
-that writes the grant, and refuses the request when the notices the issuer states it accepted are
-not the ones the grant carries. A shared live screen can hold text printed long before the
-invitation, so the preview shows the text. A new recipient receives no historical attachment keys.
+**An issuer is shown what it is sharing.** The preview is computed by the same code that writes the
+grant. An invitation that names a question, an approval or the live screen is refused unless the
+current text of that thing arrives with it and matches what the selection names, and the request is
+refused when the notices the issuer states it accepted are not the ones the grant carries. A shared
+live screen can hold text printed long before the invitation, so the preview shows the text. A new
+recipient receives no historical attachment keys.
 
 **Invitations are single use and they expire.** The default is `session.view` for one hour, from the
 moment the invitation is issued: the recipient sees the selected live screen and what happens next,
@@ -1244,8 +1246,8 @@ every time, and it can hand over no more than the transferring grant carries.
 
 **Nothing is lent through an intermediary.** What an actor may do through a plugin action, an
 attachment action or a workflow is the *intersection* of what the actor holds and what the
-intermediary declares. A view-only invitation calling a plugin that declares `terminal.input`
-obtains no terminal input.
+intermediary declares, which is `sharing::roles::effective_rights`. An intermediary bounds a call;
+it never funds one.
 
 **Delegating needs the parent and the right to pass it on.** An issuer has to hold the grant it
 delegates from — naming one is not holding one — and that grant has to carry `session.share`.
@@ -1302,11 +1304,13 @@ reported stale rather than current.
 
 `grants::policy` holds what is true of this host rather than of one grant.
 
-* **Organisation leases.** A signed membership lease lasts at most 15 minutes. It is checked against
-  the clock on every request, never against whether a socket is open, so an expired membership
-  blocks further organisation-mediated reads and mutations while the transport stays connected.
-  Personal local owner access continues through an organisation outage unless the host was
-  explicitly enrolled as exclusively organisation-managed.
+* **Organisation leases.** A signed membership lease lasts at most 15 minutes, is held per member
+  account, and is checked against the clock when a grant that requires membership is decided, never
+  against whether a socket is open: an expired membership blocks organisation-mediated reads and
+  mutations while the transport stays connected, and one member's lease never answers for another.
+  A lease longer than 15 minutes, signed under an unpinned key revision, or wider than its role's
+  ceiling is not stored at all. Personal local owner access continues through an organisation
+  outage unless the host is exclusively organisation-managed.
 * **The bounded offline-validity policy.** Optional, and off by default: the non-expiring owner
   grant stays account-free and usable without an authority-feed dependency. An owner who chooses a
   bound gets that bound, measured from the last successful synchronisation, with the stale status
@@ -1336,8 +1340,10 @@ projection it answers with.
 
 Content is admitted by **when it was produced**, never by when it was read, re-read or summarised,
 so a summary generated now from an hour-old conversation is an hour-old conversation. Derived data
-carries the interval and the resources it was built from; when that interval crosses the viewer's
-scope the answer is recomputed from the part inside it, or omitted when nothing is left.
+carries the interval and the resources it was built from; the filter answers with the interval to
+rebuild from when that interval crosses the viewer's scope, and with nothing when the whole of it
+does. Whether a viewer may read a particular *resource* is a separate question the caller answers:
+the filter decides when, and a file's or an attachment's own grant decides what.
 
 A live-only invitation reaches the currently visible screen and nothing else. Snapshot installation
 goes through the filtered projection rather than the worker's unrestricted state, so the buffer that

@@ -1052,9 +1052,13 @@ fn a_clock_that_goes_backwards_does_not_revive_an_expiry_the_host_already_decide
     );
 }
 
-/// The stored policy is what a restarted host comes back with.
+/// The stored policy is what a host reads back, and a restored old policy cannot revive authority.
+///
+/// The store is the durable path a restart takes; this exercises that path rather than restarting
+/// a `Controller`, which would need a daemon and a worker directory to say nothing more about the
+/// policy than this does.
 #[test]
-fn a_restart_restores_the_restrictions_rather_than_an_unrestricted_host() {
+fn a_stored_policy_is_read_back_with_its_restrictions_and_its_floors() {
     let directory = GrantDirectory::in_memory().expect("a grant store");
     let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
 
@@ -1670,9 +1674,15 @@ async fn a_device_revocation_takes_every_grant_that_device_held() {
     assert_eq!(again.authority_revision, result.authority_revision);
 }
 
-/// A grant written while a revocation is reading its subtree does not escape the cascade.
+/// Issuing and revoking the same subtree from two threads leaves a consistent store.
+///
+/// A smoke test rather than a regression test for the read-then-write gap: it starts two threads
+/// and does not control which reaches the store first, so both serial orders pass. What the
+/// property actually rests on is [`GrantDirectory`]'s immediate transaction, which holds the write
+/// lock from before the subtree is read until after it is updated. This checks that the two orders
+/// are both *consistent*, which is what a caller can observe.
 #[test]
-fn a_child_cannot_be_written_while_its_parent_is_being_revoked() {
+fn issuing_and_revoking_one_subtree_at_once_leaves_a_consistent_store() {
     use std::sync::Arc;
 
     let directory = Arc::new(GrantDirectory::in_memory().expect("a grant store"));

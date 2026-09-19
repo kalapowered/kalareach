@@ -7,11 +7,11 @@
 //!
 //! | Row | What proves it |
 //! | --- | --- |
-//! | KR-REQ-18.03 | `an_invitation_is_scoped_to_the_session_it_shares`, `a_delegation_narrows_what_the_issuer_holds`, `transfer_of_control_hands_over_only_what_the_transferring_grant_carries` |
+//! | KR-REQ-18.03 | `an_invitation_is_scoped_to_the_session_it_shares`, `a_delegation_narrows_what_the_issuer_holds`, `transfer_of_control_hands_over_only_what_the_transferring_grant_carries`, `transfer_of_control_issues_one_authority_and_revokes_the_other` |
 //! | KR-REQ-19.01 | `a_view_only_invitation_obtains_no_input_through_a_plugin_an_attachment_action_or_a_workflow` |
 //! | KR-REQ-23.49 | `sharing_checks_parent_rights_expiry_and_owner_confirmation`, `revoking_a_shared_grant_completes_through_the_dispatch_barrier` |
 //! | KR-REQ-25.07 | `each_role_compiles_to_explicit_actions_and_the_host_decides_from_those`, `only_controller_and_owner_answer_questions_without_an_explicit_option` |
-//! | KR-REQ-25.10 | `an_invitation_is_single_use_and_expires`, `the_issuer_sees_what_is_being_shared_and_no_historical_attachment_keys` |
+//! | KR-REQ-25.10 | `an_invitation_is_single_use_and_expires`, `the_issuer_sees_what_is_being_shared_and_no_historical_attachment_keys`, `an_invitation_names_nothing_the_issuer_was_not_shown` |
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,8 +19,8 @@ use std::time::Duration;
 use kr_controller::grants::{AccessRequest, GrantRecord, HostPolicy, Refusal, decide};
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::sharing::{
-    Intermediary, ShareRequest, SharingService, effective_rights, requires_owner_confirmation,
-    roles, transfer,
+    ConfirmedTransfer, Intermediary, ShareRequest, SharingService, TransferPlan, effective_rights,
+    requires_owner_confirmation, roles, transfer,
 };
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
 use kr_crypto::store::{StoreSelection, open_store_in};
@@ -379,7 +379,7 @@ fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
         .redeem(owner.preview.invitation_id, device_id(0xf1), NOW + 1)
         .expect("the owner redeems it");
 
-    let plan = transfer::TransferPlan {
+    let plan = TransferPlan {
         session_id: session_id(0xa0),
         from_device_id: device_id(0xf1),
         to_device_id: device_id(0xf2),
@@ -388,18 +388,21 @@ fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
         actions: transfer::transferable_actions(&owner.grant),
     };
 
-    // Without the owner's confirmation it does not happen at all.
+    // A confirmation the owner gave for a *different* transfer authorises nothing. The digest
+    // covers the whole plan, so changing the recipient changes it.
+    let elsewhere = ConfirmedTransfer::accepted(
+        TransferPlan {
+            to_device_id: device_id(0xbb),
+            ..plan.clone()
+        }
+        .action_digest()
+        .expect("a digest"),
+    );
     let error = service
-        .transfer_control(
-            &plan,
-            false,
-            AuthorityRevision::new(1),
-            environment_id(0xe0),
-            NOW + 2,
-        )
-        .expect_err("a transfer changes who holds authority");
+        .transfer_control(&plan, &elsewhere, AuthorityRevision::new(1), NOW + 2)
+        .expect_err("a confirmation is about one exact transfer");
     assert!(
-        error.to_string().contains("confirmation"),
+        error.to_string().contains("different transfer"),
         "unexpected refusal: {error}"
     );
     assert!(
@@ -411,15 +414,10 @@ fn transfer_of_control_issues_one_authority_and_revokes_the_other() {
         "and nothing was written"
     );
 
+    let confirmed = ConfirmedTransfer::accepted(plan.action_digest().expect("a digest"));
     let done = service
-        .transfer_control(
-            &plan,
-            true,
-            AuthorityRevision::new(1),
-            environment_id(0xe0),
-            NOW + 2,
-        )
-        .expect("the owner confirmed it");
+        .transfer_control(&plan, &confirmed, AuthorityRevision::new(1), NOW + 2)
+        .expect("the owner confirmed this transfer");
 
     // The recipient holds active authority immediately: there is no invitation left to redeem.
     let received = service
@@ -489,8 +487,7 @@ fn the_issuer_sees_what_is_being_shared_and_no_historical_attachment_keys() {
         "what was written is what was shown"
     );
     let kept = service
-        .invitations()
-        .record(preview.invitation_id)
+        .invitation(preview.invitation_id)
         .expect("readable")
         .expect("present");
     assert_eq!(
@@ -508,6 +505,96 @@ fn the_issuer_sees_what_is_being_shared_and_no_historical_attachment_keys() {
         .expect("a preview");
     assert!(plain.live_screen.as_ref().is_none());
     assert!(!plain.history.include_live_screen);
+}
+
+/// Nothing enters a grant's scope that the issuer was not shown, and nothing is previewed that the
+/// grant does not name.
+#[test]
+fn an_invitation_names_nothing_the_issuer_was_not_shown() {
+    use kr_protocol::ids::QuestionId;
+    use kr_protocol::sharing::{LiveScreenPreview, NamedQuestionPreview};
+
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
+    let question = QuestionId::new(Uuid::from_bytes([7; 16]));
+    let naming = RoleSelection {
+        named_questions: [question].into_iter().collect(),
+        ..RoleSelection::plain(SessionRole::Viewer)
+    };
+
+    // Named, and no preview of it.
+    let error = service
+        .preview(&ShareRequest {
+            accepted_notices: AuthorityNotice::for_actions(&naming.actions()),
+            selection: naming.clone(),
+            ..share(SessionRole::Viewer, 1)
+        })
+        .expect_err("a bare identifier is not a preview");
+    assert!(
+        error.to_string().contains("was not shown"),
+        "unexpected refusal: {error}"
+    );
+
+    // Previewed, and not named: a preview of something that is not being shared.
+    let error = service
+        .preview(&ShareRequest {
+            named_questions: vec![NamedQuestionPreview {
+                question_id: question,
+                revision: kr_protocol::ids::QuestionRevision::new(1),
+                question: "Push the branch anyway?".to_owned(),
+                created_at_ms: kr_protocol::scalars::TimestampMs::new(NOW - 1),
+            }],
+            ..share(SessionRole::Viewer, 1)
+        })
+        .expect_err("a preview of something the grant does not name");
+    assert!(
+        error.to_string().contains("does not name"),
+        "unexpected refusal: {error}"
+    );
+
+    // Both, and it is accepted, with the preview carried into the invitation.
+    let preview = service
+        .preview(&ShareRequest {
+            accepted_notices: AuthorityNotice::for_actions(&naming.actions()),
+            selection: naming,
+            named_questions: vec![NamedQuestionPreview {
+                question_id: question,
+                revision: kr_protocol::ids::QuestionRevision::new(1),
+                question: "Push the branch anyway?".to_owned(),
+                created_at_ms: kr_protocol::scalars::TimestampMs::new(NOW - 1),
+            }],
+            ..share(SessionRole::Viewer, 1)
+        })
+        .expect("named and shown");
+    assert_eq!(preview.named_questions.len(), 1);
+    assert!(preview.history.named_questions.contains(&question));
+
+    // The live screen is the same rule: included and not shown is refused.
+    let screen = RoleSelection {
+        include_live_screen: true,
+        ..RoleSelection::plain(SessionRole::Viewer)
+    };
+    let error = service
+        .preview(&ShareRequest {
+            accepted_notices: AuthorityNotice::for_actions(&screen.actions()),
+            selection: screen.clone(),
+            ..share(SessionRole::Viewer, 2)
+        })
+        .expect_err("a screen nobody was shown is not shared");
+    assert!(
+        error.to_string().contains("shown none"),
+        "unexpected refusal: {error}"
+    );
+    service
+        .preview(&ShareRequest {
+            accepted_notices: AuthorityNotice::for_actions(&screen.actions()),
+            selection: screen,
+            live_screen: Some(LiveScreenPreview {
+                lines: vec!["$ ".to_owned()],
+                truncated: false,
+            }),
+            ..share(SessionRole::Viewer, 2)
+        })
+        .expect("included and shown");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -551,6 +638,11 @@ fn a_delegation_narrows_what_the_issuer_holds() {
     let owner = service
         .share(&share(SessionRole::Owner, 1))
         .expect("an owner");
+    // Redeemed, because a proposal carries nothing to delegate: authority nobody has taken up is
+    // not authority anybody can pass on.
+    service
+        .redeem(owner.preview.invitation_id, device_id(0xf1), NOW + 1)
+        .expect("the owner redeems it");
 
     // The owner delegates a viewer's grant to a third device: narrower, and accepted.
     let narrower = service
@@ -568,6 +660,10 @@ fn a_delegation_narrows_what_the_issuer_holds() {
         Some(&owner.grant.grant_id),
         "a delegated grant names its parent"
     );
+
+    service
+        .redeem(narrower.preview.invitation_id, device_id(0xf2), NOW + 2)
+        .expect("the viewer redeems it");
 
     // The viewer it just created tries to pass its own view on. It holds no `session.share`, so
     // it cannot, however narrow the thing it is offering.
@@ -618,7 +714,10 @@ fn a_delegation_narrows_what_the_issuer_holds() {
         "unexpected refusal: {error}"
     );
 
-    // The owner tries to delegate more than it holds: a grant with a right its own does not carry.
+    // The owner tries to delegate more history than it holds. Its own invitation included no live
+    // screen, so a delegation that does reaches further than its parent, and the issuer is shown
+    // the screen it is proposing to share so the refusal is about the delegation rather than the
+    // missing preview.
     let beyond = RoleSelection {
         include_live_screen: true,
         ..RoleSelection::plain(SessionRole::Viewer)
@@ -632,6 +731,10 @@ fn a_delegation_narrows_what_the_issuer_holds() {
             parent_grant_id: Some(owner.grant.grant_id),
             accepted_notices: AuthorityNotice::for_actions(&beyond.actions()),
             selection: beyond,
+            live_screen: Some(kr_protocol::sharing::LiveScreenPreview {
+                lines: vec!["$ ".to_owned()],
+                truncated: false,
+            }),
             ..share(SessionRole::Viewer, 6)
         })
         .expect_err("the parent's history scope does not include the live screen");
@@ -653,7 +756,7 @@ fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
     let owner = service
         .share(&share(SessionRole::Owner, 1))
         .expect("an owner");
-    let plan = transfer::TransferPlan {
+    let plan = TransferPlan {
         session_id: session_id(0xa0),
         from_device_id: device_id(0xf1),
         to_device_id: device_id(0xf2),
@@ -664,7 +767,7 @@ fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
     transfer::check_transfer(&plan, &owner.grant).expect("an owner may transfer control");
     assert!(plan.actions.contains(&ActionRight::SessionShare));
     assert_eq!(
-        transfer::TransferPlan::sensitive_action(),
+        TransferPlan::sensitive_action(),
         kr_protocol::pairing::SensitiveAction::ChangeHostAuthority,
         "transferring control changes who holds host authority, and is confirmed as that"
     );
@@ -678,7 +781,7 @@ fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
             ..share(SessionRole::Controller, 3)
         })
         .expect("a controller");
-    let refused = transfer::TransferPlan {
+    let refused = TransferPlan {
         from_device_id: device_id(0xf4),
         revoking_grant_id: controller.grant.grant_id,
         actions: transfer::transferable_actions(&controller.grant),
@@ -699,7 +802,7 @@ fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
             .collect(),
         ..owner.grant.clone()
     };
-    let overreaching = transfer::TransferPlan {
+    let overreaching = TransferPlan {
         actions: [ActionRight::SessionView, ActionRight::TerminalInput]
             .into_iter()
             .collect(),
@@ -860,6 +963,9 @@ fn sharing_checks_parent_rights_expiry_and_owner_confirmation() {
             ..share(SessionRole::Owner, 5)
         })
         .expect("an owner");
+    service
+        .redeem(owner.preview.invitation_id, device_id(0xaa), NOW + 1)
+        .expect("the owner redeems it");
     let other_issuer = service
         .share(&ShareRequest {
             invitation_id: invitation_id(4),
@@ -945,6 +1051,10 @@ async fn revoking_a_shared_grant_completes_through_the_dispatch_barrier() {
             ..share(SessionRole::Owner, 1)
         })
         .expect("the host shares a session");
+    controller
+        .sharing()
+        .redeem(issued.preview.invitation_id, device_id(0xf1), NOW + 1)
+        .expect("the recipient redeems it");
 
     // A delegation from it, so the revocation has a descendant to take with it.
     let delegated = controller
