@@ -189,11 +189,11 @@ fn sources_bashrc(line: &str) -> bool {
     }
     let words: Vec<&str> = line.split_whitespace().collect();
     words.windows(2).any(|pair| {
-        let verb = pair[0].trim_start_matches(|byte| matches!(byte, ';' | '&' | '|'));
+        let verb = pair[0].trim_start_matches([';', '&', '|']);
         if verb != "source" && verb != "." {
             return false;
         }
-        let argument = pair[1].trim_matches(|byte| matches!(byte, '"' | '\'' | ';'));
+        let argument = pair[1].trim_matches(['"', '\'', ';']);
         std::path::Path::new(argument)
             .file_name()
             .is_some_and(|name| name == ".bashrc")

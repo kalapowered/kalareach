@@ -4111,11 +4111,14 @@ impl Controller {
                 continue;
             };
             let summary = &read.session;
-            let mut observed = SessionDemand::default();
-            // A launch the reader has not answered is work outstanding, and it stays outstanding
-            // through the revocation: A-17 bounds how long input is held, not how long the reader
-            // may take to decide. A session that cannot have one says null and adds nothing.
-            observed.launches = read.outstanding_launches.0.map_or(0, U64::get);
+            let mut observed = SessionDemand {
+                // A launch the reader has not answered is work outstanding, and it stays
+                // outstanding through the revocation: A-17 bounds how long input is held, not how
+                // long the reader may take to decide. A session that cannot have one says null
+                // and adds nothing.
+                launches: read.outstanding_launches.0.map_or(0, U64::get),
+                ..SessionDemand::default()
+            };
             if summary.application_state.as_ref()
                 == Some(&kr_protocol::session::ApplicationState::AgentBusy)
             {
