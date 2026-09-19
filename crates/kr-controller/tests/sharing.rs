@@ -1730,6 +1730,7 @@ async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
         build_id: BuildId::new("kr-test/0").expect("a build identifier"),
         release: "0".to_owned(),
         shell_packages: None,
+        terminal: Box::new(kr_controller::supervision::NoTerminal),
     })
     .await
     .expect("the daemon starts");
