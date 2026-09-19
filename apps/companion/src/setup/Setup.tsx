@@ -138,8 +138,26 @@ function recordKey(record: CapabilityRecord): string {
     record.capability,
     record.subject.application ?? '',
     record.subject.terminal ?? '',
+    record.subject.session_id ?? '',
+    record.subject.desktop_session_id ?? '',
     record.identity.binary ?? ''
   ].join('|')
+}
+
+/**
+ * Which grant refused this record, where the host named one.
+ *
+ * Two grants can stand behind one capability, and a card for either of them would otherwise show a
+ * refusal that came from the other. The host writes the permission's own name into the reason, so
+ * the row can say which one it was and stop a person granting the wrong thing twice.
+ */
+function refusedBy(record: CapabilityRecord): string | null {
+  if (record.state !== 'permission_required') return null
+  const reason = record.disabled_reason ?? ''
+  return (
+    categoriesFor(record.capability).find((category) => reason.includes(category.name))?.name ??
+    null
+  )
 }
 
 /** What a record was established about, in one line, where it names something. */
@@ -595,6 +613,7 @@ function PermissionCard({
             {governed.map((record) => {
               const state = displayState(record, { grantWasOffered: offered(record.capability) })
               const about = aboutLine(record)
+              const refused = refusedBy(record)
               return (
                 <li key={recordKey(record)}>
                   <span>
@@ -605,6 +624,14 @@ function PermissionCard({
                         data-testid={`setup-about-${record.capability}`}
                       >
                         {about}
+                      </span>
+                    ) : null}
+                    {refused && refused !== category.name ? (
+                      <span
+                        className="small faint setup-about"
+                        data-testid={`setup-refused-${record.capability}`}
+                      >
+                        refused by {refused}, not by this one
                       </span>
                     ) : null}
                   </span>
@@ -720,6 +747,7 @@ function CapabilityCard({
 }): ReactNode {
   const [showEvidence, setShowEvidence] = useState(false)
   const state = displayState(record, { grantWasOffered: offered })
+  const about = aboutLine(record)
   return (
     <Card data-testid={`setup-capability-${record.capability}`}>
       <header className="card-header">
@@ -729,6 +757,11 @@ function CapabilityCard({
         </Badge>
       </header>
       <div className="card-body">
+        {about ? (
+          <p className="mono small faint" data-testid={`setup-card-about-${record.capability}`}>
+            {about}
+          </p>
+        ) : null}
         <p>{stateMeaning(state, record.evidence_source)}</p>
         {record.disabled_reason ? (
           <p className="faint small" data-testid={`setup-reason-${record.capability}`}>
@@ -815,10 +848,9 @@ function HostStep({
   return (
     <>
       <p>
-        Three separate things, and you can take any of them without the others. Choosing one here
-        records the choice; the last step gives you the command that installs it, because an
-        installer that put things on your machine while you were still reading would be the wrong
-        kind of helpful.
+        Three separate things, and you can take any of them without the others. Nothing on this
+        screen installs anything: what you choose here is your answer, and the last step shows it
+        back to you.
       </p>
       {INSTALLABLES.map((item) => {
         const answer = persistence.find((each) => each.profile === item.profile)
@@ -837,9 +869,11 @@ function HostStep({
             <div className="card-body">
               <p>{item.purpose}</p>
               <p className="faint small">{item.installs}</p>
-              <p className="faint small">
-                Installed by <code className="mono">{item.command}</code>
-              </p>
+              {item.command ? (
+                <p className="faint small">
+                  Installed by <code className="mono">{item.command}</code>
+                </p>
+              ) : null}
               {answer ? (
                 <p className="setup-persistence" data-testid={`setup-persistence-${item.id}`}>
                   <strong>
@@ -857,7 +891,7 @@ function HostStep({
         <header className="card-header">
           <h2>Staying awake while work runs</h2>
           <Badge tone={power?.active ? 'accent' : 'neutral'}>
-            {power ? power.setting : 'off'}
+            {power ? power.setting : 'not read'}
           </Badge>
         </header>
         <div className="card-body">
@@ -869,7 +903,8 @@ function HostStep({
             {SLEEP_OFFERS.map((offer) => (
               <li key={offer.setting} data-testid={`setup-sleep-${offer.setting}`}>
                 <code className="mono small">
-                  {offer.setting === 'off' ? 'off (now)' : `${SLEEP_COMMAND} ${offer.setting}`}
+                  {`${SLEEP_COMMAND} ${offer.setting}`}
+                  {power?.setting === offer.setting ? ' — set now' : ''}
                 </code>
                 <span>{offer.meaning}</span>
               </li>
@@ -891,8 +926,8 @@ function HostStep({
             {readableBytes(DEFAULT_MODEL.bytes)} to download.
           </p>
           <p className="faint small">
-            Downloaded by <code className="mono">{DEFAULT_MODEL.command}</code>, when you run it.
-            Nothing is downloading while you read this.
+            Nothing is downloading while you read this. What you choose here is your answer to the
+            offer, and nothing else.
           </p>
         </div>
         <footer className="card-footer setup-route">
@@ -993,7 +1028,7 @@ function ReadyStep({
               </Badge>
             </li>
           </ul>
-          {chosen.length === 0 ? (
+          {chosen.length === 0 && download !== 'chosen' ? (
             <p className="faint small" data-testid="setup-nothing-chosen">
               Nothing at all, which is a complete answer. KalaReach works from here without any of
               it.
@@ -1001,19 +1036,26 @@ function ReadyStep({
           ) : (
             <div className="setup-commands" data-testid="setup-commands">
               <p className="faint small">
-                Nothing on this screen installed anything. These are the commands that do:
+                Nothing on this screen installed or downloaded anything. These are the answers it
+                has, and what carries each one out:
               </p>
               <ul className="setup-choices">
                 {chosen.map((item) => (
                   <li key={item.id}>
-                    <code className="mono small">{item.command}</code>
-                    <span className="faint small">{item.name}</span>
+                    <span>{item.name}</span>
+                    <span className="faint small">
+                      {item.command ? (
+                        <code className="mono">{item.command}</code>
+                      ) : (
+                        'the installer, when you run it'
+                      )}
+                    </span>
                   </li>
                 ))}
                 {download === 'chosen' ? (
                   <li>
-                    <code className="mono small">{DEFAULT_MODEL.command}</code>
-                    <span className="faint small">{DEFAULT_MODEL.name}</span>
+                    <span>{DEFAULT_MODEL.name}</span>
+                    <span className="faint small">the installer, when you run it</span>
                   </li>
                 ) : null}
               </ul>

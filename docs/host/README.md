@@ -292,7 +292,7 @@ can put about itself. So the checks perform the operations:
 | Read a file you authorised | opens the file you nominated and reads its first few thousand bytes | that file, and nothing else on the filesystem |
 | Take a screen image | takes one image of the desktop and measures it | writes the image into the check's own directory and removes it before answering |
 | Find an element | asks the accessibility tree for the name of one element | reads the tree; selects nothing, moves nothing, clicks nothing |
-| Open an application | starts one new hidden instance of an application that opens no document, and ends the instance it started | nothing you already have open |
+| Open an application | starts one new hidden instance of the platform's own calculator, and ends the instance it started | nothing you already have open: the application it starts has no documents to reopen |
 | Send a keystroke | delivers one keystroke | this one changes something, so it runs only inside a test context that owns the application the keystroke lands in, and this build has none |
 
 Each of them runs in the same execution context an agent's own tools run in, each declares what it
@@ -313,9 +313,10 @@ clock would take an image of your screen for no reason.
 
 `ready` is an operation that was performed and worked. `permission_required` is one the operating
 system refused, and the record names which grant. `desktop_unavailable` is a desktop that is not
-there to act on. A capability nothing has performed the operation for says so, and that is an
-answer rather than a failure: it means nothing is known either way, which is different from knowing
-it cannot be done.
+there to act on, and a check that ran on a desktop that is there and did not get far enough says
+that instead. A capability nothing has performed the operation for says so, and that is an answer
+rather than a failure: it means nothing is known either way, which is different from knowing it
+cannot be done.
 
 One more answer belongs to the person rather than to the host. macOS gives a new grant to a process
 when that process starts, so an application that was already running when you granted something is

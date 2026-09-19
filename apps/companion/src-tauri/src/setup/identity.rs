@@ -210,11 +210,23 @@ pub fn read_signature(executable: &str) -> Signature {
     if !std::path::Path::new(SIGNING_TOOL).is_file() {
         return Signature::unread("the platform's signing tool is not installed");
     }
-    let Ok(output) = std::process::Command::new(SIGNING_TOOL)
-        .args(["-d", "--verbose=2", executable])
-        .stdin(std::process::Stdio::null())
-        .output()
-    else {
+    // On a thread, with a deadline. The signing tool talks to the platform's own services, and a
+    // setup screen that could not answer because one of those was busy would be a worse answer
+    // than one that says the signature was not read.
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let owned = executable.to_owned();
+    std::thread::spawn(move || {
+        let _ = sender.send(
+            std::process::Command::new(SIGNING_TOOL)
+                .args(["-d", "--verbose=2", &owned])
+                .stdin(std::process::Stdio::null())
+                .output(),
+        );
+    });
+    let Ok(answered) = receiver.recv_timeout(SIGNING_BOUND) else {
+        return Signature::unread("the platform's signing tool did not answer");
+    };
+    let Ok(output) = answered else {
         return Signature::unread("the platform's signing tool could not be run");
     };
     // The tool prints its description on the error stream, which is where these fields are.
@@ -231,9 +243,31 @@ pub fn read_signature(executable: &str) -> Signature {
         authority: field(&said, "Authority="),
         team: field(&said, "TeamIdentifier=").filter(|team| team != "not set"),
         identifier: field(&said, "Identifier="),
-        ad_hoc: said.contains("Signature=adhoc") || said.contains("adhoc"),
+        ad_hoc: is_ad_hoc(&said),
         refusal: None,
     }
+}
+
+/// How long the signing tool is given before the report says the signature was not read.
+const SIGNING_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Whether the tool's description says this signature is ad-hoc.
+///
+/// The two fields that say so, and nothing else. Looking for the word anywhere in the description
+/// would find it in the path of an application that happens to live in a directory called `adhoc`,
+/// and telling somebody to install a signed build of the signed build they have is not a message
+/// worth shipping.
+fn is_ad_hoc(said: &str) -> bool {
+    if field(said, "Signature=").is_some_and(|value| value.contains("adhoc")) {
+        return true;
+    }
+    said.lines()
+        .filter(|line| line.trim_start().starts_with("CodeDirectory "))
+        .any(|line| {
+            line.split_whitespace()
+                .find_map(|word| word.strip_prefix("flags="))
+                .is_some_and(|flags| flags.contains("adhoc"))
+        })
 }
 
 /// The platform's own signing tool.
@@ -327,6 +361,23 @@ mod tests {
         assert!(inside_bundle(path));
         let said = unstable(path, true, &signed()).expect("a build product is not stable");
         assert!(said.contains("inside a build directory"));
+    }
+
+    #[test]
+    fn an_ad_hoc_signature_is_read_from_the_fields_that_say_so_and_not_from_the_path() {
+        assert!(is_ad_hoc("Signature=adhoc\n"));
+        assert!(is_ad_hoc(
+            "CodeDirectory v=20400 size=448061 flags=0x20002(adhoc,linker-signed) hashes=1\n"
+        ));
+        assert!(
+            !is_ad_hoc(
+                "Executable=/Applications/adhoc/KalaReach.app/Contents/MacOS/k\nSignature size=4567\n"
+            ),
+            "a directory called adhoc is not a signature"
+        );
+        assert!(!is_ad_hoc(
+            "Signature size=4567\nAuthority=Developer ID Application\n"
+        ));
     }
 
     #[test]

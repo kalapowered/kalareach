@@ -262,8 +262,8 @@ describe('how KalaReach runs here', () => {
     await screen.findByTestId('setup-identity')
     await goTo('host')
     const sleep = screen.getByTestId('setup-sleep')
-    expect(within(sleep).getByText('off')).toBeInTheDocument()
     expect(screen.getByTestId('setup-sleep-now').textContent).toMatch(/It is off\./)
+    expect(screen.getByTestId('setup-sleep-off').textContent).toMatch(/set now/)
     expect(sleep.textContent).toMatch(/Setting up KalaReach does not change it/)
     expect(screen.getByTestId('setup-sleep-mains_only').textContent).toMatch(
       /kr host power --set mains_only/
@@ -419,16 +419,32 @@ describe('what a restart is asked for, and what a record is about', () => {
     )
   })
 
-  it('says what will install what, and installs nothing itself', async () => {
+  it('says it installs nothing itself, and names the command where there is one', async () => {
     start()
     await screen.findByTestId('setup-identity')
     await goTo('host')
-    const card = screen.getByTestId('setup-install-gui_host')
-    expect(card.textContent).toMatch(/kr host install --desktop/)
-    await userEvent.click(within(card).getByRole('switch'))
+    expect(screen.getByTestId('setup-panel-host').textContent).toMatch(
+      /Nothing on this screen installs anything/
+    )
+    // The one offer with a command of its own names it; the others do not invent one.
+    expect(screen.getByTestId('setup-install-terminal_profile').textContent).toMatch(
+      /kr shell install/
+    )
+    expect(screen.getByTestId('setup-install-gui_host').textContent).not.toMatch(/kr host install/)
+    await userEvent.click(within(screen.getByTestId('setup-install-gui_host')).getByRole('switch'))
     await goTo('ready')
     const commands = screen.getByTestId('setup-commands')
-    expect(commands.textContent).toMatch(/Nothing on this screen installed anything/)
-    expect(commands.textContent).toMatch(/kr host install --desktop/)
+    expect(commands.textContent).toMatch(/installed or downloaded anything/)
+    expect(commands.textContent).toMatch(/The graphical host/)
+  })
+
+  it('shows the model choice on its own, with nothing else chosen', async () => {
+    start()
+    await screen.findByTestId('setup-identity')
+    await goTo('host')
+    await userEvent.click(screen.getByTestId('setup-model-download'))
+    await goTo('ready')
+    expect(screen.queryByTestId('setup-nothing-chosen')).toBeNull()
+    expect(screen.getByTestId('setup-commands').textContent).toMatch(/The default local model/)
   })
 })

@@ -156,11 +156,11 @@ impl Check {
                 bound: Duration::from_secs(20),
             },
             Self::ApplicationLaunch => Effects {
-                performs: "starts one new hidden instance of an application that opens no \
-                           document, and ends the instance it started",
+                performs: "starts one new hidden instance of the platform's own calculator, and \
+                           ends the instance it started",
                 reads: "nothing",
-                writes: "nothing, unless an application named in place of the default writes \
-                         something of its own when it starts",
+                writes: "nothing: the application this check starts has no documents to reopen \
+                         and no state of its own to write",
                 sends_input: false,
                 changes_user_data: false,
                 needs_isolated_context: false,
@@ -225,8 +225,6 @@ pub struct Plan {
     pub authorised_file: Option<PathBuf>,
     /// Where a check may put its own working files. Owner-only, and never on the workspace volume.
     pub scratch: PathBuf,
-    /// The application the launch check starts a new instance of.
-    pub application: Option<String>,
     /// The test context a destructive check needs, where the caller supplied one.
     pub isolated: Option<IsolatedContext>,
 }
@@ -238,7 +236,6 @@ impl Plan {
         Self {
             authorised_file: None,
             scratch: scratch.into(),
-            application: None,
             isolated: None,
         }
     }
@@ -268,6 +265,8 @@ pub enum Outcome {
     NotAnswered {
         /// How long the check waited.
         waited: Duration,
+        /// Whether the facility had stopped by the time the check answered.
+        stopped: bool,
     },
     /// The check could not be attempted, for a reason that is not a permission.
     NotAttempted {
@@ -337,14 +336,19 @@ pub fn judge(
                     .to_owned(),
             ),
         ),
-        Outcome::NotAnswered { waited } => (
+        Outcome::NotAnswered { waited, stopped } => (
             CapabilityState::TemporarilyUnavailable,
             CapabilityEvidenceSource::DisclosedProbe,
             Some(format!(
-                "the operation was started and had not answered after {} seconds, so it was \
-                 stopped and nothing is established either way. A permission the operating system \
-                 asks the person at the machine about looks exactly like this from here",
-                waited.as_secs()
+                "the operation was started and had not answered after {} seconds, so it was asked \
+                 to stop{} and nothing is established either way. A permission the operating \
+                 system asks the person at the machine about looks exactly like this from here",
+                waited.as_secs(),
+                if *stopped {
+                    " and it did"
+                } else {
+                    ", which it had not done when this check answered"
+                }
             )),
         ),
         Outcome::NotAttempted { detail } => (
@@ -521,6 +525,7 @@ pub fn stale(
 pub struct Schedule {
     held: Vec<CapabilityRecord>,
     taken_against: Option<Fingerprint>,
+    ran_with: Option<Plan>,
 }
 
 impl Schedule {
@@ -557,9 +562,13 @@ impl Schedule {
     }
 
     /// Whether the checks have to run again.
+    ///
+    /// The plan is part of the question. A run given a file the last one did not have is a
+    /// different question, and answering it from what was held would report that no file was
+    /// nominated to somebody who had just nominated one.
     #[must_use]
-    pub fn must_run(&self, now: &Fingerprint) -> bool {
-        self.held.is_empty() || !self.fired(now).is_empty()
+    pub fn must_run(&self, now: &Fingerprint, plan: &Plan) -> bool {
+        self.held.is_empty() || self.ran_with.as_ref() != Some(plan) || !self.fired(now).is_empty()
     }
 
     /// Returns the records, running the checks again only where something fired.
@@ -572,9 +581,10 @@ impl Schedule {
         plan: &Plan,
         facilities: &dyn Facilities,
     ) -> &[CapabilityRecord] {
-        if self.must_run(now) {
+        if self.must_run(now, plan) {
             self.held = report(subject, desktop, revision, plan, facilities);
             self.taken_against = Some(now.clone());
+            self.ran_with = Some(plan.clone());
         }
         &self.held
     }
@@ -666,20 +676,24 @@ fn read_authorised_file(plan: &Plan) -> Ran {
             };
         }
     }
-    let outcome = match read_first_block(path) {
-        Ok(count) => Outcome::Performed {
+    let outcome = match bounded_read(path, check.effects().bound) {
+        None => Outcome::NotAnswered {
+            waited: check.effects().bound,
+            stopped: false,
+        },
+        Some(Ok(count)) => Outcome::Performed {
             detail: format!("it read {count} bytes of {}", path.display()),
         },
-        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+        Some(Err(error)) if error.kind() == std::io::ErrorKind::PermissionDenied => {
             Outcome::PermissionRefused {
                 permission: permission_for_path(path).to_owned(),
                 detail: format!("the platform refused to open {}: {error}", path.display()),
             }
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Outcome::NotAttempted {
+        Some(Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Outcome::NotAttempted {
             detail: format!("{} is not there", path.display()),
         },
-        Err(error) => Outcome::NotAttempted {
+        Some(Err(error)) => Outcome::NotAttempted {
             detail: format!("{} could not be read: {error}", path.display()),
         },
     };
@@ -688,6 +702,23 @@ fn read_authorised_file(plan: &Plan) -> Ran {
         facility,
         outcome,
     }
+}
+
+/// Reads the first block of a file, or gives up on the clock.
+///
+/// A regular file on a filesystem that has stopped answering blocks in the kernel, and a read has
+/// no deadline of its own. The read is done on a thread and waited for with one, so the check
+/// answers whatever the filesystem does. A read that never returns leaves its thread waiting
+/// rather than the check, which is the trade this makes deliberately: a diagnostic that cannot
+/// answer is worse than a thread that is still asleep when the process ends.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn bounded_read(path: &Path, bound: Duration) -> Option<std::io::Result<usize>> {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let owned = path.to_path_buf();
+    std::thread::spawn(move || {
+        let _ = sender.send(read_first_block(&owned));
+    });
+    receiver.recv_timeout(bound).ok()
 }
 
 /// How much of the nominated file the read check takes.
@@ -767,12 +798,13 @@ mod platform {
     const AUTOMATION: &str = "/usr/bin/osascript";
     /// The platform's application launcher.
     const LAUNCHER: &str = "/usr/bin/open";
-    /// The application the launch check starts when the caller nominates none.
+    /// The application the launch check starts.
     ///
     /// The platform's own calculator: it is on every installation, it has no documents to restore
     /// and no saved state to reopen, so a new hidden instance of it does nothing to anything the
-    /// person owns. An editor would have reopened whatever they last had open.
-    const DEFAULT_APPLICATION: &str = "Calculator";
+    /// person owns. An editor would have reopened whatever they last had open, which is a check
+    /// that changes what is on somebody's screen to find out whether it can.
+    const APPLICATION: &str = "Calculator";
 
     pub(super) fn perform(check: Check, plan: &Plan) -> Ran {
         match check {
@@ -839,8 +871,7 @@ mod platform {
                 Outcome::Performed {
                     detail: format!(
                         "it read a {bytes}-byte image of the main display into memory and kept \
-                         none of it{}",
-                        left_behind.unwrap_or_default()
+                         none of it"
                     ),
                 }
             }
@@ -862,7 +893,25 @@ mod platform {
         Ran {
             check,
             facility: ran.facility,
-            outcome,
+            // Whatever the answer, an image this check could not remove is part of it.
+            outcome: match (outcome, left_behind) {
+                (outcome, None) => outcome,
+                (Outcome::Performed { detail }, Some(said)) => Outcome::Performed {
+                    detail: format!("{detail}{said}"),
+                },
+                (Outcome::PermissionRefused { permission, detail }, Some(said)) => {
+                    Outcome::PermissionRefused {
+                        permission,
+                        detail: format!("{detail}{said}"),
+                    }
+                }
+                (Outcome::NotAttempted { detail }, Some(said)) => Outcome::NotAttempted {
+                    detail: format!("{detail}{said}"),
+                },
+                (other, Some(said)) => Outcome::NotAttempted {
+                    detail: format!("{other:?}{said}"),
+                },
+            },
         }
     }
 
@@ -895,6 +944,13 @@ mod platform {
         );
         let outcome = match ran.outcome {
             Outcome::Performed { detail } => match detail.trim().parse::<u64>() {
+                // An element, not a number. A tree that answered with nothing in it is a tree
+                // this check found no element in, and the capability is finding one.
+                Ok(0) => Outcome::NotAttempted {
+                    detail: "the frontmost application offered no element to read, so nothing \
+                             about the accessibility tree is established"
+                        .to_owned(),
+                },
                 Ok(count) => Outcome::Performed {
                     detail: format!(
                         "it read the accessibility tree of the frontmost application and found \
@@ -944,7 +1000,6 @@ mod platform {
         if lowered.contains("assistive")
             || lowered.contains("accessibility")
             || lowered.contains("-25211")
-            || lowered.contains("-1728")
         {
             return Outcome::PermissionRefused {
                 permission: "Accessibility".to_owned(),
@@ -986,7 +1041,10 @@ mod platform {
                 outcome: Outcome::FacilityMissing,
             };
         }
-        let application = plan.application.as_deref().unwrap_or(DEFAULT_APPLICATION);
+        // This check names its own application and takes none from a caller. An application a
+        // caller could nominate is one that could write something when it starts, and the effects
+        // this check declares would then be true of the default and not of the run.
+        let application = APPLICATION;
         // A mark this check made up, passed to the instance it starts. It is how the instance this
         // check is responsible for is told apart from one the person already had open, and it is
         // the only thing this check will end.
@@ -1058,8 +1116,9 @@ mod platform {
     /// started. Nothing else is looked for, and the processes are ended by the identifiers the
     /// platform gave back rather than by any pattern of its own.
     fn end_marked(mark: &str, plan: &Plan) -> Ended {
-        for _ in 0..LAUNCH_ATTEMPTS {
-            let pids = marked(mark, plan);
+        let deadline = std::time::Instant::now() + Check::ApplicationLaunch.effects().bound;
+        while std::time::Instant::now() < deadline {
+            let pids = marked(mark, plan).unwrap_or_default();
             if !pids.is_empty() {
                 let arguments: Vec<&str> = pids.iter().map(String::as_str).collect();
                 let _ = bounded(Check::ApplicationLaunch, "/bin/kill", &arguments, plan);
@@ -1068,11 +1127,11 @@ mod platform {
                 } else {
                     format!("the {} instances it started", pids.len())
                 };
-                // Asked to end is not ended. An application still there after being asked is
-                // reported as still there rather than as tidied up.
-                for _ in 0..LAUNCH_ATTEMPTS {
+                // Asked to end is not ended, and a listing this check could not take is not a
+                // listing that came back empty. Only an answer settles it.
+                while std::time::Instant::now() < deadline {
                     std::thread::sleep(LAUNCH_POLL);
-                    if marked(mark, plan).is_empty() {
+                    if marked(mark, plan).is_some_and(|pids| pids.is_empty()) {
                         return Ended::Gone(named);
                     }
                 }
@@ -1083,32 +1142,32 @@ mod platform {
         Ended::NeverAppeared
     }
 
-    /// The process identifiers carrying this check's own mark.
-    fn marked(mark: &str, plan: &Plan) -> Vec<String> {
+    /// The process identifiers carrying this check's own mark, where the platform answered.
+    ///
+    /// `None` is the listing this check could not take, which is a different thing from a listing
+    /// that came back empty: one says nothing is there and the other says nobody looked.
+    fn marked(mark: &str, plan: &Plan) -> Option<Vec<String>> {
         let listed = bounded(
             Check::ApplicationLaunch,
             "/usr/bin/pgrep",
             &["-f", mark],
             plan,
         );
-        let Outcome::Performed { detail } = listed.outcome else {
-            return Vec::new();
-        };
-        detail
-            .split_whitespace()
-            .filter(|word| word.chars().all(|character| character.is_ascii_digit()))
-            .map(std::borrow::ToOwned::to_owned)
-            .collect()
+        match listed.outcome {
+            Outcome::Performed { detail } => Some(
+                detail
+                    .split_whitespace()
+                    .filter(|word| word.chars().all(|character| character.is_ascii_digit()))
+                    .map(std::borrow::ToOwned::to_owned)
+                    .collect(),
+            ),
+            // The lister exits with a failure when it matched nothing, which is an answer.
+            Outcome::NotAttempted { detail } if detail.trim().is_empty() => Some(Vec::new()),
+            _ => None,
+        }
     }
 
-    /// How many times the launch check looks for the instance it started.
-    ///
-    /// The launcher answers as soon as the platform accepts the launch, which is well before the
-    /// application is a process, and a cold start of one takes seconds. Looking for a few seconds
-    /// would leave an application running that this check promised to end.
-    const LAUNCH_ATTEMPTS: usize = 150;
-
-    /// How long it waits between those looks.
+    /// How long the launch check waits between looks for the instance it started.
     const LAUNCH_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 }
 
@@ -1237,15 +1296,17 @@ fn bounded(check: Check, program: &str, arguments: &[&str], plan: &Plan) -> Ran 
             // a reason for a diagnostic to stop answering.
             let _ = child.kill();
             let collected = std::time::Instant::now();
-            loop {
+            let stopped = loop {
                 match child.try_wait() {
-                    Ok(Some(_)) | Err(_) => break,
-                    Ok(None) if collected.elapsed() >= COLLECT => break,
+                    Ok(Some(_)) => break true,
+                    Err(_) => break false,
+                    Ok(None) if collected.elapsed() >= COLLECT => break false,
                     Ok(None) => std::thread::sleep(POLL),
                 }
-            }
+            };
             Outcome::NotAnswered {
                 waited: started.elapsed(),
+                stopped,
             }
         }
     };
@@ -1446,6 +1507,7 @@ mod tests {
             Check::ScreenImage,
             &Outcome::NotAnswered {
                 waited: Duration::from_secs(20),
+                stopped: true,
             },
         );
         assert_eq!(state, CapabilityState::TemporarilyUnavailable);
@@ -1641,7 +1703,7 @@ mod tests {
 
         let mut schedule = Schedule::new();
         assert!(
-            schedule.must_run(&taken),
+            schedule.must_run(&taken, &plan),
             "nothing held is nothing to trust"
         );
         let first = schedule
@@ -1650,7 +1712,7 @@ mod tests {
         assert_eq!(first.len(), 5);
 
         // The same moment: nothing fired, nothing runs, and the answers are the ones already held.
-        assert!(!schedule.must_run(&taken));
+        assert!(!schedule.must_run(&taken, &plan));
         assert!(schedule.fired(&taken).is_empty());
         let again = schedule
             .refresh(&subject, &desktop, revision(), &taken, &plan, &facilities)
@@ -1669,7 +1731,27 @@ mod tests {
             schedule.fired(&granted),
             vec![CapabilityInvalidation::OsPermission]
         );
-        assert!(schedule.must_run(&granted));
+        assert!(schedule.must_run(&granted, &plan));
+        // And it runs, rather than handing back what it held against the moment before.
+        let after = schedule
+            .refresh(&subject, &desktop, revision(), &granted, &plan, &facilities)
+            .to_vec();
+        assert_eq!(after.len(), 5);
+        assert!(
+            schedule.fired(&granted).is_empty(),
+            "and it is current again"
+        );
+
+        // A different question is a different answer, whatever the moment says. A run given a
+        // file the last one did not have must not be answered from the one that had none.
+        let nominated = Plan {
+            authorised_file: Some("/etc/hosts".into()),
+            ..Plan::in_directory(".")
+        };
+        assert!(
+            schedule.must_run(&granted, &nominated),
+            "a plan the held answers were not taken against is a question nobody has answered"
+        );
     }
 
     #[test]
@@ -1796,7 +1878,6 @@ fn the_disclosed_checks_on_this_desktop() {
     let plan = Plan {
         authorised_file: std::env::var("KR_PROBE_FILE").ok().map(Into::into),
         scratch,
-        application: std::env::var("KR_PROBE_APPLICATION").ok(),
         isolated: None,
     };
 

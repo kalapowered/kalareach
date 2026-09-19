@@ -61,7 +61,8 @@ describe('the state one capability is shown as', () => {
       permission_required: 'permission_required',
       missing_installation: 'not_installed',
       incompatible: 'desktop_unavailable',
-      temporarily_unavailable: 'desktop_unavailable',
+      // A check that performed the operation and got nowhere is not a desktop that is missing.
+      temporarily_unavailable: 'not_established',
       not_tested: 'not_checked'
     }
     for (const [reported, shown] of Object.entries(states)) {
@@ -69,6 +70,13 @@ describe('the state one capability is shown as', () => {
         displayState(record('desktop.screen_capture', reported as CapabilityRecord['state']), NOT_OFFERED)
       ).toBe(shown)
     }
+    // The same state from a question put to the platform is the desktop being unavailable.
+    expect(
+      displayState(
+        record('desktop.screen_capture', 'temporarily_unavailable', 'platform_query'),
+        NOT_OFFERED
+      )
+    ).toBe('desktop_unavailable')
   })
 
   it('never upgrades an answer the host did not establish', () => {
@@ -80,14 +88,18 @@ describe('the state one capability is shown as', () => {
   it('asks for a restart once the grant was given and the answer did not change', () => {
     const waiting = record('desktop.screen_capture', 'permission_required')
     expect(displayState(waiting, { grantWasOffered: true })).toBe('restart_required')
-    expect(stateMeaning('restart_required', 'disclosed_probe')).toMatch(/open it again/i)
+    expect(stateMeaning('restart_required', 'disclosed_probe')).toMatch(
+      /opening KalaReach again is the next thing to try/i
+    )
   })
 
   it('says what an answer means differently when nothing performed the operation', () => {
     expect(stateMeaning('ready', 'disclosed_probe')).toMatch(/did the thing and it worked/)
     expect(stateMeaning('ready', 'platform_query')).toMatch(/Nothing has done it yet/)
     expect(stateMeaning('desktop_unavailable', 'platform_query')).toMatch(/no desktop/)
-    expect(stateMeaning('desktop_unavailable', 'disclosed_probe')).toMatch(/it was tried/i)
+    expect(stateMeaning('not_established', 'disclosed_probe')).toMatch(
+      /did not get far enough/i
+    )
   })
 
   it('does not ask for a restart once the operation works', () => {

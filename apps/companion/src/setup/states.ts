@@ -24,6 +24,7 @@ export type DisplayState =
   | 'permission_required'
   | 'restart_required'
   | 'desktop_unavailable'
+  | 'not_established'
   | 'not_installed'
   | 'not_checked'
 
@@ -54,6 +55,11 @@ export function displayState(record: CapabilityRecord, since: SinceRead): Displa
     case 'permission_required':
       return since.grantWasOffered ? 'restart_required' : 'permission_required'
     case 'temporarily_unavailable':
+      // A check that performed the operation and did not get far enough says so. Calling that a
+      // desktop that is not there would send somebody looking for a desktop they are sitting at.
+      return record.evidence_source === 'disclosed_probe'
+        ? 'not_established'
+        : 'desktop_unavailable'
     case 'incompatible':
       return 'desktop_unavailable'
     case 'missing_installation':
@@ -69,6 +75,7 @@ export const STATE_LABEL: Readonly<Record<DisplayState, string>> = {
   permission_required: 'Permission required',
   restart_required: 'Restart required',
   desktop_unavailable: 'Desktop unavailable',
+  not_established: 'Not established',
   not_installed: 'Tool not installed',
   not_checked: 'Not checked'
 }
@@ -81,6 +88,7 @@ export const STATE_TONE: Readonly<
   permission_required: 'warning',
   restart_required: 'accent',
   desktop_unavailable: 'neutral',
+  not_established: 'neutral',
   not_installed: 'neutral',
   not_checked: 'neutral'
 }
@@ -111,11 +119,15 @@ export function stateMeaning(
         ? 'macOS refused it. The grant is yours to give.'
         : 'This needs a grant macOS has not given. The grant is yours to give.'
     case 'restart_required':
-      return 'macOS gives a new grant to a process when it starts. Quit KalaReach and open it again.'
+      return (
+        'You have been to every settings pane behind this and the answer has not moved. macOS ' +
+        'gives a new grant to a process when it starts, so opening KalaReach again is the next ' +
+        'thing to try.'
+      )
     case 'desktop_unavailable':
-      return probed
-        ? 'It was tried and it did not get far enough to establish anything. The reason is below.'
-        : 'There is no desktop to do it on right now.'
+      return 'There is no desktop to do it on right now.'
+    case 'not_established':
+      return 'This did not get far enough to establish anything. The reason is below.'
     case 'not_installed':
       return 'The tool this uses is not on this machine, so there is nothing to grant.'
     case 'not_checked':

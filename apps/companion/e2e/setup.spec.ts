@@ -172,6 +172,7 @@ test.describe('the first-start assistant', () => {
       await expect(card.getByRole('switch')).toHaveAttribute('aria-checked', 'false')
     }
     await expect(page.getByTestId('setup-sleep-now')).toContainText('It is off.')
+    await expect(page.getByTestId('setup-sleep-off')).toContainText('set now')
     await expect(page.getByTestId('setup-sleep')).toContainText(
       'Setting up KalaReach does not change it'
     )
