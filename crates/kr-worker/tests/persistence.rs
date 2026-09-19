@@ -24,7 +24,7 @@ use kr_protocol::local::LocalClientKind;
 use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::receipt::ReceiptState;
 use kr_protocol::recovery::HistoryGapCause;
-use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
+use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::{Dimensions, DisplayNumber, Durability, ShellMode};
 use kr_worker::history::SpoolLayout;
 use kr_worker::journal::{Journal, RETENTION_MS, Submission};
@@ -207,6 +207,9 @@ fn numbered_submission(index: u16) -> Submission {
 fn attach_params(session_id: SessionId) -> kr_protocol::attachment::SessionAttachParams {
     let mut requested = kr_protocol::scalars::CanonicalSet::new();
     requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    // The native terminal exception is about raw input under the live lease, so the attachment
+    // this suite uses asks for input as well as for output.
+    requested.insert(kr_protocol::attachment::AttachmentCapability::Input);
     kr_protocol::attachment::SessionAttachParams {
         session_id,
         mode: kr_protocol::attachment::AttachMode::Terminal,
@@ -1362,6 +1365,191 @@ fn a_gap_that_carries_a_cause_is_refused_by_a_decoder_built_before_it() {
 struct EarlierHistoryGap {
     from_cursor: kr_protocol::scalars::U64,
     to_cursor: kr_protocol::scalars::U64,
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-ACC-028: a full journal during native traffic
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_full_journal_fences_rich_work_while_the_terminal_keeps_working() {
+    // KR-ACC-028: fill the journal while local terminal traffic continues; fence rich mutations
+    // and approvals, and never replay a volatile request. All three in one sequence, because the
+    // contract is about what happens to them *together*.
+    let host = host().await;
+    let mut client = cli(&host).await;
+
+    // An attachment and the input lease, taken while the store is still working.
+    let attachment: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("attaches");
+    let lease: kr_protocol::input::InputAcquireResult = client
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::input::InputAcquireParams {
+                session_id: host.session_id,
+                attachment_id: attachment.attachment.attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("acquires the lease");
+
+    {
+        let mut session = host.runtime.session();
+        let refusal = fill_the_store(session.journal_mut().expect("a journal"));
+        assert!(refusal.to_string().contains("full"), "{refusal}");
+    }
+
+    // The terminal keeps working. Raw input under the live lease is section 11's exception, and a
+    // keystroke never waited for a durable write in the first place.
+    for sequence in 0..4 {
+        let written: kr_protocol::input::InputWriteResult = client
+            .request(
+                Method::InputWrite,
+                &kr_protocol::input::InputWriteParams {
+                    session_id: host.session_id,
+                    attachment_id: attachment.attachment.attachment_id,
+                    epoch: lease.lease.epoch,
+                    sequence: kr_protocol::ids::InputSequence::new(sequence),
+                    bytes: kr_protocol::scalars::Bytes::new(b"echo hello\n".to_vec()),
+                },
+            )
+            .await
+            .expect("reaches the worker")
+            .map(|value| value.to_typed().expect("decodes"))
+            .expect("the terminal still takes input with a full store");
+        assert_eq!(written.sequence.get(), sequence);
+    }
+
+    // Rich work is fenced, and the refusal is a refusal rather than an uncertain outcome.
+    let action_id = ActionId::new(kr_ipc::new_uuid());
+    let refused = client
+        .mutate(
+            Method::SessionAttach,
+            action_id,
+            target(&host),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("a full store fences rich work");
+    assert_eq!(refused.code, ErrorCode::StorageUnavailable);
+
+    // And nothing can replay it: the store holds no record of the action at all, so there is no
+    // dispatch marker for a recovery to turn into an uncertain outcome.
+    {
+        let mut session = host.runtime.session();
+        let journal = session.journal_mut().expect("a journal");
+        let caller =
+            ActorId::new(format!("os:{}", kr_ipc::paths::current_uid())).expect("the local caller");
+        assert!(
+            journal.read(caller, action_id).expect("reads").is_none(),
+            "a fenced mutation leaves nothing to replay"
+        );
+        assert!(!session.durability_posture().admits(WorkClass::RichMutation));
+        assert!(
+            session
+                .durability_posture()
+                .admits(WorkClass::NativeTerminal)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-23.48: state-recovery reads bounded by cursor, range and authority
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_history_page_is_bounded_by_its_cursor_and_its_range() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    {
+        let mut session = host.runtime.session();
+        for _ in 0..8 {
+            session.ingest_output(&[b'x'; 1024]);
+        }
+    }
+    // The cursor bounds where it starts.
+    let page: kr_protocol::recovery::HistoryPageResult = client
+        .request(
+            Method::HistoryPage,
+            &kr_protocol::recovery::HistoryPageParams {
+                session_id: host.session_id,
+                from_cursor: U64::new(2048),
+                max_bytes: U64::new(512),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("a page");
+    assert_eq!(page.from_cursor.get(), 2048);
+    // And the range bounds how much it carries.
+    assert_eq!(page.bytes.len(), 512);
+    assert_eq!(page.next_cursor.get(), 2048 + 512);
+    // A page asked for beyond every bound is still bounded.
+    let bounded: kr_protocol::recovery::HistoryPageResult = client
+        .request(
+            Method::HistoryPage,
+            &kr_protocol::recovery::HistoryPageParams {
+                session_id: host.session_id,
+                from_cursor: U64::new(0),
+                max_bytes: U64::new(u64::MAX),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("a page");
+    assert!(
+        bounded.bytes.len() as u64 <= kr_protocol::recovery::MAX_HISTORY_PAGE_BYTES,
+        "a page never carries more than the protocol's bound"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-07.68: what the persistence contract covers
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_persistence_contract_covers_network_loss_and_a_daemon_restart_and_not_a_crash() {
+    // Section 7: *the persistence contract covers network loss and control-daemon restart. A
+    // worker crash or host reboot ends the affected live process execution.* The store
+    // declarations are where that is decidable: what survives a daemon restart is what the
+    // worker's own journal holds, and what a worker crash ends is the live execution, which is
+    // why a crash's closure is recorded by the controller rather than resumed.
+    use kr_worker::persistence::stores;
+
+    for name in ["receipts", "results", "closure", "session", "journal_gaps"] {
+        let store = stores::store(name).expect("a declaration");
+        assert_eq!(
+            store.durability,
+            stores::Durability::CrashDurable,
+            "{name} survives a daemon restart"
+        );
+    }
+    // The live parser and the session's own memory do not survive the process that holds them,
+    // which is what "a worker crash ends the live execution" means in this host.
+    let resident = stores::store("resident history").expect("a declaration");
+    assert_eq!(resident.durability, stores::Durability::ProcessMemory);
+    assert_eq!(resident.reconciliation, stores::Reconciliation::NotRestored);
+    // And a crashed session's record is the archive's to serve rather than a worker's to resume.
+    let closure = stores::store("closure").expect("a declaration");
+    assert!(closure.served_by_archive);
+    assert_eq!(closure.cleanup, stores::Cleanup::ArchiveService);
 }
 
 // ---------------------------------------------------------------------------------------------
