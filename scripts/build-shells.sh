@@ -393,7 +393,7 @@ startup=$(digest "$package/$m_startup") $m_startup"
 
     local work
     work="$(mktemp -d "${TMPDIR:-/tmp}/kr-shell-$shell_name.XXXXXX")"
-    trap 'rm -rf "$work"' RETURN
+    trap 'rm -rf "${work:?}"' RETURN
 
     echo "build-shells: unpacking $m_archive"
     tar -x -f "$archive" -C "$work"
@@ -541,7 +541,7 @@ startup=$(digest "$package/$m_startup") $m_startup"
         exit 1
     fi
 
-    rm -rf "$destination"
+    rm -rf "${destination:?}"
     mkdir -p "$destination"
     if [ "$m_build_system" = "cmake" ]; then
         # shellcheck disable=SC2086
