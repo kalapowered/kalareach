@@ -661,14 +661,40 @@ fn prove_the_marker_records(marker: &Path, sentinels: &Path) {
     const CONTROL: &str = "the-recorder-itself";
 
     std::fs::create_dir_all(sentinels).expect("the sentinel directory");
+    // A bounded retry, for one race and nothing else. This binary's tests run in threads of one
+    // process, and another test's child can be forked while the descriptor this helper wrote the
+    // marker through is still open: the child inherits a copy and holds it until its own exec
+    // closes it, and Linux refuses to exec a file any process still holds open for writing with
+    // ETXTBSY. Nothing about the marker or the product is wrong when that happens, and the window
+    // closes as soon as that child execs, so the control run is attempted again for about a second
+    // before the error stands. This is not something to replace with a lock or with serial tests:
+    // the race is between processes rather than between these tests.
+    const ATTEMPTS: usize = 100;
+    const BETWEEN: std::time::Duration = std::time::Duration::from_millis(10);
+
     // With nothing in its environment, which is at least as bare as the one the restricted profile
     // gives a Git child: a marker that records under this records under that.
-    let status = Command::new(marker)
-        .arg(CONTROL)
-        .env_clear()
-        .stdin(std::process::Stdio::null())
-        .status()
-        .expect("the planted marker runs");
+    let mut attempted = 0;
+    let status = loop {
+        attempted += 1;
+        match Command::new(marker)
+            .arg(CONTROL)
+            .env_clear()
+            .stdin(std::process::Stdio::null())
+            .status()
+        {
+            Ok(status) => break status,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempted < ATTEMPTS =>
+            {
+                std::thread::sleep(BETWEEN);
+            }
+            Err(error) => {
+                panic!("the planted marker runs, after {attempted} attempts: {error:?}");
+            }
+        }
+    };
     assert!(status.success(), "the planted marker exits zero: {status}");
     let recorded = sentinels.join(CONTROL);
     assert!(
