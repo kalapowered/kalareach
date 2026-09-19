@@ -697,11 +697,12 @@ fn durable(directory: &cap_std::fs::Dir) -> Result<()> {
 
 /// Leaves a directory's own list of names as the platform left it.
 ///
-/// This platform has no ordinary open of a directory to synchronise, and it runs no Git: an
-/// invocation makes its temporary directory and writes the record, and then the boundary refuses
-/// before Git exists. The record is still read and rewritten when the service starts. What is not
-/// done here is making the record's *name* survive a power failure, and that is the difference to
-/// close when this platform runs Git.
+/// This platform has no ordinary open of a directory to synchronise, and it runs no repository
+/// operation through Git: an invocation makes its temporary directory and writes the record, and
+/// then the boundary refuses before Git exists. Git itself is still started at startup, to say
+/// which Git this host has, and the record is still read and rewritten when the service starts.
+/// What is not done here is making the record's *name* survive a power failure, and that is the
+/// difference to close when this platform runs a repository operation.
 ///
 /// # Errors
 ///
