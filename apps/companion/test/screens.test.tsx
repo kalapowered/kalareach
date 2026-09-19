@@ -583,3 +583,52 @@ describe('one session at a time', () => {
     })
   })
 })
+
+describe('a refusal keeps what was written', () => {
+  it('gives the text back when a later receipt refuses the submission', async () => {
+    const { port, controls } = fakeHost()
+    const pending = {
+      ...port,
+      composerSubmit: (params: unknown, subject: Parameters<typeof port.composerSubmit>[1]) =>
+        port.composerSubmit(params, subject).then((settled) => ({
+          ...settled,
+          // The host took the request and has not said what became of it yet.
+          receipt: settled.receipt ? { ...settled.receipt, state: 'accepted' as const } : null
+        }))
+    }
+    render(
+      <AppProvider
+        port={pending}
+        initialPlace={{ view: 'session', sessionId: SESSION_MAIN, pane: 'semantic' }}
+      >
+        <App />
+      </AppProvider>
+    )
+    const input = await screen.findByTestId('composer-input')
+    await userEvent.type(input, 'do the thing')
+    await userEvent.click(screen.getByTestId('composer-send'))
+
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-input')).toHaveValue('')
+    })
+    await screen.findByTestId('pending-actions')
+    const actionId = controls.actions[controls.actions.length - 1]
+
+    controls.emit({
+      stream_id: `receipts:${SESSION_MAIN}`,
+      sequence: '1',
+      body: {
+        kind: 'receipt',
+        receipt: {
+          action_id: actionId,
+          state: 'refused',
+          error: { code: 'UPSTREAM_UNAVAILABLE', message: 'the agent is not reachable' }
+        }
+      }
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId('composer-input')).toHaveValue('do the thing')
+    })
+  })
+})

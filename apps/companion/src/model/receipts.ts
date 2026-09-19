@@ -23,6 +23,13 @@ export interface Submission {
   readonly actionId: string | null
   /** The text or label the person will recognise. */
   readonly label: string
+  /**
+   * Exactly what was submitted.
+   *
+   * Kept until the outcome permits letting it go, because a refusal has to be able to give it
+   * back, and the label above is a trimmed thing to show rather than the text itself.
+   */
+  readonly text: string
   /** Its current state. */
   readonly state: InputState
   /** When it was created. */
@@ -77,8 +84,23 @@ export function describeState(state: InputState): string {
 }
 
 /** A submission that has not left this device. */
-export function queued(localId: string, label: string, createdAtMs: number): Submission {
-  return { localId, actionId: null, label, state: 'queued', createdAtMs, error: null }
+export function queued(
+  localId: string,
+  label: string,
+  createdAtMs: number,
+  text = label
+): Submission {
+  return { localId, actionId: null, label, text, state: 'queued', createdAtMs, error: null }
+}
+
+/** Whether an outcome is one the person can do nothing more about. */
+export function isTerminal(state: InputState): boolean {
+  return state === 'applied' || state === 'refused' || state === 'rejected'
+}
+
+/** Whether an outcome means the submission did not happen and its text should come back. */
+export function wasRefused(state: InputState): boolean {
+  return state === 'refused' || state === 'rejected'
 }
 
 /** Records that the request has been made. */

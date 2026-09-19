@@ -111,21 +111,20 @@ pub struct Asciicast {
     pub omissions: Vec<Omission>,
 }
 
-/// The string sequences an export never replays.
-///
-/// A recording is read back by writing it to a terminal, so a sequence that acts on the reader's
-/// machine rather than on the recorded screen is a side effect the reader did not ask for. OSC 52
-/// writes the system clipboard; OSC 7 and OSC 9;9 report a working directory a shell may then
-/// change to; DCS, APC, SOS and PM carry payloads a terminal or a multiplexer interprets.
-///
-/// The recogniser below is a small state machine rather than a search, because a recording is a
-/// sequence of frames and a terminal does not restart at a frame boundary: `\x1b]5` at the end of
-/// one frame and `2;c;…` at the start of the next is one clipboard write, and a search over each
-/// frame on its own would pass both through.
+/// What an export removes, and what it is called when it declares the removal.
 const CLIPBOARD_WRITE: &str = "clipboard_write";
 const WORKING_DIRECTORY: &str = "working_directory_report";
+const NOTIFICATION: &str = "notification";
+const TERMINAL_QUERY: &str = "terminal_query";
 const DEVICE_CONTROL: &str = "device_control_string";
 const OTHER_STRING: &str = "application_string";
+
+/// How much of one string sequence is held while it is decided on.
+///
+/// An operating-system command that draws something is short. One longer than this is not display
+/// data anyone is missing, and holding an unbounded one would let a recording decide how much
+/// memory an export uses.
+const MAX_HELD_STRING: usize = 8 * 1024;
 
 /// Builds an asciicast recording, dropping every sequence whose replay would act on the reader's
 /// machine and declaring what it dropped.
@@ -186,43 +185,58 @@ pub fn asciicast(
 enum Phase {
     /// Ordinary text.
     Text,
-    /// Inside a removed string, having just seen an escape that may terminate it.
-    RemovedTerminator,
-    /// An escape was seen and the next byte says what it introduces.
+    /// An escape was seen and the next character says what it introduces.
     Escape,
-    /// Inside an OSC, collecting enough of its number to know what it is.
-    OscNumber,
-    /// Inside a string this export keeps, which ends at ST or BEL.
-    KeptString,
-    /// Inside a string this export removes.
-    RemovedString,
+    /// Inside an operating-system command, holding it until its end decides what it was.
+    Osc,
+    /// Inside an operating-system command, having just seen an escape.
+    OscEscape,
+    /// Inside a string that is removed whatever it turns out to say.
+    Removed,
+    /// Inside a removed string, having just seen an escape.
+    RemovedEscape,
 }
 
 /// The recogniser, kept across the whole recording.
 ///
-/// It is deliberately narrow. It recognises the string sequences that act on the reader's machine,
-/// removes them whole, and passes everything else through byte for byte: colours, cursor movement
-/// and screen clears are rendering data and are what makes the recording worth keeping.
+/// A recording is read back by writing it to a terminal, so the question for every sequence is
+/// what it would do to the terminal that plays it. Drawing is what the recording is for.
+/// Everything else -- writing the reader's clipboard, telling a shell where to be, raising a
+/// notification, asking the terminal a question it will answer into the reader's input -- is a
+/// side effect the reader did not ask for, and section 25 does not permit replaying one.
+///
+/// So an operating-system command is held until its terminator and then decided on against a list
+/// of the ones that only draw. A device-control string, an application-program command, a privacy
+/// message and a start-of-string are removed outright: each carries a payload something
+/// interprets. Everything that is not a string sequence -- colours, cursor movement, screen
+/// clears, every ordinary escape -- passes through byte for byte.
+///
+/// It is one recogniser for the whole recording, because a terminal does not restart at a frame
+/// boundary: `ESC ]5` at the end of one frame and `2;c;…` at the start of the next is one
+/// clipboard write.
 #[derive(Debug)]
 struct Stripper {
     phase: Phase,
-    /// The OSC number as it is being read.
-    number: String,
-    /// What the current removed string was, so it can be declared once it ends.
-    removing: &'static str,
-    /// Text held back while it is not yet known whether it belongs to a removed sequence.
+    /// The operating-system command being held, without its introducer.
     held: String,
+    /// True when what is held grew past the bound and is removed whatever it says.
+    overlong: bool,
+    /// What the current removed string is, so it can be declared once it ends.
+    removing: &'static str,
     /// Each removed kind and how many times it was removed.
     removed: Vec<(&'static str, u64)>,
 }
+
+/// The string terminator's own character, which a recording may carry instead of `ESC \\`.
+const ST: char = '\u{9c}';
 
 impl Stripper {
     fn new() -> Self {
         Self {
             phase: Phase::Text,
-            number: String::new(),
-            removing: OTHER_STRING,
             held: String::new(),
+            overlong: false,
+            removing: OTHER_STRING,
             removed: Vec::new(),
         }
     }
@@ -234,16 +248,64 @@ impl Stripper {
         }
     }
 
-    /// Whether an OSC with this number is removed.
+    /// Whether an operating-system command only draws, and so may be replayed.
     ///
-    /// 52 writes the clipboard. 7 and 9 report a working directory a shell may act on. Everything
-    /// else, including the window title, only changes what the reader sees.
-    fn osc_is_removed(number: &str) -> Option<&'static str> {
+    /// An allowlist rather than a deny list, because "safe rendering data" is a property a
+    /// sequence has to earn: an extension nobody here has heard of is not known to be safe.
+    ///
+    /// A colour command that carries `?` is a query, and a query makes the reader's terminal write
+    /// an answer into the reader's input. That is a side effect whichever selector asks it.
+    fn osc_is_kept(payload: &str) -> std::result::Result<(), &'static str> {
+        let (selector, rest) = payload.split_once(';').unwrap_or((payload, ""));
+        let Ok(number) = selector.trim().parse::<u32>() else {
+            // An operating-system command with no numeric selector is not one this recogniser can
+            // place, so it is not replayed.
+            return Err(OTHER_STRING);
+        };
         match number {
-            "52" => Some(CLIPBOARD_WRITE),
-            "7" | "9" => Some(WORKING_DIRECTORY),
-            _ => None,
+            52 => return Err(CLIPBOARD_WRITE),
+            7 => return Err(WORKING_DIRECTORY),
+            // 9 is a notification on one terminal and a working-directory report on another. Both
+            // act on the machine that plays the recording back.
+            9 | 99 | 777 => return Err(NOTIFICATION),
+            _ => {}
         }
+        let draws = matches!(number, 0 | 1 | 2 | 8 | 104 | 105)
+            || matches!(number, 4 | 5 | 10..=19 | 110..=119);
+        if !draws {
+            return Err(OTHER_STRING);
+        }
+        if rest.contains('?') {
+            return Err(TERMINAL_QUERY);
+        }
+        Ok(())
+    }
+
+    /// Ends the held operating-system command, deciding whether it may be replayed.
+    fn finish_osc(&mut self, terminator: &str, out: &mut String) {
+        let held = std::mem::take(&mut self.held);
+        let overlong = std::mem::replace(&mut self.overlong, false);
+        self.phase = Phase::Text;
+        if overlong {
+            self.note(OTHER_STRING);
+            return;
+        }
+        match Self::osc_is_kept(&held) {
+            Ok(()) => {
+                out.push('\u{1b}');
+                out.push(']');
+                out.push_str(&held);
+                out.push_str(terminator);
+            }
+            Err(kind) => self.note(kind),
+        }
+    }
+
+    /// Abandons whatever is being held, as a terminal does when a string sequence is cancelled.
+    fn cancel(&mut self) {
+        self.held.clear();
+        self.overlong = false;
+        self.phase = Phase::Text;
     }
 
     /// Folds one frame of recorded output in, and returns what may be replayed.
@@ -251,107 +313,115 @@ impl Stripper {
         let mut out = String::with_capacity(text.len());
         for character in text.chars() {
             match self.phase {
-                Phase::Text => {
-                    if character == '\u{1b}' {
-                        self.phase = Phase::Escape;
-                        self.held.push(character);
-                    } else {
-                        out.push(character);
+                Phase::Text => match character {
+                    '\u{1b}' => self.phase = Phase::Escape,
+                    // The eight-bit forms of the same introducers.
+                    '\u{9d}' => {
+                        self.phase = Phase::Osc;
+                        self.held.clear();
+                        self.overlong = false;
                     }
-                }
+                    '\u{90}' => self.start_removed(DEVICE_CONTROL),
+                    '\u{9f}' | '\u{98}' | '\u{9e}' => self.start_removed(OTHER_STRING),
+                    _ => out.push(character),
+                },
                 Phase::Escape => match character {
                     ']' => {
-                        self.phase = Phase::OscNumber;
-                        self.number.clear();
-                        self.held.push(character);
-                    }
-                    'P' | '_' | '^' | 'X' => {
-                        // A device-control string, an application-program command, a privacy
-                        // message or a start-of-string: each carries a payload something
-                        // interprets, and none of them draws the recorded screen.
-                        self.phase = Phase::RemovedString;
-                        self.removing = if character == 'P' {
-                            DEVICE_CONTROL
-                        } else {
-                            OTHER_STRING
-                        };
+                        self.phase = Phase::Osc;
                         self.held.clear();
+                        self.overlong = false;
                     }
+                    'P' => self.start_removed(DEVICE_CONTROL),
+                    '_' | '^' | 'X' => self.start_removed(OTHER_STRING),
+                    // A second escape abandons the first and introduces a new sequence, which is
+                    // what a terminal does with it.
+                    '\u{1b}' => {}
+                    _ if is_cancel(character) => self.phase = Phase::Text,
                     _ => {
-                        // Any other escape sequence is rendering data. It goes through with the
-                        // escape that introduced it.
-                        out.push_str(&self.held);
-                        self.held.clear();
+                        // Every other escape sequence is rendering data.
+                        out.push('\u{1b}');
                         out.push(character);
                         self.phase = Phase::Text;
                     }
                 },
-                Phase::OscNumber => {
-                    if character.is_ascii_digit() && self.number.len() < 4 {
-                        self.number.push(character);
-                        self.held.push(character);
-                    } else if character == ';' {
-                        match Self::osc_is_removed(&self.number) {
-                            Some(kind) => {
-                                self.phase = Phase::RemovedString;
-                                self.removing = kind;
+                Phase::Osc => match character {
+                    '\u{7}' => self.finish_osc("\u{7}", &mut out),
+                    ST => self.finish_osc("\u{9c}", &mut out),
+                    '\u{1b}' => self.phase = Phase::OscEscape,
+                    _ if is_cancel(character) => self.cancel(),
+                    _ => {
+                        if self.held.len() >= MAX_HELD_STRING {
+                            self.overlong = true;
+                        } else {
+                            self.held.push(character);
+                        }
+                    }
+                },
+                Phase::OscEscape => {
+                    if character == '\\' {
+                        self.finish_osc("\u{1b}\\", &mut out);
+                    } else {
+                        // An escape inside a string that is not its terminator abandons the string
+                        // and starts a new sequence. What follows is text the reader should see,
+                        // so the string ends here and is decided on as it stands.
+                        self.finish_osc("", &mut out);
+                        self.phase = Phase::Escape;
+                        // The character that followed the escape is this new sequence's, so it is
+                        // handled by the escape branch on the next pass.
+                        match character {
+                            ']' => {
+                                self.phase = Phase::Osc;
                                 self.held.clear();
+                                self.overlong = false;
                             }
-                            None => {
-                                self.phase = Phase::KeptString;
-                                out.push_str(&self.held);
+                            'P' => self.start_removed(DEVICE_CONTROL),
+                            '_' | '^' | 'X' => self.start_removed(OTHER_STRING),
+                            '\u{1b}' => self.phase = Phase::Escape,
+                            _ if is_cancel(character) => self.phase = Phase::Text,
+                            _ => {
+                                out.push('\u{1b}');
                                 out.push(character);
-                                self.held.clear();
+                                self.phase = Phase::Text;
                             }
                         }
-                    } else if is_cancel(character) {
-                        // The terminal abandons the sequence, and so does this.
-                        self.held.clear();
-                        self.phase = Phase::Text;
-                    } else {
-                        // An OSC with no number, or something that is not one: keep it as it is.
-                        self.phase = Phase::KeptString;
-                        out.push_str(&self.held);
-                        out.push(character);
-                        self.held.clear();
                     }
                 }
-                Phase::KeptString => {
-                    out.push(character);
-                    if character == '\u{7}' || is_cancel(character) {
-                        self.phase = Phase::Text;
-                    } else if character == '\u{1b}' {
-                        // Either the string terminator or a new sequence; either way the next
-                        // character decides, and both are rendering data here.
-                        self.phase = Phase::Escape;
-                        self.held.clear();
-                        self.held.push(character);
-                        out.pop();
-                    }
-                }
-                Phase::RemovedString => {
-                    if character == '\u{7}' {
+                Phase::Removed => match character {
+                    // A device-control string and its neighbours end at the string terminator and
+                    // at nothing else: a bell inside one is part of its payload.
+                    ST => {
                         self.note(self.removing);
                         self.phase = Phase::Text;
-                    } else if is_cancel(character) {
-                        // Cancelled: nothing was removed and nothing was replayed.
-                        self.phase = Phase::Text;
-                    } else if character == '\u{1b}' {
-                        self.held.clear();
-                        self.held.push(character);
-                        self.phase = Phase::RemovedTerminator;
                     }
-                }
-                Phase::RemovedTerminator => {
+                    '\u{1b}' => self.phase = Phase::RemovedEscape,
+                    _ if is_cancel(character) => self.phase = Phase::Text,
+                    _ => {}
+                },
+                Phase::RemovedEscape => {
                     if character == '\\' {
                         self.note(self.removing);
                         self.phase = Phase::Text;
-                        self.held.clear();
+                    } else if is_cancel(character) {
+                        self.phase = Phase::Text;
                     } else {
-                        // Still inside the removed payload: an escape that is not a terminator is
-                        // part of it.
-                        self.phase = Phase::RemovedString;
-                        self.held.clear();
+                        // The string is abandoned and a new sequence begins. The removal is
+                        // declared, and what follows is the reader's again.
+                        self.note(self.removing);
+                        match character {
+                            ']' => {
+                                self.phase = Phase::Osc;
+                                self.held.clear();
+                                self.overlong = false;
+                            }
+                            'P' => self.start_removed(DEVICE_CONTROL),
+                            '_' | '^' | 'X' => self.start_removed(OTHER_STRING),
+                            '\u{1b}' => self.phase = Phase::Escape,
+                            _ => {
+                                out.push('\u{1b}');
+                                out.push(character);
+                                self.phase = Phase::Text;
+                            }
+                        }
                     }
                 }
             }
@@ -359,13 +429,30 @@ impl Stripper {
         out
     }
 
+    fn start_removed(&mut self, kind: &'static str) {
+        self.phase = Phase::Removed;
+        self.removing = kind;
+        self.held.clear();
+        self.overlong = false;
+    }
+
     /// What the recording does not carry, once every frame has been folded in.
     ///
-    /// A sequence still open at the end of the recording is one the terminal never completed, so
-    /// what was held back is never replayed and is declared like any other removal.
+    /// A sequence still open at the end is one the terminal never completed. Nothing held back is
+    /// replayed, and the removal is declared like any other.
     fn finish(&mut self) -> Vec<Omission> {
-        if matches!(self.phase, Phase::RemovedString | Phase::RemovedTerminator) {
-            self.note(self.removing);
+        match self.phase {
+            Phase::Removed | Phase::RemovedEscape => self.note(self.removing),
+            Phase::Osc | Phase::OscEscape => {
+                let held = std::mem::take(&mut self.held);
+                let kind = if self.overlong {
+                    OTHER_STRING
+                } else {
+                    Self::osc_is_kept(&held).err().unwrap_or(OTHER_STRING)
+                };
+                self.note(kind);
+            }
+            Phase::Text | Phase::Escape => {}
         }
         self.removed
             .iter()
@@ -388,6 +475,8 @@ fn detail_of(kind: &str) -> &'static str {
     match kind {
         CLIPBOARD_WRITE => "a clipboard write recorded from the session",
         WORKING_DIRECTORY => "a working-directory report",
+        NOTIFICATION => "a notification the session raised",
+        TERMINAL_QUERY => "a question the terminal would have answered",
         DEVICE_CONTROL => "a device-control string",
         _ => "an application string a terminal would interpret",
     }
@@ -654,6 +743,252 @@ mod tests {
         .expect("a valid recording");
         assert!(!cast.body.contains("half"));
         assert_eq!(cast.omissions[0].kind, "clipboard_write");
+    }
+
+    /// Drives one string through the recogniser at every split point it has.
+    ///
+    /// A recording is frames, and a terminal does not restart at a frame boundary. A filter that
+    /// worked on whole sequences and not on split ones would pass a clipboard write through as
+    /// soon as the output happened to arrive in two pieces.
+    fn at_every_split(text: &str) -> Vec<(String, Vec<Omission>)> {
+        let indices: Vec<usize> = (0..=text.len())
+            .filter(|index| text.is_char_boundary(*index))
+            .collect();
+        indices
+            .iter()
+            .map(|split| {
+                let (left, right) = text.split_at(*split);
+                let cast = asciicast(
+                    dimensions(),
+                    1,
+                    "s-1",
+                    &[
+                        Frame {
+                            at_ms: 0,
+                            text: left.to_owned(),
+                        },
+                        Frame {
+                            at_ms: 1,
+                            text: right.to_owned(),
+                        },
+                    ],
+                    Vec::new(),
+                )
+                .expect("a valid recording");
+                // What a terminal would receive is the frames' text in order, whatever the split
+                // was, so that is what the assertions are about.
+                let replayed: String = cast
+                    .body
+                    .lines()
+                    .skip(1)
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter_map(|event| event[2].as_str().map(str::to_owned))
+                    .collect();
+                (replayed, cast.omissions)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_clipboard_write_is_removed_however_the_frames_fall() {
+        for (body, omissions) in at_every_split("before\u{1b}]52;c;c2VjcmV0\u{7}after") {
+            assert!(
+                !body.contains("c2VjcmV0"),
+                "a clipboard write reached the recording"
+            );
+            assert!(body.contains("before"), "text before it was lost");
+            assert!(body.contains("after"), "text after it was lost");
+            assert_eq!(omissions[0].kind, "clipboard_write");
+        }
+    }
+
+    #[test]
+    fn a_selector_written_with_a_leading_zero_is_the_same_selector() {
+        for (body, omissions) in at_every_split("a\u{1b}]052;c;c2VjcmV0\u{1b}\\b") {
+            assert!(!body.contains("c2VjcmV0"), "052 is 52");
+            assert_eq!(omissions[0].kind, "clipboard_write");
+            assert!(body.contains("ab"));
+        }
+    }
+
+    #[test]
+    fn an_abandoned_escape_does_not_smuggle_a_clipboard_write_past_the_filter() {
+        // A terminal treats the second escape as the start of a new sequence, so this is one
+        // clipboard write with a discarded escape in front of it.
+        for (body, omissions) in at_every_split("a\u{1b}\u{1b}]52;c;c2VjcmV0\u{7}b") {
+            assert!(!body.contains("c2VjcmV0"));
+            assert_eq!(omissions[0].kind, "clipboard_write");
+        }
+    }
+
+    #[test]
+    fn a_bell_inside_a_device_control_string_is_payload_rather_than_its_end() {
+        let cast = asciicast(
+            dimensions(),
+            1,
+            "s-1",
+            &[Frame {
+                at_ms: 0,
+                text: "x\u{1b}P+q\u{7}still inside\u{1b}\\y".into(),
+            }],
+            Vec::new(),
+        )
+        .expect("a valid recording");
+        assert!(
+            !cast.body.contains("still inside"),
+            "a device-control string ends at the string terminator and nothing else"
+        );
+        assert!(cast.body.contains("xy"));
+        assert_eq!(cast.omissions[0].kind, "device_control_string");
+    }
+
+    #[test]
+    fn a_colour_query_is_removed_because_the_terminal_would_answer_it() {
+        let cast = asciicast(
+            dimensions(),
+            1,
+            "s-1",
+            &[Frame {
+                at_ms: 0,
+                text: "\u{1b}]4;1;?\u{7}done".into(),
+            }],
+            Vec::new(),
+        )
+        .expect("a valid recording");
+        assert!(!cast.body.contains("4;1;?"));
+        assert_eq!(cast.omissions[0].kind, "terminal_query");
+        assert!(cast.body.contains("done"));
+    }
+
+    #[test]
+    fn a_colour_that_is_set_rather_than_asked_about_survives() {
+        let cast = asciicast(
+            dimensions(),
+            1,
+            "s-1",
+            &[Frame {
+                at_ms: 0,
+                text: "\u{1b}]4;1;rgb:ff/00/00\u{7}done".into(),
+            }],
+            Vec::new(),
+        )
+        .expect("a valid recording");
+        assert!(cast.body.contains("rgb:ff/00/00"));
+        assert!(cast.omissions.is_empty());
+    }
+
+    #[test]
+    fn an_escape_inside_a_removed_string_gives_the_reader_what_follows_it() {
+        let cast = asciicast(
+            dimensions(),
+            1,
+            "s-1",
+            &[Frame {
+                at_ms: 0,
+                text: "\u{1b}]52;x\u{1b}[31mRED".into(),
+            }],
+            Vec::new(),
+        )
+        .expect("a valid recording");
+        assert!(
+            cast.body.contains("[31m"),
+            "the colour change is the reader's"
+        );
+        assert!(cast.body.contains("RED"));
+        assert_eq!(cast.omissions[0].kind, "clipboard_write");
+    }
+
+    #[test]
+    fn a_notification_is_not_raised_on_the_machine_that_plays_the_recording() {
+        for selector in ["9", "99", "777"] {
+            let cast = asciicast(
+                dimensions(),
+                1,
+                "s-1",
+                &[Frame {
+                    at_ms: 0,
+                    text: format!("\u{1b}]{selector};build finished\u{7}ok"),
+                }],
+                Vec::new(),
+            )
+            .expect("a valid recording");
+            assert!(
+                !cast.body.contains("build finished"),
+                "{selector} was replayed"
+            );
+            assert!(cast.body.contains("ok"));
+        }
+    }
+
+    #[test]
+    fn the_eight_bit_introducer_is_the_same_introducer() {
+        let cast = asciicast(
+            dimensions(),
+            1,
+            "s-1",
+            &[Frame {
+                at_ms: 0,
+                text: "a\u{9d}52;c;c2VjcmV0\u{9c}b".into(),
+            }],
+            Vec::new(),
+        )
+        .expect("a valid recording");
+        assert!(!cast.body.contains("c2VjcmV0"));
+        assert_eq!(cast.omissions[0].kind, "clipboard_write");
+    }
+
+    #[test]
+    fn an_extension_nobody_here_knows_is_not_assumed_to_be_safe() {
+        let cast = asciicast(
+            dimensions(),
+            1,
+            "s-1",
+            &[Frame {
+                at_ms: 0,
+                text: "\u{1b}]1337;File=inline=1:AAAA\u{7}after".into(),
+            }],
+            Vec::new(),
+        )
+        .expect("a valid recording");
+        assert!(!cast.body.contains("1337"));
+        assert!(cast.body.contains("after"));
+        assert_eq!(cast.omissions[0].kind, "application_string");
+    }
+
+    #[test]
+    fn a_string_longer_than_the_bound_is_removed_rather_than_held() {
+        let payload = "a".repeat(MAX_HELD_STRING + 64);
+        let cast = asciicast(
+            dimensions(),
+            1,
+            "s-1",
+            &[Frame {
+                at_ms: 0,
+                text: format!("\u{1b}]0;{payload}\u{7}after"),
+            }],
+            Vec::new(),
+        )
+        .expect("a valid recording");
+        assert!(!cast.body.contains(&payload));
+        assert!(cast.body.contains("after"));
+        assert_eq!(cast.omissions[0].kind, "application_string");
+    }
+
+    #[test]
+    fn a_cancel_after_an_escape_inside_a_removed_string_still_cancels() {
+        let cast = asciicast(
+            dimensions(),
+            1,
+            "s-1",
+            &[Frame {
+                at_ms: 0,
+                text: "\u{1b}]52;c;partial\u{1b}\u{18}kept text".into(),
+            }],
+            Vec::new(),
+        )
+        .expect("a valid recording");
+        assert!(cast.body.contains("kept text"));
+        assert!(!cast.body.contains("partial"));
     }
 
     #[test]

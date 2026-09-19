@@ -38,7 +38,7 @@ interface AppValue {
   readonly place: Place
   readonly go: (place: Place) => void
   readonly toast: ToastMessage | null
-  readonly say: (text: string, tone?: 'success' | 'danger') => void
+  readonly say: (text: string, tone?: 'success' | 'danger' | 'pending') => void
   readonly dismissToast: () => void
   /** The open session tabs, in the order the person opened them. */
   readonly tabs: readonly string[]
@@ -65,7 +65,7 @@ export function AppProvider({
   // every render, and every session's state would go with the old one.
   const [sessions] = useState(() => new SessionStates())
 
-  const say = useCallback((text: string, tone: 'success' | 'danger' = 'success') => {
+  const say = useCallback((text: string, tone: 'success' | 'danger' | 'pending' = 'success') => {
     setToast({ id: Date.now() + Math.random(), text, tone })
   }, [])
 

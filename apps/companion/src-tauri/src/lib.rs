@@ -68,34 +68,33 @@ pub fn run() {
 ///
 /// The bytes never reach the page: the platform gives this process a path, the backend remembers
 /// it, and the page is told the name so it can show what was dropped. An upload spends one of
-/// these; a path the page names on its own was never dropped and is refused.
+/// these, and a path the page names on its own was never dropped.
+///
+/// This reads the window's own event rather than the application's event bus. The bus carries an
+/// event of the same name to the page, and the page can emit on it: a backend that took its
+/// authority from the bus would let the page name any file it liked and have it read. The
+/// window's callback comes from the platform and nothing in the page can produce it.
 fn watch_drops(app: &tauri::AppHandle) {
-    use tauri::{Emitter as _, Listener as _, Manager as _};
+    use tauri::{Emitter as _, Manager as _};
 
-    let handle = app.clone();
-    // The platform's own event, in the window rather than in the page: the page is told the names
-    // afterwards, and the paths themselves stay here.
-    app.listen_any(PLATFORM_DRAG_DROP_EVENT, move |event| {
-        let Ok(payload) = serde_json::from_str::<DroppedPaths>(event.payload()) else {
-            return;
-        };
-        if payload.paths.is_empty() {
-            return;
-        }
-        let paths: Vec<std::path::PathBuf> =
-            payload.paths.iter().map(std::path::PathBuf::from).collect();
-        handle.state::<AppState>().dropped(paths);
-        let _ = handle.emit(DROPPED_EVENT, payload.paths);
-    });
-}
-
-/// The event the platform publishes when something is dropped on the window.
-const PLATFORM_DRAG_DROP_EVENT: &str = "tauri://drag-drop";
-
-/// What that event carries.
-#[derive(serde::Deserialize)]
-struct DroppedPaths {
-    paths: Vec<String>,
+    for (_, window) in app.webview_windows() {
+        let handle = app.clone();
+        window.on_window_event(move |event| {
+            let tauri::WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event
+            else {
+                return;
+            };
+            if paths.is_empty() {
+                return;
+            }
+            handle.state::<AppState>().dropped(paths.clone());
+            let named: Vec<String> = paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect();
+            let _ = handle.emit(DROPPED_EVENT, named);
+        });
+    }
 }
 
 /// The event the backend publishes the paths of dropped files on.

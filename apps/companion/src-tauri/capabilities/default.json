@@ -1,11 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "What the bundled interface may reach: this application's own named commands, the window it is drawn in, the events it listens for, and one save dialog. There is no shell, no general filesystem path and no general HTTP.",
+  "description": "What the bundled interface may reach: this application's own named commands, the window it is drawn in, the events it listens for, and one save dialog. Nothing here is a shell, a filesystem path or a general HTTP request, and the page may listen for events without being able to emit one: an event it could emit is an event it could use to tell the backend something happened that did not.",
   "windows": ["main"],
   "local": true,
   "permissions": [
-    "core:default",
     "core:event:allow-listen",
     "core:event:allow-unlisten",
     "core:window:allow-start-dragging",

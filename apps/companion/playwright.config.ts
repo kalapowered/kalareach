@@ -25,7 +25,7 @@ export default defineConfig({
     { name: 'webkit', use: { ...devices['Desktop Safari'] } }
   ],
   webServer: {
-    command: 'pnpm exec vite preview --outDir dist-harness --port 4188 --strictPort',
+    command: 'node scripts/preview-harness.mjs',
     url: 'http://localhost:4188/harness.html',
     reuseExistingServer: !process.env.CI,
     timeout: 60_000

@@ -69,7 +69,8 @@ import {
   reconnectBanner,
   sent,
   settled,
-  stateOfReceipt
+  stateOfReceipt,
+  wasRefused
 } from '../model/receipts'
 import type { LaunchSurface } from '../model/pending'
 
@@ -131,6 +132,27 @@ export function Conversation({
     [update]
   )
 
+  /**
+   * Gives a refused submission's text back to the person who wrote it.
+   *
+   * The composer may already hold something else by the time a refusal arrives, and overwriting it
+   * would lose that instead. So the text goes back when the composer is empty, and when it is not
+   * it is offered: the submission keeps its text either way, and nothing the person wrote is gone.
+   */
+  const returnRefusedText = useCallback(
+    (localId: string) => {
+      update((current) => {
+        const refused = current.submissions.find(
+          (submission) => submission.localId === localId
+        )
+        if (!refused || refused.text.length === 0) return current
+        if (current.draft.text.length > 0) return current
+        return { ...current, draft: edit(current.draft, refused.text, Date.now()) }
+      })
+    },
+    [update]
+  )
+
   useEffect(() => {
     let cancelled = false
     port
@@ -178,19 +200,23 @@ export function Conversation({
         batcher.push(body.node)
       }
       if (body.kind === 'receipt' && body.receipt) {
-        const receipt = body.receipt as { action_id: string }
+        const receipt = body.receipt as Parameters<typeof settled>[1]
+        let refused: string | null = null
         update((current) => ({
           ...current,
-          submissions: current.submissions.map((submission) =>
-            submission.actionId === receipt.action_id
-              ? settled(submission, body.receipt as Parameters<typeof settled>[1])
-              : submission
-          )
+          submissions: current.submissions.map((submission) => {
+            if (submission.actionId !== receipt.action_id) return submission
+            const next = settled(submission, receipt)
+            if (wasRefused(next.state)) refused = next.localId
+            return next
+          })
         }))
+        // A refusal that arrives later is the same refusal: the text comes back then too.
+        if (refused) returnRefusedText(refused)
       }
     })
     return stop
-  }, [port, batcher, sessionId, update])
+  }, [port, batcher, sessionId, update, returnRefusedText])
 
   const controlState: ControlState = useMemo(() => {
     const present = new Set(state.conversation.nodes.map((node) => node.id))
@@ -201,7 +227,7 @@ export function Conversation({
     (action: ComposerAction) => {
       const typed = state.draft.text
       const label = typed.trim() || action
-      const local = queued(`s-${Date.now()}-${Math.random()}`, label, Date.now())
+      const local = queued(`s-${Date.now()}-${Math.random()}`, label, Date.now(), typed)
       const clears = action === 'submit' || action === 'queue'
 
       // Local feedback first: the entry appears as queued and the composer clears. The completion
@@ -233,18 +259,11 @@ export function Conversation({
                 ? sent(submission, result.action_id)
                 : submission
               return result.receipt ? settled(identified, result.receipt) : identified
-            }),
-            // A refused or rejected submission gives the text back, exactly as a transport failure
-            // does. What the host said no to is still what the person wrote.
-            draft:
-              clears &&
-              (outcome === 'refused' || outcome === 'rejected') &&
-              current.draft.text.length === 0
-                ? edit(current.draft, typed, Date.now())
-                : current.draft
+            })
           }))
-          if (outcome === 'refused' || outcome === 'rejected') {
-            say('The host did not take that. It is back in the composer.', 'danger')
+          if (wasRefused(outcome)) {
+            returnRefusedText(local.localId)
+            say('The host did not take that. It is kept here.', 'danger')
           }
           if (outcome === 'unknown') {
             say('The host could not confirm what became of that.', 'danger')
@@ -258,18 +277,13 @@ export function Conversation({
               submission.localId === local.localId
                 ? failed(submission, { code, message: failureMessage(error) })
                 : submission
-            ),
-            // A refused submission gives the text back. Losing what someone wrote because the host
-            // said no is the one outcome a composer must never have.
-            draft:
-              clears && current.draft.text.length === 0
-                ? edit(current.draft, typed, Date.now())
-                : current.draft
+            )
           }))
+          returnRefusedText(local.localId)
           say(failureMessage(error), 'danger')
         })
     },
-    [port, sessionId, subject, state.draft.text, update, say]
+    [port, sessionId, subject, state.draft.text, update, say, returnRefusedText]
   )
 
   /**
@@ -600,11 +614,16 @@ export function outcomeMessage(done: string, receipt: { state?: string } | null)
   }
 }
 
-/** Whether an outcome reads as a failure. */
-export function receiptTone(receipt: { state?: string } | null): 'success' | 'danger' {
-  return receipt && ['refused', 'rejected', 'unknown'].includes(receipt.state ?? '')
-    ? 'danger'
-    : 'success'
+/**
+ * How an outcome reads.
+ *
+ * Only an applied receipt is completion. Anything still with the host is pending, and a pending
+ * outcome wearing a completion mark is the same false claim in a different shape.
+ */
+export function receiptTone(receipt: { state?: string } | null): 'success' | 'danger' | 'pending' {
+  if (!receipt) return 'pending'
+  if (['refused', 'rejected', 'unknown'].includes(receipt.state ?? '')) return 'danger'
+  return receipt.state === 'applied' ? 'success' : 'pending'
 }
 
 /** Whether the view is at the live end, which is what makes it follow. */

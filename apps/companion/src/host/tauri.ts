@@ -102,8 +102,14 @@ export function tauriPort(): HostPort {
 
     draftCreate: (params, subject) => mutate<Settled>('draft_create', params, subject),
     draftUpdate: (params, subject) => mutate<Settled>('draft_update', params, subject),
+    // The upload belongs to the same session the subject names; sending the subject without it
+    // would reserve the transfer against no session while the action targeted one.
     attachmentUpload: (path, subject) =>
-      call<AttachmentHandle>('attachment_upload', { path, subject }),
+      call<AttachmentHandle>('attachment_upload', {
+        path,
+        subject,
+        sessionId: subject.sessionId ?? null
+      }),
     draftAddAttachment: (params, subject) =>
       mutate<Settled>('draft_add_attachment', params, subject),
     attachmentImage: (params) =>

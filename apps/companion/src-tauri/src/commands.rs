@@ -365,17 +365,20 @@ mutate_command!(
     draft_add_attachment, Method::AgentDraftAddAttachment,
     kr_protocol::transfer::AgentDraftAddAttachmentParams
 );
-mutate_command!(
+read_command!(
     /// Begins reading an image through its validated attachment handle.
     ///
     /// This is the only way an image from a session reaches the page. A renderer that followed a
     /// URL out of agent text would be fetching whatever that text named; a handle names bytes the
-    /// host verified.
-    attachment_image, Method::DownloadBegin, kr_protocol::transfer::DownloadBeginParams
+    /// host verified. The registry marks it a read, so it is one: a mutation of a read method is
+    /// refused by the session before it reaches the host.
+    attachment_image, Method::DownloadBegin,
+    kr_protocol::transfer::DownloadBeginParams => kr_protocol::transfer::DownloadBeginResult
 );
-mutate_command!(
-    /// Reads one chunk of an image the handle named.
-    attachment_image_chunk, Method::DownloadChunk, kr_protocol::transfer::DownloadChunkParams
+read_command!(
+    /// Reads one chunk of the source the handle named.
+    attachment_image_chunk, Method::DownloadChunk,
+    kr_protocol::transfer::DownloadChunkParams => kr_protocol::transfer::DownloadChunkResult
 );
 mutate_command!(
     /// Answers a question.

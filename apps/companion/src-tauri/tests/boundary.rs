@@ -161,6 +161,20 @@ fn the_capabilities_grant_no_shell_no_filesystem_and_no_general_http() {
         );
     }
     assert!(
+        !granted.iter().any(|name| name == "core:default"),
+        "the core default set includes emitting events, which is more than the interface needs"
+    );
+    assert!(
+        !granted
+            .iter()
+            .any(|name| name.starts_with("core:event:allow-emit")),
+        "an event the page can emit is an event it can use to tell the backend something happened"
+    );
+    assert!(
+        granted.iter().any(|name| name == "core:event:allow-listen"),
+        "the interface listens for the host's events"
+    );
+    assert!(
         granted.iter().any(|name| name == "dialog:allow-save"),
         "an export needs the platform's own save dialog"
     );

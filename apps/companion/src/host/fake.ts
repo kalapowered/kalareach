@@ -100,6 +100,10 @@ function receipt(actionId: string, state: Receipt['state'], method: string): Rec
 }
 
 let actionCounter = 0
+
+/** The action identifiers this host has issued, so a test can name one in a later receipt. */
+const issuedActions: string[] = []
+
 /**
  * One settled answer whose receipt and identity agree.
  *
@@ -117,7 +121,9 @@ function settledAs(method: string, state: Receipt['state']): {
 
 function nextActionId(): string {
   actionCounter += 1
-  return `00000000-0000-4000-8000-${String(actionCounter).padStart(12, '0')}`
+  const actionId = `00000000-0000-4000-8000-${String(actionCounter).padStart(12, '0')}`
+  issuedActions.push(actionId)
+  return actionId
 }
 
 /** What the fake host can be told to do before a test drives the interface. */
@@ -140,6 +146,8 @@ export interface FakeHostControls {
   readonly importedImages: string[]
   /** The files the interface sent to the host, in order. */
   readonly uploaded: string[]
+  /** The action identifiers this host has issued, in order. */
+  readonly actions: string[]
 }
 
 /** The fake host, and the controls a test drives it with. */
@@ -567,7 +575,8 @@ export function fakeHost(): { port: HostPort; controls: FakeHostControls } {
     savedExports,
     openedLinks,
     importedImages,
-    uploaded
+    uploaded,
+    actions: issuedActions
   }
 
   return { port, controls }

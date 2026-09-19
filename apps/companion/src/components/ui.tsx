@@ -334,7 +334,7 @@ export function Banner({
 export interface ToastMessage {
   readonly id: number
   readonly text: string
-  readonly tone: 'success' | 'danger'
+  readonly tone: 'success' | 'danger' | 'pending'
 }
 
 /** Shows the newest message, and takes it away. */
@@ -356,8 +356,17 @@ export function Toast({
   if (!message) return null
   return (
     <div className="toast" role="status" aria-live="polite" key={message.id}>
-      <span className={message.tone === 'danger' ? 'danger-text' : 'success-text'} aria-hidden="true">
-        {message.tone === 'danger' ? '!' : '✓'}
+      <span
+        className={
+          message.tone === 'danger'
+            ? 'danger-text'
+            : message.tone === 'pending'
+              ? 'faint'
+              : 'success-text'
+        }
+        aria-hidden="true"
+      >
+        {message.tone === 'danger' ? '!' : message.tone === 'pending' ? '…' : '✓'}
       </span>
       <span>{message.text}</span>
       <IconButton label="Dismiss" onClick={onDismiss}>
