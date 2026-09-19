@@ -89,6 +89,12 @@ pub enum FlushPolicy {
 }
 
 /// Returns what one kind of write is allowed to wait for.
+///
+/// This is the policy section 24 states, held where it can be read and tested. It is not
+/// instrumentation of the store: nothing consults it on the write path, because the store's own
+/// durability settings are what carry a transaction. Section 24 permits safe grouped commits to
+/// share a flush, and what this names is which writes may not be grouped with work nobody is
+/// waiting on.
 #[must_use]
 pub const fn flush_policy(write: WriteKind) -> FlushPolicy {
     match write {

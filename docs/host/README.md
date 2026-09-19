@@ -1000,8 +1000,11 @@ again. Only the retained output and the host events an attachment never saw are 
 ### What waits for a flush, and what never does
 
 Three commit points wait: the intent before the acknowledgement, the dispatch marker before the
-effect, and the outcome with its receipt revision, its event and its outbox record. Nothing else
-does. Section 24 forbids a per-keystroke, per-output-byte or ordinary prompt and command telemetry
+effect, and the outcome with its receipt revision, its event and its outbox record. Those three
+are the ones something else is waiting on, so they are never grouped. Other durable writes - a
+closure record, the privacy generation, a session summary - are ordinary transactions on the same
+store, and the store's own durability settings are what carry them; they are not a fourth commit
+point and nothing is held for them. Section 24 forbids a per-keystroke, per-output-byte or ordinary prompt and command telemetry
 event from waiting for an fsync, and this host goes further with the first two: a keystroke and an
 output byte write no durable row at all. The live parser is in worker memory and the retained
 output is a bounded indexed spool.
@@ -1079,9 +1082,11 @@ maintenance tick, from a reading of the environment's whole spool directory, so 
 writing at once can take the host past it until the next tick. Neither bound is a reservation and
 neither is enforced ahead of the write.
 
-Eviction is never quiet. Every pass records the cursor range it took and the bound that took it,
-and a reader asking for a cursor inside that range is told both: `history.page` returns the range
-as a gap with a cause. A spool that has evicted everything writes down where its output got to
+Eviction is never quiet. A retention pass records the cursor range it took and the bound that took
+it, and a reader asking for a cursor inside that range is told both: `history.page` returns the
+range as a gap with a cause. The spool's own capacity is the exception: when an append rotates
+past the session cap the oldest segment goes with it, and that drop carries no recorded cause, so
+the range reads as a gap without one until a retention pass records the bound it was over. A spool that has evicted everything writes down where its output got to
 before it deletes what supports that, so a session reopened over an empty directory continues its
 cursor and reports the range that went rather than starting again at nought.
 
@@ -1114,9 +1119,10 @@ way round because the answer can be *no*: a daemon that fenced before it asked w
 working session's socket on the way to finding out that it was working. A query the platform
 declines is not death either, and the archive leaves the session alone.
 
-The removal is best effort and the answer says which halves went. What makes the stores safe to
-open is the death this host confirmed, not the socket file: a worker the kernel says has ended
-cannot answer a socket whether or not the file is still on disk.
+The removal is best effort, and the answer is one value: whether either half went. It does not
+say which. What makes the stores safe to open is the death this host confirmed, not the socket
+file: a worker the kernel says has ended cannot answer a socket whether or not the file is still
+on disk.
 
 A read of a closed session asks the same question first. A session this daemon has verified is
 refused with the endpoint to ask; so is one whose registry record names a process the kernel still
