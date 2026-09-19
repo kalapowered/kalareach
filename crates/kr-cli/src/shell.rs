@@ -144,10 +144,16 @@ pub fn install(
     nsh_bypass: bool,
     dry_run: bool,
 ) -> Result<ShellReport> {
-    let body = startup::entry(package.kind(), &package.startup_entry(), nsh_bypass);
+    let targets = layout.targets(package.kind());
     let mut reported = report(package, layout);
     for entry in &mut reported.entries {
         let path = std::path::Path::new(&entry.path);
+        // The entry each file gets is the entry for that file: `.profile` is read by shells that
+        // are not this one, and its entry says so.
+        let Some(target) = targets.iter().find(|target| target.path == path) else {
+            continue;
+        };
+        let body = startup::entry(target, &package.startup_entry(), nsh_bypass);
         let change = if dry_run {
             if startup::installed(path) {
                 Change::Unchanged
@@ -367,7 +373,7 @@ mod tests {
         let zshrc = home.path().join(".zshrc");
         std::fs::write(&zshrc, theirs).expect("writes");
         let body = startup::entry(
-            ShellKind::Zsh,
+            &layout.targets(ShellKind::Zsh)[0],
             std::path::Path::new("/gone/entry.zsh"),
             false,
         );

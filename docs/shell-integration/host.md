@@ -234,7 +234,7 @@ and mode, and where each guarded entry goes and whether it is there. It writes n
 | Shell | Where |
 | --- | --- |
 | Zsh | `.zshrc` inside the configured `ZDOTDIR` when there is one |
-| Bash | `.bashrc`, plus the first login file this user has when it does not already source `.bashrc` |
+| Bash | `.bashrc`, plus the one login file Bash reads |
 | Fish | a guarded `conf.d` entry; it loads before `config.fish` and its own activation is deferred until after it |
 | PowerShell | the profile that PowerShell itself names, added to rather than replaced |
 
@@ -244,15 +244,6 @@ integration's logic is copied into the user's configuration, so upgrading the pa
 runs without rewriting anything they own. Nothing replaces `.bashrc`, points a shell at another
 `ZDOTDIR`, substitutes an `--rcfile` or disables a profile.
 
-Whether a Bash login file already sources `.bashrc` is read from the file as commands rather than
-as text: a here-document's body, a comment, a quoted message and a word inside a substitution are
-not commands. A call this host cannot see the login shell itself make reads as one that is not
-there, and costs one more guarded entry, which is idempotent: that is the direction that leaves a
-login shell integrated either way. `. ~/.bashrc` behind a `;`, a `&&` or a `then` is read as a
-call, and so is the usual `[ -f ~/.bashrc ] && . ~/.bashrc`, because an installation has already
-made that test true. A call behind any other condition, in a loop or function body, in a pipeline,
-in the background or in a subshell is not.
-
 PowerShell's profile path differs by edition, by platform and by whether the user's Documents
 directory is redirected, so it is not derived: the shell this host would launch is asked for
 `$PROFILE.CurrentUserCurrentHost`, with a deadline, and a host where no PowerShell answers has no
@@ -261,6 +252,19 @@ profile to add an entry to rather than one this host guessed.
 `kr shell install --nsh-bypass` adds the documented session-local bypass for a known auto-wrapper:
 `NSH_NO_WRAP=1`, set only where the worker exported the bridge, which is a KalaReach-created shell.
 It changes no other setting of that tool and affects no ordinary terminal.
+
+Nothing decides where an entry goes by reading what is inside a startup file. A login Bash reads
+exactly one of `.bash_profile`, `.bash_login` and `.profile`, and the entry goes in the first of
+those that exists, or in `.bash_profile` when none does. Whether that file happens to run `.bashrc`
+is not asked: reading a person's shell text without a shell is guesswork, and a guess that goes the
+wrong way leaves a login shell with no integration at all. The two entries share one guard
+instead, `KR_SHELL_ENTRY`, so a shell that reads both of them sources the package once. The guard
+is not exported, so a shell started inside that one loads the integration of its own. The entry in
+`.profile` is written in the language `sh`, `dash` and `ksh` share and does nothing unless
+`BASH_VERSION` says Bash is the shell reading it.
+
+Whether the integration actually loaded is established at run time by the handshake, never by
+reading a file back.
 
 `kr shell remove` deletes exactly the marked entry. Everything the user wrote stays as they left it.
 

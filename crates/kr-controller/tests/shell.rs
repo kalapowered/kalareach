@@ -448,12 +448,12 @@ fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
     };
 
     for package in set.packages() {
-        let body = startup::entry(
-            package.kind(),
-            &package.startup_entry(),
-            package.kind() == ShellKind::Zsh,
-        );
         for target in layout.targets(package.kind()) {
+            let body = startup::entry(
+                &target,
+                &package.startup_entry(),
+                package.kind() == ShellKind::Zsh,
+            );
             assert_eq!(
                 startup::install(&target.path, &body).expect("installs"),
                 Change::Added
@@ -515,13 +515,19 @@ fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
 /// KR-REQ-07.41: the documented bypass for a known auto-wrapper, inside KalaReach shells only.
 #[test]
 fn a_known_auto_wrapper_gets_its_documented_session_local_bypass() {
-    let with = startup::entry(ShellKind::Zsh, Path::new("/opt/kr/entry"), true);
+    let target = kr_shell_integration::host::startup::StartupTarget {
+        kind: ShellKind::Zsh,
+        path: std::path::PathBuf::from("/home/someone/.zshrc"),
+        reason: "a test",
+        shared: false,
+    };
+    let with = startup::entry(&target, Path::new("/opt/kr/entry"), true);
     assert!(with.contains(startup::NSH_BYPASS_VARIABLE));
     assert!(
         with.contains("KR_SHELL_BRIDGE"),
         "the bypass is set only where the worker exported the bridge, which is a KR shell"
     );
-    let without = startup::entry(ShellKind::Zsh, Path::new("/opt/kr/entry"), false);
+    let without = startup::entry(&target, Path::new("/opt/kr/entry"), false);
     assert!(!without.contains(startup::NSH_BYPASS_VARIABLE));
     // And nothing else of that tool's configuration is touched: the entry names one variable.
     assert_eq!(with.matches("NSH_").count(), 1);

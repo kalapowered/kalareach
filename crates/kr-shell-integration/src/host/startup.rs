@@ -37,6 +37,12 @@ pub struct StartupTarget {
     pub path: PathBuf,
     /// Why this file rather than another, for the diagnostics setup prints.
     pub reason: &'static str,
+    /// Whether shells other than this one read the file.
+    ///
+    /// `.profile` is the one that is: `sh`, `dash` and `ksh` read it too, so the entry in it is
+    /// written in the language they all share and does nothing unless the shell reading it is the
+    /// one the entry is for.
+    pub shared: bool,
 }
 
 /// What a home directory looks like to setup.
@@ -104,21 +110,25 @@ impl HomeLayout {
                     .unwrap_or_else(|| self.home.clone())
                     .join(".zshrc"),
                 reason: "the interactive file this shell actually reads, inside ZDOTDIR when one is set",
+                shared: false,
             }],
             ShellKind::Bash => {
-                let mut targets = vec![StartupTarget {
-                    kind,
-                    path: self.home.join(".bashrc"),
-                    reason: "the file a non-login interactive Bash reads",
-                }];
-                if let Some(login) = self.bash_login_file() {
-                    targets.push(StartupTarget {
+                let login = self.bash_login_file();
+                let shared = login.file_name().is_some_and(|name| name == ".profile");
+                vec![
+                    StartupTarget {
+                        kind,
+                        path: self.home.join(".bashrc"),
+                        reason: "the file a non-login interactive Bash reads",
+                        shared: false,
+                    },
+                    StartupTarget {
                         kind,
                         path: login,
-                        reason: "the first login file this user has, which does not source .bashrc",
-                    });
-                }
-                targets
+                        reason: "the login file this user has, which a login Bash reads instead",
+                        shared,
+                    },
+                ]
             }
             ShellKind::Fish => vec![StartupTarget {
                 kind,
@@ -128,6 +138,7 @@ impl HomeLayout {
                     .unwrap_or_else(|| self.home.join(".config"))
                     .join("fish/conf.d/kalareach.fish"),
                 reason: "a guarded conf.d entry; it loads before config.fish and defers its own activation until after it",
+                shared: false,
             }],
             // PowerShell is the one shell whose profile path this host does not derive: where it
             // keeps a per-user profile depends on where the platform puts that user's documents,
@@ -141,6 +152,7 @@ impl HomeLayout {
                     path,
                     reason: "the profile this shell itself names, which this entry adds to rather \
                              than replaces",
+                    shared: false,
                 })
                 .into_iter()
                 .collect(),
@@ -176,27 +188,30 @@ impl HomeLayout {
         (!said.is_empty()).then(|| PathBuf::from(said))
     }
 
-    /// Returns the first login file this user has, when it does not already source `.bashrc`.
+    /// Returns the login file Bash reads for this user, which is the first of three that exists.
     ///
-    /// Bash reads exactly one of these for a login shell, in this order, and a file that already
-    /// sources `.bashrc` needs no entry of its own: the entry in `.bashrc` will run.
+    /// A login Bash reads exactly one of `.bash_profile`, `.bash_login` and `.profile`, in that
+    /// order, and `.bashrc` only if that file runs it. The entry goes in whichever one Bash will
+    /// read, and in none of the others, so that a person who rearranges their login files later
+    /// finds one entry rather than three.
     ///
-    /// What counts as sourcing it is a `source` or `.` of a path whose last component is
-    /// `.bashrc`, on a line that is not a comment. A file that merely mentions the name, in a
-    /// comment, in a message or in a variable that is never read, is not a file that runs it, and
-    /// treating it as one would leave a login shell with no entry at all.
-    fn bash_login_file(&self) -> Option<PathBuf> {
+    /// Whether that file happens to run `.bashrc` is not asked, and neither is anything else about
+    /// what is inside it. Reading a person's shell text without a shell is guesswork, and a guess
+    /// that goes the wrong way leaves a login shell with no integration at all; the two entries
+    /// share one guard instead, so the bridge loads once in a shell that reads both of them.
+    ///
+    /// Where none of the three is there, the entry goes in `.bash_profile`, which is the one Bash
+    /// looks for first.
+    fn bash_login_file(&self) -> PathBuf {
         for name in [".bash_profile", ".bash_login", ".profile"] {
             let path = self.home.join(name);
-            let Ok(contents) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            if runs_bashrc(&contents) {
-                return None;
+            // Its own metadata rather than the target's: a symbolic link to a file that is not
+            // there is still the file Bash finds and refuses to read past.
+            if std::fs::symlink_metadata(&path).is_ok() {
+                return path;
             }
-            return Some(path);
         }
-        None
+        self.home.join(".bash_profile")
     }
 }
 
@@ -311,525 +326,8 @@ fn powershell_on_path() -> Option<PathBuf> {
     })
 }
 
-/// Returns whether a login file runs `.bashrc`.
-///
-/// Reading shell text without a shell is a judgement, so the rule is which way to be wrong. A file
-/// this host wrongly thinks sources `.bashrc` gets no entry of its own, and a login shell then has
-/// no integration at all; a file it wrongly thinks does not gets one more marked entry, which is
-/// guarded, idempotent and removed by `kr shell remove`. The second is the harmless direction, so
-/// anything this cannot establish reads as "it does not".
-///
-/// The file is read as commands rather than as lines: a quoted newline and a backslash before one
-/// both carry a command on, and a here-document's body is text the shell passes on rather than
-/// commands it runs, so `cat <<EOF` … `source ~/.bashrc` … `EOF` is skipped. Everything a command
-/// could still hide the call behind, a substitution or an expansion this does not evaluate, reads
-/// as "it does not" and costs one guarded entry.
-///
-/// A call the shell reaches is a call in this shell: `. ~/.bashrc`, and the same behind a `;`, a
-/// `&&` or a `then`. What a login file writes the call behind is whether `.bashrc` is there,
-/// which an installation has already made true, so that one condition is read through. Any other
-/// condition is one this host cannot answer, and so are a `||`, a loop body that can run no times,
-/// a function body nothing here calls, a pipeline, a background `&` and a subshell: each of them
-/// either may not be reached or reaches a shell this host is not integrating, and each reads as
-/// "it does not".
-fn runs_bashrc(contents: &str) -> bool {
-    let mut rest = contents;
-    while !rest.is_empty() {
-        let command = read_command(rest);
-        rest = command.rest;
-        // The bodies follow the whole command, however many lines it took to write.
-        for document in &command.documents {
-            rest = skip_body(rest, document);
-        }
-        if sources(&command.words) {
-            return true;
-        }
-    }
-    false
-}
-
-/// One word of a command, and what the scanner knows about it.
-struct Word {
-    text: String,
-    /// Whether any of it was quoted, which makes it an argument rather than a verb.
-    quoted: bool,
-    /// Whether any of it was taken literally, by single quotes or a backslash.
-    ///
-    /// A path this host reads has to be the path the shell reads. `'$HOME/.bashrc'` names a
-    /// directory called `$HOME`, not the person's home, and nothing here expands anything, so a
-    /// word the shell takes literally is not read as a path at all.
-    literal: bool,
-    /// Whether it stands where a command name stands.
-    command_position: bool,
-    /// Whether a condition this host does not evaluate stands between the file and this command.
-    ///
-    /// `if` and `&&` both lead to a command that runs only when something else said so. The one
-    /// condition a login file is written with is whether `.bashrc` is there, and after an
-    /// installation it is; any other condition is one this host cannot answer, and a call it
-    /// cannot see made is a call it reads as not made.
-    conditional: bool,
-    /// Whether this host can see the command it belongs to being run by the shell it integrates.
-    ///
-    /// `&&`, `;` and a new line all lead to one. `||` leads to one only when what came before it
-    /// failed, a pipe and a background `&` lead to a shell of their own, and what is inside `( )`,
-    /// `$( )`, backticks or a group is either another shell or not a command at all.
-    plainly_run: bool,
-}
-
-/// One here-document a command opened, and how its body ends.
-struct HereDocument {
-    marker: String,
-    /// `<<-` strips leading tabs from the delimiter line, and nothing else does.
-    strip_tabs: bool,
-    /// Whether the delimiter was written without quoting, which is what leaves the body expanded
-    /// and a backslash at the end of a body line carrying on to the next.
-    expands: bool,
-}
-
-/// One command, the here-documents it opened and what follows it.
-struct Command<'a> {
-    words: Vec<Word>,
-    documents: Vec<HereDocument>,
-    rest: &'a str,
-}
-
-/// Reads one command from the front of a login file.
-fn read_command(text: &str) -> Command<'_> {
-    let characters: Vec<(usize, char)> = text.char_indices().collect();
-    let mut reading = Reading {
-        words: Vec::new(),
-        word: String::new(),
-        quoted: false,
-        literal: false,
-        started: false,
-    };
-    let mut documents = Vec::new();
-    // A command begins at the front and after every separator; everything else is an argument.
-    let mut command_position = true;
-    let mut next_command_position = true;
-    let mut plainly_run = true;
-    let mut conditional = false;
-    // Where the command being read began, because what follows it can change what this host can
-    // see of it: `. ~/.bashrc &` is read before the `&` that backgrounds it.
-    let mut began = 0usize;
-    let mut index = 0;
-    while index < characters.len() {
-        let character = characters[index].1;
-        match character {
-            // A backslash quotes whatever follows it. Before a newline it joins the two lines with
-            // nothing in between, which is how `source\` and `~/.bashrc` make one word.
-            '\\' => match characters.get(index + 1) {
-                Some((_, '\n')) => index += 2,
-                Some((_, following)) => {
-                    reading.word.push(*following);
-                    reading.quoted = true;
-                    reading.literal = true;
-                    reading.started = true;
-                    next_command_position = false;
-                    index += 2;
-                }
-                None => index += 1,
-            },
-            '\'' | '"' => {
-                let quote = character;
-                // `$'…'` takes backslash escapes, so the apostrophe in `$'it\'s'` does not end it.
-                let escapes = quote == '"' || reading.word.ends_with('$');
-                reading.quoted = true;
-                reading.literal |= quote == '\'';
-                reading.started = true;
-                // A word has begun, so the next one is an argument: `"echo" source ~/.bashrc`
-                // passes `source` to `echo`.
-                next_command_position = false;
-                index += 1;
-                while let Some((_, inside)) = characters.get(index) {
-                    if *inside == quote {
-                        index += 1;
-                        break;
-                    }
-                    if *inside == '\\' && escapes {
-                        match characters.get(index + 1) {
-                            Some((_, '\n')) => index += 2,
-                            Some((_, following)) => {
-                                reading.word.push(*following);
-                                reading.literal = true;
-                                index += 2;
-                            }
-                            None => index += 1,
-                        }
-                        continue;
-                    }
-                    reading.word.push(*inside);
-                    index += 1;
-                }
-            }
-            // A comment begins at a `#` that begins a word and runs to the end of its line.
-            '#' if !reading.started => {
-                while matches!(characters.get(index), Some((_, character)) if *character != '\n') {
-                    index += 1;
-                }
-            }
-            '\n' => {
-                index += 1;
-                break;
-            }
-            // A subshell, a substitution, arithmetic or array data. Whatever is inside is either
-            // not a command or a command another shell runs, and either way it is not a call this
-            // host can see the shell it integrates make, so all of it is taken as this word's.
-            '(' => {
-                index = skip_nested(&characters, index);
-                reading.started = true;
-                next_command_position = false;
-            }
-            '`' => {
-                index = skip_backticks(&characters, index);
-                reading.started = true;
-                next_command_position = false;
-            }
-            ';' | '&' | '|' => {
-                finish(&mut reading, command_position, plainly_run, conditional);
-                let pair = characters.get(index + 1).map(|(_, character)| *character);
-                // A single `&` backgrounds the command in front of it and a pipe puts it in a
-                // shell of its own, so what this host can see of that command changes here,
-                // after it has been read.
-                let elsewhere = match (character, pair) {
-                    ('&', Some('&')) => false,
-                    ('&' | '|', _) => true,
-                    _ => false,
-                };
-                if elsewhere {
-                    for word in &mut reading.words[began..] {
-                        word.plainly_run = false;
-                    }
-                }
-                // `&&` and `;` lead to a command this shell runs next. `||` leads to one only
-                // when what came before it failed, `|` and `|&` to one in a shell of their own,
-                // `&` to one in the background, and `;;` out of a `case` arm.
-                plainly_run = matches!((character, pair), (';', _) | ('&', Some('&')))
-                    && !matches!((character, pair), (';', Some(';')));
-                // `&&` and `||` both put a condition in front of what comes next.
-                conditional |= matches!((character, pair), ('&' | '|', Some('&' | '|')));
-                if matches!(
-                    (character, pair),
-                    (';', Some(';')) | ('&', Some('&')) | ('|', Some('|' | '&'))
-                ) {
-                    index += 1;
-                }
-                began = reading.words.len();
-                command_position = true;
-                next_command_position = true;
-                index += 1;
-            }
-            // A here-document. Its delimiter follows the redirection and its body follows the
-            // whole command, so only the delimiter is read here.
-            '<' if matches!(characters.get(index + 1), Some((_, '<'))) => {
-                finish(&mut reading, command_position, plainly_run, conditional);
-                index += 2;
-                // `<<<` is a here-string: its word is the input, and no body follows.
-                if matches!(characters.get(index), Some((_, '<'))) {
-                    index += 1;
-                    continue;
-                }
-                let strip_tabs = matches!(characters.get(index), Some((_, '-')));
-                if strip_tabs {
-                    index += 1;
-                }
-                while matches!(characters.get(index), Some((_, ' ' | '\t'))) {
-                    index += 1;
-                }
-                let (marker, expands, after) = marker_word(&characters, index);
-                index = after;
-                documents.push(HereDocument {
-                    marker,
-                    strip_tabs,
-                    expands,
-                });
-            }
-            character if character.is_whitespace() => {
-                finish(&mut reading, command_position, plainly_run, conditional);
-                command_position = next_command_position;
-                index += 1;
-            }
-            character => {
-                reading.word.push(character);
-                reading.started = true;
-                // A word this host reads as opening a condition puts everything after it behind
-                // one, whether or not the shell takes that branch.
-                if command_position
-                    && !reading.quoted
-                    && matches!(reading.word.as_str(), "if" | "elif")
-                {
-                    conditional = true;
-                }
-                next_command_position = false;
-                index += 1;
-            }
-        }
-    }
-    finish(&mut reading, command_position, plainly_run, conditional);
-    Command {
-        words: reading.words,
-        documents,
-        rest: characters.get(index).map_or("", |(at, _)| &text[*at..]),
-    }
-}
-
-/// Returns where the text a `(` opens ends, counting the ones inside it.
-fn skip_nested(characters: &[(usize, char)], from: usize) -> usize {
-    let mut index = from + 1;
-    let mut depth = 1usize;
-    while let Some((_, character)) = characters.get(index) {
-        match character {
-            '\\' => index += 2,
-            '\'' | '"' => {
-                let quote = *character;
-                index += 1;
-                while let Some((_, inside)) = characters.get(index) {
-                    if *inside == quote {
-                        index += 1;
-                        break;
-                    }
-                    index += if *inside == '\\' && quote == '"' {
-                        2
-                    } else {
-                        1
-                    };
-                }
-            }
-            '(' => {
-                depth += 1;
-                index += 1;
-            }
-            ')' => {
-                depth -= 1;
-                index += 1;
-                if depth == 0 {
-                    return index;
-                }
-            }
-            _ => index += 1,
-        }
-    }
-    index
-}
-
-/// Returns where the text a backtick opens ends.
-fn skip_backticks(characters: &[(usize, char)], from: usize) -> usize {
-    let mut index = from + 1;
-    while let Some((_, character)) = characters.get(index) {
-        match character {
-            '\\' => index += 2,
-            '`' => return index + 1,
-            _ => index += 1,
-        }
-    }
-    index
-}
-
-/// Ends the word being read, where one has begun.
-fn finish(reading: &mut Reading, command_position: bool, plainly_run: bool, conditional: bool) {
-    if !reading.started {
-        return;
-    }
-    reading.words.push(Word {
-        text: std::mem::take(&mut reading.word),
-        quoted: std::mem::take(&mut reading.quoted),
-        literal: std::mem::take(&mut reading.literal),
-        conditional,
-        command_position,
-        plainly_run,
-    });
-    reading.started = false;
-}
-
-/// The word being read and the words read so far.
-struct Reading {
-    words: Vec<Word>,
-    word: String,
-    quoted: bool,
-    literal: bool,
-    started: bool,
-}
-
-/// Reads one here-document's delimiter, which may be quoted, may hold spaces and may be empty.
-///
-/// Returns the delimiter, whether it was written without any quoting, and where it ends.
-fn marker_word(characters: &[(usize, char)], from: usize) -> (String, bool, usize) {
-    let mut marker = String::new();
-    let mut expands = true;
-    let mut index = from;
-    while let Some((_, character)) = characters.get(index) {
-        match character {
-            '\\' => {
-                expands = false;
-                match characters.get(index + 1) {
-                    Some((_, following)) => {
-                        marker.push(*following);
-                        index += 2;
-                    }
-                    None => index += 1,
-                }
-            }
-            '\'' | '"' => {
-                let quote = *character;
-                expands = false;
-                index += 1;
-                while let Some((_, inside)) = characters.get(index) {
-                    if *inside == quote {
-                        index += 1;
-                        break;
-                    }
-                    // Inside double quotes a backslash goes before the four characters it can
-                    // quote and stays anywhere else, so `<<"\$EOF"` ends at `$EOF`.
-                    if *inside == '\\' && quote == '"' {
-                        match characters.get(index + 1) {
-                            Some((_, following @ ('$' | '`' | '"' | '\\'))) => {
-                                marker.push(*following);
-                                index += 2;
-                            }
-                            Some((_, following)) => {
-                                marker.push('\\');
-                                marker.push(*following);
-                                index += 2;
-                            }
-                            None => index += 1,
-                        }
-                        continue;
-                    }
-                    marker.push(*inside);
-                    index += 1;
-                }
-            }
-            ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
-            character if character.is_whitespace() => break,
-            character => {
-                marker.push(*character);
-                index += 1;
-            }
-        }
-    }
-    (marker, expands, index)
-}
-
-/// Returns what follows one here-document's body.
-fn skip_body<'a>(text: &'a str, document: &HereDocument) -> &'a str {
-    let mut rest = text;
-    while !rest.is_empty() {
-        let (line, after) = match rest.find('\n') {
-            Some(at) => (rest[..at].to_owned(), &rest[at + 1..]),
-            None => (rest.to_owned(), ""),
-        };
-        let mut line = line;
-        let mut after = after;
-        // An unquoted delimiter leaves the body expanded, and there a backslash before the newline
-        // joins the two lines before the delimiter is looked for at all.
-        while document.expands && continues(&line) {
-            line.pop();
-            match after.find('\n') {
-                Some(at) => {
-                    line.push_str(&after[..at]);
-                    after = &after[at + 1..];
-                }
-                None => {
-                    line.push_str(after);
-                    after = "";
-                    break;
-                }
-            }
-        }
-        let ends = if document.strip_tabs {
-            line.trim_start_matches('\t') == document.marker
-        } else {
-            line == document.marker
-        };
-        rest = after;
-        if ends {
-            return rest;
-        }
-    }
-    ""
-}
-
-/// Returns whether a line carries on to the next one.
-fn continues(line: &str) -> bool {
-    // An odd number of trailing backslashes is a continuation; an even number is that many
-    // backslashes, each quoting the one before it.
-    line.chars().rev().take_while(|byte| *byte == '\\').count() % 2 == 1
-}
-
-/// Returns whether a word assigns a variable in front of a command, such as `LANG=C`.
-fn assigns(word: &str) -> bool {
-    let Some((name, _)) = word.split_once('=') else {
-        return false;
-    };
-    // `NAME+=value` appends, and is an assignment like any other.
-    let name = name.strip_suffix('+').unwrap_or(name);
-    let mut characters = name.chars();
-    characters
-        .next()
-        .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
-}
-
-/// Returns whether one command runs `.bashrc`.
-///
-/// The shape is a `source` or `.` command whose next word is a path ending in `.bashrc`, wherever
-/// in the command it stands: a login file writes it inside a test, after a `then`, behind a `&&`.
-/// A word that merely contains the name, in a message or in a variable nothing reads, is not a
-/// command that runs it, and treating it as one would leave a login shell with no entry.
-fn sources(words: &[Word]) -> bool {
-    // A word that stands where a command stands and introduces one leaves the next word standing
-    // there too: `if [ -f ~/.bashrc ]; then . ~/.bashrc; fi` sources it.
-    let mut at_command = true;
-    let mut verbs: Vec<usize> = Vec::new();
-    for (index, word) in words.iter().enumerate() {
-        let here = at_command || word.command_position;
-        // A keyword is only a keyword where a command stands and only unquoted: `echo if source
-        // ~/.bashrc` passes `if` to `echo`, and `"if"` is the word rather than the keyword.
-        //
-        // These five leave the next word standing where a command stands and lead to one this
-        // shell runs. `while`, `until`, `do` and a group's `{` lead to a body that may run no
-        // times, and a body is not what this reads.
-        let introduces = here
-            && !word.quoted
-            && matches!(word.text.as_str(), "if" | "then" | "else" | "elif" | "!");
-        // An assignment in front of a command is that command's environment rather than a command
-        // of its own: `LANG=C source ~/.bashrc` runs `source`.
-        let assignment = here && !word.quoted && assigns(&word.text);
-        if here && !word.quoted && !introduces && !assignment {
-            verbs.push(index);
-        }
-        at_command = introduces || assignment;
-    }
-    verbs.iter().any(|index| {
-        let verb = &words[*index];
-        if !verb.plainly_run || (verb.text != "source" && verb.text != ".") {
-            return false;
-        }
-        // A condition this host does not evaluate stands in front of it only where the condition
-        // is about `.bashrc` itself, which is the one a login file is written with and the one an
-        // installation has already made true.
-        if verb.conditional && !words[..*index].iter().any(names_bashrc) {
-            return false;
-        }
-        words.get(index + 1).is_some_and(|argument| {
-            // The word after it in this same command: `source; /missing/.bashrc` names no file to
-            // `source`, because the `;` ended that command before the path began.
-            !argument.command_position && names_bashrc(argument)
-        })
-    })
-}
-
-/// Returns whether a word names a path ending in `.bashrc`.
-fn names_bashrc(word: &Word) -> bool {
-    // Quoting that leaves `$HOME` or `~` standing leaves a path that names neither the home
-    // directory nor anything under it, and nothing here expands either one.
-    if word.literal || (word.quoted && word.text.starts_with('~')) {
-        return false;
-    }
-    std::path::Path::new(&word.text)
-        .file_name()
-        .is_some_and(|name| name == ".bashrc")
-}
+/// The variable one shell's entries share, so the integration loads once in each shell.
+pub const ENTRY_GUARD_VARIABLE: &str = "KR_SHELL_ENTRY";
 
 /// What one guarded entry contains.
 ///
@@ -837,7 +335,8 @@ fn names_bashrc(word: &Word) -> bool {
 /// copied into the user's configuration, so upgrading the package changes what runs without
 /// rewriting anything the user owns.
 #[must_use]
-pub fn entry(kind: ShellKind, package_entry: &Path, nsh_bypass: bool) -> String {
+pub fn entry(target: &StartupTarget, package_entry: &Path, nsh_bypass: bool) -> String {
+    let kind = target.kind;
     // The path is quoted for the shell that will read this file, by the same rules a launch is
     // quoted by. An installation directory with an apostrophe in it would otherwise end the string
     // and turn the rest of the path into shell syntax.
@@ -856,7 +355,23 @@ pub fn entry(kind: ShellKind, package_entry: &Path, nsh_bypass: bool) -> String 
                     "[ -n \"${{KR_SHELL_BRIDGE:-}}\" ] && export {NSH_BYPASS_VARIABLE}=1\n"
                 ));
             }
-            body.push_str(&format!("[ -r {path} ] && . {path}\n"));
+            // One shell can read two of these files: a login Bash reads its login file, and that
+            // file may run `.bashrc` as well. Both entries test and set the same variable, so the
+            // package is sourced once in that shell. It is not exported, so a shell started inside
+            // this one loads the integration of its own.
+            //
+            // `.profile` is read by shells that are not this one, so the entry there says which
+            // shell it is for and is written in the language they all share.
+            let guard = if target.shared {
+                format!(
+                    "[ -n \"${{BASH_VERSION:-}}\" ] && [ -z \"${{{ENTRY_GUARD_VARIABLE}:-}}\" ]"
+                )
+            } else {
+                format!("[ -z \"${{{ENTRY_GUARD_VARIABLE}:-}}\" ]")
+            };
+            body.push_str(&format!(
+                "if {guard} && [ -r {path} ]; then {ENTRY_GUARD_VARIABLE}=1; . {path}; fi\n"
+            ));
         }
         ShellKind::Fish => {
             if nsh_bypass {
@@ -1319,33 +834,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn bash_gets_a_login_entry_only_when_the_login_file_ignores_bashrc() {
-        let root = tempfile::tempdir().expect("a directory");
-        let home = layout(root.path());
-        // No login file at all.
-        assert_eq!(home.targets(ShellKind::Bash).len(), 1);
-        // One that already sources .bashrc needs nothing of its own.
-        std::fs::write(
-            root.path().join(".bash_profile"),
-            "[ -f ~/.bashrc ] && . ~/.bashrc\n",
-        )
-        .expect("writes");
-        assert_eq!(home.targets(ShellKind::Bash).len(), 1);
-        // One that does not.
-        std::fs::write(
-            root.path().join(".bash_profile"),
-            "export PATH=$PATH:/opt\n",
-        )
-        .expect("writes");
-        let targets = home.targets(ShellKind::Bash);
-        assert_eq!(targets.len(), 2);
-        assert_eq!(targets[0].path, root.path().join(".bashrc"));
-        assert_eq!(targets[1].path, root.path().join(".bash_profile"));
-    }
-
-    /// Login files that name `.bashrc` without running it.
-    const MENTIONS: &[&str] = &[
+    /// Login files this host used to read and no longer does. Every one of them gets an entry.
+    const LOGIN_FILES: &[&str] = &[
         "# this used to source ~/.bashrc; it does not any more\n",
         "echo 'see .bashrc for the aliases'\n",
         "BASHRC=~/.bashrc\n",
@@ -1414,8 +904,8 @@ mod tests {
         "source \"~/.bashrc\"\n",
     ];
 
-    /// Login files that run `.bashrc`.
-    const SOURCES: &[&str] = &[
+    /// The same, written the ways a login file that does run `.bashrc` is written.
+    const LOGIN_FILES_THAT_SOURCE: &[&str] = &[
         ". ~/.bashrc\n",
         "source ~/.bashrc\n",
         "[ -f ~/.bashrc ] && source \"$HOME/.bashrc\"\n",
@@ -1429,92 +919,128 @@ mod tests {
         "LANG=C source ~/.bashrc\n",
     ];
 
-    /// KR-REQ-07.30: only a login file that actually runs `.bashrc` counts as one that does.
+    /// KR-REQ-07.30: the entry goes in the login file, whatever is written in that file.
+    ///
+    /// The contents are every shape three reviews of the reader this replaced turned up, which is
+    /// the point: none of them is read any more, so none of them can decide anything.
     #[test]
-    fn a_login_file_that_only_mentions_bashrc_still_gets_its_own_entry() {
+    fn a_login_file_gets_an_entry_whatever_is_written_in_it() {
         let root = tempfile::tempdir().expect("a directory");
         let home = layout(root.path());
-        for mentions in MENTIONS {
-            std::fs::write(root.path().join(".bash_profile"), mentions).expect("writes");
+        for contents in LOGIN_FILES.iter().chain(LOGIN_FILES_THAT_SOURCE) {
+            std::fs::write(root.path().join(".bash_profile"), contents).expect("writes");
+            let targets = home.targets(ShellKind::Bash);
             assert_eq!(
-                home.targets(ShellKind::Bash).len(),
+                targets.len(),
                 2,
-                "a login file that names .bashrc without running it still needs an entry: \
-                 {mentions:?}"
+                "both files get an entry whatever the login file says: {contents:?}"
             );
-        }
-        for sources in SOURCES {
-            std::fs::write(root.path().join(".bash_profile"), sources).expect("writes");
-            assert_eq!(
-                home.targets(ShellKind::Bash).len(),
-                1,
-                "a login file that runs .bashrc needs no entry of its own: {sources:?}"
-            );
+            assert_eq!(targets[0].path, root.path().join(".bashrc"));
+            assert_eq!(targets[1].path, root.path().join(".bash_profile"));
+            assert!(!targets[1].shared);
         }
     }
 
-    /// KR-REQ-07.30: what this host reads as a call is one Bash itself makes.
-    ///
-    /// The scanner is allowed to miss a call, which costs one guarded entry nothing reads twice.
-    /// It is not allowed to see one that is not there, because that leaves a login shell with no
-    /// integration at all. That direction is checked against the shell rather than against this
-    /// host's reading of it.
+    /// KR-REQ-07.30: the entry goes in the one login file Bash reads, and in no other.
+    #[test]
+    fn the_login_entry_goes_in_the_file_bash_reads() {
+        let root = tempfile::tempdir().expect("a directory");
+        let home = layout(root.path());
+
+        // None of the three is there, so the entry goes where Bash looks first.
+        assert_eq!(
+            home.targets(ShellKind::Bash)[1].path,
+            root.path().join(".bash_profile")
+        );
+
+        // Bash reads exactly one of them, in this order, and so does this.
+        for (name, next) in [
+            (".profile", ".bash_login"),
+            (".bash_login", ".bash_profile"),
+            (".bash_profile", ".bash_profile"),
+        ] {
+            std::fs::write(root.path().join(name), "echo hello\n").expect("writes");
+            let targets = home.targets(ShellKind::Bash);
+            assert_eq!(targets[1].path, root.path().join(name), "{name} is first");
+            assert_eq!(
+                targets[1].shared,
+                name == ".profile",
+                "only .profile is read by shells that are not Bash"
+            );
+            let _ = next;
+        }
+    }
+
+    /// KR-REQ-07.16, KR-REQ-07.30: each shell loads the integration once, and a login shell that
+    /// also runs `.bashrc` still loads it once.
     #[cfg(unix)]
     #[test]
-    fn nothing_reads_as_a_call_bash_does_not_make() {
+    fn a_shell_loads_the_integration_exactly_once() {
         let bash = Path::new("/bin/bash");
         if !bash.exists() {
-            eprintln!("skipped: this host has no /bin/bash to compare the scanner against");
+            eprintln!("skipped: this host has no /bin/bash to start");
             return;
         }
-        for text in MENTIONS.iter().chain(SOURCES) {
-            let scanned = runs_bashrc(text);
-            if !scanned {
-                continue;
+        for login in [
+            "echo hello\n",
+            ". ~/.bashrc\n",
+            "[ -f ~/.bashrc ] && . ~/.bashrc\n",
+        ] {
+            let home = tempfile::Builder::new()
+                .prefix("kr-bash-home-")
+                .tempdir()
+                .expect("a home directory");
+            let loaded = home.path().join("loaded");
+            let package = home.path().join("entry.sh");
+            std::fs::write(&package, format!("printf x >> {}\n", loaded.display()))
+                .expect("writes the package's entry");
+            std::fs::write(home.path().join(".bashrc"), "").expect("writes .bashrc");
+            std::fs::write(home.path().join(".bash_profile"), login)
+                .expect("writes the login file");
+            let layout = HomeLayout {
+                home: home.path().to_path_buf(),
+                zdotdir: None,
+                xdg_config_home: None,
+                powershell: None,
+            };
+            for target in layout.targets(ShellKind::Bash) {
+                install(&target.path, &entry(&target, &package, false)).expect("installs");
             }
-            assert!(
-                bash_sources_bashrc(bash, text),
-                "this host reads a call Bash does not make, so a login shell would get no entry: \
-                 {text:?}"
+
+            // A login Bash: it reads the login file, and in two of these three that file runs
+            // `.bashrc` as well, so both entries run in the one shell.
+            assert_eq!(
+                loads(bash, home.path(), &["--login", "-c", ":"], &loaded),
+                1,
+                "a login shell loads it once: {login:?}"
+            );
+            // And an interactive Bash that is not a login shell, which reads `.bashrc` alone.
+            assert_eq!(
+                loads(bash, home.path(), &["-i", "-c", ":"], &loaded),
+                1,
+                "an interactive shell loads it once: {login:?}"
             );
         }
     }
 
-    /// Runs one login file under Bash with a home of its own and reports whether `.bashrc` ran.
+    /// Starts one Bash with a home of its own and returns how many times the package was sourced.
     #[cfg(unix)]
-    fn bash_sources_bashrc(bash: &Path, text: &str) -> bool {
-        let home = tempfile::Builder::new()
-            .prefix("kr-bash-home-")
-            .tempdir()
-            .expect("a home directory");
-        let ran = home.path().join("ran");
-        std::fs::write(
-            home.path().join(".bashrc"),
-            format!(": > {}\n", ran.display()),
-        )
-        .expect("writes a .bashrc");
-        let script = home.path().join("login");
-        // One case names an absolute path rather than the home directory, so that the scanner is
-        // read on both shapes. Here it is pointed at this run's own home, or the shell would find
-        // nothing to source and every reading of it would look like a miss.
-        let text = text.replace("/home/someone", &home.path().display().to_string());
-        std::fs::write(&script, &text).expect("writes a login file");
+    fn loads(bash: &Path, home: &Path, arguments: &[&str], loaded: &Path) -> usize {
+        let _ = std::fs::remove_file(loaded);
         let mut child = std::process::Command::new(bash)
-            .arg(&script)
-            .env("HOME", home.path())
-            .current_dir(home.path())
+            .args(arguments)
+            .env("HOME", home)
+            .current_dir(home)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
-            .expect("runs the login file");
-        // Bounded, because a login file that waits for something would otherwise wait for ever.
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            .expect("starts a shell");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         loop {
             match child.try_wait() {
-                Ok(Some(_)) => break,
+                Ok(Some(_)) | Err(_) => break,
                 Ok(None) => {}
-                Err(_) => break,
             }
             if std::time::Instant::now() >= deadline {
                 let _ = child.kill();
@@ -1523,11 +1049,19 @@ mod tests {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        ran.exists()
+        std::fs::read(loaded).map(|read| read.len()).unwrap_or(0)
     }
 
-    /// KR-REQ-07.40: two writers of one startup file do not interleave, whichever process each
-    /// is in.
+    /// A target for one shell, for the tests that only care what an entry contains.
+    fn for_shell(kind: ShellKind) -> StartupTarget {
+        StartupTarget {
+            kind,
+            path: PathBuf::from("/tmp/startup"),
+            reason: "a test",
+            shared: false,
+        }
+    }
+
     #[test]
     fn a_second_writer_waits_for_the_first_and_neither_loses_its_entry() {
         let root = tempfile::tempdir().expect("a directory");
@@ -1548,7 +1082,11 @@ mod tests {
         let after = FileLock::take(&path).expect("the next writer takes it straight away");
         drop(after);
 
-        let body = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), false);
+        let body = entry(
+            &for_shell(ShellKind::Zsh),
+            Path::new("/opt/kr/zsh-entry.zsh"),
+            false,
+        );
         assert_eq!(install(&path, &body).expect("installs"), Change::Added);
         assert!(
             std::fs::read_to_string(&path)
@@ -1572,7 +1110,11 @@ mod tests {
         assert!(lock.is_file());
         drop(held);
 
-        let body = entry(ShellKind::PowerShell, Path::new("/opt/kr/entry.ps1"), false);
+        let body = entry(
+            &for_shell(ShellKind::PowerShell),
+            Path::new("/opt/kr/entry.ps1"),
+            false,
+        );
         assert_eq!(install(&path, &body).expect("installs"), Change::Added);
         assert!(installed(&path));
     }
@@ -1589,7 +1131,11 @@ mod tests {
         // contents alone, which is what a filesystem with moving numbers gets.
         assert_eq!(stable_identity(&root.path().join("absent")), None);
 
-        let body = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), false);
+        let body = entry(
+            &for_shell(ShellKind::Zsh),
+            Path::new("/opt/kr/zsh-entry.zsh"),
+            false,
+        );
         assert_eq!(install(&path, &body).expect("installs"), Change::Added);
         assert_eq!(remove(&path).expect("removes"), Change::Removed);
         assert_eq!(
@@ -1667,7 +1213,11 @@ mod tests {
         let path = root.path().join(".zshrc");
         let theirs = "export EDITOR=vim\nalias ll='ls -la'\n";
         std::fs::write(&path, theirs).expect("writes");
-        let body = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), false);
+        let body = entry(
+            &for_shell(ShellKind::Zsh),
+            Path::new("/opt/kr/zsh-entry.zsh"),
+            false,
+        );
         assert_eq!(install(&path, &body).expect("installs"), Change::Added);
         let after = std::fs::read_to_string(&path).expect("reads");
         assert!(after.starts_with(theirs), "the user's own lines are first");
@@ -1675,7 +1225,11 @@ mod tests {
         assert!(installed(&path));
         // A second install is not a second entry.
         assert_eq!(install(&path, &body).expect("installs"), Change::Unchanged);
-        let updated = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), true);
+        let updated = entry(
+            &for_shell(ShellKind::Zsh),
+            Path::new("/opt/kr/zsh-entry.zsh"),
+            true,
+        );
         assert_eq!(
             install(&path, &updated).expect("installs"),
             Change::Replaced
@@ -1707,7 +1261,11 @@ mod tests {
         let link = root.path().join(".zshrc");
         std::os::unix::fs::symlink(&real, &link).expect("links");
 
-        let body = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), false);
+        let body = entry(
+            &for_shell(ShellKind::Zsh),
+            Path::new("/opt/kr/zsh-entry.zsh"),
+            false,
+        );
         assert_eq!(install(&link, &body).expect("installs"), Change::Added);
         assert!(
             link.symlink_metadata()
@@ -1743,7 +1301,11 @@ mod tests {
         let link = root.path().join(".zshrc");
         std::os::unix::fs::symlink(&real, &link).expect("links");
 
-        let body = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), false);
+        let body = entry(
+            &for_shell(ShellKind::Zsh),
+            Path::new("/opt/kr/zsh-entry.zsh"),
+            false,
+        );
         assert_eq!(install(&link, &body).expect("installs"), Change::Added);
         assert_eq!(remove(&link).expect("removes"), Change::Removed);
         assert!(
@@ -1771,7 +1333,11 @@ mod tests {
         let bystander = root.path().join(".zshrc.kalareach-new");
         std::fs::write(&bystander, "not ours\n").expect("writes");
 
-        let body = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), false);
+        let body = entry(
+            &for_shell(ShellKind::Zsh),
+            Path::new("/opt/kr/zsh-entry.zsh"),
+            false,
+        );
         assert_eq!(install(&path, &body).expect("installs"), Change::Added);
         assert_eq!(
             std::fs::read_to_string(&bystander).expect("reads"),
@@ -1822,7 +1388,7 @@ mod tests {
     #[test]
     fn the_bypass_is_only_ever_set_inside_a_kalareach_shell() {
         for kind in ShellKind::ALL {
-            let with = entry(*kind, Path::new("/opt/kr/entry"), true);
+            let with = entry(&for_shell(*kind), Path::new("/opt/kr/entry"), true);
             assert!(
                 with.contains(NSH_BYPASS_VARIABLE),
                 "{kind} offers the documented bypass"
@@ -1831,7 +1397,7 @@ mod tests {
                 with.contains("KR_SHELL_BRIDGE"),
                 "{kind} sets it only where the bridge was exported"
             );
-            let without = entry(*kind, Path::new("/opt/kr/entry"), false);
+            let without = entry(&for_shell(*kind), Path::new("/opt/kr/entry"), false);
             assert!(
                 !without.contains(NSH_BYPASS_VARIABLE),
                 "{kind} sets nothing when the option is off"
@@ -1842,7 +1408,11 @@ mod tests {
     #[test]
     fn a_path_with_an_apostrophe_stays_one_word() {
         for kind in ShellKind::ALL {
-            let body = entry(*kind, Path::new("/home/it's mine/kr/entry"), false);
+            let body = entry(
+                &for_shell(*kind),
+                Path::new("/home/it's mine/kr/entry"),
+                false,
+            );
             // The apostrophe is escaped rather than ending the string, so the line still names one
             // path and nothing after it is read as shell syntax.
             assert!(
@@ -1856,7 +1426,7 @@ mod tests {
     #[test]
     fn nothing_replaces_a_profile_or_points_at_another_zdotdir() {
         for kind in ShellKind::ALL {
-            let body = entry(*kind, Path::new("/opt/kr/entry"), true);
+            let body = entry(&for_shell(*kind), Path::new("/opt/kr/entry"), true);
             for forbidden in ["ZDOTDIR=", "--rcfile", "--norc", "--noprofile", "exec "] {
                 assert!(
                     !body.contains(forbidden),
