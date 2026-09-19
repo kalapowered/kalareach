@@ -465,6 +465,10 @@ pub enum BridgeEvent {
     EofDetach(RootEofDetachParams),
     /// `root.command.accepted`: the accepted line and where it came from.
     CommandAccepted(RootCommandAcceptedParams),
+    /// `root.command.resolve`: what an interactive invocation resolves to, asked before it runs.
+    CommandResolve(kr_protocol::root::RootCommandResolveParams),
+    /// `root.command.block`: one command block, with its status, duration and directory.
+    CommandBlock(Box<kr_protocol::root::RootCommandBlockParams>),
     /// The end-of-file gesture changed.
     GestureChanged(EofGestureChange),
     /// An eligible gesture was consumed because it could not be attributed.

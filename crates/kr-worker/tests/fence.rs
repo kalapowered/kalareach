@@ -77,6 +77,7 @@ fn configuration(host: &kr_ipc::testing::TempHost, mode: ShellMode) -> SessionCo
         dimensions: Dimensions::new(80, 24),
         journal_path: Some(host.environment().journal_database(session_id)),
         spool_directory: Some(host.environment().session_spool(session_id)),
+        worker_endpoint: None,
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
         launch_profile: kr_protocol::session::LaunchProfile::default(),
@@ -348,6 +349,55 @@ async fn holder_over(client: &mut LocalClient, wired: &Wired) -> AttachmentId {
         .expect("reaches the worker")
         .expect("takes the keys");
     attachment_id
+}
+
+/// Asks the worker what one invocation resolves to, over the real endpoint.
+async fn resolve_over(
+    wired: &mut Wired,
+    argv: &[&str],
+    interactive: bool,
+) -> kr_protocol::root::RootCommandResolveResult {
+    wired
+        .bridge
+        .send_event(BridgeEvent::CommandResolve(
+            kr_protocol::root::RootCommandResolveParams {
+                session_id: wired.session_id,
+                argv: argv.iter().map(|word| (*word).to_owned()).collect(),
+                interactive,
+            },
+        ))
+        .await
+        .expect("asks");
+    loop {
+        if let ToBridge::EventResult { result, .. } = wired.next().await
+            && let kr_shell_integration::contract::transport::EventOutcome::CommandResolved(
+                resolved,
+            ) = *result
+        {
+            return *resolved;
+        }
+    }
+}
+
+/// Reports one command block over the real endpoint.
+async fn block_over(
+    wired: &mut Wired,
+    block: kr_protocol::root::RootCommandBlockParams,
+) -> kr_protocol::root::RootCommandBlockResult {
+    wired
+        .bridge
+        .send_event(BridgeEvent::CommandBlock(Box::new(block)))
+        .await
+        .expect("reports");
+    loop {
+        if let ToBridge::EventResult { result, .. } = wired.next().await
+            && let kr_shell_integration::contract::transport::EventOutcome::CommandBlockRecorded(
+                recorded,
+            ) = *result
+        {
+            return recorded;
+        }
+    }
 }
 
 /// Starts a managed session with its bridge registered.
@@ -914,6 +964,208 @@ async fn a_gesture_with_a_stale_fence_is_refused_rather_than_becoming_an_end_of_
         }
     };
     assert_eq!(refusal.code, ErrorCode::EditorBusy);
+    wired.close().await;
+}
+
+// --------------------------------------------------------------------------------------------
+// KR-REQ-12.07, KR-REQ-25.05: the command hooks the private integration reports through.
+// --------------------------------------------------------------------------------------------
+
+/// KR-REQ-12.07: an enabled integration adds its flags and the backend exists before the command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enabled_integration_adds_its_flags_and_hands_back_a_backend() {
+    let mut wired = wired_profiled(
+        ShellMode::Managed,
+        true,
+        kr_protocol::session::LaunchProfile {
+            command_integrations: vec![kr_protocol::session::CommandIntegration {
+                command: "codex".to_owned(),
+                flags: vec!["--kr-gateway".to_owned()],
+                enabled: true,
+            }],
+            ..kr_protocol::session::LaunchProfile::default()
+        },
+    )
+    .await;
+    let resolved = resolve_over(&mut wired, &["codex", "--model", "opus"], true).await;
+    assert_eq!(
+        resolved.arguments,
+        vec![
+            "codex".to_owned(),
+            "--model".to_owned(),
+            "opus".to_owned(),
+            "--kr-gateway".to_owned()
+        ],
+        "the command name and the vector the person typed are preserved, and the flags follow"
+    );
+    assert_eq!(resolved.added, vec!["--kr-gateway".to_owned()]);
+    assert!(resolved.bypass.0.is_none());
+    let backend = resolved.backend.0.expect("a worker-owned backend");
+    assert_eq!(backend.session_id, wired.session_id);
+    assert!(
+        backend
+            .environment
+            .iter()
+            .any(|variable| variable.name == "KR_SESSION"),
+        "the backend names the session the gateway belongs to"
+    );
+    wired.close().await;
+}
+
+/// KR-REQ-12.07: the three bypasses keep the invocation and get no gateway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bypassed_invocation_runs_as_typed_and_is_given_no_backend() {
+    let mut wired = wired_profiled(
+        ShellMode::Managed,
+        true,
+        kr_protocol::session::LaunchProfile {
+            command_integrations: vec![
+                kr_protocol::session::CommandIntegration {
+                    command: "codex".to_owned(),
+                    flags: vec!["--kr-gateway".to_owned()],
+                    enabled: true,
+                },
+                kr_protocol::session::CommandIntegration {
+                    command: "opencode".to_owned(),
+                    flags: vec!["--kr-gateway".to_owned()],
+                    enabled: false,
+                },
+            ],
+            ..kr_protocol::session::LaunchProfile::default()
+        },
+    )
+    .await;
+    for (argv, interactive, reason) in [
+        (
+            vec!["/usr/local/bin/codex".to_owned()],
+            true,
+            kr_protocol::root::CommandBypassReason::AbsolutePath,
+        ),
+        (
+            vec!["opencode".to_owned()],
+            true,
+            kr_protocol::root::CommandBypassReason::Disabled,
+        ),
+        (
+            vec!["codex".to_owned()],
+            false,
+            kr_protocol::root::CommandBypassReason::NotInteractive,
+        ),
+        (
+            vec!["make".to_owned()],
+            true,
+            kr_protocol::root::CommandBypassReason::NotIntegrated,
+        ),
+    ] {
+        let borrowed: Vec<&str> = argv.iter().map(String::as_str).collect();
+        let resolved = resolve_over(&mut wired, &borrowed, interactive).await;
+        assert_eq!(
+            resolved.arguments, argv,
+            "the invocation is exactly as typed"
+        );
+        assert!(resolved.added.is_empty());
+        assert_eq!(resolved.bypass.0, Some(reason));
+        assert!(
+            resolved.backend.0.is_none(),
+            "a bypassed invocation never gets a gateway, then or later"
+        );
+    }
+    wired.close().await;
+}
+
+/// KR-REQ-12.07: a shell whose integration is not yet a managed root shell is never intercepted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unmanaged_shell_is_never_intercepted() {
+    let mut wired = wired_profiled(
+        ShellMode::Managed,
+        false,
+        kr_protocol::session::LaunchProfile {
+            command_integrations: vec![kr_protocol::session::CommandIntegration {
+                command: "codex".to_owned(),
+                flags: vec!["--kr-gateway".to_owned()],
+                enabled: true,
+            }],
+            ..kr_protocol::session::LaunchProfile::default()
+        },
+    )
+    .await;
+    // Registered but not qualified: the user's startup files have not finished, so the hooks
+    // that make this a managed root shell are not live yet.
+    let resolved = resolve_over(&mut wired, &["codex"], true).await;
+    assert_eq!(resolved.arguments, vec!["codex".to_owned()]);
+    assert_eq!(
+        resolved.bypass.0,
+        Some(kr_protocol::root::CommandBypassReason::UnmanagedShell)
+    );
+    assert!(resolved.backend.0.is_none());
+    wired.close().await;
+}
+
+/// KR-REQ-25.05: a command block carries its exit status, duration and directory to a reader.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_block_reaches_the_session_read_with_its_status_duration_and_directory() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+
+    let started = kr_protocol::root::RootCommandBlockParams {
+        session_id: wired.session_id,
+        prompt_generation: PromptGeneration::new(4),
+        command: "cargo test".to_owned(),
+        started_at_ms: kr_protocol::scalars::TimestampMs::new(1_700_000_000_000),
+        duration_ms: Nullable::null(),
+        exit_status: Nullable::null(),
+        cwd: "/tmp/project".to_owned(),
+        cwd_revision: CwdRevision::new(3),
+    };
+    let recorded = block_over(&mut wired, started.clone()).await;
+    assert_eq!(recorded.retained.get(), 1);
+
+    let read: kr_protocol::session::SessionReadResult = client
+        .request(
+            Method::SessionRead,
+            &kr_protocol::session::SessionReadParams {
+                session_id: wired.session_id,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("reads")
+        .to_typed()
+        .expect("decodes");
+    let running = read.last_command_block.0.expect("a block");
+    assert_eq!(running.command, "cargo test");
+    assert!(!running.finished(), "it is still running");
+
+    // The same command ends. One entry per command, with what it exited with.
+    let finished = kr_protocol::root::RootCommandBlockParams {
+        duration_ms: Nullable::some(kr_protocol::scalars::DurationMs::new(4_200)),
+        exit_status: Nullable::some(U64::new(101)),
+        ..started
+    };
+    let recorded = block_over(&mut wired, finished).await;
+    assert_eq!(recorded.retained.get(), 1, "the end replaces the start");
+
+    let read: kr_protocol::session::SessionReadResult = client
+        .request(
+            Method::SessionRead,
+            &kr_protocol::session::SessionReadParams {
+                session_id: wired.session_id,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("reads")
+        .to_typed()
+        .expect("decodes");
+    let block = read.last_command_block.0.expect("a block");
+    assert!(block.finished());
+    assert!(block.completed_nonzero());
+    assert_eq!(block.exit_status.0.expect("a status").get(), 101);
+    assert_eq!(block.duration_ms.0.expect("a duration").get(), 4_200);
+    assert_eq!(block.cwd, "/tmp/project");
+    assert_eq!(block.cwd_revision, CwdRevision::new(3));
     wired.close().await;
 }
 

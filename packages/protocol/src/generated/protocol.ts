@@ -1035,6 +1035,14 @@ export type ReviewSubject =
  */
 export type FenceId = string
 /**
+ * Why an invocation ran exactly as it was typed.
+ *
+ * Section 12: an absolute-path invocation and a user-disabled integration keep their actual
+ * bypassed execution, with only verified observation and the terminal's own capabilities.
+ */
+export type CommandBypassReason =
+  'not_integrated' | 'disabled' | 'absolute_path' | 'unmanaged_shell' | 'not_interactive'
+/**
  * What the worker tells the bridge about the fence.
  *
  * The bridge cannot conclude that its acknowledgement published a fence: the hold may have expired
@@ -1451,6 +1459,10 @@ export interface KalaReachProtocol {
   role_selection?: RoleSelection1
   root_command_accepted_params?: RootCommandAcceptedParams
   root_command_accepted_result?: RootCommandAcceptedResult
+  root_command_block_params?: RootCommandBlockParams
+  root_command_block_result?: RootCommandBlockResult
+  root_command_resolve_params?: RootCommandResolveParams
+  root_command_resolve_result?: RootCommandResolveResult
   root_editor_busy_event?: EditorBusyEvent
   root_editor_enter_params?: RootEditorEnterParams
   root_editor_enter_result?: RootEditorEnterResult
@@ -7696,6 +7708,8 @@ export interface MethodEntry {
     | 'root.editor.fence'
     | 'root.eof.detach'
     | 'root.command.accepted'
+    | 'root.command.resolve'
+    | 'root.command.block'
     | 'shell.launch'
     | 'agent.capabilities'
     | 'agent.snapshot'
@@ -12665,6 +12679,122 @@ export interface RootCommandAcceptedResult {
   state: 'outside' | 'unfenced' | 'fenced' | 'launch_reserved' | 'closing'
 }
 /**
+ * Parameters of `root.command.block`.
+ *
+ * Section 25: the shell adapter reports command blocks with their exit status, duration and
+ * working directory, from the same private hooks the fence rests on. All four come from the
+ * reader's own boundaries rather than from parsed terminal output.
+ */
+export interface RootCommandBlockParams {
+  /**
+   * The command line, exactly as the editor accepted it.
+   */
+  command: string
+  /**
+   * The working directory it ran in.
+   */
+  cwd: string
+  /**
+   * The working-directory revision at that boundary, which is what a launch is checked against.
+   */
+  cwd_revision: string
+  /**
+   * How long it ran. Null while it is still running.
+   */
+  duration_ms: DurationMs | null
+  /**
+   * The status it exited with. Null while it is still running.
+   */
+  exit_status: U64 | null
+  /**
+   * The prompt generation the command was accepted at.
+   */
+  prompt_generation: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at_ms: string
+}
+/**
+ * The result of `root.command.block`.
+ */
+export interface RootCommandBlockResult {
+  /**
+   * The prompt generation the block was recorded under.
+   */
+  prompt_generation: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  retained: string
+}
+/**
+ * Parameters of `root.command.resolve`.
+ *
+ * The integration's pre-execution hook asks the worker what to run, before it runs anything. The
+ * command name and the argument vector are the person's; what the answer may do is add flags.
+ */
+export interface RootCommandResolveParams {
+  /**
+   * The invocation, split by the shell: the command name first, then its arguments.
+   */
+  argv: string[]
+  /**
+   * Whether this is an interactive invocation rather than a line of a script.
+   */
+  interactive: boolean
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `root.command.resolve`.
+ */
+export interface RootCommandResolveResult {
+  /**
+   * The flags this answer added. Empty for a bypassed invocation.
+   */
+  added: string[]
+  /**
+   * The argument vector to run: what was typed, plus any flags the integration added.
+   */
+  arguments: string[]
+  /**
+   * The worker-owned backend, established before this answer was sent. Null for a bypass.
+   */
+  backend: CommandBackend | null
+  /**
+   * Why the invocation was left alone, or null when the integration applied.
+   */
+  bypass: CommandBypassReason | null
+}
+/**
+ * The worker-owned backend an integrated invocation is given.
+ *
+ * Section 12 requires it to exist *before* the native program starts, which is why it is part of
+ * the answer to the hook that runs in front of the command rather than something a detected agent
+ * asks for afterwards. There is no other route to one: an agent that is noticed after it started
+ * never gets a gateway created for it retroactively.
+ */
+export interface CommandBackend {
+  /**
+   * The variables the shell exports for this one invocation.
+   *
+   * They name this session and the worker's own private endpoint. A bypassed invocation is
+   * given none of them, which is what keeps its execution the one the person asked for.
+   */
+  environment: EnvironmentVariable[]
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
  * The `EDITOR_BUSY` attachment event.
  *
  * It is an event about the editor, not a failed `input.acquire`: the lease change it follows
@@ -13246,6 +13376,8 @@ export interface ServiceRequestPayload {
     | 'root.editor.fence'
     | 'root.eof.detach'
     | 'root.command.accepted'
+    | 'root.command.resolve'
+    | 'root.command.block'
     | 'shell.launch'
     | 'agent.capabilities'
     | 'agent.snapshot'
@@ -13756,6 +13888,13 @@ export interface SessionReadResult {
    * The endpoint a local client can attach to, while the session is running.
    */
   endpoint: string | null
+  /**
+   * The most recent command block the session's private hooks reported.
+   *
+   * Section 25's typed event: the command, its exit status, how long it ran and where. Null
+   * when no hook has reported one, which is every session without a managed root integration.
+   */
+  last_command_block: RootCommandBlockParams | null
   /**
    * How this session starts its root shell and what may be launched inside it.
    *

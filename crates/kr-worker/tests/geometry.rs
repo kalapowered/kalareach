@@ -74,6 +74,7 @@ fn configuration(
         dimensions,
         journal_path: Some(host.environment().journal_database(session_id)),
         spool_directory: Some(host.environment().session_spool(session_id)),
+        worker_endpoint: None,
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
         launch_profile: kr_protocol::session::LaunchProfile::default(),

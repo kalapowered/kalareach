@@ -674,6 +674,7 @@ async fn a_worker_that_has_not_qualified_proves_nothing_and_is_found_when_it_doe
         dimensions: kr_protocol::session::Dimensions::new(80, 24),
         journal_path: Some(environment.journal_database(session_id)),
         spool_directory: Some(environment.session_spool(session_id)),
+        worker_endpoint: None,
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
         launch_profile: kr_protocol::session::LaunchProfile::default(),

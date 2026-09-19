@@ -838,6 +838,11 @@ pub struct SessionReadResult {
     ///
     /// Null for a session that has already closed, whose profile decides nothing any more.
     pub launch_profile: Nullable<LaunchProfile>,
+    /// The most recent command block the session's private hooks reported.
+    ///
+    /// Section 25's typed event: the command, its exit status, how long it ran and where. Null
+    /// when no hook has reported one, which is every session without a managed root integration.
+    pub last_command_block: Nullable<crate::root::RootCommandBlockParams>,
 }
 
 /// Parameters of `session.close`.

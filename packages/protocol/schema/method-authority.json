@@ -1868,6 +1868,66 @@
         }
       },
       "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "root_integration",
+      "history_filter": "not_applicable",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "root.command.resolve",
+      "name": "root.command.resolve",
+      "required_rights": [
+        {
+          "authority": "local_caller_token",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "The root integration asks what an interactive invocation resolves to before it runs it.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "required": {
+          "capability_id": "shell.root_integration",
+          "revision": "root_editor_fence"
+        }
+      },
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "root_integration",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc"
+      ],
+      "method": "root.command.block",
+      "name": "root.command.block",
+      "required_rights": [
+        {
+          "authority": "local_caller_token",
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "The root integration reports one command block with its exit status, duration and working directory.",
+      "version": 1
+    },
+    {
+      "capability": {
+        "required": {
+          "capability_id": "shell.root_integration",
+          "revision": "root_editor_fence"
+        }
+      },
+      "confirmation": "none",
       "effect": "write",
       "freshness": "action_window",
       "group": "shell_launch",

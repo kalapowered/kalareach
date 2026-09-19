@@ -25,6 +25,13 @@ pub const TERM_PROGRAM: &str = "KalaReach";
 /// peer and its session binding before it accepts anything quoted from here.
 pub const SESSION_VARIABLE: &str = "KR_SESSION";
 
+/// The variable that names the private endpoint a session's own worker answers on.
+///
+/// It is set for a command the session established a worker-owned backend for, and for no other
+/// process. The endpoint is owner-only, and reaching it proves nothing on its own: the host still
+/// validates the caller's local peer and its session binding.
+pub const WORKER_ENDPOINT_VARIABLE: &str = "KR_WORKER_ENDPOINT";
+
 /// The prefix reserved for KalaReach's own bootstrap values.
 ///
 /// A creator's snapshot cannot set one of these. They come from the worker or not at all.

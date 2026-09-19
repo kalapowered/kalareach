@@ -626,6 +626,20 @@ impl Session {
                     state: FenceState::Fenced,
                 }))
             }
+            BridgeEvent::CommandResolve(params) => Some(EventOutcome::CommandResolved(Box::new(
+                kr_protocol::root::RootCommandResolveResult {
+                    arguments: params.argv.clone(),
+                    added: Vec::new(),
+                    bypass: Nullable::some(kr_protocol::root::CommandBypassReason::NotIntegrated),
+                    backend: Nullable::null(),
+                },
+            ))),
+            BridgeEvent::CommandBlock(params) => Some(EventOutcome::CommandBlockRecorded(
+                kr_protocol::root::RootCommandBlockResult {
+                    prompt_generation: params.prompt_generation,
+                    retained: kr_protocol::scalars::U64::new(1),
+                },
+            )),
             BridgeEvent::ReaderIdle(_)
             | BridgeEvent::GestureChanged(_)
             | BridgeEvent::PreEofConsumed(_)
@@ -909,6 +923,8 @@ fn name_of(event: &BridgeEvent) -> &'static str {
         BridgeEvent::ReaderIdle(_) => "reader_idle",
         BridgeEvent::EofDetach(_) => "eof_detach",
         BridgeEvent::CommandAccepted(_) => "command_accepted",
+        BridgeEvent::CommandResolve(_) => "command_resolve",
+        BridgeEvent::CommandBlock(_) => "command_block",
         BridgeEvent::GestureChanged(_) => "gesture_changed",
         BridgeEvent::PreEofConsumed(_) => "pre_eof_consumed",
         BridgeEvent::HooksActivated(_) => "hooks_activated",

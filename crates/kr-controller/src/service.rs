@@ -4380,6 +4380,7 @@ impl Controller {
                         session: read.session,
                         endpoint: Nullable::some(worker.endpoint.as_text()),
                         launch_profile: read.launch_profile,
+                        last_command_block: read.last_command_block,
                     });
                 }
                 // A worker that cannot be reached is not necessarily gone. Reconciliation asks the
@@ -4407,6 +4408,7 @@ impl Controller {
                     session: self.closed_session(&closure, display).await,
                     endpoint: Nullable::null(),
                     launch_profile: Nullable::null(),
+                    last_command_block: Nullable::null(),
                 })
             }
             None => Err(ControllerError::UnknownSession {

@@ -99,9 +99,11 @@ use crate::relay::{
 };
 use crate::root::{
     EditorBusyEvent, EditorFence, FencePublication, RootCommandAcceptedParams,
-    RootCommandAcceptedResult, RootEditorEnterParams, RootEditorEnterResult, RootEditorFenceParams,
-    RootEditorFenceResult, RootEditorLeaveParams, RootEditorLeaveResult, RootEofDetachParams,
-    RootEofDetachResult, ShellLaunchParams, ShellLaunchResult,
+    RootCommandAcceptedResult, RootCommandBlockParams, RootCommandBlockResult,
+    RootCommandResolveParams, RootCommandResolveResult, RootEditorEnterParams,
+    RootEditorEnterResult, RootEditorFenceParams, RootEditorFenceResult, RootEditorLeaveParams,
+    RootEditorLeaveResult, RootEofDetachParams, RootEofDetachResult, ShellLaunchParams,
+    ShellLaunchResult,
 };
 use crate::semantic::SemanticContinuation;
 use crate::service::ServiceRequestSignature;
@@ -324,6 +326,10 @@ pub fn protocol_schema() -> Value {
         "revocation_request" => RevocationRequest,
         "root_command_accepted_params" => RootCommandAcceptedParams,
         "root_command_accepted_result" => RootCommandAcceptedResult,
+        "root_command_block_params" => RootCommandBlockParams,
+        "root_command_block_result" => RootCommandBlockResult,
+        "root_command_resolve_params" => RootCommandResolveParams,
+        "root_command_resolve_result" => RootCommandResolveResult,
         "root_editor_busy_event" => EditorBusyEvent,
         "root_editor_enter_params" => RootEditorEnterParams,
         "root_editor_enter_result" => RootEditorEnterResult,

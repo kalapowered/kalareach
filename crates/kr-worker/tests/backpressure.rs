@@ -89,6 +89,7 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         dimensions: Dimensions::new(80, 24),
         journal_path: Some(environment.journal_database(session_id)),
         spool_directory: Some(environment.session_spool(session_id)),
+        worker_endpoint: None,
         send_queue_bytes: SEND_QUEUE_BYTES,
         resident_bytes: 4 * 1024 * 1024,
         launch_profile: kr_protocol::session::LaunchProfile::default(),

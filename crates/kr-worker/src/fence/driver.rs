@@ -146,6 +146,22 @@ pub enum Step {
     Launch(LaunchTransactionId, Box<LaunchAnswer>),
     /// Send one frame to the bridge.
     Send(Outbound),
+    /// Answer a command hook the session decides rather than the fence machine.
+    ///
+    /// Resolving an invocation and recording a command block are both about the session's own
+    /// configuration and history, not about the reader's state, so the machine sweeps its clock
+    /// and hands the question on. The step keeps its place in the machine's order, so the answer
+    /// still goes out after everything the same stimulus released.
+    CommandHook(RequestId, Box<CommandHook>),
+}
+
+/// A command hook the session answers.
+#[derive(Clone, Debug)]
+pub enum CommandHook {
+    /// What an interactive invocation resolves to, asked before the command runs.
+    Resolve(kr_protocol::root::RootCommandResolveParams),
+    /// One command block, with its status, duration and directory.
+    Block(Box<kr_protocol::root::RootCommandBlockParams>),
 }
 
 /// Everything one stimulus left for the worker to do.
@@ -573,6 +589,14 @@ impl FenceDriver {
             BridgeEvent::ReaderIdle(idle) => self.reader_idled(idle),
             BridgeEvent::EofDetach(params) => self.detach_submitted(params),
             BridgeEvent::CommandAccepted(params) => self.command_accepted(params),
+            // Neither is a fence question. The clock is still swept, for the reason `received`
+            // gives, and the answer is the session's to make.
+            BridgeEvent::CommandResolve(params) => {
+                self.command_hook(CommandHook::Resolve(params.clone()))
+            }
+            BridgeEvent::CommandBlock(params) => {
+                self.command_hook(CommandHook::Block(params.clone()))
+            }
             BridgeEvent::HooksActivated(_) => {
                 let _ = self.phase.qualified();
                 self.received()
@@ -584,6 +608,15 @@ impl FenceDriver {
                 effects
             }
         }
+    }
+
+    /// Sweeps the clock and hands one command hook to the session to answer.
+    fn command_hook(&mut self, hook: CommandHook) -> Effects {
+        let mut effects = self.apply(&Stimulus::HoldExpired, Context::Other);
+        if let Some(id) = self.answering {
+            effects.steps.push(Step::CommandHook(id, Box::new(hook)));
+        }
+        effects
     }
 
     /// Answers an event the machine has no stimulus for, sweeping the clock on the way.

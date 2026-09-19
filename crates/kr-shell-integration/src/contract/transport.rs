@@ -788,6 +788,10 @@ pub enum EventOutcome {
     Detached(RootEofDetachResult),
     /// The answer to `root.command.accepted`.
     CommandRecorded(RootCommandAcceptedResult),
+    /// The answer to `root.command.resolve`: what to run, and the backend established for it.
+    CommandResolved(Box<kr_protocol::root::RootCommandResolveResult>),
+    /// The answer to `root.command.block`.
+    CommandBlockRecorded(kr_protocol::root::RootCommandBlockResult),
     /// The event was received and needs no answer of its own: an idle report, a gesture change or a
     /// consumed gesture.
     Received,

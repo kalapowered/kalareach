@@ -14,52 +14,10 @@
 //! ended, what it exited with and where it ran, from the same private hooks the fence rests on. The
 //! attention engine reads typed events; this is the type.
 
-use kr_protocol::ids::SessionId;
-use kr_protocol::root::{CwdRevision, PromptGeneration};
-use kr_protocol::scalars::{DurationMs, Nullable, TimestampMs, U64};
+use kr_protocol::root::{CommandBypassReason, RootCommandResolveResult};
+use kr_protocol::scalars::Nullable;
+use kr_protocol::session::CommandIntegration;
 use serde::{Deserialize, Serialize};
-
-/// One agent's opt-in command integration.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CommandIntegration {
-    /// The command name this integration applies to, as typed.
-    pub command: String,
-    /// The flags the agent needs, added to an interactive invocation.
-    pub flags: Vec<String>,
-    /// Whether the user has enabled it. A disabled integration changes nothing.
-    pub enabled: bool,
-}
-
-/// Why an invocation was left exactly as it was typed.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BypassReason {
-    /// No integration is configured for this command.
-    NotIntegrated,
-    /// The user has not enabled it.
-    Disabled,
-    /// The command was invoked by absolute path, which is the documented way to bypass it.
-    AbsolutePath,
-    /// The shell is not a managed KalaReach root shell.
-    UnmanagedShell,
-    /// The invocation is a script rather than an interactive command.
-    NotInteractive,
-}
-
-impl BypassReason {
-    /// Returns the stable wire string.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::NotIntegrated => "not_integrated",
-            Self::Disabled => "disabled",
-            Self::AbsolutePath => "absolute_path",
-            Self::UnmanagedShell => "unmanaged_shell",
-            Self::NotInteractive => "not_interactive",
-        }
-    }
-}
 
 /// What the integration resolved one invocation to.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,7 +42,7 @@ pub enum Resolution {
         /// The argument vector that will be run: exactly what was typed.
         arguments: Vec<String>,
         /// Why.
-        reason: BypassReason,
+        reason: CommandBypassReason,
     },
 }
 
@@ -101,6 +59,36 @@ impl Resolution {
     #[must_use]
     pub const fn establishes_backend(&self) -> bool {
         matches!(self, Self::Integrated { .. })
+    }
+
+    /// Returns this resolution as the answer the integration's hook reads.
+    ///
+    /// The backend is the caller's to supply, because establishing one is the worker's work rather
+    /// than this decision's. A bypassed invocation is given none, whatever the caller offers: that
+    /// is what keeps its execution the one the person asked for.
+    #[must_use]
+    pub fn to_answer(
+        &self,
+        backend: Option<kr_protocol::root::CommandBackend>,
+    ) -> RootCommandResolveResult {
+        match self {
+            Self::Integrated {
+                arguments, added, ..
+            } => RootCommandResolveResult {
+                arguments: arguments.clone(),
+                added: added.clone(),
+                bypass: Nullable::null(),
+                backend: Nullable(backend),
+            },
+            Self::Bypassed {
+                arguments, reason, ..
+            } => RootCommandResolveResult {
+                arguments: arguments.clone(),
+                added: Vec::new(),
+                bypass: Nullable::some(*reason),
+                backend: Nullable::null(),
+            },
+        }
     }
 }
 
@@ -127,36 +115,36 @@ pub fn resolve(
         return Resolution::Bypassed {
             command: String::new(),
             arguments: Vec::new(),
-            reason: BypassReason::NotIntegrated,
+            reason: CommandBypassReason::NotIntegrated,
         };
     };
-    let bypass = |reason| Resolution::Bypassed {
+    let bypass = |reason: CommandBypassReason| Resolution::Bypassed {
         command: command.clone(),
         arguments: argv.to_vec(),
         reason,
     };
     if !context.managed_root_shell {
         // Section 12: an integration never intercepts a command in an unmanaged shell.
-        return bypass(BypassReason::UnmanagedShell);
+        return bypass(CommandBypassReason::UnmanagedShell);
     }
     if !context.interactive {
-        return bypass(BypassReason::NotInteractive);
+        return bypass(CommandBypassReason::NotInteractive);
     }
     if command.contains('/') {
         // The documented bypass. Somebody who names the binary by path is asking for that binary.
-        return bypass(BypassReason::AbsolutePath);
+        return bypass(CommandBypassReason::AbsolutePath);
     }
     let Some(integration) = integrations
         .iter()
         .find(|integration| integration.command == command)
     else {
-        return bypass(BypassReason::NotIntegrated);
+        return bypass(CommandBypassReason::NotIntegrated);
     };
     if !integration.enabled {
-        return bypass(BypassReason::Disabled);
+        return bypass(CommandBypassReason::Disabled);
     }
     if integration.flags.is_empty() {
-        return bypass(BypassReason::NotIntegrated);
+        return bypass(CommandBypassReason::NotIntegrated);
     }
     let mut arguments = argv.to_vec();
     // Only flags the caller did not already give. Repeating one would change what the agent sees.
@@ -181,53 +169,8 @@ pub fn resolve(
     }
 }
 
-/// One command block, as the private hooks report it.
-///
-/// Section 25: the shell adapter provides command blocks, exit status, duration and working
-/// directory. All four come from the reader's own boundaries rather than from parsed output, which
-/// is what makes them typed events the attention engine can act on.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CommandBlock {
-    /// The session.
-    pub session_id: SessionId,
-    /// The prompt generation the command was accepted at.
-    pub prompt_generation: PromptGeneration,
-    /// The command line, exactly as the editor accepted it.
-    pub command: String,
-    /// When it started.
-    pub started_at: TimestampMs,
-    /// How long it ran. Null while it is still running.
-    pub duration_ms: Nullable<DurationMs>,
-    /// The status it exited with. Null while it is still running.
-    pub exit_status: Nullable<U64>,
-    /// The working directory it ran in.
-    pub cwd: String,
-    /// The working-directory revision at that boundary, which is what a launch is checked against.
-    pub cwd_revision: CwdRevision,
-}
-
-impl CommandBlock {
-    /// Returns true when the command has finished.
-    #[must_use]
-    pub const fn finished(&self) -> bool {
-        self.exit_status.0.is_some()
-    }
-
-    /// Returns true when the command finished with a status the attention engine reports.
-    ///
-    /// Section 25's rule is a non-zero completion, which is a fact about the status the hook
-    /// reported rather than about anything parsed out of the terminal.
-    #[must_use]
-    pub fn completed_nonzero(&self) -> bool {
-        self.exit_status.0.is_some_and(|status| status.get() != 0)
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use kr_protocol::scalars::Uuid;
-
     use super::*;
 
     fn integrations() -> Vec<CommandIntegration> {
@@ -284,16 +227,16 @@ mod tests {
             (
                 argv(&["/usr/local/bin/codex"]),
                 MANAGED,
-                BypassReason::AbsolutePath,
+                CommandBypassReason::AbsolutePath,
             ),
-            (argv(&["opencode"]), MANAGED, BypassReason::Disabled),
+            (argv(&["opencode"]), MANAGED, CommandBypassReason::Disabled),
             (
                 argv(&["codex"]),
                 InvocationContext {
                     managed_root_shell: false,
                     interactive: true,
                 },
-                BypassReason::UnmanagedShell,
+                CommandBypassReason::UnmanagedShell,
             ),
             (
                 argv(&["codex"]),
@@ -301,9 +244,9 @@ mod tests {
                     managed_root_shell: true,
                     interactive: false,
                 },
-                BypassReason::NotInteractive,
+                CommandBypassReason::NotInteractive,
             ),
-            (argv(&["make"]), MANAGED, BypassReason::NotIntegrated),
+            (argv(&["make"]), MANAGED, CommandBypassReason::NotIntegrated),
         ];
         for (invocation, context, expected) in cases {
             let resolved = resolve(&integrations(), context, &invocation);
@@ -331,11 +274,15 @@ mod tests {
 
     #[test]
     fn a_command_block_reports_status_duration_and_directory() {
-        let block = CommandBlock {
+        use kr_protocol::ids::SessionId;
+        use kr_protocol::root::{CwdRevision, PromptGeneration, RootCommandBlockParams};
+        use kr_protocol::scalars::{DurationMs, TimestampMs, U64, Uuid};
+
+        let block = RootCommandBlockParams {
             session_id: SessionId::new(Uuid::from_bytes([7; 16])),
             prompt_generation: PromptGeneration::new(12),
             command: "cargo test".to_owned(),
-            started_at: TimestampMs::new(1_700_000_000_000),
+            started_at_ms: TimestampMs::new(1_700_000_000_000),
             duration_ms: Nullable::some(DurationMs::new(4_200)),
             exit_status: Nullable::some(U64::new(101)),
             cwd: "/Users/someone/project".to_owned(),
@@ -343,14 +290,14 @@ mod tests {
         };
         assert!(block.finished());
         assert!(block.completed_nonzero());
-        let running = CommandBlock {
+        let running = RootCommandBlockParams {
             duration_ms: Nullable::null(),
             exit_status: Nullable::null(),
             ..block.clone()
         };
         assert!(!running.finished());
         assert!(!running.completed_nonzero());
-        let succeeded = CommandBlock {
+        let succeeded = RootCommandBlockParams {
             exit_status: Nullable::some(U64::ZERO),
             ..block
         };

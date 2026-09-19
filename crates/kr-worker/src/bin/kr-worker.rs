@@ -205,6 +205,7 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
         display_number,
         package.as_ref(),
         bridge.as_ref().map(|(_, endpoint)| endpoint),
+        &endpoint,
     );
     // The machine's own continuous clock, which is the clock the daemon expresses a forwarded
     // authority deadline on. Every boundary in this process that decides whether authority has
@@ -430,6 +431,7 @@ fn session_config(
     display_number: DisplayNumber,
     package: Option<&ShellPackage>,
     bridge: Option<&HostEndpoint>,
+    worker_endpoint: &kr_ipc::paths::Endpoint,
 ) -> SessionConfig {
     let create: &SessionCreateParams = &specification.create;
     // A managed session launches the package's own binary. Everything else launches the shell the
@@ -510,6 +512,7 @@ fn session_config(
         dimensions,
         journal_path: Some(environment.journal_database(specification.session_id)),
         spool_directory: Some(environment.session_spool(specification.session_id)),
+        worker_endpoint: Some(worker_endpoint.as_text()),
         send_queue_bytes: DEFAULT_SEND_QUEUE_BYTES,
         resident_bytes: DEFAULT_RESIDENT_BYTES,
     }

@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::ProcessStartIdentity;
 use crate::ids::{AttachmentId, InputLeaseEpoch, SessionId};
-use crate::scalars::{Bytes, DurationMs, Nullable, U64, Uuid};
+use crate::scalars::{Bytes, DurationMs, Nullable, TimestampMs, U64, Uuid};
 
 /// How long the worker holds new input while a reader transition resolves.
 ///
@@ -910,7 +910,142 @@ pub struct RootCommandAcceptedResult {
     pub state: FenceState,
 }
 
-/// What a launch installs in the editor.
+/// Why an invocation ran exactly as it was typed.
+///
+/// Section 12: an absolute-path invocation and a user-disabled integration keep their actual
+/// bypassed execution, with only verified observation and the terminal's own capabilities.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandBypassReason {
+    /// No integration is configured for this command.
+    NotIntegrated,
+    /// The user has not enabled it.
+    Disabled,
+    /// The command was invoked by absolute path, which is the documented way to bypass it.
+    AbsolutePath,
+    /// The shell is not a managed KalaReach root shell.
+    UnmanagedShell,
+    /// The invocation is a script rather than an interactive command.
+    NotInteractive,
+}
+
+impl CommandBypassReason {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NotIntegrated => "not_integrated",
+            Self::Disabled => "disabled",
+            Self::AbsolutePath => "absolute_path",
+            Self::UnmanagedShell => "unmanaged_shell",
+            Self::NotInteractive => "not_interactive",
+        }
+    }
+}
+
+/// The worker-owned backend an integrated invocation is given.
+///
+/// Section 12 requires it to exist *before* the native program starts, which is why it is part of
+/// the answer to the hook that runs in front of the command rather than something a detected agent
+/// asks for afterwards. There is no other route to one: an agent that is noticed after it started
+/// never gets a gateway created for it retroactively.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct CommandBackend {
+    /// The session the backend belongs to.
+    pub session_id: SessionId,
+    /// The variables the shell exports for this one invocation.
+    ///
+    /// They name this session and the worker's own private endpoint. A bypassed invocation is
+    /// given none of them, which is what keeps its execution the one the person asked for.
+    pub environment: Vec<crate::session::EnvironmentVariable>,
+}
+
+/// Parameters of `root.command.resolve`.
+///
+/// The integration's pre-execution hook asks the worker what to run, before it runs anything. The
+/// command name and the argument vector are the person's; what the answer may do is add flags.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RootCommandResolveParams {
+    /// The session.
+    pub session_id: SessionId,
+    /// The invocation, split by the shell: the command name first, then its arguments.
+    pub argv: Vec<String>,
+    /// Whether this is an interactive invocation rather than a line of a script.
+    pub interactive: bool,
+}
+
+/// The result of `root.command.resolve`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RootCommandResolveResult {
+    /// The argument vector to run: what was typed, plus any flags the integration added.
+    pub arguments: Vec<String>,
+    /// The flags this answer added. Empty for a bypassed invocation.
+    pub added: Vec<String>,
+    /// Why the invocation was left alone, or null when the integration applied.
+    pub bypass: Nullable<CommandBypassReason>,
+    /// The worker-owned backend, established before this answer was sent. Null for a bypass.
+    pub backend: Nullable<CommandBackend>,
+}
+
+/// Parameters of `root.command.block`.
+///
+/// Section 25: the shell adapter reports command blocks with their exit status, duration and
+/// working directory, from the same private hooks the fence rests on. All four come from the
+/// reader's own boundaries rather than from parsed terminal output.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RootCommandBlockParams {
+    /// The session.
+    pub session_id: SessionId,
+    /// The prompt generation the command was accepted at.
+    pub prompt_generation: PromptGeneration,
+    /// The command line, exactly as the editor accepted it.
+    pub command: String,
+    /// When it started.
+    pub started_at_ms: TimestampMs,
+    /// How long it ran. Null while it is still running.
+    pub duration_ms: Nullable<DurationMs>,
+    /// The status it exited with. Null while it is still running.
+    pub exit_status: Nullable<U64>,
+    /// The working directory it ran in.
+    pub cwd: String,
+    /// The working-directory revision at that boundary, which is what a launch is checked against.
+    pub cwd_revision: CwdRevision,
+}
+
+impl RootCommandBlockParams {
+    /// Returns true when the command has finished.
+    #[must_use]
+    pub const fn finished(&self) -> bool {
+        self.exit_status.0.is_some()
+    }
+
+    /// Returns true when the command finished with a status the attention engine reports.
+    ///
+    /// Section 25's rule is a non-zero completion, which is a fact about the status the hook
+    /// reported rather than about anything parsed out of the terminal.
+    #[must_use]
+    pub fn completed_nonzero(&self) -> bool {
+        self.exit_status.0.is_some_and(|status| status.get() != 0)
+    }
+}
+
+/// The result of `root.command.block`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RootCommandBlockResult {
+    /// The prompt generation the block was recorded under.
+    pub prompt_generation: PromptGeneration,
+    /// How many blocks the session is retaining, newest included.
+    pub retained: U64,
+}
+
+/// What a launch installs in the editor./// What a launch installs in the editor.
 ///
 /// An argument vector is the safe form: the integration quotes it for its own shell. A quoted
 /// command is already the exact text to run, and neither form is assembled by interpolation.

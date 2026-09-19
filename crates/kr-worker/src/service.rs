@@ -3542,6 +3542,7 @@ impl WorkerService {
             session: session.summary(),
             endpoint: Nullable(running.then(|| self.endpoint.as_text())),
             launch_profile: Nullable(running.then(|| session.config().launch_profile.clone())),
+            last_command_block: Nullable(session.last_command_block()),
         })
     }
 

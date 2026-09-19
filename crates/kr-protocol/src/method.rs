@@ -767,6 +767,19 @@ methods! {
     freshness: ActionWindow, confirmation: None, idempotency: ACTION,
     doc: "The root integration confirms that the installed command was accepted by the editor.";
 
+    RootCommandResolve = "root.command.resolve", RootIntegration,
+    effect: Read, ingress: [LocalIpc], rights: [basis(LocalCallerToken)], selectors: [Session],
+    history: NotApplicable, capability: cap("shell.root_integration", RootEditorFence),
+    freshness: CurrentAuthority, confirmation: None, idempotency: READ,
+    doc: "The root integration asks what an interactive invocation resolves to before it runs it.";
+
+    RootCommandBlock = "root.command.block", RootIntegration,
+    effect: Write, ingress: [LocalIpc], rights: [basis(LocalCallerToken)], selectors: [Session],
+    history: NotApplicable, capability: cap("shell.root_integration", RootEditorFence),
+    freshness: ActionWindow, confirmation: None, idempotency: ACTION,
+    doc: "The root integration reports one command block with its exit status, duration and \
+          working directory.";
+
     // ----- Shell launch ---------------------------------------------------------------------
     ShellLaunch = "shell.launch", ShellLaunch,
     effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(TerminalInput)],

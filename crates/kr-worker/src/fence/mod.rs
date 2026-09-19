@@ -29,5 +29,5 @@ pub mod bridge;
 pub mod driver;
 
 pub use crate::fence::driver::{
-    Effects, FenceDriver, Outbound, ReaderDiscards, Step, TakeoverReceipt,
+    CommandHook, Effects, FenceDriver, Outbound, ReaderDiscards, Step, TakeoverReceipt,
 };

@@ -79,6 +79,12 @@ pub struct SessionConfig {
     pub journal_path: Option<std::path::PathBuf>,
     /// The output spool directory.
     pub spool_directory: Option<std::path::PathBuf>,
+    /// The worker's own private endpoint, as a child process would reach it.
+    ///
+    /// It is what a worker-owned backend is: an owner-only socket this session answers on. A
+    /// session opened without one establishes no backend, which is what a test harness with no
+    /// listener of its own gets.
+    pub worker_endpoint: Option<String>,
     /// The bound on one attachment's queued output.
     pub send_queue_bytes: usize,
     /// The resident output cache.
@@ -225,6 +231,12 @@ pub struct Session {
     >,
     /// Commands a reader installed after their transaction had been revoked.
     late_installations: Vec<kr_protocol::root::ShellLaunchResult>,
+    /// The command blocks the private hooks have reported, oldest first.
+    ///
+    /// Bounded: a session that runs for a week must not grow a record of every command it ever
+    /// ran in memory. What a reader of this needs is what happened recently, and the durable
+    /// record of a command is its own.
+    command_blocks: std::collections::VecDeque<kr_protocol::root::RootCommandBlockParams>,
     /// Why the last interrupt this session tried did not reach the foreground group.
     interrupt_failed: Option<String>,
     /// Accepted bytes the root editor's machine is holding for a reader transition.
@@ -504,6 +516,7 @@ impl Session {
             takeover_receipt: None,
             launches: BTreeMap::new(),
             late_installations: Vec::new(),
+            command_blocks: std::collections::VecDeque::new(),
             interrupt_failed: None,
             held_input_bytes: 0,
             restoration_losses: crate::render::Carried::default(),
@@ -701,10 +714,126 @@ impl Session {
                         driver.send(frame);
                     }
                 }
+                Step::CommandHook(id, hook) => {
+                    let outcome = self.answer_command_hook(*hook);
+                    if let Some(driver) = self.fence.as_ref() {
+                        driver.send(crate::fence::Outbound::EventResult {
+                            id,
+                            result: Box::new(outcome),
+                        });
+                    }
+                }
             }
         }
         self.pump_replies();
         outcome
+    }
+
+    /// The most command blocks one session keeps in memory.
+    const RETAINED_COMMAND_BLOCKS: usize = 64;
+
+    /// Answers one command hook out of the session's own configuration and history.
+    fn answer_command_hook(
+        &mut self,
+        hook: crate::fence::CommandHook,
+    ) -> kr_shell_integration::contract::transport::EventOutcome {
+        use kr_shell_integration::contract::transport::EventOutcome;
+
+        match hook {
+            crate::fence::CommandHook::Resolve(params) => {
+                EventOutcome::CommandResolved(Box::new(self.resolve_invocation(&params)))
+            }
+            crate::fence::CommandHook::Block(block) => {
+                let prompt_generation = block.prompt_generation;
+                self.record_command_block(*block);
+                EventOutcome::CommandBlockRecorded(kr_protocol::root::RootCommandBlockResult {
+                    prompt_generation,
+                    retained: U64::new(self.command_blocks.len() as u64),
+                })
+            }
+        }
+    }
+
+    /// Decides what one interactive invocation resolves to, and establishes its backend first.
+    ///
+    /// Section 12's order is the point. The worker-owned backend exists before this answer is
+    /// sent, so it is there before the program the answer names is started, and there is no route
+    /// by which a program already running acquires one afterwards: this hook is the only place a
+    /// backend is made.
+    fn resolve_invocation(
+        &mut self,
+        params: &kr_protocol::root::RootCommandResolveParams,
+    ) -> kr_protocol::root::RootCommandResolveResult {
+        use kr_shell_integration::host::command::{InvocationContext, resolve};
+
+        let context = InvocationContext {
+            // The shell asking is this session's own registered root integration, and a session
+            // that never claimed a managed editor never had one to ask through.
+            managed_root_shell: self.config.shell_mode.claims_managed_editor()
+                && self
+                    .fence
+                    .as_ref()
+                    .is_some_and(|driver| driver.phase().reports_ready()),
+            interactive: params.interactive,
+        };
+        let resolution = resolve(
+            &self.config.launch_profile.command_integrations,
+            context,
+            &params.argv,
+        );
+        let backend = resolution
+            .establishes_backend()
+            .then(|| self.establish_command_backend());
+        resolution.to_answer(backend)
+    }
+
+    /// Establishes the worker-owned backend one integrated invocation runs behind.
+    ///
+    /// It is this session's own private endpoint and the variable that names the session on it.
+    /// Both belong to the worker: the endpoint is owner-only, and the session identifier is a
+    /// candidate rather than an authority, which is what lets the host validate a child process's
+    /// local peer and its session binding before it accepts anything quoted from there.
+    fn establish_command_backend(&self) -> kr_protocol::root::CommandBackend {
+        let mut environment = vec![kr_protocol::session::EnvironmentVariable {
+            name: crate::environment::SESSION_VARIABLE.to_owned(),
+            value: self.config.session_id.to_string(),
+        }];
+        if let Some(endpoint) = self.config.worker_endpoint.as_ref() {
+            environment.push(kr_protocol::session::EnvironmentVariable {
+                name: crate::environment::WORKER_ENDPOINT_VARIABLE.to_owned(),
+                value: endpoint.clone(),
+            });
+        }
+        kr_protocol::root::CommandBackend {
+            session_id: self.config.session_id,
+            environment,
+        }
+    }
+
+    /// Records one command block, keeping the most recent [`Self::RETAINED_COMMAND_BLOCKS`].
+    ///
+    /// A block arrives twice for one command: once when it starts, with no status, and once when
+    /// it ends. The second replaces the first rather than joining it, so a reader sees one entry
+    /// per command.
+    fn record_command_block(&mut self, block: kr_protocol::root::RootCommandBlockParams) {
+        if let Some(existing) = self
+            .command_blocks
+            .iter_mut()
+            .find(|held| held.prompt_generation == block.prompt_generation)
+        {
+            *existing = block;
+            return;
+        }
+        if self.command_blocks.len() == Self::RETAINED_COMMAND_BLOCKS {
+            self.command_blocks.pop_front();
+        }
+        self.command_blocks.push_back(block);
+    }
+
+    /// Returns the most recent command block the private hooks reported.
+    #[must_use]
+    pub fn last_command_block(&self) -> Option<kr_protocol::root::RootCommandBlockParams> {
+        self.command_blocks.back().cloned()
     }
 
     /// Sends the terminal's configured interrupt to the foreground process group.

@@ -87,6 +87,7 @@ async fn host_sized(script: &str, canonical: Dimensions) -> Host {
         dimensions: canonical,
         journal_path: Some(environment.journal_database(session_id)),
         spool_directory: Some(environment.session_spool(session_id)),
+        worker_endpoint: None,
         send_queue_bytes: 1024 * 1024,
         resident_bytes: 1024 * 1024,
         launch_profile: kr_protocol::session::LaunchProfile::default(),
