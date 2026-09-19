@@ -32,6 +32,7 @@ import {
   settled,
   failed
 } from '../../model/receipts'
+import { renderMarkdown } from '../../markdown/render'
 import { ZOOM_DEFAULT_INDEX, ZOOM_STEPS, zoomBy, type ViewMode } from '../../terminal/modes'
 import { AccessoryRow } from '../components/keys'
 import { AttachmentPicker } from '../components/picker'
@@ -43,6 +44,18 @@ import { minimumTarget, type Surface } from '../platform'
 
 /** Which of the two views is showing. */
 type Pane = 'semantic' | 'terminal'
+
+/** One node as the phone holds it. */
+interface ReadNode {
+  readonly id: string
+  readonly role: string
+  readonly text: string
+  /** True when the text is Markdown the allowlisted renderer draws. */
+  readonly markdown?: boolean
+}
+
+/** No image has been imported: a renderer never fetches one on a person's behalf. */
+const NO_IMAGES: ReadonlyMap<string, string> = new Map()
 
 /** The session screen. */
 export function MobileSession({
@@ -58,7 +71,7 @@ export function MobileSession({
 }): ReactNode {
   const { port, say } = useApp()
   const [pane, setPane] = useState<Pane>('semantic')
-  const [nodes, setNodes] = useState<readonly { id: string; role: string; text: string }[]>([])
+  const [nodes, setNodes] = useState<readonly ReadNode[]>([])
   const [screen, setScreen] = useState<readonly string[]>([])
   const [mode, setMode] = useState<ViewMode>('control')
   const [zoom, setZoom] = useState(ZOOM_DEFAULT_INDEX)
@@ -100,13 +113,7 @@ export function MobileSession({
     port
       .agentSnapshot({ session_id: sessionId })
       .then((answer) => {
-        setNodes(
-          answer.nodes.slice(-80).map((node, index) => ({
-            id: String((node as { id?: string }).id ?? index),
-            role: String((node as { kind?: string }).kind ?? 'node'),
-            text: describeNode(node)
-          }))
-        )
+        setNodes(answer.nodes.slice(-80).map(readNode))
       })
       .catch(() => {
         setNodes([])
@@ -227,7 +234,23 @@ export function MobileSession({
               nodes.map((node) => (
                 <div key={node.id} className="m-node">
                   <p className="m-node-role">{node.role}</p>
-                  <p>{node.text}</p>
+                  {node.markdown ? (
+                    // The same allowlisted renderer the desktop window uses: an element tree from
+                    // a parser's tokens, never a string of markup.
+                    <div>
+                      {renderMarkdown(node.text, {
+                        openLink: (url) => {
+                          port.openExternal(url).catch((failure: unknown) => {
+                            say(failureMessage(failure), 'danger')
+                          })
+                        },
+                        importImage: () => undefined,
+                        importedImages: NO_IMAGES
+                      })}
+                    </div>
+                  ) : (
+                    <p>{node.text}</p>
+                  )}
                 </div>
               ))
             )}
@@ -446,8 +469,49 @@ function RawTerminal({
   )
 }
 
-/** One document node, as a line of text. */
-function describeNode(node: unknown): string {
-  const body = node as { text?: string; summary?: string; title?: string; kind?: string }
-  return body.text ?? body.summary ?? body.title ?? String(body.kind ?? '')
+/**
+ * One document node, as the phone shows it.
+ *
+ * A phone shows less than a desktop window does, and what it shows is the node's own words rather
+ * than a rendering of every kind it could be. Each kind names itself, so a node this build does
+ * not draw fully is still a node the person can see is there.
+ */
+function readNode(node: unknown, index: number): ReadNode {
+  const outer = node as { id?: string; body?: Record<string, unknown> }
+  const body = outer.body ?? {}
+  // Only a string is text. A field that is not one is a node shape this build does not draw, and
+  // showing "[object Object]" to a person would be worse than showing the kind alone.
+  const text = (name: string): string => (typeof body[name] === 'string' ? body[name] : '')
+  const kind = text('kind') || 'node'
+  const id = outer.id ?? String(index)
+  switch (kind) {
+    case 'message':
+      return { id, role: text('author') || 'message', text: text('text') }
+    case 'markdown':
+      return { id, role: 'assistant', text: text('source'), markdown: true }
+    case 'tool': {
+      const summary = text('summary')
+      return {
+        id,
+        role: `tool · ${text('name')}`,
+        text: summary ? `${text('outcome')} · ${summary}` : text('outcome')
+      }
+    }
+    case 'diff': {
+      const files = (body['files'] as { path?: string; added?: number; removed?: number }[]) ?? []
+      return {
+        id,
+        role: 'change',
+        text: files
+          .map((file) => `${file.path ?? ''} +${file.added ?? 0} −${file.removed ?? 0}`)
+          .join(', ')
+      }
+    }
+    case 'approval_ref':
+      return { id, role: 'decision', text: 'A decision is waiting in the inbox.' }
+    case 'action_group':
+      return { id, role: 'actions', text: text('label') }
+    default:
+      return { id, role: kind, text: '' }
+  }
 }

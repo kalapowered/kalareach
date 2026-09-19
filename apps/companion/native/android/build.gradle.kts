@@ -13,6 +13,10 @@
 
 apply(plugin = "org.jetbrains.kotlin.jvm")
 
+// The output goes under the generated Android project rather than beside these sources. The
+// interface package's linter walks this directory, and a Gradle report is not source.
+layout.buildDirectory.set(rootProject.layout.buildDirectory.dir("krnative"))
+
 dependencies {
     add("testImplementation", "junit:junit:4.13.2")
 }

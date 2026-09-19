@@ -41,6 +41,24 @@ interface Place {
   readonly sessionId?: string
 }
 
+const TABS: readonly Tab[] = ['attention', 'sessions', 'hosts', 'account']
+
+/**
+ * Where an address says to open.
+ *
+ * A notification about one session has to open that session, so the address the system hands the
+ * application when a person taps it names where to go. An address that names nowhere opens the
+ * inbox, which is where the application opens anyway.
+ */
+export function placeFromAddress(search: string): Place {
+  const parameters = new URLSearchParams(search)
+  const tab = parameters.get('tab')
+  const sessionId = parameters.get('session')
+  if (sessionId) return { tab: 'sessions', sessionId }
+  const named = TABS.find((each) => each === tab)
+  return { tab: named ?? 'attention' }
+}
+
 /** What this build is, which decides only what the account screen may show. */
 export interface MobileBuild {
   readonly channel: Channel
@@ -71,7 +89,9 @@ export function MobileApp({
       typeof navigator === 'undefined' ? '' : navigator.userAgent,
       typeof navigator === 'undefined' ? 0 : navigator.maxTouchPoints
     )
-  const [place, setPlace] = useState<Place>({ tab: 'attention' })
+  const [place, setPlace] = useState<Place>(() =>
+    placeFromAddress(typeof window === 'undefined' ? '' : window.location.search)
+  )
   const [connection, setConnection] = useState<{ connected: boolean; reason: string | null }>({
     connected: false,
     reason: null
