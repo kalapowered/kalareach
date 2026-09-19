@@ -24,8 +24,11 @@
 //! | [`error`] | The broker's refusals, each mapped to a stable protocol code |
 //! | [`gateway`] | The core-declarative forwarding path, the closed rich table and reverse calls |
 //! | [`ledger`] | The durable records, in the worker's own journal file |
+//! | [`methods`] | The agent-state reads, the five agent mutations and the plugin action call |
+//! | [`listener`] | The private local endpoint, bridge registration and the pinned binary |
 //! | [`process`] | Launched processes, their credentials and their immutable source frames |
 //! | [`profiles`] | Launch profiles, the stale-launch refusal and one process per conversation |
+//! | [`semantic`] | The observed entries, the consumed cursor and the gap an eviction leaves |
 //! | [`tokens`] | Action tokens: issued per invocation, spent once |
 //! | [`volatile`] | `native_only_volatile`: what is fenced, what continues, and the gap |
 //!
@@ -41,8 +44,11 @@ pub mod capability;
 pub mod error;
 pub mod gateway;
 pub mod ledger;
+pub mod listener;
+pub mod methods;
 pub mod process;
 pub mod profiles;
+pub mod semantic;
 pub mod tokens;
 pub mod volatile;
 
@@ -62,8 +68,8 @@ use kr_protocol::identity::ProcessStartIdentity;
 use kr_protocol::ids::{
     ActorId, AgentBindingRevision, AgentThreadId, AgentTurnId, ApplicationInstanceId,
     BrokerBindingId, CapabilityId, CapabilityRevision, GatewayConnectionId, LaunchProfileId,
-    PendingResourceId, PluginId, PublisherId, SourceEventHandle, SourceGeneration, StreamCursor,
-    UpstreamMethod, UpstreamRequestId,
+    PendingResourceId, PluginId, PublisherId, SessionId, SourceEventHandle, SourceGeneration,
+    StreamCursor, UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, Uuid};
 
@@ -76,10 +82,15 @@ pub use crate::broker::gateway::{
     Connection, ConnectionOrigin, Forwarded, Gateway, ReverseRequest, RichInvocation,
 };
 pub use crate::broker::ledger::{BindingRecord, Ledger, UnresolvedRecord};
+pub use crate::broker::listener::{
+    BoundBinary, BridgeHello, ListenerAddress, Registration, reject_browser_origin,
+};
+pub use crate::broker::methods::{Caller, RegisteredAction, command, subject};
 pub use crate::broker::process::{
     BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
 };
 pub use crate::broker::profiles::{ForegroundMark, LaunchIntent, ProfileStore, new_profile_id};
+pub use crate::broker::semantic::{GrantLowerBound, HistoryFilter, Replay, SemanticLog};
 pub use crate::broker::tokens::{Invocation, TokenStore};
 pub use crate::broker::volatile::{VolatileState, VolatileTransition};
 
@@ -110,6 +121,8 @@ pub struct Binding {
     pub grants: BrokerGrants,
     /// The decoding trust, where the binding has any.
     pub trust: Option<DecodingTrust>,
+    /// The actions this package registered, by name.
+    pub actions: BTreeMap<ActionName, RegisteredAction>,
     /// True when a component fault has disabled this binding's rich capabilities.
     ///
     /// Native forwarding is untouched by this. Section 11: "A Wasm fault disables the affected
@@ -173,6 +186,10 @@ pub struct Instance {
     /// Closing one does not end the process. Section 7: "Closing a KR attachment does not end the
     /// TUI process in the worker PTY."
     pub attachments: usize,
+    /// What this instance has been observed doing, and the cursor an adapter replays from.
+    semantic: crate::broker::semantic::SemanticLog,
+    /// The commands the upstream advertises.
+    commands: Vec<kr_protocol::agent::AgentCommand>,
     /// The unconsumed source frames the broker is holding for this instance's decoders.
     frames: BTreeMap<SourceEventHandle, SourceFrame>,
     /// The order those frames arrived in, so the oldest is the one that goes.
@@ -283,6 +300,7 @@ pub struct StopOutcome {
 /// The broker's whole state and its ledger, behind one lock.
 #[derive(Debug)]
 struct BrokerState {
+    session_id: SessionId,
     ledger: Ledger,
     gateway: Gateway,
     instances: BTreeMap<ApplicationInstanceId, Instance>,
@@ -307,7 +325,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::LedgerUnavailable`] when the ledger cannot be opened or read.
-    pub fn open(journal_path: Option<&std::path::Path>) -> Result<Self> {
+    pub fn open(journal_path: Option<&std::path::Path>, session_id: SessionId) -> Result<Self> {
         let ledger = Ledger::open(journal_path)?;
         let mut arbitration = Arbitration::new();
         // A restarted worker starts from what it wrote, not from nothing. The dispatch marker is
@@ -320,6 +338,7 @@ impl Broker {
         profiles.restore(ledger.profiles()?);
         Ok(Self {
             state: Mutex::new(BrokerState {
+                session_id,
                 ledger,
                 gateway: Gateway::new(),
                 instances: BTreeMap::new(),
@@ -361,6 +380,8 @@ impl Broker {
                 profile_id,
                 rich_suspension: None,
                 attachments: 0,
+                semantic: crate::broker::semantic::SemanticLog::new(),
+                commands: Vec::new(),
                 frames: BTreeMap::new(),
                 frame_order: std::collections::VecDeque::new(),
                 frame_bytes: 0,
@@ -613,6 +634,7 @@ impl Broker {
                 package_digest,
                 grants,
                 trust,
+                actions: BTreeMap::new(),
                 rich_disabled: None,
             },
         );
@@ -1294,6 +1316,21 @@ impl Broker {
         state.arbitration.commit(transition)
     }
 
+    /// Gives a claim back, because nothing was dispatched under it.
+    ///
+    /// A caller whose answer was refused between the claim and the dispatch releases it here, so
+    /// the resource is answerable again rather than stuck behind a claim nobody will spend.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Arbitration`] when an answer has already gone for the resource.
+    pub fn release_claim(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
+        let mut state = self.state();
+        let transition = state.arbitration.plan_release(claim)?;
+        state.write_transition(&transition, now)?;
+        state.arbitration.commit(transition)
+    }
+
     /// Leaves a claimed resource uncertain: an answer went and nothing confirmed it.
     ///
     /// # Errors
@@ -1610,6 +1647,133 @@ impl Broker {
             .observers(application_instance_id)
             .map(|connection| connection.connection)
             .collect()
+    }
+
+    /// Returns true when this broker serves the named session.
+    #[must_use]
+    pub fn serves_session(&self, session_id: SessionId) -> bool {
+        self.state().session_id == session_id
+    }
+
+    /// Returns the session this broker serves.
+    #[must_use]
+    pub fn session_id(&self) -> SessionId {
+        self.state().session_id
+    }
+
+    // -- observed history ---------------------------------------------------------------------
+
+    /// Records one observed semantic entry and returns its cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance.
+    pub fn observe(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        kind: &str,
+        text: &str,
+        now: TimestampMs,
+    ) -> Result<StreamCursor> {
+        let mut state = self.state();
+        let instance = state
+            .instances
+            .get_mut(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        Ok(instance.semantic.append(kind, text, now))
+    }
+
+    /// Replays what an adapter has not consumed, through the actor's own history filter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance.
+    pub fn replay(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        from: Option<StreamCursor>,
+        filter: &dyn crate::broker::semantic::HistoryFilter,
+    ) -> Result<crate::broker::semantic::Replay> {
+        let state = self.state();
+        let instance = state
+            .instances
+            .get(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        Ok(instance.semantic.replay(from, filter))
+    }
+
+    /// Records the commands the upstream advertises.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance.
+    pub fn set_commands(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        commands: Vec<kr_protocol::agent::AgentCommand>,
+    ) -> Result<()> {
+        let mut state = self.state();
+        let instance = state
+            .instances
+            .get_mut(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        instance.commands = commands;
+        Ok(())
+    }
+
+    /// Returns the commands one instance advertises.
+    #[must_use]
+    pub fn commands(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Vec<kr_protocol::agent::AgentCommand> {
+        self.state()
+            .instances
+            .get(&application_instance_id)
+            .map(|instance| instance.commands.clone())
+            .unwrap_or_default()
+    }
+
+    // -- registered actions -------------------------------------------------------------------
+
+    /// Records the actions one package registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such binding.
+    pub fn register_actions(
+        &self,
+        binding_id: BrokerBindingId,
+        actions: impl IntoIterator<Item = RegisteredAction>,
+    ) -> Result<()> {
+        let mut state = self.state();
+        let binding = state
+            .bindings
+            .get_mut(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        binding.actions = actions
+            .into_iter()
+            .map(|action| (action.name.clone(), action))
+            .collect();
+        Ok(())
+    }
+
+    /// Returns one registered action.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such binding.
+    pub fn registered_action(
+        &self,
+        binding_id: BrokerBindingId,
+        action: &ActionName,
+    ) -> Result<Option<RegisteredAction>> {
+        let state = self.state();
+        let binding = state
+            .bindings
+            .get(&binding_id)
+            .ok_or_else(|| unknown_binding(binding_id))?;
+        Ok(binding.actions.get(action).cloned())
     }
 
     /// Mints the next gateway connection identifier.

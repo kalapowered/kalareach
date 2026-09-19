@@ -329,6 +329,21 @@ impl Arbitration {
         })
     }
 
+    /// Plans giving a claim back, because nothing was dispatched under it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] when another claim holds the resource, and
+    /// [`BrokerError::Arbitration`] when an answer has already gone, because a resource an answer
+    /// went for is never handed back to somebody else.
+    pub fn plan_release(&self, claim: &Claim) -> Result<Transition> {
+        let pending = self.claimed_by(claim)?;
+        if pending.dispatched {
+            return Err(BrokerError::Arbitration(ArbitrationError::AlreadyClaimed));
+        }
+        self.plan_from_claim(claim, PendingState::Pending, false)
+    }
+
     /// Plans the resolution of a claimed resource: the upstream confirmed the answer.
     ///
     /// # Errors

@@ -16,7 +16,7 @@ use kr_protocol::gateway::{
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
     ActorId, ApplicationInstanceId, BrokerBindingId, EnvironmentId, GatewayConnectionId,
-    MethodTableVersion, PluginId, PublisherId, UpstreamMethod, UpstreamRequestId,
+    MethodTableVersion, PluginId, PublisherId, SessionId, UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, TimestampMs, U64, Uuid};
@@ -26,6 +26,10 @@ use kr_worker::broker::{
 };
 
 const CREDENTIAL: [u8; 32] = [9; 32];
+
+fn session() -> SessionId {
+    SessionId::new(Uuid::from_bytes([1; 16]))
+}
 
 fn instance(byte: u8) -> ApplicationInstanceId {
     ApplicationInstanceId::new(Uuid::from_bytes([byte; 16]))
@@ -156,7 +160,7 @@ fn response(id: &str) -> String {
 
 /// A worker with one instance, one authenticated native connection and one trusted decoder.
 fn gateway(path: Option<&std::path::Path>) -> Broker {
-    let broker = Broker::open(path).expect("the broker opens");
+    let broker = Broker::open(path, session()).expect("the broker opens");
     broker.register_instance(
         instance(2),
         IntegrationMode::Gateway,
@@ -842,7 +846,7 @@ fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns
     };
 
     // And what the gap committed is what a restart reads back.
-    let restarted = Broker::open(Some(&path)).expect("the broker reopens");
+    let restarted = Broker::open(Some(&path), session()).expect("the broker reopens");
     assert_eq!(
         restarted
             .recorded(answered)
@@ -894,7 +898,7 @@ fn kr_req_12_10_gateway_request_state_survives_a_restart_of_the_worker() {
         (opaque.resource_id, interpreted.resource_id)
     };
 
-    let restarted = Broker::open(Some(&path)).expect("the broker reopens");
+    let restarted = Broker::open(Some(&path), session()).expect("the broker reopens");
     let recovered_opaque = restarted
         .pending(opaque)
         .expect("the opaque request came back");

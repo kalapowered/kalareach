@@ -556,10 +556,18 @@ impl PendingState {
             // out of time. It cannot go straight to resolved: an answer is always claimed first,
             // which is what makes one answer win.
             Self::Pending => &[Self::Claimed, Self::Cancelled, Self::Expired],
-            // A claim ends in exactly one of three ways. `Cancelled` is there because a native
-            // answer arriving during encoding wins, and the claim it beat is released as the
-            // upstream's own resolution rather than as a second dispatch.
-            Self::Claimed => &[Self::Resolved, Self::Uncertain, Self::Cancelled],
+            // A claim ends in one of three ways, or is given up. `Cancelled` is there because a
+            // native answer arriving during encoding wins, and the claim it beat is released as
+            // the upstream's own resolution rather than as a second dispatch. `Pending` is there
+            // because a claim that never dispatched anything can be handed back: what stops a
+            // second answer is the dispatch marker, not the claim, and a resource nobody answered
+            // is one somebody should still be able to.
+            Self::Claimed => &[
+                Self::Resolved,
+                Self::Uncertain,
+                Self::Cancelled,
+                Self::Pending,
+            ],
             Self::Resolved | Self::Cancelled | Self::Expired | Self::Uncertain => &[],
         }
     }
@@ -1050,6 +1058,17 @@ mod tests {
     #[test]
     fn a_native_answer_during_encoding_releases_the_claim() {
         assert!(check_transition(PendingState::Claimed, PendingState::Cancelled).is_ok());
+    }
+
+    #[test]
+    fn a_claim_that_dispatched_nothing_can_be_given_back() {
+        assert!(check_transition(PendingState::Claimed, PendingState::Pending).is_ok());
+        assert_eq!(
+            check_transition(PendingState::Resolved, PendingState::Pending),
+            Err(ArbitrationError::AlreadyResolved {
+                state: PendingState::Resolved
+            })
+        );
     }
 
     #[test]

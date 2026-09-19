@@ -19,8 +19,8 @@ use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
     ActorId, AgentBindingRevision, AgentThreadId, ApplicationInstanceId, BrokerBindingId,
     CapabilityId, CapabilityRevision, EnvironmentId, GatewayConnectionId, GrantId, LaunchProfileId,
-    MethodTableVersion, PluginId, PublisherId, SourceEventHandle, StreamCursor, UpstreamMethod,
-    UpstreamRequestId,
+    MethodTableVersion, PluginId, PublisherId, SessionId, SourceEventHandle, StreamCursor,
+    UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
@@ -30,6 +30,10 @@ use kr_worker::broker::{
 };
 
 const CREDENTIAL: [u8; 32] = [9; 32];
+
+fn session() -> SessionId {
+    SessionId::new(Uuid::from_bytes([1; 16]))
+}
 
 fn instance(byte: u8) -> ApplicationInstanceId {
     ApplicationInstanceId::new(Uuid::from_bytes([byte; 16]))
@@ -221,7 +225,7 @@ fn rich_table() -> RichMethodTable {
 
 /// A broker with one instance, one process, one binding and one native connection.
 fn broker_with(grants: BrokerGrants, decoding: Option<DecodingTrust>) -> Broker {
-    let broker = Broker::open(None).expect("the broker opens");
+    let broker = Broker::open(None, session()).expect("the broker opens");
     broker.register_instance(
         instance(2),
         IntegrationMode::Gateway,
@@ -449,7 +453,7 @@ fn kr_req_11_25_decoding_trust_is_explicit_and_display_only_creates_no_approval(
     assert!(matches!(refusal, BrokerError::PermissionDenied { .. }));
 
     // Trust without the grant it depends on is refused when it is offered, not stored.
-    let broker = Broker::open(None).expect("the broker opens");
+    let broker = Broker::open(None, session()).expect("the broker opens");
     broker.register_instance(instance(2), IntegrationMode::Gateway, None, None);
     let refusal = broker
         .bind(
@@ -490,7 +494,7 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
     let path = directory.join("session.sqlite");
 
     let resource_id = {
-        let broker = Broker::open(Some(&path)).expect("the broker opens");
+        let broker = Broker::open(Some(&path), session()).expect("the broker opens");
         broker.register_instance(
             instance(2),
             IntegrationMode::Gateway,
@@ -625,7 +629,7 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
 
     // The ledger is retained across a restart, and it says whose interpretation this was, over
     // which bytes, and exactly which decisions were offered.
-    let restarted = Broker::open(Some(&path)).expect("the broker reopens");
+    let restarted = Broker::open(Some(&path), session()).expect("the broker reopens");
     let entry = restarted
         .decoding(resource_id)
         .expect("the read succeeds")
@@ -810,7 +814,7 @@ fn kr_req_11_28_an_action_token_binds_actor_grant_revision_action_and_parameters
 /// argument vector, authentication state and integration mode.
 #[test]
 fn kr_req_12_02_a_launch_profile_records_what_was_resolved() {
-    let broker = Broker::open(None).expect("the broker opens");
+    let broker = Broker::open(None, session()).expect("the broker opens");
     let intent = broker
         .prepare_launch(
             profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
@@ -844,7 +848,7 @@ fn kr_req_12_02_a_launch_profile_records_what_was_resolved() {
 /// end-to-end demonstration of an untouched terminal belongs to the gateway suite.
 #[test]
 fn kr_req_12_03_a_stale_launch_is_refused_and_starts_nothing() {
-    let broker = Broker::open(None).expect("the broker opens");
+    let broker = Broker::open(None, session()).expect("the broker opens");
     let intent = broker
         .prepare_launch(
             profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
@@ -883,7 +887,7 @@ fn kr_req_12_03_a_stale_launch_is_refused_and_starts_nothing() {
 /// and selecting another conversation moves the reservation rather than leaving both taken.
 #[test]
 fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
-    let broker = Broker::open(None).expect("the broker opens");
+    let broker = Broker::open(None, session()).expect("the broker opens");
     let first = broker
         .prepare_launch(
             profile(IntegrationMode::Gateway, [3; 32], "0.9.1"),
@@ -941,7 +945,7 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
 /// and measuring its deadline is the acceptance owner's, because it needs an upstream to probe.
 #[test]
 fn kr_req_11_16_a_probe_is_bounded_and_disclosed_before_it_runs() {
-    let broker = Broker::open(None).expect("the broker opens");
+    let broker = Broker::open(None, session()).expect("the broker opens");
     broker.register_instance(instance(2), IntegrationMode::Gateway, None, None);
 
     let undisclosed = Probe {
@@ -1141,7 +1145,7 @@ fn kr_req_11_17_an_action_rechecks_its_capability_and_an_upgrade_spares_a_pinned
 /// here can say it works here.
 #[test]
 fn kr_req_01_02_the_capability_map_is_per_installation() {
-    let broker = Broker::open(None).expect("the broker opens");
+    let broker = Broker::open(None, session()).expect("the broker opens");
     broker.register_instance(instance(2), IntegrationMode::Gateway, None, None);
     broker.register_instance(instance(3), IntegrationMode::NativeTerminal, None, None);
     broker
@@ -1200,7 +1204,7 @@ fn kr_req_07_67_a_native_exit_names_its_backend_and_closing_an_attachment_leaves
     let pid = u64::from(child.id());
     let identity = process_identity(pid, 12_345);
 
-    let broker = Broker::open(None).expect("the broker opens");
+    let broker = Broker::open(None, session()).expect("the broker opens");
     broker.register_instance(
         instance(2),
         IntegrationMode::Gateway,
@@ -1236,7 +1240,7 @@ fn kr_req_07_67_a_native_exit_names_its_backend_and_closing_an_attachment_leaves
     let _ = child.kill();
     let _ = child.wait();
 
-    let bypassed = Broker::open(None).expect("the broker opens");
+    let bypassed = Broker::open(None, session()).expect("the broker opens");
     bypassed.register_instance(instance(4), IntegrationMode::NativeTerminal, None, None);
     let ended = bypassed.end(instance(4), InstanceEnding::NativeExit);
     assert!(ended.instance_ended);
@@ -1296,7 +1300,7 @@ fn kr_req_24_24_a_consumed_cursor_survives_a_restart() {
     std::fs::create_dir_all(&directory).expect("the directory is created");
     let path = directory.join("session.sqlite");
     {
-        let broker = Broker::open(Some(&path)).expect("the broker opens");
+        let broker = Broker::open(Some(&path), session()).expect("the broker opens");
         broker.register_instance(instance(2), IntegrationMode::Gateway, None, None);
         assert_eq!(
             broker
@@ -1309,7 +1313,7 @@ fn kr_req_24_24_a_consumed_cursor_survives_a_restart() {
             .checkpoint(instance(2), StreamCursor::new(40), TimestampMs::new(2))
             .expect("the checkpoint is written");
     }
-    let restarted = Broker::open(Some(&path)).expect("the broker reopens");
+    let restarted = Broker::open(Some(&path), session()).expect("the broker reopens");
     assert_eq!(
         restarted
             .consumed_cursor(instance(2))
@@ -1331,7 +1335,7 @@ fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
     let path = directory.join("session.sqlite");
 
     let (surviving, withdrawn) = {
-        let broker = Broker::open(Some(&path)).expect("the broker opens");
+        let broker = Broker::open(Some(&path), session()).expect("the broker opens");
         broker.register_instance(
             instance(2),
             IntegrationMode::Gateway,
@@ -1407,7 +1411,7 @@ fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
     };
 
     // A restart reads back what the gap committed and what happened after it.
-    let restarted = Broker::open(Some(&path)).expect("the broker reopens");
+    let restarted = Broker::open(Some(&path), session()).expect("the broker reopens");
     assert!(
         restarted.pending(surviving).is_none(),
         "a resolved resource is not one a restart offers again"
