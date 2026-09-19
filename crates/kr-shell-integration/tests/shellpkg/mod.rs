@@ -265,6 +265,8 @@ pub struct Session {
     mark: usize,
     /// True once the shell has a reader of its own, which is what a step can be given to.
     pub reading: bool,
+    /// False while what is being written is not something the reader is waiting for.
+    stepping: bool,
     stream: UnixStream,
     /// True once the worker's end has gone, after which nothing is written or read.
     closed: bool,
@@ -422,6 +424,7 @@ impl Session {
             prompt,
             mark: 0,
             reading: false,
+            stepping: true,
             last_entry: None,
             stream,
             closed: false,
@@ -690,8 +693,13 @@ impl Session {
     }
 
     /// Answers one event.
+    ///
+    /// The reader asked for this and is not waiting on it, so it is not given a step of its own:
+    /// a session that stepped the reader for every acknowledgement would never let it be idle.
     pub fn answer_event(&mut self, id: RequestId, result: EventOutcome) {
+        self.stepping = false;
         self.write_frame(&BridgeFrame::EventResult { id, result });
+        self.stepping = true;
     }
 
     /// Sends one request to the reader thread and returns its identifier.
@@ -710,7 +718,7 @@ impl Session {
     pub fn nudge(&mut self) {
         // A key typed before the shell has a reader is not a step for it: it goes through the
         // terminal's own line discipline and waits there for the line it is part of.
-        if !self.reading || !dialect(self.package_kind).answers_at_the_next_step {
+        if !self.reading || !self.stepping || !dialect(self.package_kind).answers_at_the_next_step {
             return;
         }
         self.type_bytes(&[0x06]);
@@ -767,13 +775,21 @@ impl Session {
     /// Types a line and its return, at a prompt where this editor needs one.
     pub fn type_line(&mut self, line: &str) {
         if dialect(self.package_kind).types_at_the_prompt && !line.is_empty() {
-            self.wait_for_prompt();
+            assert!(
+                self.wait_for_prompt(),
+                "the shell drew no prompt to type {line:?} at:\n{}",
+                self.terminal_output()
+            );
             // The return goes in once the editor has drawn what was typed, which is where it is
             // reading the terminal itself. Before that the terminal's own line discipline holds
             // the line, and it sends a line feed where the return was.
             let start = self.output.lock().expect("the output lock").len();
             self.type_bytes(line.as_bytes());
-            self.wait_for_editor(start);
+            assert!(
+                self.wait_for_editor(start),
+                "the editor drew nothing for {line:?}:\n{}",
+                self.terminal_output()
+            );
             self.type_bytes(b"\r");
         } else {
             let mut bytes = line.as_bytes().to_vec();

@@ -219,6 +219,8 @@ struct BridgeState {
     /// True once the gesture has been looked at, so a terminal that starts with none is still
     /// followed when the person gives it one.
     gesture_followed: bool,
+    /// A reader underneath one that has just left, waiting to be announced with its own state.
+    resume_pending: bool,
 }
 
 struct BridgeStateCell(UnsafeCell<BridgeState>);
@@ -251,6 +253,7 @@ static STATE: BridgeStateCell = BridgeStateCell(UnsafeCell::new(BridgeState {
     gesture_previous: Vec::new(),
     gesture_bound: false,
     gesture_followed: false,
+    resume_pending: false,
 }));
 
 /// The bridge's own state. Main thread only, like the reader it belongs to.
@@ -441,14 +444,16 @@ pub unsafe extern "C" fn kr_shell_reader_state(out: *mut KrReaderState) {
     out.tty_typeahead_drained = c_int::from(out.pending_bytes == 0);
     out.macro_input_drained = c_int::from(out.queued_keys == 0);
     // Anything that owns input the reader has taken and not acted on holds this queue: a sequence
-    // it has peeked and not resolved, the first bytes of a character it has not finished,
-    // characters it has read and not yet put in the buffer, an input function waiting for its
-    // target, `get-key` waiting for a literal key, an operator waiting for the motion it applies
-    // to, and a count waiting for the command it counts.
+    // it has peeked and not resolved, the first bytes of a character or an escape sequence it has
+    // not finished, characters it has read and not yet put in the buffer, a paste it is still
+    // collecting, an input function waiting for its target, `get-key` waiting for a literal key,
+    // an operator waiting for the motion it applies to, and a count waiting for the command it
+    // counts.
     out.partial_key_drained = c_int::from(
         !(state.in_key_wait && state.peeked_keys > 0)
             && !state.partial_character
             && !state.accumulated_characters
+            && data.input_data.paste_buffer.is_none()
             && !state.pending_target
             && !state.pending_literal_key
             && !vi_operator
@@ -797,23 +802,32 @@ pub fn editor_leave(reader: &mut Reader<'_>, reason: c_int) {
     emit_leave(reader, reason);
 
     if state().reader_depth > 0 {
-        {
-            let state = state();
-            state.reader_revision += 1;
-            state.invoking_keys.clear();
-            state.invoking_key_count = 0;
-            state.invoking_byte = None;
-            state.peeked_keys = 0;
-            state.peeked_bytes = 0;
-            state.in_key_wait = false;
-            state.key_selected = false;
-            state.pending_target = false;
-            state.pending_literal_key = false;
-            state.source_pushed_back = false;
-            state.idle_reported = false;
-        }
-        emit_enter(reader);
+        // The reader underneath is not running yet: this one is still on the stack and its state
+        // is what would be reported. The one that resumes announces itself at its own next
+        // boundary, with its own buffer and its own queues.
+        let state = state();
+        state.reader_revision += 1;
+        state.invoking_keys.clear();
+        state.invoking_key_count = 0;
+        state.invoking_byte = None;
+        state.peeked_keys = 0;
+        state.peeked_bytes = 0;
+        state.in_key_wait = false;
+        state.key_selected = false;
+        state.pending_target = false;
+        state.pending_literal_key = false;
+        state.source_pushed_back = false;
+        state.idle_reported = false;
+        state.resume_pending = true;
     }
+}
+
+/// Announces a reader that has resumed underneath one that left, with its own state.
+fn announce_resumed(reader: &mut Reader<'_>) {
+    if !std::mem::take(&mut state().resume_pending) {
+        return;
+    }
+    emit_enter(reader);
 }
 
 /// Reads the mailbox and answers what is in it.
@@ -865,6 +879,7 @@ pub fn boundary(reader: &mut Reader<'_>) {
     if !managed() {
         return;
     }
+    announce_resumed(reader);
     state().key_selected = true;
     let _ = service(reader);
     let state = state();
@@ -880,6 +895,7 @@ pub fn before_wait(reader: &mut Reader<'_>) {
     if !registered() {
         return;
     }
+    announce_resumed(reader);
     if reader.kr_querying() || terminal_typeahead(reader.kr_input_fd()) > 0 {
         // A reader with bytes still waiting on its terminal has something left to read, whether
         // that is the person's typing or the answer to a question it asked the terminal itself.
@@ -925,6 +941,7 @@ pub fn pass_end(reader: &mut Reader<'_>) {
     if !registered() {
         return;
     }
+    announce_resumed(reader);
     if std::mem::take(&mut state().cancel_drain) {
         // The reader is out of whatever the cancellation ended, so the old lease's undelivered
         // input goes here rather than reaching the person's next prompt. The edit buffer, which
@@ -1032,6 +1049,16 @@ pub fn note_accumulated_characters(active: bool) {
 /// A directory change, which is one whether or not it ends where it started.
 pub fn note_cwd_changed() {
     state().cwd_revision += 1;
+}
+
+/// True once a takeover has ended the wait the reader is in.
+///
+/// The waits inside the reader's own decoding watch this: the sequence or character they are
+/// waiting for is exactly what the cancellation ended, so they give it up and go to what the
+/// cancellation put in the queue instead.
+pub fn cancelled() -> bool {
+    let state = state();
+    state.cancel_requested || state.cancel_drain
 }
 
 /// True while the bridge holds an answer it could not finish writing.

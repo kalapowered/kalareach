@@ -550,9 +550,10 @@ four things:
   that arrives while the reader is blocked is answered then rather than at the person's next key.
 - The mailbox is read at every key-sequence boundary: after one complete sequence has been resolved
   and before its binding runs, which is where the reader is between operations. Every wait the
-  reader can be in watches the endpoint alongside the terminal, including the wait for the rest of
-  a character and the timed wait for the rest of a sequence, and it watches for room to write while
-  an answer is still going out.
+  reader can be in watches the endpoint alongside the terminal: the wait for a key, the wait for
+  the rest of a character and the wait for the rest of an escape sequence. It watches for room to
+  write while an answer is still going out, and the two waits inside the reader's own decoding
+  give up what they are waiting for when a takeover ends them.
 - The end-of-file decision is a **named binding**, `kr-eof-decide`, in the reader's own command
   table. The guarded entry under `conf.d` puts it on the configured gesture once the person's own
   configuration has run, in every bind mode the shipped bindings use, keeps whatever was bound
@@ -601,10 +602,13 @@ Section 7 says this package does not claim that the stock public API has an asyn
 method, and that is exactly what it cannot do:
 
 - **The reader is reached when it steps.** The module's queue is serviced on the reader's own
-  thread, where the editor reads its own key queue: at the read-line entry and in front of every
-  chord the editor has a binding for. A request that arrives at a reader parked in its key wait is
-  therefore answered at its next step rather than immediately, and until then the reader's last
-  idle report is what the worker has to go on.
+  thread, after each of the editor's own operations has run: every chord the editor has a binding
+  for goes through the module, which runs the editor's operation and then reads the queue. The
+  read-line entry reports the reader and reads nothing, because the editor clears its buffer when
+  its read starts. A key the person bound to a script of their own is theirs and carries no
+  boundary, and an ordinary character goes straight to the editor's own insertion, so a request
+  that arrives at a parked reader is answered at its next bound key rather than immediately. Until
+  then the reader's last idle report is what the worker has to go on.
 - **A launch is installed where it is decided and accepted at the next step.** The decision, the
   state check and the installation all happen on the reader's thread, inside the fence, at a point
   where the reader is between operations: a key of the person's that has been read and not yet run
