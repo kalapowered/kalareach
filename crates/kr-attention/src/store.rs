@@ -52,9 +52,10 @@
 //!
 //! Every write here replaces the whole state, and it is made from the copy its owner has been
 //! holding, so two owners of one store would each replace the other's work with a picture of the
-//! world that predates it. There is one owner instead: opening a store on a path claims an
-//! exclusive lock on a file of its own beside it, holds it until the store is dropped, and refuses
-//! a second opener with [`Error::StoreHeld`] rather than letting it read a state it may not write.
+//! world that predates it. There is one owner instead: opening a store claims an exclusive lock on
+//! a file of its own beside it, named after what the operating system says the store *is* rather
+//! than after the name that reached it, holds it until the store is dropped, and refuses a second
+//! opener with [`Error::StoreHeld`] rather than letting it read a state it may not write.
 //! The lock is on a file of its own so the receipt journal and the question ledger, which share
 //! this store's file, keep writing through their own transactions throughout.
 //!
@@ -79,7 +80,7 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::engine::{Item, ItemAck, PendingInput};
-use crate::error::{Error, Result};
+use crate::error::{Error, Result, StoreFault};
 use crate::review::{ReviewAck, Subject, subject_key};
 use crate::time::{Anchor, BootMark, Elapsed, HostReading};
 use crate::visit::{Omitted, Visit};
@@ -156,8 +157,10 @@ pub struct Store {
 /// A whole-state write replaces everything, and it is made from the copy its owner has been
 /// holding, so two owners of one store would each replace the other's work with a picture of the
 /// world that predates it. There is one owner instead. The claim is an exclusive lock on a file of
-/// its own beside the store, held from before the state is read until this value is dropped, and
-/// released by the operating system if the process ends without dropping it. It is a file of its
+/// its own beside the store and named after what the operating system says the store *is* - its
+/// device and its number there - so every name for one database claims one lock. It is held from
+/// before the state is read until this value is dropped, and released by the operating system if
+/// the process ends without dropping it. It is a file of its
 /// own so that the receipt journal and the question ledger, which share the store's file, keep
 /// writing through their own transactions throughout.
 #[derive(Debug)]
@@ -170,8 +173,19 @@ struct Ownership {
 /// Short, because it is not a queue: the answer to a store somebody else owns is to say so.
 pub const OWNERSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// The name of the file a store's ownership is claimed on, beside the store itself.
-pub const OWNERSHIP_SUFFIX: &str = "-attention-owner";
+/// What the file a store's ownership is claimed on is called, before the store's own identity.
+pub const OWNERSHIP_PREFIX: &str = "attention-owner-";
+
+/// How a store and its ownership are opened: a file, never a URI.
+///
+/// SQLite reads a name beginning `file:` as a URI by default, and a URI carries a query after the
+/// path it names. A suffix appended to one of those changes the query rather than the file, so two
+/// names that look different would open one database - and an ownership claim meant for a file
+/// beside the store would land on the store's own file, where it would hold the lock the receipts
+/// and the question ledger need. A name here is a path.
+const FILE_ONLY: rusqlite::OpenFlags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+    .union(rusqlite::OpenFlags::SQLITE_OPEN_CREATE)
+    .union(rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX);
 
 impl Ownership {
     /// Claims the one ownership of the store at `path`, or says who has it.
@@ -181,9 +195,7 @@ impl Ownership {
     /// Returns [`Error::StoreHeld`] when another live owner holds it, and
     /// [`Error::StoreUnavailable`] when the claim itself cannot be made.
     fn claim(path: &Path) -> Result<Self> {
-        let mut name = path.as_os_str().to_os_string();
-        name.push(OWNERSHIP_SUFFIX);
-        let claim = Connection::open(std::path::PathBuf::from(name))?;
+        let claim = Connection::open_with_flags(Self::identity(path)?, FILE_ONLY)?;
         claim.busy_timeout(OWNERSHIP_TIMEOUT)?;
         // The transaction is never committed. It holds the file's write lock until this
         // connection closes, which is this value's drop or this process ending.
@@ -201,6 +213,80 @@ impl Ownership {
             }
             Err(error) => Err(error.into()),
         }
+    }
+
+    /// Returns the one name this store is claimed under, whatever name reached it.
+    ///
+    /// Ownership is of a database, not of a spelling. A symbolic link gives one database two
+    /// paths and a hard link gives it two real names, and two owners claiming two names would each
+    /// hold a lock the other never asks for, which is no ownership at all. So the claim is named
+    /// after what the operating system says the file *is* - the device it sits on and its number
+    /// there, read from an open handle rather than from the path - and it is placed beside the
+    /// file the path resolves to.
+    ///
+    /// **What this does not reach:** a second hard link to the store in another directory. Both
+    /// names are real and each resolves to its own directory, so the claim beside one is not the
+    /// claim beside the other. On a platform where this build cannot ask what a file is, a hard
+    /// link beside it is not reached either. Nothing this host does creates one.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::StoreUnavailable`] when the file cannot be opened, when what it is cannot
+    /// be read, or when the path cannot be resolved.
+    fn identity(path: &Path) -> Result<std::path::PathBuf> {
+        let unavailable = |what: &str, error: &dyn core::fmt::Display| Error::StoreUnavailable {
+            kind: StoreFault::Other,
+            detail: format!("{} {what}: {error}", path.display()),
+        };
+        // Opened, and created when it is not there yet, so the identity comes from a handle to the
+        // file rather than from the name that reached it.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|error| unavailable("cannot be opened", &error))?;
+        let metadata = file
+            .metadata()
+            .map_err(|error| unavailable("cannot be read", &error))?;
+        let resolved = std::fs::canonicalize(path)
+            .map_err(|error| unavailable("cannot be resolved", &error))?;
+        let directory = resolved.parent().unwrap_or_else(|| Path::new("."));
+        Ok(directory.join(format!(
+            "{OWNERSHIP_PREFIX}{}",
+            Self::file_mark(&metadata, &resolved)
+        )))
+    }
+
+    /// Returns what the operating system says this file is, as a name a claim can carry.
+    ///
+    /// The device it sits on and its number there, which every name for one database shares: a
+    /// symbolic link and a hard link both answer with the one the file actually is.
+    #[cfg(unix)]
+    fn file_mark(metadata: &std::fs::Metadata, _resolved: &Path) -> String {
+        use std::os::unix::fs::MetadataExt;
+
+        format!("{:x}-{:x}", metadata.dev(), metadata.ino())
+    }
+
+    /// The same, where this build cannot ask what a file is without leaving the standard library.
+    ///
+    /// The resolved path is what is left. It follows a symbolic link, so two paths for one file
+    /// still claim one lock; two *hard* links do not, because each is a real name of its own.
+    /// Nothing this host does creates a second hard link to a session's own store.
+    #[cfg(not(unix))]
+    fn file_mark(_metadata: &std::fs::Metadata, resolved: &Path) -> String {
+        use sha2::{Digest, Sha256};
+
+        let digest = Sha256::digest(resolved.as_os_str().as_encoded_bytes());
+        let mut mark = String::with_capacity(32);
+        for byte in digest.iter().take(16) {
+            use core::fmt::Write;
+
+            write!(mark, "{byte:02x}").expect("writing to a string cannot fail");
+        }
+        mark
     }
 }
 
@@ -414,7 +500,7 @@ impl Store {
         // Claimed before the file is opened, let alone read: an owner that read first and claimed
         // afterwards would already be holding a copy of the world it might not be allowed to write.
         let ownership = Ownership::claim(path)?;
-        let connection = Connection::open(path)?;
+        let connection = Connection::open_with_flags(path, FILE_ONLY)?;
         Self::prepare(connection, Some(ownership))
     }
 

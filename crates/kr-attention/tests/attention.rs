@@ -3788,3 +3788,38 @@ fn a_second_owner_of_one_store_is_refused_before_it_reads_anything() {
     assert_eq!(next.revision(&who), 1);
     assert!(next.inbox(&who, false, Content::Whole).is_empty());
 }
+
+#[test]
+fn one_database_is_one_owner_whatever_name_reaches_it() {
+    // Ownership is of a database, not of a spelling. A second name for the same file is the same
+    // store, and the second owner is refused exactly as it would be under the first name.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let held = Attention::open(&path, reading(0)).expect("the feature store opens");
+
+    // A symbolic link: another path, the same database.
+    let alias = directory.path().join("alias.db");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&path, &alias).expect("the link is made");
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&path, &alias).expect("the link is made");
+    let refused = Attention::open(&alias, reading(1_000));
+    assert!(
+        matches!(refused, Err(kr_attention::Error::StoreHeld { .. })),
+        "a link to the store is the store: {refused:?}"
+    );
+
+    // A hard link beside it: two real names, one database.
+    let second_name = directory.path().join("also.db");
+    std::fs::hard_link(&path, &second_name).expect("the link is made");
+    let refused = Attention::open(&second_name, reading(2_000));
+    assert!(
+        matches!(refused, Err(kr_attention::Error::StoreHeld { .. })),
+        "a second name for the store is the store: {refused:?}"
+    );
+
+    drop(held);
+    let next = Attention::open(&alias, reading(3_000)).expect("the store opens under either name");
+    drop(next);
+    let _ = Attention::open(&second_name, reading(4_000)).expect("and under the other");
+}
