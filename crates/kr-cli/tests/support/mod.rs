@@ -62,20 +62,26 @@ pub fn command_binaries() -> &'static Path {
 
 /// Removes the directories that earlier runs of these suites left in `temporary`.
 ///
-/// A directory is one of ours only if its name is the prefix above and a number, and it is removed
-/// only if no process is running under that number. The question is asked of the operating system
-/// rather than assumed from an age: a suite of these can take minutes, and a directory whose owner
-/// is still launching binaries out of it is not one to take away. A number that has since been
-/// given to something else keeps a directory one round longer, which costs nothing.
+/// A directory is one of ours if its name is the prefix above and ends in the number of the process
+/// that made it, and it is removed only if no process is running under that number. Whether the name
+/// of a test binary stands between the two makes no difference: that is the form each suite used
+/// while it kept a copy of this helper of its own, and it is the form of every directory those runs
+/// left behind, so a run that swept only its own form would tidy nothing that is actually there.
+///
+/// Whether the owner is running is asked of the operating system rather than assumed from an age: a
+/// suite of these can take minutes, and a directory whose owner is still launching binaries out of
+/// it is not one to take away. A number that has since been given to something else keeps a
+/// directory one round longer, which costs nothing.
 fn remove_what_earlier_runs_left(temporary: &Path) {
     let Ok(entries) = std::fs::read_dir(temporary) else {
         return;
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(owner) = name.to_str().and_then(|name| name.strip_prefix(PREFIX)) else {
+        let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(PREFIX)) else {
             continue;
         };
+        let owner = rest.rsplit('-').next().unwrap_or_default();
         if owner.is_empty() || !owner.bytes().all(|byte| byte.is_ascii_digit()) {
             continue;
         }
