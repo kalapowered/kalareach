@@ -78,10 +78,10 @@ impl Drop for Host {
     /// Nothing else reliably does. A session's shell runs in a terminal of its own, and whether
     /// closing the last handle to that terminal hangs it up depends on what the session's own
     /// tasks are still holding, so a test that returned early - because it finished, or because an
-    /// assertion failed part of the way through - cannot count on it. Most of these applications
-    /// end by themselves soon afterwards; the one above prints until something stops it, and a
-    /// process left forking a hundred times a second is what the next run of this binary would be
-    /// competing with.
+    /// assertion failed part of the way through - cannot count on it. None of these applications
+    /// ends by itself: each one waits on its terminal for a line, or prints until something stops
+    /// it, and a process left waiting or forking a hundred times a second is what the next run of
+    /// this binary would be competing with.
     ///
     /// Nothing is named by number here. `Session::force_close` is the host's own forced stop, and
     /// it signals through the handle the session holds, under the lock that keeps the session from
@@ -419,9 +419,9 @@ enum Event {
 /// A liveness bound is not a measurement. Every wait in this file but one is for a condition the
 /// session itself reports - a screen installed, an update carrying a line, a presentation the host
 /// names, a byte in the retained stream - and this bound is what a test that never reaches its
-/// condition fails at, rather than hanging. It is deliberately far outside the range the slowest
-/// host reaches under the load of every other suite beside it, so a test that is merely slow is
-/// not a failure. Nothing here samples what arrives inside a window, because a window that catches
+/// condition fails at, rather than hanging. It is the allowance chosen for that, far outside the
+/// range the slowest host this suite runs on reaches under the load of every other suite beside
+/// it. Nothing here samples what arrives inside a window, because a window that catches
 /// a delivery on an idle machine and misses it on a busy one proves nothing either way. The one
 /// exception is `HANDOFF_WINDOW`, which is about a product bound rather than about waiting.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
@@ -1015,6 +1015,10 @@ async fn a_projected_attachment_receives_bounded_updates_rather_than_a_repaint_p
         typist
             .type_bytes(&host, format!("{batch}\n").as_bytes())
             .await;
+        // The whole line, ending included, before the next one is typed. A line ending still on
+        // its way would be read with the line after it, and whatever that batch then produced
+        // would be behind the next fence rather than inside it.
+        produced(&host.runtime, format!("{batch}\r\n").as_bytes()).await;
         events.extend(
             collect_until(
                 &mut attached.client,
@@ -1102,9 +1106,10 @@ async fn subscribing_returns_the_state_at_a_cursor_and_queues_what_follows() {
         at > 0,
         "the session had produced output before this client arrived"
     );
-    // Written while the screen is still being installed, which is the half of this requirement a
-    // client attaching to a quiet session never reaches: what follows the cursor has to be queued
-    // behind the screen rather than folded into it or dropped for arriving too early.
+    // Asked for before the screen is read, which is the half of this requirement a client
+    // attaching to a quiet session never reaches: what follows the cursor has to be queued behind
+    // the screen rather than folded into it or dropped for arriving too early. Where the
+    // application gets to it is the machine's business; what this orders is the request.
     typist.type_bytes(&host, b"after\n").await;
     let events = collect_until(
         &mut attached.client,
@@ -1733,10 +1738,9 @@ async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() 
         "the session is holding this subscriber's place rather than waiting for it"
     );
     let at_overflow = host.runtime.session().output_cursor();
-    // The client that is still reading is given until it has something to show or has been told to
-    // resynchronise itself. Both are answers, and neither is a length of time: a client that has
-    // been told to resynchronise is sent nothing until it asks again, so the session is watched
-    // beside the socket rather than a window being given to whichever arrives first.
+    // The client that is still reading is read until one of the two things that can reach it does:
+    // the session draws it, or the session tells it to resynchronise. Both are answers, and
+    // neither is a length of time.
     let after = collect_until_drawn_or_told(
         &mut quick.client,
         "this client to be drawn the session or told it had fallen behind too",
@@ -1762,12 +1766,10 @@ async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() 
         "the terminal was still being read after the queue filled: the output cursor stood at \
          {at_overflow} and is at {afterwards}"
     );
-    // And what became of the client that was reading, named rather than inferred. It reads in
-    // windows, so on a host that delivers faster than those windows it can fall behind too: the
-    // same rule then applies to it and its own queue is the reason. What it must never be is a
-    // client left with a hole and no word, and a subscriber that has been told to resynchronise is
-    // sent nothing until it asks again, which is why "no events" is an answer here and not a
-    // failure.
+    // And what became of the client that was reading, named rather than inferred. A host that
+    // delivers faster than this client reads puts it behind too: the same rule then applies to it
+    // and its own queue is the reason. What it must never be is a client left with a hole and no
+    // word, which is why being told to resynchronise is an answer here and not a failure.
     let told = host
         .runtime
         .session()
@@ -2098,9 +2100,9 @@ async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() 
         "with nothing missing: {:?}",
         again.gap
     );
-    // The application writes again with the subscription answered and the screen not yet read, so
-    // the screen carrying nothing of what came after its cursor is this host's answer rather than
-    // an application that had not got there yet.
+    // The next line is asked for with the subscription answered and the screen not yet read, so
+    // the screen carrying nothing from after its cursor is this host's answer rather than an
+    // application that had not been asked yet.
     typist.release(&host).await;
     let mut batches = collect_output_until(
         &mut attached.client,
@@ -2108,9 +2110,11 @@ async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() 
         |seen| carries(&joined(seen), b"after-the-handoff"),
     )
     .await;
-    // One more line, released only once the last one has arrived, so everything the session had
-    // queued behind it is here: a byte of the screen sent a second time as though it were live
-    // would otherwise be behind the assertion rather than inside it.
+    // One more line, released only once the whole of the last one is in the engine, so everything
+    // that line produced is queued in front of the fence and inside this run: a byte of the screen
+    // sent a second time as though it were live would otherwise be behind the assertion rather
+    // than inside it, and a line ending still on its way would be read with the fence itself.
+    produced(&host.runtime, b"after-the-handoff\r\r\n").await;
     typist.release(&host).await;
     batches.extend(
         collect_output_until(
