@@ -382,13 +382,16 @@ pub struct ChangeSetVersionRecord {
     /// workspace this version was captured from, both filesystem identities, the base revision,
     /// the consistency class, the inclusion policy's five choices, the grant's sorted prefixes and
     /// the quiescence declaration, every captured path with its content digest, length, executable
-    /// bit, class, change kind and origin, and every exclusion with its reason. Two versions with
+    /// bit, content class, path class, change kind and origin, and every exclusion with its
+    /// reason. Two versions with
     /// the same digest are the same captured work.
     ///
     /// What it does **not** commit to: the provenance, the label, the capture instant, the free
     /// text of an exclusion's detail, and the Git object identifier a path's base side holds. The
-    /// first three are about who took this reading rather than what it is; the last two follow
-    /// from what is committed to, or are this host's own words about it.
+    /// first three are about who took this reading rather than what it is, and the last two are
+    /// this host's own words about the tree rather than the tree. A version whose base object
+    /// identifiers differed while everything above was the same would be the same captured work
+    /// against the same revision, which is what this digest is for.
     pub content_digest: Digest256,
     /// The label the caller gave the change set.
     pub label: String,

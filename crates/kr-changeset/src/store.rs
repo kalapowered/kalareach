@@ -479,6 +479,13 @@ impl Store {
             .connection
             .transaction()
             .map_err(ChangeSetError::store)?;
+        // A version that is derived from another names it, and a version whose parent is gone
+        // cannot say where it came from. The parent is required inside this transaction, so a
+        // deletion that ran while this one was being built refuses it rather than leaving a
+        // reference to something that is not there.
+        if let Some(parent) = row.derived_from {
+            Self::require_version(&transaction, row.change_set_id, parent)?;
+        }
         transaction
             .execute(
                 "INSERT INTO versions

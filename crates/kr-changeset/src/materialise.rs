@@ -796,10 +796,18 @@ fn derive_from(
 ///
 /// The removal goes **through the handle** this host opened and checked the identity of: every
 /// level is listed and emptied through its own open directory, and each name is taken away by the
-/// parent that holds it. A directory somebody substituted at the name is therefore not reached at
-/// all, rather than being emptied by a removal that resolved the name a second time. A removal
-/// this host could not finish is a failure: the materialisation goes on holding its version
-/// rather than losing that protection without its contents being gone.
+/// parent that holds it. A directory somebody substituted at the materialisation's own name is
+/// therefore not reached at all, rather than being emptied by a removal that resolved the name a
+/// second time. A removal this host could not finish is a failure: the materialisation goes on
+/// holding its version rather than losing that protection without its contents being gone.
+///
+/// What this does remove is **everything beneath that verified root**, including whatever the run
+/// put there, because that is what releasing a materialisation means: the directory is one this
+/// host made for one run and the run's output lives in it. It does not check each descendant
+/// against a record of what this host wrote, so a directory a same-account writer substituted
+/// *inside* the materialisation goes with it. That writer could have emptied it themselves; the
+/// stronger rule that D-057(b) puts on the profile's own temporary directories is for a case where
+/// this host cannot say it created the directory at all, and here it can.
 ///
 /// # Errors
 ///
