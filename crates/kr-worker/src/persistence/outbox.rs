@@ -50,7 +50,7 @@ impl Subsystem {
 
     /// Returns the subsystem a stored name refers to.
     #[must_use]
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn from_stored(value: &str) -> Option<Self> {
         match value {
             "session" => Some(Self::Session),
             "receipts" => Some(Self::Receipts),

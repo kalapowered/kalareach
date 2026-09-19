@@ -67,7 +67,7 @@ impl FaultKind {
 
     /// Returns the kind a stored name refers to.
     #[must_use]
-    pub fn from_str(value: &str) -> Option<Self> {
+    pub fn from_stored(value: &str) -> Option<Self> {
         match value {
             "absent" => Some(Self::Absent),
             "full" => Some(Self::Full),
@@ -456,8 +456,8 @@ mod tests {
             FaultKind::WriteFailed,
             FaultKind::Corrupt,
         ] {
-            assert_eq!(FaultKind::from_str(kind.as_str()), Some(kind));
+            assert_eq!(FaultKind::from_stored(kind.as_str()), Some(kind));
         }
-        assert_eq!(FaultKind::from_str("something else"), None);
+        assert_eq!(FaultKind::from_stored("something else"), None);
     }
 }

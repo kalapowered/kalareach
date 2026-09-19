@@ -332,7 +332,6 @@ pub fn store(name: &str) -> Option<&'static StoreDescriptor> {
 }
 
 /// Returns every store a history byte cap may evict.
-#[must_use]
 pub fn evictable_under_history_cap() -> impl Iterator<Item = &'static StoreDescriptor> {
     STORES
         .iter()

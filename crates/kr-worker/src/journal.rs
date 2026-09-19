@@ -1187,11 +1187,13 @@ impl Journal {
                 &self.health,
                 &transaction,
                 revocation,
-                "rejected",
-                &actor_id,
-                action_id,
-                None,
-                None,
+                NamedAction {
+                    kind: "rejected",
+                    actor_id: &actor_id,
+                    action_id,
+                    method: None,
+                    state: None,
+                },
             )?,
             None => false,
         };
@@ -1329,11 +1331,13 @@ impl Journal {
             &self.health,
             &self.connection,
             revision,
-            "possibly_executed",
-            &action.actor_id,
-            action.action_id,
-            Some(action.method.as_str()),
-            Some(action.state.as_str()),
+            NamedAction {
+                kind: "possibly_executed",
+                actor_id: &action.actor_id,
+                action_id: action.action_id,
+                method: Some(action.method.as_str()),
+                state: Some(action.state.as_str()),
+            },
         )
     }
 
@@ -2519,9 +2523,9 @@ impl Journal {
             let (kind, detail, faulted_at, recovered_at, durable_through, resumed_at) =
                 row.map_err(unavailable)?;
             gaps.push(crate::persistence::fault::RecoveryGap {
-                kind: crate::persistence::fault::FaultKind::from_str(&kind).ok_or_else(|| {
-                    unavailable_detail("a stored fault kind is not one this build writes")
-                })?,
+                kind: crate::persistence::fault::FaultKind::from_stored(&kind).ok_or_else(
+                    || unavailable_detail("a stored fault kind is not one this build writes"),
+                )?,
                 detail,
                 faulted_at_ms: TimestampMs::new(u64::try_from(faulted_at).unwrap_or(0)),
                 recovered_at_ms: TimestampMs::new(u64::try_from(recovered_at).unwrap_or(0)),
@@ -2597,7 +2601,7 @@ impl Journal {
                 event: OutboxEvent {
                     event_id: uuid_from(&event_id)?,
                     stream: parse_stream(&stream)?,
-                    source: Subsystem::from_str(&source).ok_or_else(|| {
+                    source: Subsystem::from_stored(&source).ok_or_else(|| {
                         unavailable_detail("a stored subsystem is not one this build writes")
                     })?,
                     actor_id: actor_id
@@ -2895,11 +2899,7 @@ fn name_evidence(
     health: &crate::persistence::fault::JournalHealth,
     connection: &Connection,
     revision: u64,
-    kind: &str,
-    actor_id: &ActorId,
-    action_id: ActionId,
-    method: Option<&str>,
-    state: Option<&str>,
+    named: NamedAction<'_>,
 ) -> Result<bool> {
     let revision = i64::try_from(revision).unwrap_or(i64::MAX);
     let changed = connection
@@ -2913,15 +2913,30 @@ fn name_evidence(
              )",
             params![
                 revision,
-                kind,
-                actor_id.as_str(),
-                action_id.get().as_bytes().as_slice(),
-                method,
-                state
+                named.kind,
+                named.actor_id.as_str(),
+                named.action_id.get().as_bytes().as_slice(),
+                named.method,
+                named.state
             ],
         )
         .map_err(|error| faulted(health, error))?;
     Ok(changed > 0)
+}
+
+/// One action a fence named, as the evidence row records it.
+#[derive(Clone, Copy, Debug)]
+struct NamedAction<'a> {
+    /// Whether the fence rejected it or named it as possibly executed.
+    kind: &'a str,
+    /// The actor whose action it was.
+    actor_id: &'a ActorId,
+    /// The action.
+    action_id: ActionId,
+    /// The method, for a name the daemon reports to a person.
+    method: Option<&'a str>,
+    /// The receipt state the name was taken at.
+    state: Option<&'a str>,
 }
 
 fn parse_state(text: &str) -> Result<ReceiptState> {
