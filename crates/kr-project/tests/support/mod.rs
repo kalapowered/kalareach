@@ -286,6 +286,37 @@ pub fn ordinary_repository(parent: &Path, name: &str) -> PathBuf {
     path
 }
 
+/// Creates a named pipe nothing ever writes to, and returns its path.
+///
+/// Opening one for reading blocks until a writer arrives, so a child pointed at one cannot finish
+/// on its own. That is what a test of the host's deadline needs: a child whose only way out is the
+/// host ending it, rather than a real command racing a bound it might beat on a fast machine.
+///
+/// # Panics
+///
+/// Panics when the pipe cannot be created, and when what was created is not one.
+#[cfg(unix)]
+#[must_use]
+pub fn pipe_nothing_writes_to(parent: &Path, name: &str) -> PathBuf {
+    use std::os::unix::fs::FileTypeExt;
+
+    let path = parent.join(name);
+    let made = Command::new("mkfifo")
+        .arg(&path)
+        .status()
+        .expect("mkfifo runs on this host");
+    assert!(made.success(), "a named pipe at {}", path.display());
+    let kind = std::fs::symlink_metadata(&path)
+        .expect("the pipe this test just made")
+        .file_type();
+    assert!(
+        kind.is_fifo(),
+        "{} is a named pipe rather than {kind:?}",
+        path.display()
+    );
+    path
+}
+
 /// Writes one file, creating the directories above it.
 ///
 /// # Panics

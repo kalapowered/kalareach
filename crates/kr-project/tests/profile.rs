@@ -27,7 +27,7 @@ use kr_protocol::project::{AdoptionFlow, ProjectAdoptParams, WorkspaceKind};
 
 use support::{
     Fixture, action, actor, destination, include_everything, installed_broker, ordinary_repository,
-    planted_repository, restricted_profile_fixture, write,
+    pipe_nothing_writes_to, planted_repository, restricted_profile_fixture, write,
 };
 
 #[test]
@@ -413,23 +413,44 @@ fn the_audit_reads_the_repositorys_own_configuration_through_the_profile() {
 fn a_git_invocation_that_runs_too_long_is_stopped_and_says_so() {
     // The bound is the host's rather than the repository's, and a subprocess that outlives it is
     // ended by the handle this host holds rather than by a name or a pattern.
+    //
+    // So the child here is one that cannot finish on its own: the configuration file it is asked
+    // to read is a named pipe nothing ever writes to, and a reader of one of those waits in the
+    // open until a writer arrives. Only the host ends it, which is the path this test is about.
+    // A real command under a bound shorter than it takes would not do: `run` answers a child that
+    // has already exited with the child's own output, so on a host fast enough to finish first the
+    // test would assert nothing, and how fast the host is would decide what was tested.
     let fixture = Fixture::create();
     let path = ordinary_repository(fixture.work(), "slow");
-    let arguments: [&OsStr; 3] = [
+    let unwritten = pipe_nothing_writes_to(fixture.work(), "configuration-nothing-writes");
+    let arguments: [&OsStr; 5] = [
         OsStr::new("config"),
         OsStr::new("--list"),
         OsStr::new("--null"),
+        OsStr::new("--file"),
+        unwritten.as_os_str(),
     ];
     let request =
-        GitRequest::read(&path, &arguments).with_deadline(std::time::Duration::from_nanos(1));
+        GitRequest::read(&path, &arguments).with_deadline(std::time::Duration::from_millis(250));
+    let started = std::time::Instant::now();
     let refusal = fixture
         .service()
         .profile()
         .run(&request)
-        .expect_err("a deadline of a nanosecond is not met");
+        .expect_err("a child that cannot finish is stopped rather than waited on for ever");
+    let waited = started.elapsed();
+    let said = refusal.to_string();
     assert!(
-        refusal.to_string().contains("was stopped"),
-        "the refusal says the invocation was stopped: {refusal}"
+        said.contains("ran longer than 250 milliseconds and was stopped"),
+        "the refusal says the invocation was stopped and what it ran past: {refusal}"
+    );
+    assert!(
+        !said.contains("could not confirm"),
+        "the host ended what it started and knows it did: {refusal}"
+    );
+    assert!(
+        waited >= std::time::Duration::from_millis(250),
+        "the deadline was waited out rather than declared: {waited:?}"
     );
 }
 
