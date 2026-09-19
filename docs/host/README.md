@@ -2951,3 +2951,204 @@ is not showing is neither drawn nor described: not its rows, not its saved curso
 negotiation. Attachment bytes are a second question from the attachment reference, and need their
 own `files.read`. An invitation may name current questions or approval requests explicitly, which
 permits those exact decisions and not the conversation they came from.
+## The broker
+
+One worker owns one broker, and the broker owns everything an upstream application's meaning is
+built out of: the processes it launched, their credentials, the immutable frames they produced,
+the pending resources those frames imply, and the arbitration that resolves them.
+
+It is one lock, over the state **and** the durable records together. Every change is validated
+against the state as it is, written to the ledger conditionally on the state that write expects to
+find, and only then applied in memory. A failed or racing write therefore leaves memory exactly as
+it was, and there is no window in which a check has passed and the thing it checked has already
+moved.
+
+The durable records live in the worker's own journal file, beside the receipts and the questions,
+with their own `broker_schema` version row. A plugin-host crash cannot touch them, because none of
+them is in the plugin process.
+
+### Three grants, held apart
+
+A binding holds any of three grants, and holding one is never holding another.
+
+| Grant | What it permits |
+| --- | --- |
+| Observation | Presenting what the upstream is doing, and inferring status from it |
+| Upstream action | Preparing a declared prompt, command, attachment or cancellation |
+| Approval interpreter | Reading a native request and encoding an answer to it |
+
+A component that holds observation alone is display-only: it can present a conversation and it
+cannot create an approval, whatever its output says about itself. Withdrawing one grant leaves the
+others exactly as they were, and withdrawing the interpreter grant also withdraws the decoding
+trust that depended on it, because a trust record nobody will act on is one somebody will
+eventually read as permission.
+
+### Decoding trust
+
+An installed connector is a semantic trust boundary, and the record that says so names the package
+identifier, the publisher, the digest of the exact component bytes, the upstream methods it covers,
+the projection schema versions it may write against and how many decisions one projection may
+offer. Trust granted to one package is never another's: a binding whose package, publisher or
+digest differs from the record is refused when it is bound, not when it first decodes something.
+
+The ledger retains, for every request a decoder interpreted: the package and its publisher, the
+digest of its bytes, the upstream method and request identifier, the original source bytes whole,
+the source generation, the exact decisions offered and the deadline. A request too large to retain
+whole never becomes an approval; it is still forwarded opaquely, where nothing depends on this host
+being able to reproduce it.
+
+### Action tokens
+
+Every action callback receives a token bound to five things: the verified actor, which of the three
+grants authorised it, the application and binding revision it was issued against, the declared
+action, and the hash of the parameters. It is spent once, and both the issue and the spend check
+the present: the binding still exists, still holds that grant, is not disabled by a component
+fault, the instance is not suspended, the revision is the one in force, and the capability the
+action needs is still usable at the revision the caller read it at.
+
+### Capability evidence
+
+A per-installation map, not a label on an agent's name: two installations of one agent have two
+maps. Each record names the capability and its version, the exact identity it was gathered against
+(the binary digest, the schema version, the package, the signed qualification profile, the launch
+profile, the binding and its revision), the state, where the evidence came from and what makes it
+stale.
+
+Evidence is never permission. Only a probe this host ran or a binding that performed the operation
+here can say a capability works here; a signed catalogue record is evidence about a version. A
+probe declares the operations it will perform and the budget it may spend before it runs, and a
+probe with a destructive effect needs its own isolated test context.
+
+Invalidation is by what the change was about. An installed upgrade invalidates the records that
+name the binary and leaves a running binding's correctly pinned record exactly as it was. A record
+only ever moves forward: a late answer at a revision the host has already passed is refused rather
+than allowed to restore availability that was withdrawn.
+
+### Launch profiles
+
+A profile records the resolved executable and its digest, the distribution, the version, the
+argument vector, what is known about authentication, and the integration mode. It is written before
+the launch, so a refused launch still leaves a record of what was going to be run.
+
+A launch intent is prepared against the idle root shell and executed against it. If an application
+has taken the foreground, or the prompt has moved, the launch is refused — and refusing is the
+whole answer. There is no path in this code that writes the command into whatever is reading the
+terminal.
+
+One saved conversation takes one live execution. A second launch against it is refused and names
+the instance that owns it. A native thread selection moves the reservation with it, so the
+conversation an instance left is free and the one it took is not.
+
+### What a native exit ends
+
+A native terminal application's intentional exit ends its instance and names the backend to stop,
+by the full process identity this host recorded. Closing a KalaReach attachment ends nothing: the
+application keeps running in the worker's pseudo-terminal. A backend this host did not launch is
+never claimed or stopped as owned, however the instance ended.
+
+## The gateway
+
+A native terminal reaches its upstream through a path core code alone interprets. The connector
+supplies a qualified declarative table: how its protocol frames, which member carries the request
+identifier, which carries the method, and what each method does. Nothing on that path calls a
+component.
+
+Only an authenticated worker-launched native connection may use it. Opening one requires the
+process identity of a launch this host made *and* the private exchange of that launch; a rich
+client or a component cannot ask for the native origin at all, so nothing can label itself native
+to escape the rich method table.
+
+A request the table does not classify is presumed mutation-capable, forwarded exactly as it is, and
+suspends that instance's rich mutations until the binding is reconciled. The terminal stays usable
+throughout: suspension is a state a client reads, not an error it hits.
+
+Downstream request identifiers are namespaced by connection, so two connections that both call
+their first request `1` are two different pending resources. The upstream's own identifier is
+carried exactly as it wrote it, string or number; an upstream identifier never becomes a KalaReach
+identifier. One resource takes one response transition.
+
+The rich method table is closed and versioned. A method with no entry is rejected; one listed as
+unsupported is rejected with its own reason. Both tables are pinned to an upstream protocol version
+and refused against another.
+
+Upstream reverse requests for filesystem and terminal operations execute in the agent's own host
+environment, under the user the agent runs as. The site comes from the connection rather than from
+the request, so it cannot be pointed at a phone or another desktop client's filesystem.
+
+Every action records how it actually reached the upstream: a typed remote procedure call, an
+authenticated hook response, or terminal input. Terminal input is never an authoritative typed
+result, and the vocabulary says so rather than leaving it to a caller's judgement.
+
+## Volatile-native mode
+
+When the journal faults during live traffic the gateway enters `native_only_volatile`, atomically:
+rich work is fenced, every unresolved resource is marked volatile, the identifiers that were
+already claimed or dispatched are counted and carried, and the gap is opened.
+
+What continues is the qualified native forwarding path and its in-memory arbitration. What stops is
+everything rich: a new interpretation, a rich mutation and a rich approval are all refused with
+`UPSTREAM_UNAVAILABLE`, because the caller needs to know that this operation cannot reach the
+upstream now and that no second backend was opened to make it look as though it did. Nothing is
+relabelled: a rich client is still a rich client and still cannot forward.
+
+The gap is exposed while it is open, with when it started, why, how many native requests and
+responses passed through it, how many rich operations it refused, and how many claimed identifiers
+it carried.
+
+Recovery is two steps because it can fail. Storage returning begins it; committing the gap finishes
+it. The commit is one transaction over the gap and every resource the gap touched, in whatever
+state each actually reached, including the ones the upstream withdrew inside it. Rich work comes
+back only after that commit, and the pending identifiers are then reconciled with the same
+upstream. A failure part way leaves nothing committed and the fence back in place. Volatile
+operations are never replayed to manufacture durable history: a resource that lived through a gap
+says so for the rest of its life, and its later transitions are written down like anything else.
+
+## The local listener
+
+A launched agent reaches its worker-owned backend on a private Unix socket inside the owner-only
+runtime directory where the platform has one, and on loopback with a random per-launch credential
+where it does not. Either way the address is local; nothing here can produce an address a relay
+could carry, and the listener is never exposed through iroh.
+
+A connection carrying any header a browser adds — `origin`, `referer`, `sec-fetch-site`,
+`sec-fetch-mode`, `sec-websocket-key`, `access-control-request-method` — is refused. A page that
+guesses the address still cannot speak to it.
+
+Registration authenticates against the launch and process binding **and** a private exchange. An
+environment-variable session identifier is carried so a person debugging can see what the
+application thought it was, and it is never authority. The registration file is the small file
+section 11 prefers: where to connect, which launch, which process this host expects. It carries no
+credential, and neither does any address a diagnostic prints or any argument vector.
+
+The credential itself travels in an owner-only file the launched process opens. On a platform where
+the host cannot read back the owning user and the mode bits of the directory it wrote into, that
+file is not written at all: a secret in a file whose protection cannot be proved is worse than no
+file, and the launch authenticates over the endpoint's own access-controlled channel instead.
+
+An executable upgrade affects new launches. An existing binding keeps the binary identity, schema
+and adapter version it was bound to, because the identity is pinned when the process starts and
+nothing that happens on disk afterwards reaches it.
+
+## Agent methods
+
+The method registry decides what an actor must present. The broker decides everything about the
+instance, and the two are separate because a caller can hold every right in the table and still be
+acting on a conversation that changed underneath it.
+
+An agent read names one exact application instance, answers with the capability evidence it was
+answered under, and says how many entries the history filter withheld and whether the range the
+reader asked for had been evicted. A gap is reported, never filled: nothing reconstructs an
+unobserved pending approval from a transcript or a screen.
+
+The five agent mutations each carry the binding revision they were prepared against. A revision
+behind the one in force is `STALE_SESSION`; a draft that moved is `DRAFT_CONFLICT`. A steer or a
+cancellation names the turn it acts on and is refused rather than redirected when that turn is not
+the one running. An approval answer is one of the decisions the request actually offered, checked
+against the retained list before the claim is taken, and it happens once.
+
+`plugin.action.invoke` validates the registered action, the grant that action declares, its effect
+class and its draft and request preconditions, and then issues the action token that authorises the
+one invocation that follows.
+
+An adapter checkpoints the cursor it consumed. A restart replays from after it; a range that was
+evicted rebuilds from what is verifiably retained and says there is a gap.

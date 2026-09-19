@@ -158,6 +158,14 @@ pub enum WorkerError {
     /// A question could not be created, read or resolved.
     #[error("{0}")]
     Question(#[from] crate::questions::QuestionError),
+    /// The broker refused, or could not reach, what the request named.
+    ///
+    /// The broker has refusals the rest of this worker does not: an upstream that cannot safely
+    /// continue, a rich method outside the closed table, a component asked to do something no
+    /// grant of its permits. Each already maps to a code section 23 lists, so this carries the
+    /// failure rather than flattening it.
+    #[error("{0}")]
+    Broker(#[from] crate::broker::BrokerError),
 }
 
 impl WorkerError {
@@ -203,6 +211,7 @@ impl WorkerError {
             Self::Ipc(error) => error.code(),
             Self::Verification(_) => ErrorCode::PermissionDenied,
             Self::Question(error) => error.code(),
+            Self::Broker(error) => error.code(),
         }
     }
 

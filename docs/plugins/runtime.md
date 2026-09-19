@@ -419,9 +419,25 @@ declared effect class, and claims and dispatches. Pending and dispatch state liv
 broker ledger, never in a component and never in the plugin host, which is why a plugin-host crash
 cannot destroy an approval ledger.
 
-The broker itself, the gateway, the native proxy and action tokens are a separate piece of work. What
-it builds on is the API in `crates/kr-plugin-runtime`: prepare a binding, offer events to its queue,
-invoke a control, ask for an interpretation, take a checkpoint, unbind.
+The broker lives in `crates/kr-worker/src/broker`, and it builds on the API in
+`crates/kr-plugin-runtime`: prepare a binding, offer events to its queue, invoke a control, ask for
+an interpretation, take a checkpoint, unbind. `docs/host/README.md` has its whole contract; what
+matters from this side is the order:
+
+1. The broker records the opaque native request **before** it forwards it, and forwards it whether
+   or not any component is healthy.
+2. A component's `decode-request` returns a projection. The broker checks the binding's
+   approval-interpreter grant, the decoding-trust record that names *this* package at *this*
+   digest, the method that record covers, the projection's schema version and decision count, the
+   source frame's generation, and that this source event has not already produced an
+   interpretation. Only then does the request become something a person can answer.
+3. A component's `encode-response` returns bytes. The broker rechecks the actor, the grant, the
+   binding revision and the decoder's right to answer, checks the decision against the ones the
+   request actually offered, commits the dispatch marker, and only then may the answer go.
+
+A component that is faulted, disabled or slow changes none of step 1. That is the whole of the
+separation: rich meaning is a thing the broker asks for, and the native path does not wait for the
+answer.
 
 Offering an event never waits at all. Every call carries the caller's own deadline and returns when
 it runs out, so nothing on the terminal path can end up behind a component. `unbind` is the one that

@@ -1758,6 +1758,35 @@ impl Broker {
         Ok(())
     }
 
+    /// Returns the binding one package holds against one instance.
+    ///
+    /// A package may be bound to several instances, and an action names the instance it acts on,
+    /// so the pair is what identifies the binding rather than the package alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when no binding of that package is bound to that
+    /// instance.
+    pub fn binding_for(
+        &self,
+        plugin_id: &PluginId,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Result<BrokerBindingId> {
+        self.state()
+            .bindings
+            .values()
+            .find(|binding| {
+                &binding.plugin_id == plugin_id
+                    && binding.application_instance_id == application_instance_id
+            })
+            .map(|binding| binding.binding_id)
+            .ok_or_else(|| {
+                BrokerError::unknown(format!(
+                    "{plugin_id} is not bound to {application_instance_id}"
+                ))
+            })
+    }
+
     /// Returns one registered action.
     ///
     /// # Errors

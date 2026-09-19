@@ -230,6 +230,8 @@ pub struct WorkerService {
     /// announcement, most of all - would otherwise not be acted on until that wait ended. There is
     /// one waiter, and a signal raised while it is between waits is kept for the next one.
     attention_wake: tokio::sync::Notify,
+    /// The trusted broker: the agent processes, their gateway and the resources it arbitrates.
+    broker: Arc<crate::broker::Broker>,
     build_id: kr_protocol::ids::BuildId,
 }
 
@@ -278,6 +280,12 @@ impl WorkerService {
     pub fn attention(&self) -> &Arc<crate::attention::Attention> {
         &self.attention
     }
+
+    /// Returns this session's trusted broker.
+    #[must_use]
+    pub fn broker(&self) -> &Arc<crate::broker::Broker> {
+        &self.broker
+    }
 }
 
 impl std::fmt::Debug for WorkerService {
@@ -318,6 +326,12 @@ impl WorkerService {
             binding.journal_path.as_deref(),
             runtime.session().time(),
         )?);
+        // The broker's records live in the same journal file, beside the receipts and the
+        // questions, with their own version row.
+        let broker = Arc::new(crate::broker::Broker::open(
+            binding.journal_path.as_deref(),
+            session_id,
+        )?);
         let clock = Arc::new(SystemContinuousClock::new());
         // The session's own, not a second one: the check this service makes before a batch is
         // accepted and the fence the writer applies before it is written have to be reading the
@@ -348,6 +362,7 @@ impl WorkerService {
             admitted: Mutex::new(std::collections::BTreeMap::new()),
             remote_attachments: Mutex::new(std::collections::BTreeSet::new()),
             questions,
+            broker,
             build_id: binding.build_id,
         })
     }
@@ -1990,6 +2005,9 @@ impl WorkerService {
             Method::AttentionRead => self.attention_read(caller, &request.params),
             Method::ReviewRead => self.review_read(&caller.actor_id, &request.params),
             Method::VisitChanged => self.visit_changed(caller, &request.params),
+            Method::AgentCapabilities => self.agent_capabilities(&request.params),
+            Method::AgentSnapshot => self.agent_snapshot(&request.params, caller),
+            Method::AgentCommands => self.agent_commands(&request.params),
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a read this worker serves",
                 method.as_str()
@@ -3204,6 +3222,30 @@ impl WorkerService {
                     self.question_clock(),
                 )?)
             }
+            // Every agent mutation names one subject, and the subject names this session. What
+            // the broker checks is everything about the instance and the binding; this is the
+            // envelope check the other methods make here, and nothing more.
+            Method::AgentPromptSubmit | Method::AgentPromptQueue => {
+                let params: kr_protocol::agent::AgentPromptParams = parse(&mutation.params)?;
+                Self::check_session(session, params.target.subject.session_id)
+            }
+            Method::AgentTurnSteer => {
+                let params: kr_protocol::agent::AgentSteerParams = parse(&mutation.params)?;
+                Self::check_session(session, params.target.subject.session_id)
+            }
+            Method::AgentTurnCancel => {
+                let params: kr_protocol::agent::AgentCancelParams = parse(&mutation.params)?;
+                Self::check_session(session, params.target.subject.session_id)
+            }
+            Method::AgentApprovalRespond => {
+                let params: kr_protocol::agent::AgentApprovalRespondParams =
+                    parse(&mutation.params)?;
+                Self::check_session(session, params.target.subject.session_id)
+            }
+            Method::PluginActionInvoke => {
+                let params: kr_protocol::agent::PluginActionInvokeParams = parse(&mutation.params)?;
+                Self::check_session(session, params.target.subject.session_id)
+            }
             // An action belongs to the actor that submitted it, or to the host owner over anybody
             // else's, and the receipt itself is the subject: nothing else about the request decides
             // whether it may be cancelled. Whose it is, and whether there is one at all, are what
@@ -3710,6 +3752,44 @@ impl WorkerService {
     }
 
     /// Returns the two clocks a question's deadlines are measured on.
+    /// Answers `agent.capabilities`: what this installation can do, with its evidence.
+    fn agent_capabilities(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::agent::AgentCapabilitiesParams = parse(params)?;
+        encode(&self.broker.agent_capabilities(&params)?)
+    }
+
+    /// Answers `agent.snapshot`, through the actor's own history filter.
+    ///
+    /// The shared host-side filter is T-039's. What this passes is the lower bound a grant
+    /// carries, which is the part this worker decides; the answer says how much was withheld, so a
+    /// reader can tell a filtered answer from a complete one either way.
+    fn agent_snapshot(&self, params: &ParamsValue, caller: &Caller) -> Result<ParamsValue> {
+        let params: kr_protocol::agent::AgentSnapshotParams = parse(params)?;
+        let filter = crate::broker::GrantLowerBound {
+            from: kr_protocol::ids::StreamCursor::new(0),
+        };
+        let _ = caller;
+        encode(&self.broker.agent_snapshot(&params, &filter)?)
+    }
+
+    /// Answers `agent.commands`: what the bound agent advertises.
+    fn agent_commands(&self, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::agent::AgentCommandsParams = parse(params)?;
+        encode(&self.broker.agent_commands(&params)?)
+    }
+
+    /// Returns the broker caller for one verified actor.
+    fn broker_caller(caller: &Caller) -> crate::broker::Caller {
+        crate::broker::Caller {
+            actor_id: caller.actor_id.clone(),
+            grant_id: caller
+                .grant_id
+                .as_ref()
+                .copied()
+                .unwrap_or_else(|| kr_protocol::ids::GrantId::new(kr_ipc::new_uuid())),
+        }
+    }
+
     fn question_clock(&self) -> crate::questions::Now {
         crate::questions::Now {
             utc_ms: kr_ipc::now_ms(),
@@ -4162,6 +4242,54 @@ impl WorkerService {
                 let result = self
                     .attention
                     .acknowledge_visit(&caller.actor_id, &params)?;
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            // The five agent mutations and the plugin action call. Each is applied by the broker,
+            // which is where the binding revision, the capability evidence, the grant and the
+            // arbitration live; what happens here is the parse and the hand-over.
+            Method::AgentPromptSubmit | Method::AgentPromptQueue => {
+                let params: kr_protocol::agent::AgentPromptParams = parse(params)?;
+                let queued = method == Method::AgentPromptQueue;
+                let result =
+                    self.broker
+                        .agent_prompt(&Self::broker_caller(caller), &params, queued)?;
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            Method::AgentTurnSteer => {
+                let params: kr_protocol::agent::AgentSteerParams = parse(params)?;
+                let result = self
+                    .broker
+                    .agent_steer(&Self::broker_caller(caller), &params)?;
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            Method::AgentTurnCancel => {
+                let params: kr_protocol::agent::AgentCancelParams = parse(params)?;
+                let result = self
+                    .broker
+                    .agent_cancel(&Self::broker_caller(caller), &params)?;
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            Method::AgentApprovalRespond => {
+                let params: kr_protocol::agent::AgentApprovalRespondParams = parse(params)?;
+                let (result, _) = self.broker.agent_approval_respond(
+                    &Self::broker_caller(caller),
+                    &params,
+                    kr_ipc::now_ms(),
+                )?;
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            Method::PluginActionInvoke => {
+                let params: kr_protocol::agent::PluginActionInvokeParams = parse(params)?;
+                let binding_id = self.broker.binding_for(
+                    &params.plugin_id,
+                    params.target.subject.application_instance_id,
+                )?;
+                let result = self.broker.plugin_action_invoke(
+                    &Self::broker_caller(caller),
+                    binding_id,
+                    &params,
+                    kr_ipc::now_ms(),
+                )?;
                 Ok((encode(&result)?, AfterEffect::None))
             }
             _ => Err(WorkerError::InvalidArgument(format!(
