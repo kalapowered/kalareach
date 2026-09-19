@@ -580,6 +580,158 @@ reservation, which is a lock this daemon holds rather than a fact about the work
 | `HOST_NOT_CONFIGURED` | Installed Git is missing or older than the profile needs |
 | `STORAGE_UNAVAILABLE` | The journal or the service's own directories |
 
+## Change sets
+
+A **change set** names exact work. A version of one is immutable: it records which repository and
+which working copy it came from, the revision it is against, every selected path with the digest of
+its content, the dirty, untracked and binary changes it includes, everything it leaves out and why,
+the policy and grant it was captured under, and where it came from. New edits produce a new version;
+nothing ever changes what an earlier test or review was about.
+
+| Method | What it does | Authority |
+| --- | --- | --- |
+| `diff.read` | A working copy's changes, or a captured version's, with both sides' content revisions | `files.read` |
+| `changeset.capture` | An immutable version of a working copy | `changeset.create` |
+| `changeset.read` | One exact version, every version beside it, and everything that names it | `files.read` |
+| `changeset.materialize` | An independent copy of one exact version, in a directory of this host's own | `workspace.manage` |
+| `diff.apply` | Applies a version at a named destination class | `files.apply_diff` |
+| `diff.revert` | Puts the base's own content back for the paths a version changed | `files.apply_diff` |
+
+### The base is the commit, and the index is not it
+
+A version is against a **revision**. What the captured tree is compared with is the commit `HEAD`
+names, never the index, so a staged change is an uncommitted change like any other: a staged
+addition is a path the base never held, a staged deletion is a path the base does hold, and
+excluding an uncommitted change falls back to what the commit has rather than to what is staged.
+
+### How consistent the source was, and the mechanism behind each answer
+
+Three classes, no default, and no fourth that means "probably fine". A capture is described as what
+it actually was.
+
+| Class | What it rests on |
+| --- | --- |
+| `atomic_snapshot` | The base commit's **own tree**, walked from `<revision>^{tree}` through immutable tree objects and read blob by blob. The commit is immutable and so is everything under it, so the whole listing is one instant by construction. Nothing of the working tree is read |
+| `quiesced_capture` | The caller declared the tree quiesced, **and** no session and no automation run this host knows of held the workspace before or after the read, **and** every per-file and selection check passed. A declaration alone never decides it |
+| `per_file_capture` | Files read one at a time from a live tree, each one the same object of the same length written at the same instant after its read as before it, with the base revision, the index and the status unchanged at the end |
+
+No filesystem this service runs on offers an unprivileged atomic snapshot of a directory tree, so
+there is no fourth mechanism and no capture is described as one. A caller can require a class, and
+a capture that cannot reach the one it asked for is refused rather than served a weaker one under
+that name. A source that keeps changing is retried within a bound and then rejected with
+`SOURCE_CHANGED`.
+
+What `quiesced_capture` does **not** exclude is an editor outside KalaReach. The record says so in
+its own words.
+
+### What a capture will not read
+
+The grant and the rules decide before anything is opened, in this order, and a path any of them
+removes is never opened at all:
+
+1. A repository's own administrative data. Git reports an untracked nested repository as one
+   directory, and descending into it would reach its configuration, which holds its remotes and can
+   hold a credential, and its object database, which holds every version of every file in it.
+2. This host's own secret rules: `.env` and its variants, a private key by name or by suffix, a
+   credential or authentication file, and everything under `.ssh`, `.gnupg` or `.aws`. No wire field
+   turns them off, and the version records that they were applied.
+3. The caller's own exclusions, and then its selection when it made one.
+
+A symbolic link and a submodule are named rather than captured: a link's Git object holds its
+target rather than content, and writing either out as a regular file would make a materialisation a
+different tree.
+
+### Materialisations, and what a result may say
+
+A materialisation is an independent copy of one exact version, written out of this host's own
+content-addressed store into a private directory of its own. Neither the repository nor the working
+copy the version came from is touched, so the agent whose tree was captured keeps working.
+
+Recording a result re-reads the materialisation and says what it establishes:
+
+* it still holds the version — the result attests that version;
+* it holds something else — this host records a **derived version** with its own identity, from the
+  one reading it made, and the result attests that and says in as many words that it says nothing
+  about the version that was materialised;
+* it holds something this host cannot represent, or cannot read — the result is
+  `indeterminate` and attests nothing at all.
+
+The limit, stated rather than left to be discovered: this host reads the directory when the
+materialisation is made and again when the result is recorded. It does not watch it while the run
+is happening. A run that changed a file, tested the change and put the file back reads as
+unmodified from here. Binding a result to the bytes a command actually read needs a host that owns
+the execution.
+
+An identical source promises nothing about network services, installed dependencies, secrets or
+graphical state. Every version and every materialisation carries that sentence.
+
+### Where an apply goes, and what it comes to
+
+An apply names its destination class. There is no default, and the one that cannot lose anybody's
+work is the one a caller gets by asking for it plainly.
+
+| Class | What it is |
+| --- | --- |
+| `proposal` | Two immutable versions and no write to any working tree: what the destination holds now, and what it would hold. A person decides |
+| `versioned_reference` | Compare-and-swap on a Git reference against an expected old value. It does not atomically update a dirty working tree, and this host **states** rather than performs the update itself: its restricted execution profile runs no subcommand that writes a reference |
+| `shared_existing` | The user's own working tree, written in place. Best-effort conflict detection, not universal no-clobber compare-and-swap |
+
+A direct apply to `shared_existing` cannot be chosen until the request carries back the limitation
+this host returns for it. What it then does, in order: the preflight, which compares every affected
+path with what the request expects and answers `DRAFT_CONFLICT` with **nothing written anywhere** if
+they differ; an immutable capture of the destination as it stands; the content staged in a private
+directory and read back against its digest; then, per path, `planned` recorded for every path before
+any of them is attempted, the destination rechecked as late as the platform permits, the staged file
+renamed over the destination through the directory's own handle, and the outcome replacing that
+`planned` row; and finally an immutable capture of the destination as it now stands.
+
+Permissions are the destination's own, put on the staged copy before the rename, so a file that was
+executable stays executable and one that was not does not become one. Content is written byte for
+byte, so a line ending is whatever the version holds.
+
+Five outcome classes and no sixth:
+
+| Outcome | What it means |
+| --- | --- |
+| `preflight_conflict` | The destination was not what the request expected. Nothing was written, anywhere |
+| `applied` | Every path landed and this host confirmed each one |
+| `conflict_after_partial_writes` | Some landed, and then the destination stopped being what the request expected |
+| `interrupted_apply` | Some landed, and this host stopped before finishing |
+| `uncertain_outcome` | This host cannot say what the destination holds |
+
+A crash after one file cannot produce `applied`. `applied` is recorded only once every planned path
+has been confirmed, and a path whose row still says `planned` means this host did not establish what
+became of it — which is not the same as saying it did not write it. A replacement daemon settles
+such an apply as `interrupted_apply` and names exactly the paths on each side.
+
+Marking a review complete records that somebody acknowledged **that version**. It runs no Git
+invocation, writes to no working tree and removes nothing. `commit`, `push`, `revert`, `reset`,
+`clean` and `stash` are not subcommands this host can run at all.
+
+### Retention
+
+A version is not deleted while anything names it: a materialisation that has not been released, a
+review acknowledgement or any other evidence, a later version derived from it, a recorded result, an
+apply that names it on either side, or a pin the project service holds against the workspace. The
+counting and the removal are one transaction inside the change-set store, so nothing recorded in
+between is lost. The project service's pin lives in another store and is checked first; a pin
+recorded between that check and the transaction is not covered, and that is written down rather than
+hidden.
+
+### Storage layout
+
+```text
+<state>/environments/<prefix>/changesets/
+  changesets.sqlite
+  objects/<aa>/<rest>     one blob per distinct content, named by its own SHA-256 digest
+  materialisations/<id>/  one independent copy of one exact version
+  staging/<action>/       one apply's validated content, before it reaches a destination
+```
+
+A blob's name **is** the digest of its content, so storing the same content twice stores it once, a
+manifest that names a digest names exactly one sequence of bytes, and a read that does not hash back
+to its own name is refused as damage rather than served.
+
 ## What a caller builds on
 
 A change set captures an exact version of a workspace; an automation run materialises one; a client
@@ -592,3 +744,8 @@ what the interface gives:
   through the same authority the creation wrote through.
 * A `RestrictedProfile`, from `ProjectService::profile`, so every later Git invocation runs under the
   same profile and its driver overrides come from the same audit.
+
+The change-set service above is the first of those three. It opens every repository through
+`OpenedRepository`, runs every Git invocation under that profile and inside its execution boundary,
+reads every file through the working tree's own handle, and writes nothing into the user's
+repository except through an apply the caller explicitly chose.
