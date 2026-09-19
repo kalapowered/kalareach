@@ -3240,6 +3240,9 @@ nothing: resolved and uncertain are both statements about an answer that went.
 What an admission carries is a permit, taken once. Taking it is what authorises the transmission,
 and it carries the answer's own claim with it, so a second caller on one admission transmits
 nothing and settles nothing rather than recording the first caller's answer as uncertain.
+Claiming a resource, marking it and settling it are the broker's own steps and the admission is
+the only way into them: there is no sequence that resolves a pending resource without holding the
+permit that carried its answer.
 An answer's transport is the one that speaks for the connection whose resource it resolves, chosen
 when the answer is admitted; a connection that has gone is `UPSTREAM_UNAVAILABLE` before anything
 is claimed. The transport work happens after the session boundary ends, because terminal ingestion

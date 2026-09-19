@@ -4,9 +4,11 @@
 //! row asks for, the name says what it does establish and the comment says what is left and who
 //! owns it.
 
+use kr_protocol::agent::{AgentApprovalRespondParams, AgentApprovalRespondResult};
 use kr_protocol::broker::{
-    ActionProvenance, BrokerGrant, BrokerGrants, DecodedProjection, DecodingTrust, IntegrationMode,
-    OfferedDecision,
+    ActionProvenance, BrokerGrant, BrokerGrants, DecodedProjection, DecodingTrust,
+    InstanceCapabilityIdentity, InstanceCapabilityRecord, InstanceCapabilityState,
+    InstanceEvidenceSource, InstanceInvalidation, IntegrationMode, OfferedDecision,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{
@@ -15,15 +17,17 @@ use kr_protocol::gateway::{
 };
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
-    ActorId, ApplicationInstanceId, BrokerBindingId, EnvironmentId, GatewayConnectionId,
-    MethodTableVersion, PluginId, PublisherId, SessionId, UpstreamMethod, UpstreamRequestId,
+    ActorId, AgentBindingRevision, ApplicationInstanceId, BrokerBindingId, CapabilityId,
+    CapabilityRevision, EnvironmentId, GatewayConnectionId, GrantId, MethodTableVersion,
+    PendingResourceId, PluginId, PublisherId, SessionId, UpstreamMethod, UpstreamRequestId,
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_protocol::session::Durability;
 use kr_worker::broker::{
-    Broker, BrokerError, BrokerTransport, ConnectionOrigin, Credential, ManagedProcess,
-    ReconcileScope, TransportHandle,
+    Broker, BrokerError, BrokerTransport, Caller, ConnectionOrigin, Credential, ManagedProcess,
+    MutationAdmission, ReconcileScope, TransportHandle, UpstreamBody, UpstreamDispatch,
+    UpstreamOutcome, UpstreamRequest, subject,
 };
 
 const CREDENTIAL: [u8; 32] = [9; 32];
@@ -180,7 +184,153 @@ fn response(id: &str) -> String {
 }
 
 /// A worker with one instance, one authenticated native connection and one trusted decoder.
-fn gateway(path: Option<&std::path::Path>) -> Broker {
+/// A transport that records what it was asked to carry, and answers as an upstream would.
+///
+/// An answer reaches its upstream through one of these in the product: section 12's bundled
+/// adapters are the plugins repository's, and each drives its own connection. What it establishes
+/// here is that the resource settles on a transmission rather than on a caller's say-so.
+#[derive(Debug, Default)]
+struct RecordingUpstream {
+    submitted: std::sync::Mutex<Vec<UpstreamRequest>>,
+}
+
+impl RecordingUpstream {
+    fn submitted(&self) -> Vec<UpstreamRequest> {
+        self.submitted
+            .lock()
+            .expect("the record is not poisoned")
+            .clone()
+    }
+}
+
+impl UpstreamDispatch for RecordingUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+        self.submitted
+            .lock()
+            .expect("the record is not poisoned")
+            .push(request.clone());
+        let upstream_request_id = match &request.body {
+            UpstreamBody::Approval {
+                upstream_request_id,
+                ..
+            } => upstream_request_id.clone(),
+            _ => UpstreamRequestId::new("upstream-1").expect("valid"),
+        };
+        Ok(UpstreamOutcome {
+            upstream_request_id: Some(upstream_request_id),
+            turn_id: request.turn_id.clone(),
+            provenance: ActionProvenance::UpstreamTypedRpc,
+        })
+    }
+}
+
+/// A transport that stops the host at the moment the bytes go.
+///
+/// Section 24 puts the durable marker before the effect so that exactly this state is readable
+/// afterwards: the marker is in, the answer may already have reached the upstream, and nothing
+/// records what came of it. It is the state a worker that died mid-answer comes back to, and it
+/// is reconciliation, not a second answer, that settles it.
+#[derive(Debug, Default)]
+struct StoppingUpstream;
+
+const STOPPED: &str = "the host stops after the marker and before the outcome is recorded";
+
+impl UpstreamDispatch for StoppingUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    fn submit(&self, _request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+        panic!("{STOPPED}")
+    }
+}
+
+fn caller(name: &str) -> Caller {
+    Caller {
+        actor_id: actor(name),
+        grant_id: Some(GrantId::new(Uuid::from_bytes([7; 16]))),
+    }
+}
+
+fn respond(resource_id: PendingResourceId, option_id: &str) -> AgentApprovalRespondParams {
+    AgentApprovalRespondParams {
+        target: kr_protocol::agent::AgentMutationTarget {
+            subject: subject(session(), instance(2)),
+            binding_revision: AgentBindingRevision::new(1),
+        },
+        resource_id,
+        option_id: option_id.to_owned(),
+    }
+}
+
+/// Reserves one approval's transmission, the way `agent.approval.respond` does before it writes.
+fn reserve(
+    broker: &Broker,
+    resource_id: PendingResourceId,
+    option_id: &str,
+    now: u64,
+) -> Result<MutationAdmission, BrokerError> {
+    broker.admit_approval(
+        &caller("device-1"),
+        &respond(resource_id, option_id),
+        TimestampMs::new(now),
+    )
+}
+
+/// Answers one approval and stops the host at the moment its bytes go.
+///
+/// What is left behind is a resource with a committed dispatch marker and no recorded outcome,
+/// which is what a restart reads back and what reconciliation has to settle.
+fn answer_and_stop(
+    broker: &Broker,
+    upstream: &std::sync::Arc<RecordingUpstream>,
+    resource_id: PendingResourceId,
+    now: u64,
+) {
+    broker.bind_connection_dispatch(
+        GatewayConnectionId::new(1),
+        std::sync::Arc::new(StoppingUpstream),
+    );
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = answer(broker, resource_id, "allow", now);
+    }));
+    std::panic::set_hook(previous);
+    let payload = stopped.expect_err("the host stopped where the transport stops it");
+    assert_eq!(
+        payload.downcast_ref::<String>().map(String::as_str),
+        Some(STOPPED)
+    );
+    broker.bind_connection_dispatch(
+        GatewayConnectionId::new(1),
+        std::sync::Arc::clone(upstream) as _,
+    );
+}
+
+/// Answers one approval the way the method does: admit, mark, transmit, settle.
+fn answer(
+    broker: &Broker,
+    resource_id: PendingResourceId,
+    option_id: &str,
+    now: u64,
+) -> Result<AgentApprovalRespondResult, BrokerError> {
+    broker
+        .agent_approval_respond(
+            &caller("device-1"),
+            &respond(resource_id, option_id),
+            TimestampMs::new(now),
+        )
+        .map(|(result, _)| result)
+}
+
+fn gateway_recording(
+    path: Option<&std::path::Path>,
+) -> (Broker, std::sync::Arc<RecordingUpstream>) {
     let broker = Broker::open(path, session()).expect("the broker opens");
     broker
         .register_instance(
@@ -214,7 +364,36 @@ fn gateway(path: Option<&std::path::Path>) -> Broker {
             "1",
         )
         .expect("the native connection is authenticated");
+    // An answer is checked against the installation's own evidence for what it does, and it goes
+    // out on the connection whose resource it resolves: without a transport there is nothing to
+    // carry one and nothing settles.
     broker
+        .record_capability(InstanceCapabilityRecord {
+            capability_id: CapabilityId::new("agent.approval").expect("valid"),
+            capability_version: "1".to_owned(),
+            application_instance_id: instance(2),
+            identity: InstanceCapabilityIdentity::default(),
+            revision: CapabilityRevision::new(1),
+            state: InstanceCapabilityState::QualifiedAvailable,
+            source: InstanceEvidenceSource::HostProbe,
+            invalidated_by: [InstanceInvalidation::BindingChanged].into_iter().collect(),
+            disabled_reason: Nullable::null(),
+            observed_at: TimestampMs::new(1),
+        })
+        .expect("the evidence is recorded");
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    broker
+        .bind_dispatch(instance(2), std::sync::Arc::clone(&upstream) as _)
+        .expect("the transport is bound");
+    broker.bind_connection_dispatch(
+        GatewayConnectionId::new(1),
+        std::sync::Arc::clone(&upstream) as _,
+    );
+    (broker, upstream)
+}
+
+fn gateway(path: Option<&std::path::Path>) -> Broker {
+    gateway_recording(path).0
 }
 
 fn journal_path() -> std::path::PathBuf {
@@ -420,13 +599,8 @@ fn kr_req_11_33_a_native_answer_before_the_recheck_wins_and_the_rich_answer_is_t
         .expect("the native client answered first");
     assert_eq!(answered.state, PendingState::Resolved);
 
-    // The rich answer now reaches the recheck, and there is nothing to claim.
-    let refusal = broker
-        .claim(
-            resource.resource_id,
-            &actor("device-1"),
-            TimestampMs::new(6),
-        )
+    // The rich answer now reaches the recheck, and there is nothing to admit.
+    let refusal = answer(&broker, resource.resource_id, "allow", 6)
         .expect_err("the native answer already resolved it");
     assert_eq!(refusal.code(), ErrorCode::QuestionResolved);
     assert_eq!(
@@ -438,21 +612,15 @@ fn kr_req_11_33_a_native_answer_before_the_recheck_wins_and_the_rich_answer_is_t
         "the later rich response is told the resolved state"
     );
 
-    // The ordinary order: claim, then admit the dispatch, then resolve.
+    // The ordinary order, and the whole of it is one admission: it reserves the resource, marks
+    // it, transmits it and settles it, and nothing outside it can do any of those.
     let second = approval(&broker, "2", 7).expect("another interpretation");
-    let claim = broker
-        .claim(second.resource_id, &actor("device-1"), TimestampMs::new(8))
-        .expect("claimed");
-    let admission = broker
-        .admit_dispatch(&claim, "allow")
-        .expect("the answer is admitted");
-    assert_eq!(admission.provenance, ActionProvenance::UpstreamTypedRpc);
-    broker
-        .commit_dispatch(&claim, TimestampMs::new(8))
-        .expect("the marker is committed before the bytes");
-    broker
-        .resolve(&claim, TimestampMs::new(9))
-        .expect("the upstream confirmed it");
+    let applied = answer(&broker, second.resource_id, "allow", 8).expect("the upstream took it");
+    assert_eq!(
+        applied.mutation.provenance,
+        ActionProvenance::UpstreamTypedRpc
+    );
+    assert_eq!(applied.state, PendingState::Resolved);
     assert_eq!(
         broker.pending(second.resource_id).expect("recorded").state,
         PendingState::Resolved
@@ -826,18 +994,9 @@ fn kr_req_12_16_a_reverse_request_names_the_agents_own_environment_and_user() {
 fn kr_req_12_09_an_admitted_answer_records_the_provenance_it_reached_the_upstream_by() {
     let broker = gateway(None);
     let resource = approval(&broker, "1", 2).expect("the interpretation is accepted");
-    let claim = broker
-        .claim(
-            resource.resource_id,
-            &actor("device-1"),
-            TimestampMs::new(4),
-        )
-        .expect("claimed");
-    let admission = broker
-        .admit_dispatch(&claim, "allow")
-        .expect("the answer is admitted");
+    let applied = answer(&broker, resource.resource_id, "allow", 4).expect("the answer is applied");
     assert_eq!(
-        admission.provenance,
+        applied.mutation.provenance,
         ActionProvenance::UpstreamTypedRpc,
         "an answer over the gateway's typed connection is a typed result"
     );
@@ -855,9 +1014,9 @@ fn kr_req_12_09_an_admitted_answer_records_the_provenance_it_reached_the_upstrea
 fn kr_req_11_35_the_fence_keeps_native_recording_and_arbitration_and_exposes_the_gap() {
     let broker = gateway(None);
     let claimed = approval(&broker, "1", 2).expect("an interpretation before the fault");
-    broker
-        .claim(claimed.resource_id, &actor("device-1"), TimestampMs::new(4))
-        .expect("claimed before the fault");
+    let untouched = approval(&broker, "4", 2).expect("another one before the fault");
+    let _reserved = reserve(&broker, claimed.resource_id, "allow", 4)
+        .expect("its transmission is reserved before the fault");
 
     // The journal faults during live traffic.
     let transition = broker
@@ -905,10 +1064,9 @@ fn kr_req_11_35_the_fence_keeps_native_recording_and_arbitration_and_exposes_the
         )
         .expect_err("a rich mutation is fenced");
     assert_eq!(rich_refusal.code(), ErrorCode::UpstreamUnavailable);
-    let claim_refusal = broker
-        .claim(claimed.resource_id, &actor("device-2"), TimestampMs::new(9))
-        .expect_err("a rich approval is fenced");
-    assert_eq!(claim_refusal.code(), ErrorCode::UpstreamUnavailable);
+    let answer_refusal =
+        answer(&broker, untouched.resource_id, "allow", 9).expect_err("a rich approval is fenced");
+    assert_eq!(answer_refusal.code(), ErrorCode::UpstreamUnavailable);
 
     // The gap is exposed while it is open, and it counts what passed through it.
     let gap = broker.gap().expect("the gap is open");
@@ -944,22 +1102,11 @@ fn kr_req_11_35_the_fence_keeps_native_recording_and_arbitration_and_exposes_the
 fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns() {
     let path = journal_path();
     let (surviving, answered) = {
-        let broker = gateway(Some(&path));
+        let (broker, upstream) = gateway_recording(Some(&path));
         let surviving = approval(&broker, "1", 2).expect("an interpretation before the fault");
         let answered = approval(&broker, "2", 4).expect("another one");
-        let claim = broker
-            .claim(
-                answered.resource_id,
-                &actor("device-1"),
-                TimestampMs::new(6),
-            )
-            .expect("claimed");
-        broker
-            .admit_dispatch(&claim, "allow")
-            .expect("an answer went before the fault");
-        broker
-            .commit_dispatch(&claim, TimestampMs::new(6))
-            .expect("the marker is committed before the bytes");
+        // An answer went before the fault and this host never recorded what came of it.
+        answer_and_stop(&broker, &upstream, answered.resource_id, 6);
 
         broker
             .enter_volatile("the journal could not be written", TimestampMs::new(7))
@@ -982,13 +1129,7 @@ fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns
             "committing the gap is not the same as reconciling the upstream"
         );
         assert!(
-            broker
-                .claim(
-                    surviving.resource_id,
-                    &actor("device-1"),
-                    TimestampMs::new(10)
-                )
-                .is_err(),
+            answer(&broker, surviving.resource_id, "allow", 10).is_err(),
             "rich work does not come back before the pending identifiers are reconciled"
         );
 
@@ -1022,14 +1163,11 @@ fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns
             "a committed gap is no longer an open one"
         );
 
-        // Rich work is back.
-        broker
-            .claim(
-                surviving.resource_id,
-                &actor("device-1"),
-                TimestampMs::new(12),
-            )
+        // Rich work is back. The answer is given up rather than sent, so the resource stays
+        // answerable and a restart has something to read back.
+        let resumed = reserve(&broker, surviving.resource_id, "allow", 12)
             .expect("rich approvals work again");
+        broker.abandon(&resumed);
         (surviving.resource_id, answered.resource_id)
     };
 
@@ -1084,10 +1222,8 @@ fn a_restart_comes_back_fenced_and_numbers_its_connections_above_what_it_wrote()
         "a recovery this host did not finish is one it comes back in the middle of"
     );
     assert!(
-        restarted
-            .claim(resource_id, &actor("device-1"), TimestampMs::new(10))
-            .is_err(),
-        "nothing is claimable until an upstream has been reconciled"
+        answer(&restarted, resource_id, "allow", 10).is_err(),
+        "nothing is answerable until an upstream has been reconciled"
     );
     assert!(
         restarted.next_connection().get() > 1,
@@ -1158,11 +1294,7 @@ fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
         "one upstream says nothing about another's pending identifiers"
     );
     assert_eq!(broker.mode(), GatewayMode::Recovering);
-    assert!(
-        broker
-            .claim(first.resource_id, &actor("device-1"), TimestampMs::new(7))
-            .is_err()
-    );
+    assert!(answer(&broker, first.resource_id, "allow", 7).is_err());
 
     let (_, finished) = broker
         .reconcile_recovered(
@@ -1181,9 +1313,7 @@ fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
     assert!(finished.is_some(), "and that was the last one that owed");
     assert_eq!(broker.mode(), GatewayMode::Normal);
     assert!(broker.pending(second.resource_id).is_some());
-    broker
-        .claim(first.resource_id, &actor("device-1"), TimestampMs::new(9))
-        .expect("rich work is back");
+    answer(&broker, first.resource_id, "allow", 9).expect("rich work is back");
 }
 
 /// KR-REQ-12.10: the worker's own agent, terminal and gateway request state survives a restart of
@@ -1255,23 +1385,13 @@ fn kr_req_12_10_gateway_request_state_survives_reopening_the_workers_own_journal
 /// impossible is the second transmission.
 #[test]
 fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_writer_takes_it() {
-    let broker = gateway(None);
+    let (broker, upstream) = gateway_recording(None);
 
     // The rich writer takes the admission first. The native answer that follows is refused, and
     // the frame is never forwarded: the closure below would have run if it had been.
     let first = approval(&broker, "1", 2).expect("the interpretation is accepted");
-    let claim = broker
-        .claim(first.resource_id, &actor("device-1"), TimestampMs::new(3))
-        .expect("claimed");
-    let admission = broker
-        .admit_dispatch(&claim, "allow")
-        .expect("the rich answer is admitted");
-    assert_eq!(admission.connection, GatewayConnectionId::new(1));
-    assert_eq!(
-        *admission.response.request(),
-        admission.resource.request,
-        "the prepared answer names the resource it was admitted for"
-    );
+    let admitted = reserve(&broker, first.resource_id, "allow", 3)
+        .expect("the rich answer reserves the resource");
     let forwarded = std::cell::Cell::new(false);
     let refusal = broker
         .native_answer_through(
@@ -1290,23 +1410,47 @@ fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_writer_take
         "the second answer is refused before its bytes go, not recorded after they have gone"
     );
 
+    // The rich writer's own answer then goes, and it is the frame the core prepared for that
+    // resource: it names the connection the resource was asked on and the request it answers.
+    broker
+        .record_approval(&admitted, TimestampMs::new(5))
+        .expect("the admitted answer goes");
+    let carried: Vec<UpstreamBody> = upstream
+        .submitted()
+        .iter()
+        .map(|request| request.body.clone())
+        .collect();
+    let [
+        UpstreamBody::Approval {
+            response: prepared, ..
+        },
+    ] = carried.as_slice()
+    else {
+        panic!("one approval answer was carried");
+    };
+    assert_eq!(prepared.request().connection, GatewayConnectionId::new(1));
+    assert_eq!(
+        *prepared.request(),
+        first.request,
+        "the prepared answer names the resource it was admitted for"
+    );
+
     // The other order. The native writer takes the admission, and the rich claim that reaches the
     // recheck afterwards finds nothing to claim.
     let second = approval(&broker, "2", 5).expect("another interpretation");
-    let answer = broker
+    let native = broker
         .admit_native_answer(
             GatewayConnectionId::new(1),
             response("2").as_bytes(),
             TimestampMs::new(6),
         )
         .expect("the native client's answer is admitted");
-    assert_eq!(answer.resource_id, second.resource_id);
-    let taken = broker
-        .claim(second.resource_id, &actor("device-1"), TimestampMs::new(7))
+    assert_eq!(native.resource_id, second.resource_id);
+    let taken = answer(&broker, second.resource_id, "allow", 7)
         .expect_err("the native writer holds the admission");
     assert_eq!(taken.code(), ErrorCode::QuestionResolved);
     broker
-        .native_answer_sent(&answer, TimestampMs::new(8))
+        .native_answer_sent(&native, TimestampMs::new(8))
         .expect("the native answer reached the upstream");
     assert_eq!(
         broker.pending(second.resource_id).expect("recorded").state,
@@ -1380,9 +1524,7 @@ fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_what_i
         .expect_err("a reconciliation from the recovery that failed finishes nothing");
     assert_eq!(stale.code(), ErrorCode::InvalidArgument);
     assert!(
-        broker
-            .claim(first.resource_id, &actor("device-1"), TimestampMs::new(8))
-            .is_err(),
+        answer(&broker, first.resource_id, "allow", 8).is_err(),
         "rich work has not come back"
     );
 

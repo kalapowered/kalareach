@@ -1109,7 +1109,7 @@ impl Broker {
     /// Returns [`BrokerError::Arbitration`] when this claim does not hold the resource's
     /// transmission admission, and [`BrokerError::LedgerUnavailable`] when the marker cannot be
     /// written.
-    pub fn commit_dispatch(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
+    fn commit_dispatch(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
         let _ = now;
         let mut state = self.state();
         let transition = state.arbitration.plan_dispatched(claim)?;
@@ -1569,46 +1569,14 @@ impl Broker {
     }
 
     // -- arbitration --------------------------------------------------------------------------
-
-    /// Takes the claim on one pending resource.
-    ///
-    /// The recheck covers everything that could have changed while the answer was being encoded:
-    /// the resource's own state, its deadline, the instance it belongs to, the generation that
-    /// produced it, and whether the decoder that interpreted it may still encode an answer.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::Arbitration`] when the resource is already claimed or resolved, and
-    /// [`BrokerError::PreconditionFailed`] or [`BrokerError::PermissionDenied`] when one of the
-    /// rechecks fails.
-    pub fn claim(
-        &self,
-        resource_id: PendingResourceId,
-        actor_id: &ActorId,
-        now: TimestampMs,
-    ) -> Result<Claim> {
-        self.state().claim_in(resource_id, actor_id, now)
-    }
-
-    /// Admits one answer to dispatch, and commits the marker before it goes.
-    ///
-    /// This is the last gate before bytes reach the upstream, and it is one operation because
-    /// everything it checks can change between the claim and the dispatch. Under the lock it
-    /// rechecks that rich work is admitted at all, that the resource is still answerable by this
-    /// claim, that the decision is one the upstream actually offered, and that no answer has gone
-    /// already; then it commits the durable marker. A caller that holds the returned admission may
-    /// write the answer, and nothing else may.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::RichWorkFenced`] while rich work is fenced,
-    /// [`BrokerError::PermissionDenied`] when another claim holds the resource or its decoder may
-    /// no longer answer, [`BrokerError::PreconditionFailed`] when the decision is not one the
-    /// request offered, [`BrokerError::Arbitration`] when an answer has already been admitted, and
-    /// [`BrokerError::LedgerUnavailable`] when the marker cannot be committed.
-    pub fn admit_dispatch(&self, claim: &Claim, option_id: &str) -> Result<DispatchAdmission> {
-        self.state().admit_dispatch_in(claim, option_id)
-    }
+    //
+    // The four steps below — claim, admit, mark, settle — are the broker's own, and nothing
+    // outside it reaches them. Section 11 gives a resource one resolution, and the whole of that
+    // guarantee is that the caller that settles is the caller that was admitted and transmitted:
+    // a sequence that claimed a resource and resolved it without an execution permit would settle
+    // a resource no answer had gone for. The way in is `admit_approval`, which reserves the
+    // resource and hands back the permit, and `record_approval`, which marks, transmits and
+    // settles under it; `abandon` gives an unspent reservation back.
 
     /// Resolves a claimed resource: the upstream confirmed the answer.
     ///
@@ -1616,7 +1584,7 @@ impl Broker {
     ///
     /// Returns [`BrokerError::Arbitration`] or [`BrokerError::PermissionDenied`] as the claim
     /// requires.
-    pub fn resolve(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
+    fn resolve(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
         let mut state = self.state();
         let transition = state.arbitration.plan_resolve(claim)?;
         state.write_transition(&transition, now)?;
@@ -1631,7 +1599,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::Arbitration`] when an answer has already gone for the resource.
-    pub fn release_claim(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
+    fn release_claim(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
         self.state().release_claim_in(claim, now)
     }
 
@@ -1640,7 +1608,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns the same failures [`Broker::resolve`] does.
-    pub fn uncertain(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
+    fn uncertain(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
         let mut state = self.state();
         let transition = state.arbitration.plan_uncertain(claim)?;
         state.write_transition(&transition, now)?;
