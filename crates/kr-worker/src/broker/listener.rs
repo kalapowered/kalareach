@@ -237,7 +237,15 @@ impl Registration {
         }
     }
 
-    /// Authenticates one connecting bridge.
+    /// Authenticates the two halves a registration decides on its own: the owner and the process.
+    ///
+    /// The private exchange is deliberately not here. It lives in the broker's own record of the
+    /// launch, and the admission that opens the connection checks it there, so the credential
+    /// never has to be handed to whatever is accepting.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] naming which half failed.
     ///
     /// Three things are checked and all three must hold: the connection came from this user, the
     /// process is the one this host launched, and the credential is the one this host generated
@@ -249,6 +257,36 @@ impl Registration {
     /// platform has no private socket the kernel names no peer, and there the credential is the
     /// whole authentication and the identity the bridge presents is compared with the launch; that
     /// case is the one [`PeerIdentity::from_operating_system`] reports.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] naming which of the three failed.
+    pub fn authenticate_peer(&self, hello: &BridgeHello, peer: &PeerIdentity) -> Result<()> {
+        if !peer.is_owner() {
+            return Err(BrokerError::denied(
+                "this connection is not the operating-system user who owns the session",
+            ));
+        }
+        // Where the kernel can name the peer, an identity it did not name is not one this host
+        // admits. Otherwise the presented identity that loopback needs would become a way past
+        // the check on a platform that never needed it.
+        if cfg!(unix) && !peer.from_operating_system() {
+            return Err(BrokerError::denied(
+                "this platform names the process on a private socket, and this connection was \
+                 admitted without one",
+            ));
+        }
+        let connecting = peer.process().unwrap_or(&hello.process);
+        if !connecting.matches(&self.expected_process) {
+            return Err(BrokerError::denied(format!(
+                "this connection is process {} and the launch was process {}",
+                connecting.pid, self.expected_process.pid
+            )));
+        }
+        Ok(())
+    }
+
+    /// The same, and the private exchange as well, for a caller that holds the launch's record.
     ///
     /// # Errors
     ///

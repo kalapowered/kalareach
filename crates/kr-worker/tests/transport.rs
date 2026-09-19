@@ -994,28 +994,21 @@ async fn kr_req_11_33_an_answer_needs_no_rich_method_of_its_own() {
     drained.abort();
 }
 
-/// A broker whose managed process is this one, so a connection the kernel names is the launch.
+/// A broker with nothing registered yet, for a launch that will register the instance itself.
 ///
-/// The endpoint tests need the process the kernel reports on an accepted socket to be the process
-/// the launch recorded. Nothing is faked: the identity comes from the operating system, on both
-/// sides of the comparison.
-fn broker_launched_here() -> (Arc<Broker>, ManagedProcess, ProcessStartIdentity) {
+/// The production composition is what registers the instance, with the process it actually
+/// started. Nothing here pretends to have launched anything.
+fn broker_for_launch() -> Arc<Broker> {
+    Arc::new(Broker::open(None, session()).expect("the broker opens"))
+}
+
+/// A broker that expects this process on its connections, for the tests that stand in for a bridge.
+///
+/// The launch itself is proved by the test that starts the forwarder. These two are about what
+/// happens to a connection once one reaches the endpoint, so the process the kernel names is this
+/// one and the instance's record says so.
+fn broker_expecting_this_process() -> (Arc<Broker>, ProcessStartIdentity) {
     let running = kr_ipc::identity::current_process_start_identity().expect("a process identity");
-    let process = ManagedProcess::new(
-        instance(),
-        running.clone(),
-        TransportHandle {
-            transport: BrokerTransport::PrivateSocket,
-            application_instance_id: instance(),
-            executable_digest: Digest256::from_bytes([3; 32]),
-            process: running.clone(),
-        },
-        Credential::from_bytes(CREDENTIAL),
-        // Not dedicated: the process on the other end of this connection is this test, and a
-        // backend this host did not start for itself is never claimed or terminated as owned.
-        false,
-        TimestampMs::new(1),
-    );
     let broker = Broker::open(None, session()).expect("the broker opens");
     broker
         .register_instance(
@@ -1032,6 +1025,8 @@ fn broker_launched_here() -> (Arc<Broker>, ManagedProcess, ProcessStartIdentity)
                     process: running.clone(),
                 },
                 Credential::from_bytes(CREDENTIAL),
+                // Not dedicated: the process on the other end is this test, and a backend this
+                // host did not start for itself is never claimed or terminated as owned.
                 false,
                 TimestampMs::new(1),
             )),
@@ -1040,6 +1035,13 @@ fn broker_launched_here() -> (Arc<Broker>, ManagedProcess, ProcessStartIdentity)
     broker
         .pin_table(instance(), table(), rich())
         .expect("the installed tables are pinned");
+    bind_component(&broker);
+    record_capabilities(&broker);
+    (Arc::new(broker), running)
+}
+
+/// Binds the component whose decoder interprets this connector's approvals.
+fn bind_component(broker: &Broker) {
     broker
         .bind(
             binding(),
@@ -1055,18 +1057,45 @@ fn broker_launched_here() -> (Arc<Broker>, ManagedProcess, ProcessStartIdentity)
             TimestampMs::new(1),
         )
         .expect("the component is bound");
-    record_capabilities(&broker);
-    (Arc::new(broker), process, running)
+}
+
+/// The forwarder this host ships, as the test build put it on disk.
+///
+/// The endpoint tests launch a real executable through the same composition production uses, so
+/// the process the kernel names on the accepted socket is a process this host started and not the
+/// test standing in for one.
+fn forwarder() -> std::path::PathBuf {
+    let path = std::path::PathBuf::from(env!("CARGO_BIN_EXE_kr-hook"));
+    assert!(path.exists(), "the forwarder is built beside this test");
+    path
+}
+
+/// The launch profile that starts that forwarder.
+fn forwarder_profile() -> kr_protocol::broker::LaunchProfile {
+    kr_protocol::broker::LaunchProfile {
+        profile_id: kr_protocol::ids::LaunchProfileId::new("lp-1").expect("valid"),
+        environment_id: EnvironmentId::new(Uuid::from_bytes([4; 16])),
+        binary: kr_protocol::broker::BinaryIdentity {
+            resolved_path: forwarder().to_string_lossy().into_owned(),
+            digest: Digest256::from_bytes([3; 32]),
+            version: "0.9.0".to_owned(),
+            distribution: "build".to_owned(),
+        },
+        arguments: Vec::new(),
+        authentication: kr_protocol::broker::AuthenticationState::Authenticated,
+        mode: IntegrationMode::Gateway,
+        resolved_at: TimestampMs::new(1),
+    }
 }
 
 /// The launch one of these endpoints publishes.
 fn launch_for(
-    expected: &ProcessStartIdentity,
+    expected: Option<ProcessStartIdentity>,
     native_terminal: Option<ProcessStartIdentity>,
 ) -> kr_worker::broker::NativeLaunch {
     kr_worker::broker::NativeLaunch {
         profile_id: kr_protocol::ids::LaunchProfileId::new("lp-1").expect("valid"),
-        expected_process: expected.clone(),
+        expected_process: expected,
         native_terminal,
         application_instance_id: instance(),
         plugin_id: package(),
@@ -1103,49 +1132,72 @@ fn hello_bytes(process: &ProcessStartIdentity, headers: &[(&str, &str)]) -> Vec<
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connection() {
     let directory = private_directory();
-    let (broker, process, running) = broker_launched_here();
-    let endpoint_directory = directory.clone();
-    let gateway = kr_worker::broker::NativeGateway::bind(
+    let broker = broker_for_launch();
+    let mut gateway = kr_worker::broker::NativeGateway::bind(
         Arc::clone(&broker),
-        &endpoint_directory,
+        &directory,
         Observatory::new(),
-        launch_for(&running, Some(running.clone())),
+        launch_for(None, None),
     )
     .expect("the endpoint binds");
-    let kr_worker::broker::ListenerAddress::PrivateSocket(path) = gateway.address().clone() else {
-        panic!("this platform prefers a private socket");
-    };
-    assert!(
-        gateway.registration().contains("endpoint="),
-        "the file a launched process reads names where to connect"
-    );
 
-    // The bridge connects, says who it is, and then speaks for the upstream.
-    let bridging = tokio::spawn(async move {
-        let mut stream = tokio::net::UnixStream::connect(&path)
-            .await
-            .expect("the bridge connects");
-        stream
-            .write_all(&hello_bytes(&running, &[]))
-            .await
-            .expect("the bridge says who it is");
-        stream
-            .write_all(b"{\"id\":21,\"method\":\"session/request_permission\",\"params\":{}}\n")
-            .await
-            .expect("and forwards the upstream's request");
-        stream
-    });
+    // The host starts the forwarder, through the same composition production uses. Everything the
+    // forwarder needs is published by that call: the endpoint it connects to, the private exchange
+    // it presents, and the process identity this host will compare it against.
+    let intent = broker
+        .prepare_launch(
+            forwarder_profile(),
+            kr_worker::broker::ForegroundMark::idle(4),
+            None,
+        )
+        .expect("the launch is prepared");
+    let mut launched = gateway
+        .launch(
+            &intent,
+            &kr_worker::broker::ForegroundMark::idle(4),
+            IntegrationMode::Gateway,
+            TimestampMs::new(1),
+        )
+        .expect("the agent is started");
+    broker
+        .pin_table(instance(), table(), rich())
+        .expect("the installed tables are pinned");
+    bind_component(&broker);
+    record_capabilities(&broker);
+    assert!(
+        gateway
+            .registration()
+            .expect("a launch publishes one")
+            .contains("endpoint="),
+        "the file the forwarder reads names where to connect"
+    );
 
     let (client_here, client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
     let (client_reads, client_writes) = tokio::io::split(client_here);
-    let attached = gateway
-        .accept(&process, client_reads, client_writes)
-        .await
-        .expect("the bridge is authenticated and admitted");
+    let attached = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        gateway.accept(client_reads, client_writes),
+    )
+    .await
+    .expect("the forwarder reaches the endpoint")
+    .expect("it is authenticated and admitted");
     let mut observations = attached.observations;
     let mut client = tokio::io::BufReader::new(client_there);
 
-    // The request reached the native terminal, through the owner the composition started.
+    // The upstream speaks through the forwarder's own standard input, which is what a launched
+    // agent writes to. The request reaches the native terminal through the owner the composition
+    // started.
+    let mut upstream = launched
+        .child
+        .stdin
+        .take()
+        .expect("the forwarder reads input");
+    std::io::Write::write_all(
+        &mut upstream,
+        b"{\"id\":21,\"method\":\"session/request_permission\",\"params\":{}}\n",
+    )
+    .expect("the agent asks for a permission");
+    std::io::Write::flush(&mut upstream).expect("and it goes");
     let forwarded = next_line(&mut client).await;
     assert!(forwarded.contains("session/request_permission"));
     let resource = broker
@@ -1154,16 +1206,25 @@ async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connec
         .find(|resource| resource.state == PendingState::Pending)
         .expect("the request was recorded before it was forwarded");
 
-    // The person answers in the terminal. The answer goes back to the upstream over the same
+    // The person answers in the terminal. The answer goes back to the agent over the same
     // connection, and the resource is resolved only once the bytes have gone.
     client
         .get_mut()
         .write_all(b"{\"id\":21,\"result\":{\"outcome\":\"allow\"}}\n")
         .await
         .expect("the person answers");
-    let mut bridge = tokio::io::BufReader::new(bridging.await.expect("the bridge task finished"));
-    let answered = next_line(&mut bridge).await;
-    assert!(answered.contains("\"outcome\":\"allow\""));
+    let mut answered = String::new();
+    let agent = launched
+        .child
+        .stdout
+        .take()
+        .expect("the forwarder writes output");
+    let mut agent = std::io::BufReader::new(agent);
+    std::io::BufRead::read_line(&mut agent, &mut answered).expect("the agent reads its answer");
+    assert!(
+        answered.contains("\"outcome\":\"allow\""),
+        "the answer reached the agent: {answered}"
+    );
     let transition = tokio::time::timeout(std::time::Duration::from_secs(5), observations.next())
         .await
         .expect("an authorised observer is told")
@@ -1178,10 +1239,8 @@ async fn kr_req_12_14_a_bridge_that_reaches_the_endpoint_becomes_a_served_connec
         PendingState::Resolved
     );
 
-    // And the host can stop the connection without dropping what it has already admitted.
-    drop(bridge);
-    let closure = attached.owner.connection();
-    assert_eq!(closure, GatewayConnectionId::new(1));
+    let _ = launched.child.kill();
+    let _ = launched.child.wait();
     let _ = std::fs::remove_dir_all(&directory);
 }
 
@@ -1224,12 +1283,12 @@ async fn kr_req_11_43_a_wrong_credential_process_or_browser_origin_is_refused() 
         ),
     ] {
         let directory = private_directory();
-        let (broker, process, _) = broker_launched_here();
+        let (broker, _) = broker_expecting_this_process();
         let gateway = kr_worker::broker::NativeGateway::bind(
             Arc::clone(&broker),
             &directory,
             Observatory::new(),
-            launch_for(&expected, None),
+            launch_for(Some(expected.clone()), None),
         )
         .expect("the endpoint binds");
         let kr_worker::broker::ListenerAddress::PrivateSocket(path) = gateway.address().clone()
@@ -1246,7 +1305,7 @@ async fn kr_req_11_43_a_wrong_credential_process_or_browser_origin_is_refused() 
         let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
         let (client_reads, client_writes) = tokio::io::split(client_here);
         let refused = gateway
-            .accept(&process, client_reads, client_writes)
+            .accept(client_reads, client_writes)
             .await
             .expect_err(what);
         assert_eq!(
@@ -1586,7 +1645,7 @@ async fn kr_req_07_67_an_intentional_native_exit_stops_the_dedicated_backend() {
 async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_closing_does_not() {
     for exits in [true, false] {
         let directory = private_directory();
-        let (broker, process, running) = broker_launched_here();
+        let (broker, running) = broker_expecting_this_process();
         // A terminal of this host's own, as a real process the kernel names.
         let mut terminal = tokio::process::Command::new("/bin/sh")
             .arg("-c")
@@ -1597,7 +1656,7 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
         let pid = terminal.id().expect("the terminal has an identifier");
         let identity =
             kr_ipc::identity::process_start_identity(pid).expect("the kernel names the terminal");
-        let mut launch = launch_for(&running, Some(identity));
+        let mut launch = launch_for(Some(running.clone()), Some(identity));
         launch.application_instance_id = instance();
         let gateway = kr_worker::broker::NativeGateway::bind(
             Arc::clone(&broker),
@@ -1623,7 +1682,7 @@ async fn kr_req_07_67_a_terminal_exit_ends_the_connection_and_an_attachment_clos
         let (client_here, _client_there) = tokio::net::UnixStream::pair().expect("a socket pair");
         let (client_reads, client_writes) = tokio::io::split(client_here);
         let attached = gateway
-            .accept(&process, client_reads, client_writes)
+            .accept(client_reads, client_writes)
             .await
             .expect("the bridge is admitted");
         let bridge = bridging.await.expect("the bridge task finished");

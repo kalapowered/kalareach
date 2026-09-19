@@ -38,7 +38,7 @@ use crate::broker::endpoint::{Accepted, BoundEndpoint, Stream};
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::framing::Framing;
 use crate::broker::listener::{BridgeHello, ListenerAddress, Registration, reject_browser_origin};
-use crate::broker::process::ManagedProcess;
+use crate::broker::process::{Credential, ManagedProcess};
 
 /// How long a connecting bridge has to say who it is.
 ///
@@ -61,7 +61,11 @@ pub struct NativeLaunch {
     /// The launch profile this registration belongs to.
     pub profile_id: kr_protocol::ids::LaunchProfileId,
     /// The bridge process this host expects on the connection.
-    pub expected_process: ProcessStartIdentity,
+    ///
+    /// It is absent until this host has started one. [`NativeGateway::launch`] fills it in from
+    /// the process it actually spawned, which is the only thing that can: the registration names
+    /// the process, so the process has to exist before the registration does.
+    pub expected_process: Option<ProcessStartIdentity>,
     /// The native terminal this host started, where it started one.
     ///
     /// Section 7 draws its line between two processes: the terminal the person is typing in, and
@@ -203,7 +207,19 @@ pub struct NativeGateway {
     endpoint: BoundEndpoint,
     observatory: Observatory,
     launch: NativeLaunch,
-    registration: Registration,
+    registration: Option<Registration>,
+    runtime_directory: std::path::PathBuf,
+}
+
+/// One agent this host started, and what it started.
+#[derive(Debug)]
+pub struct Launched {
+    /// The process itself, so its owner can wait for it or end it.
+    pub child: std::process::Child,
+    /// What the kernel says it is.
+    pub process: ProcessStartIdentity,
+    /// The profile it was started from.
+    pub profile: kr_protocol::broker::LaunchProfile,
 }
 
 impl NativeGateway {
@@ -221,13 +237,15 @@ impl NativeGateway {
         let endpoint = BoundEndpoint::bind(runtime_directory)?;
         // The registration is built from the address this host bound, never from one a caller
         // supplied. A launched process is told where to connect, and telling it anywhere but the
-        // socket that exists is telling it nothing.
-        let registration = Registration::new(
-            endpoint.address().clone(),
-            launch.profile_id.clone(),
-            launch.application_instance_id,
-            launch.expected_process.clone(),
-        );
+        // socket that exists is telling it nothing. Which process it will be is not known yet.
+        let registration = launch.expected_process.clone().map(|expected| {
+            Registration::new(
+                endpoint.address().clone(),
+                launch.profile_id.clone(),
+                launch.application_instance_id,
+                expected,
+            )
+        });
         // Every settled resource of this broker reaches the observers watching its instance.
         broker.observe_transitions(observatory.clone());
         Ok(Self {
@@ -236,6 +254,110 @@ impl NativeGateway {
             observatory,
             launch,
             registration,
+            runtime_directory: runtime_directory.to_path_buf(),
+        })
+    }
+
+    /// Starts the agent this launch names and publishes what its forwarder needs to reach here.
+    ///
+    /// This is the whole of the production order, and the order is the point.
+    ///
+    /// 1. The intent is checked against the foreground it was prepared against, because section 12
+    ///    refuses a launch an application took the foreground in front of.
+    /// 2. The executable is started, with the two file paths in its environment and nothing secret
+    ///    in its argument vector.
+    /// 3. The kernel is asked what it started, and that identity is what the registration names.
+    ///    Nothing the process says about itself is used.
+    /// 4. The private exchange is generated, written to an owner-only file, and handed to the
+    ///    broker as the launch's own record.
+    /// 5. The registration file is written last, so a forwarder that reads it reads a complete
+    ///    one and the credential it names already exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Launch`] when the intent is stale, and
+    /// [`BrokerError::LedgerUnavailable`] when the process cannot be started or its files written.
+    pub fn launch(
+        &mut self,
+        intent: &crate::broker::profiles::LaunchIntent,
+        foreground: &crate::broker::profiles::ForegroundMark,
+        mode: kr_protocol::broker::IntegrationMode,
+        now: kr_protocol::scalars::TimestampMs,
+    ) -> Result<Launched> {
+        let application_instance_id = self.launch.application_instance_id;
+        let registration_path = self.runtime_directory.join("registration");
+        let credential_path = self.runtime_directory.join("credential");
+        // Refused before anything is started. A stale intent must cost nothing.
+        let profile = self
+            .broker
+            .execute_launch(intent, foreground, application_instance_id)?;
+        let mut command = std::process::Command::new(&profile.binary.resolved_path);
+        command
+            .args(&profile.arguments)
+            .current_dir(&self.runtime_directory)
+            .env("KR_REGISTRATION", &registration_path)
+            .env("KR_CREDENTIAL", &credential_path)
+            // The worker owns the standard streams of the backend it starts. The person's own
+            // terminal is the session's PTY and is a different path; what this pair carries is
+            // whatever the launched process says to the host that started it.
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped());
+        let child = command.spawn().map_err(|error| {
+            BrokerError::ledger(format!(
+                "could not start {}: {error}",
+                profile.binary.resolved_path
+            ))
+        })?;
+        let started = kr_ipc::identity::started_process_identity(child.id()).map_err(|error| {
+            BrokerError::ledger(format!("the started process cannot be read: {error}"))
+        })?;
+        let process = ManagedProcess::new(
+            application_instance_id,
+            started.clone(),
+            crate::broker::process::TransportHandle {
+                transport: crate::broker::process::BrokerTransport::PrivateSocket,
+                application_instance_id,
+                executable_digest: profile.binary.digest,
+                process: started.clone(),
+            },
+            Credential::generate()?,
+            // Dedicated: this host started it for this instance, so section 7 stops it when the
+            // terminal intentionally exits.
+            true,
+            now,
+        );
+        process.write_registration(&credential_path)?;
+        self.broker.register_instance(
+            application_instance_id,
+            mode,
+            Some(profile.profile_id.clone()),
+            Some(process),
+        )?;
+        let registration = Registration::new(
+            self.endpoint.address().clone(),
+            profile.profile_id.clone(),
+            application_instance_id,
+            started.clone(),
+        );
+        // The framing travels with it, because the forwarder writes one frame before this host
+        // has told it anything else and it has to write that frame the way this connector reads.
+        let published = format!(
+            "{}framing={}\n",
+            registration.to_file(),
+            self.launch.framing.name()
+        );
+        std::fs::write(&registration_path, published).map_err(|error| {
+            BrokerError::ledger(format!(
+                "could not write the registration file {}: {error}",
+                registration_path.display()
+            ))
+        })?;
+        self.launch.expected_process = Some(started.clone());
+        self.registration = Some(registration);
+        Ok(Launched {
+            child,
+            process: started,
+            profile,
         })
     }
 
@@ -247,8 +369,14 @@ impl NativeGateway {
 
     /// Returns the registration file a launched process reads.
     #[must_use]
-    pub fn registration(&self) -> String {
-        self.registration.to_file()
+    pub fn registration(&self) -> Option<String> {
+        self.registration.as_ref().map(|registration| {
+            format!(
+                "{}framing={}\n",
+                registration.to_file(),
+                self.launch.framing.name()
+            )
+        })
     }
 
     /// Accepts one bridge, authenticates it, admits it and starts its owner.
@@ -261,26 +389,19 @@ impl NativeGateway {
     /// Returns [`BrokerError::PermissionDenied`] when the connection is not the launch this host
     /// made, or carries anything a browser would have added; and whatever the broker refuses when
     /// it admits the connection.
-    pub async fn accept<CR, CW>(
-        &self,
-        process: &ManagedProcess,
-        client_reader: CR,
-        client_writer: CW,
-    ) -> Result<Attached>
+    pub async fn accept<CR, CW>(&self, client_reader: CR, client_writer: CW) -> Result<Attached>
     where
         CR: tokio::io::AsyncRead + Unpin + Send + 'static,
         CW: tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
         let accepted = self.endpoint.accept().await?;
-        self.admit(accepted, process, client_reader, client_writer)
-            .await
+        self.admit(accepted, client_reader, client_writer).await
     }
 
     /// Everything after the accept, for one connection.
     async fn admit<CR, CW>(
         &self,
         accepted: Accepted,
-        process: &ManagedProcess,
         client_reader: CR,
         client_writer: CW,
     ) -> Result<Attached>
@@ -341,7 +462,13 @@ impl NativeGateway {
             process: read,
             environment_session_id: hello.session.clone(),
         };
-        self.registration.authenticate(&presented, &peer, process)?;
+        let registration = self.registration.as_ref().ok_or_else(|| {
+            BrokerError::denied("this endpoint has not launched anything to authenticate against")
+        })?;
+        // The owner, the kernel's naming of the process and the process the launch started. The
+        // private exchange is the broker's own record and is checked where that record lives, in
+        // the admission immediately below, so the credential never leaves it.
+        registration.authenticate_peer(&presented, &peer)?;
         // The identity the connection is admitted under is the kernel's where there is one. The
         // presented one is only ever used where the platform names no peer, which is the case the
         // authentication above has already established.

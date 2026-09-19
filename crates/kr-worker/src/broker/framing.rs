@@ -22,6 +22,16 @@ impl Framing {
         Self(framing)
     }
 
+    /// Returns the stable name of this framing, as the registration file publishes it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self.0 {
+            NativeFraming::JsonLines => "json_lines",
+            NativeFraming::LengthPrefixed => "length_prefixed",
+            NativeFraming::ContentLength => "content_length",
+        }
+    }
+
     /// Wraps one body in the framing this connector uses.
     #[must_use]
     pub fn encode(self, body: &[u8]) -> Vec<u8> {
