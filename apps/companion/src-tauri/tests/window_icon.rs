@@ -20,10 +20,18 @@ const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
 /// Red, green, blue and alpha, one sample each.
 const TRUE_COLOUR_WITH_ALPHA: u8 = 6;
 
+/// The bytes an image header occupies: the signature, the chunk's length and name, and its fields.
+const HEADER_BYTES: usize = 26;
+
 fn header_of(bytes: &[u8], what: &str) -> Header {
     assert!(
         bytes.starts_with(&SIGNATURE),
         "{what} does not begin with the PNG signature"
+    );
+    assert!(
+        bytes.len() >= HEADER_BYTES,
+        "{what} is {} bytes, too short to hold an image header",
+        bytes.len()
     );
     assert!(&bytes[12..16] == b"IHDR", "{what} does not begin with IHDR");
     let field = |at: usize| u32::from_be_bytes(bytes[at..at + 4].try_into().expect("four bytes"));
@@ -121,6 +129,28 @@ fn a_declared_png_is_the_size_its_name_states() {
     }
 }
 
+/// One frame's bytes, or the reason the directory does not describe a frame.
+///
+/// Every field is read through a checked range, so a file that names a frame it does not contain
+/// is reported as the malformed file it is rather than ending the run somewhere further along.
+fn frame_at(bytes: &[u8], index: usize) -> Result<&[u8], String> {
+    let start = 6 + 16 * index;
+    let entry = bytes
+        .get(start..start + 16)
+        .ok_or_else(|| format!("the directory ends before entry {index}"))?;
+    let length = u32::from_le_bytes(entry[8..12].try_into().expect("four bytes")) as usize;
+    let offset = u32::from_le_bytes(entry[12..16].try_into().expect("four bytes")) as usize;
+    let end = offset
+        .checked_add(length)
+        .ok_or_else(|| format!("entry {index} names a range past the end of any file"))?;
+    bytes.get(offset..end).ok_or_else(|| {
+        format!("entry {index} names bytes {offset}..{end}, past the end of the file")
+    })
+}
+
+/// The smallest device-independent bitmap header an icon frame can carry.
+const BITMAP_HEADER: usize = 40;
+
 #[test]
 fn every_frame_of_the_windows_icon_carries_one_byte_per_channel() {
     for path in declared_icons()
@@ -128,23 +158,45 @@ fn every_frame_of_the_windows_icon_carries_one_byte_per_channel() {
         .filter(|path| path.ends_with(".ico"))
     {
         let bytes = read(&crate_root().join(path));
-        let count = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        let directory = bytes
+            .get(0..6)
+            .unwrap_or_else(|| panic!("{path} is too short to hold an icon directory"));
+        assert_eq!(
+            (directory[0], directory[1], directory[2], directory[3]),
+            (0, 0, 1, 0),
+            "{path} does not begin with an icon directory"
+        );
+        let count = u16::from_le_bytes([directory[4], directory[5]]) as usize;
         assert!(count > 0, "{path} holds no frames");
         for frame in 0..count {
-            let entry = &bytes[6 + 16 * frame..6 + 16 * frame + 16];
-            let length = u32::from_le_bytes(entry[8..12].try_into().expect("four bytes")) as usize;
-            let offset = u32::from_le_bytes(entry[12..16].try_into().expect("four bytes")) as usize;
-            let payload = &bytes[offset..offset + length];
-            if !payload.starts_with(&SIGNATURE) {
-                // A frame stored as a device-independent bitmap carries its depth in its own
-                // header, and the loader converts it.
+            let what = format!("frame {frame} of {path}");
+            let payload =
+                frame_at(&bytes, frame).unwrap_or_else(|reason| panic!("{path}: {reason}"));
+            if payload.starts_with(&SIGNATURE) {
+                let header = header_of(payload, &what);
+                assert_eq!(
+                    header.bits_per_channel, 8,
+                    "{what} is not one byte per channel"
+                );
+                assert_eq!(
+                    header.colour_type, TRUE_COLOUR_WITH_ALPHA,
+                    "{what} is not true colour with alpha"
+                );
                 continue;
             }
-            let what = format!("frame {frame} of {path}");
-            let header = header_of(payload, &what);
+            // The other form a frame takes is a device-independent bitmap, whose own header states
+            // its depth and which the loader converts. It still has to be a header.
+            let stated = payload
+                .get(0..4)
+                .map(|size| u32::from_le_bytes(size.try_into().expect("four bytes")) as usize);
             assert_eq!(
-                header.bits_per_channel, 8,
-                "{what} is not one byte per channel"
+                stated,
+                Some(BITMAP_HEADER),
+                "{what} is neither a PNG nor a bitmap header"
+            );
+            assert!(
+                payload.len() > BITMAP_HEADER,
+                "{what} is a bitmap header with no pixels after it"
             );
         }
     }

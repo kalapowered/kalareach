@@ -26,6 +26,13 @@ function bridge(): void {
     message: 'no host on this machine',
     user_action: 'retry'
   }
+  let nextListener = 0
+  // Removing a listener goes through the event plugin's own internals before it reaches a command,
+  // so a stub without them turns an ordinary unmount into a type error.
+  Object.defineProperty(window, '__TAURI_EVENT_PLUGIN_INTERNALS__', {
+    value: { unregisterListener: () => undefined },
+    configurable: true
+  })
   Object.defineProperty(window, '__TAURI_INTERNALS__', {
     value: {
       metadata: {
@@ -39,7 +46,9 @@ function bridge(): void {
         return id
       },
       invoke(command: string) {
-        if (command === 'plugin:event|listen') return Promise.resolve(1)
+        // Each listener gets its own identifier, because two listeners that share one are one
+        // listener as far as removing them is concerned.
+        if (command === 'plugin:event|listen') return Promise.resolve(++nextListener)
         if (command === 'plugin:event|unlisten') return Promise.resolve(null)
         if (command === 'connection_state') {
           return Promise.resolve({
@@ -68,9 +77,18 @@ test.describe('the bundle the desktop window loads', () => {
     await page.goto(BUNDLE)
 
     await expect(page.getByRole('heading', { name: 'What needs you' })).toBeVisible()
-    await expect(page.getByRole('button', { name: 'Sessions' })).toBeVisible()
     // The host is not there, and the window says so in its own words.
     await expect(page.getByText('no host on this machine').first()).toBeVisible()
+
+    // Moving between screens mounts and unmounts views, which is where a subscription is taken out
+    // and given back. A bridge that only survives startup would fail here.
+    const sessions = page.getByRole('button', { name: 'Sessions' })
+    await sessions.click()
+    await expect(sessions).toHaveAttribute('aria-current', 'page')
+    const attention = page.getByRole('button', { name: 'Attention' })
+    await attention.click()
+    await expect(page.getByRole('heading', { name: 'What needs you' })).toBeVisible()
+
     expect(uncaught).toEqual([])
   })
 
