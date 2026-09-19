@@ -1187,8 +1187,9 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     assert!(seen.contains(SECOND_MARKER));
 
     // Something is typed that the device will *not* wait for, and then its connection is lost.
-    // What the session produces next happens while the device is away, which is what makes the
-    // restoration on the next connection worth checking.
+    // Whether the session produced it before the connection went or after is the machine's
+    // business; what matters below is that the device never applied it, so the restoration has to
+    // bring it.
     let away = "printf 'while%s-away\n' -it\n";
     session
         .write_input(&InputWriteParams {
@@ -1207,10 +1208,10 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     session.close();
     drop(session);
 
-    // While the device is away, the session goes on producing: a local caller reads the retained
-    // history on the worker's own endpoint and finds what was typed but never waited for. That is
-    // what makes the restoration on the next connection worth checking — the content exists, and
-    // the device has not seen it.
+    // A local caller reads the retained history on the worker's own endpoint and finds what was
+    // typed but never waited for. That is what makes the restoration on the next connection worth
+    // checking — the content exists, at a position past the one the device carried, and the device
+    // has not seen it.
     let mut on_worker = LocalClient::connect(
         &kr_ipc::paths::Endpoint::from_path(
             created

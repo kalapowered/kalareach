@@ -219,13 +219,20 @@ jobs:
               break
             fi
             if [ "$attempt" -ge 5 ]; then
-              if [ "${published%% *}" = "$release" ]; then
-                echo "$GITHUB_REF_NAME was published as a release whose assets can be replaced." >&2
-                echo 'Turn on immutable releases for this repository, then release the next commit.' >&2
-              else
-                echo "$GITHUB_REF_NAME does not resolve to the release this run published." >&2
-                echo "It published release $release; the tag answers: ${published:-nothing}" >&2
-              fi
+              case "$published" in
+                "$release false")
+                  echo "$GITHUB_REF_NAME was published as a release whose assets can be replaced." >&2
+                  echo 'Turn on immutable releases for this repository, then release the next commit.' >&2
+                  ;;
+                "$release" | "$release "*)
+                  echo "$GITHUB_REF_NAME was published, and this is not an answer about whether its" >&2
+                  echo "assets can be replaced, so it is not one to publish against: $published" >&2
+                  ;;
+                *)
+                  echo "$GITHUB_REF_NAME does not resolve to the release this run published." >&2
+                  echo "It published release $release; the tag answers: ${published:-nothing}" >&2
+                  ;;
+              esac
               exit 1
             fi
             attempt=$((attempt + 1))

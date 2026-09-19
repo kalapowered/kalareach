@@ -78,12 +78,20 @@ impl Host {
 impl Drop for Host {
     /// Stops the shell this fixture started, however the test ended.
     ///
-    /// Exiting does not stop it. A shell a session owns runs in a terminal of its own, and a test
-    /// binary that ends - because it finished, or because an assertion failed part of the way
-    /// through - leaves it running and reparented. Most of these applications end by themselves
-    /// soon afterwards; one prints until something stops it. So the process is stopped here, by
-    /// the identity this session recorded when it started it: the kernel is asked what holds that
-    /// number now, and nothing is signalled unless the answer is still the same process.
+    /// Nothing else reliably does. A session's shell runs in a terminal of its own, and whether
+    /// closing the last handle to that terminal hangs it up depends on what the session's own
+    /// tasks are still holding, so a test that returned early - because it finished, or because an
+    /// assertion failed part of the way through - cannot count on it. Most of these applications
+    /// end by themselves soon afterwards; the one above prints until something stops it, and a
+    /// process left forking a hundred times a second is what the next run of this binary would be
+    /// competing with.
+    ///
+    /// What is signalled is named rather than matched: the identity this session recorded when it
+    /// started the shell. The kernel is asked what holds that number now, and nothing is signalled
+    /// unless the answer is still that same process. A number belongs to a process only while the
+    /// process is alive, so the moment between that answer and the signal is the limit of naming a
+    /// process by its number; it is why the ordinary way to stop one of these is `Host::end`, and
+    /// why this is one call rather than two.
     fn drop(&mut self) {
         let Some(started) = self.shell.as_ref() else {
             return;
@@ -97,17 +105,15 @@ impl Drop for Host {
         if !now.matches(started) {
             return;
         }
-        // The group first, because the application's own children are in it, and then the process
-        // itself for a platform that gave it no group of its own. Neither answer is acted on: a
-        // shell that has already gone between the reading above and this line is not an error.
-        for named in [format!("-{pid}"), pid.to_string()] {
-            let _ = std::process::Command::new("kill")
-                .arg("-KILL")
-                .arg(named)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
+        // The group the shell leads, rather than the shell alone: the terminal gives it a session
+        // of its own, so the application's own children are in that group with it. The answer is
+        // not acted on - a shell that has gone in the meantime is not an error here.
+        let _ = std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{pid}"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 }
 
