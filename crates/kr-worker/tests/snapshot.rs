@@ -91,10 +91,15 @@ impl Drop for Host {
     /// however few calls it made. Going through the owner closes that window rather than narrowing
     /// it, and the session already refuses to signal anything it cannot still confirm.
     ///
-    /// A session whose lock is poisoned is the one case nothing can be stopped from here: an
-    /// earlier panic left the state it holds untrustworthy, which is exactly when `session()`
-    /// refuses to hand it over. That refusal is caught rather than raised, because a panic while
-    /// this one is unwinding would take the whole test binary down and tell nobody why.
+    /// This is an attempt rather than a guarantee, and two things can end it without stopping
+    /// anything. A session whose lock is poisoned cannot be reached at all: an earlier panic left
+    /// the state it holds untrustworthy, which is exactly when `session()` refuses to hand it
+    /// over, and that refusal is caught here rather than raised, because a panic inside a drop
+    /// that is already unwinding would take the whole test binary down and tell nobody why. And
+    /// `force_close` itself answers with an error when it cannot ask about or signal what it
+    /// holds. Neither is acted on, because there is nothing a fixture being dropped can do about
+    /// either, and because a test that has already failed is the wrong place to raise a second
+    /// complaint.
     fn drop(&mut self) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = self.runtime.session().force_close();

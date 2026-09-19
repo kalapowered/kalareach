@@ -52,10 +52,12 @@ into the notes.
 
 One tag is one run at a time. A second run for a tag that is already being released waits for the
 first to finish rather than running beside it, and the run already under way is never cancelled for
-the one waiting; when the waiting run's turn comes it finds the release the first one made and
-refuses to go on. What is guaranteed is that two runs for one tag never overlap, not that every run
-gets its turn: GitHub holds one run waiting per tag, so a third arrival takes the waiting one's
-place. Nothing is lost when it does, because a run that has not started has created nothing.
+the one waiting; when the waiting run's turn comes, it finds whatever the run before it made and
+refuses to go on if that is a release or a draft. A first run that failed before creating either
+leaves the tag as it found it, and the run that follows releases it. What is guaranteed is that two
+runs for one tag never overlap, not that every run gets its turn: GitHub holds one run waiting per
+tag, so a third arrival takes the waiting one's place. Nothing is lost when it does, because a run
+that has not started has created nothing.
 Reading a release moments after writing to it can reach a copy of GitHub's records
 that has not caught up, so each of the three reads that follow is attempted up to five times, three
 seconds apart, before its answer is taken as the release's state. Repeating them changes nothing:
