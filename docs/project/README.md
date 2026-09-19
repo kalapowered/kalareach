@@ -732,9 +732,10 @@ it with, before the rename, so a file that was executable stays executable and o
 does not become one. A destination whose permissions this host cannot read is a path it does not
 replace. What it carries is the platform's mode bits. An access-control list beside them it does
 **not** carry, and a destination that has one is a path it refuses rather than replaces, so the
-protection is never lost quietly: that is the answer on macOS and on Linux, where a list is read
-and a minimal one, which says no more than the mode bits, is not treated as one. On a platform
-whose lists this host does not read, only the mode bits are carried. Content is written byte for
+protection is never lost quietly. That is the answer on macOS, which keeps a list beside the mode
+bits, and on Linux, where the question is whether the file carries the extended attribute a list
+lives in: a file whose protection is its mode bits alone carries none. On a platform whose lists
+this host does not read, only the mode bits are carried. Content is written byte for
 byte, so a line ending is whatever the version holds.
 
 An apply comes to one of five classes. **A preflight conflict is an error, not a result**:
