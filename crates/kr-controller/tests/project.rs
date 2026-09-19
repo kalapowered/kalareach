@@ -1233,8 +1233,10 @@ fn start_daemon(program: &Path, host: &kr_ipc::testing::TempHost) -> Daemon {
     // moment - including the one another test's copy of this daemon is being written through. Linux
     // refuses to execute a file any process still holds open for writing, with ETXTBSY, and the
     // window closes as soon as that child reaches its own exec. Nothing about the daemon or the
-    // copy is wrong when that happens, and it is not something a lock or serial tests would fix:
-    // the race is between processes rather than between these tests.
+    // copy is wrong when that happens, and the window closes in milliseconds, so it is waited out
+    // rather than prevented. Preventing it is possible - coordinate every write of an executable
+    // against every launch in the binary, or run these tests one at a time - and both cost far
+    // more than the wait does.
     const ATTEMPTS: usize = 100;
     const BETWEEN: std::time::Duration = std::time::Duration::from_millis(10);
 

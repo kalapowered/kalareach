@@ -1245,9 +1245,11 @@ impl RestrictedProfile {
             // Completion is asked about first, and a child that has already exited is answered
             // with its own output however long it took. The deadline bounds what this host lets a
             // subprocess hold and its remedy is to end it; a child that ended by itself was never
-            // stopped, and the refusal below says it was. Reporting a failure for an invocation
-            // that produced a complete, enclosed, confirmed result would be untrue, and would make
-            // the answer depend on which side of one poll the scheduler landed on.
+            // stopped, and the refusal below says it was, so reporting one for an invocation that
+            // produced a complete, enclosed, confirmed result would be untrue of it. When this
+            // loop next looks is the scheduler's business either way, and so is which of a
+            // finishing child and a passing deadline it sees first; what the order decides is
+            // whether a result that is already in hand is thrown away.
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) => {}

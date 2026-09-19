@@ -1251,7 +1251,7 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     }
     assert!(
         retained.contains("while-it-away"),
-        "the session produced it while the device was away: {retained:?}"
+        "the retained history holds what the device never applied: {retained:?}"
     );
 
     let resumed_from = carried
@@ -1294,12 +1294,15 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
         resumed.from_cursor.get() >= resumed_from.get(),
         "a resumed subscription starts no earlier than the position the client held"
     );
-    // And the screen it is drawn carries what the session produced while it was away. That is the
-    // restoration: the client asked from its own cursor and was given the state at it.
+    // And the screen it is drawn carries content this client never applied. That is the
+    // restoration, and it is what it can claim: the client asked from the position it held and was
+    // given the screen as it stands at the host's cursor, rather than the bytes from that position
+    // over again. Whether the session produced that content before this connection went or after
+    // is the machine's business and this test does not depend on which.
     let restored = observe(&session, &mut events, "while-it-away").await;
     assert!(
         restored.contains("while-it-away"),
-        "the restoration carries what happened while the device was away: {restored:?}"
+        "the restoration carries content this client never applied: {restored:?}"
     );
     drop(on_worker);
 
