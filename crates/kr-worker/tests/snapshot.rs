@@ -2570,23 +2570,26 @@ async fn a_buffer_switch_brings_every_window_back_to_the_live_screen() {
     };
     assert!(switched, "the application took the screen");
 
-    // The window is the live screen now, on both sides: the session holds no row above the live
-    // page for this attachment, so a report that names none is answered with none and a fresh
-    // screen is the live one.
+    // The window came back with it, and nothing here asked for that: a report that names its own
+    // size and no position at all would clear the window itself, so the size this attachment
+    // already has is reported and the answer is read for where the window is.
     let after = report_viewport(&host, &mut watcher, window, None).await;
     assert!(
         after.position.0.is_none(),
-        "the window came back to the live screen with it: {:?}",
+        "the window is the live screen: {:?}",
         after.position.0
     );
-    let installed = collect_until_installed(&mut watcher.client, Duration::from_secs(5)).await;
-    if let Some(top) = installed.iter().rev().find_map(|event| match event {
-        Event::Snapshot(header) => Some(header.viewport),
-        _ => None,
-    }) {
-        assert_eq!(
-            top.top_row, top.screen_top_row,
-            "and the screen it draws is the live one"
-        );
-    }
+    let installed = collect_until_installed(&mut watcher.client, Duration::from_secs(10)).await;
+    let drawn = installed
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            Event::Snapshot(header) => Some(header.viewport),
+            _ => None,
+        })
+        .expect("a fresh screen follows");
+    assert_eq!(
+        drawn.top_row, drawn.screen_top_row,
+        "and the screen it draws is the live one"
+    );
 }

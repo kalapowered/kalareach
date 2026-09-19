@@ -137,6 +137,9 @@ fn probed() -> Result<Chosen> {
         }
     };
     let Some((foreground, background)) = probe.palette else {
+        // The exchange finished, so the person's own typing came back with it, and this refusal is
+        // where it stops: no session exists to forward it to. They are owed the number.
+        let _owed = crate::session::UndeliveredTyping::new(probe.typed.len());
         return Err(CliError::TerminalProbeFailed(
             "this terminal did not report both its default foreground and its default background, \
              so there is no shared palette to record; choose light or dark"

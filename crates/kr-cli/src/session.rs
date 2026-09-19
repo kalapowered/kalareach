@@ -126,13 +126,14 @@ const SCROLL_FORWARD_KEY: &[u8] = b"\x1b[6;2~";
 /// by reporting where this window is looking and never by writing input.
 ///
 /// A read is one of them or it is the session's, whole and unchanged. That is the rule because of
-/// what the alternative costs: a reader that looked *inside* a batch would have to know where a
-/// bracketed paste began, hold the beginning of a sequence the read boundary cut in half, and
-/// decide what a key means among bytes it did not recognise - and each of those is a way for the
-/// command to alter what somebody typed. A terminal writes one key in one go, so a key pressed on
-/// its own arrives on its own, and a key that arrives among other bytes is forwarded like every
-/// other byte. Holding the key down repeats it, so a read of several of the same key is that many
-/// pages; a read mixing the two is nobody's gesture and belongs to the session.
+/// what the alternative costs: a reader that looked *inside* a batch would have to hold the
+/// beginning of a sequence the read boundary cut in half and decide what a key means among bytes
+/// it did not recognise, and each of those is a way for the command to alter what somebody typed.
+/// A read is a batch of bytes and not a key, so what this recognises is a batch that is one key
+/// and nothing else: a key pressed on its own usually arrives that way, and one that arrives among
+/// other bytes is forwarded like every other byte and scrolls nothing. A read of several of the
+/// same key is that many pages; a read mixing the two is nobody's gesture and belongs to the
+/// session.
 ///
 /// Returns how far the window moves: positive back through the history, negative towards the live
 /// screen, and `None` for a read that is not this.
@@ -650,9 +651,7 @@ async fn drive(
                             // and the last of its pages this terminal holds no screen at all, and
                             // reading a position out of that would forget where the window is
                             // half way through being told.
-                            if parked.is_some()
-                                && let Some(above) = display.window_above_the_live_page()
-                            {
+                            if let Some(above) = display.window_above_the_live_page() {
                                 parked = above;
                             }
                             // The client's own choice, not the session's: a person who asked to
@@ -715,50 +714,6 @@ async fn drive(
                         // a window would lose their session — so the marker is answered by asking
                         // for the screen again, which is what the marker is for.
                         if notification.event_type.as_str() == "session.resync" {
-                            // A marker that follows no request of this terminal's is the session
-                            // having gone on without it: its queue overflowed, or its screen was
-                            // replaced for a reason nobody here asked for. A person following the
-                            // live screen is taken back to it, because the screen that is about to
-                            // arrive is where the session got to.
-                            let mine = outstanding.values().any(|what| {
-                                matches!(what, Outstanding::Viewport | Outstanding::Scrollback)
-                            });
-                            if follow_live && !mine && parked.is_some() {
-                                parked = None;
-                                if let Ok(size) = terminal.size()
-                                    && size.columns > 0
-                                    && size.rows > 0
-                                {
-                                    let request_id =
-                                        kr_protocol::ids::RequestId::new(next_request);
-                                    next_request += 1;
-                                    let params =
-                                        kr_protocol::attachment::AttachmentViewportParams {
-                                            attachment_id,
-                                            dimensions: Dimensions::new(
-                                                u64::from(size.columns),
-                                                u64::from(size.rows),
-                                            ),
-                                            position: Nullable(None),
-                                        };
-                                    if !send_geometry(
-                                        client,
-                                        descriptor,
-                                        request_id,
-                                        Method::AttachmentViewport,
-                                        &params,
-                                    )
-                                    .await
-                                    {
-                                        return AttachOutcome::Disconnected;
-                                    }
-                                    outstanding.insert(request_id, Outstanding::Scrollback);
-                                }
-                            }
-                            // A marker means this terminal fell behind or was moved, which is the
-                            // session having gone on without it. A person following the live
-                            // screen is taken back to it; the fresh screen that follows is then
-                            // the live one rather than the window they had left.
                             // Whatever this terminal was holding is no longer the session's screen.
                             // It is discarded before the fresh one is asked for, so nothing is
                             // drawn from it in between.
@@ -921,13 +876,20 @@ async fn drive(
                                 {
                                     parked = landed(result.position.0);
                                 }
+                                // The screen this terminal has been given since is newer than any
+                                // answer about a request that was in flight while it arrived, and
+                                // where a window is is a property of the screen.
+                                if let Some(above) = display.window_above_the_live_page() {
+                                    parked = above;
+                                }
                                 // What the person asked for while this was in flight, resolved
                                 // against where the window actually ended up. A refusal leaves the
                                 // window where it was, and the movement is measured from there.
-                                if queued != 0
-                                    && let Some(position) = scrolled(parked, queued, step)
-                                {
-                                    queued = 0;
+                                let asked = (queued != 0)
+                                    .then(|| scrolled(parked, queued, step))
+                                    .flatten();
+                                queued = 0;
+                                if let Some(position) = asked {
                                     let request_id =
                                         kr_protocol::ids::RequestId::new(next_request);
                                     next_request += 1;
@@ -949,8 +911,6 @@ async fn drive(
                                         return AttachOutcome::Disconnected;
                                     }
                                     outstanding.insert(request_id, Outstanding::Scrollback);
-                                } else {
-                                    queued = 0;
                                 }
                             }
                             // The screen follows as ordinary output. A refusal means the session no
@@ -982,6 +942,9 @@ async fn drive(
                     u64::from(size.columns),
                     u64::from(size.rows),
                 );
+                // What every later report about this window carries, so one queued behind a scroll
+                // does not put the terminal's old size back.
+                dimensions_now = dimensions;
                 let request_id = kr_protocol::ids::RequestId::new(next_request);
                 next_request += 1;
                 // The owner moves the session's size; anybody else reports the size it is
@@ -1074,9 +1037,13 @@ async fn drive(
                     if !outstanding
                         .values()
                         .any(|what| matches!(what, Outstanding::Scrollback))
-                        && let Some(position) = scrolled(parked, queued, step)
                     {
+                        // A movement the window cannot make is spent rather than kept: a window on
+                        // the live screen asked to go forward has nowhere to go, and holding that
+                        // against the next key would swallow it.
+                        let asked = scrolled(parked, queued, step);
                         queued = 0;
+                        if let Some(position) = asked {
                         let request_id = kr_protocol::ids::RequestId::new(next_request);
                         next_request += 1;
                         let params = kr_protocol::attachment::AttachmentViewportParams {
@@ -1096,6 +1063,7 @@ async fn drive(
                             return AttachOutcome::Disconnected;
                         }
                         outstanding.insert(request_id, Outstanding::Scrollback);
+                        }
                     }
                     // The key was this terminal's, so nothing of it reaches the session, whether
                     // or not the window had anywhere to go.
@@ -1103,10 +1071,9 @@ async fn drive(
                 }
                 // A click addresses a cell of the live screen, and a window above it is showing
                 // rows the application's grid does not have. Section 8 gives that its answer:
-                // input outside the visible grid has no application effect. Whole reads again,
-                // for the same reason the keys are: a report the terminal wrote on its own is a
-                // read of its own, and looking inside a batch is how a command starts altering
-                // what somebody typed.
+                // input outside the visible grid has no application effect. Whole reads again, for
+                // the same reason the keys are, and with the same limit: a report a read boundary
+                // cut in half, or one among other bytes, is forwarded like every other byte.
                 if !pasting && parked.is_some() && is_pointer_report(&bytes) {
                     continue;
                 }

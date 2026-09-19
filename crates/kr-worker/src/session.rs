@@ -2033,6 +2033,14 @@ impl Session {
         // The engine's answer is recorded first, so a summary and a delivery cannot disagree about
         // how an attachment is being served. Which of them may *begin* forwarding is settled with
         // it, because that answer depends on where the parser stands and not only on a size.
+        if filtered.projection_reset {
+            // The screen was replaced rather than changed, and what replaced it has no history
+            // above it: the alternate buffer keeps none, and a full reset starts the rows again.
+            // Every window therefore comes back to the live screen with it, before anything reads
+            // where a window is: whether an attachment may take the stream depends on that answer,
+            // and a window nobody is above is not a reason to keep drawing a projection.
+            self.attachments.clear_history_windows();
+        }
         self.attachments
             .set_carryable(self.engine.direct_is_carryable());
         self.settle_forwarding(kr_ipc::now_ms().get(), None);
@@ -2094,13 +2102,6 @@ impl Session {
             None
         };
         if reset_reason.is_some() {
-            // The screen was replaced rather than changed, and what replaced it has no history
-            // above it: the alternate buffer keeps none, and a full reset starts the rows again.
-            // Every window therefore comes back to the live screen with it. This happens where the
-            // session sees the reset rather than where a client is published to, because a client
-            // that is behind is published nothing at all and would otherwise be restored to rows
-            // that are no longer above anything.
-            self.attachments.clear_history_windows();
             for attachment_id in self.hub.subscribers() {
                 if projecting.contains(&attachment_id) {
                     self.projections.forget(attachment_id);

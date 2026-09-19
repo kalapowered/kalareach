@@ -122,9 +122,11 @@ or a pointer report, so pasted text reaches the session byte for byte. A paste w
 read boundary cut in half, or one a terminal sends without them at all, is text the command cannot
 tell from typing.
 
-The window this terminal is looking through is the session's answer to say. One report is in flight
-at a time; what the person presses meanwhile waits for it and is measured from where the window
-actually landed.
+The window this terminal is looking through is the session's answer to say. One scroll-back report
+is in flight at a time; what the person presses meanwhile waits for it and is measured from where
+the window actually landed. A report about this terminal's *size* goes out when the size changes,
+whatever else is in flight, because a window drawn for a size the terminal no longer has is wrong
+about every row.
 
 They are this terminal's keys only where this terminal has no history of its own. A terminal being
 handed the session's bytes has them, so its own scrollback holds what scrolled past and the command
@@ -133,9 +135,13 @@ window is the only way above its screen. They are also the application's while a
 program is running, because its buffer keeps no history and it has its own use for those keys; the
 window comes back to the live screen with the screen that program took.
 
-While the window is above the live page a click reaches no application. It would address a cell of
-the live screen, and the rows the person is looking at are not on it; section 8 gives that case its
-answer, that input outside the visible grid has no application effect.
+While the window is above the live page a read that is nothing but pointer reports reaches no
+application. It would address a cell of the live screen, and the rows the person is looking at are
+not on it; section 8 gives that case its answer, that input outside the visible grid has no
+application effect. A report a read boundary cut in half, or one among other bytes, is forwarded
+like every other byte, so a click there reaches the application at the coordinates the terminal
+wrote. The command does not map pointer coordinates at all: that belongs with the rest of a
+window's pointer handling.
 
 A window stays where the person put it while the session goes on writing underneath. `--follow-live`
 brings it back to the live screen as soon as the session writes something, which the command reads
