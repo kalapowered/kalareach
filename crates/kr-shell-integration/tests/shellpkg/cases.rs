@@ -38,6 +38,8 @@ impl Session {
         let (_, event) = self.expect_event("the first editor entry", |event| {
             matches!(event, BridgeEvent::EditorEnter(_))
         });
+        // From here the shell has a reader, so a key typed at it is a step it takes.
+        self.reading = true;
         let entry = as_enter(&event).clone();
         self.last_entry = Some(entry.clone());
         entry

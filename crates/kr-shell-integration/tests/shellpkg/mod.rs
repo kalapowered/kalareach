@@ -206,7 +206,12 @@ fn user_configuration(kind: ShellKind, prompt: &str) -> String {
              function global:prompt {{ '{prompt}' }}\n\
              $global:KR_TEST_USER_CONFIGURATION = 1\n\
              Set-PSReadLineOption -HistorySaveStyle SaveNothing\n\
-             Set-PSReadLineOption -PredictionSource None\n\n"
+             Set-PSReadLineOption -PredictionSource None\n\
+             # A line typed before this editor takes the terminal arrives through the terminal's\n\
+             # own line discipline, which sends a line feed where the return was. This person has\n\
+             # bound that to the same acceptance, so a line they type a moment early is still\n\
+             # theirs. The integration goes on top of this binding rather than in place of it.\n\
+             Set-PSReadLineKeyHandler -Chord Ctrl+j -Function AcceptLine\n\n"
         ),
     }
 }
@@ -258,6 +263,8 @@ pub struct Session {
     pub last_entry: Option<RootEditorEnterParams>,
     /// How far into the terminal's output a drawn prompt has already been typed at.
     mark: usize,
+    /// True once the shell has a reader of its own, which is what a step can be given to.
+    pub reading: bool,
     stream: UnixStream,
     /// True once the worker's end has gone, after which nothing is written or read.
     closed: bool,
@@ -414,6 +421,7 @@ impl Session {
             accepted: placeholder_accept(session_id),
             prompt,
             mark: 0,
+            reading: false,
             last_entry: None,
             stream,
             closed: false,
@@ -700,7 +708,9 @@ impl Session {
     /// wrapper sits, and one whose binding moves the cursor and touches nothing else. A person at
     /// the keyboard gives the reader the same step by typing at all.
     pub fn nudge(&mut self) {
-        if !dialect(self.package_kind).answers_at_the_next_step {
+        // A key typed before the shell has a reader is not a step for it: it goes through the
+        // terminal's own line discipline and waits there for the line it is part of.
+        if !self.reading || !dialect(self.package_kind).answers_at_the_next_step {
             return;
         }
         self.type_bytes(&[0x06]);
@@ -756,13 +766,42 @@ impl Session {
 
     /// Types a line and its return, at a prompt where this editor needs one.
     pub fn type_line(&mut self, line: &str) {
-        if dialect(self.package_kind).types_at_the_prompt {
+        if dialect(self.package_kind).types_at_the_prompt && !line.is_empty() {
             self.wait_for_prompt();
+            // The return goes in once the editor has drawn what was typed, which is where it is
+            // reading the terminal itself. Before that the terminal's own line discipline holds
+            // the line, and it sends a line feed where the return was.
+            let start = self.output.lock().expect("the output lock").len();
+            self.type_bytes(line.as_bytes());
+            self.wait_for_editor(start);
+            self.type_bytes(b"\r");
+        } else {
+            let mut bytes = line.as_bytes().to_vec();
+            bytes.push(b'\r');
+            self.type_bytes(&bytes);
         }
-        let mut bytes = line.as_bytes().to_vec();
-        bytes.push(b'\r');
-        self.type_bytes(&bytes);
         self.mark = self.output.lock().expect("the output lock").len();
+    }
+
+    /// Waits for the editor's own drawing to reach the terminal after `start`.
+    ///
+    /// The sequence is the one this editor puts around every line it draws, and nothing the
+    /// terminal echoes by itself contains it.
+    fn wait_for_editor(&mut self, start: usize) -> bool {
+        const DRAWING: &[u8] = b"\x1b[?25l";
+        let deadline = Instant::now() + REPLY;
+        loop {
+            {
+                let output = self.output.lock().expect("the output lock");
+                if find(&output[start.min(output.len())..], DRAWING) {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.pump(Duration::from_millis(10));
+        }
     }
 
     /// Waits until the shell has drawn a prompt that nothing has been typed at yet.
