@@ -13941,6 +13941,15 @@ export interface SessionReadResult {
    * Null for a session that has already closed, whose profile decides nothing any more.
    */
   launch_profile: LaunchProfile1 | null
+  /**
+   * How many `shell.launch` confirmations this session is still waiting on its reader for.
+   *
+   * Work this host has admitted and not finished: a launch is with the reader, and the caller
+   * is waiting for the reader's decision. Null and zero are different answers. Null is a
+   * session that cannot have one — no managed root editor, or a session that has closed — and
+   * says nothing about outstanding work; zero is a session that could have one and has none.
+   */
+  outstanding_launches: U64 | null
   session: SessionSummary3
 }
 /**

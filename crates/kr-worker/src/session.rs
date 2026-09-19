@@ -922,6 +922,21 @@ impl Session {
         self.command_blocks.back().cloned()
     }
 
+    /// Returns how many launch confirmations this session is still waiting on its reader for.
+    ///
+    /// `None` for a session that cannot have one, which is one with no managed root editor. Every
+    /// other session answers with a count, and a count of zero is an answer: section 9's sleep
+    /// demand reads this, and "none outstanding" and "this host cannot say" are different facts.
+    ///
+    /// An entry lives from the moment the request is registered until the reader's decision is
+    /// delivered. The revocation A-17 sends at 250 ms does not end it: the launch is still with
+    /// the reader and the caller is still waiting. What ends it is the reader's answer, the bridge
+    /// going, or the session closing, each of which delivers an answer to whoever was waiting.
+    #[must_use]
+    pub fn outstanding_launches(&self) -> Option<u64> {
+        self.fence.as_ref().map(|_| self.launches.len() as u64)
+    }
+
     /// Sends the terminal's configured interrupt to the foreground process group.
     fn interrupt_foreground(&mut self) -> Result<()> {
         if self.pty.interrupt_foreground().is_ok() {

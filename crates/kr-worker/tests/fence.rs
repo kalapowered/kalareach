@@ -2112,6 +2112,162 @@ async fn a_detach_that_names_nothing_is_refused_when_the_origin_was_mixed() {
 // KR-REQ-07.32, KR-REQ-07.33, KR-REQ-07.83, KR-REQ-23.38, KR-REQ-23.54: the launch transaction.
 // --------------------------------------------------------------------------------------------
 
+/// A launch the reader has not answered is work this host has outstanding.
+///
+/// Section 9's sleep demand reads it, so it has to survive the revocation A-17 sends at 250 ms:
+/// that bounds how long input is held, not how long the reader may take to decide. What ends it
+/// is the reader's answer, the bridge going, or the session closing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unanswered_launch_is_outstanding_through_its_revocation_and_ends_with_the_answer() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let _holder = holder_over(&mut client, &wired).await;
+    assert_eq!(
+        wired.runtime.session().outstanding_launches(),
+        Some(0),
+        "a managed session with nothing in flight says none, which is not the same as saying \
+         nothing"
+    );
+
+    let fence = fenced(&mut wired, 1, 1).await;
+    let params = ShellLaunchParams {
+        session_id: wired.session_id,
+        command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
+        expected_prompt_generation: fence.prompt_generation,
+        expected_buffer_revision: EditorBufferRevision::new(1),
+    };
+    let target = wired.target();
+    let calling = tokio::spawn(async move {
+        client
+            .mutate(
+                Method::ShellLaunch,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &params,
+            )
+            .await
+    });
+    let request = loop {
+        match wired.next().await {
+            ToBridge::Request { request, .. } => match *request {
+                WorkerRequest::Launch(request) => break request,
+                _ => continue,
+            },
+            _ => continue,
+        }
+    };
+    assert_eq!(
+        wired.runtime.session().outstanding_launches(),
+        Some(1),
+        "the reader has it and the caller is waiting"
+    );
+
+    // The revocation comes and goes. The launch is still with the reader, and the caller is still
+    // waiting for its decision, so it is still outstanding.
+    let revoked = tokio::time::timeout(SOON, async {
+        loop {
+            if matches!(wired.next().await, ToBridge::LaunchRevoked { .. }) {
+                return;
+            }
+        }
+    })
+    .await;
+    assert!(
+        revoked.is_ok(),
+        "the hold expired and the launch was revoked"
+    );
+    assert_eq!(
+        wired.runtime.session().outstanding_launches(),
+        Some(1),
+        "a revocation bounds the hold on input, not the reader's decision"
+    );
+
+    // The reader decides, the caller is answered, and nothing is outstanding.
+    wired
+        .bridge
+        .answer(
+            kr_protocol::ids::RequestId::new(0),
+            BridgeAnswer::Launch(LaunchDecision::Rejected(LaunchRejection {
+                transaction: request.transaction,
+                reason: LaunchRejectionReason::Revoked,
+                fence_id: request.fence_id,
+                prompt_generation: fence.prompt_generation,
+                buffer_revision: EditorBufferRevision::new(1),
+            })),
+        )
+        .await
+        .expect("answers");
+    let _ = tokio::time::timeout(SOON, calling).await.expect("answered");
+    tokio::time::timeout(SOON, async {
+        loop {
+            if wired.runtime.session().outstanding_launches() == Some(0) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the reader's answer ended it");
+
+    // And a session with no managed editor says nothing at all, which is a different answer from
+    // saying none.
+    let stock = wired_with(ShellMode::NativeCompat, false).await;
+    assert_eq!(stock.runtime.session().outstanding_launches(), None);
+    stock.close().await;
+    wired.close().await;
+}
+
+/// A bridge that goes takes every launch it was deciding with it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_bridge_leaves_no_launch_outstanding() {
+    let mut wired = wired().await;
+    let mut client = LocalClient::connect(&wired.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects");
+    let _holder = holder_over(&mut client, &wired).await;
+    let fence = fenced(&mut wired, 1, 1).await;
+    let params = ShellLaunchParams {
+        session_id: wired.session_id,
+        command: LaunchCommand::Arguments(vec!["ls".to_owned()]),
+        expected_prompt_generation: fence.prompt_generation,
+        expected_buffer_revision: EditorBufferRevision::new(1),
+    };
+    let target = wired.target();
+    let calling = tokio::spawn(async move {
+        client
+            .mutate(
+                Method::ShellLaunch,
+                ActionId::new(kr_ipc::new_uuid()),
+                target,
+                &params,
+            )
+            .await
+    });
+    loop {
+        if let ToBridge::Request { request, .. } = wired.next().await
+            && matches!(*request, WorkerRequest::Launch(_))
+        {
+            break;
+        }
+    }
+    assert_eq!(wired.runtime.session().outstanding_launches(), Some(1));
+
+    let _ = wired
+        .runtime
+        .drive_fence(|driver| driver.integration_lost(IntegrationLoss::BridgeDisconnected));
+    let _ = tokio::time::timeout(SOON, calling)
+        .await
+        .expect("the caller is answered rather than left waiting");
+    assert_eq!(
+        wired.runtime.session().outstanding_launches(),
+        Some(0),
+        "a bridge that has gone is deciding nothing"
+    );
+    wired.close().await;
+}
+
 /// KR-REQ-07.32, KR-REQ-23.38: a launch reaches the reader's mailbox and nothing else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_launch_is_installed_through_the_reader_and_never_written_into_the_terminal() {

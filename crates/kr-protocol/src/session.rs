@@ -849,6 +849,13 @@ pub struct SessionReadResult {
     /// Section 25's typed event: the command, its exit status, how long it ran and where. Null
     /// when no hook has reported one, which is every session without a managed root integration.
     pub last_command_block: Nullable<crate::root::RootCommandBlockParams>,
+    /// How many `shell.launch` confirmations this session is still waiting on its reader for.
+    ///
+    /// Work this host has admitted and not finished: a launch is with the reader, and the caller
+    /// is waiting for the reader's decision. Null and zero are different answers. Null is a
+    /// session that cannot have one — no managed root editor, or a session that has closed — and
+    /// says nothing about outstanding work; zero is a session that could have one and has none.
+    pub outstanding_launches: Nullable<U64>,
 }
 
 /// Parameters of `session.close`.

@@ -375,6 +375,13 @@ struct SessionDemand {
     approval: bool,
     /// Whether this host has a closure for it that it has not finished recording.
     closing: bool,
+    /// How many launch confirmations its worker is waiting on its reader for.
+    ///
+    /// A managed session waiting for a reader's answer to `shell.launch` is a request this host
+    /// admitted and has not finished, and suspending underneath one delays the answer past the
+    /// window the caller was given. A session that cannot have one reports null and contributes
+    /// nothing here, which is not the same as reporting none.
+    launches: u64,
 }
 
 /// The desktop this host has, and how old the reading is.
@@ -4063,12 +4070,11 @@ impl Controller {
                 break;
             };
             asked += 1;
-            let summary = self
+            let read = self
                 .read_from_worker_within(&worker, Some(DEMAND_PATIENCE.min(left)))
                 .await
-                .ok()
-                .map(|read| read.session);
-            let Some(summary) = summary else {
+                .ok();
+            let Some(read) = read else {
                 // A worker that did not answer has not said its work ended, so what it last said
                 // stands. A worker whose process the kernel says is gone is different: it is not
                 // running an agent and it is not waiting for an answer, whatever it last said, so
@@ -4090,6 +4096,8 @@ impl Controller {
                                 work: false,
                                 approval: false,
                                 closing: true,
+                                // Its process is gone, so nothing is waiting on its reader.
+                                launches: 0,
                             },
                         );
                     } else {
@@ -4102,7 +4110,12 @@ impl Controller {
                 }
                 continue;
             };
+            let summary = &read.session;
             let mut observed = SessionDemand::default();
+            // A launch the reader has not answered is work outstanding, and it stays outstanding
+            // through the revocation: A-17 bounds how long input is held, not how long the reader
+            // may take to decide. A session that cannot have one says null and adds nothing.
+            observed.launches = read.outstanding_launches.0.map_or(0, U64::get);
             if summary.application_state.as_ref()
                 == Some(&kr_protocol::session::ApplicationState::AgentBusy)
             {
@@ -4132,7 +4145,7 @@ impl Controller {
         let outstanding = scan
             .seen
             .values()
-            .map(|seen| u64::from(seen.approval) + u64::from(seen.closing))
+            .map(|seen| u64::from(seen.approval) + u64::from(seen.closing) + seen.launches)
             .sum::<u64>();
         drop(scan);
         Demand {
@@ -4402,6 +4415,7 @@ impl Controller {
                         endpoint: Nullable::some(worker.endpoint.as_text()),
                         launch_profile: read.launch_profile,
                         last_command_block: read.last_command_block,
+                        outstanding_launches: read.outstanding_launches,
                     });
                 }
                 // A worker that cannot be reached is not necessarily gone. Reconciliation asks the
@@ -4430,6 +4444,7 @@ impl Controller {
                     endpoint: Nullable::null(),
                     launch_profile: Nullable::null(),
                     last_command_block: Nullable::null(),
+                    outstanding_launches: Nullable::null(),
                 })
             }
             None => Err(ControllerError::UnknownSession {
