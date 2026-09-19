@@ -768,7 +768,7 @@ opaque_id!(
     "A single-use broker handle for one issued action token."
 );
 opaque_id!(
-    /// An upstream JSON-RPC request identifier, in the JSON form the upstream wrote it in.
+    /// An upstream JSON-RPC request identifier, in this host's JSON encoding of it.
     ///
     /// A JSON-RPC identifier is a string or a number, and the two are different identifiers, so
     /// what is carried is the member's JSON form: the string eleven is `"11"` and the number

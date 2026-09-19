@@ -698,6 +698,11 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
         r#"{"id":"11","error":{"message":"no such method"}}"#,
         r#"{"id":"11","error":{"code":"-32601","message":"no such method"}}"#,
         r#"{"id":"11","error":{"code":-3.5,"message":"no such method"}}"#,
+        // Parsing has already rounded these, so the code this host would report is not the code
+        // the upstream wrote.
+        r#"{"id":"11","error":{"code":-32601.0,"message":"no such method"}}"#,
+        r#"{"id":"11","error":{"code":1.00000000000000001,"message":"no such method"}}"#,
+        r#"{"id":"11","error":{"code":1e-400,"message":"no such method"}}"#,
     ] {
         assert!(
             broker
@@ -718,12 +723,12 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
         PendingState::Pending
     );
 
-    // An integer is an integer however the upstream spells it, and a code beyond a signed 64-bit
-    // word is still one. Refusing either would leave a resource pending on a real answer.
+    // A code beyond a signed 64-bit word is still an integer, and refusing it would leave a
+    // resource pending on a real answer.
     for (id, spelling) in [
         (
             "21",
-            r#"{"id":21,"error":{"code":-32601.0,"message":"no such method"}}"#,
+            r#"{"id":21,"error":{"code":-9223372036854775808,"message":"no such method"}}"#,
         ),
         (
             "22",
