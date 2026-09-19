@@ -602,10 +602,12 @@ pub fn read_status(
     let entries = kr_project::workspace::parse_status(reported)?;
     let mut expanded = Vec::with_capacity(entries.len());
     let mut budget = MAX_WALK_ENTRIES;
+    let root_mount = mount_of(repository.work_tree())?;
     for entry in entries {
         if let Some(prefix) = entry.path.strip_suffix('/') {
             walk(
                 repository.work_tree(),
+                root_mount,
                 prefix,
                 entry.class,
                 grant,
@@ -651,6 +653,7 @@ fn exactly<'a>(bytes: &'a [u8], what: &str) -> Result<&'a str> {
 #[allow(clippy::too_many_arguments)]
 fn walk(
     tree: &kr_transfer::AuthorisedDirectory,
+    root_mount: Mount,
     prefix: &str,
     class: InclusionClass,
     grant: &FileGrant,
@@ -692,7 +695,7 @@ fn walk(
         });
         return Ok(());
     };
-    let Ok(directory) = tree.subdirectory(&name) else {
+    let Ok(directory) = open_beneath(tree, &name, root_mount, prefix)? else {
         // Not a directory after all, or not reachable. It is still one entry the status reported,
         // and the content read decides what it is.
         out.push(kr_project::workspace::StatusEntry {
@@ -750,6 +753,7 @@ fn walk(
         if kind.is_dir() {
             walk(
                 tree,
+                root_mount,
                 &child,
                 class,
                 grant,
@@ -1154,6 +1158,7 @@ fn nested_repositories(
         }
     }
     let tree = repository.work_tree();
+    let root_mount = mount_of(tree)?;
     let mut budget = MAX_WALK_ENTRIES;
     let mut charge = |directory: &str| -> Result<()> {
         budget = budget
@@ -1191,7 +1196,7 @@ fn nested_repositories(
             Ok(_) | Err(kr_transfer::Escape::NotFound { .. }) => continue,
             Err(_) => return Err(unplaceable(directory)),
         }
-        match tree.subdirectory(&name) {
+        match open_beneath(tree, &name, root_mount, directory)? {
             Ok(held) => opened.push((directory, held)),
             // It was a directory a moment ago and this host cannot open it. It will not say a
             // tree is free of another repository it could not look for.
@@ -1316,6 +1321,66 @@ fn administrative_identity(
     AuthorisedDirectory::open_root(environment_id, path)
         .map(|held| identity_of(&held))
         .map_err(|_| unplaceable("this repository's own data"))
+}
+
+/// Opens one directory beneath another and refuses one that is **on a different mount** (D-087c).
+///
+/// A second name for a directory inside a tree is one of three things: a symbolic link, which the
+/// authority refuses to follow; the same object under another spelling, which the identity rules
+/// catch; or a mount, which puts one directory at two places with two identities and no link. This
+/// is the third. A tree that holds a mount of its own is not one this host reads, because what is
+/// under that mount is not what the tree's own path says it is.
+fn open_beneath(
+    parent: &AuthorisedDirectory,
+    name: &RelativeName,
+    root: Mount,
+    what: &str,
+) -> Result<std::result::Result<AuthorisedDirectory, kr_transfer::Escape>> {
+    let held = match parent.subdirectory(name) {
+        Ok(held) => held,
+        Err(escape) => return Ok(Err(escape)),
+    };
+    if mount_of(&held)? != root {
+        return Err(ChangeSetError::Unsupported {
+            detail: format!(
+                "{} is on a different mount from this working tree, and a tree that holds one is \
+                 not one this host reads: what is under it is not what the tree's own path says",
+                kr_project::git::redact(what)
+            )
+            .into(),
+        });
+    }
+    Ok(Ok(held))
+}
+
+/// What mount one open directory is on.
+type Mount = u64;
+
+/// Returns the mount one open directory is on.
+///
+/// The kernel's own answer where it has one: a bind mount shares its device with what it came
+/// from, so a device number alone would not see it, and this asks for the mount instead. Where a
+/// platform has no such answer, the device number is the whole of what it can say and is what it
+/// says.
+#[cfg(target_os = "linux")]
+fn mount_of(directory: &AuthorisedDirectory) -> Result<Mount> {
+    let stat = rustix::fs::statx(
+        directory.handle(),
+        "",
+        rustix::fs::AtFlags::EMPTY_PATH,
+        rustix::fs::StatxFlags::MNT_ID,
+    )
+    .map_err(|error| ChangeSetError::StorageUnavailable {
+        detail: format!("this host could not ask what mount a directory is on: {error}").into(),
+    })?;
+    Ok(stat.stx_mnt_id)
+}
+
+/// Returns the device one open directory is on.
+#[cfg(not(target_os = "linux"))]
+fn mount_of(directory: &AuthorisedDirectory) -> Result<Mount> {
+    let identity = directory.identity();
+    Ok(identity.device)
 }
 
 /// Returns the object one open directory is.
@@ -2325,6 +2390,46 @@ mod tests {
             request,
             administrative_prefix: None,
             nested: &NESTED,
+        }
+    }
+
+    #[test]
+    fn one_directory_and_a_second_handle_on_it_are_the_same_mount() {
+        // What the mount rule rests on: two handles on one directory answer the same mount, so a
+        // directory that answers a different one is genuinely somewhere else. Where this host can
+        // reach a real mount boundary it checks that too; where it cannot, it says so rather than
+        // asserting something it did not exercise.
+        let host = kr_ipc::testing::TempHost::create();
+        let root = host.environment().state_dir().to_path_buf();
+        let environment_id = host.environment_id();
+        let one = kr_transfer::AuthorisedDirectory::open_root(environment_id, &root)
+            .expect("the directory opens");
+        let two = kr_transfer::AuthorisedDirectory::open_root(environment_id, &root)
+            .expect("it opens again");
+        assert_eq!(
+            mount_of(&one).expect("a mount"),
+            mount_of(&two).expect("a mount"),
+            "two handles on one directory are on one mount"
+        );
+        // A boundary this platform usually has. On one where it does not, the comparison is not
+        // exercised and this says so.
+        let elsewhere = std::path::Path::new("/dev");
+        match kr_transfer::AuthorisedDirectory::open_root(environment_id, elsewhere) {
+            Ok(other) => {
+                let (here, there) = (
+                    mount_of(&one).expect("a mount"),
+                    mount_of(&other).expect("a mount"),
+                );
+                if here == there {
+                    println!(
+                        "not exercised: this host puts {} on the same mount as its state",
+                        elsewhere.display()
+                    );
+                } else {
+                    assert_ne!(here, there, "two mounts answer differently");
+                }
+            }
+            Err(_) => println!("not exercised: this host would not open a second mount"),
         }
     }
 
