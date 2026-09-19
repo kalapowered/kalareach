@@ -131,18 +131,48 @@ pub struct RichInvocation {
 /// whatever writes it. Two things follow. The namespaced identifier travels with the bytes, so the
 /// writer cannot answer a resource other than the one that was admitted; and the frame is fixed at
 /// admission, so the exclusive admission and the bytes it authorises are one object.
+///
+/// Its members are readable and not writable. Only [`Gateway::prepare_response`] builds one, so a
+/// caller cannot assemble a frame of its own and present it as an answer this host admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreparedResponse {
-    /// The namespaced identifier the answer resolves, which names the connection it goes out on.
-    pub request: DownstreamRequestId,
-    /// The upstream's own identifier for the request, as it wrote it.
-    pub upstream_request_id: UpstreamRequestId,
-    /// The method the original request named.
-    pub method: UpstreamMethod,
-    /// The decision, one of the ones the request offered.
-    pub option_id: String,
-    /// The response frame, built from the table's own member names.
-    pub frame: Vec<u8>,
+    request: DownstreamRequestId,
+    upstream_request_id: UpstreamRequestId,
+    method: UpstreamMethod,
+    option_id: String,
+    frame: Vec<u8>,
+}
+
+impl PreparedResponse {
+    /// Returns the namespaced identifier the answer resolves, which names its connection.
+    #[must_use]
+    pub const fn request(&self) -> &DownstreamRequestId {
+        &self.request
+    }
+
+    /// Returns the upstream's own identifier for the request, as it wrote it.
+    #[must_use]
+    pub const fn upstream_request_id(&self) -> &UpstreamRequestId {
+        &self.upstream_request_id
+    }
+
+    /// Returns the method the original request named.
+    #[must_use]
+    pub const fn method(&self) -> &UpstreamMethod {
+        &self.method
+    }
+
+    /// Returns the decision, one of the ones the request offered.
+    #[must_use]
+    pub fn option_id(&self) -> &str {
+        &self.option_id
+    }
+
+    /// Returns the response frame, built from the table's own member names.
+    #[must_use]
+    pub fn frame(&self) -> &[u8] {
+        &self.frame
+    }
 }
 
 /// One reverse request the upstream asked this host to perform.
@@ -1071,7 +1101,7 @@ mod tests {
     }
 
     #[test]
-    fn an_answer_goes_in_the_member_the_table_names_and_nowhere_else() {
+    fn an_answer_goes_in_the_member_the_table_names() {
         let gateway = native_gateway();
         let prepared = gateway
             .prepare_response(

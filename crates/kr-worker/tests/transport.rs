@@ -95,6 +95,13 @@ fn projection() -> DecodedProjection {
     }
 }
 
+fn target() -> kr_protocol::agent::AgentMutationTarget {
+    kr_protocol::agent::AgentMutationTarget {
+        subject: kr_worker::broker::subject(session(), instance()),
+        binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+    }
+}
+
 fn package() -> PluginId {
     PluginId::new("kalareach.codex").expect("valid")
 }
@@ -217,6 +224,34 @@ fn private_directory() -> std::path::PathBuf {
     directory
 }
 
+/// The capability evidence every agent mutation in this suite acts under.
+fn record_capabilities(broker: &Broker) {
+    for name in [
+        "agent.prompt",
+        "agent.prompt.queue",
+        "agent.steer",
+        "agent.cancel",
+        "agent.approval",
+    ] {
+        broker
+            .record_capability(kr_protocol::broker::InstanceCapabilityRecord {
+                capability_id: kr_protocol::ids::CapabilityId::new(name).expect("valid"),
+                capability_version: "1".to_owned(),
+                application_instance_id: instance(),
+                identity: kr_protocol::broker::InstanceCapabilityIdentity::default(),
+                revision: kr_protocol::ids::CapabilityRevision::new(1),
+                state: kr_protocol::broker::InstanceCapabilityState::QualifiedAvailable,
+                source: kr_protocol::broker::InstanceEvidenceSource::HostProbe,
+                invalidated_by: [kr_protocol::broker::InstanceInvalidation::BindingChanged]
+                    .into_iter()
+                    .collect(),
+                disabled_reason: Nullable::null(),
+                observed_at: TimestampMs::new(1),
+            })
+            .expect("the capability is recorded");
+    }
+}
+
 /// A broker with one instance, one pinned table and one authenticated native connection.
 fn broker() -> Arc<Broker> {
     let broker = Broker::open(None, session()).expect("the broker opens");
@@ -247,6 +282,7 @@ fn broker() -> Arc<Broker> {
             "1",
         )
         .expect("the native connection is authenticated");
+    record_capabilities(&broker);
     Arc::new(broker)
 }
 
@@ -336,34 +372,24 @@ async fn kr_req_12_11_a_real_transport_forwards_a_request_and_carries_the_answer
             TimestampMs::new(3),
         )
         .expect("the interpretation is accepted");
-    let claim = broker
-        .claim(
-            resource_id,
-            &ActorId::new("device-1").expect("valid"),
+    let dispatch = link.dispatch().expect("the link carries operations");
+    broker.bind_connection_dispatch(GatewayConnectionId::new(1), dispatch);
+    let answered = broker
+        .agent_approval_respond(
+            &kr_worker::broker::Caller {
+                actor_id: ActorId::new("device-1").expect("valid"),
+                grant_id: None,
+            },
+            &kr_protocol::agent::AgentApprovalRespondParams {
+                target: target(),
+                resource_id,
+                option_id: "allow".to_owned(),
+            },
             TimestampMs::new(4),
         )
-        .expect("claimed");
-    let admission = broker
-        .admit_dispatch(&claim, "allow")
-        .expect("the answer is admitted");
-    let dispatch = link.dispatch().expect("the link carries operations");
-    kr_worker::broker::UpstreamDispatch::submit(
-        dispatch.as_ref(),
-        &kr_worker::broker::UpstreamRequest {
-            application_instance_id: instance(),
-            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
-            operation: kr_protocol::gateway::RichOperation::ApprovalRespond,
-            turn_id: None,
-            body: kr_worker::broker::UpstreamBody::Approval {
-                resource_id,
-                upstream_request_id: admission.upstream_request_id.clone(),
-                method: admission.method.clone(),
-                option_id: "allow".to_owned(),
-                response: admission.response.clone(),
-            },
-        },
-    )
-    .expect("the answer is carried");
+        .expect("the answer is admitted and carried")
+        .0;
+    assert_eq!(answered.state, PendingState::Resolved);
     let answer = next_line(&mut upstream_reader).await;
     let answer: serde_json::Value = serde_json::from_str(answer.trim()).expect("readable");
     assert_eq!(
@@ -380,10 +406,6 @@ async fn kr_req_12_11_a_real_transport_forwards_a_request_and_carries_the_answer
         answer["result"].get("option_id").is_none(),
         "and in no member the core invented"
     );
-    broker
-        .resolve(&claim, TimestampMs::new(5))
-        .expect("the upstream took it");
-
     drop(link);
     drop(client_reader);
     drop(upstream_reader);
@@ -577,90 +599,105 @@ async fn kr_req_11_32_the_read_loop_carries_what_arrives_on_the_socket() {
 }
 
 /// KR-REQ-12.08 and KR-REQ-12.12: each operation is encoded as the method its own table names,
-/// with the turn it acts on, and an operation the table names nothing for sends nothing.
+/// with the turn it acts on, and an operation the table names nothing for is refused at admission.
 #[tokio::test]
 async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_its_turn() {
     let broker = broker();
     let (link, upstream, _client, drained) = link_over_sockets(&broker).await;
     let mut upstream_reader = tokio::io::BufReader::new(upstream);
-    let dispatch = link.dispatch().expect("the link carries operations");
+    broker
+        .bind_dispatch(instance(), link.dispatch().expect("it carries operations"))
+        .expect("the transport is bound");
     let turn = kr_protocol::ids::AgentTurnId::new("turn-7").expect("valid");
+    broker
+        .set_turn(instance(), Some(turn.clone()))
+        .expect("a turn is running");
+    let caller = kr_worker::broker::Caller {
+        actor_id: ActorId::new("device-1").expect("valid"),
+        grant_id: None,
+    };
+    let prompt = |text: &str| kr_protocol::agent::AgentPromptParams {
+        target: target(),
+        draft_id: kr_protocol::scalars::Nullable::null(),
+        text: kr_protocol::scalars::Nullable::some(
+            kr_protocol::agent::PromptText::new(text).expect("valid"),
+        ),
+    };
 
     // Four operations, three of which need one right between them. Each goes out as its own
     // method, with its own parameters, and never as whichever the table happened to list first.
-    let expected = [
-        (
-            kr_protocol::gateway::RichOperation::PromptSubmit,
-            None,
-            kr_worker::broker::UpstreamBody::Prompt {
-                draft_id: None,
-                text: Some("hello".to_owned()),
+    broker
+        .agent_prompt(&caller, &prompt("hello"), false, TimestampMs::new(2))
+        .expect("the prompt is applied");
+    broker
+        .agent_prompt(&caller, &prompt("and then this"), true, TimestampMs::new(3))
+        .expect("the queued prompt is applied");
+    broker
+        .agent_steer(
+            &caller,
+            &kr_protocol::agent::AgentSteerParams {
+                target: target(),
+                turn_id: turn.clone(),
+                text: kr_protocol::agent::PromptText::new("try the other file").expect("valid"),
             },
+            TimestampMs::new(4),
+        )
+        .expect("the steer is applied");
+    broker
+        .agent_cancel(
+            &caller,
+            &kr_protocol::agent::AgentCancelParams {
+                target: target(),
+                turn_id: turn.clone(),
+            },
+            TimestampMs::new(5),
+        )
+        .expect("the cancellation is applied");
+
+    for (method_name, parameters) in [
+        (
             "session/prompt",
             serde_json::json!({ "draft_id": null, "text": "hello" }),
         ),
         (
-            kr_protocol::gateway::RichOperation::PromptQueue,
-            None,
-            kr_worker::broker::UpstreamBody::Prompt {
-                draft_id: None,
-                text: Some("and then this".to_owned()),
-            },
             "session/queue",
             serde_json::json!({ "draft_id": null, "text": "and then this" }),
         ),
         (
-            kr_protocol::gateway::RichOperation::TurnSteer,
-            Some(turn.clone()),
-            kr_worker::broker::UpstreamBody::Steer {
-                text: "try the other file".to_owned(),
-            },
             "session/steer",
             serde_json::json!({ "text": "try the other file", "turn_id": "turn-7" }),
         ),
-        (
-            kr_protocol::gateway::RichOperation::TurnCancel,
-            Some(turn.clone()),
-            kr_worker::broker::UpstreamBody::Cancel,
-            "session/cancel",
-            serde_json::json!({ "turn_id": "turn-7" }),
-        ),
-    ];
-    for (operation, turn_id, body, method_name, parameters) in expected {
-        kr_worker::broker::UpstreamDispatch::submit(
-            dispatch.as_ref(),
-            &kr_worker::broker::UpstreamRequest {
-                application_instance_id: instance(),
-                binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
-                operation,
-                turn_id,
-                body,
-            },
-        )
-        .unwrap_or_else(|error| panic!("{operation} is carried: {error}"));
+        ("session/cancel", serde_json::json!({ "turn_id": "turn-7" })),
+    ] {
         let frame = next_line(&mut upstream_reader).await;
         let frame: serde_json::Value = serde_json::from_str(frame.trim()).expect("readable");
         assert_eq!(
             frame["method"],
             serde_json::json!(method_name),
-            "{operation} encodes as the method its table names"
+            "each operation encodes as the method its table names"
         );
         assert_eq!(
             frame["params"], parameters,
-            "{operation} carries exactly what it asks for"
+            "{method_name} carries exactly what it asks for"
         );
     }
 
-    // A table that names no method for an operation encodes nothing, and one whose method this
-    // build does not support encodes nothing either. Both refuse before any byte is written.
+    // A table that names no method for an operation refuses the operation at admission, before
+    // anything is marked and before any byte. So does one whose method this build lists as
+    // unsupported.
     let bare = Broker::open(None, session()).expect("the broker opens");
     bare.register_instance(instance(), IntegrationMode::Gateway, None, Some(managed()))
         .expect("the instance is registered");
-    let mut without_steer = rich();
-    without_steer
+    let mut narrowed = rich();
+    narrowed
         .entries
         .retain(|entry| entry.operation.as_ref() != Some(&RichOperation::TurnSteer));
-    bare.pin_table(instance(), table(), without_steer)
+    for entry in &mut narrowed.entries {
+        if entry.operation.as_ref() == Some(&RichOperation::TurnCancel) {
+            entry.class = NativeMethodClass::Unsupported;
+        }
+    }
+    bare.pin_table(instance(), table(), narrowed)
         .expect("the installed tables are pinned");
     bare.open_native_connection(
         instance(),
@@ -670,28 +707,50 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
         "1",
     )
     .expect("the native connection is authenticated");
+    record_capabilities(&bare);
     let bare = Arc::new(bare);
-    let (unsteerable, _upstream, _client, other_drain) = link_over_sockets(&bare).await;
-    let refusal = kr_worker::broker::UpstreamDispatch::submit(
-        unsteerable
-            .dispatch()
-            .expect("it carries operations")
-            .as_ref(),
-        &kr_worker::broker::UpstreamRequest {
-            application_instance_id: instance(),
-            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
-            operation: kr_protocol::gateway::RichOperation::TurnSteer,
-            turn_id: Some(turn),
-            body: kr_worker::broker::UpstreamBody::Steer {
-                text: "nowhere to send this".to_owned(),
-            },
-        },
+    let (narrow_link, _upstream, _client, other_drain) = link_over_sockets(&bare).await;
+    bare.bind_dispatch(
+        instance(),
+        narrow_link.dispatch().expect("it carries operations"),
     )
-    .expect_err("a table that names no steer cannot steer");
-    assert_eq!(
-        refusal.code(),
-        kr_protocol::error::ErrorCode::UnsupportedCapability
-    );
+    .expect("the transport is bound");
+    bare.set_turn(instance(), Some(turn.clone()))
+        .expect("a turn is running");
+    for (what, refusal) in [
+        (
+            "a table that names no steer",
+            bare.admit_steer(
+                &caller,
+                &kr_protocol::agent::AgentSteerParams {
+                    target: target(),
+                    turn_id: turn.clone(),
+                    text: kr_protocol::agent::PromptText::new("nowhere to send this")
+                        .expect("valid"),
+                },
+                TimestampMs::new(6),
+            )
+            .expect_err("it cannot steer"),
+        ),
+        (
+            "a method this build does not support",
+            bare.admit_cancel(
+                &caller,
+                &kr_protocol::agent::AgentCancelParams {
+                    target: target(),
+                    turn_id: turn,
+                },
+                TimestampMs::new(7),
+            )
+            .expect_err("it cannot cancel"),
+        ),
+    ] {
+        assert_eq!(
+            refusal.code(),
+            kr_protocol::error::ErrorCode::UnsupportedCapability,
+            "{what} refuses at admission"
+        );
+    }
 
     drop(link);
     drop(upstream_reader);

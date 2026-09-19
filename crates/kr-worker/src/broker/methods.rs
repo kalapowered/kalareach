@@ -38,9 +38,26 @@ use crate::broker::semantic::HistoryFilter;
 use crate::broker::tokens::Invocation;
 use crate::broker::{Broker, DispatchAdmission};
 
+/// The broker's own mark on a prepared operation. Nothing outside the broker can make one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Admitted(());
+
+impl Admitted {
+    pub(crate) const fn new() -> Self {
+        Self(())
+    }
+}
+
 /// One prepared operation, on its way to the upstream.
 #[derive(Clone, Debug)]
 pub struct UpstreamRequest {
+    /// Proof that the broker built this request.
+    ///
+    /// A prepared operation is what a transport is given to send. Only the broker's own admission
+    /// makes one, so nothing outside it can assemble an operation and hand it to a transport as
+    /// though this host had admitted it.
+    #[allow(dead_code)]
+    pub(crate) admitted: Admitted,
     /// The instance it acts on.
     pub application_instance_id: ApplicationInstanceId,
     /// The binding revision it was admitted at.
@@ -100,6 +117,12 @@ pub enum UpstreamBody {
         draft_id: Option<kr_protocol::ids::DraftId>,
         /// The action's own parameters, canonically encoded.
         parameters: Vec<u8>,
+        /// The operation the validated plan prepares.
+        ///
+        /// It is absent until a plan has been validated against this invocation, and what is
+        /// transmitted carries it, so the frame names the operation the host checked rather than
+        /// only the action the caller asked for.
+        operation: Option<kr_protocol::broker::PreparedOperation>,
         /// The action token this invocation runs under.
         ///
         /// Section 11 binds it to the actor, the grant, the revision, the action and the parameter
@@ -129,6 +152,19 @@ pub struct UpstreamOutcome {
 /// An instance with nothing bound here has no upstream this host can reach, and its mutations are
 /// refused before the dispatch marker rather than reported as applied.
 pub trait UpstreamDispatch: Send + Sync + core::fmt::Debug {
+    /// Answers whether this transport can carry one operation at all, before anything is marked.
+    ///
+    /// Section 9 makes a refusal this host can decide a rejection rather than an outcome nobody
+    /// can establish, and "this upstream has no method for steering" is such a refusal. It is
+    /// asked during admission, so an operation the connector cannot encode is refused before the
+    /// dispatch marker rather than discovered when the bytes were due.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnsupportedCapability`] for an operation this upstream's tables
+    /// name no method for, or name one this build does not support.
+    fn admit(&self, request: &UpstreamRequest) -> Result<()>;
+
     /// Submits one prepared operation and returns what the upstream answered.
     ///
     /// # Errors
@@ -177,6 +213,8 @@ struct ExecutionPermit {
     token: Option<ActionToken>,
     /// The draft this invocation was admitted against, as it stood then.
     draft: Option<crate::broker::DraftSnapshot>,
+    /// The action declaration the admission checked, as it stood then.
+    declared: Option<RegisteredAction>,
     /// The effect plan the component prepared, as validated against that token.
     ///
     /// A plugin action without one is not executable. The permit carries the plan rather than a
@@ -186,7 +224,7 @@ struct ExecutionPermit {
 
 /// Permission to carry one agent mutation to its upstream, and everything it was admitted against.
 ///
-/// Only [`Broker::admit_mutation`] and its two siblings make one, under the broker's own lock, in
+/// Only the broker's own admissions make one, under its own lock, in
 /// one operation with the checks. A caller holding one is therefore a caller whose complete
 /// invocation was valid against the state the broker had at a single moment: a fence, a
 /// suspension, a turn change or a capability invalidation cannot land between the check and the
@@ -238,6 +276,7 @@ impl MutationAdmission {
                 approval: None,
                 token: None,
                 draft: None,
+                declared: None,
                 plan: None,
             })),
         }
@@ -269,6 +308,13 @@ impl MutationAdmission {
     pub(crate) fn with_draft(self, draft: Option<crate::broker::DraftSnapshot>) -> Self {
         if let Some(permit) = self.held().as_mut() {
             permit.draft = draft;
+        }
+        self
+    }
+
+    pub(crate) fn with_declaration(self, declared: RegisteredAction) -> Self {
+        if let Some(permit) = self.held().as_mut() {
+            permit.declared = Some(declared);
         }
         self
     }
@@ -488,7 +534,7 @@ impl Broker {
     /// and [`BrokerError::PreconditionFailed`] when rich mutations are suspended or the turn named
     /// is not the one running.
     #[allow(clippy::too_many_arguments)]
-    pub fn admit_mutation(
+    fn admit_mutation(
         &self,
         caller: &Caller,
         target: &AgentMutationTarget,
@@ -518,7 +564,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the call names neither a draft nor text, or
-    /// both, and whatever [`Broker::admit_mutation`] refuses.
+    /// both, and whatever the admission refuses.
     pub fn admit_prompt(
         &self,
         caller: &Caller,
@@ -550,7 +596,7 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns whatever [`Broker::admit_mutation`] refuses.
+    /// Returns whatever the admission refuses.
     pub fn admit_steer(
         &self,
         caller: &Caller,
@@ -574,7 +620,7 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns whatever [`Broker::admit_mutation`] refuses.
+    /// Returns whatever the admission refuses.
     pub fn admit_cancel(
         &self,
         caller: &Caller,
@@ -648,7 +694,7 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns whatever [`Broker::admit_mutation`] refuses, [`BrokerError::UnknownSubject`] when
+    /// Returns whatever the admission refuses, [`BrokerError::UnknownSubject`] when
     /// the resource is not one this broker holds, [`BrokerError::PermissionDenied`] when it
     /// belongs to another instance or its decoder may no longer answer,
     /// [`BrokerError::Arbitration`] when it has already been answered, and
@@ -770,9 +816,16 @@ impl Broker {
         admitted: &MutationAdmission,
         now: TimestampMs,
     ) -> Result<AgentApprovalRespondResult> {
-        // The permit is taken first, and taking it is what makes this caller the one that
-        // settles. A second caller gets `AlreadyTransmitted` here and never reaches the transport
-        // or the arbitration, so it cannot record the winner's answer as uncertain.
+        // The kind is checked before the permit is taken, so an admission handed to the wrong
+        // entry point comes back unspent rather than being destroyed by the mistake.
+        if admitted.resource_id().is_none() {
+            return Err(BrokerError::invalid(
+                "this admission does not carry an approval to answer",
+            ));
+        }
+        // The permit is taken next, and taking it is what makes this caller the one that settles.
+        // A second caller gets `AlreadyTransmitted` here and never reaches the transport or the
+        // arbitration, so it cannot record the winner's answer as uncertain.
         let permit = admitted.take()?;
         let dispatch = permit.approval.ok_or_else(|| {
             BrokerError::invalid("this admission does not carry an approval to answer")
@@ -780,6 +833,10 @@ impl Broker {
         let claim = permit
             .settlement
             .ok_or_else(|| BrokerError::invalid("this admission holds no claim"))?;
+        // The marker goes in immediately before the bytes. Everything that could refuse this
+        // answer has already refused it, so what remains after this point is the transport's own
+        // failure, which is what uncertainty is for.
+        self.commit_dispatch(&claim, now)?;
         let outcome = match permit.dispatch.submit(&permit.request) {
             Ok(outcome) => outcome,
             Err(error) => {
@@ -829,6 +886,15 @@ impl Broker {
             Some(draft_id) => Some(self.resolve_draft(draft_id)?),
             None => None,
         };
+        // The parameters have to be ones this host can put on the wire. Discovering that they
+        // are not when the frame is built would substitute something else for them after the
+        // digest had already been agreed, so it is decided here.
+        if serde_json::from_slice::<serde_json::Value>(params.parameters.as_slice()).is_err() {
+            return Err(BrokerError::invalid(format!(
+                "{}'s parameters are not an encoding this host can carry to an upstream",
+                params.action
+            )));
+        }
         let mut state = self.state();
         // The declaration is read *inside* the admission. Reading it before the lock would let
         // `register_actions` replace it in between, so the grant, the effect class and the draft
@@ -851,6 +917,7 @@ impl Broker {
                 action: params.action.clone(),
                 draft_id: params.draft_id.as_ref().copied(),
                 parameters: params.parameters.as_slice().to_vec(),
+                operation: None,
                 token: None,
             },
             None,
@@ -867,7 +934,10 @@ impl Broker {
             .inspect_err(|_| {
                 state.tokens.retire(&token.token_id);
             })?;
-        Ok(admitted.with_action_token(spent).with_draft(draft))
+        Ok(admitted
+            .with_action_token(spent)
+            .with_draft(draft)
+            .with_declaration(registered))
     }
 
     /// Applies `plugin.action.invoke`.
@@ -899,6 +969,13 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<PluginActionInvokeResult> {
         let _ = now;
+        // The kind is checked before the permit is taken. An approval handed to this entry point
+        // comes back unspent, with its claim, rather than being consumed by the mistake.
+        if admitted.action().is_none() {
+            return Err(BrokerError::invalid(
+                "this admission carries no action token",
+            ));
+        }
         // Taking the permit is what refuses an invocation whose component returned a plan nobody
         // validated: an admission with no validated plan has no permit to take.
         let permit = admitted.take()?;
@@ -933,81 +1010,6 @@ impl Broker {
         }
         if let Some(token) = permit.token.as_ref() {
             self.state().tokens.retire(&token.token_id);
-        }
-    }
-
-    /// Checks everything one agent mutation would be refused for, without admitting it.
-    ///
-    /// Section 9 makes a refusal this host can decide a rejection rather than an outcome nobody
-    /// can establish, so the service asks this before it writes a dispatch marker. It asks exactly
-    /// what the admission asks, by taking one and letting it go: a check that drifts from the
-    /// admission it stands for is worse than no check at all.
-    ///
-    /// # Errors
-    ///
-    /// Returns whatever [`Broker::admit_mutation`] refuses.
-    pub fn check_mutation(
-        &self,
-        caller: &Caller,
-        target: &AgentMutationTarget,
-        capability: &str,
-        action: RichOperation,
-        turn_id: Option<kr_protocol::ids::AgentTurnId>,
-        now: TimestampMs,
-    ) -> Result<()> {
-        self.admit_mutation(
-            caller,
-            target,
-            capability,
-            action,
-            turn_id,
-            UpstreamBody::Cancel,
-            now,
-        )
-        .map(|_| ())
-    }
-
-    /// Checks what every rich operation on one instance needs, whatever the operation is.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::UnknownSubject`] for an instance this broker does not hold,
-    /// [`BrokerError::UpstreamUnavailable`] while the journal is fenced, and
-    /// [`BrokerError::UnsupportedCapability`] when no transport is bound or every component's
-    /// rich capabilities are disabled.
-    pub fn check_dispatchable(&self, target: &AgentMutationTarget) -> Result<()> {
-        self.state()
-            .admit_mutation_in(
-                target,
-                None,
-                RichOperation::PluginAction,
-                None,
-                Responsible::Transport,
-                UpstreamBody::Cancel,
-                None,
-                TimestampMs::new(0),
-            )
-            .map(|_| ())
-    }
-
-    /// Checks that the turn a mutation names is the one this instance is running.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`BrokerError::PreconditionFailed`] when it is not. A turn that has ended is
-    /// refused rather than redirected to whatever is running now.
-    pub fn check_turn(
-        &self,
-        target: &AgentMutationTarget,
-        turn_id: &kr_protocol::ids::AgentTurnId,
-    ) -> Result<()> {
-        let binding = self.binding_state(target.subject.application_instance_id)?;
-        if binding.turn_id.as_ref() == Some(turn_id) {
-            Ok(())
-        } else {
-            Err(BrokerError::PreconditionFailed {
-                detail: format!("{turn_id} is not the turn this instance is running"),
-            })
         }
     }
 
@@ -1095,7 +1097,7 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns whatever [`Broker::check_action`] and [`Broker::check_dispatchable`] return, and
+    /// Returns whatever [`Broker::check_action`] returns, and
     /// [`BrokerError::Grant`], [`BrokerError::StaleBinding`] or
     /// [`BrokerError::UnsupportedCapability`] when the invocation's own authority does not hold.
     pub fn check_invocable(
@@ -1213,13 +1215,27 @@ impl Broker {
                 ));
             }
         };
-        // The operation the manifest declared. A plan that asks for something else is asking
-        // under an invocation that was admitted for something else.
+        // The declaration this invocation was admitted against, and the one in force now. They
+        // have to be the same declaration: a package that replaced the action while its component
+        // was working has withdrawn the invitation, and the capability and grant the admission
+        // checked belonged to the declaration it read.
+        let admitted_declaration = permit
+            .declared
+            .clone()
+            .ok_or_else(|| BrokerError::invalid("this admission carries no action declaration"))?;
         let registered = self
             .registered_action(binding_id, &token.action)?
             .ok_or_else(|| {
                 BrokerError::unknown(format!("{} is no longer a registered action", token.action))
             })?;
+        if registered != admitted_declaration {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{} was admitted under one declaration and another is registered now",
+                    token.action
+                ),
+            });
+        }
         if registered.operation != effect.operation {
             return Err(BrokerError::invalid(format!(
                 "{} is declared as {} and this plan prepares {}",
@@ -1301,6 +1317,21 @@ impl Broker {
                     ),
                 });
             }
+            // And the revision it stood at. A draft that moved while the component was preparing
+            // its plan is `DRAFT_CONFLICT`: the plan was made against a draft that is not there
+            // any more.
+            let revision = snapshot.revision;
+            let current = self.resolve_draft(named)?;
+            if current.revision != revision {
+                return Err(BrokerError::PreconditionFailed {
+                    detail: format!(
+                        "{named} was at revision {} when this invocation was admitted and is at \
+                         {} now",
+                        revision.get(),
+                        current.revision.get()
+                    ),
+                });
+            }
         } else if registered.needs_draft {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!(
@@ -1309,8 +1340,12 @@ impl Broker {
                 ),
             });
         }
-        // The plan itself goes into the permit. What transmits is now the plan that was checked,
-        // rather than an operation beside a flag saying a plan was seen.
+        // The plan itself goes into the permit, and the operation it prepares goes into the body
+        // that will be transmitted. What reaches the upstream is therefore the plan that was
+        // checked, rather than an operation beside a flag saying a plan was seen.
+        if let UpstreamBody::PluginAction { operation, .. } = &mut permit.request.body {
+            *operation = Some(effect.operation);
+        }
         permit.plan = Some(effect.clone());
         Ok(())
     }
@@ -1345,6 +1380,14 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<AgentMutationResult> {
         let _ = now;
+        // An answer settles its resource, and this route does not settle anything. Refusing it
+        // before the permit is taken leaves the approval's own admission intact.
+        if admitted.resource_id().is_some() {
+            return Err(BrokerError::invalid(
+                "this admission answers a pending resource, and an answer is recorded by the \
+                 route that settles it",
+            ));
+        }
         let permit = admitted.take()?;
         let turn_id = permit.request.turn_id.clone();
         let outcome = permit.dispatch.submit(&permit.request)?;

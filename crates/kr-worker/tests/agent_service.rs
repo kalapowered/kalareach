@@ -71,6 +71,10 @@ struct SlowUpstream {
 }
 
 impl UpstreamDispatch for SlowUpstream {
+    fn admit(&self, _request: &kr_worker::broker::UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
     fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
         std::thread::sleep(self.holds);
         self.carried

@@ -1099,6 +1099,24 @@ impl Broker {
         self.settle_native(answer, PendingState::Resolved, now)
     }
 
+    /// Commits the dispatch marker for one claim, immediately before its bytes go.
+    ///
+    /// Section 24 puts the durable marker before the effect: once this returns, a restart reads
+    /// the resource back as one an answer may already have gone for, so no second answer is sent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Arbitration`] when this claim does not hold the resource's
+    /// transmission admission, and [`BrokerError::LedgerUnavailable`] when the marker cannot be
+    /// written.
+    pub fn commit_dispatch(&self, claim: &Claim, now: TimestampMs) -> Result<PendingResource> {
+        let mut state = self.state();
+        let transition = state.arbitration.plan_dispatched(claim)?;
+        state.ledger.mark_dispatched(&transition.resource)?;
+        state.write_transition(&transition, now)?;
+        state.arbitration.commit(transition)
+    }
+
     /// Records that an admitted native answer went and nothing confirmed it.
     ///
     /// # Errors
@@ -2456,16 +2474,16 @@ impl BrokerState {
         }
         let transition = self.arbitration.plan_dispatch(claim)?;
         let connection = transition.resource.request.connection;
-        // The answer is prepared before the marker, from the connection's own qualified table, so
-        // the admission and the bytes it authorises are one object. Preparing it afterwards would
-        // leave a marker committed for an answer that turned out to be unencodable.
+        // The answer is prepared here, from the connection's own qualified table, so the
+        // admission and the bytes it authorises are one object. The marker is not written yet:
+        // this reserves the resource's one transmission, and the marker goes in immediately
+        // before the bytes, so an admission that is abandoned leaves the resource answerable.
         let response = self.gateway.prepare_response(
             connection,
             &entry.upstream_request_id,
             &entry.method,
             option_id,
         )?;
-        self.ledger.mark_dispatched(&transition.resource)?;
         let resource = self.arbitration.commit(transition)?;
         let provenance = self
             .gateway
@@ -2601,14 +2619,20 @@ impl BrokerState {
             self.capabilities
                 .recheck(application_instance_id, capability_id, None)?;
         }
+        let request = crate::broker::methods::UpstreamRequest {
+            admitted: crate::broker::methods::Admitted::new(),
+            application_instance_id,
+            binding_revision,
+            operation,
+            turn_id,
+            body,
+        };
+        // And whether the transport can carry this operation at all. Asking here is what makes an
+        // upstream with no method for the operation a rejection rather than a marker followed by
+        // a refusal nobody can act on.
+        dispatch.admit(&request)?;
         Ok(crate::broker::methods::MutationAdmission::new(
-            crate::broker::methods::UpstreamRequest {
-                application_instance_id,
-                binding_revision,
-                operation,
-                turn_id,
-                body,
-            },
+            request,
             dispatch,
             responsible,
             capability,

@@ -284,17 +284,38 @@ impl LinkDispatch {
                 action,
                 draft_id,
                 parameters,
+                operation,
                 token,
-            } => serde_json::json!({
-                "plugin_id": plugin_id.as_str(),
-                "action": action.as_str(),
-                "draft_id": draft_id.as_ref().map(ToString::to_string),
-                "parameters": serde_json::from_slice::<serde_json::Value>(parameters)
-                    .unwrap_or(serde_json::Value::Null),
-                // Section 11: the effect plan may use only what this invocation permits, and the
-                // token is what says which invocation that is.
-                "action_token": token.as_ref().map(|token| token.token_id.as_str()),
-            }),
+            } => {
+                // The arguments the invocation was admitted with, read as they are. Substituting
+                // anything for an encoding this host cannot read would send something other than
+                // what the token's digest covers; the admission refuses such an invocation, and
+                // this refuses it again rather than trusting that.
+                let arguments: serde_json::Value =
+                    serde_json::from_slice(parameters).map_err(|error| {
+                        BrokerError::invalid(format!(
+                            "this invocation's parameters will not encode: {error}"
+                        ))
+                    })?;
+                // The operation the host validated, which is absent until a plan has been checked
+                // against this invocation.
+                let operation = operation.ok_or_else(|| {
+                    BrokerError::invalid(
+                        "this invocation has no validated operation to name, so there is nothing \
+                         to encode",
+                    )
+                })?;
+                serde_json::json!({
+                    "plugin_id": plugin_id.as_str(),
+                    "action": action.as_str(),
+                    "operation": operation.as_str(),
+                    "draft_id": draft_id.as_ref().map(ToString::to_string),
+                    "parameters": arguments,
+                    // Section 11: the effect plan may use only what this invocation permits, and
+                    // the token is what says which invocation that is.
+                    "action_token": token.as_ref().map(|token| token.token_id.as_str()),
+                })
+            }
         };
         if let Some(turn_id) = request.turn_id.as_ref() {
             let Some(members) = parameters.as_object_mut() else {
@@ -312,21 +333,31 @@ impl LinkDispatch {
 }
 
 impl UpstreamDispatch for LinkDispatch {
+    fn admit(&self, request: &UpstreamRequest) -> Result<()> {
+        // An approval's answer is the frame the core prepared, which needs no method of this
+        // table; everything else needs one, and the table has to name exactly one for it.
+        if matches!(request.body, UpstreamBody::Approval { .. }) {
+            return Ok(());
+        }
+        self.method_for(request).map(|_| ())
+    }
+
     fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome> {
         // An approval's answer was prepared by the core at admission, from this connection's own
         // table. Writing anything else here would send bytes nobody admitted.
         if let UpstreamBody::Approval { response, .. } = &request.body {
             // The prepared answer names the connection it was admitted on. Writing it anywhere
             // else would answer one upstream's resource on another's stream.
-            if response.request.connection != self.connection {
+            if response.request().connection != self.connection {
                 return Err(BrokerError::denied(format!(
                     "this answer was admitted on {} and this transport speaks for {}",
-                    response.request.connection, self.connection
+                    response.request().connection,
+                    self.connection
                 )));
             }
-            self.upstream.send(&response.frame)?;
+            self.upstream.send(response.frame())?;
             return Ok(UpstreamOutcome {
-                upstream_request_id: Some(response.upstream_request_id.clone()),
+                upstream_request_id: Some(response.upstream_request_id().clone()),
                 turn_id: request.turn_id.clone(),
                 provenance: ActionProvenance::UpstreamTypedRpc,
             });

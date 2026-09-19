@@ -3222,11 +3222,18 @@ action's own authority is checked too: its grant, its binding revision, its capa
 to issue its token are all checked before the marker rather than when the token is issued.
 
 The admission itself crosses the marker. The broker admits the mutation before the marker is
-written and the same admission is what the effect carries out, so a fence, a suspension, a turn
-change or a capability invalidation cannot land between the check and the transmission. A marker
-this host could not write leaves nothing executable behind it: the admission is given up, an
-approval's claim goes back and a plugin action's token is retired. What a refusal after the marker
-still covers is the transport's own failure, which is what `OUTCOME_UNKNOWN` is for.
+written and the same admission is what the effect carries out, so nothing between the two can turn
+a refusal this host could have made into an outcome nobody can establish. That includes the
+transport: whether this upstream has a method for the operation at all is settled at admission, not
+when the bytes were due. A marker this host could not write leaves nothing executable behind it:
+the admission is given up, an approval's reservation goes back and a plugin action's token is
+retired. What a refusal after the marker still covers is the transport's own failure, which is what
+`OUTCOME_UNKNOWN` is for.
+
+Reserving a resource and marking it dispatched are two moments. The admission reserves the
+resource's one transmission; the durable marker goes in immediately before the bytes. An answer
+that is abandoned in between leaves the resource answerable, and a claim with no marker settles
+nothing: resolved and uncertain are both statements about an answer that went.
 
 What an admission carries is a permit, taken once. Taking it is what authorises the transmission,
 and for an answer it is also what authorises the settlement, so a second caller on one admission
@@ -3238,16 +3245,18 @@ needs that boundary and an upstream that is slow to answer must not stop a perso
 
 `plugin.action.invoke` validates the registered action, the grant that action declares, its effect
 class and whether a draft the action needs was named, and then issues the action token that
-authorises the one invocation that follows. The declaration is read inside the admission, so a
-registration that replaces it cannot land between the read and the dispatch that depends on it, and
-the plan the component returns is checked against the declaration in force when it arrives. The
-draft is resolved before the admission takes its lock and the snapshot is what the admission binds
-to. The arguments a plan is for are the arguments that will execute: the host computes their digest
-itself and compares it with the token's, because a hash a component supplied says only that the
-component can write a hash. What transmits is the plan that was validated, carried in the permit
-rather than attested by a flag beside it. Resolving the draft itself — that it exists, whose it is
-and at which revision — is the draft store's, and this host checks the name and the snapshot's
-identity until that is joined up.
+authorises the one invocation that follows. The declaration is read inside the admission and kept
+with it, and the plan the component returns is refused unless the declaration in force is still the
+one the invocation was admitted under: a package that re-registered the action while its component
+was working has withdrawn the invitation. The draft is resolved before the admission takes its lock
+and the snapshot is what the admission binds to; a draft that moved before the plan arrived is
+`DRAFT_CONFLICT`. The arguments a plan is for are the arguments that will execute: the host
+computes their digest itself and compares it with the token's and the plan's, because a hash a
+component supplied says only that the component can write a hash, and an encoding this host cannot
+put on the wire is refused at admission rather than replaced when the frame is built. What
+transmits is the plan that was validated: the operation it prepares travels in the frame, carried
+in the permit rather than attested by a flag beside it. The draft store itself — whose the draft is
+and what else it holds — is not this host's, and what it supplies here is the snapshot.
 
 An adapter checkpoints the cursor it consumed, and the cursor survives a restart. A restart resumes
 the numbering after it, so a new entry never takes a cursor an adapter has already passed and a

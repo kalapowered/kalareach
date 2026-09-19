@@ -389,16 +389,47 @@ impl Arbitration {
         })
     }
 
-    /// Plans the dispatch marker for a claimed resource.
+    /// Plans one claim taking the resource's exclusive transmission admission.
+    ///
+    /// The marker is **not** set here. Reserving and marking are two moments: an admission that is
+    /// abandoned before its bytes — because a receipt marker could not be written, or because the
+    /// caller gave it up — must leave the resource answerable, and a marker says an answer may
+    /// already have gone. [`Arbitration::plan_dispatched`] is the second moment, immediately
+    /// before the bytes.
     ///
     /// # Errors
     ///
     /// Returns [`BrokerError::UnknownSubject`] or [`BrokerError::PermissionDenied`] as the claim
-    /// requires, and [`BrokerError::Arbitration`] when the marker is already set, because a second
-    /// admission to dispatch is a second answer.
+    /// requires, and [`BrokerError::Arbitration`] when the admission is already held, because a
+    /// second admission to dispatch is a second answer.
     pub fn plan_dispatch(&self, claim: &Claim) -> Result<Transition> {
         let pending = self.claimed_by(claim)?;
         if pending.dispatched || pending.transmitter.is_some() {
+            return Err(BrokerError::Arbitration(ArbitrationError::AlreadyClaimed));
+        }
+        Ok(Transition {
+            resource: pending.resource.clone(),
+            from: pending.resource.state,
+            claim: Some(claim.clone()),
+            holds_claim: true,
+            dispatched: false,
+            transmitter: Some(Transmitter::Rich(claim.claim_id)),
+        })
+    }
+
+    /// Plans the dispatch marker for the claim that holds the admission.
+    ///
+    /// This is what says an answer may already have gone, so it is committed immediately before
+    /// the bytes and never earlier.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] or [`BrokerError::PermissionDenied`] as the claim
+    /// requires, and [`BrokerError::Arbitration`] when this claim does not hold the resource's
+    /// transmission admission.
+    pub fn plan_dispatched(&self, claim: &Claim) -> Result<Transition> {
+        let pending = self.claimed_by(claim)?;
+        if pending.transmitter != Some(Transmitter::Rich(claim.claim_id)) {
             return Err(BrokerError::Arbitration(ArbitrationError::AlreadyClaimed));
         }
         Ok(Transition {
@@ -510,6 +541,7 @@ impl Arbitration {
     /// Returns [`BrokerError::UnknownSubject`], [`BrokerError::PermissionDenied`] or
     /// [`BrokerError::Arbitration`] as the claim, the actor or the state requires.
     pub fn plan_resolve(&self, claim: &Claim) -> Result<Transition> {
+        self.require_dispatched(claim)?;
         self.plan_from_claim(claim, PendingState::Resolved, true)
     }
 
@@ -519,6 +551,7 @@ impl Arbitration {
     ///
     /// Returns the same failures [`Arbitration::plan_resolve`] does.
     pub fn plan_uncertain(&self, claim: &Claim) -> Result<Transition> {
+        self.require_dispatched(claim)?;
         self.plan_from_claim(claim, PendingState::Uncertain, true)
     }
 
@@ -746,6 +779,24 @@ impl Arbitration {
             }
         }
         resolved.len()
+    }
+
+    /// Refuses a settlement for a claim whose answer was never dispatched.
+    ///
+    /// Resolved and uncertain are both statements about an answer that went. A claim with no
+    /// marker has sent nothing, so it has nothing to settle and the resource stays answerable.
+    fn require_dispatched(&self, claim: &Claim) -> Result<()> {
+        let pending = self.claimed_by(claim)?;
+        if pending.dispatched {
+            Ok(())
+        } else {
+            Err(BrokerError::Arbitration(
+                ArbitrationError::ForbiddenTransition {
+                    from: pending.resource.state,
+                    to: PendingState::Resolved,
+                },
+            ))
+        }
     }
 
     fn plan_from_claim(

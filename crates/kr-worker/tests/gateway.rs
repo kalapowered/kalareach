@@ -448,6 +448,9 @@ fn kr_req_11_33_a_native_answer_before_the_recheck_wins_and_the_rich_answer_is_t
         .expect("the answer is admitted");
     assert_eq!(admission.provenance, ActionProvenance::UpstreamTypedRpc);
     broker
+        .commit_dispatch(&claim, TimestampMs::new(8))
+        .expect("the marker is committed before the bytes");
+    broker
         .resolve(&claim, TimestampMs::new(9))
         .expect("the upstream confirmed it");
     assert_eq!(
@@ -954,6 +957,9 @@ fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns
         broker
             .admit_dispatch(&claim, "allow")
             .expect("an answer went before the fault");
+        broker
+            .commit_dispatch(&claim, TimestampMs::new(6))
+            .expect("the marker is committed before the bytes");
 
         broker
             .enter_volatile("the journal could not be written", TimestampMs::new(7))
@@ -1262,7 +1268,8 @@ fn kr_req_11_27_one_exclusive_admission_carries_one_answer_whichever_writer_take
         .expect("the rich answer is admitted");
     assert_eq!(admission.connection, GatewayConnectionId::new(1));
     assert_eq!(
-        admission.response.request, admission.resource.request,
+        *admission.response.request(),
+        admission.resource.request,
         "the prepared answer names the resource it was admitted for"
     );
     let forwarded = std::cell::Cell::new(false);

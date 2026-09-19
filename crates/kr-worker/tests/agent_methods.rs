@@ -203,6 +203,10 @@ impl RecordingUpstream {
 }
 
 impl UpstreamDispatch for RecordingUpstream {
+    fn admit(&self, _request: &kr_worker::broker::UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
     fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
         self.submitted
             .lock()
@@ -426,8 +430,8 @@ fn kr_req_23_39_an_agent_read_names_the_instance_carries_its_evidence_and_report
     assert!(elsewhere.is_err());
 }
 
-/// KR-REQ-23.40 and KR-REQ-12.06: the five agent mutations have five distinct rights, and every
-/// one of them refuses a revision that is not the one in force.
+/// KR-REQ-23.40 and KR-REQ-12.06: the five agent mutations carry the rights the method registry
+/// names for them, and every one of them refuses a revision that is not the one in force.
 #[test]
 fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_their_binding() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
@@ -664,11 +668,13 @@ fn kr_req_23_40_an_approval_answer_is_one_of_the_decisions_the_request_offered()
     );
 }
 
-/// KR-REQ-23.40 and KR-REQ-11.27: everything an approval answer can be refused for
-/// deterministically is refused before the receipt marker, so a refusal the host can make on its
-/// own is a rejection and not an outcome nobody can establish.
+/// KR-REQ-23.40 and KR-REQ-11.27: an approval answer that cannot be dispatched is refused by the
+/// broker's own admission, which is what the service asks before it writes a receipt marker.
+///
+/// What this establishes is the broker's half. The receipt a refused answer leaves is the
+/// service's, and `agent_service.rs` is where that is asserted.
 #[test]
-fn kr_req_23_40_an_approval_that_cannot_be_answered_is_refused_before_the_marker() {
+fn kr_req_23_40_an_approval_that_cannot_be_answered_is_refused_at_admission() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
 
@@ -1340,9 +1346,13 @@ fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
 }
 
 /// KR-REQ-11.27 and KR-REQ-11.33: one admission carries one transmission, and a caller that
-/// arrives second transmits nothing and settles nothing.
+/// reaches it after the winner transmits nothing and settles nothing.
+///
+/// The two calls here are sequential, which is the shape a losing concurrent caller ends up in:
+/// the permit is taken atomically, so whichever caller loses the race arrives at exactly this
+/// state.
 #[test]
-fn kr_req_11_27_a_second_caller_on_one_admission_transmits_nothing_and_settles_nothing() {
+fn kr_req_11_27_a_later_caller_on_one_admission_transmits_nothing_and_settles_nothing() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     let opaque = broker
@@ -1401,9 +1411,10 @@ fn kr_req_11_27_a_second_caller_on_one_admission_transmits_nothing_and_settles_n
 }
 
 /// KR-REQ-11.28 and KR-REQ-23.30: an invocation whose prepared effect was never validated
-/// transmits nothing, whichever public route is asked to carry it.
+/// transmits nothing on either of the broker's dispatch routes, and a plan whose arguments are
+/// not the ones that will execute is not this invocation's plan.
 #[test]
-fn kr_req_11_28_an_unvalidated_effect_transmits_on_no_route() {
+fn kr_req_11_28_an_unvalidated_effect_transmits_on_neither_dispatch_route() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     broker
@@ -1478,10 +1489,11 @@ fn kr_req_11_28_an_unvalidated_effect_transmits_on_no_route() {
     assert!(upstream.submitted().is_empty());
 }
 
-/// KR-REQ-23.30: the action declaration an admission checks is the one in force when it admits,
-/// and a registration that replaces it afterwards does not reach back into what was admitted.
+/// KR-REQ-23.30: the declaration an admission checks is the one in force when it admits, and a
+/// registration that replaces it afterwards refuses both the next admission and the plan the
+/// admitted invocation returns.
 #[test]
-fn kr_req_23_30_an_admission_checks_the_declaration_in_force_when_it_admits() {
+fn kr_req_23_30_a_replaced_declaration_refuses_the_plan_of_the_invocation_it_replaced() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     broker
@@ -1608,10 +1620,10 @@ fn kr_req_12_13_each_connection_answers_its_own_resource() {
     assert_eq!(first.submitted().len(), 1, "and the first is untouched");
 }
 
-/// KR-REQ-11.33: when the native answer wins the race, the rich answer writes no frame and the
-/// resource keeps the one resolution it already has.
+/// KR-REQ-11.33: a native answer that has already resolved the resource leaves the rich answer
+/// nothing to admit, so the rich path writes no frame and takes no claim.
 #[test]
-fn kr_req_11_33_a_native_answer_that_wins_leaves_the_rich_answer_nothing_to_send() {
+fn kr_req_11_33_a_resolved_resource_leaves_the_rich_answer_nothing_to_admit() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     let opaque = broker

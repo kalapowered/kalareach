@@ -705,10 +705,14 @@ fn kr_req_11_27_one_resolution_each_and_a_reconnect_leaves_a_sent_answer_uncerta
     );
 
     // The answer leaves this host. The admission checks the decision against what the request
-    // offered and commits the marker before anything is written; nothing confirms it afterwards.
+    // offered and reserves the resource's one transmission; the marker goes in immediately
+    // before the bytes, and nothing confirms them afterwards.
     let admission = broker
         .admit_dispatch(&claim, "allow")
-        .expect("the answer is admitted and the marker is committed");
+        .expect("the answer is admitted");
+    broker
+        .commit_dispatch(&claim, TimestampMs::new(6))
+        .expect("the marker is committed before the bytes");
     assert_eq!(admission.option_id, "allow");
     assert_eq!(admission.upstream_request_id.as_str(), "11");
     assert!(
@@ -1472,6 +1476,9 @@ fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
             .admit_dispatch(&claim, "allow")
             .expect("the answer is admitted");
         broker
+            .commit_dispatch(&claim, TimestampMs::new(12))
+            .expect("the marker is committed before the bytes");
+        broker
             .resolve(&claim, TimestampMs::new(13))
             .expect("the upstream confirmed it");
 
@@ -1560,16 +1567,25 @@ fn kr_req_11_17_evidence_names_the_package_publisher_schema_and_binary_it_was_ga
         Nullable::some(kr_protocol::broker::MethodTableVersionText("2".to_owned()));
     let mut other_binary = complete.clone();
     other_binary.identity.binary_digest = Nullable::some(Digest256::from_bytes([9; 32]));
-    for (what, record) in [
+    for (what, mut record) in [
         ("another package", other_package),
         ("other package bytes", other_bytes),
         ("another publisher", other_publisher),
         ("another upstream schema", other_schema),
         ("another binary", other_binary),
     ] {
+        // A newer revision, so what refuses the record is the identity check rather than the map
+        // refusing to move backwards.
+        record.revision = CapabilityRevision::new(2);
+        let refusal = broker
+            .record_capability(record)
+            .expect_err("evidence about something else is refused");
         assert!(
-            broker.record_capability(record).is_err(),
-            "evidence about {what} is not evidence about this installation"
+            matches!(
+                refusal,
+                BrokerError::InvalidArgument(_) | BrokerError::StaleBinding { .. }
+            ),
+            "evidence about {what} is not evidence about this installation: {refusal:?}"
         );
     }
 
@@ -1578,6 +1594,7 @@ fn kr_req_11_17_evidence_names_the_package_publisher_schema_and_binary_it_was_ga
     // nothing qualified.
     let mut unbound_bytes = complete.clone();
     unbound_bytes.identity.binding_id = Nullable::null();
+    unbound_bytes.revision = CapabilityRevision::new(2);
     assert!(
         broker.record_capability(unbound_bytes).is_err(),
         "package bytes are known through the binding that loaded them"
@@ -1586,6 +1603,7 @@ fn kr_req_11_17_evidence_names_the_package_publisher_schema_and_binary_it_was_ga
     unnamed_package.identity.plugin_id = Nullable::null();
     unnamed_package.identity.package_digest = Nullable::null();
     unnamed_package.identity.publisher_id = Nullable::null();
+    unnamed_package.revision = CapabilityRevision::new(2);
     assert!(
         broker.record_capability(unnamed_package).is_err(),
         "a schema version says nothing without the package it belongs to"
