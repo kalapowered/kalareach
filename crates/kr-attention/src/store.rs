@@ -72,7 +72,7 @@ use crate::visit::{Omitted, Visit};
 /// derived rather than stored on their own - an item's key, and the order a review page continues
 /// by - so a row written under a different derivation would be read under a name that does not
 /// describe it, which is worse than not reading it at all.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// How long a write waits for another holder of the same file before it is refused.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -150,6 +150,7 @@ const SCHEMA: &str = "
         last_seen_ms INTEGER NOT NULL,
         notification TEXT NOT NULL,
         last_notified_ms INTEGER,
+        announced_proven INTEGER NOT NULL,
         announced_level TEXT,
         announcements INTEGER NOT NULL,
         pending_handoff INTEGER,
@@ -462,9 +463,10 @@ impl Store {
                 "INSERT INTO attention_items (
                      key, rule, source, session_id, summary, routing, level, steps_taken,
                      occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
-                     announced_level, announcements, pending_handoff, uncertain, deferred
+                     announced_proven, announced_level, announcements, pending_handoff, uncertain,
+                     deferred
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                           ?17, ?18)",
+                           ?17, ?18, ?19)",
                 params![
                     item.key.as_str(),
                     item.rule.as_str(),
@@ -481,6 +483,7 @@ impl Store {
                     item.last_notified_ms
                         .map(|at| as_i64(at.get(), "last announced"))
                         .transpose()?,
+                    i64::from(item.announced_wall_proven),
                     item.announced_level.map(AttentionLevel::as_str),
                     as_i64(item.announcements, "announcement count")?,
                     item.pending_handoff
@@ -657,7 +660,8 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT key, rule, source, session_id, summary, routing, level, steps_taken,
                     occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
-                    announced_level, announcements, pending_handoff, uncertain, deferred
+                    announced_proven, announced_level, announcements, pending_handoff, uncertain,
+                    deferred
              FROM attention_items ORDER BY first_seen_ms, key",
         )?;
         let rows = statement.query_map([], |row| {
@@ -675,11 +679,12 @@ impl Store {
                 row.get::<_, i64>(10)?,
                 row.get::<_, String>(11)?,
                 row.get::<_, Option<i64>>(12)?,
-                row.get::<_, Option<String>>(13)?,
-                row.get::<_, i64>(14)?,
-                row.get::<_, Option<i64>>(15)?,
-                row.get::<_, i64>(16)?,
+                row.get::<_, i64>(13)?,
+                row.get::<_, Option<String>>(14)?,
+                row.get::<_, i64>(15)?,
+                row.get::<_, Option<i64>>(16)?,
                 row.get::<_, i64>(17)?,
+                row.get::<_, i64>(18)?,
             ))
         })?;
         let unanchored = Elapsed::starting(HostReading::new(0, 0, false));
@@ -710,23 +715,24 @@ impl Store {
                 notification: NotificationState::from_wire(&row.11)
                     .ok_or_else(|| unreadable("notification"))?,
                 last_notified_ms,
+                announced_wall_proven: row.13 != 0,
                 announced_level: row
-                    .13
+                    .14
                     .map(|level| {
                         AttentionLevel::from_wire(&level).ok_or_else(|| unreadable("level"))
                     })
                     .transpose()?,
-                announcements: as_u64(row.14, "announcement count")?,
+                announcements: as_u64(row.15, "announcement count")?,
                 pending_handoff: row
-                    .15
+                    .16
                     .map(|number| as_u64(number, "announcement number"))
                     .transpose()?,
-                uncertain: row.16 != 0,
+                uncertain: row.17 != 0,
                 // Both intervals are re-anchored before anything reads them; the values here stand
                 // only until `Attention::open` does that.
                 age: unanchored,
                 since_notified: last_notified_ms.map(|_| unanchored),
-                deferred: row.17 != 0,
+                deferred: row.18 != 0,
             });
         }
         Ok(items)

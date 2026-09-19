@@ -3123,3 +3123,147 @@ fn a_subject_recorded_after_a_reopen_takes_the_next_place_in_the_page() {
         "the one recorded after the reopen takes the place after it, not beside it"
     );
 }
+
+// ----- A record arriving late, continued ------------------------------------------------------
+
+/// A turn and its change set at versions of their own, so a late one of each can be told apart.
+fn turn_with_change_set(
+    sequence: u64,
+    at_ms: u64,
+    turn_version: u64,
+    change_set_version: u64,
+) -> SourceEvent {
+    event(
+        AttentionSource::Semantic,
+        sequence,
+        at_ms,
+        EventKind::TurnCompleted {
+            session_id: session(1),
+            turn_id: AgentTurnId::new("turn-1").expect("an identifier"),
+            version: turn_version,
+            change_set: Some((
+                ChangeSetId::new(Uuid::from_bytes([5; 16])),
+                change_set_version,
+            )),
+            summary: "rewrote the parser".to_owned(),
+        },
+    )
+}
+
+#[test]
+fn a_late_turn_beside_a_newer_change_set_still_records_the_change_set() {
+    // Each version an event names is weighed on its own. The turn is a record the host already
+    // holds, so nothing about it moves; the change set is one it has not seen, so all of it does.
+    for replay in [false, true] {
+        let mut attention = engine();
+        let who = actor("local:501");
+        let first = turn_with_change_set(1, 1_000, 2, 1);
+        let late = turn_with_change_set(2, 2_000, 1, 2);
+        if replay {
+            attention
+                .rebuild(std::slice::from_ref(&first), reading(0))
+                .expect("the store records the rebuild");
+        } else {
+            attention
+                .apply(&first, reading(0))
+                .expect("the store records the decision");
+        }
+        let change_set = ReviewSubject::ChangeSet {
+            session_id: session(1),
+            change_set_id: ChangeSetId::new(Uuid::from_bytes([5; 16])),
+        };
+        attention
+            .acknowledge_review(&who, &change_set, 1, reading(1_000))
+            .expect("the actor reads it");
+        let before = attention
+            .changed_since(&who, 500, 0, Content::Whole)
+            .changes
+            .len();
+
+        if replay {
+            attention
+                .rebuild(std::slice::from_ref(&late), reading(2_000))
+                .expect("the store records the rebuild");
+        } else {
+            attention
+                .apply(&late, reading(2_000))
+                .expect("the store records the decision");
+        }
+        let state = attention
+            .reviews()
+            .state(&who, &change_set)
+            .expect("the change set is a subject the host holds");
+        assert_eq!(
+            state.current_version,
+            U64::new(2),
+            "the change set the host had not seen moved, whatever the turn beside it said"
+        );
+        assert!(state.outstanding, "and it is review work again");
+        assert_eq!(
+            attention
+                .changed_since(&who, 500, 0, Content::Whole)
+                .changes
+                .len(),
+            before + 1,
+            "the capture is one change since a visit, and the late turn is none"
+        );
+        let turn = attention
+            .reviews()
+            .state(
+                &who,
+                &ReviewSubject::CompletedTurn {
+                    session_id: session(1),
+                    turn_id: AgentTurnId::new("turn-1").expect("an identifier"),
+                },
+            )
+            .expect("the turn is still a subject");
+        assert_eq!(
+            turn.current_version,
+            U64::new(2),
+            "and the turn did not move"
+        );
+    }
+}
+
+// ----- What a clock nobody could prove may not anchor -----------------------------------------
+
+#[test]
+fn an_announcement_stamped_on_an_unprovable_clock_is_not_measured_against_a_proved_one() {
+    // The two readings are not on the same scale. Subtracting one from the other could make a
+    // two-second-old announcement look an hour old, and the same condition would be announced
+    // again inside its own de-duplication window.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    {
+        let mut attention = Attention::open(&path, HostReading::new(0, 1_000, false))
+            .expect("the feature store opens");
+        attention
+            .apply(
+                &notice(1, 1_000, "build finished", false),
+                HostReading::new(10_000, 1_000, false),
+            )
+            .expect("the store records the decision");
+        assert_eq!(attention.awaiting_delivery(), 1, "it went out at once");
+    }
+    // Two seconds later on the machine's own clock, with the wall clock corrected and proved.
+    let mut reopened = Attention::open(&path, HostReading::new(12_000, NOON, true))
+        .expect("the feature store reopens");
+    let outcomes = reopened
+        .tick(HostReading::new(12_000, NOON, true))
+        .expect("the store records the decision");
+    assert!(
+        notified(&outcomes).is_empty(),
+        "an interval the host cannot measure starts again rather than reading as an hour: \
+         {outcomes:?}"
+    );
+    let repeated = reopened
+        .apply(
+            &notice(2, 2_000, "build finished", false),
+            HostReading::new(12_500, NOON + 500, true),
+        )
+        .expect("the store records the decision");
+    assert!(
+        notified(&repeated).is_empty(),
+        "and the same condition inside the window is counted rather than announced: {repeated:?}"
+    );
+}

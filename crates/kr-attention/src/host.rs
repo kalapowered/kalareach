@@ -571,19 +571,22 @@ fn consume(
         .consumed(event.cursor.source)
         .is_none_or(|consumed| event.cursor.sequence > consumed);
     // A turn the host already holds at this version or later is a record it has, not review work
-    // it has been given. The engine is told the record was consumed and nothing more, so a late
-    // event cannot reopen an inbox item whose review is complete.
+    // it has been given. The *engine* is told the record was consumed and nothing more, so a late
+    // event cannot reopen an inbox item whose review is complete. What the event says about every
+    // other version it names still goes to the review state: a turn arriving late beside a change
+    // set the host has not seen is still that change set's capture, and each version is weighed on
+    // its own there.
     let consumed_only;
-    let event = if reopens_nothing(state, event) {
+    let for_engine = if reopens_nothing(state, event) {
         consumed_only = SourceEvent::new(event.cursor, event.at_ms, EventKind::Observed);
         &consumed_only
     } else {
         event
     };
     let produced = if replay {
-        state.engine.replay(event, reading)
+        state.engine.replay(for_engine, reading)
     } else {
-        state.engine.apply(event, reading)
+        state.engine.apply(for_engine, reading)
     };
     carry_gaps(state, &produced);
     outcomes.extend(produced);

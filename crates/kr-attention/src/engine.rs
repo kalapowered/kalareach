@@ -91,6 +91,14 @@ pub struct Item {
     pub notification: NotificationState,
     /// When the last announcement was decided, when there has been one.
     pub last_notified_ms: Option<TimestampMs>,
+    /// Whether the clock that stamped [`Item::last_notified_ms`] could be proved at the time.
+    ///
+    /// A host that cannot prove its wall clock still stamps the moment it read, because the
+    /// alternative is no anchor at all. What it must not do is measure against that stamp later,
+    /// once the clock is proved: the two readings are not on the same scale, and subtracting one
+    /// from the other can make a two-second-old announcement look an hour old, which would announce
+    /// the same condition again inside its own window.
+    pub announced_wall_proven: bool,
     /// The level the last announcement went out at.
     ///
     /// An item that has climbed past it is owed another announcement; one that has not is not.
@@ -684,9 +692,10 @@ impl Engine {
     /// Re-anchors every interval at `reading`, from the wall-clock moments the store kept.
     ///
     /// The continuous clock restarts with the machine, so the durable half of an interval is the
-    /// moment it started. A host that can prove its wall clock keeps every interval where it was,
-    /// including one that is already overdue. One that cannot starts them again, which is the
-    /// conservative answer rather than arithmetic on a reading nobody can vouch for.
+    /// moment it started. A host that can prove its wall clock keeps every interval whose anchor
+    /// was also stamped on a proved clock, including one that is already overdue. Every other
+    /// interval starts again, which is the conservative answer rather than arithmetic across two
+    /// readings that are not on the same scale.
     pub(crate) fn reanchor(&mut self, reading: HostReading) {
         let since = |recorded: TimestampMs| {
             if reading.wall_proven {
@@ -697,9 +706,13 @@ impl Engine {
         };
         for item in self.items.values_mut() {
             item.age = Elapsed::already(since(item.first_seen_ms), reading);
+            // Both ends of the interval have to be on a clock somebody can vouch for. An anchor
+            // stamped while this host could not prove its clock is not one, whatever the clock
+            // says now, so that interval starts again rather than being measured against it.
+            let announced = item.announced_wall_proven;
             item.since_notified = item
                 .last_notified_ms
-                .map(|at| Elapsed::already(since(at), reading));
+                .map(|at| Elapsed::already(if announced { since(at) } else { 0 }, reading));
         }
         for pending in self.pending_inputs.values_mut() {
             pending.waited = Elapsed::already(since(pending.pending_since_ms), reading);
@@ -1013,6 +1026,7 @@ impl Engine {
             last_seen_ms: raise.at_ms,
             notification: NotificationState::Pending,
             last_notified_ms: None,
+            announced_wall_proven: false,
             announced_level: None,
             announcements: 0,
             pending_handoff: None,
@@ -1038,10 +1052,10 @@ impl Engine {
     /// Keeps the inbox inside [`MAX_RETAINED_ATTENTION_ITEMS`].
     ///
     /// The inbox is a working set. The receipts, the question ledger and the retained output are
-    /// where the record lives, so what is let go of here is the least urgent and oldest item, and
-    /// the count of what has gone is reported rather than hidden. The item that was just raised is
-    /// weighed with the rest: a fresh informational notice does not displace an urgent approval
-    /// merely by being the newest thing to arrive.
+    /// where the record lives, so what is let go of here is the least urgent and oldest *record of
+    /// a condition*, and the count of what has gone is reported rather than hidden. An item that
+    /// has only just arrived is not one of those and cannot be chosen; among those that are, level
+    /// and then age decide, so an informational notice goes before an urgent approval.
     ///
     /// Four things are never let go of: a condition somebody or something is still waiting on, a
     /// decision no delivery consumer has settled, a decision quiet hours are holding, and a
@@ -1111,6 +1125,7 @@ impl Engine {
         // inside quiet hours is deferred once rather than re-decided on every tick.
         item.since_notified = Some(Elapsed::starting(reading));
         item.last_notified_ms = Some(reading.wall_ms);
+        item.announced_wall_proven = reading.wall_proven;
         if quiet {
             item.deferred = true;
             item.notification = NotificationState::Deferred;

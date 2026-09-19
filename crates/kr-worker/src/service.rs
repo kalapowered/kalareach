@@ -3124,9 +3124,10 @@ impl WorkerService {
                 let _: kr_protocol::receipt::ActionCancelParams = parse(&mutation.params)?;
                 Ok(())
             }
-            // The review and attention group. Each names this session and nothing else: what may
-            // be acknowledged, and at which version, is the engine's own answer, and it is given
-            // inside the effect where the state it is read against cannot move underneath it.
+            // The review and attention group. Each names this session and nothing else here:
+            // whether the subject, the version, the counters, the window and the actor are ones
+            // this host will accept is answered before the dispatch marker, in `decidable`, so a
+            // refusal it can weigh rejects the action rather than failing inside the effect.
             Method::AttentionAcknowledge => {
                 let params: kr_protocol::attention::AttentionAcknowledgeParams =
                     parse(&mutation.params)?;

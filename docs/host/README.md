@@ -1329,9 +1329,12 @@ as an explicit history gap.
 ### The feature store, and what a gap means
 
 The state lives beside the receipts, in the session's own private journal, under its own table
-names and its own schema version. It is a projection of the journal's events, so it can be rebuilt
-from them: replaying a record the engine has already consumed changes nothing, which is what makes
-a rebuild safe to run twice.
+names and its own schema version. What it decided is a projection of the journal's events, so that
+half can be rebuilt from them: replaying a record the engine has already consumed changes nothing,
+which is what makes a rebuild safe to run twice. What people and clients put there is not, and no
+replay restores it: the acknowledgements, the per-actor revisions, the visits and their log views,
+the quiet-hours window and the identities already given to announcements are records in their own
+right, and the store is where they live.
 
 Every mutating call writes the new state before it publishes the decision. A write that fails
 leaves the engine where it was, so the same event can be offered again and produces the same
