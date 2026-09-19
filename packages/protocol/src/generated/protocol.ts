@@ -405,6 +405,11 @@ export type ApplicationState = 'shell_ready' | 'agent_busy' | 'awaiting_input' |
  */
 export type EventStream = 'session_state' | 'output' | 'attachments' | 'input_lease' | 'receipts'
 /**
+ * Why a range of output is no longer retained.
+ */
+export type HistoryGapCause =
+  'retention' | 'host_capacity' | 'session_capacity' | 'spool_unavailable'
+/**
  * An upstream approval request identifier. Opaque to KalaReach.
  */
 export type ApprovalRequestId = string
@@ -5928,6 +5933,17 @@ export interface EventsSubscribeResult {
  * A range of output the worker can no longer replay.
  */
 export interface HistoryGap {
+  /**
+   * Why the range is missing, when the host recorded a reason for it.
+   *
+   * Section 20 asks eviction to leave *explicit* history-gap cursors. The cursors say what is
+   * gone; this says which bound took it, so a person looking at a gap can tell their own
+   * session's size from a busy host.
+   *
+   * It is absent from the wire when the host has no reason recorded, so a gap this host
+   * reports is byte for byte what a client built before causes existed expects.
+   */
+  cause?: HistoryGapCause | null
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */

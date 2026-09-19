@@ -22,7 +22,7 @@
 
 use std::time::Duration;
 
-use kr_protocol::recovery::HistoryGap;
+use kr_protocol::recovery::{HistoryGap, HistoryGapCause};
 use kr_protocol::scalars::{TimestampMs, U64};
 
 /// How long retained session output is kept.
@@ -51,6 +51,16 @@ impl RetentionLimit {
     /// The order is what "the first applicable limit" refers to, so it is fixed here rather than
     /// left to whichever check a caller happens to run first.
     pub const ALL: &'static [Self] = &[Self::Age, Self::HostCap, Self::SessionCap];
+
+    /// Returns what a reader of a history gap is told this limit was.
+    #[must_use]
+    pub const fn cause(self) -> HistoryGapCause {
+        match self {
+            Self::Age => HistoryGapCause::Retention,
+            Self::HostCap => HistoryGapCause::HostCapacity,
+            Self::SessionCap => HistoryGapCause::SessionCapacity,
+        }
+    }
 
     /// Returns the stable name this limit is reported under.
     #[must_use]
@@ -175,12 +185,13 @@ pub struct Eviction {
 }
 
 impl Eviction {
-    /// Returns the gap a reader is told about.
+    /// Returns the gap a reader is told about, with the bound that produced it.
     #[must_use]
     pub const fn gap(&self) -> HistoryGap {
         HistoryGap {
             from_cursor: U64::new(self.from_cursor),
             to_cursor: U64::new(self.to_cursor),
+            cause: Some(self.limit.cause()),
         }
     }
 }

@@ -7414,6 +7414,17 @@
       "additionalProperties": false,
       "description": "A range of output the worker can no longer replay.",
       "properties": {
+        "cause": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HistoryGapCause"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why the range is missing, when the host recorded a reason for it.\n\nSection 20 asks eviction to leave *explicit* history-gap cursors. The cursors say what is\ngone; this says which bound took it, so a person looking at a gap can tell their own\nsession's size from a busy host.\n\nIt is absent from the wire when the host has no reason recorded, so a gap this host\nreports is byte for byte what a client built before causes existed expects."
+        },
         "from_cursor": {
           "$ref": "#/$defs/U64",
           "description": "The first cursor that is missing."
@@ -7428,6 +7439,31 @@
         "to_cursor"
       ],
       "type": "object"
+    },
+    "HistoryGapCause": {
+      "description": "Why a range of output is no longer retained.",
+      "oneOf": [
+        {
+          "const": "retention",
+          "description": "Output older than the retention period.",
+          "type": "string"
+        },
+        {
+          "const": "host_capacity",
+          "description": "The host-wide cap on retained session output.",
+          "type": "string"
+        },
+        {
+          "const": "session_capacity",
+          "description": "This session's own cap on retained output.",
+          "type": "string"
+        },
+        {
+          "const": "spool_unavailable",
+          "description": "The spool could not be written, so only the resident window is retained.",
+          "type": "string"
+        }
+      ]
     },
     "HistoryPageParams": {
       "additionalProperties": false,

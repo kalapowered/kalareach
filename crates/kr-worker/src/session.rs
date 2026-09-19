@@ -160,6 +160,12 @@ pub struct Session {
     hub: OutputHub,
     journal: Option<Journal>,
     journal_failure: Option<String>,
+    /// The durability condition this session publishes.
+    ///
+    /// It is the journal's own seam when there is a journal, and a seam of this session's own,
+    /// already faulted, when there is not: a session with no durable store is in exactly the
+    /// condition section 24 describes, and saying so is what fences rich work.
+    health: Arc<crate::persistence::fault::JournalHealth>,
     /// The one time contract every expiry in this session is decided by.
     ///
     /// Retention is the consumer that exists today: section 9 stops expiry-based collection while
@@ -391,6 +397,21 @@ impl Session {
         if let Some(bound) = watch.bound_binding() {
             config.desktop = bound;
         }
+        let health = match journal.as_ref() {
+            Some(journal) => Arc::clone(journal.health()),
+            None => {
+                let health = crate::persistence::fault::JournalHealth::shared();
+                health.note_fault(crate::persistence::fault::JournalFault {
+                    kind: crate::persistence::fault::FaultKind::Absent,
+                    detail: journal_failure
+                        .clone()
+                        .unwrap_or_else(|| "this session has no durable journal".to_owned()),
+                    observed_at_ms: kr_ipc::now_ms(),
+                    durable_through: 0,
+                });
+                health
+            }
+        };
         Ok(Self {
             attachments: AttachmentTable::new(config.dimensions),
             state: SessionState::Creating,
@@ -403,6 +424,7 @@ impl Session {
             hub: OutputHub::new(),
             journal,
             journal_failure,
+            health,
             time,
             closure: None,
             application_state: None,
@@ -2539,6 +2561,38 @@ impl Session {
         self.history.page(from_cursor, max_bytes)
     }
 
+    /// Returns why a cursor is no longer retained, when this host recorded a reason.
+    ///
+    /// The gap a page carries says what is gone; this says which of section 20's bounds took it,
+    /// so a caller that is told to resynchronise can say why rather than only that.
+    #[must_use]
+    pub fn history_gap_cause(&self, cursor: u64) -> Option<kr_protocol::recovery::HistoryGapCause> {
+        self.history
+            .page(cursor, 1)
+            .ok()
+            .and_then(|page| page.gap.as_ref().and_then(|gap| gap.cause))
+    }
+
+    /// Returns how many bytes of output this session retains.
+    #[must_use]
+    pub fn retained_output_bytes(&self) -> u64 {
+        self.history.retained_bytes()
+    }
+
+    /// Applies section 20's retention to this session's retained output.
+    ///
+    /// `host_bytes` is what every session on this host retains. The host cap is a ceiling on the
+    /// whole host rather than a sum of per-session allowances, so a session inside its own cap
+    /// still gives bytes up when the host is over its.
+    pub fn apply_output_retention(
+        &mut self,
+        retention: crate::persistence::retention::OutputRetention,
+        host_bytes: u64,
+        now_ms: kr_protocol::scalars::TimestampMs,
+    ) -> Vec<crate::persistence::retention::Eviction> {
+        self.history.apply_retention(retention, host_bytes, now_ms)
+    }
+
     /// Tells one attachment to install a fresh snapshot.
     pub fn require_resync(&mut self, attachment_id: AttachmentId, reason: ResyncReason) {
         self.hub.require_resync(
@@ -2796,6 +2850,26 @@ impl Session {
         }
     }
 
+    /// Applies section 20's output retention, on the host's own maintenance cadence.
+    ///
+    /// The host-wide figure is measured from the environment's whole spool directory rather than
+    /// asked for, because that directory is what the 1 GiB bound is about and this host can read
+    /// it. A session whose spool is somewhere of its own answers for itself alone, which is the
+    /// conservative direction: it never evicts on another session's account.
+    pub fn collect_output(&mut self) -> Vec<crate::persistence::retention::Eviction> {
+        let host_bytes = self
+            .config
+            .spool_directory
+            .as_deref()
+            .and_then(std::path::Path::parent)
+            .map_or_else(|| self.history.retained_bytes(), retained_bytes_under);
+        self.history.apply_retention(
+            crate::persistence::retention::OutputRetention::DEFAULT,
+            host_bytes,
+            kr_ipc::now_ms(),
+        )
+    }
+
     /// Writes down what the time contract has to survive a restart, when it has changed.
     fn persist_time(&mut self, time: &crate::action::time::TimeContract) {
         if !time.unsaved() {
@@ -2829,6 +2903,21 @@ impl Session {
     /// Returns the private journal for writing, when one is available.
     pub fn journal_mut(&mut self) -> Option<&mut Journal> {
         self.journal.as_mut()
+    }
+
+    /// Returns the durability condition this session publishes.
+    ///
+    /// The handle is shared and outlives the session's lock, so a subsystem that has to fence
+    /// rich work while the journal is faulted holds it rather than asking each time.
+    #[must_use]
+    pub fn health(&self) -> &Arc<crate::persistence::fault::JournalHealth> {
+        &self.health
+    }
+
+    /// Returns what this session may do under the condition its journal is in.
+    #[must_use]
+    pub fn durability_posture(&self) -> crate::persistence::fault::DurabilityPosture {
+        self.health.posture()
     }
 
     /// Returns why the journal is unavailable, when it is.
@@ -3103,7 +3192,18 @@ impl Session {
     /// records in it are still the session's. What changes is the answer the host gives about
     /// durability, which stops being a claim the session cannot support.
     pub fn note_journal_failure(&mut self, detail: impl std::fmt::Display) {
-        self.journal_failure = Some(detail.to_string());
+        let detail = detail.to_string();
+        // The journal's own paths classify from the store's result code and have already
+        // published. This covers what reaches the session another way: an open that failed, and a
+        // caller that decided a write had failed from the refusal it was given.
+        self.health
+            .note_fault(crate::persistence::fault::JournalFault {
+                kind: crate::persistence::fault::FaultKind::WriteFailed,
+                detail: detail.clone(),
+                observed_at_ms: kr_ipc::now_ms(),
+                durable_through: self.health.durable_through(),
+            });
+        self.journal_failure = Some(detail);
     }
 
     const fn durability(&self) -> Durability {
@@ -3308,4 +3408,36 @@ pub const MAX_QUEUED_INPUT_BYTES: usize = 1024 * 1024;
 #[must_use]
 pub const fn cursor(value: u64) -> StreamCursor {
     StreamCursor::new(value)
+}
+
+/// Returns how many bytes of retained output live under one directory.
+///
+/// One level of session directories, each holding fixed-size segments, so the walk is bounded by
+/// the number of sessions rather than by how much output they have produced. A directory this
+/// host cannot read counts as nothing, which under-reports the host figure and therefore evicts
+/// less rather than more.
+fn retained_bytes_under(root: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_file() {
+            total += entry.metadata().map(|data| data.len()).unwrap_or(0);
+            continue;
+        }
+        if !kind.is_dir() {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(entry.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            total += file.metadata().map(|data| data.len()).unwrap_or(0);
+        }
+    }
+    total
 }

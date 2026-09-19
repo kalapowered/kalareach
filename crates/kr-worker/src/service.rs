@@ -436,6 +436,10 @@ impl WorkerService {
                 let state = {
                     let mut session = self.runtime.session();
                     session.collect_expired();
+                    // Output retention is separate from receipt retention and runs on the same
+                    // tick: section 20 budgets the two stores apart, so history pressure never
+                    // reaches a dispatch barrier or a de-duplication record.
+                    session.collect_output();
                     session.state()
                 };
                 state == kr_protocol::session::SessionState::Closed
@@ -3530,6 +3534,7 @@ impl WorkerService {
         // is about to be drawn is current either way; the gap says that what happened in between is
         // no longer readable through `history.page`.
         let gap = (from < oldest).then_some(kr_protocol::recovery::HistoryGap {
+            cause: session.history_gap_cause(from),
             from_cursor: U64::new(from),
             to_cursor: U64::new(oldest),
         });

@@ -97,6 +97,45 @@ pub struct HistoryGap {
     pub from_cursor: U64,
     /// The first cursor that is present again.
     pub to_cursor: U64,
+    /// Why the range is missing, when the host recorded a reason for it.
+    ///
+    /// Section 20 asks eviction to leave *explicit* history-gap cursors. The cursors say what is
+    /// gone; this says which bound took it, so a person looking at a gap can tell their own
+    /// session's size from a busy host.
+    ///
+    /// It is absent from the wire when the host has no reason recorded, so a gap this host
+    /// reports is byte for byte what a client built before causes existed expects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cause: Option<HistoryGapCause>,
+}
+
+/// Why a range of output is no longer retained.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum HistoryGapCause {
+    /// Output older than the retention period.
+    Retention,
+    /// The host-wide cap on retained session output.
+    HostCapacity,
+    /// This session's own cap on retained output.
+    SessionCapacity,
+    /// The spool could not be written, so only the resident window is retained.
+    SpoolUnavailable,
+}
+
+impl HistoryGapCause {
+    /// Returns the stable wire name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Retention => "retention",
+            Self::HostCapacity => "host_capacity",
+            Self::SessionCapacity => "session_capacity",
+            Self::SpoolUnavailable => "spool_unavailable",
+        }
+    }
 }
 
 /// Parameters of `events.snapshot`.
