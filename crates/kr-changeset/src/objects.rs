@@ -93,6 +93,7 @@ impl ObjectStore {
         // the content. Should is not is: a damaged file, a directory or a link at that name would
         // make this write report success and throw the valid bytes away, and every later read of
         // it would fail. So what is there is read back before it is believed.
+        let mut repair = false;
         if shelf.occupied(&final_name)? {
             match self.reads_back(digest)? {
                 ReadBack::Content => {
@@ -105,8 +106,11 @@ impl ObjectStore {
                 }
                 // The name **is** the digest of the content, so a file at it that hashes to
                 // something else is not content anything can be referring to, and leaving it would
-                // make every version that names this digest undeliverable.
-                ReadBack::Damaged => shelf.remove(&final_name)?,
+                // make every version that names this digest undeliverable. It is replaced in one
+                // step rather than removed and written again: another writer who published the
+                // right content in between published *these bytes*, since the name is their
+                // digest, and a name that is never empty is never a name a crash leaves absent.
+                ReadBack::Damaged => repair = true,
                 // Something is at the name and this host could not read it. That is not evidence
                 // of damage, and removing it would take away an object a version may name.
                 ReadBack::Unreadable(detail) => {
@@ -144,7 +148,11 @@ impl ObjectStore {
         // to make room here**: a valid blob another writer published between the check above and
         // this link is the content, and unlinking it would take an object a recorded version
         // names.
-        let published = shelf.link_into(&temporary, &shelf, &final_name);
+        let published = if repair {
+            shelf.rename_into(&temporary, &shelf, &final_name)
+        } else {
+            shelf.link_into(&temporary, &shelf, &final_name)
+        };
         let _ = shelf.remove(&temporary);
         match published {
             Ok(()) => {
