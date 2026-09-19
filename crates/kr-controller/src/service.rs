@@ -3714,25 +3714,24 @@ impl Controller {
             };
             for row in rows {
                 self.directory.lock().await.remove(row.session_id);
-                // The worker went with the boot it was in, so the recovery pass section 24 gives
-                // a session never ran for this one. It runs here instead, on a crash's terms: the
-                // kernel is asked whether the recorded process ended, and the session's stores are
-                // opened only once it has said so.
+                // The worker went with the boot it was in: a boot that is not this one ended
+                // every process in it, which is what the boot record establishes and what the
+                // kernel may still decline to say about any one of them. So the closure is
+                // recorded either way.
                 //
-                // Where it will not say, nothing is written either. A closure deletes the worker
-                // row, and that row is what every later read asks before it opens anything: a
-                // session with neither a row nor a confirmed death would read as a closed session
-                // whose store is free to open. So the row stays and this session keeps being
-                // refused until something can answer the question.
+                // The recovery pass is not. It opens the session's stores, so it runs only where
+                // the kernel confirms the death, and where it does not the store is left as it is
+                // and the archive reports an action with no ending when a reader asks. What stops
+                // a later read or migration reaching a store a worker may still own is the
+                // published descriptor, which a closure does not delete.
                 let archive = self.archive();
-                let Ok(ownership) = archive.take_ownership(
+                if let Ok(ownership) = archive.take_ownership(
                     row.session_id,
                     row.display_number,
                     &row.process_identity,
-                ) else {
-                    continue;
-                };
-                let _ = archive.recover_journal(&ownership);
+                ) {
+                    let _ = archive.recover_journal(&ownership);
+                }
                 self.record_final(
                     row.session_id,
                     ClosureReason::HostShutdown,
@@ -4829,21 +4828,29 @@ impl Controller {
             .workers()?
             .into_iter()
             .find(|record| record.session_id == session_id);
-        match recorded {
-            Some(record)
-                if !matches!(
-                    kr_ipc::identity::process_state(&record.process_identity),
-                    kr_ipc::identity::ProcessState::Ended
-                ) =>
-            {
-                Err(ControllerError::InvalidArgument(format!(
-                    "session {session_id} has a worker this daemon has not confirmed ended; its \
-                     endpoint is {}",
-                    record.endpoint
-                )))
-            }
-            _ => Ok(()),
+        if let Some(record) = recorded
+            && !matches!(
+                kr_ipc::identity::process_state(&record.process_identity),
+                kr_ipc::identity::ProcessState::Ended
+            )
+        {
+            return Err(ControllerError::InvalidArgument(format!(
+                "session {session_id} has a worker this daemon has not confirmed ended; its \
+                 endpoint is {}",
+                record.endpoint
+            )));
         }
+        // The registry's row is not the only place a live worker shows. A closure deletes that
+        // row, and a closure can be recorded for a session whose death this host inferred from a
+        // boot record rather than confirmed, so the published descriptor is asked as well: it is
+        // removed when a session is fenced, not when it is closed.
+        if self.archive().a_worker_may_still_own(session_id) {
+            return Err(ControllerError::InvalidArgument(format!(
+                "session {session_id} published a descriptor for a worker this daemon has not \
+                 confirmed ended"
+            )));
+        }
+        Ok(())
     }
 
     /// Reads what one session left behind, with the registry's own record beside it.
