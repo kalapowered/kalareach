@@ -55,6 +55,12 @@ that means, and each rule is a fact about a file here rather than a convention:
 
 `src-tauri/tests/boundary.rs` reads those files and holds them to those sentences.
 
+One hardening switch is deliberately off. `freezePrototype` freezes `Object.prototype` before the
+page runs, and the terminal library assigns `toString` to one of its own namespace objects while it
+is being evaluated; against a frozen inherited property that assignment throws and the window comes
+up empty. The setting is written into `tauri.conf.json` as `false` rather than left out, so the
+choice is visible where the rest of the boundary is.
+
 ## The design system
 
 Newsprint, with light, dark and system modes. `src/styles/tokens.css` holds every colour, the motion

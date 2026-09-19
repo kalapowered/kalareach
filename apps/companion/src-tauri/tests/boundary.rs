@@ -204,16 +204,22 @@ fn an_external_link_is_permitted_only_for_the_approved_schemes() {
 }
 
 #[test]
-fn the_asset_protocol_is_off_and_the_prototype_is_frozen() {
+fn the_asset_protocol_is_off_and_the_bridge_is_not_a_global() {
     let configuration = configuration();
     assert_eq!(
         configuration["app"]["security"]["assetProtocol"]["enable"],
         serde_json::Value::Bool(false),
         "there is no protocol that turns a path into a readable URL"
     );
+    // Freezing `Object.prototype` is stated, and stated false. The terminal library writes
+    // `toString` onto one of its own namespace objects while it is being evaluated, and an
+    // inherited property that has been frozen makes that assignment throw, which leaves the
+    // window empty. The page loads no script it did not ship, so the setting is named here rather
+    // than left to a default that a later version could flip.
     assert_eq!(
         configuration["app"]["security"]["freezePrototype"],
-        serde_json::Value::Bool(true)
+        serde_json::Value::Bool(false),
+        "the setting is stated, because the terminal library cannot run under a frozen prototype"
     );
     assert_eq!(
         configuration["app"]["withGlobalTauri"],

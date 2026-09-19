@@ -24,10 +24,19 @@ export default defineConfig({
     { name: 'chromium', use: { ...devices['Desktop Chrome'] } },
     { name: 'webkit', use: { ...devices['Desktop Safari'] } }
   ],
-  webServer: {
-    command: 'node scripts/preview-harness.mjs',
-    url: 'http://localhost:4188/harness.html',
-    reuseExistingServer: !process.env.CI,
-    timeout: 60_000
-  }
+  webServer: [
+    {
+      command: 'node scripts/preview-harness.mjs',
+      url: 'http://localhost:4188/harness.html',
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000
+    },
+    // The bundle the desktop window loads, served beside the harness so one test can open it.
+    {
+      command: 'node scripts/preview-desktop.mjs',
+      url: 'http://localhost:4189/',
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000
+    }
+  ]
 })
