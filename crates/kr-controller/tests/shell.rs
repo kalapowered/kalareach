@@ -251,16 +251,18 @@ async fn a_stock_shell_is_labelled_rather_than_claiming_the_managed_contract() {
 
 /// KR-REQ-07.16, KR-REQ-07.17.
 #[test]
-fn a_managed_session_launches_the_package_binary_with_the_flags_it_declares() {
+fn a_managed_session_launches_the_package_binary_as_an_interactive_login_shell() {
     let packages = tempfile::tempdir().expect("a directory");
     install_package(packages.path(), ShellKind::Zsh);
     let set = PackageSet::discover(packages.path()).expect("reads the package");
     let package = set.select(Some("zsh")).expect("qualified");
     assert_eq!(
         package.executable(),
-        packages.path().join("zsh/identity-1/bin/shell"),
+        packages.path().join("zsh/identity-1/bin/zsh"),
         "the exact binary the reader patch was built into"
     );
+    // The arguments belong to the shell family rather than to the record: a package says what it
+    // was built from, not how a session starts it.
     assert_eq!(package.interactive_flags(), vec!["-l", "-i"]);
     let identity = package.identity();
     assert_eq!(identity.kind, ShellKind::Zsh);
