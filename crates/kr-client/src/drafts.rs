@@ -84,6 +84,12 @@ const CHECKPOINT_EXTENSION: &str = "sync";
 /// The extension of a draft being written, which is not yet a draft.
 const PARTIAL_EXTENSION: &str = "partial";
 
+/// How many links the walk over a store's path follows before it gives up.
+///
+/// The same figure Linux and macOS use for resolving one path, so a chain this walk refuses is a
+/// chain the kernel would refuse to open through anyway.
+const MAX_PATH_LINKS: usize = 40;
+
 /// The name of the store's lock.
 const LOCK_NAME: &str = "store.lock";
 
@@ -1084,50 +1090,6 @@ fn private_directory(directory: &Path) -> std::io::Result<()> {
     flush_path_names(directory)
 }
 
-/// Flushes the directory entry of every name on this store's path.
-///
-/// Creating the levels this call was missing is not enough. Another opener may have created one a
-/// moment ago and not yet flushed it, and a store that returned success under such a name would be
-/// a store whose own path a crash could lose. Flushing them all costs a handful of metadata
-/// operations once per store, which is what opening one is.
-///
-/// A failure is reported. A store that cannot open the directories its own path is made of cannot
-/// establish that the path survives a crash, and saying so is better than returning success that
-/// means less than it looks.
-///
-/// Two paths are walked: the one the filesystem resolves to, and the one the caller spelled. A
-/// symbolic link leads to its target, and the target's ancestors are what a draft under it lives
-/// in; but the link is a name too, and the directory holding it is what the *path* to that draft
-/// lives in. Losing either leaves a store nothing reaches.
-fn flush_path_names(directory: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let resolved = std::fs::canonicalize(directory)?;
-        let supplied = if directory.is_absolute() {
-            directory.to_path_buf()
-        } else {
-            std::env::current_dir()?.join(directory)
-        };
-        let mut flushed: Vec<PathBuf> = Vec::new();
-        for path in [resolved.as_path(), supplied.as_path()] {
-            let mut level = path;
-            while let Some(parent) = level.parent() {
-                if !flushed.iter().any(|done| done == parent) {
-                    sync_directory(parent)?;
-                    flushed.push(parent.to_path_buf());
-                }
-                level = parent;
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        // Nothing here flushes a directory on Windows, so there is nothing to walk.
-        let _ = directory;
-    }
-    Ok(())
-}
-
 /// The directory one name lives in.
 ///
 /// A relative path of one component has an empty parent, and an empty path is not a directory
@@ -1177,6 +1139,80 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
     }
     #[cfg(not(unix))]
     {
+        let _ = directory;
+    }
+    Ok(())
+}
+
+/// Flushes the directory entry of every name this store's path is made of.
+///
+/// Creating the levels this call was missing is not enough. Another opener may have created one a
+/// moment ago and not yet flushed it, and a store that returned success under such a name would be
+/// a store whose own path a crash could lose. Flushing them all costs a handful of metadata
+/// operations once per store, which is what opening one is.
+///
+/// A path is a chain of names, and losing any one of them leaves a store nothing reaches. The chain
+/// is not only the components a caller spelled: a link is a name in a directory, it leads somewhere,
+/// and that somewhere has its own ancestors. So the walk follows each component in turn, flushes the
+/// directory that holds it, and steps into a link's target before going on, which reaches a link
+/// that leads to another link as well as one that leads to a directory.
+///
+/// A failure is reported. A store that cannot open the directories its own path is made of cannot
+/// establish that the path survives a crash, and saying so is better than returning success that
+/// means less than it looks.
+fn flush_path_names(directory: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let start = if directory.is_absolute() {
+            directory.to_path_buf()
+        } else {
+            std::env::current_dir()?.join(directory)
+        };
+        let mut pending = vec![start];
+        let mut flushed: Vec<PathBuf> = Vec::new();
+        let mut followed = 0_usize;
+        while let Some(path) = pending.pop() {
+            let mut prefix = PathBuf::new();
+            for component in path.components() {
+                prefix.push(component);
+                let Some(holder) = prefix.parent() else {
+                    // The root holds itself, and there is nothing above it to flush.
+                    continue;
+                };
+                if !flushed.iter().any(|done| done == holder) {
+                    sync_directory(holder)?;
+                    flushed.push(holder.to_path_buf());
+                }
+                let Ok(metadata) = std::fs::symlink_metadata(&prefix) else {
+                    // A component that is not there is one nothing is reaching through: what this
+                    // call had to make durable, it made above.
+                    continue;
+                };
+                if !metadata.file_type().is_symlink() {
+                    continue;
+                }
+                followed += 1;
+                if followed > MAX_PATH_LINKS {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "{} follows more than {MAX_PATH_LINKS} links",
+                            path.display()
+                        ),
+                    ));
+                }
+                let target = std::fs::read_link(&prefix)?;
+                pending.push(if target.is_absolute() {
+                    target
+                } else {
+                    holder.join(target)
+                });
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // Nothing here flushes a directory on Windows, so there is nothing to walk.
         let _ = directory;
     }
     Ok(())
@@ -1517,12 +1553,70 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn every_link_on_the_way_is_a_name_the_store_answers_for() {
+        // A chain: the path a caller spells leads to a link that leads to the store. The directory
+        // holding the middle link is on neither end of the chain, and losing that name would leave
+        // the drafts where they are and nothing reaching them. Making it unreadable is how a test
+        // can see whether the walk got there: the store refuses rather than saying it is durable.
+        use std::os::unix::fs::PermissionsExt as _;
+
+        if kr_ipc::paths::current_uid() == 0 {
+            // A process that bypasses the mode bits cannot be told anything by them.
+            return;
+        }
+
+        let directory = tempfile::tempdir().expect("a directory");
+        let data = directory.path().join("data");
+        std::fs::create_dir_all(data.join("drafts")).expect("the store's real home");
+        let middle = directory.path().join("middle");
+        std::fs::create_dir(&middle).expect("the directory holding the second link");
+        std::os::unix::fs::symlink(data.join("drafts"), middle.join("hop"))
+            .expect("the second link");
+        let entry = directory.path().join("entry");
+        std::fs::create_dir(&entry).expect("the directory holding the first link");
+        std::os::unix::fs::symlink(middle.join("hop"), entry.join("link")).expect("the first link");
+
+        // Walked through but not read, which is what the middle of a chain can be.
+        std::fs::set_permissions(&middle, std::fs::Permissions::from_mode(0o111))
+            .expect("search but not read");
+        let outcome = DraftStore::open(entry.join("link"), device());
+        std::fs::set_permissions(&middle, std::fs::Permissions::from_mode(0o700))
+            .expect("readable again");
+        let error = outcome.expect_err("a name on the way this store cannot answer for");
+        assert!(error.to_string().contains("could not be used"), "{error}");
+
+        // Readable, and the same path opens and reads a draft written at the far end.
+        let real = DraftStore::open(data.join("drafts"), device()).expect("a store");
+        let draft = real
+            .create(
+                open_target(),
+                "at the far end".to_owned(),
+                TimestampMs::new(1),
+            )
+            .expect("a draft");
+        let through_the_chain =
+            DraftStore::open(entry.join("link"), device()).expect("a store through two links");
+        assert_eq!(
+            through_the_chain
+                .load(draft.draft_id)
+                .expect("the same draft")
+                .text,
+            "at the far end"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn a_store_says_so_when_it_cannot_make_its_own_path_durable() {
         // A directory a caller can walk through but not open is a directory this store cannot
         // establish a name in, and it says that rather than returning a success that means less
         // than it looks. Reaching the refusal is also what shows the walk covers the path the
         // caller supplied and not only the deepest level.
         use std::os::unix::fs::PermissionsExt as _;
+
+        if kr_ipc::paths::current_uid() == 0 {
+            return;
+        }
 
         let directory = tempfile::tempdir().expect("a directory");
         let outer = directory.path().join("outer");
