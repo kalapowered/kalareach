@@ -27,10 +27,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     # One tag is one release, and the refusal below cannot see a run that has not created its draft
-    # yet. Two runs for the same tag would both pass it, and the second would be refused its create
-    # and leave the first holding a draft nobody was expecting. So runs for one tag are serialised
-    # here, and a run that has already begun is never cancelled for a later one: it is the run that
-    # holds the draft, and the later one is the duplicate.
+    # yet: two runs for the same tag would both pass it and both go on to create one. So runs for
+    # one tag are serialised here instead, and a run that has already begun is never cancelled for a
+    # later one, because it is the run that holds the draft. A duplicate that waits meets the
+    # refusal when its turn comes, which is where it belongs.
     concurrency:
       group: package-release-${{ github.ref }}
       cancel-in-progress: false
@@ -215,23 +215,22 @@ jobs:
           while :; do
             published="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
               --jq '"\(.id) \(.immutable)"' 2>/dev/null || echo '')"
-            if [ "${published%% *}" = "$release" ]; then
+            if [ "$published" = "$release true" ]; then
               break
             fi
             if [ "$attempt" -ge 5 ]; then
-              echo "$GITHUB_REF_NAME does not resolve to the release this run published." >&2
-              echo "It published release $release; the tag answers: ${published:-nothing}" >&2
+              if [ "${published%% *}" = "$release" ]; then
+                echo "$GITHUB_REF_NAME was published as a release whose assets can be replaced." >&2
+                echo 'Turn on immutable releases for this repository, then release the next commit.' >&2
+              else
+                echo "$GITHUB_REF_NAME does not resolve to the release this run published." >&2
+                echo "It published release $release; the tag answers: ${published:-nothing}" >&2
+              fi
               exit 1
             fi
             attempt=$((attempt + 1))
             sleep 3
           done
-
-          if [ "${published#* }" != "true" ]; then
-            echo "$GITHUB_REF_NAME was published as a release whose assets can be replaced." >&2
-            echo 'Turn on immutable releases for this repository, then release the next commit.' >&2
-            exit 1
-          fi
 
       - name: Check what the release serves, and name those URLs in the notes
         env:
@@ -309,8 +308,11 @@ jobs:
             --field "body=@$RUNNER_TEMP/notes.md" --silent; do
             if [ "$attempt" -ge 5 ]; then
               echo "Writing the served URLs into the notes of release $release failed." >&2
-              echo 'The release is published and carries what was packed; its notes are still the' >&2
-              echo 'text the draft was created with. Edit them by hand, or re-run this step.' >&2
+              echo 'The release itself is published and carries what was packed; only its notes are' >&2
+              echo 'in doubt, because a request that ends without an answer may still have been' >&2
+              echo 'applied. Read the notes of that release and, if they are still the text the' >&2
+              echo 'draft was created with, put the URLs below into them by hand.' >&2
+              cat "$RUNNER_TEMP/notes.md" >&2
               exit 1
             fi
             attempt=$((attempt + 1))

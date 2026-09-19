@@ -50,12 +50,14 @@ release it just published and that the release cannot be replaced, and the last 
 asset back from the URL GitHub serves it at, holds it to the packed sha512, and writes those URLs
 into the notes.
 
-One tag is one run: a second push of the same tag waits for the first to finish rather than running
-beside it, and a run already under way is never cancelled for a later one. Reading a release moments
-after writing to it can reach a copy of GitHub's records that has not caught up, so each of those
-reads is attempted up to five times, three seconds apart, before its answer is taken as the
-release's state. Repeating them changes nothing: they are reads, and an answer that is wrong rather
-than late is still wrong on the last attempt.
+One tag is one run at a time. A second run for a tag that is already being released waits for the
+first to finish rather than running beside it, and the run already under way is never cancelled for
+the one waiting; when the waiting run's turn comes it finds the release the first one made and
+refuses to go on. Reading a release moments after writing to it can reach a copy of GitHub's records
+that has not caught up, so each of the three reads that follow is attempted up to five times, three
+seconds apart, before its answer is taken as the release's state. Repeating them changes nothing:
+they are reads, and an answer that is wrong rather than late is still wrong on the last attempt. The
+notes are written the same way, and writing the same notes twice leaves the same notes.
 
 The script is what makes the release that commit's output rather than a working tree's:
 
