@@ -317,17 +317,38 @@ fn acknowledged(
             // Still running, which is what a window that opened looks like.
             Ok(None) => {}
             Err(error) => {
+                // The wait failed, which says nothing about the launcher: it is collected like one
+                // that is still running rather than left behind.
+                let detail = error.to_string();
+                reap(child);
                 return Err(TerminalUnavailable::CouldNotOpen {
                     application: application.to_owned(),
-                    detail: error.to_string(),
+                    detail,
                 });
             }
         }
         if std::time::Instant::now() >= deadline {
+            reap(child);
             return Ok(());
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
+}
+
+/// Waits for a launcher nothing else will wait for.
+///
+/// A terminal that opened outlives this call by design: its window stays until the person closes
+/// it. Something must still collect it when it goes, or the process that presented the session
+/// keeps one dead child per window for as long as it runs.
+#[cfg(not(target_vendor = "apple"))]
+fn reap(mut child: std::process::Child) {
+    // A host that cannot start a thread keeps the child instead: one uncollected launcher is a
+    // better answer than a session that could not be presented.
+    let _ = std::thread::Builder::new()
+        .name("kr-terminal".to_owned())
+        .spawn(move || {
+            let _ = child.wait();
+        });
 }
 
 /// Opens the chosen terminal application on a command.

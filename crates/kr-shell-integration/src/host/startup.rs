@@ -319,120 +319,311 @@ fn powershell_on_path() -> Option<PathBuf> {
 /// guarded, idempotent and removed by `kr shell remove`. The second is the harmless direction, so
 /// anything this cannot establish reads as "it does not".
 ///
-/// What that rules out here: the body of a here-document is text the shell passes on rather than
-/// commands it runs, so `cat <<EOF` … `source ~/.bashrc` … `EOF` is skipped.
+/// The file is read as commands rather than as lines: a quoted newline and a backslash before one
+/// both carry a command on, and a here-document's body is text the shell passes on rather than
+/// commands it runs, so `cat <<EOF` … `source ~/.bashrc` … `EOF` is skipped. Everything a command
+/// could still hide the call behind, a substitution or an expansion this does not evaluate, reads
+/// as "it does not" and costs one guarded entry.
+///
+/// The question is whether the file holds such a command, not whether this run of it would reach
+/// one. `[ -f ~/.bashrc ] && . ~/.bashrc` is the ordinary way to write it and is read as a file
+/// that runs `.bashrc`, although the test can fail; a file that names the call inside a function
+/// or a loop reads the same way. The person wrote the call, and the entry this host would add
+/// beside it would run the integration a second time.
 fn runs_bashrc(contents: &str) -> bool {
-    let mut pending: Vec<HereDocument> = Vec::new();
-    let mut continued = String::new();
-    for line in contents.lines() {
-        // A here-document's body is text the shell passes on rather than commands it runs, and its
-        // end is the delimiter exactly: `<<` matches the line as written, `<<-` after leading tabs
-        // and nothing else.
-        if let Some(open) = pending.first() {
-            let ended = if open.strip_tabs {
-                line.trim_start_matches('\t') == open.marker
-            } else {
-                line == open.marker
-            };
-            if ended {
-                pending.remove(0);
-            }
-            continue;
+    let mut rest = contents;
+    while !rest.is_empty() {
+        let command = read_command(rest);
+        rest = command.rest;
+        // The bodies follow the whole command, however many lines it took to write.
+        for document in &command.documents {
+            rest = skip_body(rest, document);
         }
-        // A command can run on past the end of a line, and what follows is more of that command
-        // rather than a command of its own.
-        let joined = if continued.is_empty() {
-            line.to_owned()
-        } else {
-            format!("{continued} {}", line.trim_start())
-        };
-        if let Some(rest) = ends_continued(&joined) {
-            continued = rest;
-            continue;
-        }
-        continued = String::new();
-        pending = here_documents(&joined);
-        if sources_bashrc(&joined) {
+        if sources(&command.words) {
             return true;
         }
     }
     false
 }
 
-/// One here-document a line opened, and how its end is recognised.
+/// One word of a command, and what the scanner knows about it.
+struct Word {
+    text: String,
+    /// Whether any of it was quoted, which makes it an argument rather than a verb.
+    quoted: bool,
+    /// Whether it stands where a command name stands.
+    command_position: bool,
+}
+
+/// One here-document a command opened, and how its body ends.
 struct HereDocument {
     marker: String,
     /// `<<-` strips leading tabs from the delimiter line, and nothing else does.
     strip_tabs: bool,
+    /// Whether the delimiter was written without quoting, which is what leaves the body expanded
+    /// and a backslash at the end of a body line carrying on to the next.
+    expands: bool,
 }
 
-/// Returns the line without its trailing backslash, when a command runs on past it.
-fn ends_continued(line: &str) -> Option<String> {
-    let trailing = line.chars().rev().take_while(|byte| *byte == '\\').count();
-    // An odd number of them is a continuation; an even number is that many escaped backslashes.
-    (trailing % 2 == 1).then(|| line[..line.len() - 1].to_owned())
+/// One command, the here-documents it opened and what follows it.
+struct Command<'a> {
+    words: Vec<Word>,
+    documents: Vec<HereDocument>,
+    rest: &'a str,
 }
 
-/// Returns the here-documents one line opens, in the order their bodies follow it.
-fn here_documents(line: &str) -> Vec<HereDocument> {
-    let mut opened = Vec::new();
-    let mut rest = line;
-    while let Some(at) = rest.find("<<") {
-        // `<<<` is a here-string: its word is the input, and no body follows.
-        let after = &rest[at + 2..];
-        if let Some(beyond) = after.strip_prefix('<') {
-            rest = beyond;
-            continue;
-        }
-        let strip_tabs = after.starts_with('-');
-        let after = after.strip_prefix('-').unwrap_or(after);
-        let after = after.trim_start();
-        let (marker, taken) = delimiter(after);
-        rest = &after[taken..];
-        if !marker.is_empty() {
-            opened.push(HereDocument { marker, strip_tabs });
-        }
-    }
-    opened
-}
-
-/// Reads one here-document's delimiter, which may be quoted and may hold spaces.
-fn delimiter(text: &str) -> (String, usize) {
-    let mut marker = String::new();
-    let mut taken = 0;
+/// Reads one command from the front of a login file.
+fn read_command(text: &str) -> Command<'_> {
+    let characters: Vec<(usize, char)> = text.char_indices().collect();
+    let mut words: Vec<Word> = Vec::new();
+    let mut documents = Vec::new();
+    let mut word = String::new();
     let mut quoted = false;
-    let mut quote = '\0';
-    let mut escaped = false;
-    for character in text.chars() {
-        taken += character.len_utf8();
-        if escaped {
-            escaped = false;
-            marker.push(character);
-            continue;
-        }
-        if quoted {
-            if character == quote {
-                quoted = false;
-            } else {
-                marker.push(character);
-            }
-            continue;
-        }
+    let mut started = false;
+    // A command begins at the front and after every separator; everything else is an argument.
+    let mut command_position = true;
+    let mut next_command_position = true;
+    let mut index = 0;
+    while index < characters.len() {
+        let character = characters[index].1;
         match character {
-            // A backslash quotes the character after it: `<<\\EOF` is the delimiter `EOF`.
-            '\\' => escaped = true,
+            // A backslash quotes whatever follows it. Before a newline it joins the two lines with
+            // nothing in between, which is how `source\` and `~/.bashrc` make one word.
+            '\\' => match characters.get(index + 1) {
+                Some((_, '\n')) => index += 2,
+                Some((_, following)) => {
+                    word.push(*following);
+                    quoted = true;
+                    started = true;
+                    next_command_position = false;
+                    index += 2;
+                }
+                None => index += 1,
+            },
             '\'' | '"' => {
+                let quote = character;
                 quoted = true;
-                quote = character;
+                started = true;
+                // A word has begun, so the next one is an argument: `"echo" source ~/.bashrc`
+                // passes `source` to `echo`.
+                next_command_position = false;
+                index += 1;
+                while let Some((_, inside)) = characters.get(index) {
+                    if *inside == quote {
+                        index += 1;
+                        break;
+                    }
+                    // A backslash still quotes inside double quotes, and nothing does inside
+                    // single ones.
+                    if *inside == '\\' && quote == '"' {
+                        match characters.get(index + 1) {
+                            Some((_, '\n')) => index += 2,
+                            Some((_, following)) => {
+                                word.push(*following);
+                                index += 2;
+                            }
+                            None => index += 1,
+                        }
+                        continue;
+                    }
+                    word.push(*inside);
+                    index += 1;
+                }
             }
-            character if character.is_whitespace() => {
-                taken -= character.len_utf8();
+            // A comment begins at a `#` that begins a word and runs to the end of its line.
+            '#' if !started => {
+                while matches!(characters.get(index), Some((_, character)) if *character != '\n') {
+                    index += 1;
+                }
+            }
+            '\n' => {
+                index += 1;
                 break;
             }
-            character => marker.push(character),
+            // `(` and backticks open a command of their own, and `$(` opens one after the `$`
+            // this does not evaluate.
+            ';' | '&' | '|' | '(' | ')' | '`' => {
+                finish(
+                    &mut words,
+                    &mut word,
+                    &mut quoted,
+                    &mut started,
+                    command_position,
+                );
+                command_position = true;
+                next_command_position = true;
+                index += 1;
+            }
+            // A here-document. Its delimiter follows the redirection and its body follows the
+            // whole command, so only the delimiter is read here.
+            '<' if matches!(characters.get(index + 1), Some((_, '<'))) => {
+                finish(
+                    &mut words,
+                    &mut word,
+                    &mut quoted,
+                    &mut started,
+                    command_position,
+                );
+                index += 2;
+                // `<<<` is a here-string: its word is the input, and no body follows.
+                if matches!(characters.get(index), Some((_, '<'))) {
+                    index += 1;
+                    continue;
+                }
+                let strip_tabs = matches!(characters.get(index), Some((_, '-')));
+                if strip_tabs {
+                    index += 1;
+                }
+                while matches!(characters.get(index), Some((_, ' ' | '\t'))) {
+                    index += 1;
+                }
+                let (marker, expands, after) = marker_word(&characters, index);
+                index = after;
+                documents.push(HereDocument {
+                    marker,
+                    strip_tabs,
+                    expands,
+                });
+            }
+            character if character.is_whitespace() => {
+                finish(
+                    &mut words,
+                    &mut word,
+                    &mut quoted,
+                    &mut started,
+                    command_position,
+                );
+                command_position = next_command_position;
+                index += 1;
+            }
+            character => {
+                word.push(character);
+                started = true;
+                next_command_position = false;
+                index += 1;
+            }
         }
     }
-    (marker, taken)
+    finish(
+        &mut words,
+        &mut word,
+        &mut quoted,
+        &mut started,
+        command_position,
+    );
+    Command {
+        words,
+        documents,
+        rest: characters.get(index).map_or("", |(at, _)| &text[*at..]),
+    }
+}
+
+/// Ends the word being read, where one has begun.
+fn finish(
+    words: &mut Vec<Word>,
+    word: &mut String,
+    quoted: &mut bool,
+    started: &mut bool,
+    command_position: bool,
+) {
+    if !*started {
+        return;
+    }
+    words.push(Word {
+        text: std::mem::take(word),
+        quoted: *quoted,
+        command_position,
+    });
+    *quoted = false;
+    *started = false;
+}
+
+/// Reads one here-document's delimiter, which may be quoted, may hold spaces and may be empty.
+///
+/// Returns the delimiter, whether it was written without any quoting, and where it ends.
+fn marker_word(characters: &[(usize, char)], from: usize) -> (String, bool, usize) {
+    let mut marker = String::new();
+    let mut expands = true;
+    let mut index = from;
+    while let Some((_, character)) = characters.get(index) {
+        match character {
+            '\\' => {
+                expands = false;
+                match characters.get(index + 1) {
+                    Some((_, following)) => {
+                        marker.push(*following);
+                        index += 2;
+                    }
+                    None => index += 1,
+                }
+            }
+            '\'' | '"' => {
+                let quote = *character;
+                expands = false;
+                index += 1;
+                while let Some((_, inside)) = characters.get(index) {
+                    index += 1;
+                    if *inside == quote {
+                        break;
+                    }
+                    marker.push(*inside);
+                }
+            }
+            ';' | '&' | '|' | '<' | '>' | '(' | ')' => break,
+            character if character.is_whitespace() => break,
+            character => {
+                marker.push(*character);
+                index += 1;
+            }
+        }
+    }
+    (marker, expands, index)
+}
+
+/// Returns what follows one here-document's body.
+fn skip_body<'a>(text: &'a str, document: &HereDocument) -> &'a str {
+    let mut rest = text;
+    while !rest.is_empty() {
+        let (line, after) = match rest.find('\n') {
+            Some(at) => (rest[..at].to_owned(), &rest[at + 1..]),
+            None => (rest.to_owned(), ""),
+        };
+        let mut line = line;
+        let mut after = after;
+        // An unquoted delimiter leaves the body expanded, and there a backslash before the newline
+        // joins the two lines before the delimiter is looked for at all.
+        while document.expands && continues(&line) {
+            line.pop();
+            match after.find('\n') {
+                Some(at) => {
+                    line.push_str(&after[..at]);
+                    after = &after[at + 1..];
+                }
+                None => {
+                    line.push_str(after);
+                    after = "";
+                    break;
+                }
+            }
+        }
+        let ends = if document.strip_tabs {
+            line.trim_start_matches('\t') == document.marker
+        } else {
+            line == document.marker
+        };
+        rest = after;
+        if ends {
+            return rest;
+        }
+    }
+    ""
+}
+
+/// Returns whether a line carries on to the next one.
+fn continues(line: &str) -> bool {
+    // An odd number of trailing backslashes is a continuation; an even number is that many
+    // backslashes, each quoting the one before it.
+    line.chars().rev().take_while(|byte| *byte == '\\').count() % 2 == 1
 }
 
 /// Returns whether a word assigns a variable in front of a command, such as `LANG=C`.
@@ -449,99 +640,13 @@ fn assigns(word: &str) -> bool {
         && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
-/// Returns whether one line of a login file sources `.bashrc`.
+/// Returns whether one command runs `.bashrc`.
 ///
 /// The shape is a `source` or `.` command whose next word is a path ending in `.bashrc`, wherever
-/// on the line it appears: a login file writes it inside a test, after a `then`, behind a `&&`.
-/// A line that merely contains the name, in a comment, in a message or in a variable nothing
-/// reads, is not a line that runs it, and treating it as one would leave a login shell with no
-/// entry.
-fn sources_bashrc(line: &str) -> bool {
-    /// One word of a line, and what the scanner knows about it.
-    struct Word {
-        text: String,
-        /// Whether any of it was inside quotes, which makes it an argument rather than a verb.
-        quoted: bool,
-        /// Whether it stands where a command name stands.
-        command_position: bool,
-    }
-
-    let line = line.trim();
-    let mut words: Vec<Word> = Vec::new();
-    let mut text = String::new();
-    let mut quoted = false;
-    let mut quote = '\0';
-    let mut escaped = false;
-    let mut any_quoted = false;
-    let mut started = false;
-    // A line begins at a command, and so does whatever follows a separator or one of the keywords
-    // that introduce one. Everything else is an argument.
-    let mut command_position = true;
-    let mut next_command_position = true;
-    let mut finish = |text: &mut String, any_quoted: &mut bool, started: &mut bool, at: bool| {
-        if !*started {
-            return;
-        }
-        words.push(Word {
-            text: std::mem::take(text),
-            quoted: *any_quoted,
-            command_position: at,
-        });
-        *any_quoted = false;
-        *started = false;
-    };
-    for character in line.chars() {
-        if escaped {
-            text.push(character);
-            started = true;
-            escaped = false;
-            continue;
-        }
-        if quoted {
-            // A backslash inside double quotes escapes; inside single quotes nothing does.
-            if character == '\\' && quote == '"' {
-                escaped = true;
-            } else if character == quote {
-                quoted = false;
-            } else {
-                text.push(character);
-            }
-            continue;
-        }
-        match character {
-            '\\' => {
-                escaped = true;
-                started = true;
-                next_command_position = false;
-            }
-            '\'' | '"' => {
-                quoted = true;
-                quote = character;
-                any_quoted = true;
-                started = true;
-                // A word has begun, so the next one is an argument. `"echo" source ~/.bashrc`
-                // passes `source` to `echo`.
-                next_command_position = false;
-            }
-            // A comment begins at a `#` that begins a word, and ends the command.
-            '#' if !started => break,
-            ';' | '&' | '|' => {
-                finish(&mut text, &mut any_quoted, &mut started, command_position);
-                command_position = true;
-                next_command_position = true;
-            }
-            character if character.is_whitespace() => {
-                finish(&mut text, &mut any_quoted, &mut started, command_position);
-                command_position = next_command_position;
-            }
-            character => {
-                text.push(character);
-                started = true;
-                next_command_position = false;
-            }
-        }
-    }
-    finish(&mut text, &mut any_quoted, &mut started, command_position);
+/// in the command it stands: a login file writes it inside a test, after a `then`, behind a `&&`.
+/// A word that merely contains the name, in a message or in a variable nothing reads, is not a
+/// command that runs it, and treating it as one would leave a login shell with no entry.
+fn sources(words: &[Word]) -> bool {
     // A word that stands where a command stands and introduces one leaves the next word standing
     // there too: `if [ -f ~/.bashrc ]; then . ~/.bashrc; fi` sources it.
     let mut at_command = true;
@@ -556,8 +661,8 @@ fn sources_bashrc(line: &str) -> bool {
                 word.text.as_str(),
                 "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "!"
             );
-        // An assignment in front of a command is that command's environment, not a command of
-        // its own: `LANG=C source ~/.bashrc` runs `source`.
+        // An assignment in front of a command is that command's environment rather than a command
+        // of its own: `LANG=C source ~/.bashrc` runs `source`.
         let assignment = here && !word.quoted && assigns(&word.text);
         if here && !word.quoted && !introduces && !assignment {
             verbs.push(index);
@@ -1090,35 +1195,66 @@ mod tests {
         assert_eq!(targets[1].path, root.path().join(".bash_profile"));
     }
 
+    /// Login files that name `.bashrc` without running it.
+    const MENTIONS: &[&str] = &[
+        "# this used to source ~/.bashrc; it does not any more\n",
+        "echo 'see .bashrc for the aliases'\n",
+        "BASHRC=~/.bashrc\n",
+        "# . ~/.bashrc\n",
+        "export EDITOR=vim # source ~/.bashrc\n",
+        "PS1='> ' ## . ~/.bashrc\n",
+        "echo \"please source ~/.bashrc\"\n",
+        "echo 'run . ~/.bashrc yourself'\n",
+        "echo source ~/.bashrc\n",
+        "echo \"please \\\" source ~/.bashrc\"\n",
+        "printf '%s\\n' source ~/.bashrc\n",
+        "echo if source ~/.bashrc\n",
+        "\"echo\" source ~/.bashrc\n",
+        "cat <<EOF\nsource ~/.bashrc\nEOF\n",
+        // `<<-` strips leading tabs from the delimiter and nothing else, so a line that
+        // begins with a space is body rather than the end of one.
+        ": <<-EOF\n EOF\nsource ~/.bashrc\nEOF\n",
+        "cat <<'END HERE'\nsource ~/.bashrc\nEND HERE\n",
+        // A backslash quotes the delimiter too, so `<<\\EOF` ends at `EOF`.
+        "cat <<\\EOF\nsource ~/.bashrc\nEOF\n",
+        "cat <<ONE <<TWO\nsource ~/.bashrc\nONE\n. ~/.bashrc\nTWO\n",
+        "echo \\\nsource ~/.bashrc\n",
+        // A here-document whose delimiter is empty ends at the first empty line.
+        ": <<''\nsource ~/.bashrc\n\n",
+        // An unquoted delimiter leaves its body expanded, so `x\` and the line after it make
+        // `xEOF` rather than the end of the body.
+        ": <<EOF\nx\\\nEOF\nsource ~/.bashrc\nEOF\n",
+        // A quoted message can hold newlines, and what is inside one is a message.
+        "echo \"a message\nsource ~/.bashrc\"\n",
+        // A backslash before a newline joins the lines with nothing between them, so this
+        // names a command called `source~/.bashrc`.
+        "source\\\n~/.bashrc\n",
+    ];
+
+    /// Login files that run `.bashrc`.
+    const SOURCES: &[&str] = &[
+        ". ~/.bashrc\n",
+        "source ~/.bashrc\n",
+        "[ -f ~/.bashrc ] && source \"$HOME/.bashrc\"\n",
+        "export PATH=/opt:$PATH; . /home/someone/.bashrc\n",
+        "if [ -r ~/.bashrc ]; then . ~/.bashrc; fi\n",
+        // A here-document that ends leaves the commands after it commands again.
+        "cat <<EOF\nnothing\nEOF\n. ~/.bashrc\n",
+        // A here-string opens no body at all.
+        "cat <<<'x'\n. ~/.bashrc\n",
+        // An assignment in front of a command leaves the command where a command stands.
+        "LANG=C source ~/.bashrc\n",
+        // A substitution runs the command inside it.
+        "OUT=$(source ~/.bashrc)\n",
+        "OUT=`source ~/.bashrc`\n",
+    ];
+
     /// KR-REQ-07.30: only a login file that actually runs `.bashrc` counts as one that does.
     #[test]
     fn a_login_file_that_only_mentions_bashrc_still_gets_its_own_entry() {
         let root = tempfile::tempdir().expect("a directory");
         let home = layout(root.path());
-        for mentions in [
-            "# this used to source ~/.bashrc; it does not any more\n",
-            "echo 'see .bashrc for the aliases'\n",
-            "BASHRC=~/.bashrc\n",
-            "# . ~/.bashrc\n",
-            "export EDITOR=vim # source ~/.bashrc\n",
-            "PS1='> ' ## . ~/.bashrc\n",
-            "echo \"please source ~/.bashrc\"\n",
-            "echo 'run . ~/.bashrc yourself'\n",
-            "echo source ~/.bashrc\n",
-            "echo \"please \\\" source ~/.bashrc\"\n",
-            "printf '%s\\n' source ~/.bashrc\n",
-            "echo if source ~/.bashrc\n",
-            "\"echo\" source ~/.bashrc\n",
-            "cat <<EOF\nsource ~/.bashrc\nEOF\n",
-            // `<<-` strips leading tabs from the delimiter and nothing else, so a line that
-            // begins with a space is body rather than the end of one.
-            ": <<-EOF\n EOF\nsource ~/.bashrc\nEOF\n",
-            "cat <<'END HERE'\nsource ~/.bashrc\nEND HERE\n",
-            // A backslash quotes the delimiter too, so `<<\\EOF` ends at `EOF`.
-            "cat <<\\EOF\nsource ~/.bashrc\nEOF\n",
-            "cat <<ONE <<TWO\nsource ~/.bashrc\nONE\n. ~/.bashrc\nTWO\n",
-            "echo \\\nsource ~/.bashrc\n",
-        ] {
+        for mentions in MENTIONS {
             std::fs::write(root.path().join(".bash_profile"), mentions).expect("writes");
             assert_eq!(
                 home.targets(ShellKind::Bash).len(),
@@ -1127,19 +1263,7 @@ mod tests {
                  {mentions:?}"
             );
         }
-        for sources in [
-            ". ~/.bashrc\n",
-            "source ~/.bashrc\n",
-            "[ -f ~/.bashrc ] && source \"$HOME/.bashrc\"\n",
-            "export PATH=/opt:$PATH; . /home/someone/.bashrc\n",
-            "if [ -r ~/.bashrc ]; then . ~/.bashrc; fi\n",
-            // A here-document that ends leaves the commands after it commands again.
-            "cat <<EOF\nnothing\nEOF\n. ~/.bashrc\n",
-            // A here-string opens no body at all.
-            "cat <<<'x'\n. ~/.bashrc\n",
-            // An assignment in front of a command leaves the command where a command stands.
-            "LANG=C source ~/.bashrc\n",
-        ] {
+        for sources in SOURCES {
             std::fs::write(root.path().join(".bash_profile"), sources).expect("writes");
             assert_eq!(
                 home.targets(ShellKind::Bash).len(),
@@ -1147,6 +1271,79 @@ mod tests {
                 "a login file that runs .bashrc needs no entry of its own: {sources:?}"
             );
         }
+    }
+
+    /// KR-REQ-07.30: what this host reads as a call is one Bash itself makes.
+    ///
+    /// The scanner is allowed to miss a call, which costs one guarded entry nothing reads twice.
+    /// It is not allowed to see one that is not there, because that leaves a login shell with no
+    /// integration at all. That direction is checked against the shell rather than against this
+    /// host's reading of it.
+    #[cfg(unix)]
+    #[test]
+    fn nothing_reads_as_a_call_bash_does_not_make() {
+        let bash = Path::new("/bin/bash");
+        if !bash.exists() {
+            eprintln!("skipped: this host has no /bin/bash to compare the scanner against");
+            return;
+        }
+        for text in MENTIONS.iter().chain(SOURCES) {
+            let scanned = runs_bashrc(text);
+            if !scanned {
+                continue;
+            }
+            assert!(
+                bash_sources_bashrc(bash, text),
+                "this host reads a call Bash does not make, so a login shell would get no entry: \
+                 {text:?}"
+            );
+        }
+    }
+
+    /// Runs one login file under Bash with a home of its own and reports whether `.bashrc` ran.
+    #[cfg(unix)]
+    fn bash_sources_bashrc(bash: &Path, text: &str) -> bool {
+        let home = tempfile::Builder::new()
+            .prefix("kr-bash-home-")
+            .tempdir()
+            .expect("a home directory");
+        let ran = home.path().join("ran");
+        std::fs::write(
+            home.path().join(".bashrc"),
+            format!(": > {}\n", ran.display()),
+        )
+        .expect("writes a .bashrc");
+        let script = home.path().join("login");
+        // One case names an absolute path rather than the home directory, so that the scanner is
+        // read on both shapes. Here it is pointed at this run's own home, or the shell would find
+        // nothing to source and every reading of it would look like a miss.
+        let text = text.replace("/home/someone", &home.path().display().to_string());
+        std::fs::write(&script, &text).expect("writes a login file");
+        let mut child = std::process::Command::new(bash)
+            .arg(&script)
+            .env("HOME", home.path())
+            .current_dir(home.path())
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("runs the login file");
+        // Bounded, because a login file that waits for something would otherwise wait for ever.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => break,
+                Ok(None) => {}
+                Err(_) => break,
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        ran.exists()
     }
 
     /// KR-REQ-07.40: two writers of one startup file do not interleave, whichever process each
