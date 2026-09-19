@@ -32,6 +32,7 @@ use crate::ids::{
 };
 use crate::rights::ActionRight;
 use crate::scalars::{Digest256, Nullable, TimestampMs, U64};
+use crate::session::Durability;
 
 /// How many methods one declarative or rich table may classify.
 ///
@@ -705,40 +706,8 @@ pub fn check_transition(from: PendingState, to: PendingState) -> Result<(), Arbi
 }
 
 // ---------------------------------------------------------------------------------------------
-// Durability and volatile-native mode
+// Volatile-native mode
 // ---------------------------------------------------------------------------------------------
-
-/// Whether a record survives this process.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Durability {
-    /// Committed to the journal before it was acted on.
-    Durable,
-    /// Held in the worker's memory only, because the journal could not take it.
-    Volatile,
-}
-
-impl Durability {
-    /// Every value, in declaration order.
-    pub const ALL: &'static [Self] = &[Self::Durable, Self::Volatile];
-
-    /// Returns the stable wire string.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Durable => "durable",
-            Self::Volatile => "volatile",
-        }
-    }
-}
-
-impl fmt::Display for Durability {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
 
 /// What the gateway is currently able to do.
 #[derive(

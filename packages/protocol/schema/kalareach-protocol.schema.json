@@ -3372,31 +3372,6 @@
       "description": "The opaque token that lets one verified source poll or cancel its own question.\n\nIt is not authority over a session and it is not an answer: it permits exactly the two reads\nand the one cancellation that belong to the question it was issued for, and only from the same\nverified application. Section 11 keeps it out of events, push payloads, backups and logs, so\nthis type prints as a redaction and carries no `Display`."
     },
     "CapabilityEvidenceSource": {
-      "description": "Where a capability record came from.",
-      "oneOf": [
-        {
-          "const": "host_probe",
-          "description": "A bounded, disclosed probe with declared effects, run by the host.",
-          "type": "string"
-        },
-        {
-          "const": "live_binding",
-          "description": "A live binding that performed the operation here.",
-          "type": "string"
-        },
-        {
-          "const": "signed_record",
-          "description": "A signed compatibility record shipped in a catalogue.\n\nEvidence about a version. Never proof that this host has permission or a live binding.",
-          "type": "string"
-        },
-        {
-          "const": "package_declaration",
-          "description": "The package's own declaration, believed only for a negative state.",
-          "type": "string"
-        }
-      ]
-    },
-    "CapabilityEvidenceSource2": {
       "description": "What produced a capability answer.",
       "oneOf": [
         {
@@ -3500,46 +3475,6 @@
       "description": "What makes a capability record stale.",
       "oneOf": [
         {
-          "const": "binary_changed",
-          "description": "The tested binary changed.",
-          "type": "string"
-        },
-        {
-          "const": "binding_changed",
-          "description": "The active binding changed.",
-          "type": "string"
-        },
-        {
-          "const": "schema_changed",
-          "description": "The upstream schema or protocol version changed.",
-          "type": "string"
-        },
-        {
-          "const": "os_permission_changed",
-          "description": "An operating-system permission changed.",
-          "type": "string"
-        },
-        {
-          "const": "desktop_generation_changed",
-          "description": "The desktop session generation changed.",
-          "type": "string"
-        },
-        {
-          "const": "qualification_profile_changed",
-          "description": "The signed qualification profile in the catalogue changed.",
-          "type": "string"
-        },
-        {
-          "const": "launch_profile_changed",
-          "description": "The host's own launch profile changed.\n\nSeparate from the catalogue's qualification profile, because a record gathered under one\nargument vector says nothing about another and neither implies the other changed.",
-          "type": "string"
-        }
-      ]
-    },
-    "CapabilityInvalidation2": {
-      "description": "What makes a capability record stale.",
-      "oneOf": [
-        {
           "const": "binary_identity",
           "description": "The probed binary changed.",
           "type": "string"
@@ -3578,7 +3513,7 @@
         "records": {
           "description": "The records, ordered by capability so the map encodes deterministically.",
           "items": {
-            "$ref": "#/$defs/CapabilityRecord"
+            "$ref": "#/$defs/InstanceCapabilityRecord"
           },
           "type": "array"
         }
@@ -3589,76 +3524,6 @@
       "type": "object"
     },
     "CapabilityRecord": {
-      "additionalProperties": false,
-      "description": "One capability record the worker keeps for dispatch.\n\nThe host owns the current evidence; a worker keeps the subset its dispatch decisions need. The\nrecord carries its own invalidation triggers so a worker can decide staleness without asking.",
-      "properties": {
-        "application_instance_id": {
-          "$ref": "#/$defs/ApplicationInstanceId",
-          "description": "The application instance the record is about."
-        },
-        "capability_id": {
-          "$ref": "#/$defs/CapabilityId",
-          "description": "The versioned capability this record is about."
-        },
-        "capability_version": {
-          "description": "The version of that capability the record is about.",
-          "type": "string"
-        },
-        "disabled_reason": {
-          "anyOf": [
-            {
-              "type": "string"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The user-facing reason, required whenever the state is not usable."
-        },
-        "identity": {
-          "$ref": "#/$defs/CapabilitySubjectIdentity",
-          "description": "The exact identity the evidence was gathered against."
-        },
-        "invalidated_by": {
-          "description": "What makes it stale.",
-          "items": {
-            "$ref": "#/$defs/CapabilityInvalidation"
-          },
-          "type": "array",
-          "uniqueItems": true
-        },
-        "observed_at": {
-          "$ref": "#/$defs/TimestampMs",
-          "description": "When the record was gathered."
-        },
-        "revision": {
-          "$ref": "#/$defs/CapabilityRevision",
-          "description": "The current revision of this record. Every action rechecks it."
-        },
-        "source": {
-          "$ref": "#/$defs/CapabilityEvidenceSource",
-          "description": "Where the record came from."
-        },
-        "state": {
-          "$ref": "#/$defs/CapabilityState",
-          "description": "The current state."
-        }
-      },
-      "required": [
-        "capability_id",
-        "capability_version",
-        "application_instance_id",
-        "identity",
-        "revision",
-        "state",
-        "source",
-        "invalidated_by",
-        "disabled_reason",
-        "observed_at"
-      ],
-      "type": "object"
-    },
-    "CapabilityRecord2": {
       "additionalProperties": false,
       "description": "One capability, one subject, one answer.\n\nThis is the shared section 11 record. Capability evidence describes feasibility and never\ncreates authority: every action still checks its grant, and it rechecks this record's revision\nindependently.",
       "properties": {
@@ -3678,7 +3543,7 @@
           "description": "What a person is told when the capability is not available."
         },
         "evidence_source": {
-          "$ref": "#/$defs/CapabilityEvidenceSource2",
+          "$ref": "#/$defs/CapabilityEvidenceSource",
           "description": "What produced the answer."
         },
         "identity": {
@@ -3688,7 +3553,7 @@
         "invalidation": {
           "description": "What makes this record stale, in the order it is written.",
           "items": {
-            "$ref": "#/$defs/CapabilityInvalidation2"
+            "$ref": "#/$defs/CapabilityInvalidation"
           },
           "type": "array"
         },
@@ -3701,7 +3566,7 @@
           "description": "This record's revision. An action binds to it and rechecks it."
         },
         "state": {
-          "$ref": "#/$defs/CapabilityState2",
+          "$ref": "#/$defs/CapabilityState",
           "description": "What the capability can currently do."
         },
         "subject": {
@@ -3771,46 +3636,6 @@
       "type": "string"
     },
     "CapabilityState": {
-      "description": "What is currently known about one capability on this host.",
-      "oneOf": [
-        {
-          "const": "qualified_available",
-          "description": "Qualified here and available now.",
-          "type": "string"
-        },
-        {
-          "const": "version_qualified",
-          "description": "This version was qualified, and nothing has established that this host can use it.\n\nA signed compatibility record establishes this and never [`CapabilityState::QualifiedAvailable`]:\nit is evidence about a version, not about this host's permission or live binding.",
-          "type": "string"
-        },
-        {
-          "const": "missing_installation",
-          "description": "The software that would provide it is not installed.",
-          "type": "string"
-        },
-        {
-          "const": "permission_required",
-          "description": "An operating-system permission is needed first.",
-          "type": "string"
-        },
-        {
-          "const": "incompatible",
-          "description": "The installed version cannot provide it.",
-          "type": "string"
-        },
-        {
-          "const": "temporarily_unavailable",
-          "description": "It normally works here and does not at the moment.",
-          "type": "string"
-        },
-        {
-          "const": "not_tested",
-          "description": "Nothing has established either way.",
-          "type": "string"
-        }
-      ]
-    },
-    "CapabilityState2": {
       "description": "What one capability can currently do.",
       "oneOf": [
         {
@@ -3904,147 +3729,6 @@
         "session_id",
         "application",
         "terminal"
-      ],
-      "type": "object"
-    },
-    "CapabilitySubjectIdentity": {
-      "additionalProperties": false,
-      "description": "The exact identity one capability record was gathered against.\n\nNaming the identity rather than the product is what lets an installed upgrade leave a running\nprocess's pinned evidence alone.",
-      "properties": {
-        "binary_digest": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Digest256"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The digest of the tested binary."
-        },
-        "binding_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/BrokerBindingId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The binding the evidence was gathered through."
-        },
-        "binding_revision": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/AgentBindingRevision"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The agent binding revision it was gathered at.\n\nA binding identifier alone names the binding, not the conversation it was bound to when the\nevidence was taken, and a thread selection changes what the upstream can do."
-        },
-        "desktop_generation": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/U64"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The desktop session generation the evidence is bound to."
-        },
-        "os_permission_held": {
-          "anyOf": [
-            {
-              "type": "boolean"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "Whether the operating-system permission the capability needs was held."
-        },
-        "package_digest": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Digest256"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The digest of that package's bytes."
-        },
-        "plugin_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PluginId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The package the evidence is about, where it is about one."
-        },
-        "profile_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/LaunchProfileId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The host's launch profile the evidence was gathered under."
-        },
-        "publisher_id": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/PublisherId"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The publisher whose signed record supplied the evidence, where one did."
-        },
-        "qualification_profile_digest": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Digest256"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The digest of the signed qualification profile the evidence came from, where one did."
-        },
-        "schema_version": {
-          "anyOf": [
-            {
-              "$ref": "#/$defs/MethodTableVersionText"
-            },
-            {
-              "type": "null"
-            }
-          ],
-          "description": "The upstream schema or protocol version the evidence is about."
-        }
-      },
-      "required": [
-        "binary_digest",
-        "schema_version",
-        "plugin_id",
-        "package_digest",
-        "publisher_id",
-        "qualification_profile_digest",
-        "profile_id",
-        "binding_id",
-        "binding_revision",
-        "desktop_generation",
-        "os_permission_held"
       ],
       "type": "object"
     },
@@ -6999,7 +6683,7 @@
         "records": {
           "description": "The records, ordered by capability name.",
           "items": {
-            "$ref": "#/$defs/CapabilityRecord2"
+            "$ref": "#/$defs/CapabilityRecord"
           },
           "type": "array"
         }
@@ -8781,21 +8465,6 @@
         {
           "const": "volatile",
           "description": "The journal was unavailable, so the result used current in-memory authority and identities.\nStorage failure must not prevent an authorised stop; the response says so outright.",
-          "type": "string"
-        }
-      ]
-    },
-    "Durability2": {
-      "description": "Whether a record survives this process.",
-      "oneOf": [
-        {
-          "const": "durable",
-          "description": "Committed to the journal before it was acted on.",
-          "type": "string"
-        },
-        {
-          "const": "volatile",
-          "description": "Held in the worker's memory only, because the journal could not take it.",
           "type": "string"
         }
       ]
@@ -12597,6 +12266,322 @@
         "actual_digest"
       ],
       "type": "object"
+    },
+    "InstanceCapabilityIdentity": {
+      "additionalProperties": false,
+      "description": "The exact identity one capability record was gathered against.\n\nNaming the identity rather than the product is what lets an installed upgrade leave a running\nprocess's pinned evidence alone.",
+      "properties": {
+        "binary_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of the tested binary."
+        },
+        "binding_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BrokerBindingId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The binding the evidence was gathered through."
+        },
+        "binding_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentBindingRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The agent binding revision it was gathered at.\n\nA binding identifier alone names the binding, not the conversation it was bound to when the\nevidence was taken, and a thread selection changes what the upstream can do."
+        },
+        "desktop_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The desktop session generation the evidence is bound to."
+        },
+        "os_permission_held": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether the operating-system permission the capability needs was held."
+        },
+        "package_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of that package's bytes."
+        },
+        "plugin_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PluginId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The package the evidence is about, where it is about one."
+        },
+        "profile_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchProfileId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The host's launch profile the evidence was gathered under."
+        },
+        "publisher_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PublisherId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The publisher whose signed record supplied the evidence, where one did."
+        },
+        "qualification_profile_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of the signed qualification profile the evidence came from, where one did."
+        },
+        "schema_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MethodTableVersionText"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The upstream schema or protocol version the evidence is about."
+        }
+      },
+      "required": [
+        "binary_digest",
+        "schema_version",
+        "plugin_id",
+        "package_digest",
+        "publisher_id",
+        "qualification_profile_digest",
+        "profile_id",
+        "binding_id",
+        "binding_revision",
+        "desktop_generation",
+        "os_permission_held"
+      ],
+      "type": "object"
+    },
+    "InstanceCapabilityRecord": {
+      "additionalProperties": false,
+      "description": "One capability record the worker keeps for dispatch.\n\nThe host owns the current evidence; a worker keeps the subset its dispatch decisions need. The\nrecord carries its own invalidation triggers so a worker can decide staleness without asking.",
+      "properties": {
+        "application_instance_id": {
+          "$ref": "#/$defs/ApplicationInstanceId",
+          "description": "The application instance the record is about."
+        },
+        "capability_id": {
+          "$ref": "#/$defs/CapabilityId",
+          "description": "The versioned capability this record is about."
+        },
+        "capability_version": {
+          "description": "The version of that capability the record is about.",
+          "type": "string"
+        },
+        "disabled_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The user-facing reason, required whenever the state is not usable."
+        },
+        "identity": {
+          "$ref": "#/$defs/InstanceCapabilityIdentity",
+          "description": "The exact identity the evidence was gathered against."
+        },
+        "invalidated_by": {
+          "description": "What makes it stale.",
+          "items": {
+            "$ref": "#/$defs/InstanceInvalidation"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "observed_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the record was gathered."
+        },
+        "revision": {
+          "$ref": "#/$defs/CapabilityRevision",
+          "description": "The current revision of this record. Every action rechecks it."
+        },
+        "source": {
+          "$ref": "#/$defs/InstanceEvidenceSource",
+          "description": "Where the record came from."
+        },
+        "state": {
+          "$ref": "#/$defs/InstanceCapabilityState",
+          "description": "The current state."
+        }
+      },
+      "required": [
+        "capability_id",
+        "capability_version",
+        "application_instance_id",
+        "identity",
+        "revision",
+        "state",
+        "source",
+        "invalidated_by",
+        "disabled_reason",
+        "observed_at"
+      ],
+      "type": "object"
+    },
+    "InstanceCapabilityState": {
+      "description": "What is currently known about one capability on this host.",
+      "oneOf": [
+        {
+          "const": "qualified_available",
+          "description": "Qualified here and available now.",
+          "type": "string"
+        },
+        {
+          "const": "version_qualified",
+          "description": "This version was qualified, and nothing has established that this host can use it.\n\nA signed compatibility record establishes this and never [`InstanceCapabilityState::QualifiedAvailable`]:\nit is evidence about a version, not about this host's permission or live binding.",
+          "type": "string"
+        },
+        {
+          "const": "missing_installation",
+          "description": "The software that would provide it is not installed.",
+          "type": "string"
+        },
+        {
+          "const": "permission_required",
+          "description": "An operating-system permission is needed first.",
+          "type": "string"
+        },
+        {
+          "const": "incompatible",
+          "description": "The installed version cannot provide it.",
+          "type": "string"
+        },
+        {
+          "const": "temporarily_unavailable",
+          "description": "It normally works here and does not at the moment.",
+          "type": "string"
+        },
+        {
+          "const": "not_tested",
+          "description": "Nothing has established either way.",
+          "type": "string"
+        }
+      ]
+    },
+    "InstanceEvidenceSource": {
+      "description": "Where a capability record came from.",
+      "oneOf": [
+        {
+          "const": "host_probe",
+          "description": "A bounded, disclosed probe with declared effects, run by the host.",
+          "type": "string"
+        },
+        {
+          "const": "live_binding",
+          "description": "A live binding that performed the operation here.",
+          "type": "string"
+        },
+        {
+          "const": "signed_record",
+          "description": "A signed compatibility record shipped in a catalogue.\n\nEvidence about a version. Never proof that this host has permission or a live binding.",
+          "type": "string"
+        },
+        {
+          "const": "package_declaration",
+          "description": "The package's own declaration, believed only for a negative state.",
+          "type": "string"
+        }
+      ]
+    },
+    "InstanceInvalidation": {
+      "description": "What makes a capability record stale.",
+      "oneOf": [
+        {
+          "const": "binary_changed",
+          "description": "The tested binary changed.",
+          "type": "string"
+        },
+        {
+          "const": "binding_changed",
+          "description": "The active binding changed.",
+          "type": "string"
+        },
+        {
+          "const": "schema_changed",
+          "description": "The upstream schema or protocol version changed.",
+          "type": "string"
+        },
+        {
+          "const": "os_permission_changed",
+          "description": "An operating-system permission changed.",
+          "type": "string"
+        },
+        {
+          "const": "desktop_generation_changed",
+          "description": "The desktop session generation changed.",
+          "type": "string"
+        },
+        {
+          "const": "qualification_profile_changed",
+          "description": "The signed qualification profile in the catalogue changed.",
+          "type": "string"
+        },
+        {
+          "const": "launch_profile_changed",
+          "description": "The host's own launch profile changed.\n\nSeparate from the catalogue's qualification profile, because a record gathered under one\nargument vector says nothing about another and neither implies the other changed.",
+          "type": "string"
+        }
+      ]
     },
     "IntegrationMode": {
       "description": "How a launched application is integrated.",
@@ -16459,7 +16444,7 @@
           "description": "The upstream's own deadline, where it stated one."
         },
         "durability": {
-          "$ref": "#/$defs/Durability2",
+          "$ref": "#/$defs/Durability",
           "description": "Whether the record of this resource is durable or only in memory."
         },
         "interpretation_verified": {
@@ -24672,7 +24657,7 @@
         "capabilities": {
           "description": "What this host can currently do, as the shared section 11 evidence.",
           "items": {
-            "$ref": "#/$defs/CapabilityRecord2"
+            "$ref": "#/$defs/CapabilityRecord"
           },
           "type": "array"
         },
@@ -28080,7 +28065,7 @@
       "$ref": "#/$defs/CapabilityMap"
     },
     "capability_record": {
-      "$ref": "#/$defs/CapabilityRecord2"
+      "$ref": "#/$defs/CapabilityRecord"
     },
     "capture_count": {
       "$ref": "#/$defs/CaptureCount"
@@ -28680,7 +28665,7 @@
       "$ref": "#/$defs/InstalledFile"
     },
     "instance_capability_record": {
-      "$ref": "#/$defs/CapabilityRecord"
+      "$ref": "#/$defs/InstanceCapabilityRecord"
     },
     "invitation_preview": {
       "$ref": "#/$defs/InvitationPreview"

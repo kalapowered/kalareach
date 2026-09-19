@@ -43,8 +43,8 @@ use crate::attention::{
 };
 use crate::authority::MethodEntry;
 use crate::broker::{
-    ActionToken, ActionTokenClaim, CapabilityMap, CapabilityRecord as InstanceCapabilityRecord,
-    DecoderLedgerEntry, DecodingTrust, LaunchProfile,
+    ActionToken, ActionTokenClaim, CapabilityMap, DecoderLedgerEntry, DecodingTrust,
+    InstanceCapabilityRecord, LaunchProfile,
 };
 use crate::changeset::{
     CaptureCount, ChangeSetVersionRecord, ChangeSetVersionSummary, ChangesetCaptureParams,

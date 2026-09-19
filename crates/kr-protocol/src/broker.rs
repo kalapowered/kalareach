@@ -21,7 +21,7 @@
 //!   which of the three grants authorised the call, the application and thread revision it was
 //!   issued against, the declared action and the hash of the parameters. A callback can do what
 //!   that invocation permits and nothing else, and the token is spent once.
-//! * **Evidence is not permission.** A [`CapabilityRecord`] says what is known to work here, at
+//! * **Evidence is not permission.** A [`InstanceCapabilityRecord`] says what is known to work here, at
 //!   which exact identity, and what makes that knowledge stale. Every action rechecks its
 //!   capability revision and its grant separately, because one answers "can this be done" and the
 //!   other answers "may this actor do it".
@@ -959,12 +959,12 @@ pub enum LaunchRefusal {
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum CapabilityState {
+pub enum InstanceCapabilityState {
     /// Qualified here and available now.
     QualifiedAvailable,
     /// This version was qualified, and nothing has established that this host can use it.
     ///
-    /// A signed compatibility record establishes this and never [`CapabilityState::QualifiedAvailable`]:
+    /// A signed compatibility record establishes this and never [`InstanceCapabilityState::QualifiedAvailable`]:
     /// it is evidence about a version, not about this host's permission or live binding.
     VersionQualified,
     /// The software that would provide it is not installed.
@@ -979,7 +979,7 @@ pub enum CapabilityState {
     NotTested,
 }
 
-impl CapabilityState {
+impl InstanceCapabilityState {
     /// Every state, in declaration order.
     pub const ALL: &'static [Self] = &[
         Self::QualifiedAvailable,
@@ -1012,7 +1012,7 @@ impl CapabilityState {
     }
 }
 
-impl fmt::Display for CapabilityState {
+impl fmt::Display for InstanceCapabilityState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
@@ -1023,7 +1023,7 @@ impl fmt::Display for CapabilityState {
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum CapabilityEvidenceSource {
+pub enum InstanceEvidenceSource {
     /// A bounded, disclosed probe with declared effects, run by the host.
     HostProbe,
     /// A live binding that performed the operation here.
@@ -1036,7 +1036,7 @@ pub enum CapabilityEvidenceSource {
     PackageDeclaration,
 }
 
-impl CapabilityEvidenceSource {
+impl InstanceEvidenceSource {
     /// Every source, in declaration order.
     pub const ALL: &'static [Self] = &[
         Self::HostProbe,
@@ -1075,7 +1075,7 @@ impl CapabilityEvidenceSource {
     }
 }
 
-impl fmt::Display for CapabilityEvidenceSource {
+impl fmt::Display for InstanceEvidenceSource {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
@@ -1086,7 +1086,7 @@ impl fmt::Display for CapabilityEvidenceSource {
     Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum CapabilityInvalidation {
+pub enum InstanceInvalidation {
     /// The tested binary changed.
     BinaryChanged,
     /// The active binding changed.
@@ -1106,7 +1106,7 @@ pub enum CapabilityInvalidation {
     LaunchProfileChanged,
 }
 
-impl CapabilityInvalidation {
+impl InstanceInvalidation {
     /// Every trigger, in declaration order.
     pub const ALL: &'static [Self] = &[
         Self::BinaryChanged,
@@ -1133,7 +1133,7 @@ impl CapabilityInvalidation {
     }
 }
 
-impl fmt::Display for CapabilityInvalidation {
+impl fmt::Display for InstanceInvalidation {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
@@ -1145,7 +1145,7 @@ impl fmt::Display for CapabilityInvalidation {
 /// process's pinned evidence alone.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub struct CapabilitySubjectIdentity {
+pub struct InstanceCapabilityIdentity {
     /// The digest of the tested binary.
     pub binary_digest: Nullable<Digest256>,
     /// The upstream schema or protocol version the evidence is about.
@@ -1173,7 +1173,7 @@ pub struct CapabilitySubjectIdentity {
     pub os_permission_held: Nullable<bool>,
 }
 
-impl Default for CapabilitySubjectIdentity {
+impl Default for InstanceCapabilityIdentity {
     fn default() -> Self {
         Self {
             binary_digest: Nullable::null(),
@@ -1204,7 +1204,7 @@ pub struct MethodTableVersionText(pub String);
 /// record carries its own invalidation triggers so a worker can decide staleness without asking.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
-pub struct CapabilityRecord {
+pub struct InstanceCapabilityRecord {
     /// The versioned capability this record is about.
     pub capability_id: CapabilityId,
     /// The version of that capability the record is about.
@@ -1212,22 +1212,22 @@ pub struct CapabilityRecord {
     /// The application instance the record is about.
     pub application_instance_id: ApplicationInstanceId,
     /// The exact identity the evidence was gathered against.
-    pub identity: CapabilitySubjectIdentity,
+    pub identity: InstanceCapabilityIdentity,
     /// The current revision of this record. Every action rechecks it.
     pub revision: CapabilityRevision,
     /// The current state.
-    pub state: CapabilityState,
+    pub state: InstanceCapabilityState,
     /// Where the record came from.
-    pub source: CapabilityEvidenceSource,
+    pub source: InstanceEvidenceSource,
     /// What makes it stale.
-    pub invalidated_by: CanonicalSet<CapabilityInvalidation>,
+    pub invalidated_by: CanonicalSet<InstanceInvalidation>,
     /// The user-facing reason, required whenever the state is not usable.
     pub disabled_reason: Nullable<String>,
     /// When the record was gathered.
     pub observed_at: TimestampMs,
 }
 
-impl CapabilityRecord {
+impl InstanceCapabilityRecord {
     /// Checks the two rules a record must satisfy before the host stores it.
     ///
     /// # Errors
@@ -1241,7 +1241,7 @@ impl CapabilityRecord {
                 evidence_source: self.source,
             });
         }
-        if self.state == CapabilityState::VersionQualified
+        if self.state == InstanceCapabilityState::VersionQualified
             && !self.source.can_establish_version_qualified()
         {
             return Err(CapabilityError::DeclaredQualification);
@@ -1254,10 +1254,10 @@ impl CapabilityRecord {
         // A record that a changed qualification profile invalidates has to name the profile it
         // came from, whatever produced it: without that name there is nothing to compare a new
         // profile against, and the trigger could never fire.
-        if (self.source == CapabilityEvidenceSource::SignedRecord
+        if (self.source == InstanceEvidenceSource::SignedRecord
             || self
                 .invalidated_by
-                .contains(&CapabilityInvalidation::QualificationProfileChanged))
+                .contains(&InstanceInvalidation::QualificationProfileChanged))
             && !self.identity.qualification_profile_digest.is_present()
         {
             return Err(CapabilityError::MissingProfileIdentity);
@@ -1278,7 +1278,7 @@ impl CapabilityRecord {
 
     /// Returns true when this change invalidates the record.
     #[must_use]
-    pub fn invalidated_by(&self, change: CapabilityInvalidation) -> bool {
+    pub fn invalidated_by(&self, change: InstanceInvalidation) -> bool {
         self.invalidated_by.contains(&change)
     }
 }
@@ -1292,13 +1292,13 @@ pub enum CapabilityError {
     )]
     UnqualifiedSource {
         /// The source that overreached.
-        evidence_source: CapabilityEvidenceSource,
+        evidence_source: InstanceEvidenceSource,
     },
     /// An unusable state carried no reason.
     #[error("state {state} needs a user-facing disabled reason")]
     MissingReason {
         /// The state that carried none.
-        state: CapabilityState,
+        state: InstanceCapabilityState,
     },
     /// A package declaration claimed a version had been qualified.
     #[error("a package declaration cannot establish that a capability version was qualified")]
@@ -1336,20 +1336,20 @@ pub enum CapabilityError {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub struct CapabilityMap {
     /// The records, ordered by capability so the map encodes deterministically.
-    pub records: Vec<CapabilityRecord>,
+    pub records: Vec<InstanceCapabilityRecord>,
 }
 
 impl CapabilityMap {
     /// Returns the record for one capability, if the map holds one.
     #[must_use]
-    pub fn record(&self, capability: &CapabilityId) -> Option<&CapabilityRecord> {
+    pub fn record(&self, capability: &CapabilityId) -> Option<&InstanceCapabilityRecord> {
         self.records
             .iter()
             .find(|record| &record.capability_id == capability)
     }
 
     /// Returns the capabilities that are usable now.
-    pub fn usable(&self) -> impl Iterator<Item = &CapabilityRecord> {
+    pub fn usable(&self) -> impl Iterator<Item = &InstanceCapabilityRecord> {
         self.records
             .iter()
             .filter(|record| record.state.is_usable())
@@ -1364,8 +1364,8 @@ impl CapabilityMap {
     /// # Errors
     ///
     /// Returns [`CapabilityError::StaleUpdate`] when the offered revision is not newer than the
-    /// one held, and whatever [`CapabilityRecord::validate`] refuses.
-    pub fn upsert(&mut self, record: CapabilityRecord) -> Result<(), CapabilityError> {
+    /// one held, and whatever [`InstanceCapabilityRecord::validate`] refuses.
+    pub fn upsert(&mut self, record: InstanceCapabilityRecord) -> Result<(), CapabilityError> {
         record.validate()?;
         match self
             .records
@@ -1393,16 +1393,17 @@ impl CapabilityMap {
     /// running binding's record names the binding, and the change names the binary.
     pub fn invalidate(
         &mut self,
-        change: CapabilityInvalidation,
+        change: InstanceInvalidation,
         reason: &str,
         now: TimestampMs,
     ) -> usize {
         let mut affected = 0;
         for record in &mut self.records {
-            if record.invalidated_by.contains(&change) && record.state != CapabilityState::NotTested
+            if record.invalidated_by.contains(&change)
+                && record.state != InstanceCapabilityState::NotTested
             {
-                record.state = CapabilityState::NotTested;
-                record.source = CapabilityEvidenceSource::HostProbe;
+                record.state = InstanceCapabilityState::NotTested;
+                record.source = InstanceEvidenceSource::HostProbe;
                 record.disabled_reason = Nullable::some(reason.to_owned());
                 record.revision = CapabilityRevision::new(record.revision.get().saturating_add(1));
                 record.observed_at = now;
@@ -1516,17 +1517,15 @@ mod tests {
 
     #[test]
     fn a_signed_record_cannot_say_a_capability_works_here() {
-        let mut record = CapabilityRecord {
+        let mut record = InstanceCapabilityRecord {
             capability_id: CapabilityId::new("agent.prompt").expect("valid"),
             capability_version: "1".to_owned(),
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
-            identity: CapabilitySubjectIdentity::default(),
+            identity: InstanceCapabilityIdentity::default(),
             revision: CapabilityRevision::new(1),
-            state: CapabilityState::QualifiedAvailable,
-            source: CapabilityEvidenceSource::SignedRecord,
-            invalidated_by: [CapabilityInvalidation::BinaryChanged]
-                .into_iter()
-                .collect(),
+            state: InstanceCapabilityState::QualifiedAvailable,
+            source: InstanceEvidenceSource::SignedRecord,
+            invalidated_by: [InstanceInvalidation::BinaryChanged].into_iter().collect(),
             disabled_reason: Nullable::null(),
             observed_at: TimestampMs::new(1),
         };
@@ -1534,9 +1533,9 @@ mod tests {
             record.validate(),
             Err(CapabilityError::UnqualifiedSource { .. })
         ));
-        record.source = CapabilityEvidenceSource::HostProbe;
+        record.source = InstanceEvidenceSource::HostProbe;
         assert!(record.validate().is_ok());
-        record.state = CapabilityState::PermissionRequired;
+        record.state = InstanceCapabilityState::PermissionRequired;
         assert!(matches!(
             record.validate(),
             Err(CapabilityError::MissingReason { .. })
@@ -1546,45 +1545,41 @@ mod tests {
     #[test]
     fn an_upgrade_leaves_a_pinned_running_binding_alone() {
         let mut map = CapabilityMap::default();
-        map.upsert(CapabilityRecord {
+        map.upsert(InstanceCapabilityRecord {
             capability_id: CapabilityId::new("agent.prompt").expect("valid"),
             capability_version: "1".to_owned(),
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
-            identity: CapabilitySubjectIdentity {
+            identity: InstanceCapabilityIdentity {
                 binding_id: Nullable::some(BrokerBindingId::new(Uuid::from_bytes([9; 16]))),
-                ..CapabilitySubjectIdentity::default()
+                ..InstanceCapabilityIdentity::default()
             },
             revision: CapabilityRevision::new(1),
-            state: CapabilityState::QualifiedAvailable,
-            source: CapabilityEvidenceSource::LiveBinding,
-            invalidated_by: [CapabilityInvalidation::BindingChanged]
-                .into_iter()
-                .collect(),
+            state: InstanceCapabilityState::QualifiedAvailable,
+            source: InstanceEvidenceSource::LiveBinding,
+            invalidated_by: [InstanceInvalidation::BindingChanged].into_iter().collect(),
             disabled_reason: Nullable::null(),
             observed_at: TimestampMs::new(1),
         })
         .expect("a fresh record is accepted");
-        map.upsert(CapabilityRecord {
+        map.upsert(InstanceCapabilityRecord {
             capability_id: CapabilityId::new("agent.commands").expect("valid"),
             capability_version: "1".to_owned(),
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
-            identity: CapabilitySubjectIdentity {
+            identity: InstanceCapabilityIdentity {
                 binary_digest: Nullable::some(Digest256::from_bytes([4; 32])),
-                ..CapabilitySubjectIdentity::default()
+                ..InstanceCapabilityIdentity::default()
             },
             revision: CapabilityRevision::new(1),
-            state: CapabilityState::QualifiedAvailable,
-            source: CapabilityEvidenceSource::HostProbe,
-            invalidated_by: [CapabilityInvalidation::BinaryChanged]
-                .into_iter()
-                .collect(),
+            state: InstanceCapabilityState::QualifiedAvailable,
+            source: InstanceEvidenceSource::HostProbe,
+            invalidated_by: [InstanceInvalidation::BinaryChanged].into_iter().collect(),
             disabled_reason: Nullable::null(),
             observed_at: TimestampMs::new(1),
         })
         .expect("a fresh record is accepted");
 
         let affected = map.invalidate(
-            CapabilityInvalidation::BinaryChanged,
+            InstanceInvalidation::BinaryChanged,
             "the executable was upgraded",
             TimestampMs::new(2),
         );
@@ -1592,12 +1587,12 @@ mod tests {
         let pinned = map
             .record(&CapabilityId::new("agent.prompt").expect("valid"))
             .expect("the running binding's record is still there");
-        assert_eq!(pinned.state, CapabilityState::QualifiedAvailable);
+        assert_eq!(pinned.state, InstanceCapabilityState::QualifiedAvailable);
         assert_eq!(pinned.revision, CapabilityRevision::new(1));
         let upgraded = map
             .record(&CapabilityId::new("agent.commands").expect("valid"))
             .expect("the probed record is still there");
-        assert_eq!(upgraded.state, CapabilityState::NotTested);
+        assert_eq!(upgraded.state, InstanceCapabilityState::NotTested);
         assert_eq!(upgraded.revision, CapabilityRevision::new(2));
     }
 
@@ -1742,14 +1737,14 @@ mod tests {
 
     #[test]
     fn a_record_that_nothing_invalidates_is_refused() {
-        let record = CapabilityRecord {
+        let record = InstanceCapabilityRecord {
             capability_id: CapabilityId::new("agent.prompt").expect("valid"),
             capability_version: "1".to_owned(),
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
-            identity: CapabilitySubjectIdentity::default(),
+            identity: InstanceCapabilityIdentity::default(),
             revision: CapabilityRevision::new(1),
-            state: CapabilityState::QualifiedAvailable,
-            source: CapabilityEvidenceSource::HostProbe,
+            state: InstanceCapabilityState::QualifiedAvailable,
+            source: InstanceEvidenceSource::HostProbe,
             invalidated_by: CanonicalSet::new(),
             disabled_reason: Nullable::null(),
             observed_at: TimestampMs::new(1),
@@ -1759,15 +1754,15 @@ mod tests {
 
     #[test]
     fn a_signed_record_names_the_profile_it_came_from() {
-        let record = CapabilityRecord {
+        let record = InstanceCapabilityRecord {
             capability_id: CapabilityId::new("agent.prompt").expect("valid"),
             capability_version: "1".to_owned(),
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
-            identity: CapabilitySubjectIdentity::default(),
+            identity: InstanceCapabilityIdentity::default(),
             revision: CapabilityRevision::new(1),
-            state: CapabilityState::VersionQualified,
-            source: CapabilityEvidenceSource::SignedRecord,
-            invalidated_by: [CapabilityInvalidation::QualificationProfileChanged]
+            state: InstanceCapabilityState::VersionQualified,
+            source: InstanceEvidenceSource::SignedRecord,
+            invalidated_by: [InstanceInvalidation::QualificationProfileChanged]
                 .into_iter()
                 .collect(),
             disabled_reason: Nullable::some("not tried on this host".to_owned()),
@@ -1777,10 +1772,10 @@ mod tests {
             record.validate(),
             Err(CapabilityError::MissingProfileIdentity)
         );
-        let named = CapabilityRecord {
-            identity: CapabilitySubjectIdentity {
+        let named = InstanceCapabilityRecord {
+            identity: InstanceCapabilityIdentity {
                 qualification_profile_digest: Nullable::some(Digest256::from_bytes([8; 32])),
-                ..CapabilitySubjectIdentity::default()
+                ..InstanceCapabilityIdentity::default()
             },
             ..record
         };
@@ -1790,23 +1785,21 @@ mod tests {
     #[test]
     fn a_late_answer_never_restores_evidence_the_host_withdrew() {
         let mut map = CapabilityMap::default();
-        let qualified = CapabilityRecord {
+        let qualified = InstanceCapabilityRecord {
             capability_id: CapabilityId::new("agent.prompt").expect("valid"),
             capability_version: "1".to_owned(),
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
-            identity: CapabilitySubjectIdentity::default(),
+            identity: InstanceCapabilityIdentity::default(),
             revision: CapabilityRevision::new(1),
-            state: CapabilityState::QualifiedAvailable,
-            source: CapabilityEvidenceSource::HostProbe,
-            invalidated_by: [CapabilityInvalidation::BinaryChanged]
-                .into_iter()
-                .collect(),
+            state: InstanceCapabilityState::QualifiedAvailable,
+            source: InstanceEvidenceSource::HostProbe,
+            invalidated_by: [InstanceInvalidation::BinaryChanged].into_iter().collect(),
             disabled_reason: Nullable::null(),
             observed_at: TimestampMs::new(1),
         };
         map.upsert(qualified.clone()).expect("the first record");
         map.invalidate(
-            CapabilityInvalidation::BinaryChanged,
+            InstanceInvalidation::BinaryChanged,
             "the executable was upgraded",
             TimestampMs::new(2),
         );
@@ -1818,7 +1811,7 @@ mod tests {
             map.record(&CapabilityId::new("agent.prompt").expect("valid"))
                 .expect("still recorded")
                 .state,
-            CapabilityState::NotTested
+            InstanceCapabilityState::NotTested
         );
     }
 }

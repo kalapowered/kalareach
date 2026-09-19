@@ -11,11 +11,12 @@
 use kr_protocol::broker::{BrokerGrant, BrokerGrants, DecodingTrust};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{
-    DeclarativeEntry, DeclarativeTable, Durability, GatewayMode, NativeFraming, NativeMethodClass,
+    DeclarativeEntry, DeclarativeTable, GatewayMode, NativeFraming, NativeMethodClass,
     PendingState, check_transition,
 };
 use kr_protocol::ids::{MethodTableVersion, PluginId, PublisherId, UpstreamMethod};
 use kr_protocol::scalars::{Digest256, TimestampMs, U64};
+use kr_protocol::session::Durability;
 
 fn method(name: &str) -> UpstreamMethod {
     UpstreamMethod::new(name).expect("a valid method name")

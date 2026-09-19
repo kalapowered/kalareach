@@ -86,7 +86,7 @@ export type MethodTableVersionText = string
 /**
  * What makes a capability record stale.
  */
-export type CapabilityInvalidation =
+export type InstanceInvalidation =
   | 'binary_changed'
   | 'binding_changed'
   | 'schema_changed'
@@ -394,7 +394,7 @@ export type WorkerProfile = 'desktop_bound' | 'headless_user'
 /**
  * What makes a capability record stale.
  */
-export type CapabilityInvalidation2 =
+export type CapabilityInvalidation =
   | 'binary_identity'
   | 'binding_identity'
   | 'package_schema'
@@ -1381,7 +1381,7 @@ export interface KalaReachProtocol {
   bridge_hello?: BridgeHello
   bridge_hello_ack?: BridgeHelloAck
   capability_map?: CapabilityMap1
-  capability_record?: CapabilityRecord2
+  capability_record?: CapabilityRecord
   capture_count?: CaptureCount
   change_manifest?: ChangeManifest1
   change_operation?: ChangeOperation
@@ -1584,7 +1584,7 @@ export interface KalaReachProtocol {
   input_write_params?: InputWriteParams
   input_write_result?: InputWriteResult
   installed_file?: InstalledFile
-  instance_capability_record?: CapabilityRecord
+  instance_capability_record?: InstanceCapabilityRecord
   invitation_preview?: InvitationPreview1
   launch_profile?: LaunchProfile2
   live_screen_preview?: LiveScreenPreview
@@ -2415,7 +2415,7 @@ export interface CapabilityMap {
   /**
    * The records, ordered by capability so the map encodes deterministically.
    */
-  records: CapabilityRecord[]
+  records: InstanceCapabilityRecord[]
 }
 /**
  * One capability record the worker keeps for dispatch.
@@ -2423,7 +2423,7 @@ export interface CapabilityMap {
  * The host owns the current evidence; a worker keeps the subset its dispatch decisions need. The
  * record carries its own invalidation triggers so a worker can decide staleness without asking.
  */
-export interface CapabilityRecord {
+export interface InstanceCapabilityRecord {
   /**
    * One foreground application within a terminal session.
    */
@@ -2440,11 +2440,11 @@ export interface CapabilityRecord {
    * The user-facing reason, required whenever the state is not usable.
    */
   disabled_reason: string | null
-  identity: CapabilitySubjectIdentity
+  identity: InstanceCapabilityIdentity
   /**
    * What makes it stale.
    */
-  invalidated_by: CapabilityInvalidation[]
+  invalidated_by: InstanceInvalidation[]
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
@@ -2472,7 +2472,7 @@ export interface CapabilityRecord {
 /**
  * The exact identity the evidence was gathered against.
  */
-export interface CapabilitySubjectIdentity {
+export interface InstanceCapabilityIdentity {
   /**
    * The digest of the tested binary.
    */
@@ -5560,7 +5560,7 @@ export interface CapabilityMap1 {
   /**
    * The records, ordered by capability so the map encodes deterministically.
    */
-  records: CapabilityRecord[]
+  records: InstanceCapabilityRecord[]
 }
 /**
  * One capability, one subject, one answer.
@@ -5569,7 +5569,7 @@ export interface CapabilityMap1 {
  * creates authority: every action still checks its grant, and it rechecks this record's revision
  * independently.
  */
-export interface CapabilityRecord2 {
+export interface CapabilityRecord {
   /**
    * A versioned capability name. Capabilities describe feasibility, never authority.
    */
@@ -5587,7 +5587,7 @@ export interface CapabilityRecord2 {
   /**
    * What makes this record stale, in the order it is written.
    */
-  invalidation: CapabilityInvalidation2[]
+  invalidation: CapabilityInvalidation[]
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
@@ -7361,7 +7361,7 @@ export interface DesktopCapabilityReport {
   /**
    * The records, ordered by capability name.
    */
-  records: CapabilityRecord2[]
+  records: CapabilityRecord[]
 }
 /**
  * The desktop the records are about.
@@ -8894,7 +8894,7 @@ export interface DesktopCapabilityReport1 {
   /**
    * The records, ordered by capability name.
    */
-  records: CapabilityRecord2[]
+  records: CapabilityRecord[]
 }
 /**
  * What the host's per-user service arrangement does at logout.
@@ -18677,7 +18677,7 @@ export interface SupportBundle {
   /**
    * What this host can currently do, as the shared section 11 evidence.
    */
-  capabilities: CapabilityRecord2[]
+  capabilities: CapabilityRecord[]
   configuration: EffectiveConfiguration2
   /**
    * The content-bearing export, when the person explicitly selected one.

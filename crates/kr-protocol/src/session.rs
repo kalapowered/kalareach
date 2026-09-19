@@ -383,6 +383,17 @@ pub enum Durability {
     Volatile,
 }
 
+impl Durability {
+    /// Returns the stable wire string.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::Volatile => "volatile",
+        }
+    }
+}
+
 /// One process the closure terminated.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

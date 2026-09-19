@@ -11,8 +11,9 @@
 //! be answered twice, and opens the gap. Nothing can be admitted between those steps, because
 //! there are no steps between them.
 
-use kr_protocol::gateway::{Durability, EvidenceGap, GatewayMode};
+use kr_protocol::gateway::{EvidenceGap, GatewayMode};
 use kr_protocol::scalars::TimestampMs;
+use kr_protocol::session::Durability;
 
 use crate::broker::error::{BrokerError, Result};
 

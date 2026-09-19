@@ -20,11 +20,11 @@
 use std::collections::BTreeMap;
 
 use kr_protocol::gateway::{
-    ArbitrationError, DownstreamRequestId, Durability, PendingResource, PendingState,
-    check_transition,
+    ArbitrationError, DownstreamRequestId, PendingResource, PendingState, check_transition,
 };
 use kr_protocol::ids::{ActorId, ApplicationInstanceId, BrokerBindingId, PendingResourceId};
 use kr_protocol::scalars::{TimestampMs, Uuid};
+use kr_protocol::session::Durability;
 
 use crate::broker::error::{BrokerError, Result};
 

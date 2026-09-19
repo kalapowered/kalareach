@@ -22,7 +22,7 @@
 use std::collections::BTreeMap;
 
 use kr_protocol::broker::{
-    CapabilityInvalidation, CapabilityMap, CapabilityRecord, CapabilityState,
+    CapabilityMap, InstanceCapabilityRecord, InstanceCapabilityState, InstanceInvalidation,
 };
 use kr_protocol::ids::{ApplicationInstanceId, CapabilityId, CapabilityRevision};
 use kr_protocol::scalars::TimestampMs;
@@ -113,7 +113,7 @@ impl CapabilityOwner {
     /// Returns [`BrokerError::Capability`] when the record breaks one of section 11's rules: a
     /// source that cannot establish a working capability claiming one, or an unusable state with
     /// no reason a person can read.
-    pub fn record(&mut self, record: CapabilityRecord) -> Result<()> {
+    pub fn record(&mut self, record: InstanceCapabilityRecord) -> Result<()> {
         self.maps
             .entry(record.application_instance_id)
             .or_default()
@@ -127,7 +127,7 @@ impl CapabilityOwner {
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the probe was not one the host would run, and
     /// [`BrokerError::Capability`] when the record it produced breaks a rule.
-    pub fn record_probe(&mut self, probe: &Probe, record: CapabilityRecord) -> Result<()> {
+    pub fn record_probe(&mut self, probe: &Probe, record: InstanceCapabilityRecord) -> Result<()> {
         probe.validate()?;
         if record.capability_id != probe.capability_id {
             return Err(BrokerError::invalid(
@@ -144,7 +144,7 @@ impl CapabilityOwner {
     /// executable on disk is replaced.
     pub fn invalidate(
         &mut self,
-        change: CapabilityInvalidation,
+        change: InstanceInvalidation,
         reason: &str,
         now: TimestampMs,
     ) -> usize {
@@ -158,7 +158,7 @@ impl CapabilityOwner {
     pub fn invalidate_instance(
         &mut self,
         application_instance_id: ApplicationInstanceId,
-        change: CapabilityInvalidation,
+        change: InstanceInvalidation,
         reason: &str,
         now: TimestampMs,
     ) -> usize {
@@ -182,7 +182,7 @@ impl CapabilityOwner {
         application_instance_id: ApplicationInstanceId,
         capability_id: &CapabilityId,
         read_at: Option<CapabilityRevision>,
-    ) -> Result<&CapabilityRecord> {
+    ) -> Result<&InstanceCapabilityRecord> {
         let record = self
             .maps
             .get(&application_instance_id)
@@ -221,7 +221,7 @@ impl CapabilityOwner {
         self.maps
             .get(&application_instance_id)
             .and_then(|map| map.record(capability_id))
-            .is_some_and(|record| record.state == CapabilityState::QualifiedAvailable)
+            .is_some_and(|record| record.state == InstanceCapabilityState::QualifiedAvailable)
     }
 
     /// Forgets one installation's map.
@@ -233,7 +233,7 @@ impl CapabilityOwner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kr_protocol::broker::{CapabilityEvidenceSource, CapabilitySubjectIdentity};
+    use kr_protocol::broker::{InstanceCapabilityIdentity, InstanceEvidenceSource};
     use kr_protocol::scalars::{CanonicalSet, Digest256, Nullable, Uuid};
 
     fn instance() -> ApplicationInstanceId {
@@ -246,20 +246,20 @@ mod tests {
 
     fn record(
         name: &str,
-        state: CapabilityState,
-        trigger: CapabilityInvalidation,
-    ) -> CapabilityRecord {
-        CapabilityRecord {
+        state: InstanceCapabilityState,
+        trigger: InstanceInvalidation,
+    ) -> InstanceCapabilityRecord {
+        InstanceCapabilityRecord {
             capability_id: capability(name),
             capability_version: "1".to_owned(),
             application_instance_id: instance(),
-            identity: CapabilitySubjectIdentity {
+            identity: InstanceCapabilityIdentity {
                 binary_digest: Nullable::some(Digest256::from_bytes([3; 32])),
-                ..CapabilitySubjectIdentity::default()
+                ..InstanceCapabilityIdentity::default()
             },
             revision: CapabilityRevision::new(1),
             state,
-            source: CapabilityEvidenceSource::HostProbe,
+            source: InstanceEvidenceSource::HostProbe,
             invalidated_by: [trigger].into_iter().collect(),
             disabled_reason: if state.is_usable() {
                 Nullable::null()
@@ -306,8 +306,8 @@ mod tests {
             &probe("agent.prompt"),
             record(
                 "agent.cancel",
-                CapabilityState::QualifiedAvailable,
-                CapabilityInvalidation::BinaryChanged,
+                InstanceCapabilityState::QualifiedAvailable,
+                InstanceInvalidation::BinaryChanged,
             ),
         );
         assert!(result.is_err());
@@ -318,10 +318,10 @@ mod tests {
         let mut owner = CapabilityOwner::new();
         let mut signed = record(
             "agent.prompt",
-            CapabilityState::QualifiedAvailable,
-            CapabilityInvalidation::BinaryChanged,
+            InstanceCapabilityState::QualifiedAvailable,
+            InstanceInvalidation::BinaryChanged,
         );
-        signed.source = CapabilityEvidenceSource::SignedRecord;
+        signed.source = InstanceEvidenceSource::SignedRecord;
         assert!(owner.record(signed).is_err());
     }
 
@@ -331,8 +331,8 @@ mod tests {
         owner
             .record(record(
                 "agent.prompt",
-                CapabilityState::QualifiedAvailable,
-                CapabilityInvalidation::BinaryChanged,
+                InstanceCapabilityState::QualifiedAvailable,
+                InstanceInvalidation::BinaryChanged,
             ))
             .expect("recorded");
         owner
@@ -365,20 +365,20 @@ mod tests {
         owner
             .record(record(
                 "agent.prompt",
-                CapabilityState::QualifiedAvailable,
-                CapabilityInvalidation::BinaryChanged,
+                InstanceCapabilityState::QualifiedAvailable,
+                InstanceInvalidation::BinaryChanged,
             ))
             .expect("recorded");
         owner
             .record(record(
                 "agent.approval",
-                CapabilityState::QualifiedAvailable,
-                CapabilityInvalidation::BindingChanged,
+                InstanceCapabilityState::QualifiedAvailable,
+                InstanceInvalidation::BindingChanged,
             ))
             .expect("recorded");
         assert_eq!(
             owner.invalidate(
-                CapabilityInvalidation::BinaryChanged,
+                InstanceInvalidation::BinaryChanged,
                 "the executable was upgraded",
                 TimestampMs::new(5)
             ),
@@ -397,8 +397,8 @@ mod tests {
         owner
             .record(record(
                 "agent.prompt",
-                CapabilityState::PermissionRequired,
-                CapabilityInvalidation::OsPermissionChanged,
+                InstanceCapabilityState::PermissionRequired,
+                InstanceInvalidation::OsPermissionChanged,
             ))
             .expect("recorded");
         let refusal = owner
@@ -413,13 +413,13 @@ mod tests {
         owner
             .record(record(
                 "agent.prompt",
-                CapabilityState::QualifiedAvailable,
-                CapabilityInvalidation::BinaryChanged,
+                InstanceCapabilityState::QualifiedAvailable,
+                InstanceInvalidation::BinaryChanged,
             ))
             .expect("recorded");
         let other = ApplicationInstanceId::new(Uuid::from_bytes([3; 16]));
         assert!(owner.map(other).records.is_empty());
         assert_eq!(owner.map(instance()).records.len(), 1);
-        let _ = CanonicalSet::<CapabilityInvalidation>::new();
+        let _ = CanonicalSet::<InstanceInvalidation>::new();
     }
 }

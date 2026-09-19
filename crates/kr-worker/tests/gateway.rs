@@ -10,8 +10,8 @@ use kr_protocol::broker::{
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{
-    DeclarativeEntry, DeclarativeTable, Durability, GatewayMode, NativeFraming, NativeMethodClass,
-    PendingKind, PendingState, ReverseOperation, RichMethodEntry, RichMethodTable,
+    DeclarativeEntry, DeclarativeTable, GatewayMode, NativeFraming, NativeMethodClass, PendingKind,
+    PendingState, ReverseOperation, RichMethodEntry, RichMethodTable,
 };
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
@@ -20,6 +20,7 @@ use kr_protocol::ids::{
 };
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, TimestampMs, U64, Uuid};
+use kr_protocol::session::Durability;
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, ConnectionOrigin, Credential, ManagedProcess,
     ReconcileScope, TransportHandle,

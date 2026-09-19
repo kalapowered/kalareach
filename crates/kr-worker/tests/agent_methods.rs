@@ -9,9 +9,9 @@ use kr_protocol::agent::{
 };
 use kr_protocol::authority::{AuthorityDecision, EffectClass};
 use kr_protocol::broker::{
-    ActionName, ActionProvenance, BrokerGrant, BrokerGrants, CapabilityEvidenceSource,
-    CapabilityInvalidation, CapabilityRecord, CapabilityState, CapabilitySubjectIdentity,
-    DecodedProjection, DecodingTrust, IntegrationMode, OfferedDecision,
+    ActionName, ActionProvenance, BrokerGrant, BrokerGrants, DecodedProjection, DecodingTrust,
+    InstanceCapabilityIdentity, InstanceCapabilityRecord, InstanceCapabilityState,
+    InstanceEvidenceSource, InstanceInvalidation, IntegrationMode, OfferedDecision,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{
@@ -144,18 +144,16 @@ fn rich() -> RichMethodTable {
     }
 }
 
-fn evidence(name: &str, state: CapabilityState) -> CapabilityRecord {
-    CapabilityRecord {
+fn evidence(name: &str, state: InstanceCapabilityState) -> InstanceCapabilityRecord {
+    InstanceCapabilityRecord {
         capability_id: capability(name),
         capability_version: "1".to_owned(),
         application_instance_id: instance(),
-        identity: CapabilitySubjectIdentity::default(),
+        identity: InstanceCapabilityIdentity::default(),
         revision: CapabilityRevision::new(1),
         state,
-        source: CapabilityEvidenceSource::HostProbe,
-        invalidated_by: [CapabilityInvalidation::BindingChanged]
-            .into_iter()
-            .collect(),
+        source: InstanceEvidenceSource::HostProbe,
+        invalidated_by: [InstanceInvalidation::BindingChanged].into_iter().collect(),
         disabled_reason: if state.is_usable() {
             Nullable::null()
         } else {
@@ -260,7 +258,7 @@ fn agent_broker() -> Broker {
         "agent.approval",
     ] {
         broker
-            .record_capability(evidence(name, CapabilityState::QualifiedAvailable))
+            .record_capability(evidence(name, InstanceCapabilityState::QualifiedAvailable))
             .expect("recorded");
     }
     broker
@@ -342,7 +340,7 @@ fn kr_req_23_39_an_agent_read_names_the_instance_carries_its_evidence_and_report
             .record(&capability("agent.prompt"))
             .expect("the evidence is carried with the answer")
             .state,
-        CapabilityState::QualifiedAvailable
+        InstanceCapabilityState::QualifiedAvailable
     );
     assert_eq!(
         capabilities.binding.binding_revision,
@@ -705,7 +703,7 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
         )
         .expect("the actions are registered");
     broker.invalidate_capabilities(
-        CapabilityInvalidation::BindingChanged,
+        InstanceInvalidation::BindingChanged,
         "the selected thread changed",
         TimestampMs::new(5),
     );

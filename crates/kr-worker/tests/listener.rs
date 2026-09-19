@@ -238,7 +238,7 @@ fn kr_req_12_15_a_bound_binary_identity_is_the_one_a_running_binding_acts_under(
         )
         .expect("the instance is registered");
     broker.invalidate_capabilities(
-        kr_protocol::broker::CapabilityInvalidation::BinaryChanged,
+        kr_protocol::broker::InstanceInvalidation::BinaryChanged,
         "the executable was upgraded",
         TimestampMs::new(5),
     );

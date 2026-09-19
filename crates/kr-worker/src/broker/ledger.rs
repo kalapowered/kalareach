@@ -26,11 +26,12 @@
 //! * **Adapter checkpoints** are the consumed semantic cursor a restart replays from.
 
 use kr_protocol::broker::{BrokerGrants, DecoderLedgerEntry, DecodingTrust, LaunchProfile};
-use kr_protocol::gateway::{Durability, EvidenceGap, PendingResource, PendingState};
+use kr_protocol::gateway::{EvidenceGap, PendingResource, PendingState};
 use kr_protocol::ids::{
     ApplicationInstanceId, BrokerBindingId, PendingResourceId, SourceEventHandle, StreamCursor,
 };
 use kr_protocol::scalars::{TimestampMs, Uuid};
+use kr_protocol::session::Durability;
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::broker::error::{BrokerError, Result};

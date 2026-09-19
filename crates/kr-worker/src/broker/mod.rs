@@ -58,8 +58,8 @@ use std::sync::Mutex;
 use kr_protocol::agent::AgentBindingState;
 use kr_protocol::broker::{
     ActionName, ActionProvenance, ActionToken, ActionTokenClaim, BrokerGrant, BrokerGrants,
-    CapabilityInvalidation, CapabilityMap, CapabilityRecord, DecodedProjection, DecoderLedgerEntry,
-    DecodingTrust, IntegrationMode, LaunchProfile, MAX_RETAINED_SOURCE_BYTES,
+    CapabilityMap, DecodedProjection, DecoderLedgerEntry, DecodingTrust, InstanceCapabilityRecord,
+    InstanceInvalidation, IntegrationMode, LaunchProfile, MAX_RETAINED_SOURCE_BYTES,
 };
 use kr_protocol::gateway::{DownstreamRequestId, PendingKind, PendingResource, PendingState};
 use kr_protocol::identity::ProcessStartIdentity;
@@ -491,7 +491,7 @@ impl Broker {
         state.tokens.withdraw(application_instance_id);
         state.capabilities.invalidate_instance(
             application_instance_id,
-            CapabilityInvalidation::BindingChanged,
+            InstanceInvalidation::BindingChanged,
             "the upstream owner or selected thread changed",
             now,
         );
@@ -1289,7 +1289,7 @@ impl Broker {
     ///
     /// Returns [`BrokerError::Capability`] when the record breaks a rule or is not newer than the
     /// one held.
-    pub fn record_capability(&self, record: CapabilityRecord) -> Result<()> {
+    pub fn record_capability(&self, record: InstanceCapabilityRecord) -> Result<()> {
         let mut state = self.state();
         state.check_evidence_identity(&record)?;
         state.capabilities.record(record)
@@ -1300,7 +1300,7 @@ impl Broker {
     /// # Errors
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the probe was not one the host would run.
-    pub fn record_probe(&self, probe: &Probe, record: CapabilityRecord) -> Result<()> {
+    pub fn record_probe(&self, probe: &Probe, record: InstanceCapabilityRecord) -> Result<()> {
         let mut state = self.state();
         state.check_evidence_identity(&record)?;
         state.capabilities.record_probe(probe, record)
@@ -1315,7 +1315,7 @@ impl Broker {
     /// Invalidates every record one change makes stale.
     pub fn invalidate_capabilities(
         &self,
-        change: CapabilityInvalidation,
+        change: InstanceInvalidation,
         reason: &str,
         now: TimestampMs,
     ) -> usize {
@@ -2109,7 +2109,7 @@ impl BrokerState {
     /// Without the check a newer record gathered against another binary would be accepted for
     /// this instance and would then pass every later recheck, because those compare the revision
     /// and the state and not what the evidence was about.
-    fn check_evidence_identity(&self, record: &CapabilityRecord) -> Result<()> {
+    fn check_evidence_identity(&self, record: &InstanceCapabilityRecord) -> Result<()> {
         let instance = self
             .instances
             .get(&record.application_instance_id)

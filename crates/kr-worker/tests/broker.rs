@@ -7,9 +7,9 @@
 
 use kr_protocol::broker::{
     ActionName, ActionProvenance, ActionTokenClaim, AuthenticationState, BinaryIdentity,
-    BrokerGrant, BrokerGrants, CapabilityEvidenceSource, CapabilityInvalidation, CapabilityRecord,
-    CapabilityState, CapabilitySubjectIdentity, DecodedProjection, DecodingTrust, IntegrationMode,
-    LaunchProfile, LaunchRefusal, OfferedDecision,
+    BrokerGrant, BrokerGrants, DecodedProjection, DecodingTrust, InstanceCapabilityIdentity,
+    InstanceCapabilityRecord, InstanceCapabilityState, InstanceEvidenceSource,
+    InstanceInvalidation, IntegrationMode, LaunchProfile, LaunchRefusal, OfferedDecision,
 };
 use kr_protocol::gateway::{
     DeclarativeEntry, DeclarativeTable, DownstreamRequestId, NativeFraming, NativeMethodClass,
@@ -146,21 +146,21 @@ fn scope(instance_id: ApplicationInstanceId, connection: u64) -> ReconcileScope 
 
 fn evidence(
     name: &str,
-    state: CapabilityState,
-    trigger: CapabilityInvalidation,
+    state: InstanceCapabilityState,
+    trigger: InstanceInvalidation,
     instance_id: ApplicationInstanceId,
-) -> CapabilityRecord {
-    CapabilityRecord {
+) -> InstanceCapabilityRecord {
+    InstanceCapabilityRecord {
         capability_id: capability(name),
         capability_version: "1".to_owned(),
         application_instance_id: instance_id,
-        identity: CapabilitySubjectIdentity {
+        identity: InstanceCapabilityIdentity {
             binary_digest: Nullable::some(Digest256::from_bytes([3; 32])),
-            ..CapabilitySubjectIdentity::default()
+            ..InstanceCapabilityIdentity::default()
         },
         revision: CapabilityRevision::new(1),
         state,
-        source: CapabilityEvidenceSource::HostProbe,
+        source: InstanceEvidenceSource::HostProbe,
         invalidated_by: [trigger].into_iter().collect(),
         disabled_reason: if state.is_usable() {
             Nullable::null()
@@ -964,8 +964,8 @@ fn kr_req_11_16_a_probe_is_bounded_and_disclosed_before_it_runs() {
                 &undisclosed,
                 evidence(
                     "agent.prompt",
-                    CapabilityState::QualifiedAvailable,
-                    CapabilityInvalidation::BinaryChanged,
+                    InstanceCapabilityState::QualifiedAvailable,
+                    InstanceInvalidation::BinaryChanged,
                     instance(2)
                 )
             )
@@ -986,8 +986,8 @@ fn kr_req_11_16_a_probe_is_bounded_and_disclosed_before_it_runs() {
                 &destructive,
                 evidence(
                     "agent.prompt",
-                    CapabilityState::QualifiedAvailable,
-                    CapabilityInvalidation::BinaryChanged,
+                    InstanceCapabilityState::QualifiedAvailable,
+                    InstanceInvalidation::BinaryChanged,
                     instance(2)
                 )
             )
@@ -1008,8 +1008,8 @@ fn kr_req_11_16_a_probe_is_bounded_and_disclosed_before_it_runs() {
                 &unbounded,
                 evidence(
                     "agent.prompt",
-                    CapabilityState::QualifiedAvailable,
-                    CapabilityInvalidation::BinaryChanged,
+                    InstanceCapabilityState::QualifiedAvailable,
+                    InstanceInvalidation::BinaryChanged,
                     instance(2)
                 )
             )
@@ -1029,8 +1029,8 @@ fn kr_req_11_16_a_probe_is_bounded_and_disclosed_before_it_runs() {
             &disclosed,
             evidence(
                 "agent.prompt",
-                CapabilityState::QualifiedAvailable,
-                CapabilityInvalidation::BinaryChanged,
+                InstanceCapabilityState::QualifiedAvailable,
+                InstanceInvalidation::BinaryChanged,
                 instance(2),
             ),
         )
@@ -1039,11 +1039,11 @@ fn kr_req_11_16_a_probe_is_bounded_and_disclosed_before_it_runs() {
     // Evidence is not permission: a signed record cannot say a capability works on this host.
     let mut signed = evidence(
         "agent.cancel",
-        CapabilityState::QualifiedAvailable,
-        CapabilityInvalidation::BinaryChanged,
+        InstanceCapabilityState::QualifiedAvailable,
+        InstanceInvalidation::BinaryChanged,
         instance(2),
     );
-    signed.source = CapabilityEvidenceSource::SignedRecord;
+    signed.source = InstanceEvidenceSource::SignedRecord;
     assert!(broker.record_capability(signed).is_err());
 }
 
@@ -1056,16 +1056,16 @@ fn kr_req_11_17_an_action_rechecks_its_capability_and_an_upgrade_spares_a_pinned
     broker
         .record_capability(evidence(
             "agent.prompt",
-            CapabilityState::QualifiedAvailable,
-            CapabilityInvalidation::BinaryChanged,
+            InstanceCapabilityState::QualifiedAvailable,
+            InstanceInvalidation::BinaryChanged,
             instance(2),
         ))
         .expect("recorded");
     broker
         .record_capability(evidence(
             "agent.approval",
-            CapabilityState::QualifiedAvailable,
-            CapabilityInvalidation::BindingChanged,
+            InstanceCapabilityState::QualifiedAvailable,
+            InstanceInvalidation::BindingChanged,
             instance(2),
         ))
         .expect("recorded");
@@ -1097,7 +1097,7 @@ fn kr_req_11_17_an_action_rechecks_its_capability_and_an_upgrade_spares_a_pinned
 
     assert_eq!(
         broker.invalidate_capabilities(
-            CapabilityInvalidation::BinaryChanged,
+            InstanceInvalidation::BinaryChanged,
             "the executable was upgraded",
             TimestampMs::new(20)
         ),
@@ -1132,7 +1132,7 @@ fn kr_req_11_17_an_action_rechecks_its_capability_and_an_upgrade_spares_a_pinned
         .expect("the token is issued");
     assert_eq!(
         broker.invalidate_capabilities(
-            CapabilityInvalidation::BindingChanged,
+            InstanceInvalidation::BindingChanged,
             "the selected thread changed",
             TimestampMs::new(24)
         ),
@@ -1158,16 +1158,16 @@ fn kr_req_01_02_the_capability_map_is_per_installation() {
     broker
         .record_capability(evidence(
             "agent.prompt",
-            CapabilityState::QualifiedAvailable,
-            CapabilityInvalidation::BinaryChanged,
+            InstanceCapabilityState::QualifiedAvailable,
+            InstanceInvalidation::BinaryChanged,
             instance(2),
         ))
         .expect("recorded");
     broker
         .record_capability(evidence(
             "agent.prompt",
-            CapabilityState::MissingInstallation,
-            CapabilityInvalidation::BinaryChanged,
+            InstanceCapabilityState::MissingInstallation,
+            InstanceInvalidation::BinaryChanged,
             instance(3),
         ))
         .expect("recorded");
@@ -1179,22 +1179,22 @@ fn kr_req_01_02_the_capability_map_is_per_installation() {
             .record(&capability("agent.prompt"))
             .expect("recorded")
             .state,
-        CapabilityState::QualifiedAvailable
+        InstanceCapabilityState::QualifiedAvailable
     );
     assert_eq!(
         terminal
             .record(&capability("agent.prompt"))
             .expect("recorded")
             .state,
-        CapabilityState::MissingInstallation,
+        InstanceCapabilityState::MissingInstallation,
         "two installations of one agent have two maps"
     );
 
     // The only source that can say a capability works here is one that tried it here.
-    assert!(CapabilityEvidenceSource::HostProbe.can_establish_qualified());
-    assert!(CapabilityEvidenceSource::LiveBinding.can_establish_qualified());
-    assert!(!CapabilityEvidenceSource::SignedRecord.can_establish_qualified());
-    assert!(!CapabilityEvidenceSource::PackageDeclaration.can_establish_qualified());
+    assert!(InstanceEvidenceSource::HostProbe.can_establish_qualified());
+    assert!(InstanceEvidenceSource::LiveBinding.can_establish_qualified());
+    assert!(!InstanceEvidenceSource::SignedRecord.can_establish_qualified());
+    assert!(!InstanceEvidenceSource::PackageDeclaration.can_establish_qualified());
 }
 
 /// KR-REQ-07.67: a native exit names the backend to stop by its full process identity; closing an
