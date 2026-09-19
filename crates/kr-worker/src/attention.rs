@@ -2,8 +2,8 @@
 //!
 //! The engine itself is in `kr-attention`: a state machine that reads no clock, opens no file and
 //! sends no notification. This is the part of it that belongs to a worker - where its feature store
-//! lives, which reading of the host time contract it is given, and how the six methods of section
-//! 23's review and attention group reach it.
+//! lives, which reading of the host time contract it is given, and how the seven methods of the
+//! review and attention group reach it.
 //!
 //! # Where the state lives
 //!
@@ -380,7 +380,7 @@ impl Attention {
         let now = reading(time);
         let mut engine = self.locked()?;
         engine
-            .set_quiet_hours(params.quiet_hours.0.clone(), now)
+            .set_quiet_hours(params.quiet_hours.0.clone())
             .map_err(translate)?;
         Ok(AttentionQuietHoursResult {
             quiet_hours: kr_protocol::scalars::Nullable(engine.engine().quiet_hours().cloned()),

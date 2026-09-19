@@ -13,16 +13,17 @@
 //! [`kr_protocol::attention::MAX_RETAINED_ATTENTION_ITEMS`] items, each with a summary bounded by
 //! [`kr_protocol::attention::MAX_ATTENTION_SUMMARY_LEN`];
 //! [`crate::visit::MAX_RETAINED_CHANGES`] changes; [`crate::visit::MAX_OMITTED_RANGES`] omitted
-//! ranges; [`kr_protocol::attention::MAX_RETAINED_SUMMARIES`] summaries;
-//! [`kr_protocol::attention::MAX_RETAINED_REVIEW_SUBJECTS`] review subjects; and
+//! ranges; [`kr_protocol::attention::MAX_RETAINED_SUMMARIES`] summaries; and
 //! [`kr_protocol::attention::MAX_RETAINED_LOG_VIEWS`] views per actor.
 //!
-//! Three of those bounds hold back rather than forget, so the set they bound grows past its figure
+//! Two of those bounds hold back rather than forget, so the set they bound grows past its figure
 //! rather than losing something authoritative: the inbox keeps a condition somebody is waiting on
-//! and a decision nobody has delivered, the review table keeps a subject an item points at, an
-//! actor has acknowledged or the host has only just recorded, and the pending requests keep one
-//! whose reminder is still owed. What that costs is the whole-state write growing with them, which
-//! is the price of not forgetting work the host was asked to do.
+//! and a decision that is still in flight, and the pending requests keep one whose reminder is
+//! still owed. The review table has no retention at all, because outstanding review work and an
+//! actor's record of what it read are both authoritative, and
+//! [`crate::review::Reviews::states_page`] bounds the answer instead. What that costs is the
+//! whole-state write growing with them, which is the price of not forgetting work the host was
+//! asked to do or told about.
 //!
 //! Writing all of it buys two properties that matter more than the saving. There is no partial
 //! write to reason about, so a crash leaves the store at the last complete state rather than at
@@ -66,7 +67,12 @@ use crate::time::{Elapsed, HostReading};
 use crate::visit::{Omitted, Visit};
 
 /// The schema this build writes and reads.
-pub const SCHEMA_VERSION: i64 = 1;
+///
+/// A store written under any other version is refused rather than read. Two things in here are
+/// derived rather than stored on their own - an item's key, and the order a review page continues
+/// by - so a row written under a different derivation would be read under a name that does not
+/// describe it, which is worse than not reading it at all.
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// How long a write waits for another holder of the same file before it is refused.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -188,7 +194,8 @@ const SCHEMA: &str = "
         session_id TEXT NOT NULL,
         object TEXT NOT NULL,
         version INTEGER NOT NULL,
-        at_ms INTEGER NOT NULL
+        at_ms INTEGER NOT NULL,
+        sequence INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS attention_review_acks (
         actor TEXT NOT NULL,
@@ -545,15 +552,17 @@ impl Store {
                 }
             };
             transaction.execute(
-                "INSERT INTO attention_review_subjects (key, kind, session_id, object, version, at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO attention_review_subjects
+                     (key, kind, session_id, object, version, at_ms, sequence)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     key,
                     kind,
                     crate::review::subject_session(&subject.subject).to_string(),
                     object,
                     as_i64(subject.version, "review version")?,
-                    as_i64(subject.at_ms.get(), "review recorded at")?
+                    as_i64(subject.at_ms.get(), "review recorded at")?,
+                    as_i64(subject.sequence, "review order")?
                 ],
             )?;
         }
@@ -862,7 +871,8 @@ impl Store {
 
     fn load_subjects(&self) -> Result<BTreeMap<String, Subject>> {
         let mut statement = self.connection.prepare(
-            "SELECT key, kind, session_id, object, version, at_ms FROM attention_review_subjects",
+            "SELECT key, kind, session_id, object, version, at_ms, sequence
+             FROM attention_review_subjects",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -872,11 +882,12 @@ impl Store {
                 row.get::<_, String>(3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
             ))
         })?;
         let mut subjects = BTreeMap::new();
         for row in rows {
-            let (key, kind, session, object, version, at_ms) = row?;
+            let (key, kind, session, object, version, at_ms, sequence) = row?;
             let session_id = SessionId::from_str(&session).map_err(|_| unreadable("session"))?;
             let subject = match kind.as_str() {
                 "turn" => ReviewSubject::CompletedTurn {
@@ -902,6 +913,7 @@ impl Store {
                     subject,
                     version: as_u64(version, "review version")?,
                     at_ms: TimestampMs::new(as_u64(at_ms, "review recorded at")?),
+                    sequence: as_u64(sequence, "review order")?,
                 },
             );
         }

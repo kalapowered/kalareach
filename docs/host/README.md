@@ -1272,6 +1272,12 @@ throughout, with its audible delivery held. The one thing that does take a held 
 is the condition it was about ending, which is a cancellation rather than a loss: nothing is
 waiting on the person any more.
 
+Setting or clearing the window records it and announces nothing by itself. What the change lets
+through is released by the next timer pass, which the host is told to run at once while anything is
+deferred. That is what keeps a release a decision about the present: announcing inside the setter
+would decide against whatever history the host had read at the moment somebody happened to change a
+setting.
+
 The window is minutes of the UTC day, so the host needs no time-zone database to decide whether it
 is inside one. A client converts its own local window before it sets one and may record the zone it
 converted from, which the host stores and gives back and never interprets. A host that cannot prove
@@ -1336,6 +1342,11 @@ after the condition came back. A host that died at any point before the settleme
 announcement again. What becomes of it afterwards - the destinations, the attempts, the receipts -
 belongs to the delivery journal.
 
+An item holds one outstanding decision at a time. A later announcement about the same condition
+replaces the identity waiting to be taken, and the condition ending takes it away, because an
+announcement about something that is no longer true is not one anybody wants. So a consumer takes
+what is waiting rather than a queue of everything that was ever decided.
+
 A jump in a source's sequence means the records between were evicted. The engine records the range,
 marks every unresolved item from that same source uncertain, and leaves it in the inbox. A gap is
 never an approval and never a completion: an approval whose answer may have been in the missing
@@ -1355,16 +1366,21 @@ let go of.
 
 What the bound never lets go of is a condition somebody or something is still waiting on - an
 unanswered approval, an unanswered request, an adapter still down, a host still out of contact - or
-a decision about one that has not been delivered yet, whether it is waiting for a consumer to
-settle it or for quiet hours to release it. When the whole inbox is those, it goes over its bound
-rather than answering that nothing is waiting or losing an announcement nothing will offer again.
+a decision about one that is still in flight: one no consumer has settled, one quiet hours are
+holding, and one nobody has made yet, which is what an item is between arriving and being
+announced. When the whole inbox is those, it goes over its bound rather than answering that nothing
+is waiting or losing an announcement nothing will offer again, and it comes back inside its bound
+on the next timer pass, against what that pass decided and what a consumer settled meanwhile. A
+host whose notifications nobody is taking therefore keeps them rather than quietly dropping them.
 
-Review subjects are bounded the same way. A subject an inbox item points at, one an actor has
-acknowledged and one the host has only just recorded a version of are all kept, so a session whose
-older work has all been read answers a new capture by holding it rather than by forgetting it the
-moment it arrives. What bounds the answer instead is the page: a review read returns at most two
-hundred subjects and continues after the last one it gave, and a subject the session no longer
-holds is refused as a continuation rather than silently restarting the list.
+Review state has no retention at all. A subject nobody has acknowledged is outstanding review work,
+and deleting it would answer that there is none; a subject somebody has acknowledged is that
+actor's own record of what they read, and nothing can rebuild it from the events, because the
+cursor that consumed them has already moved. What is bounded is the answer: a review read returns
+at most two hundred subjects and continues after the last one it gave, in the order the host first
+heard of each subject, so a new version of one already served does not move it under a page that is
+continuing. A subject the session does not hold is refused as a continuation rather than silently
+restarting the list.
 
 A feature store admits two hundred and fifty-six actors; past that a new actor's acknowledgement is
 refused, before anything is dispatched, rather than an existing actor's being deleted.

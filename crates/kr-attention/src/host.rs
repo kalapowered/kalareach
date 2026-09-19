@@ -30,7 +30,7 @@
 //! item from that source marked uncertain. Nothing here reads a gap as an approval or a
 //! completion.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use kr_protocol::attention::{
@@ -169,6 +169,15 @@ impl Attention {
             consume(state, event, reading, false, &mut outcomes);
             outcomes
         })
+    }
+
+    /// Returns the continuous reading the next timer is due at.
+    ///
+    /// A host wakes at it rather than polling, and `None` means nothing is waiting on time. While
+    /// anything is deferred and the window that deferred it has ended, it is now.
+    #[must_use]
+    pub fn next_deadline(&self, reading: HostReading) -> Option<u64> {
+        self.state.engine.next_deadline(reading)
     }
 
     /// Advances every timer to this reading.
@@ -332,15 +341,16 @@ impl Attention {
 
     /// Sets or clears the quiet-hours window.
     ///
+    /// It announces nothing. What the change lets through is released by the next
+    /// [`Attention::tick`], which [`Attention::next_deadline`] brings forward to now while
+    /// anything is deferred, so a release is decided against a history the host has finished
+    /// reading rather than against whatever it had reached when somebody changed a setting.
+    ///
     /// # Errors
     ///
     /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written.
-    pub fn set_quiet_hours(
-        &mut self,
-        quiet: Option<QuietHours>,
-        reading: HostReading,
-    ) -> Result<Vec<Outcome>> {
-        self.commit(|state| state.engine.set_quiet_hours(quiet, reading))
+    pub fn set_quiet_hours(&mut self, quiet: Option<QuietHours>) -> Result<()> {
+        self.commit(|state| state.engine.set_quiet_hours(quiet))
     }
 
     /// Records one actor's review acknowledgement.
@@ -568,45 +578,8 @@ fn consume(
     carry_gaps(state, &produced);
     outcomes.extend(produced);
     if fresh {
-        let recorded = record_semantics(state, event);
-        bound_reviews(state, &recorded);
+        record_semantics(state, event);
     }
-}
-
-/// Keeps the review subjects bounded, without letting go of one an inbox item still points at.
-///
-/// The reference goes from the subject to the item, never the other way: a subject derives the key
-/// an `attention.review_ready` item for it would carry, and the engine is asked whether it holds
-/// one. Reading a subject back out of a key would not work at all, because a key carries a digest
-/// of its subject rather than the subject.
-///
-/// `recorded` names what this event just told the host about. It is held with the rest, so a
-/// session whose older subjects have all been read does not answer a new capture by forgetting it
-/// the moment it arrives.
-fn bound_reviews(state: &mut State, recorded: &BTreeSet<String>) {
-    let referenced: BTreeSet<String> = state
-        .reviews
-        .subjects()
-        .filter_map(|subject| {
-            let ReviewSubject::CompletedTurn {
-                session_id,
-                turn_id,
-            } = &subject.subject
-            else {
-                return None;
-            };
-            let item = key::attention_key(
-                AttentionRule::ReviewReady,
-                &format!("{session_id}|{turn_id}"),
-            );
-            state
-                .engine
-                .item(&item)
-                .map(|_| crate::review::subject_key(&subject.subject))
-        })
-        .chain(recorded.iter().cloned())
-        .collect();
-    state.reviews.enforce_bound(&referenced);
 }
 
 /// Puts every gap the engine recorded where a visit can see it.
@@ -619,12 +592,7 @@ fn carry_gaps(state: &mut State, outcomes: &[Outcome]) {
 }
 
 /// Records the review work and the semantic change one event produced.
-///
-/// Returns the review subjects this event recorded a version of, which the bound then holds on to:
-/// review work the host has only just been told about is not what a retention bound should let go
-/// of to keep older work that has already been read.
-fn record_semantics(state: &mut State, event: &SourceEvent) -> BTreeSet<String> {
-    let mut recorded = BTreeSet::new();
+fn record_semantics(state: &mut State, event: &SourceEvent) {
     match &event.kind {
         EventKind::TurnCompleted {
             session_id,
@@ -633,21 +601,23 @@ fn record_semantics(state: &mut State, event: &SourceEvent) -> BTreeSet<String> 
             change_set,
             summary,
         } => {
-            let turn = ReviewSubject::CompletedTurn {
-                session_id: *session_id,
-                turn_id: turn_id.clone(),
-            };
-            recorded.insert(crate::review::subject_key(&turn));
-            state.reviews.record_version(turn, *version, event.at_ms);
-            if let Some((change_set_id, change_set_version)) = change_set {
-                let captured = ReviewSubject::ChangeSet {
+            state.reviews.record_version(
+                ReviewSubject::CompletedTurn {
                     session_id: *session_id,
-                    change_set_id: *change_set_id,
-                };
-                recorded.insert(crate::review::subject_key(&captured));
-                state
-                    .reviews
-                    .record_version(captured, *change_set_version, event.at_ms);
+                    turn_id: turn_id.clone(),
+                },
+                *version,
+                event.at_ms,
+            );
+            if let Some((change_set_id, change_set_version)) = change_set {
+                state.reviews.record_version(
+                    ReviewSubject::ChangeSet {
+                        session_id: *session_id,
+                        change_set_id: *change_set_id,
+                    },
+                    *change_set_version,
+                    event.at_ms,
+                );
                 state.visits.record(
                     SemanticChangeKind::ChangeSetCaptured,
                     *session_id,
@@ -668,14 +638,14 @@ fn record_semantics(state: &mut State, event: &SourceEvent) -> BTreeSet<String> 
             version,
             summary,
         } => {
-            let captured = ReviewSubject::ChangeSet {
-                session_id: *session_id,
-                change_set_id: *change_set_id,
-            };
-            recorded.insert(crate::review::subject_key(&captured));
-            state
-                .reviews
-                .record_version(captured, *version, event.at_ms);
+            state.reviews.record_version(
+                ReviewSubject::ChangeSet {
+                    session_id: *session_id,
+                    change_set_id: *change_set_id,
+                },
+                *version,
+                event.at_ms,
+            );
             state.visits.record(
                 SemanticChangeKind::ChangeSetCaptured,
                 *session_id,
@@ -721,7 +691,6 @@ fn record_semantics(state: &mut State, event: &SourceEvent) -> BTreeSet<String> 
         }
         _ => {}
     }
-    recorded
 }
 
 /// Returns everything the feature store writes down.

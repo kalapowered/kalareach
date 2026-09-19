@@ -17,12 +17,18 @@
 //! An acknowledgement names the version it was made against. When the host records a later
 //! version, the earlier acknowledgement still stands for the version it covered, and the subject
 //! is outstanding again. An acknowledgement is never carried forward onto a version nobody read.
+//!
+//! # Nothing here is retention's to take
+//!
+//! Both halves of this module are authoritative. A subject nobody has acknowledged is outstanding
+//! review work, and deleting it answers that there is none; a subject somebody has acknowledged is
+//! that actor's own record of what they read, and nothing can reconstruct it from the events,
+//! because the cursor that consumed them has already moved. So the table keeps what it is told and
+//! [`Reviews::states_page`] is what bounds the answer instead.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
-use kr_protocol::attention::{
-    MAX_RETAINED_REVIEW_SUBJECTS, MAX_REVIEW_SUBJECTS, ReviewState, ReviewSubject,
-};
+use kr_protocol::attention::{MAX_REVIEW_SUBJECTS, ReviewState, ReviewSubject};
 use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
@@ -64,6 +70,13 @@ pub struct Subject {
     pub version: u64,
     /// When that version was recorded.
     pub at_ms: TimestampMs,
+    /// Where it stands in the order the host first heard of it.
+    ///
+    /// It is set once, when the subject is first recorded, and never moves again. A page continues
+    /// by it rather than by the recorded moment, because a new version changes the moment: a
+    /// subject that moved ahead of the one a client is continuing after would be served twice, and
+    /// one that moved behind it would never be served at all.
+    pub sequence: u64,
 }
 
 /// One actor's acknowledgement of one subject.
@@ -80,6 +93,7 @@ pub struct ReviewAck {
 pub struct Reviews {
     subjects: BTreeMap<String, Subject>,
     acks: BTreeMap<ActorId, BTreeMap<String, ReviewAck>>,
+    next_sequence: u64,
 }
 
 impl Reviews {
@@ -112,62 +126,20 @@ impl Reviews {
                 true
             }
             None => {
+                let sequence = self.next_sequence;
+                self.next_sequence = self.next_sequence.saturating_add(1);
                 self.subjects.insert(
                     key,
                     Subject {
                         subject,
                         version,
                         at_ms,
+                        sequence,
                     },
                 );
                 true
             }
         }
-    }
-
-    /// Keeps the subject table inside [`MAX_RETAINED_REVIEW_SUBJECTS`].
-    ///
-    /// `referenced` names the subjects something else still points at - an inbox item that says a
-    /// turn is waiting to be reviewed, and whatever the event being consumed has just recorded a
-    /// version of. Those are never let go of: an item that says there is review work, beside a
-    /// subject that has gone, is a review nobody can complete, and a capture answered by deleting
-    /// it is review work the host was told about and threw away. Neither is a subject any actor
-    /// has acknowledged, because an acknowledgement is that actor's own record of what it read and
-    /// nothing here can reconstruct it. What is let go of is a subject nobody has pointed at and
-    /// nobody has read, whose version was recorded longest ago.
-    ///
-    /// When everything left is referenced or acknowledged the table goes over its bound rather
-    /// than forgetting one of those, and [`Reviews::states_page`] is what keeps a response
-    /// bounded instead.
-    ///
-    /// Returns the subjects that were let go of.
-    pub fn enforce_bound(&mut self, referenced: &BTreeSet<String>) -> Vec<String> {
-        let acknowledged: BTreeSet<&String> = self
-            .acks
-            .values()
-            .flat_map(std::collections::BTreeMap::keys)
-            .collect();
-        let mut released = Vec::new();
-        while self.subjects.len() > MAX_RETAINED_REVIEW_SUBJECTS {
-            let Some(oldest) = self
-                .subjects
-                .iter()
-                .filter(|(key, _)| !referenced.contains(*key) && !acknowledged.contains(key))
-                .min_by(|left, right| {
-                    left.1
-                        .at_ms
-                        .get()
-                        .cmp(&right.1.at_ms.get())
-                        .then_with(|| left.0.cmp(right.0))
-                })
-                .map(|(key, _)| key.clone())
-            else {
-                break;
-            };
-            self.subjects.remove(&oldest);
-            released.push(oldest);
-        }
-        released
     }
 
     /// Records that one actor read one subject at one version.
@@ -221,10 +193,9 @@ impl Reviews {
 
     /// Returns one page of one actor's state for one session, oldest first.
     ///
-    /// The table holds every subject an actor has acknowledged and every one an inbox item still
-    /// points at, so it has no bound a response could rely on. The page is what is bounded: a
-    /// caller asks for at most [`MAX_REVIEW_SUBJECTS`] and continues after the last subject it
-    /// was given.
+    /// The table keeps every subject it is told about, so it has no bound a response could rely
+    /// on. The page is what is bounded: a caller asks for at most [`MAX_REVIEW_SUBJECTS`] and
+    /// continues after the last subject it was given, in an order that does not move under it.
     ///
     /// # Errors
     ///
@@ -260,16 +231,16 @@ impl Reviews {
         Ok((page, more))
     }
 
-    /// Returns the keys of one session's subjects, oldest recorded version first.
+    /// Returns the keys of one session's subjects, in the order the host first heard of them.
     ///
-    /// The order is total: two subjects recorded in the same millisecond are separated by their
-    /// keys, so a page continues where the last one ended whatever the clock did.
+    /// The order never changes once a subject is in it, which is what makes a page continuable: a
+    /// later version moves a subject's recorded moment but not its place here.
     fn ordered(&self, session_id: SessionId) -> Vec<String> {
         let mut keys: Vec<_> = self
             .subjects
             .iter()
             .filter(|(_, held)| subject_session(&held.subject) == session_id)
-            .map(|(key, held)| (held.at_ms.get(), key.clone()))
+            .map(|(key, held)| (held.sequence, key.clone()))
             .collect();
         keys.sort();
         keys.into_iter().map(|(_, key)| key).collect()
@@ -298,6 +269,11 @@ impl Reviews {
         subjects: BTreeMap<String, Subject>,
         acks: BTreeMap<ActorId, BTreeMap<String, ReviewAck>>,
     ) {
+        self.next_sequence = subjects
+            .values()
+            .map(|held| held.sequence.saturating_add(1))
+            .max()
+            .unwrap_or_default();
         self.subjects = subjects;
         self.acks = acks;
     }

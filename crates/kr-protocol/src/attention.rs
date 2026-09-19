@@ -76,15 +76,12 @@ pub const MAX_ATTENTION_SUMMARY_LEN: usize = 512;
 /// Largest number of model summaries the host keeps for one session.
 pub const MAX_RETAINED_SUMMARIES: usize = 32;
 
-/// Largest number of review subjects the host keeps for one session.
-///
-/// It is where retention starts rather than where the table stops. A subject an inbox item points
-/// at, one an actor has acknowledged and one the host has only just recorded are all authoritative
-/// records rather than a working set, so the table holds them and grows past this figure instead
-/// of forgetting one. [`MAX_REVIEW_SUBJECTS`] is what bounds the answer.
-pub const MAX_RETAINED_REVIEW_SUBJECTS: usize = 500;
-
 /// Largest number of review subjects one review read returns.
+///
+/// The host keeps every subject it is told about: one nobody has read is outstanding review work,
+/// and one somebody has read is that actor's own record of reading it, so neither is a working set
+/// a retention bound may take. This bounds the answer instead, and a caller continues after the
+/// last subject it was given.
 pub const MAX_REVIEW_SUBJECTS: u64 = 200;
 
 /// Largest number of semantic changes one changed-since-last-visit read returns.

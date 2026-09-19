@@ -345,14 +345,14 @@ impl Engine {
                 .is_some_and(|quiet| quiet.covers(reading.minute_of_day()))
     }
 
-    /// Sets or clears the quiet-hours window, releasing anything the change lets through.
-    pub fn set_quiet_hours(
-        &mut self,
-        quiet: Option<QuietHours>,
-        reading: HostReading,
-    ) -> Vec<Outcome> {
+    /// Sets or clears the quiet-hours window.
+    ///
+    /// It records the window and announces nothing. What the change lets through is released by
+    /// the next [`Engine::tick`], which is what [`Engine::next_deadline`] brings forward to now
+    /// while anything is deferred. Announcing here instead would decide against whatever history
+    /// the host had read by the moment somebody happened to change a setting.
+    pub fn set_quiet_hours(&mut self, quiet: Option<QuietHours>) {
         self.quiet = quiet;
-        self.announce_due(reading)
     }
 
     /// Returns the ranges of retained events the host can no longer read.
@@ -548,11 +548,16 @@ impl Engine {
     ///
     /// The order is deliberate. Levels are settled first, then at most one announcement is decided
     /// per item, so an item that climbed a step and was also due a repeat is announced once, at the
-    /// level it now stands at, rather than twice at two levels.
+    /// level it now stands at, rather than twice at two levels. The inbox bound is applied last,
+    /// against what those decisions left.
     pub fn tick(&mut self, reading: HostReading) -> Vec<Outcome> {
         let mut outcomes = self.fire_idle_reminders(reading);
         outcomes.extend(self.climb(reading));
         outcomes.extend(self.announce_due(reading));
+        // Last, because what the bound may let go of is decided by what has just been announced
+        // and by what a consumer has settled since the last pass. An inbox that went over its
+        // bound while everything in it was work in flight comes back inside it here.
+        outcomes.extend(self.enforce_bound());
         outcomes
     }
 
@@ -1038,8 +1043,10 @@ impl Engine {
     /// weighed with the rest: a fresh informational notice does not displace an urgent approval
     /// merely by being the newest thing to arrive.
     ///
-    /// Three things are never let go of: a condition somebody or something is still waiting on, a
-    /// decision no delivery consumer has settled, and a decision quiet hours are holding.
+    /// Four things are never let go of: a condition somebody or something is still waiting on, a
+    /// decision no delivery consumer has settled, a decision quiet hours are holding, and a
+    /// condition nobody has decided about yet, which is what an item is between arriving and being
+    /// announced.
     fn enforce_bound(&mut self) -> Vec<Outcome> {
         let bound = usize::try_from(MAX_RETAINED_ATTENTION_ITEMS).unwrap_or(usize::MAX);
         let mut outcomes = Vec::new();
@@ -1048,10 +1055,16 @@ impl Engine {
                 .items
                 .values()
                 .filter(|item| {
-                    // A decision nobody has taken responsibility for, and one quiet hours are
-                    // holding, are both work in flight. Letting go of the item would lose the
-                    // announcement with it, and nothing offers it again.
-                    rule(item.rule).droppable && item.pending_handoff.is_none() && !item.deferred
+                    // Three of these are not a record of a condition but work in flight, and
+                    // letting go of one loses something nothing will offer again: a decision
+                    // nobody has taken responsibility for, a decision quiet hours are holding,
+                    // and a condition nobody has decided about at all. The last is what a fresh
+                    // item is until it is announced, and what every replayed item is until the
+                    // first tick after the rebuild.
+                    rule(item.rule).droppable
+                        && item.pending_handoff.is_none()
+                        && !item.deferred
+                        && item.since_notified.is_some()
                 })
                 .min_by(|left, right| {
                     left.level
@@ -1062,10 +1075,10 @@ impl Engine {
                 .map(|item| item.key.clone())
             else {
                 // Everything in the inbox is a condition somebody or something is still waiting
-                // on, or a decision about one that has not been delivered yet. The inbox goes over
-                // its bound rather than forgetting one of those: section 25 keeps an outstanding
-                // approval in the inbox, and a host that dropped one would be answering that
-                // nothing is waiting when something is.
+                // on, or a decision about one that has not gone out, been taken or been made. The
+                // inbox goes over its bound rather than forgetting one of those: section 25 keeps
+                // an outstanding approval in the inbox, and a host that dropped one would be
+                // answering that nothing is waiting when something is.
                 break;
             };
             self.items.remove(&victim);
