@@ -1,0 +1,497 @@
+//! The processes the broker launched, their credentials and their immutable source frames.
+//!
+//! Section 11 gives the broker three things nothing else may hold.
+//!
+//! * **The processes.** A managed backend belongs to an `application_instance_id`. The broker
+//!   tracks it by process identity, never by identifier alone, because a process identifier is
+//!   reused within milliseconds of the original exiting.
+//! * **The credentials.** "Credentials stay in the broker and never appear in component memory."
+//!   [`Credential`] has no accessor that returns its bytes: it can authenticate a presented value
+//!   and it can be written into an owner-only registration file, and that is all. A type that
+//!   could hand its bytes to a caller would make the rule a convention.
+//! * **The source frames.** A decoder reads immutable bytes with a generation and a digest. The
+//!   generation advances whenever the bound execution owner changes, so a resource offered from an
+//!   earlier execution's frame is refused rather than attributed to the current one.
+
+use kr_protocol::identity::ProcessStartIdentity;
+use kr_protocol::ids::{ApplicationInstanceId, SourceEventHandle, SourceGeneration};
+use kr_protocol::scalars::{Digest256, TimestampMs};
+
+use crate::broker::error::{BrokerError, Result};
+
+/// Maximum bytes one source frame may carry.
+///
+/// A frame is one upstream message. Anything larger is a stream, and a stream does not become a
+/// pending resource.
+pub const MAX_SOURCE_FRAME_BYTES: usize = 1024 * 1024;
+
+/// Length in bytes of a launch credential.
+pub const CREDENTIAL_BYTES: usize = 32;
+
+/// A per-launch secret the broker holds and never gives back.
+///
+/// It is generated once per launch, written into an owner-only registration file for the process
+/// the broker is about to start, and used to authenticate that process when it connects. Nothing
+/// reads it out: there is no `as_bytes`, no `Display` that prints it and no `Debug` that leaks it.
+pub struct Credential {
+    bytes: [u8; CREDENTIAL_BYTES],
+}
+
+impl Credential {
+    /// Generates a fresh credential.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the host has no key material, because a
+    /// launch that cannot be authenticated is one the broker declines to make.
+    pub fn generate() -> Result<Self> {
+        let mut bytes = [0_u8; CREDENTIAL_BYTES];
+        kr_crypto::random_bytes(&mut bytes).map_err(|error| {
+            BrokerError::ledger(format!("no key material for a launch credential: {error}"))
+        })?;
+        Ok(Self { bytes })
+    }
+
+    /// Builds a credential from known bytes.
+    ///
+    /// This exists for the registration file the broker itself wrote and for tests. It is not a
+    /// way to read one back out: the value goes in and nothing comes out.
+    #[must_use]
+    pub const fn from_bytes(bytes: [u8; CREDENTIAL_BYTES]) -> Self {
+        Self { bytes }
+    }
+
+    /// Returns true when the presented value is this credential.
+    ///
+    /// The comparison does not stop at the first differing byte, so how much of a wrong value was
+    /// right is not something a caller can measure.
+    #[must_use]
+    pub fn authenticates(&self, presented: &[u8]) -> bool {
+        if presented.len() != CREDENTIAL_BYTES {
+            return false;
+        }
+        let mut difference = 0_u8;
+        for (held, offered) in self.bytes.iter().zip(presented) {
+            difference |= held ^ offered;
+        }
+        difference == 0
+    }
+
+    /// Renders the credential for the registration file the launched process reads.
+    ///
+    /// The value leaves the broker exactly once, into a file the broker creates owner-only for the
+    /// process it is about to start. It never goes into an argument vector, an environment
+    /// variable, a URL or a diagnostic.
+    #[must_use]
+    pub fn to_registration_text(&self) -> String {
+        self.bytes.iter().fold(String::new(), |mut text, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{byte:02x}");
+            text
+        })
+    }
+
+    /// Reads a credential back from its registration text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the text is not exactly the right length of
+    /// hexadecimal.
+    pub fn from_registration_text(text: &str) -> Result<Self> {
+        let text = text.trim();
+        if text.len() != CREDENTIAL_BYTES * 2 {
+            return Err(BrokerError::invalid(
+                "a launch credential is 64 hexadecimal characters",
+            ));
+        }
+        let mut bytes = [0_u8; CREDENTIAL_BYTES];
+        for (index, slot) in bytes.iter_mut().enumerate() {
+            let pair = text
+                .get(index * 2..index * 2 + 2)
+                .ok_or_else(|| BrokerError::invalid("a launch credential is hexadecimal"))?;
+            *slot = u8::from_str_radix(pair, 16)
+                .map_err(|_| BrokerError::invalid("a launch credential is hexadecimal"))?;
+        }
+        Ok(Self { bytes })
+    }
+}
+
+impl std::fmt::Debug for Credential {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Credential(<redacted>)")
+    }
+}
+
+impl Drop for Credential {
+    fn drop(&mut self) {
+        // Overwritten rather than left in the allocator's free list. It is not a guarantee against
+        // a reader of this process's memory, and it is not offered as one; it is the cheap half of
+        // not leaving a live secret lying about after the launch it belonged to has ended.
+        for byte in &mut self.bytes {
+            *byte = 0;
+        }
+    }
+}
+
+/// How the broker reaches one upstream.
+///
+/// Section 11 lists the supported transports and then fixes the rule that matters: "Transport
+/// handles bind the selected executable, launch, upstream identity and environment; a plugin
+/// cannot replace them with an arbitrary URL, process or filesystem path."
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum BrokerTransport {
+    /// Newline-delimited JSON over the process's own standard input and output.
+    StdioJsonLines,
+    /// A private Unix socket or Windows named pipe.
+    PrivateSocket,
+    /// Loopback HTTP.
+    LoopbackHttp,
+    /// A WebSocket over loopback.
+    LoopbackWebSocket,
+    /// Server-sent events over loopback.
+    LoopbackServerSentEvents,
+    /// A bounded byte stream for a custom framing.
+    BoundedByteStream,
+    /// An explicitly granted transcript tail.
+    TranscriptTail,
+}
+
+impl BrokerTransport {
+    /// Every transport, in declaration order.
+    pub const ALL: &'static [Self] = &[
+        Self::StdioJsonLines,
+        Self::PrivateSocket,
+        Self::LoopbackHttp,
+        Self::LoopbackWebSocket,
+        Self::LoopbackServerSentEvents,
+        Self::BoundedByteStream,
+        Self::TranscriptTail,
+    ];
+
+    /// Returns the stable name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::StdioJsonLines => "stdio_json_lines",
+            Self::PrivateSocket => "private_socket",
+            Self::LoopbackHttp => "loopback_http",
+            Self::LoopbackWebSocket => "loopback_websocket",
+            Self::LoopbackServerSentEvents => "loopback_server_sent_events",
+            Self::BoundedByteStream => "bounded_byte_stream",
+            Self::TranscriptTail => "transcript_tail",
+        }
+    }
+
+    /// Returns true when this transport can carry the qualified opaque forwarding path.
+    ///
+    /// A transcript tail cannot: it is read-only content, and forwarding needs a channel the host
+    /// can write an answer back on.
+    #[must_use]
+    pub const fn carries_forwarding(self) -> bool {
+        !matches!(self, Self::TranscriptTail)
+    }
+}
+
+impl std::fmt::Display for BrokerTransport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A transport handle, bound to the launch it belongs to.
+///
+/// The three bindings are the whole point. A component that asked for "the connection" would be
+/// asking for a channel it could then point anywhere; what it gets is a handle that already names
+/// the executable, the process and the environment it reaches, and a handle is not something a
+/// component can construct.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransportHandle {
+    /// Which transport it is.
+    pub transport: BrokerTransport,
+    /// The application instance it reaches.
+    pub application_instance_id: ApplicationInstanceId,
+    /// The executable the launch resolved, by its digest.
+    pub executable_digest: Digest256,
+    /// The process the launch started.
+    pub process: ProcessStartIdentity,
+}
+
+/// One upstream process the broker launched and owns.
+#[derive(Debug)]
+pub struct ManagedProcess {
+    /// The instance the process is.
+    pub application_instance_id: ApplicationInstanceId,
+    /// Its process identity, checked in full on every ownership decision.
+    pub process: ProcessStartIdentity,
+    /// The handle the broker reaches it through.
+    pub handle: TransportHandle,
+    /// The credential the process authenticates with. It stays here.
+    credential: Credential,
+    /// True when this backend is dedicated to a native terminal this host started.
+    ///
+    /// Section 7: a native TUI's intentional exit ends the instance and stops its dedicated
+    /// backend. A bypassed or shared backend is never claimed or terminated as owned.
+    pub dedicated: bool,
+    /// The generation of the source frames this process is producing.
+    pub source_generation: SourceGeneration,
+    /// When the broker started it.
+    pub started_at: TimestampMs,
+}
+
+impl ManagedProcess {
+    /// Records a process the broker has launched.
+    #[must_use]
+    pub const fn new(
+        application_instance_id: ApplicationInstanceId,
+        process: ProcessStartIdentity,
+        handle: TransportHandle,
+        credential: Credential,
+        dedicated: bool,
+        started_at: TimestampMs,
+    ) -> Self {
+        Self {
+            application_instance_id,
+            process,
+            handle,
+            credential,
+            dedicated,
+            source_generation: SourceGeneration::new(1),
+            started_at,
+        }
+    }
+
+    /// Returns true when the presented credential and process identity are this process's.
+    ///
+    /// Both are required. Section 11: authenticate "against the expected launch/process binding
+    /// and private exchange, not an environment-variable session ID alone".
+    #[must_use]
+    pub fn authenticates(&self, presented: &[u8], process: &ProcessStartIdentity) -> bool {
+        self.credential.authenticates(presented) && self.process.matches(process)
+    }
+
+    /// Advances the source generation, because the bound execution owner changed.
+    pub fn advance_generation(&mut self) {
+        self.source_generation =
+            SourceGeneration::new(self.source_generation.get().saturating_add(1));
+    }
+
+    /// Writes the registration file the launched process reads its credential from.
+    ///
+    /// The file is created owner-only and refused if it already exists, so a file another writer
+    /// planted is never written into and never read as though this host had written it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the file cannot be created or written.
+    pub fn write_registration(&self, path: &std::path::Path) -> Result<()> {
+        write_owner_only(path, &self.credential.to_registration_text())
+    }
+}
+
+/// Writes one owner-only file that must not already exist.
+fn write_owner_only(path: &std::path::Path, contents: &str) -> Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path).map_err(|error| {
+        BrokerError::ledger(format!(
+            "could not create the registration file {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all())
+        .map_err(|error| {
+            BrokerError::ledger(format!(
+                "could not write the registration file {}: {error}",
+                path.display()
+            ))
+        })
+}
+
+/// One immutable frame of upstream bytes.
+///
+/// The bytes are shared rather than copied per reader, and nothing that reads them can change
+/// them: a decoder is given a handle and a slice, and two decoders reading the same frame read the
+/// same bytes.
+#[derive(Clone, Debug)]
+pub struct SourceFrame {
+    /// The handle a decoder names when it offers a resource from this frame.
+    pub handle: SourceEventHandle,
+    /// The generation this frame belongs to.
+    pub generation: SourceGeneration,
+    /// The digest of the bytes, so the original is identifiable after the frame has gone.
+    pub digest: Digest256,
+    /// The bytes themselves.
+    bytes: std::sync::Arc<[u8]>,
+    /// When the broker received them.
+    pub received_at: TimestampMs,
+}
+
+impl SourceFrame {
+    /// Records one frame of upstream bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the frame is larger than one message may be.
+    pub fn new(
+        handle: SourceEventHandle,
+        generation: SourceGeneration,
+        bytes: &[u8],
+        received_at: TimestampMs,
+    ) -> Result<Self> {
+        if bytes.len() > MAX_SOURCE_FRAME_BYTES {
+            return Err(BrokerError::invalid(format!(
+                "a source frame is at most {MAX_SOURCE_FRAME_BYTES} bytes and this one is {}",
+                bytes.len()
+            )));
+        }
+        Ok(Self {
+            handle,
+            generation,
+            digest: Digest256::from_bytes(kr_cbor::sha256(bytes)),
+            bytes: bytes.into(),
+            received_at,
+        })
+    }
+
+    /// Returns the frame's bytes.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_protocol::identity::ProcessStartSource;
+    use kr_protocol::scalars::Uuid;
+
+    fn process(pid: u64, start: u64) -> ProcessStartIdentity {
+        ProcessStartIdentity::new(pid, ProcessStartSource::MacosProcBsdInfo, start)
+    }
+
+    fn managed(credential: Credential) -> ManagedProcess {
+        let instance = ApplicationInstanceId::new(Uuid::from_bytes([2; 16]));
+        ManagedProcess::new(
+            instance,
+            process(41, 900),
+            TransportHandle {
+                transport: BrokerTransport::PrivateSocket,
+                application_instance_id: instance,
+                executable_digest: Digest256::from_bytes([3; 32]),
+                process: process(41, 900),
+            },
+            credential,
+            true,
+            TimestampMs::new(1),
+        )
+    }
+
+    #[test]
+    fn a_credential_never_prints_itself() {
+        let credential = Credential::from_bytes([9; CREDENTIAL_BYTES]);
+        assert_eq!(format!("{credential:?}"), "Credential(<redacted>)");
+    }
+
+    #[test]
+    fn a_registration_round_trip_is_the_only_way_a_credential_moves() {
+        let credential = Credential::from_bytes([9; CREDENTIAL_BYTES]);
+        let text = credential.to_registration_text();
+        let read = Credential::from_registration_text(&text).expect("the text is well formed");
+        assert!(read.authenticates(&[9; CREDENTIAL_BYTES]));
+        assert!(!read.authenticates(&[8; CREDENTIAL_BYTES]));
+        assert!(!read.authenticates(&[9; 16]));
+        assert!(Credential::from_registration_text("nonsense").is_err());
+    }
+
+    #[test]
+    fn a_process_needs_its_credential_and_its_identity() {
+        let managed = managed(Credential::from_bytes([9; CREDENTIAL_BYTES]));
+        assert!(managed.authenticates(&[9; CREDENTIAL_BYTES], &process(41, 900)));
+        // The right secret from the wrong process: a session identifier that leaked is not a
+        // launch binding.
+        assert!(!managed.authenticates(&[9; CREDENTIAL_BYTES], &process(42, 900)));
+        // The same identifier, a different start time: a recycled process identifier.
+        assert!(!managed.authenticates(&[9; CREDENTIAL_BYTES], &process(41, 901)));
+        // The right process with the wrong secret.
+        assert!(!managed.authenticates(&[8; CREDENTIAL_BYTES], &process(41, 900)));
+    }
+
+    #[test]
+    fn a_registration_file_is_owner_only_and_never_overwrites() {
+        let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("the directory is created");
+        let path = directory.join("registration");
+        let managed = managed(Credential::from_bytes([9; CREDENTIAL_BYTES]));
+        managed
+            .write_registration(&path)
+            .expect("the registration is written");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&path)
+                .expect("the file is there")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        assert!(
+            managed.write_registration(&path).is_err(),
+            "a registration file another writer planted is never written into"
+        );
+        let text = std::fs::read_to_string(&path).expect("the file reads");
+        let read = Credential::from_registration_text(&text).expect("the text is well formed");
+        assert!(read.authenticates(&[9; CREDENTIAL_BYTES]));
+        let _ = std::fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_generation_advances_when_the_owner_changes() {
+        let mut managed = managed(Credential::from_bytes([9; CREDENTIAL_BYTES]));
+        assert_eq!(managed.source_generation, SourceGeneration::new(1));
+        managed.advance_generation();
+        assert_eq!(managed.source_generation, SourceGeneration::new(2));
+    }
+
+    #[test]
+    fn a_source_frame_is_immutable_and_bounded() {
+        let frame = SourceFrame::new(
+            SourceEventHandle::new("frame-1").expect("valid"),
+            SourceGeneration::new(1),
+            b"{\"method\":\"session/update\"}",
+            TimestampMs::new(1),
+        )
+        .expect("the frame is recorded");
+        let copy = frame.clone();
+        assert_eq!(frame.bytes(), copy.bytes());
+        assert_eq!(frame.digest, copy.digest);
+
+        let oversized = vec![0_u8; MAX_SOURCE_FRAME_BYTES + 1];
+        assert!(
+            SourceFrame::new(
+                SourceEventHandle::new("frame-2").expect("valid"),
+                SourceGeneration::new(1),
+                &oversized,
+                TimestampMs::new(1),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn a_transcript_tail_cannot_carry_forwarding() {
+        assert!(!BrokerTransport::TranscriptTail.carries_forwarding());
+        for transport in BrokerTransport::ALL {
+            if *transport != BrokerTransport::TranscriptTail {
+                assert!(transport.carries_forwarding(), "{transport} should forward");
+            }
+        }
+    }
+}

@@ -1,0 +1,906 @@
+//! The broker's durable records.
+//!
+//! Section 11 requires the broker to retain a ledger of what a decoder did and what it was checked
+//! against, and section 24 makes the worker's journal the authoritative store for "live receipts,
+//! approvals, questions and gateway source bindings". This ledger lives in that same journal file,
+//! beside the receipt tables and the question tables, with its own version row: neither migration
+//! reads the other's, and a plugin-process failure cannot destroy any of them because none of them
+//! is in the plugin process.
+//!
+//! What is kept, and why each row is here rather than in memory:
+//!
+//! * **Bindings** carry the three grants and the decoding-trust record. A restarted worker that
+//!   forgot them would re-grant by default or refuse work the user had already permitted.
+//! * **Decoder entries** name the package, its publisher, the original source and the request it
+//!   produced. A person inspecting a pending approval has to be able to see whose interpretation
+//!   it is, after the process that produced it has gone.
+//! * **Consumed sources** are the non-reuse check. A decoder may offer a resource from a fresh
+//!   source event handle once; the same handle offered twice is refused, and that has to survive a
+//!   restart or the second offer would succeed after one.
+//! * **Pending resources** are what reconnect reconciles against. Their durable state is what
+//!   stops a second response from being emitted for an identifier the host may already have
+//!   answered.
+//! * **Launch profiles** record what was actually resolved and run.
+//! * **Evidence gaps** record each spell of volatile operation, so the gap is committed when
+//!   storage returns rather than quietly forgotten.
+//! * **Adapter checkpoints** are the consumed semantic cursor a restart replays from.
+
+use kr_protocol::broker::{BrokerGrants, DecoderLedgerEntry, DecodingTrust, LaunchProfile};
+use kr_protocol::gateway::{Durability, EvidenceGap, PendingResource, PendingState};
+use kr_protocol::ids::{
+    ApplicationInstanceId, BrokerBindingId, PendingResourceId, SourceGeneration, StreamCursor,
+};
+use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
+use rusqlite::{Connection, OptionalExtension as _, params};
+
+use crate::broker::error::{BrokerError, Result};
+
+/// The schema version this build reads.
+pub const SCHEMA_VERSION: i64 = 1;
+
+/// How long the ledger waits for another connection to finish writing.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// One binding, as the ledger holds it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BindingRecord {
+    /// The binding.
+    pub binding_id: BrokerBindingId,
+    /// The application instance it is bound to.
+    pub application_instance_id: ApplicationInstanceId,
+    /// The three grants, each held separately.
+    pub grants: BrokerGrants,
+    /// The decoding trust, where the binding has any.
+    ///
+    /// Absent is the default and the safe one: a component with no record here cannot create an
+    /// approval resource whatever it reports.
+    pub trust: Option<DecodingTrust>,
+    /// When the binding was recorded.
+    pub bound_at: TimestampMs,
+}
+
+/// The broker's durable records, in the worker's own journal file.
+#[derive(Debug)]
+pub struct Ledger {
+    connection: Connection,
+}
+
+impl Ledger {
+    /// Opens the ledger beside the receipt journal, or in memory when there is no journal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the file cannot be opened or its schema
+    /// cannot be created.
+    pub fn open(path: Option<&std::path::Path>) -> Result<Self> {
+        let connection = match path {
+            Some(path) => Connection::open(path),
+            None => Connection::open_in_memory(),
+        }
+        .map_err(BrokerError::ledger)?;
+        let ledger = Self { connection };
+        ledger.prepare()?;
+        Ok(ledger)
+    }
+
+    fn prepare(&self) -> Result<()> {
+        self.connection
+            .busy_timeout(BUSY_TIMEOUT)
+            .map_err(BrokerError::ledger)?;
+        self.connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(BrokerError::ledger)?;
+        self.connection
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(BrokerError::ledger)?;
+        self.connection
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS broker_schema (version INTEGER NOT NULL);
+                 CREATE TABLE IF NOT EXISTS broker_bindings (
+                     binding_id              BLOB PRIMARY KEY,
+                     application_instance_id BLOB NOT NULL,
+                     grants                  BLOB NOT NULL,
+                     trust                   BLOB,
+                     bound_at_ms             INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS broker_bindings_by_instance
+                     ON broker_bindings (application_instance_id);
+                 CREATE TABLE IF NOT EXISTS broker_decoder_entries (
+                     resource_id   BLOB PRIMARY KEY,
+                     entry         BLOB NOT NULL,
+                     recorded_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS broker_consumed_sources (
+                     binding_id        BLOB    NOT NULL,
+                     source_generation INTEGER NOT NULL,
+                     source_digest     BLOB    NOT NULL,
+                     consumed_at_ms    INTEGER NOT NULL,
+                     PRIMARY KEY (binding_id, source_generation, source_digest)
+                 );
+                 CREATE TABLE IF NOT EXISTS broker_pending (
+                     resource_id             BLOB PRIMARY KEY,
+                     application_instance_id BLOB NOT NULL,
+                     connection_id           INTEGER NOT NULL,
+                     upstream_request_id     TEXT NOT NULL,
+                     state                   TEXT NOT NULL,
+                     durability              TEXT NOT NULL,
+                     record                  BLOB NOT NULL,
+                     recorded_at_ms          INTEGER NOT NULL,
+                     resolved_at_ms          INTEGER
+                 );
+                 CREATE UNIQUE INDEX IF NOT EXISTS broker_pending_by_request
+                     ON broker_pending (connection_id, upstream_request_id);
+                 CREATE INDEX IF NOT EXISTS broker_pending_by_state ON broker_pending (state);
+                 CREATE TABLE IF NOT EXISTS broker_profiles (
+                     profile_id              TEXT PRIMARY KEY,
+                     application_instance_id BLOB,
+                     profile                 BLOB NOT NULL,
+                     resolved_at_ms          INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS broker_gaps (
+                     sequence     INTEGER PRIMARY KEY AUTOINCREMENT,
+                     opened_at_ms INTEGER NOT NULL,
+                     closed_at_ms INTEGER,
+                     record       BLOB NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS broker_checkpoints (
+                     application_instance_id BLOB PRIMARY KEY,
+                     consumed_cursor         INTEGER NOT NULL,
+                     updated_at_ms           INTEGER NOT NULL
+                 );",
+            )
+            .map_err(BrokerError::ledger)?;
+        let recorded: Option<i64> = self
+            .connection
+            .query_row("SELECT version FROM broker_schema", [], |row| row.get(0))
+            .optional()
+            .map_err(BrokerError::ledger)?;
+        match recorded {
+            None => {
+                self.connection
+                    .execute(
+                        "INSERT INTO broker_schema (version) VALUES (?1)",
+                        params![SCHEMA_VERSION],
+                    )
+                    .map_err(BrokerError::ledger)?;
+            }
+            Some(version) if version == SCHEMA_VERSION => {}
+            Some(version) => {
+                return Err(BrokerError::ledger(format!(
+                    "this ledger is at schema version {version}; this build reads {SCHEMA_VERSION}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    // -- bindings -----------------------------------------------------------------------------
+
+    /// Writes or replaces one binding's grants and decoding trust.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails, and
+    /// [`BrokerError::Trust`] when the trust record breaks section 11's rules, because a record
+    /// the broker would not act on is not one to store.
+    pub fn put_binding(&self, record: &BindingRecord) -> Result<()> {
+        if let Some(trust) = record.trust.as_ref() {
+            trust.validate()?;
+        }
+        self.connection
+            .execute(
+                "INSERT INTO broker_bindings
+                     (binding_id, application_instance_id, grants, trust, bound_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (binding_id) DO UPDATE SET
+                     application_instance_id = excluded.application_instance_id,
+                     grants = excluded.grants,
+                     trust  = excluded.trust",
+                params![
+                    record.binding_id.get().as_bytes().as_slice(),
+                    record.application_instance_id.get().as_bytes().as_slice(),
+                    encode(&record.grants)?,
+                    record.trust.as_ref().map(encode).transpose()?,
+                    i64::try_from(record.bound_at.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(())
+    }
+
+    /// Reads one binding.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails or a stored record cannot be
+    /// decoded.
+    pub fn binding(&self, binding_id: BrokerBindingId) -> Result<Option<BindingRecord>> {
+        self.connection
+            .query_row(
+                "SELECT application_instance_id, grants, trust, bound_at_ms
+                 FROM broker_bindings WHERE binding_id = ?1",
+                params![binding_id.get().as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(BrokerError::ledger)?
+            .map(|(instance, grants, trust, bound_at)| {
+                Ok(BindingRecord {
+                    binding_id,
+                    application_instance_id: ApplicationInstanceId::new(uuid_from(&instance)?),
+                    grants: decode(&grants)?,
+                    trust: trust.as_deref().map(decode).transpose()?,
+                    bound_at: TimestampMs::new(u64::try_from(bound_at).unwrap_or(0)),
+                })
+            })
+            .transpose()
+    }
+
+    /// Reads every binding of one application instance.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
+    pub fn bindings_of(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Result<Vec<BindingRecord>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT binding_id, grants, trust, bound_at_ms FROM broker_bindings
+                 WHERE application_instance_id = ?1 ORDER BY bound_at_ms, binding_id",
+            )
+            .map_err(BrokerError::ledger)?;
+        let rows = statement
+            .query_map(
+                params![application_instance_id.get().as_bytes().as_slice()],
+                |row| {
+                    Ok((
+                        row.get::<_, Vec<u8>>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, Option<Vec<u8>>>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(BrokerError::ledger)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(BrokerError::ledger)?;
+        rows.into_iter()
+            .map(|(binding, grants, trust, bound_at)| {
+                Ok(BindingRecord {
+                    binding_id: BrokerBindingId::new(uuid_from(&binding)?),
+                    application_instance_id,
+                    grants: decode(&grants)?,
+                    trust: trust.as_deref().map(decode).transpose()?,
+                    bound_at: TimestampMs::new(u64::try_from(bound_at).unwrap_or(0)),
+                })
+            })
+            .collect()
+    }
+
+    /// Removes one binding and everything that hangs from it.
+    ///
+    /// The decoder entries stay: they are the record of what was already offered, and forgetting
+    /// them because the binding ended would lose the provenance of a pending approval.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
+    pub fn remove_binding(&self, binding_id: BrokerBindingId) -> Result<()> {
+        self.connection
+            .execute(
+                "DELETE FROM broker_bindings WHERE binding_id = ?1",
+                params![binding_id.get().as_bytes().as_slice()],
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(())
+    }
+
+    // -- the decoder ledger -------------------------------------------------------------------
+
+    /// Records what a decoder offered, against the resource it produced.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
+    pub fn record_decoding(
+        &self,
+        resource_id: PendingResourceId,
+        entry: &DecoderLedgerEntry,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT OR REPLACE INTO broker_decoder_entries
+                     (resource_id, entry, recorded_at_ms) VALUES (?1, ?2, ?3)",
+                params![
+                    resource_id.get().as_bytes().as_slice(),
+                    encode(entry)?,
+                    i64::try_from(entry.decoded_at.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(())
+    }
+
+    /// Reads the decoder entry behind one pending resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
+    pub fn decoding(&self, resource_id: PendingResourceId) -> Result<Option<DecoderLedgerEntry>> {
+        self.connection
+            .query_row(
+                "SELECT entry FROM broker_decoder_entries WHERE resource_id = ?1",
+                params![resource_id.get().as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(BrokerError::ledger)?
+            .map(|bytes| decode(&bytes))
+            .transpose()
+    }
+
+    /// Claims one source event handle for one binding, exactly once.
+    ///
+    /// Returns true when this is the first claim. A second claim of the same handle returns false
+    /// and writes nothing, which is the non-reuse check section 11 requires the broker to make
+    /// before it believes a decoder.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails for any reason other than
+    /// the uniqueness constraint.
+    pub fn claim_source(
+        &self,
+        binding_id: BrokerBindingId,
+        generation: SourceGeneration,
+        digest: &Digest256,
+        now: TimestampMs,
+    ) -> Result<bool> {
+        let inserted = self
+            .connection
+            .execute(
+                "INSERT OR IGNORE INTO broker_consumed_sources
+                     (binding_id, source_generation, source_digest, consumed_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    binding_id.get().as_bytes().as_slice(),
+                    i64::try_from(generation.get()).unwrap_or(i64::MAX),
+                    digest.as_bytes().as_slice(),
+                    i64::try_from(now.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(inserted == 1)
+    }
+
+    // -- pending resources --------------------------------------------------------------------
+
+    /// Writes or replaces one pending resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
+    pub fn put_pending(&self, resource: &PendingResource) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO broker_pending
+                     (resource_id, application_instance_id, connection_id, upstream_request_id,
+                      state, durability, record, recorded_at_ms, resolved_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)
+                 ON CONFLICT (resource_id) DO UPDATE SET
+                     state = excluded.state,
+                     durability = excluded.durability,
+                     record = excluded.record",
+                params![
+                    resource.resource_id.get().as_bytes().as_slice(),
+                    resource.application_instance_id.get().as_bytes().as_slice(),
+                    i64::try_from(resource.request.connection.get()).unwrap_or(i64::MAX),
+                    resource.request.upstream.as_str(),
+                    resource.state.as_str(),
+                    resource.durability.as_str(),
+                    encode(resource)?,
+                    i64::try_from(resource.recorded_at.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(())
+    }
+
+    /// Moves one pending resource to a new state, recording when it settled.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
+    pub fn settle_pending(&self, resource: &PendingResource, now: TimestampMs) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE broker_pending
+                 SET state = ?2, durability = ?3, record = ?4,
+                     resolved_at_ms = CASE WHEN ?5 THEN ?6 ELSE resolved_at_ms END
+                 WHERE resource_id = ?1",
+                params![
+                    resource.resource_id.get().as_bytes().as_slice(),
+                    resource.state.as_str(),
+                    resource.durability.as_str(),
+                    encode(resource)?,
+                    resource.state.is_terminal(),
+                    i64::try_from(now.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(())
+    }
+
+    /// Reads one pending resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
+    pub fn pending(&self, resource_id: PendingResourceId) -> Result<Option<PendingResource>> {
+        self.connection
+            .query_row(
+                "SELECT record FROM broker_pending WHERE resource_id = ?1",
+                params![resource_id.get().as_bytes().as_slice()],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .optional()
+            .map_err(BrokerError::ledger)?
+            .map(|bytes| decode(&bytes))
+            .transpose()
+    }
+
+    /// Reads every resource that is still unresolved.
+    ///
+    /// This is what a restarted worker reconciles from: what it may already have answered, and
+    /// what nobody has answered yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
+    pub fn unresolved(&self) -> Result<Vec<PendingResource>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT record FROM broker_pending
+                 WHERE state IN ('pending', 'claimed') ORDER BY recorded_at_ms, resource_id",
+            )
+            .map_err(BrokerError::ledger)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(BrokerError::ledger)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(BrokerError::ledger)?;
+        rows.iter().map(|bytes| decode(bytes)).collect()
+    }
+
+    // -- launch profiles ----------------------------------------------------------------------
+
+    /// Records one resolved launch profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
+    pub fn put_profile(
+        &self,
+        profile: &LaunchProfile,
+        application_instance_id: Option<ApplicationInstanceId>,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO broker_profiles
+                     (profile_id, application_instance_id, profile, resolved_at_ms)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (profile_id) DO UPDATE SET
+                     application_instance_id = excluded.application_instance_id,
+                     profile = excluded.profile",
+                params![
+                    profile.profile_id.as_str(),
+                    application_instance_id.map(|id| id.get().as_bytes().to_vec()),
+                    encode(profile)?,
+                    i64::try_from(profile.resolved_at.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(())
+    }
+
+    /// Reads every recorded launch profile, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
+    pub fn profiles(&self) -> Result<Vec<LaunchProfile>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT profile FROM broker_profiles ORDER BY resolved_at_ms, profile_id")
+            .map_err(BrokerError::ledger)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(BrokerError::ledger)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(BrokerError::ledger)?;
+        rows.iter().map(|bytes| decode(bytes)).collect()
+    }
+
+    // -- evidence gaps ------------------------------------------------------------------------
+
+    /// Records a gap that has just opened, returning its row.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
+    pub fn open_gap(&self, gap: &EvidenceGap) -> Result<i64> {
+        self.connection
+            .execute(
+                "INSERT INTO broker_gaps (opened_at_ms, closed_at_ms, record)
+                 VALUES (?1, NULL, ?2)",
+                params![
+                    i64::try_from(gap.opened_at.get()).unwrap_or(i64::MAX),
+                    encode(gap)?,
+                ],
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(self.connection.last_insert_rowid())
+    }
+
+    /// Commits a gap that has closed.
+    ///
+    /// What is committed is the gap itself: when it opened, why, what passed through it and how
+    /// many claimed identifiers were carried across. The operations inside it are never replayed
+    /// into durable history.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
+    pub fn commit_gap(&self, row: i64, gap: &EvidenceGap) -> Result<()> {
+        self.connection
+            .execute(
+                "UPDATE broker_gaps SET closed_at_ms = ?2, record = ?3 WHERE sequence = ?1",
+                params![
+                    row,
+                    gap.closed_at
+                        .as_ref()
+                        .map(|at| i64::try_from(at.get()).unwrap_or(i64::MAX)),
+                    encode(gap)?,
+                ],
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(())
+    }
+
+    /// Reads every recorded gap, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
+    pub fn gaps(&self) -> Result<Vec<EvidenceGap>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT record FROM broker_gaps ORDER BY sequence")
+            .map_err(BrokerError::ledger)?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, Vec<u8>>(0))
+            .map_err(BrokerError::ledger)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(BrokerError::ledger)?;
+        rows.iter().map(|bytes| decode(bytes)).collect()
+    }
+
+    // -- adapter checkpoints ------------------------------------------------------------------
+
+    /// Records the last semantic cursor one adapter consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the write fails.
+    pub fn put_checkpoint(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        cursor: StreamCursor,
+        now: TimestampMs,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO broker_checkpoints
+                     (application_instance_id, consumed_cursor, updated_at_ms)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT (application_instance_id) DO UPDATE SET
+                     consumed_cursor = MAX(consumed_cursor, excluded.consumed_cursor),
+                     updated_at_ms = excluded.updated_at_ms",
+                params![
+                    application_instance_id.get().as_bytes().as_slice(),
+                    i64::try_from(cursor.get()).unwrap_or(i64::MAX),
+                    i64::try_from(now.get()).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(())
+    }
+
+    /// Reads one adapter's consumed cursor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
+    pub fn checkpoint(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Result<Option<StreamCursor>> {
+        Ok(self
+            .connection
+            .query_row(
+                "SELECT consumed_cursor FROM broker_checkpoints WHERE application_instance_id = ?1",
+                params![application_instance_id.get().as_bytes().as_slice()],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(BrokerError::ledger)?
+            .map(|cursor| StreamCursor::new(u64::try_from(cursor).unwrap_or(0))))
+    }
+
+    /// Returns how many pending resources this ledger holds in a given durability.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the read fails.
+    pub fn count_pending(&self, durability: Durability, state: PendingState) -> Result<u64> {
+        let count: i64 = self
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM broker_pending WHERE durability = ?1 AND state = ?2",
+                params![durability.as_str(), state.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(BrokerError::ledger)?;
+        Ok(u64::try_from(count).unwrap_or(0))
+    }
+}
+
+fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>> {
+    kr_cbor::to_canonical_vec(value).map_err(BrokerError::ledger)
+}
+
+fn decode<T: serde::de::DeserializeOwned + serde::Serialize>(bytes: &[u8]) -> Result<T> {
+    kr_cbor::from_canonical_slice(bytes, &kr_cbor::Limits::DEFAULT)
+        .map_err(|error| BrokerError::ledger(format!("a stored record could not be read: {error}")))
+}
+
+fn uuid_from(bytes: &[u8]) -> Result<Uuid> {
+    let array: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| BrokerError::ledger("a stored identifier is not sixteen bytes"))?;
+    Ok(Uuid::from_bytes(array))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kr_protocol::broker::{BrokerGrant, DecodingTrust};
+    use kr_protocol::gateway::{
+        DownstreamRequestId, NativeClassification, NativeMethodClass, PendingKind,
+    };
+    use kr_protocol::ids::{
+        GatewayConnectionId, PluginId, PublisherId, UpstreamMethod, UpstreamRequestId,
+    };
+    use kr_protocol::scalars::{Nullable, U64};
+
+    /// A journal file of this test's own, on the internal disk.
+    fn ledger_path() -> std::path::PathBuf {
+        let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("the directory is created");
+        directory.join("session.sqlite")
+    }
+
+    fn instance() -> ApplicationInstanceId {
+        ApplicationInstanceId::new(Uuid::from_bytes([2; 16]))
+    }
+
+    fn trust() -> DecodingTrust {
+        DecodingTrust {
+            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+            publisher_id: PublisherId::new("kalareach").expect("valid"),
+            package_digest: Digest256::from_bytes([5; 32]),
+            methods: [UpstreamMethod::new("session/request_permission").expect("valid")]
+                .into_iter()
+                .collect(),
+            may_encode_response: true,
+            granted_at: TimestampMs::new(1),
+        }
+    }
+
+    fn resource(state: PendingState) -> PendingResource {
+        PendingResource {
+            resource_id: PendingResourceId::new(Uuid::from_bytes([7; 16])),
+            application_instance_id: instance(),
+            request: DownstreamRequestId::new(
+                GatewayConnectionId::new(1),
+                UpstreamRequestId::new("11").expect("valid"),
+            ),
+            kind: PendingKind::Approval,
+            method: UpstreamMethod::new("session/request_permission").expect("valid"),
+            classification: NativeClassification::declared(NativeMethodClass::Mutation),
+            source_generation: SourceGeneration::new(3),
+            state,
+            durability: Durability::Durable,
+            deadline_ms: Nullable::null(),
+            recorded_at: TimestampMs::new(10),
+            interpretation_verified: true,
+        }
+    }
+
+    #[test]
+    fn a_binding_keeps_its_grants_and_its_trust_across_a_reopen() {
+        let file = ledger_path();
+        let record = BindingRecord {
+            binding_id: BrokerBindingId::new(Uuid::from_bytes([9; 16])),
+            application_instance_id: instance(),
+            grants: kr_protocol::broker::BrokerGrants::granted([
+                BrokerGrant::Observation,
+                BrokerGrant::ApprovalInterpreter,
+            ]),
+            trust: Some(trust()),
+            bound_at: TimestampMs::new(5),
+        };
+        {
+            let ledger = Ledger::open(Some(&file)).expect("the ledger opens");
+            ledger.put_binding(&record).expect("the binding is written");
+        }
+        let reopened = Ledger::open(Some(&file)).expect("the ledger reopens");
+        let read = reopened
+            .binding(record.binding_id)
+            .expect("the read succeeds")
+            .expect("the binding is still there");
+        assert_eq!(read, record);
+        assert!(read.grants.holds(BrokerGrant::ApprovalInterpreter));
+        assert!(!read.grants.holds(BrokerGrant::UpstreamAction));
+    }
+
+    #[test]
+    fn a_source_handle_is_claimed_once_and_the_claim_survives_a_reopen() {
+        let file = ledger_path();
+        let binding = BrokerBindingId::new(Uuid::from_bytes([9; 16]));
+        let digest = Digest256::from_bytes([4; 32]);
+        {
+            let ledger = Ledger::open(Some(&file)).expect("the ledger opens");
+            assert!(
+                ledger
+                    .claim_source(
+                        binding,
+                        SourceGeneration::new(1),
+                        &digest,
+                        TimestampMs::new(1)
+                    )
+                    .expect("the claim succeeds")
+            );
+            assert!(
+                !ledger
+                    .claim_source(
+                        binding,
+                        SourceGeneration::new(1),
+                        &digest,
+                        TimestampMs::new(2)
+                    )
+                    .expect("the second claim is answered")
+            );
+        }
+        let reopened = Ledger::open(Some(&file)).expect("the ledger reopens");
+        assert!(
+            !reopened
+                .claim_source(
+                    binding,
+                    SourceGeneration::new(1),
+                    &digest,
+                    TimestampMs::new(3)
+                )
+                .expect("the claim after a restart is answered"),
+            "a restart must not let the same source event be offered again"
+        );
+        assert!(
+            reopened
+                .claim_source(
+                    binding,
+                    SourceGeneration::new(2),
+                    &digest,
+                    TimestampMs::new(4)
+                )
+                .expect("a later generation is a different handle"),
+            "the same bytes in a later generation are a different source event"
+        );
+    }
+
+    #[test]
+    fn an_unresolved_resource_is_what_a_restart_reconciles_from() {
+        let file = ledger_path();
+        {
+            let ledger = Ledger::open(Some(&file)).expect("the ledger opens");
+            ledger
+                .put_pending(&resource(PendingState::Claimed))
+                .expect("the resource is written");
+        }
+        let reopened = Ledger::open(Some(&file)).expect("the ledger reopens");
+        let unresolved = reopened.unresolved().expect("the read succeeds");
+        assert_eq!(unresolved.len(), 1);
+        assert_eq!(unresolved[0].state, PendingState::Claimed);
+
+        let mut resolved = resource(PendingState::Uncertain);
+        resolved.state = PendingState::Uncertain;
+        reopened
+            .settle_pending(&resolved, TimestampMs::new(20))
+            .expect("the settle succeeds");
+        assert!(reopened.unresolved().expect("the read succeeds").is_empty());
+        assert_eq!(
+            reopened
+                .pending(resolved.resource_id)
+                .expect("the read succeeds")
+                .expect("the record is still there")
+                .state,
+            PendingState::Uncertain
+        );
+    }
+
+    #[test]
+    fn a_decoder_entry_outlives_the_binding_that_wrote_it() {
+        let ledger = Ledger::open(None).expect("the ledger opens");
+        let binding = BrokerBindingId::new(Uuid::from_bytes([9; 16]));
+        let entry = DecoderLedgerEntry {
+            binding_id: binding,
+            plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+            publisher_id: PublisherId::new("kalareach").expect("valid"),
+            package_digest: Digest256::from_bytes([5; 32]),
+            method: UpstreamMethod::new("session/request_permission").expect("valid"),
+            source_generation: SourceGeneration::new(3),
+            source_digest: Digest256::from_bytes([6; 32]),
+            offered_decisions: U64::new(2),
+            deadline_ms: Nullable::null(),
+            decoded_at: TimestampMs::new(12),
+        };
+        let resource_id = PendingResourceId::new(Uuid::from_bytes([7; 16]));
+        ledger
+            .record_decoding(resource_id, &entry)
+            .expect("the entry is written");
+        ledger
+            .put_binding(&BindingRecord {
+                binding_id: binding,
+                application_instance_id: instance(),
+                grants: kr_protocol::broker::BrokerGrants::granted([
+                    BrokerGrant::ApprovalInterpreter,
+                ]),
+                trust: Some(trust()),
+                bound_at: TimestampMs::new(5),
+            })
+            .expect("the binding is written");
+        ledger.remove_binding(binding).expect("the binding goes");
+        assert_eq!(
+            ledger
+                .decoding(resource_id)
+                .expect("the read succeeds")
+                .expect("the entry is still there"),
+            entry
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_never_moves_backwards() {
+        let ledger = Ledger::open(None).expect("the ledger opens");
+        ledger
+            .put_checkpoint(instance(), StreamCursor::new(40), TimestampMs::new(1))
+            .expect("the checkpoint is written");
+        ledger
+            .put_checkpoint(instance(), StreamCursor::new(20), TimestampMs::new(2))
+            .expect("the older checkpoint is written");
+        assert_eq!(
+            ledger.checkpoint(instance()).expect("the read succeeds"),
+            Some(StreamCursor::new(40))
+        );
+    }
+}

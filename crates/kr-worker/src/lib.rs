@@ -10,6 +10,7 @@
 //! | [`action`] | Section 9's action model: freshness windows, de-duplication, cancellation, observation and the host time contract |
 //! | [`attachments`] | Attachments, geometry ownership and succession |
 //! | [`attention`] | Section 25's attention engine, its feature store and the review and attention methods |
+//! | [`broker`] | The trusted broker: agent processes, grants, decoding trust, action tokens, the gateway, the local listener and volatile-native mode |
 //! | [`desktop`] | The desktop a session runs on, whether it is still there, and what may be done on it |
 //! | [`environment`] | The root shell's environment: what is inherited, what is replaced, what is refused |
 //! | [`fence`] | The root editor's fence and detach machine, driven against the real clock and the real bridge |
@@ -36,6 +37,7 @@
 pub mod action;
 pub mod attachments;
 pub mod attention;
+pub mod broker;
 pub mod config;
 pub mod desktop;
 pub mod environment;
