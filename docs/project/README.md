@@ -641,16 +641,22 @@ removes is never opened at all:
    component is refused whatever its case, and so is the directory **this** repository resolves its
    own data to. Every path the capture's own readings name, and every directory above it, is then
    asked whether it holds a `.git`: one that does is another repository, whose tree this host does
-   not read inside at all, and whose `.git` **file** is read for where that repository keeps its
-   data, which is refused wherever inside the working tree it lands, beside the tree or above it.
-   The name that target resolves to is then walked through the working tree's own handle, which
-   refuses a link, so the exclusion names the place the data actually is rather than a name that
-   points at it. A target this host cannot place that way is an answer it does not have, and the
-   capture is refused rather than taken without it. What is inside would otherwise be
-   that repository's configuration, which holds its remotes and can hold a credential, and its
-   object database, which holds every version of every file in it. What this covers is what a
-   capture reads: a repository in a directory no path of the capture goes near is one the capture
-   does not reach either.
+   not read inside at all. What is inside would otherwise be that repository's configuration, which
+   holds its remotes and can hold a credential, and its object database, which holds every version
+   of every file in it.
+
+   A nested repository whose `.git` is a **file** names the directory its data is really in, and
+   that name can be spelled any way Git accepts, can reach through a link this host will not
+   follow, can name a linked worktree whose configuration lives somewhere else again, and can name
+   something that is not there while the base commit still holds what used to be under it. Rather
+   than guess at any of those, **this host refuses to capture the tree at all** and says so. The
+   one exception is the ordinary submodule: a target that spells its way into this repository's own
+   administrative directory is already refused by the first rule, so the capture runs and the
+   submodule's tree is named as an exclusion.
+
+   What this covers is what a capture reads: a repository in a directory no path of the capture
+   goes near is one the capture does not reach either.
+
 2. This host's own secret rules: `.env` and its variants, a private key by name or by suffix, a
    credential or authentication file, and everything under `.ssh`, `.gnupg` or `.aws`. No wire field
    turns them off, and the version records that they were applied.

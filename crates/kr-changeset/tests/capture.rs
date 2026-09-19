@@ -936,15 +936,18 @@ fn a_nested_repository_s_own_data_is_never_captured() {
     );
 }
 
-/// KR-REQ-14.33: a nested repository is refused however it keeps its own data.
+/// KR-REQ-14.33: a nested repository that keeps its data elsewhere refuses the whole capture.
 ///
-/// A `.git` **file** points a repository's administrative data at a directory of any name, by any
-/// spelling, anywhere it can reach. Nothing the walk could resolve would answer every one of them,
-/// so the answer is the tree itself: this host does not read inside another repository.
+/// A `.git` **file** names the directory a repository's data is really in, and the name can be
+/// spelled any way Git accepts, can reach through a link, can name a linked worktree whose
+/// configuration is somewhere else again, and can name something that is not there while the base
+/// commit still holds what used to be under it. Each is a way another repository's configuration
+/// would reach a version, so a tree with a nested repository of that shape is one this host does
+/// not capture.
 #[test]
-fn a_nested_repository_that_renamed_its_own_data_is_never_captured() {
+fn a_nested_repository_that_keeps_its_data_elsewhere_refuses_the_capture() {
     let fixture = Fixture::create();
-    let path = ordinary_repository(fixture.work(), "renamed-tree");
+    let path = ordinary_repository(fixture.work(), "elsewhere-tree");
     let nested = path.join("vendor/inner");
     std::fs::create_dir_all(&nested).expect("a directory");
     git_raw(&nested, ["init", "--initial-branch=main"]);
@@ -958,113 +961,52 @@ fn a_nested_repository_that_renamed_its_own_data_is_never_captured() {
         ],
     );
     write(&nested, "inner.txt", "inner content\n");
-    let mut held = nested.join(".git");
-    let workspace = fixture.workspace("renamed-tree");
+    std::fs::rename(nested.join(".git"), path.join("vendor/repo-data"))
+        .expect("the data moves beside the nested tree");
+    std::os::unix::fs::symlink("repo-data", path.join("vendor/git-alias")).expect("a link to it");
+    let workspace = fixture.workspace("elsewhere-tree");
+    let policy = include_everything();
+    let grant = kr_protocol::changeset::FileGrant::default();
 
-    // Every spelling Git accepts, and every place it can point at: beside the tree, above it, and
-    // named by the whole absolute path.
-    for (target, where_it_is) in [
-        ("repo-data".to_owned(), nested.join("repo-data")),
-        ("./repo-data".to_owned(), nested.join("repo-data")),
-        (
-            nested.join("repo-data").display().to_string(),
-            nested.join("repo-data"),
-        ),
-        (
-            "../repo-data".to_owned(),
-            path.join("vendor").join("repo-data"),
-        ),
+    // Every spelling, the place beside the tree, the place reached through a link, and a place
+    // that is not there at all.
+    for target in [
+        "repo-data",
+        "./repo-data",
+        "../repo-data",
+        "../git-alias",
+        "../not-there",
     ] {
-        if held != where_it_is {
-            if where_it_is.exists() {
-                std::fs::remove_dir_all(&where_it_is).expect("a clean start for this spelling");
-            }
-            std::fs::create_dir_all(where_it_is.parent().expect("a parent")).expect("its parent");
-            std::fs::rename(&held, &where_it_is).expect("the data moves to where this says");
-            held = where_it_is.clone();
-        }
         std::fs::write(
             nested.join(".git"),
             format!("gitdir: {target}\n").as_bytes(),
         )
         .expect("and points at it");
-        let record = fixture.capture(workspace, &include_everything());
-        let manifest = fixture
-            .service()
-            .manifest(record.change_set_id, record.version)
-            .expect("its manifest");
+        let failure = fixture
+            .capture_with(workspace, &policy, &grant, None, None)
+            .expect_err("a tree holding a repository of that shape is not captured");
         assert!(
-            manifest
-                .paths
-                .iter()
-                .all(|entry| !entry.path.starts_with("vendor/inner/")),
-            "nothing inside another repository is captured under {target}: {:?}",
-            manifest
-                .paths
-                .iter()
-                .map(|entry| entry.path.as_str())
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            manifest
-                .paths
-                .iter()
-                .all(|entry| !entry.path.contains("repo-data")),
-            "and neither is its own data, wherever this spelling put it: {:?}",
-            manifest
-                .paths
-                .iter()
-                .map(|entry| entry.path.as_str())
-                .collect::<Vec<_>>()
-        );
-        assert!(
-            record
-                .exclusions
-                .iter()
-                .any(|entry| entry.path == "vendor/inner"),
-            "the exclusion names the tree under {target}: {:?}",
-            record.exclusions
+            failure
+                .to_string()
+                .contains("somewhere other than beside its tree"),
+            "the refusal says why under {target}: {failure}"
         );
     }
-}
 
-/// KR-REQ-14.33: a nested repository whose data this host cannot place refuses the capture.
-///
-/// A `.git` file can name its target through a link, and arithmetic on a path says where the name
-/// points rather than what is there. A capture that might hold another repository's configuration
-/// is not one this host takes on the chance that it does not.
-#[test]
-fn a_nested_repository_this_host_cannot_place_refuses_the_capture() {
-    let fixture = Fixture::create();
-    let path = ordinary_repository(fixture.work(), "aliased-tree");
-    let nested = path.join("vendor/inner");
-    std::fs::create_dir_all(&nested).expect("a directory");
-    git_raw(&nested, ["init", "--initial-branch=main"]);
-    git_raw(
-        &nested,
-        [
-            "remote",
-            "add",
-            "origin",
-            "https://user:a-secret-token@example.invalid/x.git",
-        ],
-    );
-    write(&nested, "inner.txt", "inner content\n");
-    // The data beside the tree, and the `.git` file naming it through a link.
-    std::fs::rename(nested.join(".git"), path.join("vendor/repo-data"))
-        .expect("the data moves beside the nested tree");
-    std::os::unix::fs::symlink("repo-data", path.join("vendor/git-alias")).expect("a link to it");
-    std::fs::write(nested.join(".git"), b"gitdir: ../git-alias\n").expect("and points through it");
-
-    let workspace = fixture.workspace("aliased-tree");
-    let policy = include_everything();
-    let grant = kr_protocol::changeset::FileGrant::default();
-    let failure = fixture
+    // And with its data back beside its own tree, the capture runs and the tree is excluded.
+    std::fs::remove_file(nested.join(".git")).expect("the file goes");
+    std::fs::rename(path.join("vendor/repo-data"), nested.join(".git"))
+        .expect("the data goes back where it started");
+    let record = fixture
         .capture_with(workspace, &policy, &grant, None, None)
-        .expect_err("a capture this host cannot place another repository's data in is refused");
+        .expect("an ordinary nested repository is captured around");
     assert!(
-        failure.to_string().contains("could not place"),
-        "the refusal says why: {failure}"
+        record
+            .exclusions
+            .iter()
+            .any(|entry| entry.path == "vendor/inner"),
+        "the nested tree is named: {:?}",
+        record.exclusions
     );
 }
 
