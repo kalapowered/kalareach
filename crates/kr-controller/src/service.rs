@@ -80,6 +80,14 @@ pub const CAPABILITY_REVISION_FILE: &str = "capabilities";
 /// The longest capability-revision record this host reads.
 const CAPABILITY_REVISION_LIMIT: u64 = 64;
 
+/// The resource kind a closure uses to say its worker was never confirmed gone.
+///
+/// A closure removes the registry's worker row and retires the published descriptor, so after it
+/// is written those two can no longer say whether anything is still there. This is what does: a
+/// session closed on a boot record the platform would not corroborate lists its worker here
+/// rather than among the processes it terminated, and every read and migration asks for it.
+const UNACCOUNTED_WORKER: &str = "unaccounted_worker";
+
 /// The file this environment's current boot identity is recorded in.
 ///
 /// It lives in the state directory rather than the runtime one because it has to outlive the boot
@@ -650,6 +658,7 @@ impl Controller {
                 ClosureReason::WorkerCrash,
                 &identity,
                 &crate::archive::ArchiveService::nothing_fenced(reservation.session_id),
+                true,
             )
             .await?;
         }
@@ -3725,18 +3734,22 @@ impl Controller {
                 // a later read or migration reaching a store a worker may still own is the
                 // published descriptor, which a closure does not delete.
                 let archive = self.archive();
-                if let Ok(ownership) = archive.take_ownership(
+                let validated = if let Ok(ownership) = archive.take_ownership(
                     row.session_id,
                     row.display_number,
                     &row.process_identity,
                 ) {
                     let _ = archive.recover_journal(&ownership);
-                }
+                    true
+                } else {
+                    false
+                };
                 self.record_final(
                     row.session_id,
                     ClosureReason::HostShutdown,
                     &row.process_identity,
                     &crate::archive::ArchiveService::nothing_fenced(row.session_id),
+                    validated,
                 )
                 .await?;
             }
@@ -4554,6 +4567,7 @@ impl Controller {
                             reason,
                             &identity,
                             &crate::archive::ArchiveService::nothing_fenced(session_id),
+                            true,
                         )
                         .await;
                     // The closure this watcher was waiting on has finished, so what it was
@@ -4627,7 +4641,7 @@ impl Controller {
         };
         let fenced = archive.fence_owned(&ownership, &reported);
         let closure = self
-            .record_final(session_id, reason, &record.process_identity, &fenced)
+            .record_final(session_id, reason, &record.process_identity, &fenced, true)
             .await?;
         Ok(Some(closure))
     }
@@ -4712,6 +4726,7 @@ impl Controller {
         reason: ClosureReason,
         identity: &kr_protocol::identity::ProcessStartIdentity,
         fenced: &crate::archive::Fenced,
+        death_validated: bool,
     ) -> Result<ClosureRecord> {
         let _finalising = self.finalising.lock().await;
         if let Some(existing) = self.registry.lock().await.closure(session_id)? {
@@ -4721,23 +4736,37 @@ impl Controller {
         // root's exit status, what it stopped and how much of that it could account for; a record
         // written from outside knows none of those.
         //
-        // Every caller of this has established that the worker ended, by taking recovery
-        // ownership or by asking the kernel itself, and none writes a closure without one. That is
-        // a precondition rather than a parameter, because writing the closure deletes the worker
-        // row, and that row is what a later read asks before it opens anything: a session with
-        // neither a row nor a confirmed death would read as a closed session whose store is free
-        // to open.
-        if let Some(recovered) = self.recovered_closure(session_id) {
+        // The worker's own journal is read only where the caller established that the worker
+        // ended. Writing this closure removes both the registry's worker row and the published
+        // descriptor, which are the two things a later read asks about, so a closure written over
+        // an unconfirmed death has to carry that fact itself - see `surviving` below - and must
+        // not open the store on the way.
+        if death_validated && let Some(recovered) = self.recovered_closure(session_id) {
             self.write_closure(&recovered).await?;
             return Ok(recovered);
         }
         // Nothing authoritative survived. What is written instead says so: the coverage is
         // incomplete and the root's result is absent rather than invented.
-        let mut terminated = vec![kr_protocol::session::TerminatedProcess {
-            identity: identity.clone(),
-            name: Nullable::some("the session's worker".to_owned()),
-            forced: false,
-        }];
+        // A worker this host saw end is terminated; one it did not is not, whatever else is true
+        // of the session. Saying otherwise in the record would be the record claiming the one
+        // thing this host could not establish.
+        let mut terminated = Vec::new();
+        let mut surviving = fenced.surviving.clone();
+        if death_validated {
+            terminated.push(kr_protocol::session::TerminatedProcess {
+                identity: identity.clone(),
+                name: Nullable::some("the session's worker".to_owned()),
+                forced: false,
+            });
+        } else {
+            surviving.push(kr_protocol::session::SurvivingResource {
+                kind: UNACCOUNTED_WORKER.to_owned(),
+                detail: format!(
+                    "this host closed the session without confirming that its worker, {}, ended",
+                    identity.pid.get()
+                ),
+            });
+        }
         // Whatever the fence did reach, recorded where a later reader is served it rather than
         // only where this daemon can see it.
         terminated.extend(fenced.stopped.iter().map(|identity| {
@@ -4754,7 +4783,7 @@ impl Controller {
             root_exit_code: Nullable::null(),
             root_signal: Nullable::null(),
             terminated,
-            surviving: fenced.surviving.clone(),
+            surviving,
             // The controller confirmed the worker process ended. It does not claim to have
             // discovered every application that worker may have started, and a recovery or a
             // fence that could not finish is another thing it cannot account for.
@@ -4806,51 +4835,57 @@ impl Controller {
         encode(&read)
     }
 
-    /// Refuses a read of a session whose worker is alive, naming the endpoint that owns it.
+    /// Refuses a read of a session whose worker this daemon has not confirmed gone.
     ///
-    /// The archive serves what a worker has left behind. While the worker is there, the worker is
-    /// the authority: two readers of one journal would be two answers about one action.
+    /// Three things can say so, and a closure erases two of them: writing it removes the
+    /// registry's worker row and retires the published descriptor. So the closure carries the
+    /// third itself. A session closed without a confirmed death lists its worker as a surviving
+    /// resource rather than a terminated one, and that is what this reads once the other two are
+    /// gone.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-argument refusal naming what this host has not established.
     async fn refuse_if_live(self: &Arc<Self>, session_id: SessionId) -> Result<()> {
-        if let Some(worker) = self.directory.lock().await.get(session_id).cloned() {
+        if self.a_worker_may_still_own(session_id).await {
             return Err(ControllerError::InvalidArgument(format!(
-                "session {session_id} has a live worker; ask it at {}",
-                worker.endpoint.as_text()
-            )));
-        }
-        // The directory is what this daemon has *verified*, and a worker it could not verify at
-        // startup is absent from it while still running. So the registry's own record is asked
-        // as well, and the kernel decides: a recorded process that is still the process that was
-        // recorded is a live worker whose journal is not this archive's to read.
-        let recorded = self
-            .registry
-            .lock()
-            .await
-            .workers()?
-            .into_iter()
-            .find(|record| record.session_id == session_id);
-        if let Some(record) = recorded
-            && !matches!(
-                kr_ipc::identity::process_state(&record.process_identity),
-                kr_ipc::identity::ProcessState::Ended
-            )
-        {
-            return Err(ControllerError::InvalidArgument(format!(
-                "session {session_id} has a worker this daemon has not confirmed ended; its \
-                 endpoint is {}",
-                record.endpoint
-            )));
-        }
-        // The registry's row is not the only place a live worker shows. A closure deletes that
-        // row, and a closure can be recorded for a session whose death this host inferred from a
-        // boot record rather than confirmed, so the published descriptor is asked as well: it is
-        // removed when a session is fenced, not when it is closed.
-        if self.archive().a_worker_may_still_own(session_id) {
-            return Err(ControllerError::InvalidArgument(format!(
-                "session {session_id} published a descriptor for a worker this daemon has not \
-                 confirmed ended"
+                "session {session_id} has a worker this daemon has not confirmed ended"
             )));
         }
         Ok(())
+    }
+
+    /// Returns whether anything this host can read says the session's worker may still be there.
+    ///
+    /// This is the one question every read and every migration asks. It is deliberately
+    /// pessimistic: a query the platform declines establishes nothing, and nothing is the answer
+    /// that keeps a store shut.
+    async fn a_worker_may_still_own(self: &Arc<Self>, session_id: SessionId) -> bool {
+        let (row, closure) = {
+            let registry = self.registry.lock().await;
+            let row = registry
+                .workers()
+                .ok()
+                .and_then(|rows| rows.into_iter().find(|row| row.session_id == session_id));
+            (row, registry.closure(session_id).ok().flatten())
+        };
+        if let Some(row) = row
+            && !matches!(
+                kr_ipc::identity::process_state(&row.process_identity),
+                kr_ipc::identity::ProcessState::Ended
+            )
+        {
+            return true;
+        }
+        if let Some(closure) = closure
+            && closure
+                .surviving
+                .iter()
+                .any(|resource| resource.kind == UNACCOUNTED_WORKER)
+        {
+            return true;
+        }
+        self.archive().a_worker_may_still_own(session_id)
     }
 
     /// Reads what one session left behind, with the registry's own record beside it.
@@ -4902,7 +4937,17 @@ impl Controller {
         display_number: kr_protocol::session::DisplayNumber,
     ) -> SessionSummary {
         // The worker recorded what its session was. Using it keeps the shell, the directory, the
-        // geometry and the creation time a person sees after the session has closed.
+        // geometry and the creation time a person sees after the session has closed - but only
+        // where this host established that the worker ended. A closure this host wrote over a
+        // death it could not confirm says so in its own surviving list, and then the store stays
+        // shut and the summary is built from the closure alone.
+        if closure
+            .surviving
+            .iter()
+            .any(|resource| resource.kind == UNACCOUNTED_WORKER)
+        {
+            return closed_summary(closure, self.paths.environment_id(), display_number);
+        }
         self.recovered_summary(closure.session_id).map_or_else(
             || closed_summary(closure, self.paths.environment_id(), display_number),
             |mut summary| {
