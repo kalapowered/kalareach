@@ -8,7 +8,6 @@
 //! stops rich work and reaches nothing the native forwarding path uses. A component that is
 //! disabled, fenced or simply absent must not be able to stop a terminal.
 
-use kr_plugin_runtime::broker::{AuthorityError, ComponentAuthority, RichCapability};
 use kr_protocol::broker::{BrokerGrant, BrokerGrants, DecodingTrust};
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{
@@ -61,28 +60,21 @@ fn table() -> DeclarativeTable {
     }
 }
 
-/// KR-REQ-11.35: the fence stops rich work and reaches nothing the core-declarative path uses.
+/// KR-REQ-11.35: the declarative table is not something a fence or a component fault can reach.
+///
+/// The live fence is the worker's, and `crates/kr-worker/tests/gateway.rs` drives it. What this
+/// establishes is the half that makes the separation possible: the table is a value the core
+/// reads, it classifies the same methods the same way whatever has happened to a component, and a
+/// binding's grants are untouched by anything that stops its rich capability.
 #[test]
-fn kr_req_11_35_the_fence_stops_rich_work_and_the_declarative_path_is_untouched() {
-    let authority = ComponentAuthority {
-        grants: BrokerGrants::granted([
-            BrokerGrant::Observation,
-            BrokerGrant::UpstreamAction,
-            BrokerGrant::ApprovalInterpreter,
-        ]),
-        trust: Some(trust()),
-    };
-    let mut rich = RichCapability::available();
-    rich.disable("the receipt journal faulted");
+fn kr_req_11_35_the_declarative_path_depends_on_no_component() {
+    let grants = BrokerGrants::granted([
+        BrokerGrant::Observation,
+        BrokerGrant::UpstreamAction,
+        BrokerGrant::ApprovalInterpreter,
+    ]);
+    let trust = trust();
 
-    // Everything rich is refused.
-    assert!(matches!(
-        rich.require(),
-        Err(AuthorityError::RichDisabled { .. })
-    ));
-
-    // And the table the core interprets is not something the fence can reach: it is a value, it
-    // classifies the same methods the same way, and nothing about a component is consulted.
     let table = table();
     let classified = table.classify(&method("fs/write_text_file"));
     assert_eq!(classified.class, NativeMethodClass::Mutation);
@@ -94,14 +86,9 @@ fn kr_req_11_35_the_fence_stops_rich_work_and_the_declarative_path_is_untouched(
         "an unclassified request suspends rich mutations and is still forwarded"
     );
 
-    // The grants the binding holds are what they were: the fence stopped a capability, not an
-    // authority.
-    authority
-        .may_observe()
-        .expect("observation is not what a fence stops");
-    authority
-        .may_decode(&method("session/request_permission"))
-        .expect("the trust record is untouched");
+    // And the grants a binding holds are values too: a fence stops a capability, not an authority.
+    assert!(grants.holds(BrokerGrant::Observation));
+    assert!(trust.covers(&method("session/request_permission")));
 }
 
 /// KR-REQ-11.35: the mode admits no rich work until the gap is committed, and what it writes while

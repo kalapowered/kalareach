@@ -431,9 +431,15 @@ matters from this side is the order:
    digest, the method that record covers, the projection's schema version and decision count, the
    source frame's generation, and that this source event has not already produced an
    interpretation. Only then does the request become something a person can answer.
-3. A component's `encode-response` returns bytes. The broker rechecks the actor, the grant, the
-   binding revision and the decoder's right to answer, checks the decision against the ones the
-   request actually offered, commits the dispatch marker, and only then may the answer go.
+3. A component's `encode-response` returns bytes. The broker rechecks the resource's own state and
+   deadline, the instance, the source generation and the decoder's right to answer, checks the
+   decision against the ones the request actually offered, commits the dispatch marker, and only
+   then may the answer go.
+
+What is not joined up yet is the hand-over in either direction: the plugin host invokes the
+component's exports, and passing the broker's action token into that invocation and its projection
+back out is the work that joins the two crates. Until it lands, the broker's own suites drive the
+checks and the plugin host's drive the calls.
 
 A component that is faulted, disabled or slow changes none of step 1. That is the whole of the
 separation: rich meaning is a thing the broker asks for, and the native path does not wait for the

@@ -37,8 +37,8 @@ pub struct Invocation {
     pub actor_id: ActorId,
     /// Which of the three grants authorises this call.
     pub grant: BrokerGrant,
-    /// The grant record the authority comes from.
-    pub grant_id: GrantId,
+    /// The grant record the authority comes from, when one does.
+    pub grant_id: Option<GrantId>,
     /// The instance the action runs against.
     pub application_instance_id: ApplicationInstanceId,
     /// The binding revision in force.
@@ -112,7 +112,7 @@ impl TokenStore {
             token_id: token_id.clone(),
             actor_id: invocation.actor_id.clone(),
             grant: invocation.grant,
-            grant_id: invocation.grant_id,
+            grant_id: kr_protocol::scalars::Nullable::from(invocation.grant_id),
             application_instance_id: invocation.application_instance_id,
             binding_revision: invocation.binding_revision,
             action: invocation.action.clone(),
@@ -205,7 +205,7 @@ mod tests {
         Invocation {
             actor_id: ActorId::new("device-1").expect("valid"),
             grant: BrokerGrant::UpstreamAction,
-            grant_id: GrantId::new(Uuid::from_bytes([7; 16])),
+            grant_id: Some(GrantId::new(Uuid::from_bytes([7; 16]))),
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([2; 16])),
             binding_revision: AgentBindingRevision::new(4),
             action: ActionName::new("prompt.submit").expect("valid"),

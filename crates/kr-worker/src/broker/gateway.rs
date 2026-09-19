@@ -282,15 +282,7 @@ impl Gateway {
                 held.origin
             )));
         }
-        if frame.len() > MAX_NATIVE_FRAME_BYTES {
-            return Err(BrokerError::invalid(format!(
-                "a native frame is at most {MAX_NATIVE_FRAME_BYTES} bytes and this one is {}",
-                frame.len()
-            )));
-        }
-        let body: serde_json::Value = serde_json::from_slice(frame).map_err(|error| {
-            BrokerError::invalid(format!("this frame is not readable: {error}"))
-        })?;
+        let body = read_frame(frame)?;
         let method = body
             .get(&held.table.method_field)
             .and_then(serde_json::Value::as_str)
@@ -333,9 +325,7 @@ impl Gateway {
             .connections
             .get(&connection)
             .ok_or_else(|| BrokerError::unknown(format!("no gateway connection {connection}")))?;
-        let body: serde_json::Value = serde_json::from_slice(frame).map_err(|error| {
-            BrokerError::invalid(format!("this response is not readable: {error}"))
-        })?;
+        let body = read_frame(frame)?;
         let upstream =
             read_identifier(&body, &held.table.response_id_field).ok_or_else(|| {
                 BrokerError::invalid(format!(
@@ -421,7 +411,10 @@ impl Gateway {
 /// A JSON-RPC identifier is a string or a number, and both are kept exactly as the upstream wrote
 /// them: an upstream identifier never becomes a KalaReach identifier, so it is carried rather than
 /// converted.
-fn read_identifier(body: &serde_json::Value, field: &str) -> Option<Result<UpstreamRequestId>> {
+fn read_identifier(
+    body: &serde_json::Map<String, serde_json::Value>,
+    field: &str,
+) -> Option<Result<UpstreamRequestId>> {
     let member = body.get(field)?;
     let text = match member {
         serde_json::Value::String(text) => text.clone(),
@@ -436,6 +429,84 @@ fn read_identifier(body: &serde_json::Value, field: &str) -> Option<Result<Upstr
         UpstreamRequestId::new(text)
             .map_err(|error| BrokerError::invalid(format!("upstream request identifier: {error}"))),
     )
+}
+
+/// Reads one frame into its top-level members.
+///
+/// Three things this does that `serde_json::from_slice` into a `Value` does not.
+///
+/// * It bounds the frame before it parses it, in both directions. A response is a frame too, and
+///   an unbounded one is an unbounded allocation.
+/// * It refuses a frame that is not a top-level object. A table names members, and an array or a
+///   bare number has none.
+/// * It refuses a frame that names a member twice. `serde_json` keeps the last one and another
+///   participant in the same protocol may keep the first, so a frame two readers would disagree
+///   about is one this host will not correlate.
+fn read_frame(bytes: &[u8]) -> Result<serde_json::Map<String, serde_json::Value>> {
+    if bytes.len() > MAX_NATIVE_FRAME_BYTES {
+        return Err(BrokerError::invalid(format!(
+            "a native frame is at most {MAX_NATIVE_FRAME_BYTES} bytes and this one is {}",
+            bytes.len()
+        )));
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes)
+        .map_err(|error| BrokerError::invalid(format!("this frame is not readable: {error}")))?;
+    let serde_json::Value::Object(members) = value else {
+        return Err(BrokerError::invalid(
+            "a frame this table describes is a JSON object",
+        ));
+    };
+    // The parse has already collapsed a repeated member, so the members it produced are compared
+    // with the names the bytes actually carry.
+    if count_member_names(bytes)? != members.len() {
+        return Err(BrokerError::invalid(
+            "this frame names a member more than once, and two readers of it could disagree",
+        ));
+    }
+    Ok(members)
+}
+
+/// Counts the top-level member names in one JSON object's bytes, repetitions included.
+fn count_member_names(bytes: &[u8]) -> Result<usize> {
+    let mut deserialiser = serde_json::Deserializer::from_slice(bytes);
+    serde::Deserialize::deserialize(&mut deserialiser)
+        .map(|counted: MemberNames| counted.0)
+        .map_err(|error| BrokerError::invalid(format!("this frame is not readable: {error}")))
+}
+
+/// How many top-level members one JSON object has, before repetitions are collapsed.
+struct MemberNames(usize);
+
+impl<'de> serde::Deserialize<'de> for MemberNames {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserialiser: D,
+    ) -> std::result::Result<Self, D::Error> {
+        struct Counter;
+
+        impl<'de> serde::de::Visitor<'de> for Counter {
+            type Value = MemberNames;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut members: A,
+            ) -> std::result::Result<Self::Value, A::Error> {
+                let mut counted = 0;
+                while members
+                    .next_entry::<serde::de::IgnoredAny, serde::de::IgnoredAny>()?
+                    .is_some()
+                {
+                    counted += 1;
+                }
+                Ok(MemberNames(counted))
+            }
+        }
+
+        deserialiser.deserialize_map(Counter)
+    }
 }
 
 #[cfg(test)]
@@ -722,6 +793,38 @@ mod tests {
             .correlate_response(GatewayConnectionId::new(1), br#"{"id":11,"result":{}}"#)
             .expect("correlated");
         assert_eq!(Some(correlated), forwarded.request);
+    }
+
+    #[test]
+    fn a_frame_two_readers_could_disagree_about_is_refused() {
+        let gateway = native_gateway();
+        // A repeated member: `serde_json` keeps the last, another reader may keep the first.
+        assert!(
+            gateway
+                .forward_native(
+                    GatewayConnectionId::new(1),
+                    br#"{"id":11,"method":"session/update","method":"fs/write_text_file"}"#,
+                )
+                .is_err()
+        );
+        // A frame that is not an object at all.
+        assert!(
+            gateway
+                .forward_native(GatewayConnectionId::new(1), br#"[{"id":11}]"#)
+                .is_err()
+        );
+        assert!(
+            gateway
+                .forward_native(GatewayConnectionId::new(1), b"11")
+                .is_err()
+        );
+        // And a response is bounded the same way a request is.
+        let oversized = vec![b'a'; MAX_NATIVE_FRAME_BYTES + 1];
+        assert!(
+            gateway
+                .correlate_response(GatewayConnectionId::new(1), &oversized)
+                .is_err()
+        );
     }
 
     #[test]

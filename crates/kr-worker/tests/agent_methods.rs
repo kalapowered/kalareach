@@ -29,7 +29,8 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Bytes, Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::{
     Broker, BrokerError, BrokerTransport, Caller, Credential, GrantLowerBound, ManagedProcess,
-    RegisteredAction, TransportHandle, command, subject,
+    RegisteredAction, TransportHandle, UpstreamDispatch, UpstreamOutcome, UpstreamRequest, command,
+    subject,
 };
 
 const CREDENTIAL: [u8; 32] = [9; 32];
@@ -49,7 +50,7 @@ fn binding() -> BrokerBindingId {
 fn caller() -> Caller {
     Caller {
         actor_id: ActorId::new("device-1").expect("valid"),
-        grant_id: GrantId::new(Uuid::from_bytes([7; 16])),
+        grant_id: Some(GrantId::new(Uuid::from_bytes([7; 16]))),
     }
 }
 
@@ -171,10 +172,60 @@ fn target(revision: u64) -> AgentMutationTarget {
     }
 }
 
+/// A transport that records what it was asked to carry, and answers as an upstream would.
+///
+/// It is what a connector supplies in the product: section 12's bundled adapters are the plugins
+/// repository's, and each drives its own upstream. What this establishes here is that the broker
+/// actually hands the operation over rather than reporting it as applied.
+#[derive(Debug, Default)]
+struct RecordingUpstream {
+    submitted: std::sync::Mutex<Vec<UpstreamRequest>>,
+    refuse: bool,
+}
+
+impl RecordingUpstream {
+    fn submitted(&self) -> Vec<UpstreamRequest> {
+        self.submitted
+            .lock()
+            .expect("the record is not poisoned")
+            .clone()
+    }
+}
+
+impl UpstreamDispatch for RecordingUpstream {
+    fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+        self.submitted
+            .lock()
+            .expect("the record is not poisoned")
+            .push(request.clone());
+        if self.refuse {
+            return Err(BrokerError::UpstreamUnavailable {
+                detail: "the framing connection ended".to_owned(),
+            });
+        }
+        Ok(UpstreamOutcome {
+            upstream_request_id: Some(UpstreamRequestId::new("upstream-1").expect("valid")),
+            turn_id: request.turn_id.clone(),
+            provenance: ActionProvenance::UpstreamTypedRpc,
+        })
+    }
+}
+
+/// A broker with every capability the agent mutations need, and a transport that records.
+fn agent_broker_with(upstream: std::sync::Arc<RecordingUpstream>) -> Broker {
+    let broker = agent_broker();
+    broker
+        .bind_dispatch(instance(), upstream)
+        .expect("the transport is bound");
+    broker
+}
+
 /// A broker with every capability the agent mutations need.
 fn agent_broker() -> Broker {
     let broker = Broker::open(None, session()).expect("the broker opens");
-    broker.register_instance(instance(), IntegrationMode::Gateway, None, Some(managed()));
+    broker
+        .register_instance(instance(), IntegrationMode::Gateway, None, Some(managed()))
+        .expect("the instance is registered");
     broker
         .bind(
             binding(),
@@ -221,7 +272,8 @@ fn agent_broker() -> Broker {
 /// The `session.view` half is the method registry's, and the assertion below reads it from there
 /// rather than restating it.
 #[test]
-fn kr_req_23_39_an_agent_read_names_the_instance_the_evidence_and_the_history_filter() {
+fn kr_req_23_39_an_agent_read_names_the_instance_carries_its_evidence_and_reports_what_was_withheld()
+ {
     let broker = agent_broker();
     broker
         .set_commands(
@@ -332,7 +384,8 @@ fn kr_req_23_39_an_agent_read_names_the_instance_the_evidence_and_the_history_fi
 /// one of them refuses a revision that is not the one in force.
 #[test]
 fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding() {
-    let broker = agent_broker();
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     broker
         .set_turn(instance(), Some(AgentTurnId::new("turn-1").expect("valid")))
         .expect("a turn is running");
@@ -389,6 +442,11 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
         .expect("the prompt applies");
     assert_eq!(applied.binding_revision, AgentBindingRevision::new(1));
     assert_eq!(applied.provenance, ActionProvenance::UpstreamTypedRpc);
+    assert_eq!(
+        applied.upstream_request_id.as_ref().map(|id| id.as_str()),
+        Some("upstream-1"),
+        "the answer names what the upstream called it"
+    );
     broker
         .agent_prompt(&caller(), &prompt, true)
         .expect("and so does a queued one");
@@ -411,6 +469,31 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
             },
         )
         .expect("the cancellation applies");
+
+    // Each of those reached the upstream, with the operation it was for.
+    let submitted: Vec<kr_worker::broker::UpstreamOperation> = upstream
+        .submitted()
+        .into_iter()
+        .map(|request| request.operation)
+        .collect();
+    assert_eq!(
+        submitted,
+        vec![
+            kr_worker::broker::UpstreamOperation::PromptSubmit,
+            kr_worker::broker::UpstreamOperation::PromptQueue,
+            kr_worker::broker::UpstreamOperation::TurnSteer,
+            kr_worker::broker::UpstreamOperation::TurnCancel,
+        ],
+        "a mutation that reports success is one that reached the upstream"
+    );
+
+    // An instance with nothing bound to carry its operations refuses rather than reporting them
+    // as applied.
+    let unreachable = agent_broker();
+    assert!(
+        unreachable.agent_prompt(&caller(), &prompt, false).is_err(),
+        "a prompt with no transport is refused, not applied"
+    );
 
     // A turn that is not the one running is refused rather than redirected.
     assert!(
@@ -454,11 +537,9 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
 /// request actually offered, once.
 #[test]
 fn kr_req_23_40_an_approval_answer_is_one_of_the_decisions_the_request_offered() {
-    let broker = agent_broker();
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     let body = r#"{"id":"11","method":"session/request_permission"}"#;
-    let handle = broker
-        .record_source(instance(), body.as_bytes(), TimestampMs::new(2))
-        .expect("the frame is recorded");
     let opaque = broker
         .forward_native(
             GatewayConnectionId::new(1),
@@ -472,7 +553,6 @@ fn kr_req_23_40_an_approval_answer_is_one_of_the_decisions_the_request_offered()
         .interpret(
             binding(),
             opaque.resource_id,
-            &handle,
             projection(),
             None,
             TimestampMs::new(3),
@@ -536,7 +616,8 @@ fn kr_req_23_40_an_approval_answer_is_one_of_the_decisions_the_request_offered()
 /// observation beside it.
 #[test]
 fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditions() {
-    let broker = agent_broker();
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     broker
         .register_actions(
             binding(),
@@ -610,7 +691,7 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
 
     // And the capability an action needs is separate from the observation beside it: withdrawing
     // the evidence refuses the action while the read still answers.
-    let broker = agent_broker();
+    let broker = agent_broker_with(std::sync::Arc::new(RecordingUpstream::default()));
     broker
         .register_actions(
             binding(),
@@ -654,14 +735,16 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
 /// KR-REQ-24.24: an adapter replays from the cursor it consumed, and an evicted range rebuilds
 /// with a visible history gap.
 #[test]
-fn kr_req_24_24_a_replay_starts_at_the_consumed_cursor_and_an_eviction_shows_a_gap() {
+fn kr_req_24_24_a_replay_starts_after_the_consumed_cursor_and_an_eviction_shows_a_gap() {
     let directory = std::env::temp_dir().join(format!("kr-methods-{}", kr_ipc::new_uuid()));
     std::fs::create_dir_all(&directory).expect("the directory is created");
     let path = directory.join("session.sqlite");
 
     let consumed = {
         let broker = Broker::open(Some(&path), session()).expect("the broker opens");
-        broker.register_instance(instance(), IntegrationMode::Gateway, None, None);
+        broker
+            .register_instance(instance(), IntegrationMode::Gateway, None, None)
+            .expect("the instance is registered");
         for index in 1..=5 {
             broker
                 .observe(
@@ -697,7 +780,9 @@ fn kr_req_24_24_a_replay_starts_at_the_consumed_cursor_and_an_eviction_shows_a_g
             .expect("the read succeeds"),
         Some(consumed)
     );
-    restarted.register_instance(instance(), IntegrationMode::Gateway, None, None);
+    restarted
+        .register_instance(instance(), IntegrationMode::Gateway, None, None)
+        .expect("the instance is registered");
     for index in 6..=8 {
         restarted
             .observe(
@@ -725,7 +810,9 @@ fn kr_req_24_24_a_replay_starts_at_the_consumed_cursor_and_an_eviction_shows_a_g
 
     // An evicted range rebuilds from what is verifiably retained, and says there is a gap.
     let broker = Broker::open(None, session()).expect("the broker opens");
-    broker.register_instance(instance(), IntegrationMode::Gateway, None, None);
+    broker
+        .register_instance(instance(), IntegrationMode::Gateway, None, None)
+        .expect("the instance is registered");
     for index in 1..=(kr_worker::broker::semantic::MAX_RETAINED_ENTRIES as u64 + 10) {
         broker
             .observe(

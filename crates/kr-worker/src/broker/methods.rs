@@ -36,6 +36,89 @@ use crate::broker::semantic::HistoryFilter;
 use crate::broker::tokens::Invocation;
 use crate::broker::{Broker, DispatchAdmission};
 
+/// What one agent mutation asks of the upstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum UpstreamOperation {
+    /// Submit a prompt now.
+    PromptSubmit,
+    /// Queue a prompt behind the current turn.
+    PromptQueue,
+    /// Steer the turn that is running.
+    TurnSteer,
+    /// Cancel the turn that is running.
+    TurnCancel,
+    /// Answer a pending approval.
+    ApprovalRespond,
+    /// Invoke a registered plugin action.
+    PluginAction,
+}
+
+impl UpstreamOperation {
+    /// Returns the stable name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PromptSubmit => "prompt.submit",
+            Self::PromptQueue => "prompt.queue",
+            Self::TurnSteer => "turn.steer",
+            Self::TurnCancel => "turn.cancel",
+            Self::ApprovalRespond => "approval.respond",
+            Self::PluginAction => "plugin.action",
+        }
+    }
+}
+
+impl core::fmt::Display for UpstreamOperation {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One prepared operation, on its way to the upstream.
+#[derive(Clone, Debug)]
+pub struct UpstreamRequest {
+    /// The instance it acts on.
+    pub application_instance_id: ApplicationInstanceId,
+    /// The binding revision it was admitted at.
+    pub binding_revision: kr_protocol::ids::AgentBindingRevision,
+    /// What it asks for.
+    pub operation: UpstreamOperation,
+    /// The turn it acts on, where it acts on one.
+    pub turn_id: Option<kr_protocol::ids::AgentTurnId>,
+    /// The operation's own body, as the connector encodes it.
+    pub payload: Vec<u8>,
+}
+
+/// What the upstream answered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UpstreamOutcome {
+    /// The upstream's own identifier for the operation, where it gave one.
+    pub upstream_request_id: Option<kr_protocol::ids::UpstreamRequestId>,
+    /// The turn it applies to, where the upstream named one.
+    pub turn_id: Option<kr_protocol::ids::AgentTurnId>,
+    /// How the operation actually reached the upstream.
+    pub provenance: ActionProvenance,
+}
+
+/// What carries a prepared operation to one upstream.
+///
+/// The broker decides whether an operation may happen. This is what makes it happen, and it is a
+/// seam because the thing that implements it is a connector's: section 12's bundled adapters are
+/// the plugins repository's, and each one drives its own upstream over its own transport.
+///
+/// An instance with nothing bound here has no upstream this host can reach, and its mutations are
+/// refused before the dispatch marker rather than reported as applied.
+pub trait UpstreamDispatch: Send + Sync + core::fmt::Debug {
+    /// Submits one prepared operation and returns what the upstream answered.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the transport could not do. `UPSTREAM_UNAVAILABLE` is the answer when the
+    /// framing connection cannot safely continue; section 11 forbids opening a second backend or
+    /// replaying an unknown request instead.
+    fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome>;
+}
+
 /// One action a package registered, and everything the broker checks before it runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RegisteredAction {
@@ -60,8 +143,12 @@ pub struct RegisteredAction {
 pub struct Caller {
     /// The host-verified actor.
     pub actor_id: ActorId,
-    /// The grant record the actor's authority comes from.
-    pub grant_id: GrantId,
+    /// The grant record the actor's authority comes from, when one does.
+    ///
+    /// A local operating-system caller has none: its authority is the identity the listener
+    /// authenticated, and section 23 leaves its grant null. Manufacturing one to fill the field
+    /// would name a grant nothing issued.
+    pub grant_id: Option<GrantId>,
 }
 
 impl Broker {
@@ -138,7 +225,13 @@ impl Broker {
         } else {
             "agent.prompt"
         };
-        self.check_mutation(caller, &params.target, capability, "prompt.submit")
+        let operation = if queued {
+            UpstreamOperation::PromptQueue
+        } else {
+            UpstreamOperation::PromptSubmit
+        };
+        let admitted = self.check_mutation(caller, &params.target, capability, operation)?;
+        self.dispatch_mutation(&params.target, admitted, operation, None, Vec::new())
     }
 
     /// Applies `agent.turn.steer`.
@@ -152,19 +245,20 @@ impl Broker {
         caller: &Caller,
         params: &AgentSteerParams,
     ) -> Result<AgentMutationResult> {
-        let binding = self.binding_state(params.target.subject.application_instance_id)?;
-        if binding.turn_id.as_ref() != Some(&params.turn_id) {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "{} is not the turn this instance is running",
-                    params.turn_id
-                ),
-            });
-        }
-        let mut result =
-            self.check_mutation(caller, &params.target, "agent.steer", "turn.steer")?;
-        result.turn_id = Nullable::some(params.turn_id.clone());
-        Ok(result)
+        self.check_turn(&params.target, &params.turn_id)?;
+        let admitted = self.check_mutation(
+            caller,
+            &params.target,
+            "agent.steer",
+            UpstreamOperation::TurnSteer,
+        )?;
+        self.dispatch_mutation(
+            &params.target,
+            admitted,
+            UpstreamOperation::TurnSteer,
+            Some(params.turn_id.clone()),
+            params.text.as_str().as_bytes().to_vec(),
+        )
     }
 
     /// Applies `agent.turn.cancel`.
@@ -178,19 +272,20 @@ impl Broker {
         caller: &Caller,
         params: &AgentCancelParams,
     ) -> Result<AgentMutationResult> {
-        let binding = self.binding_state(params.target.subject.application_instance_id)?;
-        if binding.turn_id.as_ref() != Some(&params.turn_id) {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!(
-                    "{} is not the turn this instance is running",
-                    params.turn_id
-                ),
-            });
-        }
-        let mut result =
-            self.check_mutation(caller, &params.target, "agent.cancel", "turn.cancel")?;
-        result.turn_id = Nullable::some(params.turn_id.clone());
-        Ok(result)
+        self.check_turn(&params.target, &params.turn_id)?;
+        let admitted = self.check_mutation(
+            caller,
+            &params.target,
+            "agent.cancel",
+            UpstreamOperation::TurnCancel,
+        )?;
+        self.dispatch_mutation(
+            &params.target,
+            admitted,
+            UpstreamOperation::TurnCancel,
+            Some(params.turn_id.clone()),
+            Vec::new(),
+        )
     }
 
     /// Applies `agent.approval.respond`: claims the resource, admits the answer and resolves it.
@@ -209,8 +304,12 @@ impl Broker {
         params: &AgentApprovalRespondParams,
         now: TimestampMs,
     ) -> Result<(AgentApprovalRespondResult, DispatchAdmission)> {
-        let mutation =
-            self.check_mutation(caller, &params.target, "agent.approval", "approval.respond")?;
+        let mutation = self.check_mutation(
+            caller,
+            &params.target,
+            "agent.approval",
+            UpstreamOperation::ApprovalRespond,
+        )?;
         let resource = self.pending(params.resource_id).ok_or_else(|| {
             BrokerError::unknown(format!("no pending resource {}", params.resource_id))
         })?;
@@ -239,9 +338,21 @@ impl Broker {
                 ),
             });
         }
+        // Nothing carries the answer to this upstream: refuse before the claim, so the resource
+        // is not held behind an answer that can never be sent.
+        let dispatch = self
+            .dispatch_for(params.target.subject.application_instance_id)
+            .ok_or_else(|| BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "nothing carries an answer to {}: this instance has no upstream transport \
+                     bound, so the approval is refused rather than reported as answered",
+                    params.target.subject.application_instance_id
+                ),
+            })?;
+
         let claim = self.claim(params.resource_id, &caller.actor_id, now)?;
-        // From here the claim is held, so anything that fails gives it back rather than leaving
-        // the resource stuck behind a claim nobody will spend.
+        // From here the claim is held, so anything that fails before the marker gives it back
+        // rather than leaving the resource stuck behind a claim nobody will spend.
         let admission = match self.admit_dispatch(&claim, &params.option_id) {
             Ok(admission) => admission,
             Err(error) => {
@@ -249,14 +360,28 @@ impl Broker {
                 return Err(error);
             }
         };
-        // An answer that went and was not confirmed is not released: it is the caller's to settle
-        // as resolved or uncertain, and `resolve` refusing here leaves the marker in place.
+        // The marker is committed. From here the answer may have gone, so a failure leaves the
+        // resource uncertain rather than answerable: asking again could apply it twice.
+        let outcome = match dispatch.submit(&UpstreamRequest {
+            application_instance_id: params.target.subject.application_instance_id,
+            binding_revision: mutation.binding_revision,
+            operation: UpstreamOperation::ApprovalRespond,
+            turn_id: None,
+            payload: params.option_id.as_bytes().to_vec(),
+        }) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                let _ = self.uncertain(&claim, now);
+                return Err(error);
+            }
+        };
         let resolved = self.resolve(&claim, now)?;
         Ok((
             AgentApprovalRespondResult {
                 mutation: AgentMutationResult {
-                    provenance: admission.provenance,
+                    provenance: outcome.provenance,
                     upstream_request_id: Nullable::some(admission.upstream_request_id.clone()),
+                    turn_id: Nullable::from(outcome.turn_id),
                     ..mutation
                 },
                 resource_id: params.resource_id,
@@ -285,25 +410,7 @@ impl Broker {
         params: &PluginActionInvokeParams,
         now: TimestampMs,
     ) -> Result<PluginActionInvokeResult> {
-        let registered = self
-            .registered_action(binding_id, &params.action)?
-            .ok_or_else(|| {
-                BrokerError::unknown(format!(
-                    "{} is not an action {} registered",
-                    params.action, params.plugin_id
-                ))
-            })?;
-        if registered.effect != EffectClass::Write {
-            return Err(BrokerError::invalid(format!(
-                "{} is a read, and this is the write path",
-                params.action
-            )));
-        }
-        if registered.needs_draft && !params.draft_id.is_present() {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!("{} acts on a draft and this call named none", params.action),
-            });
-        }
+        let registered = self.check_action(binding_id, params)?;
         let invocation = Invocation {
             actor_id: caller.actor_id.clone(),
             grant: registered.grant,
@@ -317,16 +424,33 @@ impl Broker {
                 .map(|capability| (capability, None)),
             parameters: params.parameters.as_slice().to_vec(),
         };
+        let dispatch = self
+            .dispatch_for(params.target.subject.application_instance_id)
+            .ok_or_else(|| BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "nothing carries {} to {}: this instance has no upstream transport bound, so \
+                     the action is refused rather than reported as applied",
+                    params.action, params.target.subject.application_instance_id
+                ),
+            })?;
         let token = self.issue_token(binding_id, &invocation, now)?;
-        // The token is the authority for the one invocation that follows, and it is spent by the
-        // effect plan that comes back. Nothing between here and there widens it.
+        // The token is the authority for the one invocation that follows. The invocation happens
+        // here; the token is spent afterwards, which is the broker checking that the authority it
+        // issued is still the authority the effect ran under.
+        let outcome = dispatch.submit(&UpstreamRequest {
+            application_instance_id: params.target.subject.application_instance_id,
+            binding_revision: params.target.binding_revision,
+            operation: UpstreamOperation::PluginAction,
+            turn_id: None,
+            payload: params.parameters.as_slice().to_vec(),
+        })?;
         let spent = self.spend_token(&kr_protocol::broker::ActionTokenClaim::from(&token))?;
         Ok(PluginActionInvokeResult {
             mutation: AgentMutationResult {
                 binding_revision: spent.binding_revision,
-                provenance: ActionProvenance::UpstreamTypedRpc,
-                upstream_request_id: Nullable::null(),
-                turn_id: Nullable::null(),
+                provenance: outcome.provenance,
+                upstream_request_id: Nullable::from(outcome.upstream_request_id),
+                turn_id: Nullable::from(outcome.turn_id),
             },
             action: spent.action,
         })
@@ -344,10 +468,14 @@ impl Broker {
         caller: &Caller,
         target: &AgentMutationTarget,
         capability: &str,
-        action: &str,
+        action: UpstreamOperation,
     ) -> Result<AgentMutationResult> {
         let _ = caller;
         self.check_subject(&target.subject)?;
+        // Rich work is fenced while the journal is faulted, and a mutation is rich work. Without
+        // this a prompt submitted during the gap would be answered as applied with no durable
+        // record of it at all.
+        self.require_rich_work()?;
         let binding = self.binding_state(target.subject.application_instance_id)?;
         if binding.rich_mutations_suspended {
             return Err(BrokerError::PreconditionFailed {
@@ -377,6 +505,141 @@ impl Broker {
             provenance: ActionProvenance::UpstreamTypedRpc,
             upstream_request_id: Nullable::null(),
             turn_id: Nullable::null(),
+        })
+    }
+
+    /// Checks that the turn a mutation names is the one this instance is running.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PreconditionFailed`] when it is not. A turn that has ended is
+    /// refused rather than redirected to whatever is running now.
+    pub fn check_turn(
+        &self,
+        target: &AgentMutationTarget,
+        turn_id: &kr_protocol::ids::AgentTurnId,
+    ) -> Result<()> {
+        let binding = self.binding_state(target.subject.application_instance_id)?;
+        if binding.turn_id.as_ref() == Some(turn_id) {
+            Ok(())
+        } else {
+            Err(BrokerError::PreconditionFailed {
+                detail: format!("{turn_id} is not the turn this instance is running"),
+            })
+        }
+    }
+
+    /// Checks that one pending resource can be answered with the decision named.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when the resource is not one this broker holds,
+    /// [`BrokerError::PermissionDenied`] when it belongs to another instance, and
+    /// [`BrokerError::PreconditionFailed`] when the decision is not one the request offered.
+    pub fn check_answerable(
+        &self,
+        target: &AgentMutationTarget,
+        resource_id: kr_protocol::ids::PendingResourceId,
+        option_id: &str,
+    ) -> Result<()> {
+        let resource = self
+            .pending(resource_id)
+            .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?;
+        if resource.application_instance_id != target.subject.application_instance_id {
+            return Err(BrokerError::denied(format!(
+                "{resource_id} belongs to another application instance"
+            )));
+        }
+        let entry = self
+            .decoding(resource_id)?
+            .ok_or_else(|| BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{resource_id} has no recorded interpretation, so there is nothing to answer"
+                ),
+            })?;
+        if entry.offers(option_id) {
+            Ok(())
+        } else {
+            Err(BrokerError::PreconditionFailed {
+                detail: format!("{option_id} is not one of the decisions this request offered"),
+            })
+        }
+    }
+
+    /// Checks everything a plugin action call declares, without running it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] for an action the package did not register,
+    /// [`BrokerError::InvalidArgument`] for an effect class that disagrees with the call, and
+    /// [`BrokerError::PreconditionFailed`] when a draft the action needs was not named.
+    pub fn check_action(
+        &self,
+        binding_id: BrokerBindingId,
+        params: &PluginActionInvokeParams,
+    ) -> Result<RegisteredAction> {
+        let registered = self
+            .registered_action(binding_id, &params.action)?
+            .ok_or_else(|| {
+                BrokerError::unknown(format!(
+                    "{} is not an action {} registered",
+                    params.action, params.plugin_id
+                ))
+            })?;
+        if registered.effect != EffectClass::Write {
+            return Err(BrokerError::invalid(format!(
+                "{} is a read, and this is the write path",
+                params.action
+            )));
+        }
+        if registered.needs_draft && !params.draft_id.is_present() {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("{} acts on a draft and this call named none", params.action),
+            });
+        }
+        Ok(registered)
+    }
+
+    /// Carries one admitted mutation to the upstream, and records what it answered.
+    ///
+    /// This is the half that happens: everything before it decided whether the operation may
+    /// happen, and this is the only place in the broker that reaches an upstream at all. An
+    /// instance with no transport bound has no upstream this host can reach, and the refusal says
+    /// so rather than reporting the operation as applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnsupportedCapability`] when nothing carries operations to this
+    /// instance, and whatever the transport itself refuses.
+    pub fn dispatch_mutation(
+        &self,
+        target: &AgentMutationTarget,
+        admitted: AgentMutationResult,
+        operation: UpstreamOperation,
+        turn_id: Option<kr_protocol::ids::AgentTurnId>,
+        payload: Vec<u8>,
+    ) -> Result<AgentMutationResult> {
+        let dispatch = self
+            .dispatch_for(target.subject.application_instance_id)
+            .ok_or_else(|| BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "nothing carries a {operation} to {}: this instance has no upstream transport \
+                     bound, so the operation is refused rather than reported as applied",
+                    target.subject.application_instance_id
+                ),
+            })?;
+        let outcome = dispatch.submit(&UpstreamRequest {
+            application_instance_id: target.subject.application_instance_id,
+            binding_revision: admitted.binding_revision,
+            operation,
+            turn_id: turn_id.clone(),
+            payload,
+        })?;
+        Ok(AgentMutationResult {
+            binding_revision: admitted.binding_revision,
+            provenance: outcome.provenance,
+            upstream_request_id: Nullable::from(outcome.upstream_request_id),
+            turn_id: Nullable::from(outcome.turn_id.or(turn_id)),
         })
     }
 

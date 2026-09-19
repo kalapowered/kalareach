@@ -313,7 +313,12 @@ impl ManagedProcess {
 }
 
 /// Checks that a directory is the owning user's and closed to everybody else.
-fn check_private_directory(directory: &std::path::Path) -> Result<()> {
+///
+/// # Errors
+///
+/// Returns [`BrokerError::LedgerUnavailable`] when the directory cannot be read, is not a
+/// directory, or is open to another account.
+pub fn check_private_directory(directory: &std::path::Path) -> Result<()> {
     let metadata = std::fs::metadata(directory).map_err(|error| {
         BrokerError::ledger(format!(
             "could not read the registration directory {}: {error}",

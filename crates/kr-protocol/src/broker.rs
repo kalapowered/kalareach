@@ -520,8 +520,11 @@ pub struct ActionToken {
     pub actor_id: ActorId,
     /// Which of the three grants authorised this invocation.
     pub grant: BrokerGrant,
-    /// The grant record that authority came from.
-    pub grant_id: GrantId,
+    /// The grant record that authority came from, when one does.
+    ///
+    /// A local operating-system caller has none: its authority is the identity the listener
+    /// authenticated rather than a grant, and section 23 leaves the field null for it.
+    pub grant_id: Nullable<GrantId>,
     /// The application instance the action runs against.
     pub application_instance_id: ApplicationInstanceId,
     /// The binding revision in force when the token was issued.
@@ -614,8 +617,8 @@ pub struct ActionTokenClaim {
     pub actor_id: ActorId,
     /// The grant it believes authorised the call.
     pub grant: BrokerGrant,
-    /// The grant record it names.
-    pub grant_id: GrantId,
+    /// The grant record it names, when the actor acts under one.
+    pub grant_id: Nullable<GrantId>,
     /// The application instance it acted against.
     pub application_instance_id: ApplicationInstanceId,
     /// The binding revision it acted under.
@@ -1248,7 +1251,13 @@ impl CapabilityRecord {
         if self.invalidated_by.is_empty() {
             return Err(CapabilityError::NoInvalidation);
         }
-        if self.source == CapabilityEvidenceSource::SignedRecord
+        // A record that a changed qualification profile invalidates has to name the profile it
+        // came from, whatever produced it: without that name there is nothing to compare a new
+        // profile against, and the trigger could never fire.
+        if (self.source == CapabilityEvidenceSource::SignedRecord
+            || self
+                .invalidated_by
+                .contains(&CapabilityInvalidation::QualificationProfileChanged))
             && !self.identity.qualification_profile_digest.is_present()
         {
             return Err(CapabilityError::MissingProfileIdentity);
@@ -1418,7 +1427,7 @@ mod tests {
             token_id: ActionTokenId::new("token-1").expect("a short handle is valid"),
             actor_id: actor("device-1"),
             grant: BrokerGrant::UpstreamAction,
-            grant_id: GrantId::new(Uuid::from_bytes([7; 16])),
+            grant_id: Nullable::some(GrantId::new(Uuid::from_bytes([7; 16]))),
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([3; 16])),
             binding_revision: AgentBindingRevision::new(4),
             action: ActionName::new("prompt.submit").expect("a valid action name"),

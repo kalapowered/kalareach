@@ -77,6 +77,18 @@ impl VolatileState {
         self.row
     }
 
+    /// Returns true when the ledger can be written to now.
+    ///
+    /// It is a different question from [`VolatileState::durability`], which labels what a record
+    /// written now *is*. While the fence is up the journal is faulted and nothing can be written.
+    /// During recovery storage is back, and the reconciliation that finishes the recovery has to
+    /// be written down: a reconciliation nobody recorded would be redone from the old state after
+    /// a restart.
+    #[must_use]
+    pub const fn writes_are_durable(&self) -> bool {
+        !matches!(self.mode, GatewayMode::NativeOnlyVolatile)
+    }
+
     /// Returns true when a rich mutation or rich approval may be admitted.
     #[must_use]
     pub const fn admits_rich_work(&self) -> bool {

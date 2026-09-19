@@ -2845,12 +2845,32 @@ impl WorkerService {
                 detail: format!("session {owned} is at epoch {epoch}"),
             });
         }
-        // A worker has no session-scoped application instance to act for, so naming one is a
-        // request this endpoint cannot serve rather than a field to ignore.
-        if mutation.target.application_instance_id.as_ref().is_some() {
-            return Err(WorkerError::InvalidArgument(
-                "this endpoint serves the session itself, not an application instance".to_owned(),
-            ));
+        // Most methods act on the session itself, and naming an application instance in the
+        // envelope is a request this endpoint cannot serve rather than a field to ignore. The
+        // agent and plugin methods do act on one, and for those the envelope must agree with what
+        // the parameters name: an envelope and a body that disagree are two requests.
+        match mutation.target.application_instance_id.as_ref() {
+            None => {}
+            Some(named)
+                if entry
+                    .resource_selectors
+                    .contains(&ResourceSelectorKind::ApplicationInstance) =>
+            {
+                let acted_on = Self::params_application_instance(entry.method, &mutation.params)?;
+                if acted_on != *named {
+                    return Err(WorkerError::InvalidArgument(
+                        "this request names one application instance in its envelope and another \
+                         in its parameters"
+                            .to_owned(),
+                    ));
+                }
+            }
+            Some(_) => {
+                return Err(WorkerError::InvalidArgument(
+                    "this endpoint serves the session itself, not an application instance"
+                        .to_owned(),
+                ));
+            }
         }
         // What a caller may say about its grant depends on how it reached the host. A local
         // caller's authority is the operating-system caller the listener authenticated, so section
@@ -3402,6 +3422,75 @@ impl WorkerService {
                 self.attention.check_actor(&caller.actor_id)?;
                 crate::attention::Attention::check_visit(&params)
             }
+            // The agent mutations and the plugin action. Everything the broker can decide about
+            // them is decided here, before the dispatch marker: section 9 makes a refusal this
+            // host can decide a rejection rather than an outcome nobody can establish, and all of
+            // these are decidable without touching the upstream.
+            Method::AgentPromptSubmit | Method::AgentPromptQueue => {
+                let params: kr_protocol::agent::AgentPromptParams = parse(&mutation.params)?;
+                params
+                    .validate()
+                    .map_err(|detail| WorkerError::InvalidArgument((*detail).to_owned()))?;
+                let capability = if method == Method::AgentPromptQueue {
+                    "agent.prompt.queue"
+                } else {
+                    "agent.prompt"
+                };
+                self.broker.check_mutation(
+                    &Self::broker_caller(caller),
+                    &params.target,
+                    capability,
+                    crate::broker::UpstreamOperation::PromptSubmit,
+                )?;
+                Ok(())
+            }
+            Method::AgentTurnSteer => {
+                let params: kr_protocol::agent::AgentSteerParams = parse(&mutation.params)?;
+                self.broker.check_turn(&params.target, &params.turn_id)?;
+                self.broker.check_mutation(
+                    &Self::broker_caller(caller),
+                    &params.target,
+                    "agent.steer",
+                    crate::broker::UpstreamOperation::TurnSteer,
+                )?;
+                Ok(())
+            }
+            Method::AgentTurnCancel => {
+                let params: kr_protocol::agent::AgentCancelParams = parse(&mutation.params)?;
+                self.broker.check_turn(&params.target, &params.turn_id)?;
+                self.broker.check_mutation(
+                    &Self::broker_caller(caller),
+                    &params.target,
+                    "agent.cancel",
+                    crate::broker::UpstreamOperation::TurnCancel,
+                )?;
+                Ok(())
+            }
+            Method::AgentApprovalRespond => {
+                let params: kr_protocol::agent::AgentApprovalRespondParams =
+                    parse(&mutation.params)?;
+                self.broker.check_mutation(
+                    &Self::broker_caller(caller),
+                    &params.target,
+                    "agent.approval",
+                    crate::broker::UpstreamOperation::ApprovalRespond,
+                )?;
+                self.broker.check_answerable(
+                    &params.target,
+                    params.resource_id,
+                    &params.option_id,
+                )?;
+                Ok(())
+            }
+            Method::PluginActionInvoke => {
+                let params: kr_protocol::agent::PluginActionInvokeParams = parse(&mutation.params)?;
+                let binding_id = self.broker.binding_for(
+                    &params.plugin_id,
+                    params.target.subject.application_instance_id,
+                )?;
+                self.broker.check_action(binding_id, &params)?;
+                Ok(())
+            }
             Method::ActionCancel => {
                 let params: kr_protocol::receipt::ActionCancelParams = parse(&mutation.params)?;
                 let Some(journal) = session.journal() else {
@@ -3765,10 +3854,28 @@ impl WorkerService {
     /// reader can tell a filtered answer from a complete one either way.
     fn agent_snapshot(&self, params: &ParamsValue, caller: &Caller) -> Result<ParamsValue> {
         let params: kr_protocol::agent::AgentSnapshotParams = parse(params)?;
+        // A local caller is the operating-system user the listener authenticated, and section 10's
+        // history rule narrows a *grant*; there is none to narrow, so it reads the whole retained
+        // history, exactly as a local attachment is drawn the whole screen.
+        //
+        // A forwarded caller does act under a grant, and what narrows it is the shared host-side
+        // history filter, which is not this task's. Until that filter is here, a forwarded read is
+        // refused rather than answered with more than the grant may cover: an unrestricted answer
+        // to a device is the failure this refusal exists to avoid.
+        if caller.is_remote() {
+            return Err(WorkerError::Broker(
+                crate::broker::BrokerError::UnsupportedCapability {
+                    detail:
+                        "a forwarded agent snapshot needs the shared host-side history filter, \
+                             which this build does not have; the terminal and the local reads are \
+                             unaffected"
+                            .to_owned(),
+                },
+            ));
+        }
         let filter = crate::broker::GrantLowerBound {
             from: kr_protocol::ids::StreamCursor::new(0),
         };
-        let _ = caller;
         encode(&self.broker.agent_snapshot(&params, &filter)?)
     }
 
@@ -3778,15 +3885,62 @@ impl WorkerService {
         encode(&self.broker.agent_commands(&params)?)
     }
 
+    /// Returns the application instance one of the agent or plugin methods acts on.
+    ///
+    /// It is read from the parameters, so the envelope's own selector can be compared with what
+    /// the request actually does rather than trusted beside it.
+    fn params_application_instance(
+        method: Method,
+        params: &ParamsValue,
+    ) -> Result<kr_protocol::ids::ApplicationInstanceId> {
+        Ok(match method {
+            Method::AgentPromptSubmit | Method::AgentPromptQueue => {
+                parse::<kr_protocol::agent::AgentPromptParams>(params)?
+                    .target
+                    .subject
+                    .application_instance_id
+            }
+            Method::AgentTurnSteer => {
+                parse::<kr_protocol::agent::AgentSteerParams>(params)?
+                    .target
+                    .subject
+                    .application_instance_id
+            }
+            Method::AgentTurnCancel => {
+                parse::<kr_protocol::agent::AgentCancelParams>(params)?
+                    .target
+                    .subject
+                    .application_instance_id
+            }
+            Method::AgentApprovalRespond => {
+                parse::<kr_protocol::agent::AgentApprovalRespondParams>(params)?
+                    .target
+                    .subject
+                    .application_instance_id
+            }
+            Method::PluginActionInvoke => {
+                parse::<kr_protocol::agent::PluginActionInvokeParams>(params)?
+                    .target
+                    .subject
+                    .application_instance_id
+            }
+            other => {
+                return Err(WorkerError::InvalidArgument(format!(
+                    "{} names no application instance in its parameters",
+                    other.as_str()
+                )));
+            }
+        })
+    }
+
     /// Returns the broker caller for one verified actor.
     fn broker_caller(caller: &Caller) -> crate::broker::Caller {
         crate::broker::Caller {
             actor_id: caller.actor_id.clone(),
-            grant_id: caller
-                .grant_id
-                .as_ref()
-                .copied()
-                .unwrap_or_else(|| kr_protocol::ids::GrantId::new(kr_ipc::new_uuid())),
+            // A local caller has none, and it stays none: its authority is the operating-system
+            // identity the listener authenticated, and naming a grant nothing issued would be a
+            // fact this host cannot check written into a token.
+            grant_id: caller.grant_id.as_ref().copied(),
         }
     }
 

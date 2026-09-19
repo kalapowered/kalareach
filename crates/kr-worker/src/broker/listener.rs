@@ -56,6 +56,12 @@ pub enum ListenerAddress {
     /// The address is not the secret. Anyone on this machine can reach a loopback port, so the
     /// credential is what decides, and it never appears in the address.
     Loopback {
+        /// The interface the listener is bound to.
+        ///
+        /// It is here rather than assumed, because "loopback" is what has to be checked: a
+        /// listener bound to every interface is reachable from the network, and a random
+        /// credential is not a substitute for not being reachable.
+        address: std::net::IpAddr,
         /// The port the listener is bound to.
         port: u16,
     },
@@ -70,10 +76,8 @@ impl ListenerAddress {
     #[must_use]
     pub fn is_local(&self) -> bool {
         match self {
-            Self::PrivateSocket(_) => true,
-            // Only the loopback interface. A listener bound to every interface is reachable from
-            // the network, and a random credential is not a substitute for not being reachable.
-            Self::Loopback { .. } => true,
+            Self::PrivateSocket(path) => path.is_absolute(),
+            Self::Loopback { address, .. } => address.is_loopback(),
         }
     }
 
@@ -85,7 +89,7 @@ impl ListenerAddress {
     pub fn for_diagnostics(&self) -> String {
         match self {
             Self::PrivateSocket(path) => path.display().to_string(),
-            Self::Loopback { port } => format!("127.0.0.1:{port}"),
+            Self::Loopback { address, port } => format!("{address}:{port}"),
         }
     }
 
@@ -96,16 +100,42 @@ impl ListenerAddress {
     /// Returns [`BrokerError::InvalidArgument`] when the runtime directory names nothing.
     pub fn for_launch(runtime_directory: &std::path::Path, port: u16) -> Result<Self> {
         if cfg!(unix) {
-            if runtime_directory.as_os_str().is_empty() {
+            if !runtime_directory.is_absolute() {
                 return Err(BrokerError::invalid(
-                    "a private socket needs a runtime directory to live in",
+                    "a private socket lives at an absolute path inside the runtime directory",
                 ));
             }
-            Ok(Self::PrivateSocket(
+            // The directory decides who may connect, so it is checked before an address that
+            // depends on it is handed out.
+            crate::broker::process::check_private_directory(runtime_directory)?;
+            let address = Self::PrivateSocket(
                 runtime_directory.join(format!("agent-{}.sock", kr_ipc::new_uuid())),
-            ))
+            );
+            debug_assert!(address.is_local());
+            Ok(address)
         } else {
-            Ok(Self::Loopback { port })
+            Ok(Self::Loopback {
+                address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                port,
+            })
+        }
+    }
+
+    /// Refuses an address this host will not publish.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] when the address is one something other than this
+    /// machine could reach. Section 12: the upstream listener is never exposed through iroh, and
+    /// the way to keep that true is to refuse the address rather than to filter the traffic.
+    pub fn require_local(&self) -> Result<()> {
+        if self.is_local() {
+            Ok(())
+        } else {
+            Err(BrokerError::denied(format!(
+                "{} is reachable from somewhere other than this machine",
+                self.for_diagnostics()
+            )))
         }
     }
 }
@@ -150,7 +180,10 @@ pub struct Registration {
 }
 
 /// What a connecting bridge presents.
-#[derive(Clone, Debug)]
+///
+/// `Debug` is written rather than derived, because the derived one would print the credential
+/// byte by byte and a connection failure is exactly when something logs one of these.
+#[derive(Clone)]
 pub struct BridgeHello {
     /// The credential it read from the registration.
     pub credential: Vec<u8>,
@@ -163,6 +196,17 @@ pub struct BridgeHello {
     /// launch/process binding and private exchange, not an environment-variable session ID
     /// alone".
     pub environment_session_id: Option<String>,
+}
+
+impl std::fmt::Debug for BridgeHello {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BridgeHello")
+            .field("credential", &"<redacted>")
+            .field("process", &self.process)
+            .field("environment_session_id", &self.environment_session_id)
+            .finish()
+    }
 }
 
 impl Registration {
@@ -253,17 +297,28 @@ impl BoundBinary {
         Self { pinned, process }
     }
 
-    /// Returns true when this binding keeps its identity across the installed upgrade described.
+    /// Returns the identity this binding acts under, whatever is on disk now.
     ///
-    /// It always does, while the process is the one it was bound to. The function exists so the
-    /// rule is a thing that can be asked rather than a comment.
+    /// The whole of section 12's rule is that this returns the pinned identity and not the
+    /// installed one. It takes the installed identity so that a caller cannot accidentally ask a
+    /// different question, and returns the pinned one so the answer is the rule.
     #[must_use]
-    pub fn survives_upgrade(&self, installed: &BinaryIdentity) -> bool {
+    pub fn identity_for(&self, installed: &BinaryIdentity) -> &BinaryIdentity {
         let _ = installed;
-        true
+        &self.pinned
     }
 
-    /// Returns the identity a *new* launch would resolve.
+    /// Returns true when an installed upgrade has moved on from what this binding is bound to.
+    ///
+    /// It is a fact about the world rather than a permission: the binding keeps its identity
+    /// either way, and this is what a diagnostic shows a person so they know why a running
+    /// process reports an older version than the one on disk.
+    #[must_use]
+    pub fn differs_from_installed(&self, installed: &BinaryIdentity) -> bool {
+        &self.pinned != installed
+    }
+
+    /// Returns the identity a *new* launch resolves.
     ///
     /// This is the other half of the same rule: an upgrade affects new launches, and it is the new
     /// launch that picks up what is on disk now.
@@ -401,9 +456,23 @@ mod tests {
         assert!(socket.is_local());
         assert_eq!(socket.for_diagnostics(), "/run/kr/agent-1.sock");
 
-        let loopback = ListenerAddress::Loopback { port: 49_152 };
+        let loopback = ListenerAddress::Loopback {
+            address: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            port: 49_152,
+        };
         assert!(loopback.is_local());
+        loopback.require_local().expect("loopback is local");
         assert_eq!(loopback.for_diagnostics(), "127.0.0.1:49152");
+
+        // And an address something else could reach is refused rather than published.
+        let exposed = ListenerAddress::Loopback {
+            address: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            port: 49_152,
+        };
+        assert!(!exposed.is_local());
+        assert!(exposed.require_local().is_err());
+        let relative = ListenerAddress::PrivateSocket("agent.sock".into());
+        assert!(!relative.is_local());
         assert!(
             !loopback.for_diagnostics().contains('@'),
             "a credential never travels in a URL"
@@ -412,13 +481,35 @@ mod tests {
 
     #[test]
     fn this_platform_prefers_the_private_socket_it_has() {
-        let address = ListenerAddress::for_launch(std::path::Path::new("/run/kr"), 49_152)
-            .expect("an address is chosen");
+        let directory = std::env::temp_dir().join(format!("kr-listener-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("the directory is created");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+                .expect("the directory is made private");
+        }
+        let address =
+            ListenerAddress::for_launch(&directory, 49_152).expect("an address is chosen");
+        address.require_local().expect("it is local");
         if cfg!(unix) {
             assert!(matches!(address, ListenerAddress::PrivateSocket(_)));
         } else {
             assert!(matches!(address, ListenerAddress::Loopback { .. }));
         }
+
+        // A directory other users can read is not one a private socket goes in.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let open = std::env::temp_dir().join(format!("kr-listener-{}", kr_ipc::new_uuid()));
+            std::fs::create_dir_all(&open).expect("the directory is created");
+            std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755))
+                .expect("the directory is made readable by others");
+            assert!(ListenerAddress::for_launch(&open, 49_152).is_err());
+            let _ = std::fs::remove_dir_all(&open);
+        }
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]
@@ -435,11 +526,13 @@ mod tests {
             ..original.clone()
         };
         let bound = BoundBinary::pin(original.clone(), process(41, 900));
-        assert!(bound.survives_upgrade(&upgraded));
         assert_eq!(
-            bound.pinned, original,
+            bound.identity_for(&upgraded),
+            &original,
             "a running binding keeps the identity it was bound to"
         );
+        assert!(bound.differs_from_installed(&upgraded));
+        assert!(!bound.differs_from_installed(&original));
         assert_eq!(
             BoundBinary::for_new_launch(&upgraded),
             upgraded,

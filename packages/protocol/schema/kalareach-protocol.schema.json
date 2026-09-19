@@ -419,8 +419,15 @@
           "description": "Which of the three grants authorised this invocation."
         },
         "grant_id": {
-          "$ref": "#/$defs/GrantId",
-          "description": "The grant record that authority came from."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The grant record that authority came from, when one does.\n\nA local operating-system caller has none: its authority is the identity the listener\nauthenticated rather than a grant, and section 23 leaves the field null for it."
         },
         "issued_at": {
           "$ref": "#/$defs/TimestampMs",
@@ -473,8 +480,15 @@
           "description": "The grant it believes authorised the call."
         },
         "grant_id": {
-          "$ref": "#/$defs/GrantId",
-          "description": "The grant record it names."
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The grant record it names, when the actor acts under one."
         },
         "parameter_hash": {
           "$ref": "#/$defs/Digest256",

@@ -161,12 +161,14 @@ fn response(id: &str) -> String {
 /// A worker with one instance, one authenticated native connection and one trusted decoder.
 fn gateway(path: Option<&std::path::Path>) -> Broker {
     let broker = Broker::open(path, session()).expect("the broker opens");
-    broker.register_instance(
-        instance(2),
-        IntegrationMode::Gateway,
-        None,
-        Some(managed(instance(2))),
-    );
+    broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::Gateway,
+            None,
+            Some(managed(instance(2))),
+        )
+        .expect("the instance is registered");
     broker
         .bind(
             binding(9),
@@ -206,7 +208,6 @@ fn approval(
     now: u64,
 ) -> Result<kr_protocol::gateway::PendingResource, BrokerError> {
     let body = frame(id, "session/request_permission");
-    let handle = broker.record_source(instance(2), body.as_bytes(), TimestampMs::new(now))?;
     let (_, opaque) = broker.forward_native(
         GatewayConnectionId::new(1),
         body.as_bytes(),
@@ -216,7 +217,6 @@ fn approval(
     broker.interpret(
         binding(9),
         opaque.resource_id,
-        &handle,
         projection(),
         None,
         TimestampMs::new(now + 1),
@@ -226,7 +226,7 @@ fn approval(
 /// KR-REQ-11.30: the qualified declarative table is interpreted by core code, and any request it
 /// does not classify is presumed mutating and suspends rich mutations.
 #[test]
-fn kr_req_11_30_the_core_interprets_the_table_and_presumes_an_unknown_request_mutates() {
+fn kr_req_11_30_the_core_classifies_with_the_table_and_presumes_an_unknown_request_mutates() {
     let broker = gateway(None);
 
     let observed = broker
@@ -279,7 +279,7 @@ fn kr_req_11_30_the_core_interprets_the_table_and_presumes_an_unknown_request_mu
 
 /// KR-REQ-11.31: a component fault disables the rich capability, and native traffic keeps moving.
 #[test]
-fn kr_req_11_31_a_component_fault_disables_rich_meaning_and_stalls_no_native_traffic() {
+fn kr_req_11_31_a_disabled_component_stops_rich_meaning_and_no_native_recording() {
     let broker = gateway(None);
     approval(&broker, "1", 2).expect("an interpretation before the fault");
 
@@ -320,7 +320,7 @@ fn kr_req_11_31_a_component_fault_disables_rich_meaning_and_stalls_no_native_tra
 /// KR-REQ-11.32 and KR-REQ-11.36: only an authenticated worker-launched native connection uses
 /// the forwarding path, and nothing can relabel itself native to reach it.
 #[test]
-fn kr_req_11_32_nothing_but_an_authenticated_worker_launched_terminal_forwards() {
+fn kr_req_11_32_only_the_launch_binding_and_the_private_exchange_open_a_native_connection() {
     let broker = gateway(None);
 
     // A rich client connects and is refused the native path.
@@ -399,7 +399,7 @@ fn kr_req_11_32_nothing_but_an_authenticated_worker_launched_terminal_forwards()
 /// KR-REQ-11.33: the encode, recheck, claim and dispatch transaction, and a native answer that
 /// arrives during encoding wins.
 #[test]
-fn kr_req_11_33_a_native_answer_during_encoding_wins_and_the_rich_answer_is_told_so() {
+fn kr_req_11_33_a_native_answer_before_the_recheck_wins_and_the_rich_answer_is_told_so() {
     let broker = gateway(None);
     let resource = approval(&broker, "1", 2).expect("the interpretation is accepted");
 
@@ -455,12 +455,14 @@ fn kr_req_11_33_a_native_answer_during_encoding_wins_and_the_rich_answer_is_told
 #[test]
 fn kr_req_12_13_downstream_identifiers_are_namespaced_and_transition_once() {
     let broker = gateway(None);
-    broker.register_instance(
-        instance(3),
-        IntegrationMode::Gateway,
-        None,
-        Some(managed(instance(3))),
-    );
+    broker
+        .register_instance(
+            instance(3),
+            IntegrationMode::Gateway,
+            None,
+            Some(managed(instance(3))),
+        )
+        .expect("the instance is registered");
     broker
         .open_native_connection(
             GatewayConnectionId::new(2),
@@ -529,7 +531,7 @@ fn kr_req_12_13_downstream_identifiers_are_namespaced_and_transition_once() {
 /// KR-REQ-12.11: both mutators reach the upstream through the gateway, the upstream's own
 /// identifiers are preserved, and a resolution is fanned out to every attached observer.
 #[test]
-fn kr_req_12_11_both_mutators_pass_through_the_gateway_and_events_fan_out() {
+fn kr_req_12_11_both_mutators_are_admitted_by_the_gateway_and_observers_are_listed() {
     let broker = gateway(None);
     broker
         .open_connection(
@@ -599,7 +601,7 @@ fn kr_req_12_11_both_mutators_pass_through_the_gateway_and_events_fan_out() {
 /// KR-REQ-12.16: a reverse filesystem or terminal request runs in the agent's own host
 /// environment, under the user the agent runs as.
 #[test]
-fn kr_req_12_16_a_reverse_request_runs_in_the_agents_host_environment() {
+fn kr_req_12_16_a_reverse_request_names_the_agents_own_environment_and_user() {
     let broker = gateway(None);
     let reverse = broker
         .reverse_request(
@@ -654,7 +656,7 @@ fn kr_req_12_16_a_reverse_request_runs_in_the_agents_host_environment() {
 
 /// KR-REQ-12.09: an action records how it actually reached the upstream.
 #[test]
-fn kr_req_12_09_provenance_is_typed_rpc_a_hook_response_or_terminal_input() {
+fn kr_req_12_09_an_admitted_answer_records_the_provenance_it_reached_the_upstream_by() {
     let broker = gateway(None);
     let resource = approval(&broker, "1", 2).expect("the interpretation is accepted");
     let claim = broker
@@ -683,7 +685,7 @@ fn kr_req_12_09_provenance_is_typed_rpc_a_hook_response_or_terminal_input() {
 /// KR-REQ-11.35 and KR-REQ-11.36: `native_only_volatile` fences rich work, keeps native
 /// arbitration, exposes the gap, relabels nothing, and answers `UPSTREAM_UNAVAILABLE`.
 #[test]
-fn kr_req_11_35_the_fence_keeps_native_arbitration_and_exposes_the_gap() {
+fn kr_req_11_35_the_fence_keeps_native_recording_and_arbitration_and_exposes_the_gap() {
     let broker = gateway(None);
     let claimed = approval(&broker, "1", 2).expect("an interpretation before the fault");
     broker
@@ -810,16 +812,26 @@ fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns
         broker
             .recover(TimestampMs::new(9))
             .expect("the gap is committed");
-        assert_eq!(broker.mode(), GatewayMode::Normal);
+        assert_eq!(
+            broker.mode(),
+            GatewayMode::Recovering,
+            "committing the gap is not the same as reconciling the upstream"
+        );
         assert!(
-            broker.gap().is_none(),
-            "a committed gap is no longer an open one"
+            broker
+                .claim(
+                    surviving.resource_id,
+                    &actor("device-1"),
+                    TimestampMs::new(10)
+                )
+                .is_err(),
+            "rich work does not come back before the pending identifiers are reconciled"
         );
 
         // Reconciliation with the same upstream: the request it still lists stays, and the one
-        // this host answered is uncertain and is never answered again.
-        let reconciliation = broker
-            .reconcile(
+        // this host answered is uncertain and is never answered again. Rich work returns with it.
+        let (reconciliation, finished) = broker
+            .reconcile_recovered(
                 ReconcileScope {
                     application_instance_id: instance(2),
                     connection: GatewayConnectionId::new(1),
@@ -828,18 +840,24 @@ fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns
                     GatewayConnectionId::new(1),
                     UpstreamRequestId::new("1").expect("valid"),
                 )],
-                TimestampMs::new(10),
+                TimestampMs::new(11),
             )
             .expect("the reconnect reconciles");
         assert_eq!(reconciliation.still_pending, vec![surviving.resource_id]);
         assert_eq!(reconciliation.uncertain, vec![answered.resource_id]);
+        assert_eq!(finished.to, GatewayMode::Normal);
+        assert_eq!(broker.mode(), GatewayMode::Normal);
+        assert!(
+            broker.gap().is_none(),
+            "a committed gap is no longer an open one"
+        );
 
         // Rich work is back.
         broker
             .claim(
                 surviving.resource_id,
                 &actor("device-1"),
-                TimestampMs::new(11),
+                TimestampMs::new(12),
             )
             .expect("rich approvals work again");
         (surviving.resource_id, answered.resource_id)
@@ -874,7 +892,7 @@ fn kr_req_11_37_recovery_commits_the_gap_and_reconciles_before_rich_work_returns
 /// comes back. That a control-daemon restart does not touch the worker at all is the daemon's,
 /// and `KR-ACC-006` covers it end to end.
 #[test]
-fn kr_req_12_10_gateway_request_state_survives_a_restart_of_the_worker() {
+fn kr_req_12_10_gateway_request_state_survives_reopening_the_workers_own_journal() {
     let path = journal_path();
     let (opaque, interpreted) = {
         let broker = gateway(Some(&path));

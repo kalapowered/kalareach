@@ -59,14 +59,31 @@ fn hello() -> BridgeHello {
 /// KR-REQ-12.14: the listener is private, refuses a browser and an unauthenticated request, is
 /// never an address a relay could carry, and keeps credentials out of what anybody reads.
 #[test]
-fn kr_req_12_14_the_listener_is_private_refuses_browsers_and_leaks_no_credential() {
+fn kr_req_12_14_the_address_is_private_browsers_are_refused_and_nothing_printed_carries_a_credential()
+ {
     let directory = std::env::temp_dir().join(format!("kr-listener-{}", kr_ipc::new_uuid()));
     std::fs::create_dir_all(&directory).expect("the directory is created");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700))
+            .expect("the directory is made private");
+    }
 
     // Private where the platform has one, loopback with a credential where it does not. Either
-    // way the address is local.
+    // way the address is local, and it is refused before it is published if it is not.
     let address = ListenerAddress::for_launch(&directory, 49_152).expect("an address is chosen");
     assert!(address.is_local());
+    address.require_local().expect("it is local");
+    assert!(
+        ListenerAddress::Loopback {
+            address: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            port: 49_152,
+        }
+        .require_local()
+        .is_err(),
+        "an address something else could reach is never published"
+    );
     if cfg!(unix) {
         assert!(matches!(address, ListenerAddress::PrivateSocket(_)));
     } else {
@@ -96,6 +113,14 @@ fn kr_req_12_14_the_listener_is_private_refuses_browsers_and_leaks_no_credential
             .is_err()
     );
 
+    // And what a failure logs carries no credential either.
+    let rendered = format!("{:?}", hello());
+    assert!(rendered.contains("credential: \"<redacted>\""));
+    assert!(
+        !rendered.contains("09, 09"),
+        "{rendered} carries the credential it received"
+    );
+
     // And nothing a person or a diagnostic reads carries the credential.
     let diagnostic = address.for_diagnostics();
     let file = registration.to_file();
@@ -113,7 +138,7 @@ fn kr_req_12_14_the_listener_is_private_refuses_browsers_and_leaks_no_credential
 /// KR-REQ-11.43: bridge registration authenticates against the launch and process binding and a
 /// private exchange, never an environment-variable session identifier alone.
 #[test]
-fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exchange() {
+fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exchange_together() {
     let registration = registration(ListenerAddress::PrivateSocket("/run/kr/a.sock".into()));
     let managed = managed(process(41, 900));
 
@@ -174,7 +199,7 @@ fn kr_req_11_43_registration_needs_the_launch_binding_and_the_private_exchange()
 /// KR-REQ-12.15: an executable upgrade affects new launches; an existing binding keeps the binary
 /// identity it was bound to.
 #[test]
-fn kr_req_12_15_a_running_binding_keeps_its_binary_identity_across_an_upgrade() {
+fn kr_req_12_15_a_bound_binary_identity_is_the_one_a_running_binding_acts_under() {
     let original = BinaryIdentity {
         resolved_path: "/usr/local/bin/codex".to_owned(),
         digest: Digest256::from_bytes([3; 32]),
@@ -188,20 +213,27 @@ fn kr_req_12_15_a_running_binding_keeps_its_binary_identity_across_an_upgrade() 
     };
 
     let bound = BoundBinary::pin(original.clone(), process(41, 900));
-    assert!(bound.survives_upgrade(&upgraded));
-    assert_eq!(bound.pinned.version, "0.9.1");
+    assert_eq!(
+        bound.identity_for(&upgraded).version,
+        "0.9.1",
+        "a running binding acts under the identity it was bound to"
+    );
+    assert!(bound.differs_from_installed(&upgraded));
+    assert!(!bound.differs_from_installed(&original));
     assert_eq!(bound.pinned.digest, Digest256::from_bytes([3; 32]));
     assert_eq!(BoundBinary::for_new_launch(&upgraded).version, "0.9.2");
 
     // And the live broker agrees: the connection the running process authenticated is still its
     // own after the file on disk changed.
     let broker = Broker::open(None, session()).expect("the broker opens");
-    broker.register_instance(
-        instance(),
-        IntegrationMode::Gateway,
-        Some(LaunchProfileId::new("lp-1").expect("valid")),
-        Some(managed(process(41, 900))),
-    );
+    broker
+        .register_instance(
+            instance(),
+            IntegrationMode::Gateway,
+            Some(LaunchProfileId::new("lp-1").expect("valid")),
+            Some(managed(process(41, 900))),
+        )
+        .expect("the instance is registered");
     broker.invalidate_capabilities(
         kr_protocol::broker::CapabilityInvalidation::BinaryChanged,
         "the executable was upgraded",

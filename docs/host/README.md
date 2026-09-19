@@ -2957,11 +2957,12 @@ One worker owns one broker, and the broker owns everything an upstream applicati
 built out of: the processes it launched, their credentials, the immutable frames they produced,
 the pending resources those frames imply, and the arbitration that resolves them.
 
-It is one lock, over the state **and** the durable records together. Every change is validated
-against the state as it is, written to the ledger conditionally on the state that write expects to
-find, and only then applied in memory. A failed or racing write therefore leaves memory exactly as
-it was, and there is no window in which a check has passed and the thing it checked has already
-moved.
+It is one lock, over the state **and** the durable records together. Every arbitration change is
+validated against the state as it is, written to the ledger conditionally on the state that write
+expects to find, and only then applied in memory, so a failed or racing write leaves memory exactly
+as it was. A method that makes several of those changes in turn — answering an approval claims,
+admits and resolves — holds the lock for each of them rather than for all three, and what carries
+the rule across them is the durable dispatch marker rather than the lock.
 
 The durable records live in the worker's own journal file, beside the receipts and the questions,
 with their own `broker_schema` version row. A plugin-host crash cannot touch them, because none of
@@ -2999,12 +3000,18 @@ being able to reproduce it.
 
 ### Action tokens
 
-Every action callback receives a token bound to five things: the verified actor, which of the three
-grants authorised it, the application and binding revision it was issued against, the declared
-action, and the hash of the parameters. It is spent once, and both the issue and the spend check
-the present: the binding still exists, still holds that grant, is not disabled by a component
-fault, the instance is not suspended, the revision is the one in force, and the capability the
-action needs is still usable at the revision the caller read it at.
+Every invocation gets a token bound to five things: the verified actor, which of the three grants
+authorised it, the application and binding revision it was issued against, the declared action, and
+the hash of the parameters. A local caller's grant is null, because its authority is the
+operating-system identity the listener authenticated rather than a grant. The token is spent once,
+and both the issue and the spend check the present: the binding still exists, still holds that
+grant, is not disabled by a component fault, the instance is not suspended, the revision is the one
+in force, and the capability the action needs is still usable at the revision the caller read it
+at.
+
+What is not here yet is the hand-over to a component: the runtime that invokes `prepare_action` is
+the plugin host's, and giving it the token is the work that joins the two. Until that lands, the
+broker issues and spends the token around the operation it dispatches itself.
 
 ### Capability evidence
 
@@ -3064,16 +3071,26 @@ throughout: suspension is a state a client reads, not an error it hits.
 
 Downstream request identifiers are namespaced by connection, so two connections that both call
 their first request `1` are two different pending resources. The upstream's own identifier is
-carried exactly as it wrote it, string or number; an upstream identifier never becomes a KalaReach
+carried as text exactly as it wrote it; an upstream identifier never becomes a KalaReach
 identifier. One resource takes one response transition.
+
+A frame is read strictly: it is bounded in both directions, it must be a top-level object, and a
+frame that names a member twice is refused rather than resolved, because another participant in the
+same protocol may resolve it the other way.
+
+What reads and writes the bytes is not here. The declarative table says how a connector's protocol
+frames, and the driver that applies that framing to a real transport belongs to the connector: the
+bundled adapters are the plugins repository's. What this host supplies is everything that decides:
+the classification, the recording, the correlation, the arbitration and the admission.
 
 The rich method table is closed and versioned. A method with no entry is rejected; one listed as
 unsupported is rejected with its own reason. Both tables are pinned to an upstream protocol version
 and refused against another.
 
-Upstream reverse requests for filesystem and terminal operations execute in the agent's own host
-environment, under the user the agent runs as. The site comes from the connection rather than from
-the request, so it cannot be pointed at a phone or another desktop client's filesystem.
+An upstream reverse request for a filesystem or terminal operation names the agent's own host
+environment and the user the agent runs as. The site comes from the connection rather than from the
+request, so it cannot be pointed at a phone or another desktop client's filesystem. Performing the
+operation is the worker's file and terminal paths' work and is not wired to this yet.
 
 Every action records how it actually reached the upstream: a typed remote procedure call, an
 authenticated hook response, or terminal input. Terminal input is never an authoritative typed
@@ -3083,7 +3100,9 @@ result, and the vocabulary says so rather than leaving it to a caller's judgemen
 
 When the journal faults during live traffic the gateway enters `native_only_volatile`, atomically:
 rich work is fenced, every unresolved resource is marked volatile, the identifiers that were
-already claimed or dispatched are counted and carried, and the gap is opened.
+already claimed or dispatched are counted and carried, and the gap is opened. What calls it is the
+worker's own storage-failure path, which is not wired to this yet; the mode, the fence and the gap
+are driven by their own suite until it is.
 
 What continues is the qualified native forwarding path and its in-memory arbitration. What stops is
 everything rich: a new interpretation, a rich mutation and a rich approval are all refused with
@@ -3095,20 +3114,26 @@ The gap is exposed while it is open, with when it started, why, how many native 
 responses passed through it, how many rich operations it refused, and how many claimed identifiers
 it carried.
 
-Recovery is two steps because it can fail. Storage returning begins it; committing the gap finishes
-it. The commit is one transaction over the gap and every resource the gap touched, in whatever
-state each actually reached, including the ones the upstream withdrew inside it. Rich work comes
-back only after that commit, and the pending identifiers are then reconciled with the same
-upstream. A failure part way leaves nothing committed and the fence back in place. Volatile
-operations are never replayed to manufacture durable history: a resource that lived through a gap
-says so for the rest of its life, and its later transitions are written down like anything else.
+Recovery is two steps because it can fail, and rich work comes back at the end of the second.
+Storage returning commits the gap: one transaction over the gap and every resource the gap touched,
+in whatever state each actually reached, including the ones the upstream withdrew inside it. A
+failure part way leaves nothing committed and the fence back in place. The gateway is then
+*recovering*, which admits no rich work; what ends that is reconciling the pending identifiers with
+the same upstream, and rich work returns with the reconciliation. Volatile operations are never
+replayed to manufacture durable history: a resource that lived through a gap says so for the rest
+of its life, and its later transitions are written down like anything else.
 
 ## The local listener
 
 A launched agent reaches its worker-owned backend on a private Unix socket inside the owner-only
 runtime directory where the platform has one, and on loopback with a random per-launch credential
-where it does not. Either way the address is local; nothing here can produce an address a relay
-could carry, and the listener is never exposed through iroh.
+where it does not. The directory's ownership and mode are checked before an address inside it is
+handed out, and an address something other than this machine could reach is refused before it is
+published rather than filtered afterwards, which is what keeps the listener off iroh.
+
+Binding the socket and serving it is the worker's endpoint work and is not wired to this yet. What
+is here is everything that decides: which address may be published, which connection is refused,
+and what a registration must present.
 
 A connection carrying any header a browser adds — `origin`, `referer`, `sec-fetch-site`,
 `sec-fetch-mode`, `sec-websocket-key`, `access-control-request-method` — is refused. A page that
@@ -3140,15 +3165,30 @@ answered under, and says how many entries the history filter withheld and whethe
 reader asked for had been evicted. A gap is reported, never filled: nothing reconstructs an
 unobserved pending approval from a transcript or a screen.
 
+The shared host-side history filter is not here. A local caller reads the whole retained history,
+because its authority is the operating-system identity the listener authenticated and there is no
+grant to narrow — the same rule that draws a local attachment the whole screen. A *forwarded* read
+is refused rather than answered, because answering it without the filter would give a device more
+than its grant covers.
+
 The five agent mutations each carry the binding revision they were prepared against. A revision
 behind the one in force is `STALE_SESSION`; a draft that moved is `DRAFT_CONFLICT`. A steer or a
 cancellation names the turn it acts on and is refused rather than redirected when that turn is not
 the one running. An approval answer is one of the decisions the request actually offered, checked
 against the retained list before the claim is taken, and it happens once.
 
-`plugin.action.invoke` validates the registered action, the grant that action declares, its effect
-class and its draft and request preconditions, and then issues the action token that authorises the
-one invocation that follows.
+Every one of those refusals is decided before the dispatch marker, so a request this host can
+refuse leaves a rejection rather than an outcome nobody can establish. What carries an admitted
+mutation to the upstream is the connector's own transport, and an instance with none bound is one
+whose mutations are refused rather than reported as applied.
 
-An adapter checkpoints the cursor it consumed. A restart replays from after it; a range that was
-evicted rebuilds from what is verifiably retained and says there is a gap.
+`plugin.action.invoke` validates the registered action, the grant that action declares, its effect
+class and whether a draft the action needs was named, and then issues the action token that
+authorises the one invocation that follows. Resolving the draft itself — that it exists, whose it
+is and at which revision — is the draft store's, and this host checks the presence of the name
+until that is joined up.
+
+An adapter checkpoints the cursor it consumed, and the cursor survives a restart. A restart resumes
+the numbering after it, so a new entry never takes a cursor an adapter has already passed and a
+replay from before the restart is a visible gap rather than a silently empty answer. A range that
+was evicted rebuilds from what is verifiably retained and says there is a gap.

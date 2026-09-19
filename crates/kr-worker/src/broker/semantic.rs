@@ -70,7 +70,16 @@ pub struct Replay {
     /// How many entries the history filter withheld.
     pub withheld: u64,
     /// The cursor a reader that consumed this part checkpoints.
+    ///
+    /// It stops at the last entry this reader actually received. An entry the filter withheld
+    /// does not advance it: another consumer with wider visibility checkpoints the same instance,
+    /// and skipping over what this one could not see would lose it for that one too.
     pub consumed: StreamCursor,
+    /// The cursor the next part starts *at*, when a limit stopped this one.
+    ///
+    /// It is inclusive, because the node it names is the first one that was left out. A reader
+    /// that passed it back as a consumed cursor would skip it.
+    pub resume_at: Option<StreamCursor>,
 }
 
 /// One instance's retained semantic entries.
@@ -151,13 +160,13 @@ impl SemanticLog {
         let mut withheld = 0;
         let mut consumed = from.unwrap_or_else(|| StreamCursor::new(0));
         let mut continuation = None;
+        let mut resume_at = None;
         for (cursor, entry) in &self.entries {
             if cursor.get() < start {
                 continue;
             }
             if !filter.admits(*cursor, entry) {
                 withheld += 1;
-                consumed = *cursor;
                 continue;
             }
             match budget.admit(1, u64::try_from(entry.text.len()).unwrap_or(u64::MAX)) {
@@ -167,6 +176,7 @@ impl SemanticLog {
                 }
                 Err(limit) => {
                     continuation = Some(budget.continuation(limit, cursor.get()));
+                    resume_at = Some(*cursor);
                     break;
                 }
             }
@@ -177,6 +187,21 @@ impl SemanticLog {
             history_gap,
             withheld,
             consumed,
+            resume_at,
+        }
+    }
+
+    /// Resumes a log at the cursor an adapter had already consumed.
+    ///
+    /// A restart does not keep the entries: they are the live parser's, and section 24 says a
+    /// rebuilt range shows a history gap for anything unavailable. What it does keep is the
+    /// numbering, so a new entry never takes a cursor an adapter has already checkpointed past,
+    /// and everything before the resume point is a gap rather than a silently empty answer.
+    pub const fn resume_after(&mut self, consumed: StreamCursor) {
+        let next = consumed.get().saturating_add(1);
+        if next > self.next {
+            self.next = next;
+            self.first_retained = StreamCursor::new(next);
         }
     }
 }

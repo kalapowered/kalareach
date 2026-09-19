@@ -1,15 +1,19 @@
-//! The broker's grants, decoding trust and action tokens as a component meets them, and the
-//! runtime bounds a malicious one runs under.
+//! The contract a component is held to, from the side that hosts components.
 //!
-//! Requirement rows closed here: KR-REQ-11.24, KR-REQ-11.25, KR-REQ-11.28, KR-REQ-11.31 (the
-//! runtime half) and the KR-ACC-016 harness. What is not here is the worker's arbitration and its
-//! durable ledger, which are `crates/kr-worker/tests/broker.rs` and `gateway.rs`.
+//! The rules themselves live in `kr_protocol::broker`, which is what both sides share, and the
+//! gate that applies them to a live binding is the worker's broker. What this suite establishes is
+//! the contract as a component's host reads it: which grant permits which call, what a trust
+//! record does and does not cover, what a token binds, and that an external fixture binds and runs
+//! under this host's own bounds.
+//!
+//! Rows: KR-REQ-11.24, KR-REQ-11.25, KR-REQ-11.28 for the contract, and the external-fixture half
+//! of KR-ACC-016. The worker's arbitration, its durable ledger and the live enforcement are
+//! `crates/kr-worker/tests/{broker,gateway}.rs`.
 
 mod components;
 
 use std::sync::Arc;
 
-use kr_plugin_runtime::broker::{AuthorityError, ComponentAuthority, RichCapability};
 use kr_plugin_runtime::runtime::binding::{
     BindingOwner, DEFAULT_EVENT_QUEUE, Runtime, RuntimeConfig,
 };
@@ -21,7 +25,7 @@ use kr_protocol::ids::{
     ActionTokenId, ActorId, AgentBindingRevision, ApplicationInstanceId, GrantId, PluginId,
     PublisherId, UpstreamMethod,
 };
-use kr_protocol::scalars::{Digest256, TimestampMs, U64, Uuid};
+use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 
 fn method(name: &str) -> UpstreamMethod {
     UpstreamMethod::new(name).expect("a valid method name")
@@ -63,7 +67,7 @@ fn token() -> ActionToken {
         token_id: ActionTokenId::new("act-1").expect("valid"),
         actor_id: ActorId::new("device-1").expect("valid"),
         grant: BrokerGrant::UpstreamAction,
-        grant_id: GrantId::new(Uuid::from_bytes([7; 16])),
+        grant_id: Nullable::some(GrantId::new(Uuid::from_bytes([7; 16]))),
         application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([2; 16])),
         binding_revision: AgentBindingRevision::new(4),
         action: ActionName::new("prompt.submit").expect("valid"),
@@ -72,125 +76,109 @@ fn token() -> ActionToken {
     }
 }
 
-/// KR-REQ-11.24: the three grants are separate, and a component is never invited to do what its
-/// binding does not hold.
+/// KR-REQ-11.24: the three grants are separate, and holding one is never holding another.
 #[test]
-fn kr_req_11_24_a_component_is_never_asked_for_what_its_grants_do_not_permit() {
-    let display_only =
-        ComponentAuthority::observing(BrokerGrants::granted([BrokerGrant::Observation]));
+fn kr_req_11_24_the_three_grants_are_separate() {
+    let display_only = BrokerGrants::granted([BrokerGrant::Observation]);
+    assert!(display_only.is_display_only());
     display_only
-        .may_observe()
+        .require(BrokerGrant::Observation)
         .expect("an observation binding may be given observations");
-    assert!(matches!(
-        display_only.may_prepare_action(),
-        Err(AuthorityError::Grant(_))
-    ));
-    assert!(matches!(
-        display_only.may_decode(&permission()),
-        Err(AuthorityError::Grant(_))
-    ));
+    assert!(display_only.require(BrokerGrant::UpstreamAction).is_err());
+    assert!(
+        display_only
+            .require(BrokerGrant::ApprovalInterpreter)
+            .is_err()
+    );
 
-    let acting =
-        ComponentAuthority::observing(BrokerGrants::granted([BrokerGrant::UpstreamAction]));
+    let acting = BrokerGrants::granted([BrokerGrant::UpstreamAction]);
     acting
-        .may_prepare_action()
+        .require(BrokerGrant::UpstreamAction)
         .expect("an acting binding may prepare an effect");
     assert!(
-        matches!(acting.may_observe(), Err(AuthorityError::Grant(_))),
+        acting.require(BrokerGrant::Observation).is_err(),
         "preparing effects is not permission to read output"
     );
+    assert!(!BrokerGrant::Observation.may_create_approval());
+    assert!(!BrokerGrant::UpstreamAction.may_create_approval());
+    assert!(BrokerGrant::ApprovalInterpreter.may_create_approval());
 }
 
-/// KR-REQ-11.25: decoding trust is explicit, names the method, and answering is separate from
-/// interpreting.
+/// KR-REQ-11.25: a trust record names the package, the method and whether answering is included.
 #[test]
-fn kr_req_11_25_trust_names_the_method_and_answering_is_its_own_permission() {
-    let interpreter = ComponentAuthority {
-        grants: BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
-        trust: Some(trust(false)),
-    };
-    interpreter
-        .may_decode(&permission())
-        .expect("a trusted method may be interpreted");
-    assert!(matches!(
-        interpreter.may_decode(&method("fs/write_text_file")),
-        Err(AuthorityError::NotTrusted { .. })
-    ));
+fn kr_req_11_25_trust_names_the_package_the_method_and_whether_it_may_answer() {
+    let interpret_only = trust(false);
+    assert!(interpret_only.covers(&permission()));
+    assert!(!interpret_only.covers(&method("fs/write_text_file")));
     assert!(
-        matches!(
-            interpreter.may_encode(&permission()),
-            Err(AuthorityError::MayNotAnswer { .. })
-        ),
+        !interpret_only.may_encode_response,
         "interpreting a request is not permission to answer it"
     );
+    assert!(trust(true).may_encode_response);
 
-    let answering = ComponentAuthority {
-        grants: BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
-        trust: Some(trust(true)),
-    };
-    answering
-        .may_encode(&permission())
-        .expect("a binding granted both may answer");
-
-    // The interpreter grant without a record is not trust.
-    let ungranted =
-        ComponentAuthority::observing(BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]));
-    assert!(matches!(
-        ungranted.may_decode(&permission()),
-        Err(AuthorityError::NotTrusted { .. })
+    // One package's trust is never another's, at the bytes it was granted to.
+    assert!(interpret_only.belongs_to(
+        &PluginId::new("kalareach.codex").expect("valid"),
+        &PublisherId::new("kalareach").expect("valid"),
+        &Digest256::from_bytes([5; 32])
+    ));
+    assert!(!interpret_only.belongs_to(
+        &PluginId::new("someone.else").expect("valid"),
+        &PublisherId::new("kalareach").expect("valid"),
+        &Digest256::from_bytes([5; 32])
+    ));
+    assert!(!interpret_only.belongs_to(
+        &PluginId::new("kalareach.codex").expect("valid"),
+        &PublisherId::new("kalareach").expect("valid"),
+        &Digest256::from_bytes([6; 32])
     ));
 }
 
-/// KR-ACC-016, the malicious decoder: what a component returns is checked against the trust that
-/// authorised the call, not believed because the call was authorised.
+/// KR-ACC-016, the decoder's own output: what a component returns is checked against the trust
+/// that authorised the call, not believed because the call was authorised.
+///
+/// The projections here are written rather than produced by a hostile component, because what is
+/// under test is the policy: a decoder's output is only ever these values, however it arrived at
+/// them. A live component driven through the gate is `crates/kr-worker/tests/broker.rs`.
 #[test]
-fn kr_acc_016_a_malicious_decoder_is_bounded_by_the_trust_that_invited_it() {
-    let interpreter = ComponentAuthority {
-        grants: BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
-        trust: Some(trust(true)),
-    };
-    interpreter
-        .check_projection(
-            &permission(),
-            &projection("kr-approval/1", &["allow", "deny"]),
-        )
+fn kr_acc_016_a_decoders_output_is_bounded_by_the_trust_that_invited_it() {
+    let trust = trust(true);
+    trust
+        .check_projection(&projection("kr-approval/1", &["allow", "deny"]))
         .expect("a projection inside the policy is accepted");
 
     // A schema the trust does not cover.
-    assert!(matches!(
-        interpreter.check_projection(&permission(), &projection("kr-approval/99", &["allow"])),
-        Err(AuthorityError::Trust(_))
-    ));
+    assert!(
+        trust
+            .check_projection(&projection("kr-approval/99", &["allow"]))
+            .is_err()
+    );
     // More decisions than the trust permits.
-    assert!(matches!(
-        interpreter.check_projection(
-            &permission(),
-            &projection("kr-approval/1", &["a", "b", "c"])
-        ),
-        Err(AuthorityError::Trust(_))
-    ));
+    assert!(
+        trust
+            .check_projection(&projection("kr-approval/1", &["a", "b", "c"]))
+            .is_err()
+    );
     // Two decisions wearing one identifier, which would make an answer ambiguous.
-    assert!(matches!(
-        interpreter.check_projection(
-            &permission(),
-            &projection("kr-approval/1", &["allow", "allow"])
-        ),
-        Err(AuthorityError::Trust(_))
-    ));
-    // And a projection of a method it was never trusted for.
-    assert!(matches!(
-        interpreter.check_projection(
-            &method("fs/write_text_file"),
-            &projection("kr-approval/1", &["allow"])
-        ),
-        Err(AuthorityError::NotTrusted { .. })
-    ));
+    assert!(
+        trust
+            .check_projection(&projection("kr-approval/1", &["allow", "allow"]))
+            .is_err()
+    );
+    // And an empty offer, which is not a decision to make.
+    assert!(
+        trust
+            .check_projection(&projection("kr-approval/1", &[]))
+            .is_err()
+    );
 }
 
-/// KR-REQ-11.28: an action token binds five things, and a component that changes any of them
-/// spends nothing.
+/// KR-REQ-11.28: an action token binds five things, and a claim that changes any of them fails.
+///
+/// The spending itself is the worker's, and `crates/kr-worker/tests/broker.rs` drives it through
+/// the broker. What this establishes is the type's own contract, which both sides share.
 #[test]
-fn kr_req_11_28_a_component_cannot_widen_the_invocation_it_was_given() {
+fn kr_req_11_28_a_token_binds_actor_grant_revision_action_and_parameters() {
     let issued = token();
     issued
         .check(&ActionTokenClaim::from(&issued))
@@ -240,45 +228,8 @@ fn kr_req_11_28_a_component_cannot_widen_the_invocation_it_was_given() {
     ));
 }
 
-/// KR-REQ-11.31 and KR-ACC-016, the Wasm fault: a fault disables the rich capability and is
-/// invisible to anything the native path reads.
-#[test]
-fn kr_req_11_31_a_fault_disables_rich_work_and_nothing_else() {
-    let mut rich = RichCapability::available();
-    rich.require().expect("rich work is available");
-
-    rich.disable("three faults in one minute");
-    assert!(!rich.is_available());
-    assert!(matches!(
-        rich.require(),
-        Err(AuthorityError::RichDisabled { .. })
-    ));
-    assert_eq!(rich.disabled_reason(), Some("three faults in one minute"));
-
-    // A later fault does not overwrite the reason the binding was first stopped for.
-    rich.disable("something else");
-    assert_eq!(rich.disabled_reason(), Some("three faults in one minute"));
-
-    // A disabled binding is not re-enabled by waiting. It is re-enabled by being bound again.
-    rich.restore();
-    rich.require().expect("a fresh binding starts available");
-
-    // The authority a binding holds is untouched by a fault: what stopped is the rich capability,
-    // and the grants are still what they were.
-    let authority = ComponentAuthority {
-        grants: BrokerGrants::granted([BrokerGrant::Observation, BrokerGrant::ApprovalInterpreter]),
-        trust: Some(trust(true)),
-    };
-    let mut faulted = RichCapability::available();
-    faulted.disable("the component trapped");
-    authority
-        .may_observe()
-        .expect("observation is not what a rich fault stops");
-    assert!(faulted.require().is_err());
-}
-
-/// KR-ACC-016, the runtime budgets and the external fixture harness: a component from a directory
-/// outside this repository is bound and bounded like any other.
+/// KR-ACC-016, the external fixture harness: a component from a workspace outside this one is
+/// bound and bounded like any other.
 ///
 /// The harness is the directory itself: `scripts/build-plugin-fixtures.sh` builds a workspace that
 /// is not part of this one, and the runtime loads its output by path. A vendor adding a fixture

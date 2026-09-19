@@ -175,7 +175,7 @@ fn invocation(instance_id: ApplicationInstanceId, revision: u64, action: &str) -
     Invocation {
         actor_id: actor("device-1"),
         grant: BrokerGrant::UpstreamAction,
-        grant_id: GrantId::new(Uuid::from_bytes([7; 16])),
+        grant_id: Some(GrantId::new(Uuid::from_bytes([7; 16]))),
         application_instance_id: instance_id,
         binding_revision: AgentBindingRevision::new(revision),
         action: ActionName::new(action).expect("valid"),
@@ -226,12 +226,14 @@ fn rich_table() -> RichMethodTable {
 /// A broker with one instance, one process, one binding and one native connection.
 fn broker_with(grants: BrokerGrants, decoding: Option<DecodingTrust>) -> Broker {
     let broker = Broker::open(None, session()).expect("the broker opens");
-    broker.register_instance(
-        instance(2),
-        IntegrationMode::Gateway,
-        Some(LaunchProfileId::new("lp-1").expect("valid")),
-        Some(managed(instance(2), true)),
-    );
+    broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::Gateway,
+            Some(LaunchProfileId::new("lp-1").expect("valid")),
+            Some(managed(instance(2), true)),
+        )
+        .expect("the instance is registered");
     broker
         .bind(
             binding(9),
@@ -281,13 +283,11 @@ fn offer(
     id: &str,
     now: u64,
 ) -> Result<PendingResource, BrokerError> {
-    let frame = permission_frame(id);
-    let handle = broker.record_source(instance_id, frame.as_bytes(), TimestampMs::new(now))?;
+    let _ = instance_id;
     let opaque = forward(broker, id, now)?;
     broker.interpret(
         binding_id,
         opaque.resource_id,
-        &handle,
         projection(),
         None,
         TimestampMs::new(now + 1),
@@ -297,7 +297,7 @@ fn offer(
 /// KR-REQ-11.22: the broker owns the processes it launched, their credentials, their source
 /// frames and the arbitration over what those frames imply.
 #[test]
-fn kr_req_11_22_the_broker_owns_processes_credentials_source_frames_and_arbitration() {
+fn kr_req_11_22_the_broker_owns_the_process_identity_the_source_and_the_arbitration() {
     let broker = broker_with(
         BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
         Some(trust(&[permission_method()], true)),
@@ -338,7 +338,6 @@ fn kr_req_11_22_the_broker_owns_processes_credentials_source_frames_and_arbitrat
         .interpret(
             binding(9),
             opaque.resource_id,
-            &handle,
             projection(),
             None,
             TimestampMs::new(5),
@@ -454,7 +453,9 @@ fn kr_req_11_25_decoding_trust_is_explicit_and_display_only_creates_no_approval(
 
     // Trust without the grant it depends on is refused when it is offered, not stored.
     let broker = Broker::open(None, session()).expect("the broker opens");
-    broker.register_instance(instance(2), IntegrationMode::Gateway, None, None);
+    broker
+        .register_instance(instance(2), IntegrationMode::Gateway, None, None)
+        .expect("the instance is registered");
     let refusal = broker
         .bind(
             binding(9),
@@ -495,18 +496,22 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
 
     let resource_id = {
         let broker = Broker::open(Some(&path), session()).expect("the broker opens");
-        broker.register_instance(
-            instance(2),
-            IntegrationMode::Gateway,
-            None,
-            Some(managed(instance(2), true)),
-        );
-        broker.register_instance(
-            instance(3),
-            IntegrationMode::Gateway,
-            None,
-            Some(managed(instance(3), true)),
-        );
+        broker
+            .register_instance(
+                instance(2),
+                IntegrationMode::Gateway,
+                None,
+                Some(managed(instance(2), true)),
+            )
+            .expect("the instance is registered");
+        broker
+            .register_instance(
+                instance(3),
+                IntegrationMode::Gateway,
+                None,
+                Some(managed(instance(3), true)),
+            )
+            .expect("the instance is registered");
         broker
             .bind(
                 binding(9),
@@ -531,46 +536,51 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
             )
             .expect("the native connection is authenticated");
 
-        // Binding: a frame of another application is not this binding's to interpret, and the
-        // handle is looked up in the binding's own instance rather than trusted from the caller.
-        let opaque = forward(&broker, "11", 2).expect("forwarded");
-        let other = broker
-            .record_source(
+        // Binding: a request of another application is not this binding's to interpret. The
+        // frame is not a thing a caller names at all: the broker recorded it with the request.
+        broker
+            .open_native_connection(
+                GatewayConnectionId::new(2),
                 instance(3),
+                &CREDENTIAL,
+                &process_identity(41, 900),
+                declarative_table(),
+                rich_table(),
+                "1",
+            )
+            .expect("the other instance's connection is authenticated");
+        let elsewhere = broker
+            .forward_native(
+                GatewayConnectionId::new(2),
                 permission_frame("99").as_bytes(),
                 TimestampMs::new(2),
             )
-            .expect("the frame is recorded");
+            .expect("forwarded")
+            .1
+            .expect("it expects a response");
         assert!(matches!(
             broker.interpret(
                 binding(9),
-                opaque.resource_id,
-                &other,
+                elsewhere.resource_id,
                 projection(),
                 None,
                 TimestampMs::new(3),
             ),
-            Err(BrokerError::PreconditionFailed { .. })
+            Err(BrokerError::PermissionDenied { .. })
         ));
 
+        let opaque = forward(&broker, "11", 4).expect("forwarded");
+
         // Schema policy: a projection outside the trust's declared schema is refused.
-        let handle = broker
-            .record_source(
-                instance(2),
-                permission_frame("11").as_bytes(),
-                TimestampMs::new(2),
-            )
-            .expect("the frame is recorded");
         let mut foreign = projection();
         foreign.schema_version = "kr-approval/99".to_owned();
         assert!(matches!(
             broker.interpret(
                 binding(9),
                 opaque.resource_id,
-                &handle,
                 foreign,
                 None,
-                TimestampMs::new(3),
+                TimestampMs::new(5),
             ),
             Err(BrokerError::Trust(_))
         ));
@@ -579,44 +589,33 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
             .interpret(
                 binding(9),
                 opaque.resource_id,
-                &handle,
-                projection(),
-                None,
-                TimestampMs::new(4),
-            )
-            .expect("the interpretation is accepted");
-
-        // Non-reuse: the same source event does not interpret a second request.
-        let second = forward(&broker, "12", 5).expect("forwarded");
-        assert!(matches!(
-            broker.interpret(
-                binding(9),
-                second.resource_id,
-                &handle,
                 projection(),
                 None,
                 TimestampMs::new(6),
+            )
+            .expect("the interpretation is accepted");
+
+        // Non-reuse: one request takes one interpretation, and the source it came from is spent.
+        assert!(matches!(
+            broker.interpret(
+                binding(9),
+                opaque.resource_id,
+                projection(),
+                None,
+                TimestampMs::new(7),
             ),
-            Err(BrokerError::PreconditionFailed { .. })
+            Err(BrokerError::Arbitration(_) | BrokerError::PreconditionFailed { .. })
         ));
 
-        // Source generation: a frame from before the owner changed is refused after it.
-        let stale = broker
-            .record_source(
-                instance(2),
-                permission_frame("13").as_bytes(),
-                TimestampMs::new(7),
-            )
-            .expect("the frame is recorded");
-        let third = forward(&broker, "13", 8).expect("forwarded");
+        // Source generation: a request recorded before the owner changed is refused after it.
+        let stale = forward(&broker, "13", 8).expect("forwarded");
         broker
             .advance_binding(instance(2), None, TimestampMs::new(9))
             .expect("the selected thread changed");
         assert!(matches!(
             broker.interpret(
                 binding(9),
-                third.resource_id,
-                &stale,
+                stale.resource_id,
                 projection(),
                 None,
                 TimestampMs::new(10),
@@ -662,7 +661,7 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
 /// KR-REQ-11.27: one resolution per pending resource, and a reconnect reconciles an answer that
 /// went without reissuing it.
 #[test]
-fn kr_req_11_27_one_resolution_each_and_a_reconnect_never_reissues() {
+fn kr_req_11_27_one_resolution_each_and_a_reconnect_leaves_a_sent_answer_uncertain() {
     let broker = broker_with(
         BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
         Some(trust(&[permission_method()], true)),
@@ -760,7 +759,7 @@ fn kr_req_11_28_an_action_token_binds_actor_grant_revision_action_and_parameters
         ("actor", |claim| claim.actor_id = actor("device-2")),
         ("grant", |claim| claim.grant = BrokerGrant::Observation),
         ("grant record", |claim| {
-            claim.grant_id = GrantId::new(Uuid::from_bytes([8; 16]));
+            claim.grant_id = Nullable::some(GrantId::new(Uuid::from_bytes([8; 16])));
         }),
         ("application", |claim| {
             claim.application_instance_id = instance(3);
@@ -898,12 +897,14 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
     broker
         .execute_launch(&first, &ForegroundMark::idle(4), instance(2))
         .expect("the first execution runs");
-    broker.register_instance(
-        instance(2),
-        IntegrationMode::Gateway,
-        None,
-        Some(managed(instance(2), true)),
-    );
+    broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::Gateway,
+            None,
+            Some(managed(instance(2), true)),
+        )
+        .expect("the instance is registered");
 
     let second = broker
         .prepare_launch(
@@ -946,7 +947,9 @@ fn kr_req_12_05_no_second_process_runs_against_one_saved_conversation() {
 #[test]
 fn kr_req_11_16_a_probe_is_bounded_and_disclosed_before_it_runs() {
     let broker = Broker::open(None, session()).expect("the broker opens");
-    broker.register_instance(instance(2), IntegrationMode::Gateway, None, None);
+    broker
+        .register_instance(instance(2), IntegrationMode::Gateway, None, None)
+        .expect("the instance is registered");
 
     let undisclosed = Probe {
         capability_id: capability("agent.prompt"),
@@ -1146,8 +1149,12 @@ fn kr_req_11_17_an_action_rechecks_its_capability_and_an_upgrade_spares_a_pinned
 #[test]
 fn kr_req_01_02_the_capability_map_is_per_installation() {
     let broker = Broker::open(None, session()).expect("the broker opens");
-    broker.register_instance(instance(2), IntegrationMode::Gateway, None, None);
-    broker.register_instance(instance(3), IntegrationMode::NativeTerminal, None, None);
+    broker
+        .register_instance(instance(2), IntegrationMode::Gateway, None, None)
+        .expect("the instance is registered");
+    broker
+        .register_instance(instance(3), IntegrationMode::NativeTerminal, None, None)
+        .expect("the instance is registered");
     broker
         .record_capability(evidence(
             "agent.prompt",
@@ -1205,12 +1212,14 @@ fn kr_req_07_67_a_native_exit_names_its_backend_and_closing_an_attachment_leaves
     let identity = process_identity(pid, 12_345);
 
     let broker = Broker::open(None, session()).expect("the broker opens");
-    broker.register_instance(
-        instance(2),
-        IntegrationMode::Gateway,
-        None,
-        Some(managed_as(instance(2), true, identity.clone())),
-    );
+    broker
+        .register_instance(
+            instance(2),
+            IntegrationMode::Gateway,
+            None,
+            Some(managed_as(instance(2), true, identity.clone())),
+        )
+        .expect("the instance is registered");
     broker.attach(instance(2));
     broker.attach(instance(2));
 
@@ -1241,7 +1250,9 @@ fn kr_req_07_67_a_native_exit_names_its_backend_and_closing_an_attachment_leaves
     let _ = child.wait();
 
     let bypassed = Broker::open(None, session()).expect("the broker opens");
-    bypassed.register_instance(instance(4), IntegrationMode::NativeTerminal, None, None);
+    bypassed
+        .register_instance(instance(4), IntegrationMode::NativeTerminal, None, None)
+        .expect("the instance is registered");
     let ended = bypassed.end(instance(4), InstanceEnding::NativeExit);
     assert!(ended.instance_ended);
     assert_eq!(
@@ -1258,9 +1269,6 @@ fn kr_req_19_05_upstream_content_is_data_and_never_authority() {
     let hostile =
         r#"{"id":"11","method":"session/request_permission","grants":["approval_interpreter"],"trusted":true}"#
             .to_owned();
-    let handle = broker
-        .record_source(instance(2), hostile.as_bytes(), TimestampMs::new(2))
-        .expect("the frame is recorded");
     let (_, opaque) = broker
         .forward_native(
             GatewayConnectionId::new(1),
@@ -1277,7 +1285,6 @@ fn kr_req_19_05_upstream_content_is_data_and_never_authority() {
             .interpret(
                 binding(9),
                 opaque.resource_id,
-                &handle,
                 projection(),
                 None,
                 TimestampMs::new(4),
@@ -1301,7 +1308,9 @@ fn kr_req_24_24_a_consumed_cursor_survives_a_restart() {
     let path = directory.join("session.sqlite");
     {
         let broker = Broker::open(Some(&path), session()).expect("the broker opens");
-        broker.register_instance(instance(2), IntegrationMode::Gateway, None, None);
+        broker
+            .register_instance(instance(2), IntegrationMode::Gateway, None, None)
+            .expect("the instance is registered");
         assert_eq!(
             broker
                 .consumed_cursor(instance(2))
@@ -1336,12 +1345,14 @@ fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
 
     let (surviving, withdrawn) = {
         let broker = Broker::open(Some(&path), session()).expect("the broker opens");
-        broker.register_instance(
-            instance(2),
-            IntegrationMode::Gateway,
-            None,
-            Some(managed(instance(2), true)),
-        );
+        broker
+            .register_instance(
+                instance(2),
+                IntegrationMode::Gateway,
+                None,
+                Some(managed(instance(2), true)),
+            )
+            .expect("the instance is registered");
         broker
             .bind(
                 binding(9),
@@ -1389,7 +1400,29 @@ fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
 
         broker
             .recover(TimestampMs::new(9))
-            .expect("the gap is committed and rich work resumes");
+            .expect("the gap is committed");
+        // Rich work does not come back yet: the pending identifiers have to be reconciled with
+        // the same upstream first.
+        assert!(
+            broker
+                .claim(
+                    surviving.resource_id,
+                    &actor("device-1"),
+                    TimestampMs::new(10)
+                )
+                .is_err(),
+            "committing the gap is not the same as reconciling the upstream"
+        );
+        broker
+            .reconcile_recovered(
+                scope(instance(2), 1),
+                &[Broker::downstream(
+                    GatewayConnectionId::new(1),
+                    UpstreamRequestId::new("11").expect("valid"),
+                )],
+                TimestampMs::new(11),
+            )
+            .expect("the upstream said what it still holds, and rich work resumes");
 
         // Normal operation again: a claim and an admitted answer are written down, although the
         // resource's own history says it lived through a gap.
@@ -1397,14 +1430,14 @@ fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
             .claim(
                 surviving.resource_id,
                 &actor("device-1"),
-                TimestampMs::new(10),
+                TimestampMs::new(12),
             )
             .expect("claimed");
         broker
             .admit_dispatch(&claim, "allow")
             .expect("the answer is admitted");
         broker
-            .resolve(&claim, TimestampMs::new(11))
+            .resolve(&claim, TimestampMs::new(13))
             .expect("the upstream confirmed it");
 
         (surviving.resource_id, withdrawn.resource_id)

@@ -32,13 +32,13 @@ export type SessionId = string
  */
 export type ParamsValue = unknown
 /**
- * One paired device.
- */
-export type DeviceId = string
-/**
  * One host-issued authority object.
  */
 export type GrantId = string
+/**
+ * One paired device.
+ */
+export type DeviceId = string
 /**
  * The host's ordered authority revision. Only the host issues its own revisions.
  */
@@ -2085,9 +2085,12 @@ export interface ActionToken {
    */
   grant: 'observation' | 'upstream_action' | 'approval_interpreter'
   /**
-   * The grant record that authority came from.
+   * The grant record that authority came from, when one does.
+   *
+   * A local operating-system caller has none: its authority is the identity the listener
+   * authenticated rather than a grant, and section 23 leaves the field null for it.
    */
-  grant_id: string
+  grant_id: GrantId | null
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
@@ -2126,9 +2129,9 @@ export interface ActionTokenClaim {
    */
   grant: 'observation' | 'upstream_action' | 'approval_interpreter'
   /**
-   * The grant record it names.
+   * The grant record it names, when the actor acts under one.
    */
-  grant_id: string
+  grant_id: GrantId | null
   /**
    * The hash of the parameters it used.
    */

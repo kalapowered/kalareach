@@ -43,6 +43,12 @@ pub struct Pending {
     pub dispatched: bool,
     /// The binding whose decoder produced it, where one did.
     pub decoder: Option<BrokerBindingId>,
+    /// The source event this request was recorded from.
+    ///
+    /// An interpretation must be of *this* frame. Without the link a decoder could interpret one
+    /// request from another's bytes, and the ledger would record the wrong original beside the
+    /// wrong identifier.
+    pub source: Option<kr_protocol::ids::SourceEventHandle>,
 }
 
 /// What a claim gives its holder.
@@ -147,6 +153,7 @@ impl Arbitration {
         &mut self,
         resource: PendingResource,
         decoder: Option<BrokerBindingId>,
+        source: Option<kr_protocol::ids::SourceEventHandle>,
     ) -> Result<()> {
         if let Some(existing) = self.by_request.get(&resource.request) {
             return Err(BrokerError::invalid(format!(
@@ -169,6 +176,7 @@ impl Arbitration {
                 claim: None,
                 dispatched: false,
                 decoder,
+                source,
             },
         );
         Ok(())
@@ -195,6 +203,17 @@ impl Arbitration {
         pending.resource = interpreted;
         pending.decoder = Some(decoder);
         Ok(())
+    }
+
+    /// Returns the source event one request was recorded from.
+    #[must_use]
+    pub fn source_of(
+        &self,
+        resource_id: PendingResourceId,
+    ) -> Option<&kr_protocol::ids::SourceEventHandle> {
+        self.by_id
+            .get(&resource_id)
+            .and_then(|pending| pending.source.as_ref())
     }
 
     /// Returns true when this downstream identifier already names a live resource.
@@ -224,6 +243,7 @@ impl Arbitration {
                 claim: None,
                 dispatched,
                 decoder,
+                source: None,
             },
         );
     }
@@ -382,15 +402,24 @@ impl Arbitration {
             .by_id
             .get(&resource_id)
             .ok_or_else(|| BrokerError::unknown(format!("no pending resource {resource_id}")))?;
-        check_transition(pending.resource.state, PendingState::Cancelled)?;
+        // An answer of this host's has already gone for it. The upstream answering as well does
+        // not make that answer un-sent, and the outcome is genuinely unknown: the two may be the
+        // same decision or they may not, and nothing here can tell. `Cancelled` would say the
+        // upstream decided alone, which is the one thing that is certainly untrue.
+        let to = if pending.dispatched {
+            PendingState::Uncertain
+        } else {
+            PendingState::Cancelled
+        };
+        check_transition(pending.resource.state, to)?;
         let mut resource = pending.resource.clone();
-        resource.state = PendingState::Cancelled;
+        resource.state = to;
         Ok(Transition {
             resource,
             from: pending.resource.state,
             claim: None,
             holds_claim: false,
-            dispatched: false,
+            dispatched: pending.dispatched,
         })
     }
 
@@ -689,7 +718,7 @@ mod tests {
         let mut arbitration = Arbitration::new();
         let resource = resource(7, "11");
         let resource_id = resource.resource_id;
-        arbitration.record(resource, None).expect("recorded");
+        arbitration.record(resource, None, None).expect("recorded");
         let held = claim(&mut arbitration, resource_id, "device-1", 2).expect("claimed");
         assert!(
             claim(&mut arbitration, resource_id, "device-2", 3).is_err(),
@@ -709,7 +738,7 @@ mod tests {
         let resource = resource(7, "11");
         let resource_id = resource.resource_id;
         let request = resource.request.clone();
-        arbitration.record(resource, None).expect("recorded");
+        arbitration.record(resource, None, None).expect("recorded");
         let released = claim(&mut arbitration, resource_id, "device-1", 2).expect("claimed");
         reconcile(&mut arbitration, scope(), &[request]);
         // The same actor claims again. The old claim names an older attempt and must not resolve
@@ -726,14 +755,14 @@ mod tests {
     fn a_duplicate_downstream_identifier_is_refused() {
         let mut arbitration = Arbitration::new();
         arbitration
-            .record(resource(7, "11"), None)
+            .record(resource(7, "11"), None, None)
             .expect("recorded");
-        assert!(arbitration.record(resource(8, "11"), None).is_err());
+        assert!(arbitration.record(resource(8, "11"), None, None).is_err());
         // The same identifier on another connection is a different resource.
         let mut other = resource(8, "11");
         other.request =
             DownstreamRequestId::new(GatewayConnectionId::new(2), other.request.upstream.clone());
-        arbitration.record(other, None).expect("recorded");
+        arbitration.record(other, None, None).expect("recorded");
     }
 
     #[test]
@@ -742,7 +771,7 @@ mod tests {
         let resource = resource(7, "11");
         let resource_id = resource.resource_id;
         let request = resource.request.clone();
-        arbitration.record(resource, None).expect("recorded");
+        arbitration.record(resource, None, None).expect("recorded");
 
         // The rich answer has been encoded by its component and has not reached the recheck yet;
         // the encoding itself happens outside this type, which is the point of the order. The
@@ -780,9 +809,11 @@ mod tests {
         let untouched_request = untouched.request.clone();
         let withdrawn = resource(9, "13");
         let withdrawn_id = withdrawn.resource_id;
-        arbitration.record(dispatched, None).expect("recorded");
-        arbitration.record(untouched, None).expect("recorded");
-        arbitration.record(withdrawn, None).expect("recorded");
+        arbitration
+            .record(dispatched, None, None)
+            .expect("recorded");
+        arbitration.record(untouched, None, None).expect("recorded");
+        arbitration.record(withdrawn, None, None).expect("recorded");
 
         let held = claim(&mut arbitration, dispatched_id, "device-1", 2).expect("claimed");
         let marker = arbitration.plan_dispatch(&held).expect("planned");
@@ -807,14 +838,14 @@ mod tests {
         let mut arbitration = Arbitration::new();
         let mine = resource(7, "11");
         let mine_id = mine.resource_id;
-        arbitration.record(mine, None).expect("recorded");
+        arbitration.record(mine, None, None).expect("recorded");
 
         let mut another_instance = resource(8, "21");
         another_instance.application_instance_id =
             ApplicationInstanceId::new(Uuid::from_bytes([3; 16]));
         let another_instance_id = another_instance.resource_id;
         arbitration
-            .record(another_instance, None)
+            .record(another_instance, None, None)
             .expect("recorded");
 
         let mut another_connection = resource(9, "31");
@@ -824,7 +855,7 @@ mod tests {
         );
         let another_connection_id = another_connection.resource_id;
         arbitration
-            .record(another_connection, None)
+            .record(another_connection, None, None)
             .expect("recorded");
 
         // The reconnect lists nothing. Only its own resource is withdrawn.
@@ -854,7 +885,7 @@ mod tests {
         let resource = resource(7, "11");
         let resource_id = resource.resource_id;
         let request = resource.request.clone();
-        arbitration.record(resource, None).expect("recorded");
+        arbitration.record(resource, None, None).expect("recorded");
         claim(&mut arbitration, resource_id, "device-1", 2).expect("claimed");
         let reconciliation = reconcile(&mut arbitration, scope(), &[request]);
         assert_eq!(reconciliation.released, vec![resource_id]);
@@ -876,7 +907,7 @@ mod tests {
         let mut resource = resource(7, "11");
         resource.interpretation_verified = false;
         let resource_id = resource.resource_id;
-        arbitration.record(resource, None).expect("recorded");
+        arbitration.record(resource, None, None).expect("recorded");
         assert!(claim(&mut arbitration, resource_id, "device-1", 2).is_err());
     }
 
@@ -886,7 +917,7 @@ mod tests {
         let mut resource = resource(7, "11");
         resource.deadline_ms = Nullable::some(TimestampMs::new(100));
         let resource_id = resource.resource_id;
-        arbitration.record(resource, None).expect("recorded");
+        arbitration.record(resource, None, None).expect("recorded");
         assert!(claim(&mut arbitration, resource_id, "device-1", 200).is_err());
         claim(&mut arbitration, resource_id, "device-1", 50).expect("inside the deadline");
     }
@@ -896,9 +927,9 @@ mod tests {
         let mut arbitration = Arbitration::new();
         let claimed = resource(7, "11");
         let claimed_id = claimed.resource_id;
-        arbitration.record(claimed, None).expect("recorded");
+        arbitration.record(claimed, None, None).expect("recorded");
         arbitration
-            .record(resource(8, "12"), None)
+            .record(resource(8, "12"), None, None)
             .expect("recorded");
         let held = claim(&mut arbitration, claimed_id, "device-1", 2).expect("claimed");
         let marker = arbitration.plan_dispatch(&held).expect("planned");
@@ -920,8 +951,8 @@ mod tests {
         let mut answered = resource(8, "12");
         answered.deadline_ms = Nullable::some(TimestampMs::new(100));
         let answered_id = answered.resource_id;
-        arbitration.record(waiting, None).expect("recorded");
-        arbitration.record(answered, None).expect("recorded");
+        arbitration.record(waiting, None, None).expect("recorded");
+        arbitration.record(answered, None, None).expect("recorded");
         claim(&mut arbitration, answered_id, "device-1", 50).expect("claimed");
         let expired = arbitration.expire(TimestampMs::new(200));
         assert_eq!(expired.len(), 1);

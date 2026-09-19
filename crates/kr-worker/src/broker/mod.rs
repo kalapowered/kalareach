@@ -85,7 +85,10 @@ pub use crate::broker::ledger::{BindingRecord, Ledger, UnresolvedRecord};
 pub use crate::broker::listener::{
     BoundBinary, BridgeHello, ListenerAddress, Registration, reject_browser_origin,
 };
-pub use crate::broker::methods::{Caller, RegisteredAction, command, subject};
+pub use crate::broker::methods::{
+    Caller, RegisteredAction, UpstreamDispatch, UpstreamOperation, UpstreamOutcome,
+    UpstreamRequest, command, subject,
+};
 pub use crate::broker::process::{
     BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
 };
@@ -181,6 +184,8 @@ pub struct Instance {
     pub profile_id: Option<LaunchProfileId>,
     /// Why rich mutations are suspended, while they are.
     pub rich_suspension: Option<String>,
+    /// What carries a prepared operation to this instance's upstream, where anything does.
+    dispatch: Option<std::sync::Arc<dyn crate::broker::methods::UpstreamDispatch>>,
     /// How many KalaReach attachments are watching it.
     ///
     /// Closing one does not end the process. Section 7: "Closing a KR attachment does not end the
@@ -360,13 +365,26 @@ impl Broker {
     // -- instances ----------------------------------------------------------------------------
 
     /// Registers one managed application instance.
+    ///
+    /// Its semantic numbering resumes after whatever cursor an adapter last checkpointed, so a
+    /// restarted worker never issues a cursor an adapter has already passed, and a replay from
+    /// before the restart is a visible gap rather than a silently empty answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when the checkpoint cannot be read.
     pub fn register_instance(
         &self,
         application_instance_id: ApplicationInstanceId,
         mode: IntegrationMode,
         profile_id: Option<LaunchProfileId>,
         process: Option<ManagedProcess>,
-    ) {
+    ) -> Result<()> {
+        let consumed = self.state().ledger.checkpoint(application_instance_id)?;
+        let mut semantic = crate::broker::semantic::SemanticLog::new();
+        if let Some(consumed) = consumed {
+            semantic.resume_after(consumed);
+        }
         self.state().instances.insert(
             application_instance_id,
             Instance {
@@ -379,14 +397,16 @@ impl Broker {
                 mode,
                 profile_id,
                 rich_suspension: None,
+                dispatch: None,
                 attachments: 0,
-                semantic: crate::broker::semantic::SemanticLog::new(),
+                semantic,
                 commands: Vec::new(),
                 frames: BTreeMap::new(),
                 frame_order: std::collections::VecDeque::new(),
                 frame_bytes: 0,
             },
         );
+        Ok(())
     }
 
     /// Returns one instance's binding state.
@@ -517,6 +537,37 @@ impl Broker {
             .ok_or_else(|| unknown_instance(application_instance_id))?;
         instance.rich_suspension = None;
         Ok(())
+    }
+
+    /// Binds what carries prepared operations to one instance's upstream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::UnknownSubject`] when this broker holds no such instance.
+    pub fn bind_dispatch(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+        dispatch: std::sync::Arc<dyn crate::broker::methods::UpstreamDispatch>,
+    ) -> Result<()> {
+        let mut state = self.state();
+        let instance = state
+            .instances
+            .get_mut(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        instance.dispatch = Some(dispatch);
+        Ok(())
+    }
+
+    /// Returns what carries operations to one instance's upstream, where anything does.
+    #[must_use]
+    pub fn dispatch_for(
+        &self,
+        application_instance_id: ApplicationInstanceId,
+    ) -> Option<std::sync::Arc<dyn crate::broker::methods::UpstreamDispatch>> {
+        self.state()
+            .instances
+            .get(&application_instance_id)
+            .and_then(|instance| instance.dispatch.clone())
     }
 
     /// Records that another attachment is watching one instance.
@@ -797,10 +848,22 @@ impl Broker {
         if !forwarded.expects_response {
             return Ok((forwarded, None));
         }
-        let source_generation = state.instances.get(&application_instance_id).map_or_else(
-            || SourceGeneration::new(1),
-            |instance| instance.source_generation,
-        );
+        // The frame *is* the source event, and the broker records it here rather than trusting a
+        // caller to record it and then to name the right one. That is what ties an interpretation
+        // to the bytes it is an interpretation of.
+        let instance = state
+            .instances
+            .get_mut(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        let source_generation = instance.source_generation;
+        let source = SourceEventHandle::new(format!("src-{}", kr_ipc::new_uuid()))
+            .map_err(|error| BrokerError::invalid(format!("source handle: {error}")))?;
+        instance.retain(SourceFrame::new(
+            source.clone(),
+            source_generation,
+            frame,
+            now,
+        )?);
         let resource = PendingResource {
             resource_id: PendingResourceId::new(Uuid::from_bytes(*kr_ipc::new_uuid().as_bytes())),
             application_instance_id,
@@ -819,7 +882,9 @@ impl Broker {
         if resource.durability == Durability::Durable {
             state.ledger.record_opaque(&resource)?;
         }
-        state.arbitration.record(resource.clone(), None)?;
+        state
+            .arbitration
+            .record(resource.clone(), None, Some(source))?;
         Ok((forwarded, Some(resource)))
     }
 
@@ -873,7 +938,6 @@ impl Broker {
         &self,
         binding_id: BrokerBindingId,
         resource_id: PendingResourceId,
-        handle: &SourceEventHandle,
         projection: DecodedProjection,
         deadline_ms: Option<TimestampMs>,
         now: TimestampMs,
@@ -937,18 +1001,25 @@ impl Broker {
         let package_digest = binding.package_digest;
         let application_instance_id = pending.application_instance_id;
 
+        // The frame is the one *this request* was recorded from. A caller naming any other would
+        // put one request's bytes in another's ledger row, so it does not get to name one.
+        let handle = state
+            .arbitration
+            .source_of(resource_id)
+            .cloned()
+            .ok_or_else(|| BrokerError::PreconditionFailed {
+                detail: format!("{resource_id} was not recorded from a source event of its own"),
+            })?;
+        let handle = &handle;
         let instance = state
             .instances
             .get(&application_instance_id)
             .ok_or_else(|| unknown_instance(application_instance_id))?;
-        // The frame is read from this binding's own instance, by handle. Nothing the caller says
-        // about its generation or its digest is believed, because both are how this host decides
-        // whether the event is fresh and whether it has already been used.
         let frame = instance.frames.get(handle).cloned().ok_or_else(|| {
             BrokerError::PreconditionFailed {
                 detail: format!(
-                    "source event {handle} is not one this binding's application produced, or it \
-                     has already been consumed"
+                    "source event {handle} has already been consumed, so {resource_id} has already \
+                     been interpreted"
                 ),
             }
         })?;
@@ -1069,7 +1140,7 @@ impl Broker {
         let invocation = Invocation {
             actor_id: token.actor_id.clone(),
             grant: token.grant,
-            grant_id: token.grant_id,
+            grant_id: token.grant_id.as_ref().copied(),
             application_instance_id: token.application_instance_id,
             binding_revision: token.binding_revision,
             action: token.action.clone(),
@@ -1371,6 +1442,15 @@ impl Broker {
         still_open: &[DownstreamRequestId],
         now: TimestampMs,
     ) -> Result<Reconciliation> {
+        self.reconcile_within(scope, still_open, now)
+    }
+
+    fn reconcile_within(
+        &self,
+        scope: ReconcileScope,
+        still_open: &[DownstreamRequestId],
+        now: TimestampMs,
+    ) -> Result<Reconciliation> {
         let mut state = self.state();
         let (reconciliation, transitions) = state.arbitration.plan_reconcile(scope, still_open);
         for transition in transitions {
@@ -1413,6 +1493,20 @@ impl Broker {
     }
 
     // -- volatile-native mode -----------------------------------------------------------------
+
+    /// Refuses a rich operation while rich work is fenced, and counts the refusal in the gap.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::RichWorkFenced`] while the gateway is fenced or recovering.
+    pub fn require_rich_work(&self) -> Result<()> {
+        let mut state = self.state();
+        if let Err(error) = state.volatile.require_rich_work() {
+            state.volatile.note_fenced();
+            return Err(error);
+        }
+        Ok(())
+    }
 
     /// Returns the gateway's current durability mode.
     #[must_use]
@@ -1477,7 +1571,41 @@ impl Broker {
             return Err(error);
         }
         state.arbitration.clear_volatile_records();
-        state.volatile.finish_recovery()
+        // Rich work does not come back here. Section 11 requires the pending identifiers to be
+        // reconciled with the same upstream first, and that is `reconcile_recovered`, because it
+        // needs something this host does not have yet: what the upstream still holds.
+        Ok(beginning)
+    }
+
+    /// Finishes recovery, once the upstream has said what it still holds.
+    ///
+    /// This is the second half of section 11's "commit the gap and reconcile pending IDs with the
+    /// same upstream before restoring rich mutation". The reconciliation runs first, so a resource
+    /// this host may already have answered is uncertain before anything can claim it again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::InvalidArgument`] when the gateway is not recovering, and whatever
+    /// the reconciliation's own writes refuse.
+    pub fn reconcile_recovered(
+        &self,
+        scope: ReconcileScope,
+        still_open: &[DownstreamRequestId],
+        now: TimestampMs,
+    ) -> Result<(Reconciliation, VolatileTransition)> {
+        {
+            let state = self.state();
+            if state.volatile.mode() != kr_protocol::gateway::GatewayMode::Recovering {
+                return Err(BrokerError::invalid(format!(
+                    "the gateway is {} and this finishes a recovery",
+                    state.volatile.mode()
+                )));
+            }
+        }
+        let reconciliation = self.reconcile_within(scope, still_open, now)?;
+        let mut state = self.state();
+        let finished = state.volatile.finish_recovery()?;
+        Ok((reconciliation, finished))
     }
 
     // -- adapter checkpoints ------------------------------------------------------------------
@@ -1831,11 +1959,11 @@ impl BrokerState {
     /// A volatile record is not written: that is what volatile means, and writing it would be the
     /// manufactured durable history section 11 forbids.
     fn write_transition(&self, transition: &Transition, now: TimestampMs) -> Result<()> {
-        // What decides whether a write happens is the mode this host is in now, not the evidence
-        // quality of the resource's own history. A resource that lived through a gap keeps
-        // `durability = volatile` for ever, because that is what its history was; its later
+        // What decides whether a write happens is whether the ledger can take one now, not the
+        // evidence quality of the resource's own history. A resource that lived through a gap
+        // keeps `durability = volatile` for ever, because that is what its history was; its later
         // transitions are still written down.
-        if self.volatile.durability() != Durability::Durable {
+        if !self.volatile.writes_are_durable() {
             return Ok(());
         }
         self.ledger.settle_pending(
