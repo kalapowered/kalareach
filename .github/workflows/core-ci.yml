@@ -517,6 +517,19 @@ jobs:
           cargo test --locked -p kr-shell-integration \
             --test zsh --test bash --test fish --test pwsh -- --test-threads=1
 
+      # Section 7 qualifies the packages against the startup customisations people run. The
+      # customisations are pinned by digest and fetched once here, and a package or a customisation
+      # that is missing is a failure rather than a skip, because both are steps of this job.
+      - name: Qualify the packages against the startup customisations
+        env:
+          KR_REQUIRE_SHELL_PACKAGES: "1"
+          KR_REQUIRE_SHELL_STACKS: "1"
+          KR_TEST_ARTIFACTS_DIR: /tmp/kr-shell-qualification
+        run: |
+          bash scripts/fetch-shell-stacks.sh
+          cargo test --locked -p kr-shell-integration --test qualification -- --test-threads=1
+          cat /tmp/kr-shell-qualification/qualification-cases.tsv
+
   typescript:
     name: typescript
     runs-on: ubuntu-24.04
