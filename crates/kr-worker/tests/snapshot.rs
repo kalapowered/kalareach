@@ -54,6 +54,21 @@ struct Host {
     endpoint: kr_ipc::paths::Endpoint,
 }
 
+impl Host {
+    /// Ends the session and waits until it has finished closing.
+    ///
+    /// A test whose application stops by itself does not need this. One whose application does not
+    /// does: the shell a session owns is not a child of the test binary, so it outlives the binary
+    /// that started it and goes on competing for the machine with whatever runs next.
+    async fn end(&self) {
+        self.runtime
+            .close(kr_protocol::session::ClosureReason::CloseRequested)
+            .1
+            .release();
+        self.runtime.wait_closed().await;
+    }
+}
+
 fn build() -> BuildId {
     BuildId::new("kr-test/0").expect("a build identifier")
 }
@@ -1361,12 +1376,17 @@ async fn each_palette_a_creation_can_name_is_recorded_as_what_it_was() {
 async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() {
     // A queue small enough that a screen and a few updates fill it, and an application producing
     // output steadily. The slow client never reads; the quick one does.
-    // The stream outlasts this test on purpose: what it proves is that the session keeps reading
-    // *after* the slow client's queue fills, and an application that had stopped printing by then
-    // would prove it by standing still.
+    //
+    // The stream outlasts this test, and it does so by never ending rather than by printing a
+    // fixed number of lines and waiting. What is under test is that the session keeps reading
+    // after the slow client's queue fills, and an application that had stopped printing by then
+    // stands still for a reason that has nothing to do with the session: everything before the
+    // reading - attaching, a window of collection, waiting for a queue to fill - takes as long as
+    // the machine takes, and a producer with a life measured in seconds is a race against it. This
+    // one stops when the session does, which is at the end of this test.
     let host = host_with(
-        "i=0; while [ $i -lt 3000 ]; do printf 'line %d of a steady stream\\r\\n' $i; \
-         i=$((i+1)); sleep 0.01; done; sleep 20",
+        "i=0; while :; do printf 'line %d of a steady stream\\r\\n' $i; i=$((i+1)); \
+         sleep 0.01; done",
         Dimensions::new(CANONICAL.0, CANONICAL.1),
         None,
         16 * 1024,
@@ -1414,7 +1434,17 @@ async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() 
     );
     let at_overflow = host.runtime.session().output_cursor();
     let after = collect(&mut quick.client, Duration::from_secs(3)).await;
-    let afterwards = host.runtime.session().output_cursor();
+    // That the cursor moves is the assertion; how long it takes to move is the machine's business.
+    // A window measured in seconds would be a second race beside the first one.
+    let afterwards = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut reached = host.runtime.session().output_cursor();
+        while reached <= at_overflow && std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            reached = host.runtime.session().output_cursor();
+        }
+        reached
+    };
     assert!(
         afterwards > at_overflow,
         "the terminal was still being read after the queue filled: the output cursor stood at \
@@ -1482,6 +1512,11 @@ async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() 
         kr_protocol::session::SessionState::Live,
         "while the session itself carried on"
     );
+
+    // The application above prints until something stops it, so this is what stops it. A test that
+    // left it running would hand the next run of this binary a process forking a hundred times a
+    // second, and the next run's answer would depend on this one.
+    host.end().await;
 }
 
 /// KR-REQ-08.83: the viewport names the first row of the visible page, which a scroll moves.
