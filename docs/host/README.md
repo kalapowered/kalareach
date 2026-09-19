@@ -88,6 +88,23 @@ so a recycled identifier reads as a different process. A query the operating sys
 reported as unknown, never as death: a recovery path that treated a failed query as a death would
 release a session identity while its worker was still running.
 
+### Where the daemon keeps its keys
+
+The controller identity and this host's network device keys come out of one store, opened once at
+startup after the singleton lock is held. `kr-controller --secret-store` chooses it:
+
+| Value | Store | Who uses it |
+| --- | --- | --- |
+| `platform` (the default) | the operating system's credential store, with the owner-only directory where section 10 offers it | an installed host |
+| `file` | this environment's own `secrets` directory | a test, a bench or a demonstration run |
+
+A run's keys belong to that run. `file` puts them under the temporary state directory the run
+created, where they go when it does, so nothing a test or a measurement does reaches the person's
+own credential store; the harnesses that start a daemon pass it, and the in-process suites call
+`kr_crypto::store::open_store_in` for the same reason. An installed host is never started that way
+and its keys never leave the platform's protection. The daemon names the store it opened in its
+first line of output, so a run's log says where its keys went.
+
 ## Supervision
 
 A worker's lifetime belongs to the platform, not to the control daemon.

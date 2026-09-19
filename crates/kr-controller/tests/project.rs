@@ -15,10 +15,10 @@ use std::sync::Arc;
 
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
-use kr_crypto::store::open_store;
+use kr_crypto::store::{SecretStore, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
-use kr_ipc::verify::{CONTROLLER_SECRET_SERVICE, ControllerIdentity};
+use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::{ActionTarget, ParamsValue};
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, SessionId};
@@ -112,12 +112,12 @@ async fn host_on(temp: kr_ipc::testing::TempHost, work: Arc<tempfile::TempDir>) 
             paths: environment.clone(),
             environment_id,
             identity: Box::new(move || {
-                let store = open_store(CONTROLLER_SECRET_SERVICE, &secrets)
-                    .expect("a secret store for the test environment");
-                Ok(
-                    ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                        .expect("an identity"),
-                )
+                let store =
+                    open_store_in(&secrets).expect("a secret store for the test environment");
+                let secrets: Arc<dyn SecretStore> = Arc::from(store.store);
+                let identity = ControllerIdentity::open(secrets.as_ref(), environment_id, false)
+                    .expect("an identity");
+                Ok((identity, secrets))
             }),
             boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
             supervisor: Box::new(RefusingSupervisor),
@@ -949,10 +949,6 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
         drop(accepted);
     });
 
-    let secrets = EnvironmentSecrets {
-        environment_id,
-        secrets: environment.secrets_dir(),
-    };
     let action = ActionId::new(kr_ipc::new_uuid());
     let params = ProjectCloneParams {
         destination: DestinationRequest {
@@ -1083,9 +1079,7 @@ async fn a_daemon_killed_mid_clone_is_replaced_and_the_destination_is_untouched(
     drop(control);
     second.stop();
     let _ = held.join();
-    // Checked here, rather than left to the guard: a test that cannot clean up after itself says
-    // so instead of leaving an item in the operator's credential store.
-    secrets.remove().expect("removes the daemon's secrets");
+    keys_are_this_test_s(&environment, environment_id);
 }
 
 /// Waits for the project journal to hold one operation row.
@@ -1136,70 +1130,30 @@ impl Drop for Daemon {
     }
 }
 
-/// The secrets one environment's daemon created, removed when this goes out of scope.
+/// Asserts the daemon kept its device keys where this test told it to.
+///
+/// A daemon started with `--secret-store file` writes them into this environment's own `secrets`
+/// directory, which goes when the temporary host does. That is what keeps a test run out of the
+/// person's own credential store, and this is the check that says it happened rather than the flag
+/// on the command line saying it was asked for.
 #[cfg(unix)]
-struct EnvironmentSecrets {
+fn keys_are_this_test_s(
+    environment: &kr_ipc::paths::EnvironmentPaths,
     environment_id: EnvironmentId,
-    #[cfg_attr(
-        target_os = "macos",
-        expect(
-            dead_code,
-            reason = "the platform tool works by service and account, and never reads the \
-                      directory a fallback store would use"
-        )
-    )]
-    secrets: PathBuf,
-}
-
-#[cfg(unix)]
-impl EnvironmentSecrets {
-    /// Removes them through the platform's own tool, which works by service and account.
-    #[cfg(target_os = "macos")]
-    fn remove(&self) -> Result<(), String> {
-        for purpose in kr_protocol::pairing::KeyPurpose::ALL.map(|purpose| purpose.as_str()) {
-            let account = format!("{}/device-key/{purpose}", self.environment_id);
-            let status = std::process::Command::new("security")
-                .arg("delete-generic-password")
-                .arg("-s")
-                .arg(CONTROLLER_SECRET_SERVICE)
-                .arg("-a")
-                .arg(&account)
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status()
-                .map_err(|error| format!("the platform's keychain tool did not run: {error}"))?;
-            // 44 is what it reports for an item that is not there, which is the outcome this
-            // wanted anyway.
-            if !status.success() && status.code() != Some(44) {
-                return Err(format!("{account} could not be removed: {status}"));
-            }
-        }
-        Ok(())
-    }
-
-    /// Removes them through the store the daemon chose.
-    #[cfg(not(target_os = "macos"))]
-    fn remove(&self) -> Result<(), String> {
-        let store = open_store(CONTROLLER_SECRET_SERVICE, &self.secrets)
-            .map_err(|error| format!("the daemon's secret store could not be opened: {error}"))?;
-        let scope = self.environment_id.to_string();
-        for purpose in kr_protocol::pairing::KeyPurpose::ALL {
-            let name = kr_crypto::store::SecretName::device_key(&scope, purpose)
-                .map_err(|error| format!("{purpose:?} is not a name this store takes: {error}"))?;
-            store
-                .store
-                .delete(&name)
-                .map_err(|error| format!("{purpose:?} could not be removed: {error}"))?;
-        }
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-impl Drop for EnvironmentSecrets {
-    fn drop(&mut self) {
-        // Best effort on the way out an assertion takes. The successful path checks the result.
-        let _ = self.remove();
+) {
+    let scope = environment_id.to_string();
+    for purpose in kr_protocol::pairing::KeyPurpose::ALL {
+        let name = kr_crypto::store::SecretName::device_key(&scope, purpose)
+            .expect("a name this store takes");
+        let path = name
+            .as_str()
+            .split('/')
+            .fold(environment.secrets_dir(), |path, part| path.join(part));
+        assert!(
+            path.is_file(),
+            "the daemon's {purpose:?} key is not at {}, so it went to a store this test does not own",
+            path.display()
+        );
     }
 }
 
@@ -1264,6 +1218,10 @@ fn start_daemon(program: &Path, host: &kr_ipc::testing::TempHost) -> Daemon {
         .arg(host.root().join("s"))
         .arg("--worker")
         .arg(host.root().join("no-such-worker"))
+        // Its device keys belong to this run: they go in this environment's own secrets directory
+        // and leave with the temporary host, rather than into the person's credential store.
+        .arg("--secret-store")
+        .arg("file")
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().expect("duplicates the log"))
         .stderr(log)

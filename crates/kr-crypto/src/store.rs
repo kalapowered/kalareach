@@ -18,6 +18,17 @@
 //! Android keys are held by the platform layer of the companion application, which owns Keychain
 //! and Keystore access; this crate refuses rather than writing them to a file.
 //!
+//! # Where a test keeps its secrets
+//!
+//! A test, a bench or a demonstration run must never write to the person's own credential store.
+//! Items put there outlive the run that made them, nothing collects them, and on macOS a keychain
+//! that has grown to six figures makes every later write take minutes. So a run that needs a real
+//! store on disk calls [`open_store_in`], which takes the directory to use and is the only way to
+//! reach [`FileStore`] on a platform whose fallback is compiled out; a daemon a test starts is
+//! given `--secret-store file`, which is the same choice made on its command line. [`open_store`]
+//! is the production door and is unchanged: it never returns the directory store where section 10
+//! does not offer it.
+//!
 //! # Why every purpose has its own item
 //!
 //! Each device key is stored under its own name, so loading a device's keys reads four items and
@@ -251,6 +262,17 @@ impl FileStore {
         Ok(Self { directory })
     }
 
+    /// Opens the store in a directory the caller named, on any platform.
+    ///
+    /// This is the constructor [`open_store_in`] uses, and it is deliberately private: a caller
+    /// that wants the directory store where section 10 offers no fallback has to say so through
+    /// that one named function, and [`FileStore::open`] keeps refusing.
+    fn at(directory: impl Into<PathBuf>) -> Result<Self> {
+        let directory = directory.into();
+        prepare_named_directory(&directory)?;
+        Ok(Self { directory })
+    }
+
     /// Returns the directory secrets are written to.
     #[must_use]
     pub fn directory(&self) -> &Path {
@@ -414,6 +436,42 @@ fn prepare_private_directory(directory: &Path) -> Result<()> {
     check_owner_only(directory)
 }
 
+/// Creates or validates one owner-only directory whose parents belong to the caller.
+///
+/// [`prepare_private_directory`] refuses a directory any ancestor of which is a link, because the
+/// store a host keeps its keys in is reached from that host's own root and nothing on the way may
+/// be repointed. A directory a caller named is reached from wherever the caller put it, and a run
+/// puts its directories under the system temporary directory: on macOS that is below `/var`, which
+/// is a link to `/private/var`, and `/tmp` is a link on the same systems. Refusing those would
+/// refuse every directory a run has.
+///
+/// So the named directory carries the rules the fallback root carries — it is not itself a link,
+/// it is owner-only, and it gets mode 0700 — and every path below it is checked against a link on
+/// every read, write and deletion exactly as before. Its parents are the caller's to vouch for.
+fn prepare_named_directory(directory: &Path) -> Result<()> {
+    reject_link(directory)?;
+    if directory.exists() {
+        check_owner_only(directory)?;
+    }
+    std::fs::create_dir_all(directory).map_err(|error| CryptoError::SecretStore {
+        message: format!("create {}: {error}", directory.display()),
+    })?;
+    // Again after the creation: what exists now is what the mode below is set on.
+    reject_link(directory)?;
+    set_mode(directory, 0o700)?;
+    check_owner_only(directory)
+}
+
+/// Rejects one path that is a symbolic link.
+fn reject_link(path: &Path) -> Result<()> {
+    if path.is_symlink() {
+        return Err(CryptoError::SecretStore {
+            message: format!("{} is a symbolic link", path.display()),
+        });
+    }
+    Ok(())
+}
+
 /// Rejects a path if it, or any of its ancestors, is a symbolic link.
 ///
 /// A component that does not exist yet is not a link, so this is meaningful before the directory
@@ -421,11 +479,7 @@ fn prepare_private_directory(directory: &Path) -> Result<()> {
 fn reject_ancestor_links(path: &Path) -> Result<()> {
     let mut component = Some(path);
     while let Some(current) = component {
-        if current.is_symlink() {
-            return Err(CryptoError::SecretStore {
-                message: format!("{} is a symbolic link", current.display()),
-            });
-        }
+        reject_link(current)?;
         component = current.parent().filter(|parent| *parent != current);
     }
     Ok(())
@@ -708,6 +762,36 @@ pub fn open_store(service: &str, fallback_directory: &Path) -> Result<OpenedStor
             },
         },
     }
+}
+
+/// Opens the 0700 directory store at `directory`, on any platform, because the caller said so.
+///
+/// [`open_store`] answers "which store belongs to this host": it offers the directory only where
+/// section 10 allows it, and on macOS, iOS, Android and Windows it never returns anything but the
+/// platform's own credential store. This answers a different question, "use this directory", and
+/// the caller has to have named it. That is what a test harness, a bench and a daemon started with
+/// `--secret-store file` use, so a run writes its device keys into a directory it owns and throws
+/// away rather than into the person's own credential store.
+///
+/// The directory itself must not be a link, is created with mode 0700 and has to be owner-only,
+/// and every path below it is checked against a link on every use; its parents are the caller's,
+/// which is what lets a run keep its secrets under the system temporary directory.
+///
+/// It records nothing in the directory. The `.store-kind` marker is [`open_store`]'s record of a
+/// choice it made for a host; this choice is not made once and remembered, it is passed in at
+/// every start, and a marker claiming a backend [`open_store`] would not pick would be a record
+/// that lies.
+///
+/// # Errors
+///
+/// Returns [`CryptoError::SecretStore`] when the directory is a link, belongs to another account
+/// or cannot be created owner-only.
+pub fn open_store_in(directory: &Path) -> Result<OpenedStore> {
+    Ok(OpenedStore {
+        store: Box::new(FileStore::at(directory)?),
+        kind: StoreKind::FileFallback,
+        migration_available: false,
+    })
 }
 
 /// The file that records which store a host chose.
@@ -1115,10 +1199,7 @@ mod tests {
     }
 
     /// A directory only this test uses, under the system temporary directory.
-    #[cfg(all(
-        unix,
-        not(any(target_os = "macos", target_os = "ios", target_os = "android"))
-    ))]
+    #[cfg(unix)]
     fn scratch_directory(name: &str) -> PathBuf {
         let base = std::env::temp_dir().join(format!(
             "kr-crypto-{name}-{}-{:?}",
@@ -1149,6 +1230,40 @@ mod tests {
                 std::env::temp_dir().join(format!("kr-crypto-refused-{}", std::process::id()));
             assert!(FileStore::open(&base).is_err());
         }
+    }
+
+    /// The seam a test, a bench or a demonstration run keeps its secrets in.
+    ///
+    /// It has to work on macOS as well, because that is the platform whose credential store the
+    /// runs were filling. It also has to leave no `.store-kind` record: a later `open_store` on
+    /// the same directory answers about this host, not about a run that named a directory once.
+    #[cfg(unix)]
+    #[test]
+    fn a_named_directory_is_a_store_on_every_platform() {
+        let base = scratch_directory("named");
+        let opened = open_store_in(&base).expect("a store in the named directory");
+        assert_eq!(opened.kind, StoreKind::FileFallback);
+        assert!(!opened.migration_available);
+        let name = SecretName::new("host/x").expect("a name");
+        opened.store.set(&name, b"seed").expect("a write");
+        assert_eq!(
+            opened
+                .store
+                .get(&name)
+                .expect("a read")
+                .expect("a value")
+                .expose(),
+            b"seed"
+        );
+        assert!(
+            base.join("host").join("x").is_file(),
+            "the secret is a file in the directory the caller named"
+        );
+        assert!(
+            !base.join(STORE_KIND_MARKER).exists(),
+            "naming a directory for one run is not a choice recorded against this host"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[cfg(all(

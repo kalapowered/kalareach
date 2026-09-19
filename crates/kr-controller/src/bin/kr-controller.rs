@@ -10,9 +10,10 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use clap::Parser;
-use kr_crypto::store::open_store;
+use clap::{Parser, ValueEnum};
+use kr_crypto::store::{SecretStore, open_store, open_store_in};
 use kr_ipc::endpoint::Listener;
 use kr_ipc::paths::HostPaths;
 use kr_ipc::verify::{CONTROLLER_SECRET_SERVICE, ControllerIdentity};
@@ -37,6 +38,22 @@ struct Arguments {
     /// The worker executable this daemon starts.
     #[arg(long)]
     worker: Option<PathBuf>,
+    /// Where this daemon keeps its device keys.
+    ///
+    /// The default is the platform's own credential store, which is what an installed host uses.
+    /// `file` puts them in this environment's `secrets` directory instead, and is for a test, a
+    /// bench or a demonstration run, whose keys belong to the run and go with it.
+    #[arg(long, value_enum, default_value_t = SecretStoreChoice::Platform)]
+    secret_store: SecretStoreChoice,
+}
+
+/// The store a daemon was told to keep its device keys in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SecretStoreChoice {
+    /// The operating system's credential store, with the fallback section 10 allows.
+    Platform,
+    /// This environment's own `secrets` directory, named deliberately.
+    File,
 }
 
 fn main() -> ExitCode {
@@ -84,23 +101,31 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
     // daemons starting at once cannot both decide they are the first.
     let secrets_dir = environment.secrets_dir();
     let marker = environment.state_dir().join("controller-identity");
-    let open_identity = move || -> kr_controller::Result<ControllerIdentity> {
-        let store = open_store(CONTROLLER_SECRET_SERVICE, &secrets_dir)
+    let choice = arguments.secret_store;
+    let open_identity =
+        move || -> kr_controller::Result<(ControllerIdentity, Arc<dyn SecretStore>)> {
+            let store = match choice {
+                SecretStoreChoice::Platform => open_store(CONTROLLER_SECRET_SERVICE, &secrets_dir),
+                SecretStoreChoice::File => open_store_in(&secrets_dir),
+            }
             .map_err(|error| kr_controller::ControllerError::NotConfigured(error.to_string()))?;
-        let initialised_before = marker.exists();
-        let identity =
-            ControllerIdentity::open(store.store.as_ref(), environment_id, initialised_before)
-                .map_err(|error| {
-                    kr_controller::ControllerError::NotConfigured(error.to_string())
-                })?;
-        if !initialised_before {
-            kr_ipc::paths::write_owner_only_file(
-                &marker,
-                format!("{:?}\n", store.kind).as_bytes(),
-            )?;
-        }
-        Ok(identity)
-    };
+            // Named in the daemon's own output, so a run's log says where its keys went rather than
+            // leaving it to be worked out from the command line that started it.
+            println!("kr-controller: keys in {}", store.store.describe());
+            let initialised_before = marker.exists();
+            let identity =
+                ControllerIdentity::open(store.store.as_ref(), environment_id, initialised_before)
+                    .map_err(|error| {
+                        kr_controller::ControllerError::NotConfigured(error.to_string())
+                    })?;
+            if !initialised_before {
+                kr_ipc::paths::write_owner_only_file(
+                    &marker,
+                    format!("{:?}\n", store.kind).as_bytes(),
+                )?;
+            }
+            Ok((identity, Arc::from(store.store)))
+        };
 
     let worker_program = arguments.worker.unwrap_or_else(default_worker_program);
     let build_id = BuildId::new(format!("kr-controller/{RELEASE}"))?;

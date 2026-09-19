@@ -123,28 +123,17 @@ impl std::fmt::Debug for NetworkSetup {
 impl NetworkSetup {
     /// Reads the selection and the credentials from this process's environment.
     ///
-    /// Returns `None` when the environment selects no network. The key store is the platform's own
-    /// credential store where there is one, and the documented owner-only directory where there is
-    /// not; the fallback is taken deliberately rather than discovered at the first write.
+    /// Returns `None` when the environment selects no network. The device keys go in `secrets`,
+    /// which is the store the daemon opened for its own identity at startup: one daemon keeps
+    /// every key it has in one place, so a host cannot sign as itself out of the platform's
+    /// credential store while its transport keys sit somewhere else.
     ///
     /// # Errors
     ///
-    /// Returns a configuration error naming the variable or the store that could not be read.
-    pub fn from_environment(paths: &kr_ipc::paths::EnvironmentPaths) -> Result<Option<Self>> {
+    /// Returns a configuration error naming the variable that could not be read.
+    pub fn from_environment(secrets: Arc<dyn SecretStore>) -> Result<Option<Self>> {
         let Some(settings) = NetworkSettings::from_environment()? else {
             return Ok(None);
-        };
-        let secrets: Arc<dyn SecretStore> = match kr_crypto::store::PlatformStore::open(
-            kr_ipc::verify::CONTROLLER_SECRET_SERVICE,
-        ) {
-            Ok(store) => Arc::new(store),
-            Err(platform) => Arc::new(
-                kr_crypto::store::FileStore::open(paths.secrets_dir()).map_err(|file| {
-                    ControllerError::NotConfigured(format!(
-                        "this host has nowhere to keep its network keys: {platform}; {file}"
-                    ))
-                })?,
-            ),
         };
         let owner_signer = match std::env::var(OWNER_KEY) {
             Ok(text) if !text.trim().is_empty() => Some(owner_key(text.trim())?),
@@ -1388,7 +1377,7 @@ impl Controller {
 ///
 /// Returns a configuration failure, a key-store failure or a bind failure.
 pub async fn register_from_environment(controller: &Arc<Controller>) -> Result<()> {
-    let Some(setup) = NetworkSetup::from_environment(controller.paths())? else {
+    let Some(setup) = NetworkSetup::from_environment(Arc::clone(controller.secrets()))? else {
         return Ok(());
     };
     // Registering records the host on the daemon and hands the listener to it, so the daemon owns

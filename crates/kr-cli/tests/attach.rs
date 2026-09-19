@@ -134,8 +134,8 @@ async fn hosted(script: &str) -> Hosted {
         )
         .expect("a session key"),
     );
-    let store = kr_crypto::store::open_store("KalaReachAttachTest", &environment.secrets_dir())
-        .expect("a secret store");
+    let store =
+        kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a secret store");
     let controller =
         kr_ipc::verify::ControllerIdentity::initialise(store.store.as_ref(), environment_id)
             .expect("a controller identity");
@@ -300,8 +300,8 @@ async fn second_session(hosted: &Hosted, script: &str) -> (DisplayNumber, Arc<Se
         )
         .expect("a session key"),
     );
-    let store = kr_crypto::store::open_store("KalaReachAttachTest", &environment.secrets_dir())
-        .expect("a secret store");
+    let store =
+        kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a secret store");
     // The environment already has one: this is the second session in it, not a second environment.
     let controller =
         kr_ipc::verify::ControllerIdentity::open(store.store.as_ref(), environment_id, false)

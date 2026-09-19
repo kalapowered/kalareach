@@ -18,10 +18,10 @@ use std::sync::Arc;
 use kr_controller::registry::Registry;
 use kr_controller::service::{Controller, ControllerSetup};
 use kr_controller::supervision::DetachedSupervisor;
-use kr_crypto::store::open_store;
+use kr_crypto::store::{SecretStore, open_store_in};
 use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
-use kr_ipc::verify::{CONTROLLER_SECRET_SERVICE, ControllerIdentity};
+use kr_ipc::verify::ControllerIdentity;
 use kr_protocol::envelope::ActionTarget;
 use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{ActionId, BuildId, EnvironmentId, SessionId};
@@ -70,12 +70,12 @@ impl Host {
                 paths: environment.clone(),
                 environment_id,
                 identity: Box::new(move || {
-                    let store =
-                        open_store(CONTROLLER_SECRET_SERVICE, &secrets).expect("a secret store");
-                    Ok(
-                        ControllerIdentity::open(store.store.as_ref(), environment_id, false)
-                            .expect("an identity"),
-                    )
+                    let store = open_store_in(&secrets).expect("a secret store");
+                    let secrets: Arc<dyn SecretStore> = Arc::from(store.store);
+                    let identity =
+                        ControllerIdentity::open(secrets.as_ref(), environment_id, false)
+                            .expect("an identity");
+                    Ok((identity, secrets))
                 }),
                 boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
                 supervisor: Box::new(DetachedSupervisor::new()),

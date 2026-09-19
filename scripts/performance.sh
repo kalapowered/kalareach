@@ -7,6 +7,10 @@
 # Every step is checked. A build that fails, a measurement that produces no samples, or a
 # measurement that misses its bound all end this script with a non-zero status, because a
 # performance script that exits zero without measuring anything is worse than no script.
+#
+# Nothing here reaches the person's own credential store. A measurement that needs a key store
+# opens one in its own temporary directory, so the keys a run creates leave with the run, and a
+# figure is never the cost of writing to a store that has been filling up since the last one.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -59,8 +59,8 @@ async fn host_producing(generation: u64, script: &str) -> Host {
         )
         .expect("a session key"),
     );
-    let store = kr_crypto::store::open_store("KalaReachTest", &environment.secrets_dir())
-        .expect("a secret store");
+    let store =
+        kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a secret store");
     let controller = Arc::new(
         ControllerIdentity::initialise(store.store.as_ref(), environment_id)
             .expect("a controller identity"),

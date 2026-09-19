@@ -9,6 +9,11 @@
 # Every step is checked. A suite that fails to build, a suite that runs no tests, or a suite that
 # fails all end this script with a non-zero status, because a script that exits zero without
 # demonstrating anything is worse than no script.
+#
+# Nothing here reaches the person's own credential store. A suite that needs a key store opens one
+# in its own temporary directory, and a daemon a suite starts is given `--secret-store file`, so
+# the keys a run creates leave with the run. Items written to the platform's credential store would
+# not: nothing collects them, and a run that wrote there would add to them every time.
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -66,8 +66,8 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         )
         .expect("a session key"),
     );
-    let store = kr_crypto::store::open_store("KalaReachBackpressure", &environment.secrets_dir())
-        .expect("a secret store");
+    let store =
+        kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a secret store");
     let controller =
         kr_ipc::verify::ControllerIdentity::initialise(store.store.as_ref(), environment_id)
             .expect("a controller identity");

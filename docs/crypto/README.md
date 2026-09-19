@@ -201,7 +201,26 @@ anything is decrypted.
   operating-system account isolation and on disk encryption, and it protects nothing from code
   already running as the same user. Deletion overwrites before unlinking, which a journalling or
   copy-on-write filesystem may not honour.
-- `MemoryStore` is for tests, never touches a disk and redacts itself in debug output.
+- `MemoryStore` is for a unit test, never touches a disk and redacts itself in debug output.
+
+### Where a test keeps its secrets
+
+`open_store` answers which store belongs to a host, and on macOS, iOS, Android and Windows the
+answer is always the platform's credential store. `open_store_in(directory)` answers a different
+question, "use this directory", and it is the only way to reach `FileStore` where the fallback is
+compiled out. A test, a bench or a demonstration run calls it with a directory of its own, and a
+daemon one of them starts is given `--secret-store file`, which makes the same choice on the
+command line. Items written to a person's credential store outlive the run that made them and
+nothing collects them, so a run that wrote there would leave its keys behind every time.
+
+The named directory carries the rules the fallback root carries: it is not a link, it is owner-only
+and it gets mode 0700, and every path below it is checked against a link on each read, write and
+deletion. Its parents are the caller's, which is what lets a run keep its secrets under the system
+temporary directory, below `/var` on macOS and `/tmp` on many systems, both of which are links. `open_store_in` records nothing: the
+`.store-kind` marker is `open_store`'s record of a choice made once for a host, and this choice is
+passed in at every start.
+
+### The recorded choice
 
 `open_store` records which store a host chose in a `.store-kind` marker beside the fallback
 directory, and keeps using it. A host that chose files keeps using files even when a secret service

@@ -104,8 +104,8 @@ async fn hosted(script: &str) -> Hosted {
         )
         .expect("a session key"),
     );
-    let store = kr_crypto::store::open_store("KalaReachAttachTest", &environment.secrets_dir())
-        .expect("a secret store");
+    let store =
+        kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a secret store");
     let controller =
         kr_ipc::verify::ControllerIdentity::initialise(store.store.as_ref(), environment_id)
             .expect("a controller identity");
