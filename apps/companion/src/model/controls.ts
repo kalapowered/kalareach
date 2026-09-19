@@ -18,8 +18,8 @@ export type Truth = 'true' | 'false' | 'unknown'
 export interface ControlState {
   /** Capability states by capability name. */
   readonly capabilities: ReadonlyMap<string, string>
-  /** The rights this connection holds. */
-  readonly rights: ReadonlySet<string>
+  /** The rights this connection holds, or null when the client has not been told. */
+  readonly rights: ReadonlySet<string> | null
   /** The binding's state, when the client knows it. */
   readonly bindingState: string | null
   /** The nodes present in the document. */
@@ -32,7 +32,7 @@ export interface ControlState {
 export function emptyControlState(): ControlState {
   return {
     capabilities: new Map(),
-    rights: new Set(),
+    rights: null,
     bindingState: null,
     presentNodes: new Set(),
     flags: new Map()
@@ -48,8 +48,8 @@ export type Predicate =
   | { readonly op: 'any'; readonly terms: readonly Predicate[] }
   | { readonly op: 'capability'; readonly capability: string; readonly state: string }
   | { readonly op: 'grant'; readonly right: string }
-  | { readonly op: 'binding_state'; readonly state: string }
-  | { readonly op: 'node_present'; readonly node: string }
+  | { readonly op: 'binding'; readonly state: string }
+  | { readonly op: 'node_present'; readonly node_id: string }
   | { readonly op: 'flag'; readonly flag: string }
 
 /** The bounds the contract puts on a predicate, repeated here so the client applies them too. */
@@ -70,6 +70,9 @@ export function evaluate(predicate: Predicate, state: ControlState, depth = 0): 
       return inner === 'true' ? 'false' : 'true'
     }
     case 'all': {
+      // An empty `all` is vacuously true and an empty `any` vacuously false, which is what the
+      // host's own evaluator answers. A client that disagreed would show or hide a control the
+      // host would then decide differently about.
       if (predicate.terms.length > MAX_PREDICATE_TERMS) return 'unknown'
       let sawUnknown = false
       for (const term of predicate.terms) {
@@ -95,12 +98,15 @@ export function evaluate(predicate: Predicate, state: ControlState, depth = 0): 
       return known === predicate.state ? 'true' : 'false'
     }
     case 'grant':
+      // A client that has not been told which rights it holds does not know. Answering "false"
+      // would, under a negation, show a control the package's condition meant to hide.
+      if (state.rights === null) return 'unknown'
       return state.rights.has(predicate.right) ? 'true' : 'false'
-    case 'binding_state':
+    case 'binding':
       if (state.bindingState === null) return 'unknown'
       return state.bindingState === predicate.state ? 'true' : 'false'
     case 'node_present':
-      return state.presentNodes.has(predicate.node) ? 'true' : 'false'
+      return state.presentNodes.has(predicate.node_id) ? 'true' : 'false'
     case 'flag': {
       const flag = state.flags.get(predicate.flag)
       if (flag === undefined) return 'unknown'

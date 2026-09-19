@@ -257,13 +257,25 @@ export function Segmented<T extends string>({
 }): ReactNode {
   return (
     <div className="segmented" role="tablist" aria-label={label}>
-      {options.map((option) => (
+      {options.map((option, index) => (
         <button
           key={option.value}
           type="button"
           role="tab"
           aria-selected={option.value === value}
           tabIndex={option.value === value ? 0 : -1}
+          onKeyDown={(event) => {
+            const step =
+              event.key === 'ArrowRight' || event.key === 'ArrowDown'
+                ? 1
+                : event.key === 'ArrowLeft' || event.key === 'ArrowUp'
+                  ? -1
+                  : 0
+            if (step === 0) return
+            event.preventDefault()
+            const next = options[(index + step + options.length) % options.length]
+            if (next) onChange(next.value)
+          }}
           onClick={() => {
             onChange(option.value)
           }}
@@ -372,6 +384,11 @@ export function Sheet({
   const animation = useRef<Animation | null>(null)
   const tracker = useRef(new VelocityTracker())
   const dragStart = useRef<{ pointer: number; offset: number } | null>(null)
+  // Where the surface is now, and how fast it is moving. Every animation starts from these, so a
+  // gesture caught mid-flight continues from what is on the screen rather than from where the last
+  // animation thought it was.
+  const presented = useRef({ offset: 0, velocity: 0 })
+  const restoreFocus = useRef<HTMLElement | null>(null)
   const titleId = useId()
   const [mounted, setMounted] = useState(open)
   const reduced = prefersReducedMotion()
@@ -384,6 +401,7 @@ export function Sheet({
     const sheet = sheetRef.current
     if (!sheet) return
     const height = sheet.offsetHeight || 1
+    presented.current.offset = offset
     sheet.style.transform = `translate3d(0, ${offset}px, 0)`
     if (scrimRef.current) {
       scrimRef.current.style.setProperty(
@@ -416,15 +434,22 @@ export function Sheet({
       }
     }
 
-    // Always from the value on screen: a sheet caught while closing reverses from where it is.
-    const current = animation.current?.value ?? (open ? height : 0)
+    // Always from the value on screen, with the velocity it already has: a sheet caught while
+    // closing reverses from where it is rather than jumping back to where it started.
     animation.current?.stop()
+    const from = animation.current ? presented.current.offset : open ? height : 0
+    const velocity = animation.current ? presented.current.velocity : 0
+    presented.current.offset = from
     animation.current = animateSpring({
-      from: current,
-      velocity: 0,
+      from,
+      velocity,
       to: open ? 0 : height,
-      onFrame: place,
+      onFrame: (value) => {
+        presented.current.velocity = (value - presented.current.offset) * 60
+        place(value)
+      },
       onDone: () => {
+        presented.current.velocity = 0
         if (!open) setMounted(false)
       }
     })
@@ -432,6 +457,43 @@ export function Sheet({
       animation.current?.stop()
     }
   }, [open, mounted, place, reduced])
+
+  // A modal surface takes the focus and keeps it. Without this a keyboard is still operating the
+  // session behind a consequence the person has not answered.
+  useEffect(() => {
+    if (!mounted) return
+    const sheet = sheetRef.current
+    if (!sheet) return
+    restoreFocus.current = document.activeElement as HTMLElement | null
+    const focusable = () =>
+      Array.from(
+        sheet.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+        )
+      )
+    focusable()[0]?.focus()
+
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== 'Tab') return
+      const targets = focusable()
+      if (targets.length === 0) return
+      const first = targets[0]
+      const last = targets[targets.length - 1]
+      if (!first || !last) return
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault()
+        last.focus()
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('keydown', onKey)
+      restoreFocus.current?.focus()
+    }
+  }, [mounted])
 
   useEffect(() => {
     if (!mounted) return
@@ -470,7 +532,7 @@ export function Sheet({
           role="presentation"
           onPointerDown={(event) => {
             const sheet = sheetRef.current
-            if (!sheet) return
+            if (!sheet || event.button !== 0) return
             event.currentTarget.setPointerCapture(event.pointerId)
             animation.current?.stop()
             const currentOffset = animation.current?.value ?? 0
@@ -486,8 +548,9 @@ export function Sheet({
             tracker.current.add(event.clientY, event.timeStamp)
             const height = sheet.offsetHeight || 1
             const raw = start.offset + (event.clientY - start.pointer)
-            // Upward is past the boundary: it resists rather than stopping.
-            place(raw < 0 ? -rubberband(-raw, height) : raw)
+            // Upward is past the boundary: it resists rather than stopping. With reduced motion
+            // the surface does not travel at all, and the gesture still decides.
+            if (!reduced) place(raw < 0 ? -rubberband(-raw, height) : raw)
           }}
           onPointerUp={(event) => {
             const start = dragStart.current
@@ -506,12 +569,21 @@ export function Sheet({
               close()
               return
             }
+            if (reduced) {
+              place(0)
+              return
+            }
             animation.current?.stop()
+            presented.current.offset = offset
+            presented.current.velocity = velocity
             animation.current = animateSpring({
               from: offset,
               velocity,
               to: 0,
-              onFrame: place
+              onFrame: (value) => {
+                presented.current.velocity = (value - presented.current.offset) * 60
+                place(value)
+              }
             })
           }}
         />

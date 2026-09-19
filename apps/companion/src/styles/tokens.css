@@ -69,6 +69,10 @@
 
   --shadow: 0 12px 50px #07121726, 0 2px 8px #07121712;
   --shadow-sheet: 0 24px 70px #0712172e, 0 2px 10px #07121714;
+  --shadow-inset: #0712170a;
+  --scrim: #07121775;
+  --scrim-opaque: #071217c7;
+  --success-hover: #27503e;
 
   /* Motion. The out curve is strong on purpose: the built-in easings read as hesitation. */
   --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
@@ -89,7 +93,10 @@
   --gap-5: 1.5rem;
   --gap-6: 2rem;
 
-  /* The smallest a control may be. 44 points on a touch pointer, and this on a precise one. */
+  /*
+   * The smallest a control may be, in both dimensions. A precise pointer can hit something
+   * smaller than a finger can, so the platform minimum applies where the pointer is coarse.
+   */
   --target: 36px;
 }
 
@@ -128,6 +135,10 @@
 
   --shadow: 0 12px 50px #0007, 0 2px 8px #0004;
   --shadow-sheet: 0 24px 70px #0009, 0 2px 10px #0005;
+  --shadow-inset: #00000030;
+  --scrim: #0712179e;
+  --scrim-opaque: #071217e0;
+  --success-hover: #bcdcc9;
 }
 
 /* A pointer that is not precise gets the platform's own minimum target. */

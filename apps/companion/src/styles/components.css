@@ -230,6 +230,7 @@ main {
   align-items: center;
   gap: 7px;
   min-height: var(--target);
+  min-width: var(--target);
   flex-shrink: 0;
   border: 1px solid var(--line);
   border-radius: 7px;
@@ -297,6 +298,7 @@ main {
   border: 0;
   padding: 3px 0;
   min-height: var(--target);
+  min-width: var(--target);
   font-size: 0.6875rem;
   font-weight: 500;
   color: var(--accent);
@@ -323,6 +325,7 @@ main {
   align-items: center;
   gap: 6px;
   min-height: max(30px, calc(var(--target) - 6px));
+  min-width: max(30px, calc(var(--target) - 6px));
   padding: 6px 11px;
   border: 1px solid transparent;
   border-radius: 5px;
@@ -339,7 +342,7 @@ main {
   background: var(--surface);
   color: var(--text);
   border-color: var(--line);
-  box-shadow: 0 1px 2px #0712170a;
+  box-shadow: 0 1px 2px var(--shadow-inset);
 }
 
 .filters {
@@ -351,6 +354,7 @@ main {
 
 .filter {
   min-height: max(33px, var(--target));
+  min-width: max(33px, var(--target));
   display: inline-flex;
   align-items: center;
   gap: 7px;
@@ -650,7 +654,7 @@ textarea::placeholder {
   position: fixed;
   inset: 0;
   z-index: 90;
-  background: #07121775;
+  background: var(--scrim);
   -webkit-backdrop-filter: blur(4px);
   backdrop-filter: blur(4px);
   opacity: var(--scrim-opacity, 1);
@@ -737,7 +741,7 @@ textarea::placeholder {
 
 @media (prefers-reduced-transparency: reduce) {
   .scrim {
-    background: #071217c7;
+    background: var(--scrim-opaque);
     -webkit-backdrop-filter: none;
     backdrop-filter: none;
   }
@@ -800,9 +804,17 @@ textarea::placeholder {
 /* ---- Hover, only where a pointer is precise ------------------------------------------------- */
 
 @media (hover: hover) and (pointer: fine) {
+  /* Every tone keeps its own hover. A generic one would put the sage button's text on a
+     background it was never chosen against, and the contrast would collapse. */
   .btn:hover:not(:disabled) {
     background: var(--subtle);
     border-color: var(--control-line);
+  }
+
+  .btn-sage:hover:not(:disabled) {
+    background: var(--success-hover);
+    border-color: var(--success-hover);
+    color: var(--on-success);
   }
 
   .btn-primary:hover:not(:disabled) {

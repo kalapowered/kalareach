@@ -95,6 +95,7 @@ export function Conversation({
   const { port, say } = useApp()
   const { state, update } = useSession(sessionId)
   const [insertion, setInsertion] = useState<string | null>(null)
+  const [commands, setCommands] = useState<readonly AgentCommand[]>([])
   const scroller = useRef<HTMLDivElement | null>(null)
 
   // One batch per animation frame. Forty events in one tick are one render, and the composer keeps
@@ -130,6 +131,23 @@ export function Conversation({
       batcher.discard()
     }
   }, [port, sessionId, batcher, update])
+
+  useEffect(() => {
+    let cancelled = false
+    port
+      .agentCommands({ session_id: sessionId })
+      .then((answer) => {
+        if (!cancelled) setCommands(readAgentCommands(answer))
+      })
+      .catch(() => {
+        // An agent whose commands this client cannot read offers none, rather than offering a
+        // list written here that the agent may not have.
+        if (!cancelled) setCommands([])
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [port, sessionId])
 
   useEffect(() => {
     const stop = port.subscribe((event) => {
@@ -427,6 +445,7 @@ export function Conversation({
       <Composer
         draft={presented}
         connected={connected}
+        commands={commands}
         insertion={insertion}
         onChange={(next) => {
           update((current) => ({ ...current, draft: edit(current.draft, next, Date.now()) }))
@@ -435,6 +454,23 @@ export function Conversation({
       />
     </div>
   )
+}
+
+/** One command the bound agent supports. */
+export interface AgentCommand {
+  readonly name: string
+  readonly summary: string
+}
+
+/** The commands in what `agent.commands` answered, and nothing this client invented. */
+function readAgentCommands(answer: unknown): readonly AgentCommand[] {
+  if (typeof answer !== 'object' || answer === null) return []
+  const commands = (answer as { commands?: unknown }).commands
+  if (!Array.isArray(commands)) return []
+  return commands
+    .filter((command): command is Record<string, unknown> => typeof command === 'object' && command !== null)
+    .map((command) => ({ name: text(command.name), summary: text(command.summary) }))
+    .filter((command) => command.name.length > 0)
 }
 
 /**
@@ -612,6 +648,23 @@ const NodeView = memo(function NodeView({
         </div>
       )
 
+    case 'form': {
+      const submit = body.submit as Control | undefined
+      return (
+        <Card data-node-id={node.id} data-kind="form">
+          <div className="card-header">
+            <h3>{text(body.title)}</h3>
+          </div>
+          <div className="card-body">
+            <FormFields fields={body.fields} />
+            {submit ? (
+              <ControlButton control={submit} state={controlState} onInvoke={onInvoke} />
+            ) : null}
+          </div>
+        </Card>
+      )
+    }
+
     case 'attachment':
       return (
         <div className="attachment-chip" data-node-id={node.id} data-kind="attachment">
@@ -646,6 +699,44 @@ const NodeView = memo(function NodeView({
       return null
   }
 })
+
+/**
+ * A form's fields, drawn from the parameter schema the package published.
+ *
+ * Standard components, nothing the package supplied as markup. A field whose type this client does
+ * not draw is named and left blank rather than guessed at.
+ */
+function FormFields({ fields }: { readonly fields: unknown }): ReactNode {
+  const entries =
+    typeof fields === 'object' && fields !== null && Array.isArray((fields as { fields?: unknown }).fields)
+      ? ((fields as { fields: unknown[] }).fields as Record<string, unknown>[])
+      : []
+  if (entries.length === 0) return null
+  return (
+    <div data-testid="form-fields">
+      {entries.map((field, index) => {
+        const name = text(field.name) || `field-${index}`
+        const label = text(field.label) || name
+        const kind = text(field.kind) || text(field.type)
+        return (
+          <label className="form-field" key={name}>
+            <span>{label}</span>
+            {kind === 'boolean' ? (
+              <input type="checkbox" name={name} />
+            ) : kind === 'number' || kind === 'integer' ? (
+              <input type="number" name={name} />
+            ) : (
+              <input type="text" name={name} />
+            )}
+            {text(field.description) ? (
+              <span className="form-hint">{text(field.description)}</span>
+            ) : null}
+          </label>
+        )
+      })}
+    </div>
+  )
+}
 
 function controlsOf(body: Record<string, unknown>): readonly Control[] {
   if (Array.isArray(body.controls)) return body.controls as Control[]
@@ -788,17 +879,22 @@ function LaunchSurfaceView({
 function Composer({
   draft,
   connected,
+  commands,
   insertion,
   onChange,
   onAction
 }: {
   readonly draft: Draft
   readonly connected: boolean
+  readonly commands: readonly AgentCommand[]
   readonly insertion: string | null
   readonly onChange: (text: string) => void
   readonly onAction: (action: ComposerAction) => void
 }): ReactNode {
   const [showCommands, setShowCommands] = useState(false)
+  const typed = draft.text.startsWith('/') ? draft.text.slice(1).toLowerCase() : null
+  const offered =
+    typed === null ? [] : commands.filter((command) => command.name.slice(1).startsWith(typed))
   const reason = notSubmittableBecause(draft)
   const canSubmit = submittable(draft) && connected
 
@@ -844,17 +940,23 @@ function Composer({
         />
       </label>
 
-      {showCommands ? (
+      {showCommands && offered.length > 0 ? (
         <ul className="slash-commands" data-testid="slash-commands">
-          <li>
-            <code>/compact</code> <span className="faint">Shorten the conversation so far</span>
-          </li>
-          <li>
-            <code>/model</code> <span className="faint">Change the model for this session</span>
-          </li>
-          <li>
-            <code>/review</code> <span className="faint">Review the current change set</span>
-          </li>
+          {offered.map((command) => (
+            <li key={command.name}>
+              <button
+                type="button"
+                className="text-link"
+                onClick={() => {
+                  onChange(`${command.name} `)
+                  setShowCommands(false)
+                }}
+              >
+                <code>{command.name}</code>
+                <span className="faint">{command.summary}</span>
+              </button>
+            </li>
+          ))}
         </ul>
       ) : null}
 

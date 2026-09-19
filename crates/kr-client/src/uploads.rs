@@ -94,6 +94,14 @@ impl Content for Held {
     }
 }
 
+/// A refusal that leaves the plan exactly as it was.
+fn refuse(message: &'static str) -> ClientError {
+    ClientError::Host(kr_protocol::error::ProtocolError::new(
+        kr_protocol::error::ErrorCode::InvalidArgument,
+        message,
+    ))
+}
+
 fn out_of_range() -> ClientError {
     ClientError::Host(kr_protocol::error::ProtocolError::new(
         kr_protocol::error::ErrorCode::InvalidArgument,
@@ -189,6 +197,24 @@ impl Upload {
     #[must_use]
     pub const fn transfer_id(&self) -> Option<&kr_protocol::ids::TransferId> {
         self.transfer_id.as_ref()
+    }
+
+    /// Rebuilds a plan for a transfer that was already reserved.
+    ///
+    /// A client that restarted holds the transfer identity and the same content. It resumes by
+    /// building this and feeding it the bitmap `upload.status` returns, which is the only way a
+    /// plan may be given a transfer it did not reserve itself.
+    #[must_use]
+    pub fn resuming(
+        subject: Subject,
+        content: Box<dyn Content>,
+        transfer_id: kr_protocol::ids::TransferId,
+    ) -> Self {
+        let mut plan = Self::new(subject, content);
+        plan.transfer_id = Some(transfer_id);
+        plan.phase = Phase::Sending;
+        plan.sent = Some(ChunkBitmap::empty(plan.layout.chunk_count.get()));
+        plan
     }
 
     /// The published handle, once there is one.
@@ -297,6 +323,20 @@ impl Upload {
     pub fn accept(&mut self, answer: Answer) -> Result<()> {
         match answer {
             Answer::Begun(result) => {
+                // A reservation answers a plan that has not reserved yet. One that arrives for a
+                // plan already driving a transfer would silently replace it, and the chunks
+                // already sent would be sent to a transfer nobody is tracking.
+                if self.phase != Phase::Reserving {
+                    return Err(refuse("this upload has already been reserved"));
+                }
+                if result.environment_id != self.subject.environment_id {
+                    return Err(refuse("the reservation names another environment"));
+                }
+                if result.layout.byte_len() != self.content.byte_len() {
+                    return Err(refuse(
+                        "the layout the host chose does not cover this content",
+                    ));
+                }
                 self.layout = result.layout;
                 self.transfer_id = Some(result.transfer_id.clone());
                 self.adopt_bitmap(&result.received_chunks)?;
@@ -310,23 +350,65 @@ impl Upload {
                 Ok(())
             }
             Answer::Finished(result) => {
-                self.handle = Some(result.handle.clone());
-                self.phase = Phase::Published;
+                self.accept_handle(&result.handle)?;
                 Ok(())
             }
             Answer::Status(result) => {
                 self.same_transfer(&result.transfer_id)?;
+                if let Some(handle) = result.handle.as_ref() {
+                    self.accept_handle(handle)?;
+                    return Ok(());
+                }
+                // A transfer the host has ended cannot be continued. Section 14 spends the
+                // identifier in each of these states, so the honest answer is that this upload is
+                // over and a new one is required, rather than a plan that keeps asking.
+                match result.state {
+                    kr_protocol::transfer::UploadState::Receiving
+                    | kr_protocol::transfer::UploadState::Publishing => {}
+                    ended => {
+                        return Err(refuse(match ended {
+                            kr_protocol::transfer::UploadState::Cancelled => {
+                                "this upload was cancelled; a new one is required"
+                            }
+                            kr_protocol::transfer::UploadState::Invalidated => {
+                                "this upload was invalidated; a new one is required"
+                            }
+                            kr_protocol::transfer::UploadState::Expired => {
+                                "this upload expired; a new one is required"
+                            }
+                            _ => "this upload is no longer open",
+                        }));
+                    }
+                }
+                if result.layout.byte_len() != self.content.byte_len() {
+                    return Err(refuse("the host's layout does not cover this content"));
+                }
                 self.layout = result.layout;
                 self.adopt_bitmap(&result.received_chunks)?;
-                if let Some(handle) = result.handle.as_ref().cloned() {
-                    self.handle = Some(handle);
-                    self.phase = Phase::Published;
-                } else {
-                    self.advance();
-                }
+                self.advance();
                 Ok(())
             }
         }
+    }
+
+    /// Accepts a published handle, after checking it is this upload's.
+    ///
+    /// A handle names the environment, the transfer, the length and the digest. Taking one that
+    /// disagrees with any of those would be taking someone else's file as this draft's attachment.
+    fn accept_handle(&mut self, handle: &AttachmentHandle) -> Result<()> {
+        self.same_transfer(&handle.transfer_id)?;
+        if handle.environment_id != self.subject.environment_id {
+            return Err(refuse("the published handle names another environment"));
+        }
+        if handle.byte_len.get() != self.content.byte_len() {
+            return Err(refuse("the published handle is not this content's length"));
+        }
+        if handle.content_digest != self.content.digest() {
+            return Err(refuse("the published handle is not this content's digest"));
+        }
+        self.handle = Some(handle.clone());
+        self.phase = Phase::Published;
+        Ok(())
     }
 
     fn advance(&mut self) {
@@ -576,6 +658,110 @@ mod tests {
         };
         assert_eq!(*published, handle);
         assert_eq!(upload.handle(), Some(&handle));
+    }
+
+    #[test]
+    fn a_second_reservation_does_not_replace_the_transfer_this_plan_is_driving() {
+        let mut upload = Upload::new(subject(), Box::new(Held::new(b"x".to_vec())));
+        let answer = begun(&upload, 1, &ChunkBitmap::empty(1));
+        upload.accept(answer).expect("the reservation folds in");
+        let again = begun(&upload, 1, &ChunkBitmap::empty(1));
+        assert!(
+            upload.accept(again).is_err(),
+            "a plan reserves once, and what it sent belongs to that transfer"
+        );
+    }
+
+    #[test]
+    fn a_published_handle_for_other_content_is_refused() {
+        let mut upload = Upload::new(subject(), Box::new(Held::new(b"x".to_vec())));
+        let answer = begun(&upload, 1, &ChunkBitmap::empty(1));
+        upload.accept(answer).expect("the reservation folds in");
+
+        let wrong = AttachmentHandle {
+            environment_id: subject().environment_id,
+            transfer_id: transfer_id(),
+            session_id: Nullable::null(),
+            byte_len: U64::new(9_999),
+            content_digest: Digest256::from_bytes(kr_cbor::sha256(b"something else")),
+            declared_media_type: "image/png".into(),
+            original_file_name: "diagram.png".into(),
+            preview: Nullable::null(),
+            presented_as_image: false,
+            published_at_ms: kr_protocol::scalars::TimestampMs::new(2),
+            expires_at_ms: kr_protocol::scalars::TimestampMs::new(3),
+            submitted: false,
+        };
+        let refusal = upload.accept(Answer::Finished(Box::new(UploadFinishResult {
+            handle: wrong,
+            already_published: false,
+            preview_unavailable: Nullable::null(),
+        })));
+        assert!(refusal.is_err(), "that handle is not this content");
+        assert!(upload.handle().is_none(), "and the plan is left as it was");
+    }
+
+    #[test]
+    fn an_upload_the_host_ended_is_not_continued() {
+        for ended in [
+            kr_protocol::transfer::UploadState::Cancelled,
+            kr_protocol::transfer::UploadState::Invalidated,
+            kr_protocol::transfer::UploadState::Expired,
+        ] {
+            let mut upload = Upload::new(subject(), Box::new(Held::new(b"x".to_vec())));
+            let answer = begun(&upload, 1, &ChunkBitmap::empty(1));
+            upload.accept(answer).expect("the reservation folds in");
+            let refusal = upload.accept(Answer::Status(Box::new(UploadStatusResult {
+                transfer_id: transfer_id(),
+                environment_id: subject().environment_id,
+                state: ended,
+                layout: ChunkLayout {
+                    chunk_len: U64::new(CHUNK_LEN as u64),
+                    chunk_count: U64::new(1),
+                    last_chunk_len: U64::new(1),
+                },
+                received_chunks: ChunkBitmap::empty(1).encode(),
+                received_byte_len: U64::new(0),
+                expires_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+                handle: Nullable::null(),
+                invalid_reason: Nullable::null(),
+            })));
+            assert!(refusal.is_err(), "{ended:?} spends the transfer identifier");
+        }
+    }
+
+    #[test]
+    fn a_resumed_plan_takes_the_transfer_it_is_resuming_and_asks_only_for_what_is_missing() {
+        let content = vec![5_u8; CHUNK_LEN + 4];
+        let mut upload = Upload::resuming(
+            subject(),
+            Box::new(Held::new(content)),
+            transfer_id(),
+        );
+        let mut held = ChunkBitmap::empty(2);
+        held.insert(0);
+        upload
+            .accept(Answer::Status(Box::new(UploadStatusResult {
+                transfer_id: transfer_id(),
+                environment_id: subject().environment_id,
+                state: kr_protocol::transfer::UploadState::Receiving,
+                layout: ChunkLayout {
+                    chunk_len: U64::new(CHUNK_LEN as u64),
+                    chunk_count: U64::new(2),
+                    last_chunk_len: U64::new(4),
+                },
+                received_chunks: held.encode(),
+                received_byte_len: U64::new(CHUNK_LEN as u64),
+                expires_at_ms: kr_protocol::scalars::TimestampMs::new(1),
+                handle: Nullable::null(),
+                invalid_reason: Nullable::null(),
+            })))
+            .expect("the status folds in");
+
+        let Step::Chunk(next) = upload.next().expect("a step") else {
+            panic!("the missing chunk is next");
+        };
+        assert_eq!(next.chunk.index.get(), 1);
     }
 
     #[test]

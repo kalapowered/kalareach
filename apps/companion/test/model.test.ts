@@ -303,6 +303,33 @@ describe('declarative controls', () => {
     }
   })
 
+  it('uses the published operator names, so a real control evaluates', () => {
+    const state = {
+      ...emptyControlState(),
+      bindingState: 'bound',
+      presentNodes: new Set(['n-1'])
+    }
+    expect(evaluate({ op: 'binding', state: 'bound' }, state)).toBe('true')
+    expect(evaluate({ op: 'binding', state: 'disabled' }, state)).toBe('false')
+    expect(evaluate({ op: 'node_present', node_id: 'n-1' }, state)).toBe('true')
+    expect(evaluate({ op: 'node_present', node_id: 'n-2' }, state)).toBe('false')
+  })
+
+  it('does not treat an unknown right as a right the client does not hold', () => {
+    expect(evaluate({ op: 'grant', right: 'terminal.input' }, emptyControlState())).toBe('unknown')
+    expect(
+      evaluate(
+        { op: 'grant', right: 'terminal.input' },
+        { ...emptyControlState(), rights: new Set(['session.view']) }
+      )
+    ).toBe('false')
+  })
+
+  it('answers an empty combinator the way the host does', () => {
+    expect(evaluate({ op: 'all', terms: [] }, emptyControlState())).toBe('true')
+    expect(evaluate({ op: 'any', terms: [] }, emptyControlState())).toBe('false')
+  })
+
   it('bounds the predicate depth rather than recursing on a deep one', () => {
     let predicate = { op: 'always' } as Parameters<typeof evaluate>[0]
     for (let index = 0; index < 12; index += 1) predicate = { op: 'not', term: predicate }
