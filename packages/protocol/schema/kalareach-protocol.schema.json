@@ -82,6 +82,12 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "ActionName": {
+      "description": "A declared plugin action name from a package manifest.",
+      "maxLength": 96,
+      "minLength": 1,
+      "type": "string"
+    },
     "ActionObservation": {
       "additionalProperties": false,
       "description": "One piece of additive evidence about an action.\n\nThe word in a user interface is \"observed\", and it means evidence was observed. It does not\nmean the mutation is confirmed, which is why every observation carries the provenance a reader\nneeds in order to know which of the two it is looking at.",
@@ -139,6 +145,26 @@
         "observed_at_ms"
       ],
       "type": "object"
+    },
+    "ActionProvenance": {
+      "description": "How one action actually reached the upstream application.\n\nSection 12 requires every action to record this, and forbids reporting an authoritative typed\napproval or an accepted media upload from screen text alone. The app may offer a terminal\naction as a convenience; it says so.",
+      "oneOf": [
+        {
+          "const": "upstream_typed_rpc",
+          "description": "A typed remote procedure call the upstream answered.",
+          "type": "string"
+        },
+        {
+          "const": "authenticated_hook_response",
+          "description": "An authenticated response from an installed native hook or bridge.",
+          "type": "string"
+        },
+        {
+          "const": "terminal_input",
+          "description": "Bytes written into the terminal. Convenience, never a typed result.",
+          "type": "string"
+        }
+      ]
     },
     "ActionReadParams": {
       "additionalProperties": false,
@@ -368,6 +394,115 @@
       ],
       "type": "object"
     },
+    "ActionToken": {
+      "additionalProperties": false,
+      "description": "The authority for exactly one action callback.\n\nSection 11: \"Every action callback receives a token bound to actor, grant, application/thread\nrevision, declared action and parameter hash. Its effect plan can use only resources and\noperations permitted by that invocation.\"\n\nAll five bindings are checked together when the effect plan comes back. Checking the handle\nalone would make the token a bearer secret; checking the bindings alone would let a component\nreplay one invocation's token against a later one. The broker does both, and spends the handle.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ActionName",
+          "description": "The declared action, as the package's manifest names it."
+        },
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The verified actor whose action this is. A component never asserts it."
+        },
+        "application_instance_id": {
+          "$ref": "#/$defs/ApplicationInstanceId",
+          "description": "The application instance the action runs against."
+        },
+        "binding_revision": {
+          "$ref": "#/$defs/AgentBindingRevision",
+          "description": "The binding revision in force when the token was issued.\n\nA native `/new`, `/resume` or thread selection advances it, so a token issued before the\nswitch cannot act on the conversation after it."
+        },
+        "grant": {
+          "$ref": "#/$defs/BrokerGrant",
+          "description": "Which of the three grants authorised this invocation."
+        },
+        "grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant record that authority came from."
+        },
+        "issued_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the token was issued."
+        },
+        "parameter_hash": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The hash of the parameters the action was invoked with."
+        },
+        "token_id": {
+          "$ref": "#/$defs/ActionTokenId",
+          "description": "The record the broker consumes when the effect plan arrives."
+        }
+      },
+      "required": [
+        "token_id",
+        "actor_id",
+        "grant",
+        "grant_id",
+        "application_instance_id",
+        "binding_revision",
+        "action",
+        "parameter_hash",
+        "issued_at"
+      ],
+      "type": "object"
+    },
+    "ActionTokenClaim": {
+      "additionalProperties": false,
+      "description": "What a component presents when it returns an effect plan.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ActionName",
+          "description": "The action it declares it performed."
+        },
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The actor the component believes it is acting for."
+        },
+        "application_instance_id": {
+          "$ref": "#/$defs/ApplicationInstanceId",
+          "description": "The application instance it acted against."
+        },
+        "binding_revision": {
+          "$ref": "#/$defs/AgentBindingRevision",
+          "description": "The binding revision it acted under."
+        },
+        "grant": {
+          "$ref": "#/$defs/BrokerGrant",
+          "description": "The grant it believes authorised the call."
+        },
+        "grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant record it names."
+        },
+        "parameter_hash": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The hash of the parameters it used."
+        },
+        "token_id": {
+          "$ref": "#/$defs/ActionTokenId",
+          "description": "The handle the broker issued."
+        }
+      },
+      "required": [
+        "token_id",
+        "actor_id",
+        "grant",
+        "grant_id",
+        "application_instance_id",
+        "binding_revision",
+        "action",
+        "parameter_hash"
+      ],
+      "type": "object"
+    },
+    "ActionTokenId": {
+      "description": "A single-use broker handle for one issued action token.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
     "ActionWindow": {
       "additionalProperties": false,
       "description": "A host-issued action window.\n\nSection 9: an original online request carries a window bound to this authenticated connection\nand to the host's boot identity, and the host derives the accepted deadline from the earliest\nof window expiry, receipt time plus the requested time to live, and any authority or subject\ndeadline. The window carries a *duration*, not an absolute wall-clock deadline: the client\nschedules its renewal from that duration, while the host keeps the authoritative deadline on\nits own suspend-aware continuous clock. `issued_at_ms` is the host's stamp, for display and\ndiagnosis only.",
@@ -579,10 +714,242 @@
       ],
       "type": "object"
     },
+    "AgentApprovalRespondParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `agent.approval.respond`.",
+      "properties": {
+        "option_id": {
+          "description": "The decision, as one of the options the decoder offered.\n\nAnswering is choosing from what the upstream offered. A free-form answer would be this host\ninventing an upstream decision.",
+          "type": "string"
+        },
+        "resource_id": {
+          "$ref": "#/$defs/PendingResourceId",
+          "description": "The pending resource being answered."
+        },
+        "target": {
+          "$ref": "#/$defs/AgentMutationTarget",
+          "description": "What the answer acts on."
+        }
+      },
+      "required": [
+        "target",
+        "resource_id",
+        "option_id"
+      ],
+      "type": "object"
+    },
+    "AgentApprovalRespondResult": {
+      "additionalProperties": false,
+      "description": "The result of `agent.approval.respond`.",
+      "properties": {
+        "mutation": {
+          "$ref": "#/$defs/AgentMutationResult",
+          "description": "What the mutation did."
+        },
+        "resource_id": {
+          "$ref": "#/$defs/PendingResourceId",
+          "description": "The resource that was answered."
+        },
+        "state": {
+          "$ref": "#/$defs/PendingState",
+          "description": "Its state after the answer."
+        }
+      },
+      "required": [
+        "mutation",
+        "resource_id",
+        "state"
+      ],
+      "type": "object"
+    },
     "AgentBindingRevision": {
       "description": "Changes when the active upstream execution owner or selected thread changes.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "AgentBindingState": {
+      "additionalProperties": false,
+      "description": "What the host currently knows about one bound instance.\n\nThis is the answer to \"is the thing I am looking at still the thing I was looking at\". A client\nthat holds an older revision has to re-read before it may mutate.",
+      "properties": {
+        "binding_revision": {
+          "$ref": "#/$defs/AgentBindingRevision",
+          "description": "The revision in force. It advances when the upstream owner or selected thread changes."
+        },
+        "mode": {
+          "$ref": "#/$defs/IntegrationMode",
+          "description": "How this instance is integrated."
+        },
+        "profile_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchProfileId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The launch profile this instance was started under."
+        },
+        "rich_mutations_suspended": {
+          "description": "True while a native selection could not be observed reliably.\n\nRich mutations are suspended until the binding is verified. The terminal stays available\nthroughout, which is why this is a field rather than an error.",
+          "type": "boolean"
+        },
+        "suspension_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Why they are suspended, when they are."
+        },
+        "thread_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentThreadId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The upstream's own conversation identifier, where the connector can observe one."
+        },
+        "turn_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentTurnId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The turn currently running, where one is."
+        }
+      },
+      "required": [
+        "binding_revision",
+        "thread_id",
+        "turn_id",
+        "profile_id",
+        "mode",
+        "rich_mutations_suspended",
+        "suspension_reason"
+      ],
+      "type": "object"
+    },
+    "AgentCancelParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `agent.turn.cancel`.",
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/AgentMutationTarget",
+          "description": "What the cancellation acts on."
+        },
+        "turn_id": {
+          "$ref": "#/$defs/AgentTurnId",
+          "description": "The turn to cancel, by the upstream's own identifier."
+        }
+      },
+      "required": [
+        "target",
+        "turn_id"
+      ],
+      "type": "object"
+    },
+    "AgentCapabilitiesParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `agent.capabilities`.",
+      "properties": {
+        "subject": {
+          "$ref": "#/$defs/AgentSubject",
+          "description": "The session and instance."
+        }
+      },
+      "required": [
+        "subject"
+      ],
+      "type": "object"
+    },
+    "AgentCapabilitiesResult": {
+      "additionalProperties": false,
+      "description": "The result of `agent.capabilities`.",
+      "properties": {
+        "binding": {
+          "$ref": "#/$defs/AgentBindingState",
+          "description": "The binding this answer is about."
+        },
+        "capabilities": {
+          "$ref": "#/$defs/CapabilityMap",
+          "description": "What this installation can currently do, with the evidence behind each entry."
+        }
+      },
+      "required": [
+        "binding",
+        "capabilities"
+      ],
+      "type": "object"
+    },
+    "AgentCommand": {
+      "additionalProperties": false,
+      "description": "One command a bound agent advertises.",
+      "properties": {
+        "name": {
+          "description": "The command's name, without its leading marker.",
+          "type": "string"
+        },
+        "parameter_encoding": {
+          "description": "How its parameters are encoded when it is executed upstream.",
+          "type": "string"
+        },
+        "summary": {
+          "description": "What it does, for a person.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "summary",
+        "parameter_encoding"
+      ],
+      "type": "object"
+    },
+    "AgentCommandsParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `agent.commands`.",
+      "properties": {
+        "subject": {
+          "$ref": "#/$defs/AgentSubject",
+          "description": "The session and instance."
+        }
+      },
+      "required": [
+        "subject"
+      ],
+      "type": "object"
+    },
+    "AgentCommandsResult": {
+      "additionalProperties": false,
+      "description": "The result of `agent.commands`.",
+      "properties": {
+        "binding": {
+          "$ref": "#/$defs/AgentBindingState",
+          "description": "The binding this answer is about."
+        },
+        "commands": {
+          "description": "The commands, in the order the upstream advertises them.",
+          "items": {
+            "$ref": "#/$defs/AgentCommand"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "binding",
+        "commands"
+      ],
+      "type": "object"
     },
     "AgentDraftAddAttachmentParams": {
       "additionalProperties": false,
@@ -629,6 +996,248 @@
       "required": [
         "draft",
         "attachment"
+      ],
+      "type": "object"
+    },
+    "AgentMutationResult": {
+      "additionalProperties": false,
+      "description": "What one accepted agent mutation did.",
+      "properties": {
+        "binding_revision": {
+          "$ref": "#/$defs/AgentBindingRevision",
+          "description": "The revision the mutation was applied at."
+        },
+        "provenance": {
+          "$ref": "#/$defs/ActionProvenance",
+          "description": "How it reached the upstream."
+        },
+        "turn_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentTurnId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The turn it applies to, where the upstream names one."
+        },
+        "upstream_request_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/UpstreamRequestId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The upstream's own identifier for it, where the upstream gave one."
+        }
+      },
+      "required": [
+        "binding_revision",
+        "provenance",
+        "upstream_request_id",
+        "turn_id"
+      ],
+      "type": "object"
+    },
+    "AgentMutationTarget": {
+      "additionalProperties": false,
+      "description": "What a mutation acts on: the subject and the revision it was prepared against.",
+      "properties": {
+        "binding_revision": {
+          "$ref": "#/$defs/AgentBindingRevision",
+          "description": "The revision the caller read before it prepared this.\n\nA revision behind the one in force is `STALE_SESSION`: the conversation moved, and applying\nthe mutation to the new one would be acting on something the caller never saw."
+        },
+        "subject": {
+          "$ref": "#/$defs/AgentSubject",
+          "description": "The session and instance."
+        }
+      },
+      "required": [
+        "subject",
+        "binding_revision"
+      ],
+      "type": "object"
+    },
+    "AgentPromptParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `agent.prompt.submit` and `agent.prompt.queue`.",
+      "properties": {
+        "draft_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DraftId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The draft to submit, when the prompt has attachments or was composed elsewhere."
+        },
+        "target": {
+          "$ref": "#/$defs/AgentMutationTarget",
+          "description": "What the prompt acts on."
+        },
+        "text": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The prompt itself, when it is short enough to travel inline."
+        }
+      },
+      "required": [
+        "target",
+        "draft_id",
+        "text"
+      ],
+      "type": "object"
+    },
+    "AgentSnapshotEntry": {
+      "additionalProperties": false,
+      "description": "One entry of a bound agent's shared state.",
+      "properties": {
+        "kind": {
+          "description": "What kind of entry it is, as the connector's declarative presentation names it.",
+          "type": "string"
+        },
+        "node": {
+          "$ref": "#/$defs/U64",
+          "description": "The entry's position in the producer's walk order."
+        },
+        "observed_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was observed."
+        },
+        "text": {
+          "description": "The entry's text, already filtered by the shared host-side history filter.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "node",
+        "kind",
+        "text",
+        "observed_at"
+      ],
+      "type": "object"
+    },
+    "AgentSnapshotParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `agent.snapshot`.",
+      "properties": {
+        "from_node": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The node the reader wants the next part from, when continuing a bounded snapshot."
+        },
+        "subject": {
+          "$ref": "#/$defs/AgentSubject",
+          "description": "The session and instance."
+        }
+      },
+      "required": [
+        "subject",
+        "from_node"
+      ],
+      "type": "object"
+    },
+    "AgentSnapshotResult": {
+      "additionalProperties": false,
+      "description": "The result of `agent.snapshot`.",
+      "properties": {
+        "binding": {
+          "$ref": "#/$defs/AgentBindingState",
+          "description": "The binding this answer is about."
+        },
+        "continuation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SemanticContinuation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Where a reader continues, when a limit stopped this part."
+        },
+        "entries": {
+          "description": "The entries this part carries.",
+          "items": {
+            "$ref": "#/$defs/AgentSnapshotEntry"
+          },
+          "type": "array"
+        },
+        "history_gap": {
+          "description": "True when the retained range the reader asked for had been evicted.\n\nSection 24: a rebuilt range shows a history gap for anything unavailable. A grid image or a\ntranscript file cannot reconstruct an unobserved pending approval, so the gap is reported\nrather than filled in.",
+          "type": "boolean"
+        },
+        "withheld_entries": {
+          "$ref": "#/$defs/U64",
+          "description": "How many entries the actor's own history filter withheld.\n\nThe count is the honest part: a reader can tell a short answer from a complete one without\nbeing shown what it may not see."
+        }
+      },
+      "required": [
+        "binding",
+        "entries",
+        "continuation",
+        "history_gap",
+        "withheld_entries"
+      ],
+      "type": "object"
+    },
+    "AgentSteerParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `agent.turn.steer`.",
+      "properties": {
+        "target": {
+          "$ref": "#/$defs/AgentMutationTarget",
+          "description": "What the steer acts on."
+        },
+        "text": {
+          "description": "The steering text.",
+          "type": "string"
+        },
+        "turn_id": {
+          "$ref": "#/$defs/AgentTurnId",
+          "description": "The turn being steered. A turn that has ended is refused rather than redirected."
+        }
+      },
+      "required": [
+        "target",
+        "turn_id",
+        "text"
+      ],
+      "type": "object"
+    },
+    "AgentSubject": {
+      "additionalProperties": false,
+      "description": "What every agent method names: the session and the exact instance inside it.\n\nSection 12 is explicit that observation binds to the instance, not to a product name: \"Semantic\nobservation must bind to the exact `application_instance_id`, upstream execution owner, session\nand turn.\"",
+      "properties": {
+        "application_instance_id": {
+          "$ref": "#/$defs/ApplicationInstanceId",
+          "description": "The exact application instance."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the instance runs in."
+        }
+      },
+      "required": [
+        "session_id",
+        "application_instance_id"
       ],
       "type": "object"
     },
@@ -2066,6 +2675,26 @@
         }
       ]
     },
+    "AuthenticationState": {
+      "description": "What is known about the upstream's authentication at launch time.",
+      "oneOf": [
+        {
+          "const": "authenticated",
+          "description": "The application reports a usable credential.",
+          "type": "string"
+        },
+        {
+          "const": "sign_in_required",
+          "description": "The application reports that it needs the user to sign in.",
+          "type": "string"
+        },
+        {
+          "const": "unknown",
+          "description": "The host has not established which it is.",
+          "type": "string"
+        }
+      ]
+    },
     "AuthorisationKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
@@ -2402,6 +3031,35 @@
         }
       ]
     },
+    "BinaryIdentity": {
+      "additionalProperties": false,
+      "description": "The identity of one executable, as it was resolved.\n\nAn installed upgrade replaces the file; it does not replace the identity a running process was\nbound to. Section 12: \"An agent executable upgrade affects new launches; existing bindings\nretain their original binary identity, schema and adapter version.\"",
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest of the bytes at that path when it was resolved."
+        },
+        "distribution": {
+          "description": "How the application was distributed: a package manager, an installer, a build.",
+          "type": "string"
+        },
+        "resolved_path": {
+          "description": "The absolute path the launch resolved to.",
+          "type": "string"
+        },
+        "version": {
+          "description": "The version the application reported.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "resolved_path",
+        "digest",
+        "version",
+        "distribution"
+      ],
+      "type": "object"
+    },
     "BootEpoch": {
       "description": "The host boot epoch, which binds continuous-time deadlines to one boot.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -2657,6 +3315,32 @@
       ],
       "type": "object"
     },
+    "BrokerBindingId": {
+      "description": "One component bound to one application instance inside the broker.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "BrokerGrant": {
+      "description": "One of the three broker grants a binding can hold.\n\nSection 11 keeps them apart on purpose: \"Observation callbacks cannot submit input merely\nbecause they can read output.\"",
+      "oneOf": [
+        {
+          "const": "observation",
+          "description": "Semantic presentation and inferred status from scoped source events.",
+          "type": "string"
+        },
+        {
+          "const": "upstream_action",
+          "description": "Preparing declared prompts, commands, attachments or cancellation against the bound\nexecution.",
+          "type": "string"
+        },
+        {
+          "const": "approval_interpreter",
+          "description": "Interpreting native requests from the bound upstream and encoding answers to them.",
+          "type": "string"
+        }
+      ]
+    },
     "BuildId": {
       "description": "A build identifier reported in hello.",
       "maxLength": 256,
@@ -2674,6 +3358,31 @@
       "description": "The opaque token that lets one verified source poll or cancel its own question.\n\nIt is not authority over a session and it is not an answer: it permits exactly the two reads\nand the one cancellation that belong to the question it was issued for, and only from the same\nverified application. Section 11 keeps it out of events, push payloads, backups and logs, so\nthis type prints as a redaction and carries no `Display`."
     },
     "CapabilityEvidenceSource": {
+      "description": "Where a capability record came from.",
+      "oneOf": [
+        {
+          "const": "host_probe",
+          "description": "A bounded, disclosed probe with declared effects, run by the host.",
+          "type": "string"
+        },
+        {
+          "const": "live_binding",
+          "description": "A live binding that performed the operation here.",
+          "type": "string"
+        },
+        {
+          "const": "signed_record",
+          "description": "A signed compatibility record shipped in a catalogue.\n\nEvidence about a version. Never proof that this host has permission or a live binding.",
+          "type": "string"
+        },
+        {
+          "const": "package_declaration",
+          "description": "The package's own declaration, believed only for a negative state.",
+          "type": "string"
+        }
+      ]
+    },
+    "CapabilityEvidenceSource2": {
       "description": "What produced a capability answer.",
       "oneOf": [
         {
@@ -2777,6 +3486,41 @@
       "description": "What makes a capability record stale.",
       "oneOf": [
         {
+          "const": "binary_changed",
+          "description": "The tested binary changed.",
+          "type": "string"
+        },
+        {
+          "const": "binding_changed",
+          "description": "The active binding changed.",
+          "type": "string"
+        },
+        {
+          "const": "schema_changed",
+          "description": "The upstream schema or protocol version changed.",
+          "type": "string"
+        },
+        {
+          "const": "os_permission_changed",
+          "description": "An operating-system permission changed.",
+          "type": "string"
+        },
+        {
+          "const": "desktop_generation_changed",
+          "description": "The desktop session generation changed.",
+          "type": "string"
+        },
+        {
+          "const": "profile_changed",
+          "description": "The launch profile changed.",
+          "type": "string"
+        }
+      ]
+    },
+    "CapabilityInvalidation2": {
+      "description": "What makes a capability record stale.",
+      "oneOf": [
+        {
           "const": "binary_identity",
           "description": "The probed binary changed.",
           "type": "string"
@@ -2808,7 +3552,89 @@
         }
       ]
     },
+    "CapabilityMap": {
+      "additionalProperties": false,
+      "description": "Everything one installation of one application can currently do.\n\nSection 12: \"The feature set is a per-installation capability map, not a single label assigned\nto an agent name.\" Two installations of the same agent, at different versions or with different\npermissions, have different maps.",
+      "properties": {
+        "records": {
+          "description": "The records, ordered by capability so the map encodes deterministically.",
+          "items": {
+            "$ref": "#/$defs/CapabilityRecord"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "records"
+      ],
+      "type": "object"
+    },
     "CapabilityRecord": {
+      "additionalProperties": false,
+      "description": "One capability record the worker keeps for dispatch.\n\nThe host owns the current evidence; a worker keeps the subset its dispatch decisions need. The\nrecord carries its own invalidation triggers so a worker can decide staleness without asking.",
+      "properties": {
+        "application_instance_id": {
+          "$ref": "#/$defs/ApplicationInstanceId",
+          "description": "The application instance the record is about."
+        },
+        "capability_id": {
+          "$ref": "#/$defs/CapabilityId",
+          "description": "The versioned capability this record is about."
+        },
+        "disabled_reason": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The user-facing reason, required whenever the state is not usable."
+        },
+        "identity": {
+          "$ref": "#/$defs/CapabilitySubjectIdentity",
+          "description": "The exact identity the evidence was gathered against."
+        },
+        "invalidated_by": {
+          "description": "What makes it stale.",
+          "items": {
+            "$ref": "#/$defs/CapabilityInvalidation"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "observed_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the record was gathered."
+        },
+        "revision": {
+          "$ref": "#/$defs/CapabilityRevision",
+          "description": "The current revision of this record. Every action rechecks it."
+        },
+        "source": {
+          "$ref": "#/$defs/CapabilityEvidenceSource",
+          "description": "Where the record came from."
+        },
+        "state": {
+          "$ref": "#/$defs/CapabilityState",
+          "description": "The current state."
+        }
+      },
+      "required": [
+        "capability_id",
+        "application_instance_id",
+        "identity",
+        "revision",
+        "state",
+        "source",
+        "invalidated_by",
+        "disabled_reason",
+        "observed_at"
+      ],
+      "type": "object"
+    },
+    "CapabilityRecord2": {
       "additionalProperties": false,
       "description": "One capability, one subject, one answer.\n\nThis is the shared section 11 record. Capability evidence describes feasibility and never\ncreates authority: every action still checks its grant, and it rechecks this record's revision\nindependently.",
       "properties": {
@@ -2828,7 +3654,7 @@
           "description": "What a person is told when the capability is not available."
         },
         "evidence_source": {
-          "$ref": "#/$defs/CapabilityEvidenceSource",
+          "$ref": "#/$defs/CapabilityEvidenceSource2",
           "description": "What produced the answer."
         },
         "identity": {
@@ -2838,7 +3664,7 @@
         "invalidation": {
           "description": "What makes this record stale, in the order it is written.",
           "items": {
-            "$ref": "#/$defs/CapabilityInvalidation"
+            "$ref": "#/$defs/CapabilityInvalidation2"
           },
           "type": "array"
         },
@@ -2851,7 +3677,7 @@
           "description": "This record's revision. An action binds to it and rechecks it."
         },
         "state": {
-          "$ref": "#/$defs/CapabilityState",
+          "$ref": "#/$defs/CapabilityState2",
           "description": "What the capability can currently do."
         },
         "subject": {
@@ -2921,6 +3747,41 @@
       "type": "string"
     },
     "CapabilityState": {
+      "description": "What is currently known about one capability on this host.",
+      "oneOf": [
+        {
+          "const": "qualified_available",
+          "description": "Qualified here and available now.",
+          "type": "string"
+        },
+        {
+          "const": "missing_installation",
+          "description": "The software that would provide it is not installed.",
+          "type": "string"
+        },
+        {
+          "const": "permission_required",
+          "description": "An operating-system permission is needed first.",
+          "type": "string"
+        },
+        {
+          "const": "incompatible",
+          "description": "The installed version cannot provide it.",
+          "type": "string"
+        },
+        {
+          "const": "temporarily_unavailable",
+          "description": "It normally works here and does not at the moment.",
+          "type": "string"
+        },
+        {
+          "const": "not_tested",
+          "description": "Nothing has established either way.",
+          "type": "string"
+        }
+      ]
+    },
+    "CapabilityState2": {
       "description": "What one capability can currently do.",
       "oneOf": [
         {
@@ -3014,6 +3875,87 @@
         "session_id",
         "application",
         "terminal"
+      ],
+      "type": "object"
+    },
+    "CapabilitySubjectIdentity": {
+      "additionalProperties": false,
+      "description": "The exact identity one capability record was gathered against.\n\nNaming the identity rather than the product is what lets an installed upgrade leave a running\nprocess's pinned evidence alone.",
+      "properties": {
+        "binary_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of the tested binary."
+        },
+        "binding_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/BrokerBindingId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The binding the evidence was gathered through."
+        },
+        "desktop_generation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The desktop session generation the evidence is bound to."
+        },
+        "os_permission_held": {
+          "anyOf": [
+            {
+              "type": "boolean"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Whether the operating-system permission the capability needs was held."
+        },
+        "profile_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LaunchProfileId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The launch profile the evidence was gathered under."
+        },
+        "schema_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/MethodTableVersionText"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The upstream schema or protocol version the evidence is about."
+        }
+      },
+      "required": [
+        "binary_digest",
+        "schema_version",
+        "profile_id",
+        "binding_id",
+        "desktop_generation",
+        "os_permission_held"
       ],
       "type": "object"
     },
@@ -5468,6 +6410,201 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "DeclarativeEntry": {
+      "additionalProperties": false,
+      "description": "One entry of a connector's declarative table.",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/NativeMethodClass",
+          "description": "What it does."
+        },
+        "expects_response": {
+          "description": "True when the upstream sends this as a request that expects a response.\n\nA reverse request creates a pending resource; a notification does not.",
+          "type": "boolean"
+        },
+        "method": {
+          "$ref": "#/$defs/UpstreamMethod",
+          "description": "The upstream method this entry classifies."
+        }
+      },
+      "required": [
+        "method",
+        "class",
+        "expects_response"
+      ],
+      "type": "object"
+    },
+    "DeclarativeTable": {
+      "additionalProperties": false,
+      "description": "A connector's qualified declarative table.\n\nCore code interprets this without calling Wasm, which is what makes the forwarding path\nindependent of the component runtime. The table is pinned to one upstream protocol version and\ncarries the publisher whose semantic trust grant qualifies it.",
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest of the exact table bytes, so a qualification names what was qualified."
+        },
+        "entries": {
+          "description": "The entries, ordered by method so the table encodes deterministically.",
+          "items": {
+            "$ref": "#/$defs/DeclarativeEntry"
+          },
+          "type": "array"
+        },
+        "framing": {
+          "$ref": "#/$defs/NativeFraming",
+          "description": "How the protocol frames."
+        },
+        "method_field": {
+          "description": "The member of a frame that carries its method name.",
+          "type": "string"
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package that supplied the table."
+        },
+        "publisher_id": {
+          "$ref": "#/$defs/PublisherId",
+          "description": "The publisher whose semantic trust grant qualifies it."
+        },
+        "request_id_field": {
+          "description": "The member of a frame that carries its request identifier.",
+          "type": "string"
+        },
+        "response_id_field": {
+          "description": "The member of a frame that carries the identifier a response correlates to.",
+          "type": "string"
+        },
+        "table_version": {
+          "$ref": "#/$defs/MethodTableVersion",
+          "description": "The version of the table itself."
+        },
+        "upstream_protocol_version": {
+          "description": "The upstream protocol version the table is pinned to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "plugin_id",
+        "publisher_id",
+        "table_version",
+        "upstream_protocol_version",
+        "digest",
+        "framing",
+        "request_id_field",
+        "response_id_field",
+        "method_field",
+        "entries"
+      ],
+      "type": "object"
+    },
+    "DecoderLedgerEntry": {
+      "additionalProperties": false,
+      "description": "What a decoder offered, and every check the broker made before believing it.\n\nThis is the ledger row section 11 requires the broker to retain: \"the decoder/package hash,\noriginal source, native request ID, offered decisions, deadline and resolution state\". It\noutlives the plugin process, because a plugin-process failure cannot destroy the approval\nledger.",
+      "properties": {
+        "binding_id": {
+          "$ref": "#/$defs/BrokerBindingId",
+          "description": "The binding whose component decoded the request."
+        },
+        "deadline_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The deadline the upstream put on its request, where it stated one."
+        },
+        "decoded_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the entry was written."
+        },
+        "method": {
+          "$ref": "#/$defs/UpstreamMethod",
+          "description": "The upstream method the original request named."
+        },
+        "offered_decisions": {
+          "$ref": "#/$defs/U64",
+          "description": "How many decisions the decoder offered."
+        },
+        "package_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest of the exact component bytes."
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package that binding runs."
+        },
+        "publisher_id": {
+          "$ref": "#/$defs/PublisherId",
+          "description": "The publisher of that package, for a person reading the pending resource."
+        },
+        "source_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest of those immutable source bytes, so the original is identifiable afterwards."
+        },
+        "source_generation": {
+          "$ref": "#/$defs/SourceGeneration",
+          "description": "The generation of the source frame the decoder read."
+        }
+      },
+      "required": [
+        "binding_id",
+        "plugin_id",
+        "publisher_id",
+        "package_digest",
+        "method",
+        "source_generation",
+        "source_digest",
+        "offered_decisions",
+        "deadline_ms",
+        "decoded_at"
+      ],
+      "type": "object"
+    },
+    "DecodingTrust": {
+      "additionalProperties": false,
+      "description": "What a component is trusted to interpret, and whose interpretation it is.\n\nSection 11: \"Trust to classify or encode native mutations must be explicit, with the publisher\nand methods recorded.\" Authenticated wire provenance proves which connection supplied bytes; it\ndoes not prove that this decoder read them correctly, so the record exists to be shown to a\nperson beside the pending resource it produced.",
+      "properties": {
+        "granted_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the trust was recorded."
+        },
+        "may_encode_response": {
+          "description": "Whether the component may also encode an answer to those requests.\n\nDecoding and answering are separate capabilities in the package contract, and they stay\nseparate here.",
+          "type": "boolean"
+        },
+        "methods": {
+          "description": "The upstream methods this component may decode into a pending resource.\n\nA method outside this list is forwarded opaquely and produces no rich approval, whatever\nthe component reports about it.",
+          "items": {
+            "$ref": "#/$defs/UpstreamMethod"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "package_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest of the exact component bytes the trust was granted to."
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package whose component holds the trust."
+        },
+        "publisher_id": {
+          "$ref": "#/$defs/PublisherId",
+          "description": "The publisher that signed that package."
+        }
+      },
+      "required": [
+        "plugin_id",
+        "publisher_id",
+        "package_digest",
+        "methods",
+        "may_encode_response",
+        "granted_at"
+      ],
+      "type": "object"
+    },
     "DescriptionFreshness": {
       "description": "How current a generated description is.\n\nThere is no variant meaning \"probably current\". When demand exceeds capacity a client is shown\nthe delay or the staleness rather than text that implies the session is doing what it was doing\nfive minutes ago.",
       "oneOf": [
@@ -5722,7 +6859,7 @@
         "records": {
           "description": "The records, ordered by capability name.",
           "items": {
-            "$ref": "#/$defs/CapabilityRecord"
+            "$ref": "#/$defs/CapabilityRecord2"
           },
           "type": "array"
         }
@@ -7176,6 +8313,25 @@
         }
       ]
     },
+    "DownstreamRequestId": {
+      "additionalProperties": false,
+      "description": "One downstream JSON-RPC identifier, namespaced by the connection that chose it.\n\nSection 12: \"Namespace downstream JSON-RPC IDs by connection.\" Two connections that both call\ntheir first request `1` are two different pending resources, and nothing in the gateway can\nconfuse one for the other.",
+      "properties": {
+        "connection": {
+          "$ref": "#/$defs/GatewayConnectionId",
+          "description": "The connection the identifier belongs to."
+        },
+        "upstream": {
+          "$ref": "#/$defs/UpstreamRequestId",
+          "description": "The identifier exactly as the upstream wrote it."
+        }
+      },
+      "required": [
+        "connection",
+        "upstream"
+      ],
+      "type": "object"
+    },
     "DraftAttachment": {
       "additionalProperties": false,
       "description": "One attachment bound to a draft, and what became of it.",
@@ -7485,6 +8641,21 @@
         {
           "const": "volatile",
           "description": "The journal was unavailable, so the result used current in-memory authority and identities.\nStorage failure must not prevent an authorised stop; the response says so outright.",
+          "type": "string"
+        }
+      ]
+    },
+    "Durability2": {
+      "description": "Whether a record survives this process.",
+      "oneOf": [
+        {
+          "const": "durable",
+          "description": "Committed to the journal before it was acted on.",
+          "type": "string"
+        },
+        {
+          "const": "volatile",
+          "description": "Held in the worker's memory only, because the journal could not take it.",
           "type": "string"
         }
       ]
@@ -8999,6 +10170,57 @@
       ],
       "type": "object"
     },
+    "EvidenceGap": {
+      "additionalProperties": false,
+      "description": "The evidence gap a spell of volatile operation leaves behind.\n\nIt is exposed while it is open and committed when storage returns. Section 11 forbids the\nalternative: \"Never replay volatile operations to manufacture durable history.\" What is\ncommitted is the fact that the gap happened and what was in it, not the operations themselves.",
+      "properties": {
+        "carried_pending": {
+          "$ref": "#/$defs/U64",
+          "description": "Pending identifiers that were already claimed when the gap opened.\n\nThese are the ones a second response must never be emitted for, so they are carried across\nthe gap rather than forgotten."
+        },
+        "closed_at": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When storage returned, while the gap is still open."
+        },
+        "fenced_rich_operations": {
+          "$ref": "#/$defs/U64",
+          "description": "Rich mutations and rich approvals refused because of the gap."
+        },
+        "native_requests": {
+          "$ref": "#/$defs/U64",
+          "description": "Native requests forwarded while the gap was open."
+        },
+        "native_responses": {
+          "$ref": "#/$defs/U64",
+          "description": "Native responses arbitrated in memory while the gap was open."
+        },
+        "opened_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the journal faulted."
+        },
+        "reason": {
+          "description": "Why the journal faulted, for a person to read.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "opened_at",
+        "closed_at",
+        "reason",
+        "native_requests",
+        "native_responses",
+        "fenced_rich_operations",
+        "carried_pending"
+      ],
+      "type": "object"
+    },
     "EvidenceKind": {
       "description": "What kind of evidence names a version.",
       "oneOf": [
@@ -9711,6 +10933,11 @@
           "type": "string"
         }
       ]
+    },
+    "GatewayConnectionId": {
+      "description": "One connection into the worker-owned gateway. Downstream request identifiers are namespaced by it.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
     },
     "GatewayOrigin": {
       "description": "The origin a service request is bound to: scheme, host and optional port, with no path, query, fragment or trailing slash.",
@@ -11231,6 +12458,26 @@
       ],
       "type": "object"
     },
+    "IntegrationMode": {
+      "description": "How a launched application is integrated.",
+      "oneOf": [
+        {
+          "const": "native_terminal",
+          "description": "The ordinary native terminal path and nothing else.",
+          "type": "string"
+        },
+        {
+          "const": "gateway",
+          "description": "The worker-owned gateway is established before the native terminal starts.",
+          "type": "string"
+        },
+        {
+          "const": "native_bridge",
+          "description": "A native bridge installed beside an unchanged terminal.",
+          "type": "string"
+        }
+      ]
+    },
     "InterruptAction": {
       "description": "What an interrupt may do.\n\nThe method accepts only the configured native interrupt action. It never accepts arbitrary\ncommand bytes, and it bypasses the reader-transition hold.",
       "oneOf": [
@@ -11570,6 +12817,59 @@
         "command_integrations"
       ],
       "type": "object"
+    },
+    "LaunchProfile2": {
+      "additionalProperties": false,
+      "description": "One resolved launch profile.\n\nSection 12 fixes the contents: \"Each launch profile records the resolved executable,\ndistribution, version, argument vector, supported authentication state, and integration mode.\"\nIt is written before the launch, so a launch that is refused still leaves a record of what was\ngoing to be run.",
+      "properties": {
+        "arguments": {
+          "description": "The argument vector, exactly as it will be passed. Never a shell string.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "authentication": {
+          "$ref": "#/$defs/AuthenticationState",
+          "description": "What is known about the application's authentication."
+        },
+        "binary": {
+          "$ref": "#/$defs/BinaryIdentity",
+          "description": "The executable, its digest, its version and how it was distributed."
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment the launch happens in."
+        },
+        "mode": {
+          "$ref": "#/$defs/IntegrationMode",
+          "description": "How the launch will be integrated."
+        },
+        "profile_id": {
+          "$ref": "#/$defs/LaunchProfileId",
+          "description": "This profile's identity."
+        },
+        "resolved_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the profile was resolved."
+        }
+      },
+      "required": [
+        "profile_id",
+        "environment_id",
+        "binary",
+        "arguments",
+        "authentication",
+        "mode",
+        "resolved_at"
+      ],
+      "type": "object"
+    },
+    "LaunchProfileId": {
+      "description": "One resolved launch profile: its executable, distribution, version, arguments, authentication state and mode.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
     },
     "LiveScreenPreview": {
       "additionalProperties": false,
@@ -13163,6 +14463,15 @@
       "pattern": "^[a-z0-9_]+(\\.[a-z0-9_]+)*$",
       "type": "string"
     },
+    "MethodTableVersion": {
+      "description": "The version of a connector's declarative or rich method table.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
+    "MethodTableVersionText": {
+      "description": "A schema or protocol version as text, so a record survives a vendor's own numbering.",
+      "type": "string"
+    },
     "MethodVersion": {
       "description": "The version of one method's schema.\n\nMutation schemas are closed for the negotiated version: an unknown field rejects rather than\nbeing stripped. Read-only metadata may add explicitly optional ignored fields.",
       "format": "uint16",
@@ -13288,6 +14597,70 @@
         "created_at_ms"
       ],
       "type": "object"
+    },
+    "NativeClassification": {
+      "additionalProperties": false,
+      "description": "A classification, and whether the table actually said so.\n\nThe distinction is the whole of section 11's safety rule for the native path. A declared\nmutation is forwarded and its rich effects are known. An *undeclared* one is forwarded exactly\nthe same way and suspends rich mutations until the binding is reconciled, because the host does\nnot know what it did.",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/NativeMethodClass",
+          "description": "What the request is taken to do."
+        },
+        "declared": {
+          "description": "True when the table listed the method; false when the class was presumed.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "class",
+        "declared"
+      ],
+      "type": "object"
+    },
+    "NativeFraming": {
+      "description": "How a connector's protocol frames on the wire.",
+      "oneOf": [
+        {
+          "const": "json_lines",
+          "description": "One JSON object per line.",
+          "type": "string"
+        },
+        {
+          "const": "length_prefixed",
+          "description": "A decimal byte length, a newline, then that many bytes.",
+          "type": "string"
+        },
+        {
+          "const": "content_length",
+          "description": "Header lines, a blank line, then a body of the declared length.",
+          "type": "string"
+        }
+      ]
+    },
+    "NativeMethodClass": {
+      "description": "What one upstream method does.",
+      "oneOf": [
+        {
+          "const": "observation",
+          "description": "It reports state and changes none.",
+          "type": "string"
+        },
+        {
+          "const": "mutation",
+          "description": "It changes upstream state.",
+          "type": "string"
+        },
+        {
+          "const": "credential_or_configuration",
+          "description": "It reads or writes credentials or configuration.\n\nSeparate from a mutation because a write grant is not a provider-credential grant.",
+          "type": "string"
+        },
+        {
+          "const": "unsupported",
+          "description": "This build does not support it.",
+          "type": "string"
+        }
+      ]
     },
     "NetworkConfig": {
       "additionalProperties": false,
@@ -14839,6 +16212,26 @@
         }
       ]
     },
+    "PendingKind": {
+      "description": "What kind of thing is pending.",
+      "oneOf": [
+        {
+          "const": "approval",
+          "description": "An upstream approval request.",
+          "type": "string"
+        },
+        {
+          "const": "reverse_rpc",
+          "description": "A reverse remote procedure call for a filesystem or terminal operation.",
+          "type": "string"
+        },
+        {
+          "const": "upstream_action",
+          "description": "An action this host prepared against the upstream.",
+          "type": "string"
+        }
+      ]
+    },
     "PendingReaderInput": {
       "additionalProperties": false,
       "description": "What the reader is in the middle of.\n\nEach field names an operation that is waiting for another key or is mid-way through a sequence.\nAny of them excludes the detach condition, because the next character belongs to that operation\nrather than to an empty prompt, and all of them are read from the reader's own state rather than\nguessed from the terminal.",
@@ -14880,6 +16273,183 @@
         "multikey_sequence",
         "vi_motion",
         "paste"
+      ],
+      "type": "object"
+    },
+    "PendingResource": {
+      "additionalProperties": false,
+      "description": "One pending resource, as the broker publishes it.",
+      "properties": {
+        "application_instance_id": {
+          "$ref": "#/$defs/ApplicationInstanceId",
+          "description": "The application instance the request came from."
+        },
+        "classification": {
+          "$ref": "#/$defs/NativeClassification",
+          "description": "How the table classified that method, and whether it said so."
+        },
+        "deadline_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The upstream's own deadline, where it stated one."
+        },
+        "durability": {
+          "$ref": "#/$defs/Durability2",
+          "description": "Whether the record of this resource is durable or only in memory."
+        },
+        "interpretation_verified": {
+          "description": "True when its interpretation has been verified under a granted decoder.\n\nSection 11: \"A pending opaque request is not an actionable approval UI until its\ninterpretation is verified under the granted decoder.\"",
+          "type": "boolean"
+        },
+        "kind": {
+          "$ref": "#/$defs/PendingKind",
+          "description": "What kind of thing it is."
+        },
+        "method": {
+          "$ref": "#/$defs/UpstreamMethod",
+          "description": "The upstream method that produced it."
+        },
+        "recorded_at": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the broker recorded it."
+        },
+        "request": {
+          "$ref": "#/$defs/DownstreamRequestId",
+          "description": "The namespaced downstream identifier the upstream used."
+        },
+        "resource_id": {
+          "$ref": "#/$defs/PendingResourceId",
+          "description": "This resource's identity."
+        },
+        "source_generation": {
+          "$ref": "#/$defs/SourceGeneration",
+          "description": "The source frame generation the request arrived in."
+        },
+        "state": {
+          "$ref": "#/$defs/PendingState",
+          "description": "Its current state."
+        }
+      },
+      "required": [
+        "resource_id",
+        "application_instance_id",
+        "request",
+        "kind",
+        "method",
+        "classification",
+        "source_generation",
+        "state",
+        "durability",
+        "deadline_ms",
+        "recorded_at",
+        "interpretation_verified"
+      ],
+      "type": "object"
+    },
+    "PendingResourceId": {
+      "description": "One pending resource the broker arbitrates and resolves exactly once.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "PendingState": {
+      "description": "What a pending resource is doing.\n\nThe state machine is small because the contract is small: a resource is offered once, claimed\nonce, and reaches exactly one terminal state. There is no edge back out of a terminal state,\nso a reconnect cannot revive a resolved resource and answer it again.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Recorded and waiting for an answer.",
+          "type": "string"
+        },
+        {
+          "const": "claimed",
+          "description": "One actor's answer is encoding. No other answer may claim it.",
+          "type": "string"
+        },
+        {
+          "const": "resolved",
+          "description": "The answer reached the upstream.",
+          "type": "string"
+        },
+        {
+          "const": "cancelled",
+          "description": "The upstream withdrew or cancelled the request.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "The deadline passed without an answer.",
+          "type": "string"
+        },
+        {
+          "const": "uncertain",
+          "description": "An answer was dispatched and its outcome cannot be established.\n\nReconnect reconciles this; it never reissues. Section 11: it \"does not reissue an uncertain\nresponse\".",
+          "type": "string"
+        }
+      ]
+    },
+    "PluginActionInvokeParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `plugin.action.invoke`.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ActionName",
+          "description": "The registered action."
+        },
+        "draft_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DraftId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The draft the action acts on, where it acts on one."
+        },
+        "parameters": {
+          "$ref": "#/$defs/Bytes",
+          "description": "The action's parameters, canonically encoded by the caller.\n\nThe bytes are hashed into the action token, so what the component is asked to do and what\nthe broker authorised cannot differ."
+        },
+        "plugin_id": {
+          "$ref": "#/$defs/PluginId",
+          "description": "The package whose action this is."
+        },
+        "target": {
+          "$ref": "#/$defs/AgentMutationTarget",
+          "description": "What the action acts on."
+        }
+      },
+      "required": [
+        "target",
+        "plugin_id",
+        "action",
+        "draft_id",
+        "parameters"
+      ],
+      "type": "object"
+    },
+    "PluginActionInvokeResult": {
+      "additionalProperties": false,
+      "description": "The result of `plugin.action.invoke`.",
+      "properties": {
+        "action": {
+          "$ref": "#/$defs/ActionName",
+          "description": "The action that ran."
+        },
+        "mutation": {
+          "$ref": "#/$defs/AgentMutationResult",
+          "description": "What the action did upstream."
+        }
+      },
+      "required": [
+        "mutation",
+        "action"
       ],
       "type": "object"
     },
@@ -16528,6 +18098,12 @@
         "note"
       ],
       "type": "object"
+    },
+    "PublisherId": {
+      "description": "A package publisher identity from its manifest. Decoding trust is recorded against it.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
     },
     "PushAlert": {
       "description": "The generic alert a device shows before anything is decrypted.\n\nSection 16 requires the plaintext alert to be generic, and this is how: a sender chooses from a\nclosed vocabulary and the text comes from here. A delivery request has no field for text a\nsender supplies, so command text and approval arguments cannot reach a lock screen by mistake or\nby a bug in a host. What reaches it is one of six sentences, each of which names no session,\nproject, host or command.",
@@ -20471,6 +22047,62 @@
       ],
       "type": "object"
     },
+    "RichMethodEntry": {
+      "additionalProperties": false,
+      "description": "One entry of the closed rich method table.",
+      "properties": {
+        "class": {
+          "$ref": "#/$defs/NativeMethodClass",
+          "description": "What it does."
+        },
+        "method": {
+          "$ref": "#/$defs/UpstreamMethod",
+          "description": "The upstream method."
+        },
+        "provenance": {
+          "$ref": "#/$defs/ActionProvenance",
+          "description": "How a successful invocation's provenance is recorded."
+        },
+        "required_right": {
+          "$ref": "#/$defs/ActionRight",
+          "description": "The right an actor must hold to invoke it through the gateway."
+        }
+      },
+      "required": [
+        "method",
+        "class",
+        "required_right",
+        "provenance"
+      ],
+      "type": "object"
+    },
+    "RichMethodTable": {
+      "additionalProperties": false,
+      "description": "The closed, versioned method table for rich actions.\n\nSection 12: \"The gateway has a closed, versioned method table for rich/API actions... Reject\nunknown rich/API mutations.\" Closed means exactly that: a method with no entry is refused, and\na method classified as unsupported is refused with its own reason.",
+      "properties": {
+        "entries": {
+          "description": "The entries, ordered by method.",
+          "items": {
+            "$ref": "#/$defs/RichMethodEntry"
+          },
+          "type": "array"
+        },
+        "table_version": {
+          "$ref": "#/$defs/MethodTableVersion",
+          "description": "The version of this table."
+        },
+        "upstream_protocol_version": {
+          "description": "The upstream protocol version it is pinned to.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "table_version",
+        "upstream_protocol_version",
+        "entries"
+      ],
+      "type": "object"
+    },
     "RightCondition": {
       "description": "When a required authority applies.",
       "oneOf": [
@@ -22711,6 +24343,11 @@
       "minLength": 1,
       "type": "string"
     },
+    "SourceGeneration": {
+      "description": "The generation of one immutable source frame stream. It advances when the bound execution owner changes.",
+      "pattern": "^(0|[1-9][0-9]*)$",
+      "type": "string"
+    },
     "SpokenDestination": {
       "additionalProperties": false,
       "description": "A spoken confirmation that names the destination session.\n\nSection 15 ¶13 requires the confirmation to name the destination, so the host checks the name\nagainst the session it is about to submit to rather than accepting that one was given.",
@@ -22870,7 +24507,7 @@
         "capabilities": {
           "description": "What this host can currently do, as the shared section 11 evidence.",
           "items": {
-            "$ref": "#/$defs/CapabilityRecord"
+            "$ref": "#/$defs/CapabilityRecord2"
           },
           "type": "array"
         },
@@ -23848,6 +25485,18 @@
         "invalid_reason"
       ],
       "type": "object"
+    },
+    "UpstreamMethod": {
+      "description": "An upstream method name, as a connector's declarative or rich table names it.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "UpstreamRequestId": {
+      "description": "An upstream JSON-RPC request identifier, exactly as the upstream wrote it. Correlation data, not authority.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
     },
     "Uuid": {
       "description": "A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.",
@@ -26106,17 +27755,62 @@
     "action_read_result": {
       "$ref": "#/$defs/ActionReadResult"
     },
+    "action_token": {
+      "$ref": "#/$defs/ActionToken"
+    },
+    "action_token_claim": {
+      "$ref": "#/$defs/ActionTokenClaim"
+    },
     "action_window": {
       "$ref": "#/$defs/ActionWindow"
     },
     "actor_envelope": {
       "$ref": "#/$defs/ActorEnvelope"
     },
+    "agent_approval_respond_params": {
+      "$ref": "#/$defs/AgentApprovalRespondParams"
+    },
+    "agent_approval_respond_result": {
+      "$ref": "#/$defs/AgentApprovalRespondResult"
+    },
+    "agent_binding_state": {
+      "$ref": "#/$defs/AgentBindingState"
+    },
+    "agent_cancel_params": {
+      "$ref": "#/$defs/AgentCancelParams"
+    },
+    "agent_capabilities_params": {
+      "$ref": "#/$defs/AgentCapabilitiesParams"
+    },
+    "agent_capabilities_result": {
+      "$ref": "#/$defs/AgentCapabilitiesResult"
+    },
+    "agent_commands_params": {
+      "$ref": "#/$defs/AgentCommandsParams"
+    },
+    "agent_commands_result": {
+      "$ref": "#/$defs/AgentCommandsResult"
+    },
     "agent_draft_add_attachment_params": {
       "$ref": "#/$defs/AgentDraftAddAttachmentParams"
     },
     "agent_draft_add_attachment_result": {
       "$ref": "#/$defs/AgentDraftAddAttachmentResult"
+    },
+    "agent_mutation_result": {
+      "$ref": "#/$defs/AgentMutationResult"
+    },
+    "agent_prompt_params": {
+      "$ref": "#/$defs/AgentPromptParams"
+    },
+    "agent_snapshot_params": {
+      "$ref": "#/$defs/AgentSnapshotParams"
+    },
+    "agent_snapshot_result": {
+      "$ref": "#/$defs/AgentSnapshotResult"
+    },
+    "agent_steer_params": {
+      "$ref": "#/$defs/AgentSteerParams"
     },
     "agent_tools_install_result": {
       "$ref": "#/$defs/AgentToolsInstallResult"
@@ -26217,8 +27911,11 @@
     "bridge_hello_ack": {
       "$ref": "#/$defs/BridgeHelloAck"
     },
+    "capability_map": {
+      "$ref": "#/$defs/CapabilityMap"
+    },
     "capability_record": {
-      "$ref": "#/$defs/CapabilityRecord"
+      "$ref": "#/$defs/CapabilityRecord2"
     },
     "capture_count": {
       "$ref": "#/$defs/CaptureCount"
@@ -26276,6 +27973,15 @@
     },
     "controller_generation_token": {
       "$ref": "#/$defs/ControllerGenerationToken"
+    },
+    "declarative_table": {
+      "$ref": "#/$defs/DeclarativeTable"
+    },
+    "decoder_ledger_entry": {
+      "$ref": "#/$defs/DecoderLedgerEntry"
+    },
+    "decoding_trust": {
+      "$ref": "#/$defs/DecodingTrust"
     },
     "desktop_capability_report": {
       "$ref": "#/$defs/DesktopCapabilityReport"
@@ -26409,6 +28115,9 @@
     "events_subscribe_result": {
       "$ref": "#/$defs/EventsSubscribeResult"
     },
+    "evidence_gap": {
+      "$ref": "#/$defs/EvidenceGap"
+    },
     "evidence_reference": {
       "$ref": "#/$defs/EvidenceReference"
     },
@@ -26493,6 +28202,9 @@
         "action_id": {
           "$ref": "#/$defs/ActionId"
         },
+        "action_token_id": {
+          "$ref": "#/$defs/ActionTokenId"
+        },
         "action_window_id": {
           "$ref": "#/$defs/ActionWindowId"
         },
@@ -26537,6 +28249,9 @@
         },
         "boot_epoch": {
           "$ref": "#/$defs/BootEpoch"
+        },
+        "broker_binding_id": {
+          "$ref": "#/$defs/BrokerBindingId"
         },
         "build_id": {
           "$ref": "#/$defs/BuildId"
@@ -26601,6 +28316,9 @@
         "event_type": {
           "$ref": "#/$defs/EventType"
         },
+        "gateway_connection_id": {
+          "$ref": "#/$defs/GatewayConnectionId"
+        },
         "geometry_epoch": {
           "$ref": "#/$defs/GeometryEpoch"
         },
@@ -26619,11 +28337,17 @@
         "invitation_id": {
           "$ref": "#/$defs/InvitationId"
         },
+        "launch_profile_id": {
+          "$ref": "#/$defs/LaunchProfileId"
+        },
         "machine_id": {
           "$ref": "#/$defs/MachineId"
         },
         "materialisation_id": {
           "$ref": "#/$defs/MaterialisationId"
+        },
+        "method_table_version": {
+          "$ref": "#/$defs/MethodTableVersion"
         },
         "notification_id": {
           "$ref": "#/$defs/NotificationId"
@@ -26637,6 +28361,9 @@
         "payer_authorisation_id": {
           "$ref": "#/$defs/PayerAuthorisationId"
         },
+        "pending_resource_id": {
+          "$ref": "#/$defs/PendingResourceId"
+        },
         "plugin_id": {
           "$ref": "#/$defs/PluginId"
         },
@@ -26645,6 +28372,9 @@
         },
         "project_repository_id": {
           "$ref": "#/$defs/ProjectRepositoryId"
+        },
+        "publisher_id": {
+          "$ref": "#/$defs/PublisherId"
         },
         "push_registration_id": {
           "$ref": "#/$defs/PushRegistrationId"
@@ -26718,6 +28448,9 @@
         "source_event_handle": {
           "$ref": "#/$defs/SourceEventHandle"
         },
+        "source_generation": {
+          "$ref": "#/$defs/SourceGeneration"
+        },
         "stream_cursor": {
           "$ref": "#/$defs/StreamCursor"
         },
@@ -26726,6 +28459,12 @@
         },
         "transfer_id": {
           "$ref": "#/$defs/TransferId"
+        },
+        "upstream_method": {
+          "$ref": "#/$defs/UpstreamMethod"
+        },
+        "upstream_request_id": {
+          "$ref": "#/$defs/UpstreamRequestId"
         },
         "voice_delegation_id": {
           "$ref": "#/$defs/VoiceDelegationId"
@@ -26775,8 +28514,14 @@
     "installed_file": {
       "$ref": "#/$defs/InstalledFile"
     },
+    "instance_capability_record": {
+      "$ref": "#/$defs/CapabilityRecord"
+    },
     "invitation_preview": {
       "$ref": "#/$defs/InvitationPreview"
+    },
+    "launch_profile": {
+      "$ref": "#/$defs/LaunchProfile2"
     },
     "live_screen_preview": {
       "$ref": "#/$defs/LiveScreenPreview"
@@ -26852,6 +28597,15 @@
     },
     "pair_status_result": {
       "$ref": "#/$defs/PairStatusResult"
+    },
+    "pending_resource": {
+      "$ref": "#/$defs/PendingResource"
+    },
+    "plugin_action_invoke_params": {
+      "$ref": "#/$defs/PluginActionInvokeParams"
+    },
+    "plugin_action_invoke_result": {
+      "$ref": "#/$defs/PluginActionInvokeResult"
     },
     "policy_authority": {
       "$ref": "#/$defs/PolicyAuthority"
@@ -27062,6 +28816,9 @@
     },
     "revocation_result": {
       "$ref": "#/$defs/RevocationResult"
+    },
+    "rich_method_table": {
+      "$ref": "#/$defs/RichMethodTable"
     },
     "role_selection": {
       "$ref": "#/$defs/RoleSelection"

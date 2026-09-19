@@ -44,9 +44,51 @@ export type GrantId = string
  */
 export type AuthorityRevision = string
 /**
+ * The upstream agent's current turn identifier, where available.
+ */
+export type AgentTurnId = string
+/**
+ * An upstream JSON-RPC request identifier, exactly as the upstream wrote it. Correlation data, not authority.
+ */
+export type UpstreamRequestId = string
+/**
+ * One resolved launch profile: its executable, distribution, version, arguments, authentication state and mode.
+ */
+export type LaunchProfileId = string
+/**
+ * The upstream agent's conversation identifier, where available. Correlation data, not authority.
+ */
+export type AgentThreadId = string
+/**
+ * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+ */
+export type Digest256 = string
+/**
+ * One component bound to one application instance inside the broker.
+ */
+export type BrokerBindingId = string
+/**
+ * A schema or protocol version as text, so a record survives a vendor's own numbering.
+ */
+export type MethodTableVersionText = string
+/**
+ * What makes a capability record stale.
+ */
+export type CapabilityInvalidation =
+  | 'binary_changed'
+  | 'binding_changed'
+  | 'schema_changed'
+  | 'os_permission_changed'
+  | 'desktop_generation_changed'
+  | 'profile_changed'
+/**
  * One foreground application within a terminal session.
  */
 export type ApplicationInstanceId = string
+/**
+ * One durable device-owned draft, independent of an attachment.
+ */
+export type DraftId = string
 /**
  * One change an installation makes, with its inverse implied by its kind.
  */
@@ -92,10 +134,6 @@ export type ChangeOperation =
        */
       path: string
     }
-/**
- * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
- */
-export type Digest256 = string
 /**
  * Changes when the active upstream execution owner or selected thread changes.
  */
@@ -343,7 +381,7 @@ export type WorkerProfile = 'desktop_bound' | 'headless_user'
 /**
  * What makes a capability record stale.
  */
-export type CapabilityInvalidation =
+export type CapabilityInvalidation2 =
   | 'binary_identity'
   | 'binding_identity'
   | 'package_schema'
@@ -391,6 +429,10 @@ export type ConnectReply =
   | {
       refused: ProtocolError
     }
+/**
+ * An upstream method name, as a connector's declarative or rich table names it.
+ */
+export type UpstreamMethod = string
 /**
  * One selected working copy and its policy.
  */
@@ -546,6 +588,10 @@ export type HelloReply =
  */
 export type AccountId = string
 /**
+ * A single-use broker handle for one issued action token.
+ */
+export type ActionTokenId = string
+/**
  * A host-issued action window identifier, bound to one authenticated connection and host boot.
  */
 export type ActionWindowId = string
@@ -553,14 +599,6 @@ export type ActionWindowId = string
  * A stable host-issued principal for one verified actor. The caller cannot assert it.
  */
 export type ActorId = string
-/**
- * The upstream agent's conversation identifier, where available. Correlation data, not authority.
- */
-export type AgentThreadId = string
-/**
- * The upstream agent's current turn identifier, where available.
- */
-export type AgentTurnId = string
 /**
  * One backup archive. The service sees only this opaque identifier.
  */
@@ -618,10 +656,6 @@ export type ControllerGeneration = string
  */
 export type DeviceKeyRevision = string
 /**
- * One durable device-owned draft, independent of an attachment.
- */
-export type DraftId = string
-/**
  * The exact version of a draft.
  */
 export type DraftRevision = string
@@ -637,6 +671,10 @@ export type EventSequence = string
  * The type of one notification event.
  */
 export type EventType = string
+/**
+ * One connection into the worker-owned gateway. Downstream request identifiers are namespaced by it.
+ */
+export type GatewayConnectionId = string
 /**
  * The current geometry-owner epoch, separate from the input lease.
  */
@@ -666,6 +704,10 @@ export type MachineId = string
  */
 export type MaterialisationId = string
 /**
+ * The version of a connector's declarative or rich method table.
+ */
+export type MethodTableVersion = string
+/**
  * One notification, named by the host that produced it. 128 random bits, opaque to the gateway and the provider.
  */
 export type NotificationId = string
@@ -682,6 +724,10 @@ export type PairingSequence = string
  */
 export type PayerAuthorisationId = string
 /**
+ * One pending resource the broker arbitrates and resolves exactly once.
+ */
+export type PendingResourceId = string
+/**
  * A plugin identifier from its manifest.
  */
 export type PluginId = string
@@ -693,6 +739,10 @@ export type PolicyKeyRevision = string
  * One environment-bound source repository.
  */
 export type ProjectRepositoryId = string
+/**
+ * A package publisher identity from its manifest. Decoding trust is recorded against it.
+ */
+export type PublisherId = string
 /**
  * One attempt to bind a push token to an installation. 128 random bits.
  */
@@ -761,6 +811,10 @@ export type RequestId = string
  * A private broker handle for immutable upstream bytes and their execution provenance.
  */
 export type SourceEventHandle = string
+/**
+ * The generation of one immutable source frame stream. It advances when the bound execution owner changes.
+ */
+export type SourceGeneration = string
 /**
  * A position in one event stream.
  */
@@ -1096,7 +1150,7 @@ export type ReviewSubject =
          */
         session_id: string
         /**
-         * The turn.
+         * The upstream agent's current turn identifier, where available.
          */
         turn_id: string
       }
@@ -1269,10 +1323,25 @@ export interface KalaReachProtocol {
   action_observation?: ActionObservation
   action_read_params?: ActionReadParams
   action_read_result?: ActionReadResult
+  action_token?: ActionToken
+  action_token_claim?: ActionTokenClaim
   action_window?: ActionWindow
   actor_envelope?: ActorEnvelope
+  agent_approval_respond_params?: AgentApprovalRespondParams
+  agent_approval_respond_result?: AgentApprovalRespondResult
+  agent_binding_state?: AgentBindingState
+  agent_cancel_params?: AgentCancelParams
+  agent_capabilities_params?: AgentCapabilitiesParams
+  agent_capabilities_result?: AgentCapabilitiesResult
+  agent_commands_params?: AgentCommandsParams
+  agent_commands_result?: AgentCommandsResult
   agent_draft_add_attachment_params?: AgentDraftAddAttachmentParams
   agent_draft_add_attachment_result?: AgentDraftAddAttachmentResult
+  agent_mutation_result?: AgentMutationResult1
+  agent_prompt_params?: AgentPromptParams
+  agent_snapshot_params?: AgentSnapshotParams
+  agent_snapshot_result?: AgentSnapshotResult
+  agent_steer_params?: AgentSteerParams
   agent_tools_install_result?: AgentToolsInstallResult
   agent_tools_params?: AgentToolsParams
   agent_tools_remove_result?: AgentToolsRemoveResult
@@ -1306,7 +1375,8 @@ export interface KalaReachProtocol {
   bridge_frame?: BridgeFrame
   bridge_hello?: BridgeHello
   bridge_hello_ack?: BridgeHelloAck
-  capability_record?: CapabilityRecord
+  capability_map?: CapabilityMap1
+  capability_record?: CapabilityRecord2
   capture_count?: CaptureCount
   change_manifest?: ChangeManifest1
   change_operation?: ChangeOperation
@@ -1326,6 +1396,9 @@ export interface KalaReachProtocol {
   control_frame?: ControlFrame
   controller_connection_role?: ControllerConnectionRole
   controller_generation_token?: ControllerGenerationToken
+  declarative_table?: DeclarativeTable
+  decoder_ledger_entry?: DecoderLedgerEntry
+  decoding_trust?: DecodingTrust
   desktop_capability_report?: DesktopCapabilityReport
   desktop_context?: DesktopContext1
   device_list_params?: DeviceListParams
@@ -1370,6 +1443,7 @@ export interface KalaReachProtocol {
   events_snapshot_result?: EventsSnapshotResult
   events_subscribe_params?: EventsSubscribeParams
   events_subscribe_result?: EventsSubscribeResult
+  evidence_gap?: EvidenceGap
   evidence_reference?: EvidenceReference
   expiration_tombstone?: ExpirationTombstone
   fence_evidence?: FenceEvidence
@@ -1401,6 +1475,7 @@ export interface KalaReachProtocol {
   identifiers?: {
     account_id?: AccountId
     action_id?: ActionId
+    action_token_id?: ActionTokenId
     action_window_id?: ActionWindowId
     actor_id?: ActorId
     agent_binding_revision?: AgentBindingRevision
@@ -1416,6 +1491,7 @@ export interface KalaReachProtocol {
     backup_generation?: BackupGeneration
     backup_object_id?: BackupObjectId
     boot_epoch?: BootEpoch
+    broker_binding_id?: BrokerBindingId
     build_id?: BuildId
     capability_id?: CapabilityId
     capability_revision?: CapabilityRevision
@@ -1437,21 +1513,26 @@ export interface KalaReachProtocol {
     environment_id?: EnvironmentId
     event_sequence?: EventSequence
     event_type?: EventType
+    gateway_connection_id?: GatewayConnectionId
     geometry_epoch?: GeometryEpoch
     grant_id?: GrantId
     input_lease_epoch?: InputLeaseEpoch
     input_sequence?: InputSequence
     installation_id?: InstallationId
     invitation_id?: InvitationId
+    launch_profile_id?: LaunchProfileId
     machine_id?: MachineId
     materialisation_id?: MaterialisationId
+    method_table_version?: MethodTableVersion
     notification_id?: NotificationId
     organisation_id?: OrganisationId
     pairing_sequence?: PairingSequence
     payer_authorisation_id?: PayerAuthorisationId
+    pending_resource_id?: PendingResourceId
     plugin_id?: PluginId
     policy_key_revision?: PolicyKeyRevision
     project_repository_id?: ProjectRepositoryId
+    publisher_id?: PublisherId
     push_registration_id?: PushRegistrationId
     push_sender_record_id?: PushSenderRecordId
     push_sender_revision?: PushSenderRevision
@@ -1476,9 +1557,12 @@ export interface KalaReachProtocol {
     session_epoch?: SessionEpoch
     session_id?: SessionId
     source_event_handle?: SourceEventHandle
+    source_generation?: SourceGeneration
     stream_cursor?: StreamCursor
     stream_id?: StreamId
     transfer_id?: TransferId
+    upstream_method?: UpstreamMethod
+    upstream_request_id?: UpstreamRequestId
     voice_delegation_id?: VoiceDelegationId
     voice_session_id?: VoiceSessionId
     workflow_id?: WorkflowId
@@ -1495,7 +1579,9 @@ export interface KalaReachProtocol {
   input_write_params?: InputWriteParams
   input_write_result?: InputWriteResult
   installed_file?: InstalledFile
+  instance_capability_record?: CapabilityRecord
   invitation_preview?: InvitationPreview1
+  launch_profile?: LaunchProfile2
   live_screen_preview?: LiveScreenPreview
   local_hello?: LocalHello
   local_hello_ack?: LocalHelloAck
@@ -1521,6 +1607,9 @@ export interface KalaReachProtocol {
   pair_status?: PairStatus
   pair_status_params?: PairStatusParams
   pair_status_result?: PairStatusResult
+  pending_resource?: PendingResource
+  plugin_action_invoke_params?: PluginActionInvokeParams
+  plugin_action_invoke_result?: PluginActionInvokeResult
   policy_authority?: PolicyAuthority
   preview_entry?: PreviewEntry
   project_adopt_params?: ProjectAdoptParams
@@ -1591,6 +1680,7 @@ export interface KalaReachProtocol {
   revocation_barrier?: RevocationBarrier
   revocation_request?: RevocationRequest
   revocation_result?: RevocationResult
+  rich_method_table?: RichMethodTable
   role_selection?: RoleSelection1
   root_command_accepted_params?: RootCommandAcceptedParams
   root_command_accepted_result?: RootCommandAcceptedResult
@@ -1958,6 +2048,92 @@ export interface Receipt1 {
   updated_at_ms: string
 }
 /**
+ * The authority for exactly one action callback.
+ *
+ * Section 11: "Every action callback receives a token bound to actor, grant, application/thread
+ * revision, declared action and parameter hash. Its effect plan can use only resources and
+ * operations permitted by that invocation."
+ *
+ * All five bindings are checked together when the effect plan comes back. Checking the handle
+ * alone would make the token a bearer secret; checking the bindings alone would let a component
+ * replay one invocation's token against a later one. The broker does both, and spends the handle.
+ */
+export interface ActionToken {
+  /**
+   * The declared action, as the package's manifest names it.
+   */
+  action: string
+  /**
+   * The verified actor whose action this is. A component never asserts it.
+   */
+  actor_id: string
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  /**
+   * Which of the three grants authorised this invocation.
+   */
+  grant: 'observation' | 'upstream_action' | 'approval_interpreter'
+  /**
+   * The grant record that authority came from.
+   */
+  grant_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  issued_at: string
+  /**
+   * The hash of the parameters the action was invoked with.
+   */
+  parameter_hash: string
+  /**
+   * The record the broker consumes when the effect plan arrives.
+   */
+  token_id: string
+}
+/**
+ * What a component presents when it returns an effect plan.
+ */
+export interface ActionTokenClaim {
+  /**
+   * The action it declares it performed.
+   */
+  action: string
+  /**
+   * The actor the component believes it is acting for.
+   */
+  actor_id: string
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  /**
+   * The grant it believes authorised the call.
+   */
+  grant: 'observation' | 'upstream_action' | 'approval_interpreter'
+  /**
+   * The grant record it names.
+   */
+  grant_id: string
+  /**
+   * The hash of the parameters it used.
+   */
+  parameter_hash: string
+  /**
+   * The handle the broker issued.
+   */
+  token_id: string
+}
+/**
  * A host-issued action window.
  *
  * Section 9: an original online request carries a window bound to this authenticated connection
@@ -2027,6 +2203,369 @@ export interface ActorEnvelope {
    */
   ingress:
     'local_ipc' | 'paired_device' | 'unpaired_peer' | 'workflow' | 'plugin' | 'service_client'
+}
+/**
+ * Parameters of `agent.approval.respond`.
+ */
+export interface AgentApprovalRespondParams {
+  /**
+   * The decision, as one of the options the decoder offered.
+   *
+   * Answering is choosing from what the upstream offered. A free-form answer would be this host
+   * inventing an upstream decision.
+   */
+  option_id: string
+  /**
+   * The pending resource being answered.
+   */
+  resource_id: string
+  target: AgentMutationTarget
+}
+/**
+ * What the answer acts on.
+ */
+export interface AgentMutationTarget {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  subject: AgentSubject
+}
+/**
+ * The session and instance.
+ */
+export interface AgentSubject {
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `agent.approval.respond`.
+ */
+export interface AgentApprovalRespondResult {
+  mutation: AgentMutationResult
+  /**
+   * The resource that was answered.
+   */
+  resource_id: string
+  /**
+   * Its state after the answer.
+   */
+  state: 'pending' | 'claimed' | 'resolved' | 'cancelled' | 'expired' | 'uncertain'
+}
+/**
+ * What the mutation did.
+ */
+export interface AgentMutationResult {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  /**
+   * How it reached the upstream.
+   */
+  provenance: 'upstream_typed_rpc' | 'authenticated_hook_response' | 'terminal_input'
+  /**
+   * The turn it applies to, where the upstream names one.
+   */
+  turn_id: AgentTurnId | null
+  /**
+   * The upstream's own identifier for it, where the upstream gave one.
+   */
+  upstream_request_id: UpstreamRequestId | null
+}
+/**
+ * What the host currently knows about one bound instance.
+ *
+ * This is the answer to "is the thing I am looking at still the thing I was looking at". A client
+ * that holds an older revision has to re-read before it may mutate.
+ */
+export interface AgentBindingState {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  /**
+   * How this instance is integrated.
+   */
+  mode: 'native_terminal' | 'gateway' | 'native_bridge'
+  /**
+   * The launch profile this instance was started under.
+   */
+  profile_id: LaunchProfileId | null
+  /**
+   * True while a native selection could not be observed reliably.
+   *
+   * Rich mutations are suspended until the binding is verified. The terminal stays available
+   * throughout, which is why this is a field rather than an error.
+   */
+  rich_mutations_suspended: boolean
+  /**
+   * Why they are suspended, when they are.
+   */
+  suspension_reason: string | null
+  /**
+   * The upstream's own conversation identifier, where the connector can observe one.
+   */
+  thread_id: AgentThreadId | null
+  /**
+   * The turn currently running, where one is.
+   */
+  turn_id: AgentTurnId | null
+}
+/**
+ * Parameters of `agent.turn.cancel`.
+ */
+export interface AgentCancelParams {
+  target: AgentMutationTarget1
+  /**
+   * The upstream agent's current turn identifier, where available.
+   */
+  turn_id: string
+}
+/**
+ * What the cancellation acts on.
+ */
+export interface AgentMutationTarget1 {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  subject: AgentSubject
+}
+/**
+ * Parameters of `agent.capabilities`.
+ */
+export interface AgentCapabilitiesParams {
+  subject: AgentSubject1
+}
+/**
+ * The session and instance.
+ */
+export interface AgentSubject1 {
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `agent.capabilities`.
+ */
+export interface AgentCapabilitiesResult {
+  binding: AgentBindingState1
+  capabilities: CapabilityMap
+}
+/**
+ * The binding this answer is about.
+ */
+export interface AgentBindingState1 {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  /**
+   * How this instance is integrated.
+   */
+  mode: 'native_terminal' | 'gateway' | 'native_bridge'
+  /**
+   * The launch profile this instance was started under.
+   */
+  profile_id: LaunchProfileId | null
+  /**
+   * True while a native selection could not be observed reliably.
+   *
+   * Rich mutations are suspended until the binding is verified. The terminal stays available
+   * throughout, which is why this is a field rather than an error.
+   */
+  rich_mutations_suspended: boolean
+  /**
+   * Why they are suspended, when they are.
+   */
+  suspension_reason: string | null
+  /**
+   * The upstream's own conversation identifier, where the connector can observe one.
+   */
+  thread_id: AgentThreadId | null
+  /**
+   * The turn currently running, where one is.
+   */
+  turn_id: AgentTurnId | null
+}
+/**
+ * What this installation can currently do, with the evidence behind each entry.
+ */
+export interface CapabilityMap {
+  /**
+   * The records, ordered by capability so the map encodes deterministically.
+   */
+  records: CapabilityRecord[]
+}
+/**
+ * One capability record the worker keeps for dispatch.
+ *
+ * The host owns the current evidence; a worker keeps the subset its dispatch decisions need. The
+ * record carries its own invalidation triggers so a worker can decide staleness without asking.
+ */
+export interface CapabilityRecord {
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * The versioned capability this record is about.
+   */
+  capability_id: string
+  /**
+   * The user-facing reason, required whenever the state is not usable.
+   */
+  disabled_reason: string | null
+  identity: CapabilitySubjectIdentity
+  /**
+   * What makes it stale.
+   */
+  invalidated_by: CapabilityInvalidation[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  observed_at: string
+  /**
+   * The current revision of this record. Every action rechecks it.
+   */
+  revision: string
+  /**
+   * Where the record came from.
+   */
+  source: 'host_probe' | 'live_binding' | 'signed_record' | 'package_declaration'
+  /**
+   * The current state.
+   */
+  state:
+    | 'qualified_available'
+    | 'missing_installation'
+    | 'permission_required'
+    | 'incompatible'
+    | 'temporarily_unavailable'
+    | 'not_tested'
+}
+/**
+ * The exact identity the evidence was gathered against.
+ */
+export interface CapabilitySubjectIdentity {
+  /**
+   * The digest of the tested binary.
+   */
+  binary_digest: Digest256 | null
+  /**
+   * The binding the evidence was gathered through.
+   */
+  binding_id: BrokerBindingId | null
+  /**
+   * The desktop session generation the evidence is bound to.
+   */
+  desktop_generation: U64 | null
+  /**
+   * Whether the operating-system permission the capability needs was held.
+   */
+  os_permission_held: boolean | null
+  /**
+   * The launch profile the evidence was gathered under.
+   */
+  profile_id: LaunchProfileId | null
+  /**
+   * The upstream schema or protocol version the evidence is about.
+   */
+  schema_version: MethodTableVersionText | null
+}
+/**
+ * Parameters of `agent.commands`.
+ */
+export interface AgentCommandsParams {
+  subject: AgentSubject2
+}
+/**
+ * The session and instance.
+ */
+export interface AgentSubject2 {
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `agent.commands`.
+ */
+export interface AgentCommandsResult {
+  binding: AgentBindingState2
+  /**
+   * The commands, in the order the upstream advertises them.
+   */
+  commands: AgentCommand[]
+}
+/**
+ * The binding this answer is about.
+ */
+export interface AgentBindingState2 {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  /**
+   * How this instance is integrated.
+   */
+  mode: 'native_terminal' | 'gateway' | 'native_bridge'
+  /**
+   * The launch profile this instance was started under.
+   */
+  profile_id: LaunchProfileId | null
+  /**
+   * True while a native selection could not be observed reliably.
+   *
+   * Rich mutations are suspended until the binding is verified. The terminal stays available
+   * throughout, which is why this is a field rather than an error.
+   */
+  rich_mutations_suspended: boolean
+  /**
+   * Why they are suspended, when they are.
+   */
+  suspension_reason: string | null
+  /**
+   * The upstream's own conversation identifier, where the connector can observe one.
+   */
+  thread_id: AgentThreadId | null
+  /**
+   * The turn currently running, where one is.
+   */
+  turn_id: AgentTurnId | null
+}
+/**
+ * One command a bound agent advertises.
+ */
+export interface AgentCommand {
+  /**
+   * The command's name, without its leading marker.
+   */
+  name: string
+  /**
+   * How its parameters are encoded when it is executed upstream.
+   */
+  parameter_encoding: string
+  /**
+   * What it does, for a person.
+   */
+  summary: string
 }
 /**
  * Parameters of `agent.draft.add_attachment`.
@@ -2337,6 +2876,209 @@ export interface DraftAttachment1 {
    * [`InsertionState::AcceptedByAgent`], because nothing else establishes acceptance.
    */
   upstream_evidence: string | null
+}
+/**
+ * What one accepted agent mutation did.
+ */
+export interface AgentMutationResult1 {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  /**
+   * How it reached the upstream.
+   */
+  provenance: 'upstream_typed_rpc' | 'authenticated_hook_response' | 'terminal_input'
+  /**
+   * The turn it applies to, where the upstream names one.
+   */
+  turn_id: AgentTurnId | null
+  /**
+   * The upstream's own identifier for it, where the upstream gave one.
+   */
+  upstream_request_id: UpstreamRequestId | null
+}
+/**
+ * Parameters of `agent.prompt.submit` and `agent.prompt.queue`.
+ */
+export interface AgentPromptParams {
+  /**
+   * The draft to submit, when the prompt has attachments or was composed elsewhere.
+   */
+  draft_id: DraftId | null
+  target: AgentMutationTarget2
+  /**
+   * The prompt itself, when it is short enough to travel inline.
+   */
+  text: string | null
+}
+/**
+ * What the prompt acts on.
+ */
+export interface AgentMutationTarget2 {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  subject: AgentSubject
+}
+/**
+ * Parameters of `agent.snapshot`.
+ */
+export interface AgentSnapshotParams {
+  /**
+   * The node the reader wants the next part from, when continuing a bounded snapshot.
+   */
+  from_node: U64 | null
+  subject: AgentSubject3
+}
+/**
+ * The session and instance.
+ */
+export interface AgentSubject3 {
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `agent.snapshot`.
+ */
+export interface AgentSnapshotResult {
+  binding: AgentBindingState3
+  /**
+   * Where a reader continues, when a limit stopped this part.
+   */
+  continuation: SemanticContinuation | null
+  /**
+   * The entries this part carries.
+   */
+  entries: AgentSnapshotEntry[]
+  /**
+   * True when the retained range the reader asked for had been evicted.
+   *
+   * Section 24: a rebuilt range shows a history gap for anything unavailable. A grid image or a
+   * transcript file cannot reconstruct an unobserved pending approval, so the gap is reported
+   * rather than filled in.
+   */
+  history_gap: boolean
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  withheld_entries: string
+}
+/**
+ * The binding this answer is about.
+ */
+export interface AgentBindingState3 {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  /**
+   * How this instance is integrated.
+   */
+  mode: 'native_terminal' | 'gateway' | 'native_bridge'
+  /**
+   * The launch profile this instance was started under.
+   */
+  profile_id: LaunchProfileId | null
+  /**
+   * True while a native selection could not be observed reliably.
+   *
+   * Rich mutations are suspended until the binding is verified. The terminal stays available
+   * throughout, which is why this is a field rather than an error.
+   */
+  rich_mutations_suspended: boolean
+  /**
+   * Why they are suspended, when they are.
+   */
+  suspension_reason: string | null
+  /**
+   * The upstream's own conversation identifier, where the connector can observe one.
+   */
+  thread_id: AgentThreadId | null
+  /**
+   * The turn currently running, where one is.
+   */
+  turn_id: AgentTurnId | null
+}
+/**
+ * Where a reader continues a semantic snapshot that stopped short.
+ *
+ * It is present exactly when something was left out. A snapshot with no continuation is the whole
+ * tree; one with a continuation is a part, and the fields say what to ask for next.
+ */
+export interface SemanticContinuation {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  from_node: string
+  /**
+   * Which limit stopped this part.
+   */
+  limit: 'bytes' | 'depth' | 'nodes'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  limit_value: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  nodes: string
+}
+/**
+ * One entry of a bound agent's shared state.
+ */
+export interface AgentSnapshotEntry {
+  /**
+   * What kind of entry it is, as the connector's declarative presentation names it.
+   */
+  kind: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  node: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  observed_at: string
+  /**
+   * The entry's text, already filtered by the shared host-side history filter.
+   */
+  text: string
+}
+/**
+ * Parameters of `agent.turn.steer`.
+ */
+export interface AgentSteerParams {
+  target: AgentMutationTarget3
+  /**
+   * The steering text.
+   */
+  text: string
+  /**
+   * The upstream agent's current turn identifier, where available.
+   */
+  turn_id: string
+}
+/**
+ * What the steer acts on.
+ */
+export interface AgentMutationTarget3 {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  subject: AgentSubject
 }
 /**
  * The result of `agent_tools.install`.
@@ -4772,13 +5514,26 @@ export interface Request1 {
   request_id: string
 }
 /**
+ * Everything one installation of one application can currently do.
+ *
+ * Section 12: "The feature set is a per-installation capability map, not a single label assigned
+ * to an agent name." Two installations of the same agent, at different versions or with different
+ * permissions, have different maps.
+ */
+export interface CapabilityMap1 {
+  /**
+   * The records, ordered by capability so the map encodes deterministically.
+   */
+  records: CapabilityRecord[]
+}
+/**
  * One capability, one subject, one answer.
  *
  * This is the shared section 11 record. Capability evidence describes feasibility and never
  * creates authority: every action still checks its grant, and it rechecks this record's revision
  * independently.
  */
-export interface CapabilityRecord {
+export interface CapabilityRecord2 {
   /**
    * A versioned capability name. Capabilities describe feasibility, never authority.
    */
@@ -4796,7 +5551,7 @@ export interface CapabilityRecord {
   /**
    * What makes this record stale, in the order it is written.
    */
-  invalidation: CapabilityInvalidation[]
+  invalidation: CapabilityInvalidation2[]
   /**
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
@@ -6354,6 +7109,164 @@ export interface ConnectProof {
   signature: string
 }
 /**
+ * A connector's qualified declarative table.
+ *
+ * Core code interprets this without calling Wasm, which is what makes the forwarding path
+ * independent of the component runtime. The table is pinned to one upstream protocol version and
+ * carries the publisher whose semantic trust grant qualifies it.
+ */
+export interface DeclarativeTable {
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  digest: string
+  /**
+   * The entries, ordered by method so the table encodes deterministically.
+   */
+  entries: DeclarativeEntry[]
+  /**
+   * How the protocol frames.
+   */
+  framing: 'json_lines' | 'length_prefixed' | 'content_length'
+  /**
+   * The member of a frame that carries its method name.
+   */
+  method_field: string
+  /**
+   * The package that supplied the table.
+   */
+  plugin_id: string
+  /**
+   * The publisher whose semantic trust grant qualifies it.
+   */
+  publisher_id: string
+  /**
+   * The member of a frame that carries its request identifier.
+   */
+  request_id_field: string
+  /**
+   * The member of a frame that carries the identifier a response correlates to.
+   */
+  response_id_field: string
+  /**
+   * The version of the table itself.
+   */
+  table_version: string
+  /**
+   * The upstream protocol version the table is pinned to.
+   */
+  upstream_protocol_version: string
+}
+/**
+ * One entry of a connector's declarative table.
+ */
+export interface DeclarativeEntry {
+  /**
+   * What it does.
+   */
+  class: 'observation' | 'mutation' | 'credential_or_configuration' | 'unsupported'
+  /**
+   * True when the upstream sends this as a request that expects a response.
+   *
+   * A reverse request creates a pending resource; a notification does not.
+   */
+  expects_response: boolean
+  /**
+   * The upstream method this entry classifies.
+   */
+  method: string
+}
+/**
+ * What a decoder offered, and every check the broker made before believing it.
+ *
+ * This is the ledger row section 11 requires the broker to retain: "the decoder/package hash,
+ * original source, native request ID, offered decisions, deadline and resolution state". It
+ * outlives the plugin process, because a plugin-process failure cannot destroy the approval
+ * ledger.
+ */
+export interface DecoderLedgerEntry {
+  /**
+   * One component bound to one application instance inside the broker.
+   */
+  binding_id: string
+  /**
+   * The deadline the upstream put on its request, where it stated one.
+   */
+  deadline_ms: TimestampMs | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  decoded_at: string
+  /**
+   * The upstream method the original request named.
+   */
+  method: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  offered_decisions: string
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  package_digest: string
+  /**
+   * The package that binding runs.
+   */
+  plugin_id: string
+  /**
+   * The publisher of that package, for a person reading the pending resource.
+   */
+  publisher_id: string
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  source_digest: string
+  /**
+   * The generation of the source frame the decoder read.
+   */
+  source_generation: string
+}
+/**
+ * What a component is trusted to interpret, and whose interpretation it is.
+ *
+ * Section 11: "Trust to classify or encode native mutations must be explicit, with the publisher
+ * and methods recorded." Authenticated wire provenance proves which connection supplied bytes; it
+ * does not prove that this decoder read them correctly, so the record exists to be shown to a
+ * person beside the pending resource it produced.
+ */
+export interface DecodingTrust {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  granted_at: string
+  /**
+   * Whether the component may also encode an answer to those requests.
+   *
+   * Decoding and answering are separate capabilities in the package contract, and they stay
+   * separate here.
+   */
+  may_encode_response: boolean
+  /**
+   * The upstream methods this component may decode into a pending resource.
+   *
+   * A method outside this list is forwarded opaquely and produces no rich approval, whatever
+   * the component reports about it.
+   */
+  methods: UpstreamMethod[]
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  package_digest: string
+  /**
+   * The package whose component holds the trust.
+   */
+  plugin_id: string
+  /**
+   * The publisher that signed that package.
+   */
+  publisher_id: string
+}
+/**
  * Every capability record for one desktop, with the context they are about.
  */
 export interface DesktopCapabilityReport {
@@ -6361,7 +7274,7 @@ export interface DesktopCapabilityReport {
   /**
    * The records, ordered by capability name.
    */
-  records: CapabilityRecord[]
+  records: CapabilityRecord2[]
 }
 /**
  * The desktop the records are about.
@@ -7469,7 +8382,7 @@ export interface DraftRecord2 {
  */
 export interface DraftUpdateParams {
   /**
-   * The draft.
+   * One durable device-owned draft, independent of an attachment.
    */
   draft_id: string
   /**
@@ -7894,7 +8807,7 @@ export interface DesktopCapabilityReport1 {
   /**
    * The records, ordered by capability name.
    */
-  records: CapabilityRecord[]
+  records: CapabilityRecord2[]
 }
 /**
  * What the host's per-user service arrangement does at logout.
@@ -8613,6 +9526,43 @@ export interface HistoryGap {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   to_cursor: string
+}
+/**
+ * The evidence gap a spell of volatile operation leaves behind.
+ *
+ * It is exposed while it is open and committed when storage returns. Section 11 forbids the
+ * alternative: "Never replay volatile operations to manufacture durable history." What is
+ * committed is the fact that the gap happened and what was in it, not the operations themselves.
+ */
+export interface EvidenceGap {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  carried_pending: string
+  /**
+   * When storage returned, while the gap is still open.
+   */
+  closed_at: TimestampMs | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  fenced_rich_operations: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  native_requests: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  native_responses: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  opened_at: string
+  /**
+   * Why the journal faulted, for a person to read.
+   */
+  reason: string
 }
 /**
  * The record an expired object leaves behind.
@@ -10140,6 +11090,62 @@ export interface InvitationPreview1 {
   single_use: boolean
 }
 /**
+ * One resolved launch profile.
+ *
+ * Section 12 fixes the contents: "Each launch profile records the resolved executable,
+ * distribution, version, argument vector, supported authentication state, and integration mode."
+ * It is written before the launch, so a launch that is refused still leaves a record of what was
+ * going to be run.
+ */
+export interface LaunchProfile2 {
+  /**
+   * The argument vector, exactly as it will be passed. Never a shell string.
+   */
+  arguments: string[]
+  /**
+   * What is known about the application's authentication.
+   */
+  authentication: 'authenticated' | 'sign_in_required' | 'unknown'
+  binary: BinaryIdentity
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * How the launch will be integrated.
+   */
+  mode: 'native_terminal' | 'gateway' | 'native_bridge'
+  /**
+   * One resolved launch profile: its executable, distribution, version, arguments, authentication state and mode.
+   */
+  profile_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  resolved_at: string
+}
+/**
+ * The executable, its digest, its version and how it was distributed.
+ */
+export interface BinaryIdentity {
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  digest: string
+  /**
+   * How the application was distributed: a package manager, an installer, a build.
+   */
+  distribution: string
+  /**
+   * The absolute path the launch resolved to.
+   */
+  resolved_path: string
+  /**
+   * The version the application reported.
+   */
+  version: string
+}
+/**
  * One log view's retained position and filter.
  *
  * Section 25 keeps a log view's source offsets and filtering state across a reconnect, a switch
@@ -10909,6 +11915,148 @@ export interface PairStatusResult {
           reason: 'denied' | 'expired' | 'cancelled' | 'attempts_exhausted' | 'host_restarted'
         }
       }
+}
+/**
+ * One pending resource, as the broker publishes it.
+ */
+export interface PendingResource {
+  /**
+   * One foreground application within a terminal session.
+   */
+  application_instance_id: string
+  classification: NativeClassification
+  /**
+   * The upstream's own deadline, where it stated one.
+   */
+  deadline_ms: TimestampMs | null
+  /**
+   * Whether the record of this resource is durable or only in memory.
+   */
+  durability: 'durable' | 'volatile'
+  /**
+   * True when its interpretation has been verified under a granted decoder.
+   *
+   * Section 11: "A pending opaque request is not an actionable approval UI until its
+   * interpretation is verified under the granted decoder."
+   */
+  interpretation_verified: boolean
+  /**
+   * What kind of thing it is.
+   */
+  kind: 'approval' | 'reverse_rpc' | 'upstream_action'
+  /**
+   * An upstream method name, as a connector's declarative or rich table names it.
+   */
+  method: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  recorded_at: string
+  request: DownstreamRequestId
+  /**
+   * This resource's identity.
+   */
+  resource_id: string
+  /**
+   * The source frame generation the request arrived in.
+   */
+  source_generation: string
+  /**
+   * Its current state.
+   */
+  state: 'pending' | 'claimed' | 'resolved' | 'cancelled' | 'expired' | 'uncertain'
+}
+/**
+ * How the table classified that method, and whether it said so.
+ */
+export interface NativeClassification {
+  /**
+   * What the request is taken to do.
+   */
+  class: 'observation' | 'mutation' | 'credential_or_configuration' | 'unsupported'
+  /**
+   * True when the table listed the method; false when the class was presumed.
+   */
+  declared: boolean
+}
+/**
+ * The namespaced downstream identifier the upstream used.
+ */
+export interface DownstreamRequestId {
+  /**
+   * The connection the identifier belongs to.
+   */
+  connection: string
+  /**
+   * An upstream JSON-RPC request identifier, exactly as the upstream wrote it. Correlation data, not authority.
+   */
+  upstream: string
+}
+/**
+ * Parameters of `plugin.action.invoke`.
+ */
+export interface PluginActionInvokeParams {
+  /**
+   * The registered action.
+   */
+  action: string
+  /**
+   * The draft the action acts on, where it acts on one.
+   */
+  draft_id: DraftId | null
+  /**
+   * The action's parameters, canonically encoded by the caller.
+   *
+   * The bytes are hashed into the action token, so what the component is asked to do and what
+   * the broker authorised cannot differ.
+   */
+  parameters: string
+  /**
+   * A plugin identifier from its manifest.
+   */
+  plugin_id: string
+  target: AgentMutationTarget4
+}
+/**
+ * What the action acts on.
+ */
+export interface AgentMutationTarget4 {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  subject: AgentSubject
+}
+/**
+ * The result of `plugin.action.invoke`.
+ */
+export interface PluginActionInvokeResult {
+  /**
+   * The action that ran.
+   */
+  action: string
+  mutation: AgentMutationResult2
+}
+/**
+ * What the action did upstream.
+ */
+export interface AgentMutationResult2 {
+  /**
+   * Changes when the active upstream execution owner or selected thread changes.
+   */
+  binding_revision: string
+  /**
+   * How it reached the upstream.
+   */
+  provenance: 'upstream_typed_rpc' | 'authenticated_hook_response' | 'terminal_input'
+  /**
+   * The turn it applies to, where the upstream names one.
+   */
+  turn_id: AgentTurnId | null
+  /**
+   * The upstream's own identifier for it, where the upstream gave one.
+   */
+  upstream_request_id: UpstreamRequestId | null
 }
 /**
  * An organisation's policy-signing authority as it is published.
@@ -14920,7 +16068,7 @@ export interface ReviewAcknowledgeParams {
            */
           session_id: string
           /**
-           * The turn.
+           * The upstream agent's current turn identifier, where available.
            */
           turn_id: string
         }
@@ -14994,7 +16142,7 @@ export interface ReviewState {
            */
           session_id: string
           /**
-           * The turn.
+           * The upstream agent's current turn identifier, where available.
            */
           turn_id: string
         }
@@ -15087,7 +16235,7 @@ export interface ReviewState1 {
            */
           session_id: string
           /**
-           * The turn.
+           * The upstream agent's current turn identifier, where available.
            */
           turn_id: string
         }
@@ -15226,6 +16374,70 @@ export interface RevocationBarrier1 {
    * One entry per affected worker.
    */
   workers: WorkerBarrier[]
+}
+/**
+ * The closed, versioned method table for rich actions.
+ *
+ * Section 12: "The gateway has a closed, versioned method table for rich/API actions... Reject
+ * unknown rich/API mutations." Closed means exactly that: a method with no entry is refused, and
+ * a method classified as unsupported is refused with its own reason.
+ */
+export interface RichMethodTable {
+  /**
+   * The entries, ordered by method.
+   */
+  entries: RichMethodEntry[]
+  /**
+   * The version of this table.
+   */
+  table_version: string
+  /**
+   * The upstream protocol version it is pinned to.
+   */
+  upstream_protocol_version: string
+}
+/**
+ * One entry of the closed rich method table.
+ */
+export interface RichMethodEntry {
+  /**
+   * What it does.
+   */
+  class: 'observation' | 'mutation' | 'credential_or_configuration' | 'unsupported'
+  /**
+   * An upstream method name, as a connector's declarative or rich table names it.
+   */
+  method: string
+  /**
+   * How a successful invocation's provenance is recorded.
+   */
+  provenance: 'upstream_typed_rpc' | 'authenticated_hook_response' | 'terminal_input'
+  /**
+   * One permitted action in a grant.
+   */
+  required_right:
+    | 'session.view'
+    | 'terminal.input'
+    | 'terminal.geometry'
+    | 'terminal.geometry.transfer'
+    | 'terminal.palette'
+    | 'agent.prompt'
+    | 'agent.cancel'
+    | 'agent.approval.respond'
+    | 'question.respond'
+    | 'files.read'
+    | 'files.upload'
+    | 'files.apply_diff'
+    | 'project.create'
+    | 'workspace.manage'
+    | 'changeset.create'
+    | 'session.create'
+    | 'session.rename'
+    | 'session.close'
+    | 'session.share'
+    | 'automation.manage'
+    | 'host.manage'
+    | 'voice.use'
 }
 /**
  * What the issuer chose, on top of the role, before the grant was written.
@@ -15929,34 +17141,6 @@ export interface SemanticChange {
    * Null means the host withheld it, for the same reason an attention item's text is withheld.
    */
   summary: string | null
-}
-/**
- * Where a reader continues a semantic snapshot that stopped short.
- *
- * It is present exactly when something was left out. A snapshot with no continuation is the whole
- * tree; one with a continuation is a part, and the fields say what to ask for next.
- */
-export interface SemanticContinuation {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  bytes: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  from_node: string
-  /**
-   * Which limit stopped this part.
-   */
-  limit: 'bytes' | 'depth' | 'nodes'
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  limit_value: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  nodes: string
 }
 /**
  * One signed service request.
@@ -17406,7 +18590,7 @@ export interface SupportBundle {
   /**
    * What this host can currently do, as the shared section 11 evidence.
    */
-  capabilities: CapabilityRecord[]
+  capabilities: CapabilityRecord2[]
   configuration: EffectiveConfiguration2
   /**
    * The content-bearing export, when the person explicitly selected one.

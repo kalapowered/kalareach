@@ -31,6 +31,9 @@
 //! | [`envelope`] | Request, mutation, response and notification envelopes |
 //! | [`receipt`] | Receipt states and the transition contract |
 //! | [`action`] | Observation evidence, the revocation barrier's report and the host time contract |
+//! | [`agent`] | The agent-state reads, the five agent mutations and the plugin action call |
+//! | [`broker`] | Broker grants, decoding trust, action tokens, launch profiles and the capability map |
+//! | [`gateway`] | The native proxy contract: declarative and rich method tables, pending arbitration and volatile-native mode |
 //! | [`relay`] | Relay leases, consumption receipts and relay instance registration |
 //! | [`error`] | Error codes, retry categories and the error object |
 //! | [`frame`] | Stream headers and the length-delimited frame codec |
@@ -100,10 +103,12 @@
 pub mod account;
 pub mod action;
 pub mod actor;
+pub mod agent;
 pub mod archive;
 pub mod attachment;
 pub mod attention;
 pub mod authority;
+pub mod broker;
 pub mod changeset;
 pub mod describe;
 pub mod desktop;
@@ -111,6 +116,7 @@ pub mod digest;
 pub mod envelope;
 pub mod error;
 pub mod frame;
+pub mod gateway;
 pub mod grant;
 pub mod hello;
 pub mod hostinfo;

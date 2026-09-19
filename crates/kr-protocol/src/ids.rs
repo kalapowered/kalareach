@@ -475,6 +475,22 @@ uuid_id!(
     SyncConflictId,
     "One retained conflict copy of a rejected synchronised write."
 );
+uuid_id!(
+    /// One component bound to one application instance inside the broker.
+    ///
+    /// A binding is what a grant, a decoding trust record and a capability evidence record all
+    /// hang from. It is not the package: reinstalling a package does not revive the grants of a
+    /// binding that has gone.
+    BrokerBindingId,
+    "One component bound to one application instance inside the broker."
+);
+uuid_id!(
+    /// One pending resource the broker arbitrates: an approval, a question or an upstream action.
+    ///
+    /// Exactly one resolution reaches the upstream for each of these, whatever reconnects.
+    PendingResourceId,
+    "One pending resource the broker arbitrates and resolves exactly once."
+);
 
 counter_id!(
     /// The session epoch. Fixed at 1 in version 1 of the protocol.
@@ -608,6 +624,30 @@ counter_id!(
     ClockEpoch,
     "The host clock epoch, advanced when wall-clock trust changes."
 );
+counter_id!(
+    /// One connection into the worker-owned gateway.
+    ///
+    /// Downstream JSON-RPC identifiers are namespaced by it, so two connections that both choose
+    /// the identifier `1` name two different pending resources.
+    GatewayConnectionId,
+    "One connection into the worker-owned gateway. Downstream request identifiers are namespaced by it."
+);
+counter_id!(
+    /// The generation of one immutable source frame stream.
+    ///
+    /// It advances whenever the bound upstream execution owner changes, so a decoder cannot offer
+    /// a resource from a frame an earlier execution produced.
+    SourceGeneration,
+    "The generation of one immutable source frame stream. It advances when the bound execution owner changes."
+);
+counter_id!(
+    /// The version of a connector's declarative or rich method table.
+    ///
+    /// Tables are pinned and qualified against the installed protocol version, so a table built
+    /// for one upstream version is never interpreted against another.
+    MethodTableVersion,
+    "The version of a connector's declarative or rich method table."
+);
 
 opaque_id!(
     /// Binds the operating-system user, boot identity and login-session generation.
@@ -697,6 +737,39 @@ opaque_id!(
     /// An opaque diagnostic identifier attached to an error.
     DiagnosticId,
     "An opaque diagnostic identifier. It carries no protocol meaning."
+);
+opaque_id!(
+    /// A package publisher identity, as its manifest states it.
+    ///
+    /// Decoding trust is recorded against it, so a person inspecting a pending approval can see
+    /// whose interpretation produced it.
+    PublisherId,
+    "A package publisher identity from its manifest. Decoding trust is recorded against it."
+);
+opaque_id!(
+    /// A single-use broker handle for one issued action token.
+    ///
+    /// The token's bindings are the authority; this names the record the broker consumes, so one
+    /// invocation cannot be spent twice.
+    ActionTokenId,
+    "A single-use broker handle for one issued action token."
+);
+opaque_id!(
+    /// An upstream JSON-RPC request identifier, exactly as the upstream wrote it.
+    ///
+    /// It is correlation data. An upstream identifier never becomes a KalaReach identifier.
+    UpstreamRequestId,
+    "An upstream JSON-RPC request identifier, exactly as the upstream wrote it. Correlation data, not authority."
+);
+opaque_id!(
+    /// An upstream method name, as a connector's table names it.
+    UpstreamMethod,
+    "An upstream method name, as a connector's declarative or rich table names it."
+);
+opaque_id!(
+    /// One resolved launch profile.
+    LaunchProfileId,
+    "One resolved launch profile: its executable, distribution, version, arguments, authentication state and mode."
 );
 
 impl SessionEpoch {
