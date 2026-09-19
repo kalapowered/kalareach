@@ -434,8 +434,13 @@ impl QuietHours {
 /// travels beside the subject, in [`ReviewState::current_version`] and
 /// [`ReviewAcknowledgeParams::version`], because a subject keeps one identity while its versions
 /// move: that is what lets a new change reopen review work an older version had closed.
+///
+/// The two are told apart by which variant is present rather than by a tag beside them. An
+/// internally tagged union buffers what it decodes before it knows the variant, and buffering is
+/// where a format's own representation of an identifier is lost: the canonical wire form encodes
+/// one as sixteen bytes, and a buffered decode would ask for a string and refuse it.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReviewSubject {
     /// One completed agent turn.
     CompletedTurn {
@@ -825,7 +830,7 @@ mod tests {
             change_set_id: ChangeSetId::new(crate::scalars::Uuid::from_bytes([7; 16])),
         };
         let json = serde_json::to_string(&subject).expect("a review subject encodes");
-        assert!(json.contains("\"kind\":\"change_set\""));
+        assert!(json.contains("\"change_set\""));
         let back: ReviewSubject = serde_json::from_str(&json).expect("a review subject decodes");
         assert_eq!(back, subject);
     }

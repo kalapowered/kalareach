@@ -1573,7 +1573,7 @@ fn a_stored_value_this_build_cannot_read_back_exactly_is_refused() {
     // host had not done, so the store refuses it.
     let connection = rusqlite::Connection::open(&path).expect("a second connection");
     connection
-        .execute("UPDATE review_subjects SET version = -3", [])
+        .execute("UPDATE attention_review_subjects SET version = -3", [])
         .expect("the row is written");
     drop(connection);
     assert!(

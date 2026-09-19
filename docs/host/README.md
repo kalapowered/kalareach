@@ -1210,6 +1210,109 @@ records real platform values for all three platforms and the classification each
 one machine checks every platform's classification while only its own reading comes from the
 kernel. A reading the host could not take reports `unavailable` rather than a synchronised clock
 with no stated error, because not knowing is its own state.
+## Attention, review and what changed since a visit
+
+The attention engine runs on the host, from typed events. It holds an inbox, a quiet-hours window,
+each actor's acknowledgements and the cursors it has consumed, and it reads no clock of its own:
+every decision that depends on time takes a reading of the host time contract from its caller.
+
+### The rule set
+
+Eight rules, each with a stable identifier that outlives any change to the wording it produces.
+
+| Rule | What raises it | Starts at | While it stands |
+| --- | --- | --- | --- |
+| `attention.pending_approval` | An agent is waiting for an approval decision | urgent | announced again every five minutes |
+| `attention.pending_input` | A verified source is waiting for an answer | notable | announced once |
+| `attention.input_idle_reminder` | A verified request has waited five minutes | urgent | announced again every five minutes |
+| `attention.command_failed` | A command exited nonzero | notable | announced once |
+| `attention.review_ready` | A turn finished and is waiting to be reviewed | notable | announced once |
+| `attention.adapter_failed` | An adapter failed | notable | urgent after five minutes, then every five |
+| `attention.host_contact_lost` | Contact with the host was lost | notable | urgent after a minute, then every five |
+| `attention.application_notice` | An `OSC 9`, `OSC 99` or `OSC 777` sequence | informational | announced once |
+
+The idle reminder counts from the moment the request became pending, not from the last output: a
+session printing continuously while a question waits still owes the reminder, and a silent session
+with nothing pending does not. A repeat of the same condition inside sixty seconds is counted on
+the item rather than announced again.
+
+An application notice is the one untrusted rule. Any process writing to the terminal can emit one,
+so the item says so and the rule cannot raise any other kind of item; nothing a notice says makes
+it a pending approval. With an attachment holding the input lease the notice goes there, which is
+the destination a terminal side effect has. With no lease holder there is nobody to send it to, so
+it goes through the owner's configured notification policy, and it is retained in Attention either
+way.
+
+### Quiet hours
+
+A quiet-hours window defers an announcement and releases it when the window ends. It never drops
+one, and it never takes an item out of the inbox: an urgent pending approval is in the inbox
+throughout, with its audible delivery held.
+
+The window is minutes of the UTC day, so the host needs no time-zone database to decide whether it
+is inside one. A client converts its own local window before it sets one and may record the zone it
+converted from, which the host stores and gives back and never interprets. A host that cannot prove
+what its wall clock reads is never inside a window: quiet hours are a time of day, and a
+suppression decided on an unprovable clock would withhold a notification at an hour nobody chose.
+
+Setting the window is host management rather than session view authority, because one window
+suppresses the owner's delivery rather than one actor's.
+
+### Review, and what it does not do
+
+A review acknowledgement records that one actor read one version of one subject: a completed turn,
+or a captured change set. It approves no command, applies no patch and changes no Git state.
+Section 14 makes promotion a separate authorised action, and the engine has no operation that
+performs one, so that holds by construction rather than by policy.
+
+An acknowledgement binds the version it was made against. When a later version arrives the subject
+is outstanding again, because a new change is new review work and an acknowledgement of an earlier
+version does not cover it. Acknowledging a subject the host holds no version of is refused, and so
+is a version beyond the one it holds.
+
+An acknowledgement affects only the actor that made it. It does not stop the host reminding
+anybody: the ladder and the repeats belong to the condition, and they end when the condition does.
+
+### Changed since a visit
+
+A visit records how far one actor has read, and never moves backwards. The view compares that
+cursor with the semantic events the host retains and answers with three separate things: the
+authoritative changes, the ranges that are missing, and a model summary when one covers the
+interval. The three never merge. A summary names the interval it was written from and cannot stand
+in for an event; a gap is not an absence of changes but a statement that the host cannot say what
+was there.
+
+A log view's source offset and its filter travel with the visit. They come back after a reconnect,
+each view keeps its own position when a client switches between two, and a view whose range
+retention has taken is served from the oldest byte that still exists with the range between stated
+as an explicit history gap.
+
+### The feature store, and what a gap means
+
+The state lives beside the receipts, in the session's own private journal, under its own table
+names and its own schema version. It is a projection of the journal's events, so it can be rebuilt
+from them: replaying a record the engine has already consumed changes nothing, which is what makes
+a rebuild safe to run twice.
+
+Every mutating call writes the new state before it publishes the decision. A write that fails
+leaves the engine where it was, so the same event can be offered again and produces the same
+answer.
+
+A jump in a source's sequence means the records between were evicted. The engine records the range,
+marks every unresolved item from that same source uncertain, and leaves it in the inbox. A gap is
+never an approval and never a completion: an approval whose answer may have been in the missing
+range stays pending and says the host cannot tell. A host that starts the engine partway through a
+session's life says where it is starting rather than leaving the first record to look like an
+eviction.
+
+A rebuild announces nothing. An event from an hour ago is history rather than a notification to
+send now, so the replay restores the items with the ages they had and the first timer pass after it
+decides what still needs saying.
+
+The inbox is a working set rather than a record: the receipts, the question ledger and the retained
+output are where the history lives. Past five hundred items the host lets go of its least urgent
+and oldest, and the read says how many it has let go of.
+
 ## Closure
 
 `session.close` is a state, not a request to exit.

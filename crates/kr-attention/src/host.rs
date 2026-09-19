@@ -78,6 +78,16 @@ impl Attention {
         Self::from_store(Store::open(path)?, reading)
     }
 
+    /// Opens the store inside the worker's private journal, or in memory when there is none.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::Error::StoreUnavailable`] when the store cannot be opened or read, and
+    /// [`crate::Error::StoreUnreadable`] when it holds a value this build cannot read back.
+    pub fn beside(path: Option<&Path>, reading: HostReading) -> Result<Self> {
+        Self::from_store(Store::beside(path)?, reading)
+    }
+
     /// Opens a store that lives only as long as this value.
     ///
     /// # Errors

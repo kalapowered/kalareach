@@ -4320,6 +4320,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "kr-attention",
  "kr-cbor",
  "kr-client",
  "kr-controller",

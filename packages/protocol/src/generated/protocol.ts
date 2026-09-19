@@ -985,29 +985,36 @@ export type RetrustEvidence =
  * travels beside the subject, in [`ReviewState::current_version`] and
  * [`ReviewAcknowledgeParams::version`], because a subject keeps one identity while its versions
  * move: that is what lets a new change reopen review work an older version had closed.
+ *
+ * The two are told apart by which variant is present rather than by a tag beside them. An
+ * internally tagged union buffers what it decodes before it knows the variant, and buffering is
+ * where a format's own representation of an identifier is lost: the canonical wire form encodes
+ * one as sixteen bytes, and a buffered decode would ask for a string and refuse it.
  */
 export type ReviewSubject =
   | {
-      kind: 'completed_turn'
-      /**
-       * One KalaReach terminal session.
-       */
-      session_id: string
-      /**
-       * The turn.
-       */
-      turn_id: string
+      completed_turn: {
+        /**
+         * One KalaReach terminal session.
+         */
+        session_id: string
+        /**
+         * The turn.
+         */
+        turn_id: string
+      }
     }
   | {
-      /**
-       * One immutable captured change set.
-       */
-      change_set_id: string
-      kind: 'change_set'
-      /**
-       * One KalaReach terminal session.
-       */
-      session_id: string
+      change_set: {
+        /**
+         * One immutable captured change set.
+         */
+        change_set_id: string
+        /**
+         * One KalaReach terminal session.
+         */
+        session_id: string
+      }
     }
 /**
  * One published editor fence. An identity from an unacknowledged exchange names no fence.
@@ -12031,26 +12038,28 @@ export interface ReviewAcknowledgeParams {
    */
   subject:
     | {
-        kind: 'completed_turn'
-        /**
-         * One KalaReach terminal session.
-         */
-        session_id: string
-        /**
-         * The turn.
-         */
-        turn_id: string
+        completed_turn: {
+          /**
+           * One KalaReach terminal session.
+           */
+          session_id: string
+          /**
+           * The turn.
+           */
+          turn_id: string
+        }
       }
     | {
-        /**
-         * One immutable captured change set.
-         */
-        change_set_id: string
-        kind: 'change_set'
-        /**
-         * One KalaReach terminal session.
-         */
-        session_id: string
+        change_set: {
+          /**
+           * One immutable captured change set.
+           */
+          change_set_id: string
+          /**
+           * One KalaReach terminal session.
+           */
+          session_id: string
+        }
       }
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
@@ -12103,26 +12112,28 @@ export interface ReviewState {
    */
   subject:
     | {
-        kind: 'completed_turn'
-        /**
-         * One KalaReach terminal session.
-         */
-        session_id: string
-        /**
-         * The turn.
-         */
-        turn_id: string
+        completed_turn: {
+          /**
+           * One KalaReach terminal session.
+           */
+          session_id: string
+          /**
+           * The turn.
+           */
+          turn_id: string
+        }
       }
     | {
-        /**
-         * One immutable captured change set.
-         */
-        change_set_id: string
-        kind: 'change_set'
-        /**
-         * One KalaReach terminal session.
-         */
-        session_id: string
+        change_set: {
+          /**
+           * One immutable captured change set.
+           */
+          change_set_id: string
+          /**
+           * One KalaReach terminal session.
+           */
+          session_id: string
+        }
       }
 }
 /**
@@ -12179,26 +12190,28 @@ export interface ReviewState1 {
    */
   subject:
     | {
-        kind: 'completed_turn'
-        /**
-         * One KalaReach terminal session.
-         */
-        session_id: string
-        /**
-         * The turn.
-         */
-        turn_id: string
+        completed_turn: {
+          /**
+           * One KalaReach terminal session.
+           */
+          session_id: string
+          /**
+           * The turn.
+           */
+          turn_id: string
+        }
       }
     | {
-        /**
-         * One immutable captured change set.
-         */
-        change_set_id: string
-        kind: 'change_set'
-        /**
-         * One KalaReach terminal session.
-         */
-        session_id: string
+        change_set: {
+          /**
+           * One immutable captured change set.
+           */
+          change_set_id: string
+          /**
+           * One KalaReach terminal session.
+           */
+          session_id: string
+        }
       }
 }
 /**

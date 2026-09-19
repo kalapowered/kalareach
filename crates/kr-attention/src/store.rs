@@ -61,6 +61,9 @@ use crate::visit::{Omitted, Visit};
 /// The schema this build writes and reads.
 pub const SCHEMA_VERSION: i64 = 1;
 
+/// How long a write waits for another holder of the same file before it is refused.
+pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Everything the feature store holds.
 #[derive(Clone, Debug, Default)]
 pub struct StoredState {
@@ -103,19 +106,19 @@ pub struct Store {
 }
 
 const SCHEMA: &str = "
-    CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
-    CREATE TABLE IF NOT EXISTS consumed (
+    CREATE TABLE IF NOT EXISTS attention_schema (version INTEGER NOT NULL);
+    CREATE TABLE IF NOT EXISTS attention_consumed (
         source TEXT PRIMARY KEY,
         sequence INTEGER NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS gaps (
+    CREATE TABLE IF NOT EXISTS attention_gaps (
         source TEXT NOT NULL,
         from_sequence INTEGER NOT NULL,
         to_sequence INTEGER NOT NULL,
         position INTEGER NOT NULL,
         PRIMARY KEY (source, from_sequence)
     );
-    CREATE TABLE IF NOT EXISTS items (
+    CREATE TABLE IF NOT EXISTS attention_items (
         key TEXT PRIMARY KEY,
         rule TEXT NOT NULL,
         source TEXT NOT NULL,
@@ -132,35 +135,35 @@ const SCHEMA: &str = "
         uncertain INTEGER NOT NULL,
         deferred INTEGER NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS actors (
+    CREATE TABLE IF NOT EXISTS attention_actors (
         actor TEXT PRIMARY KEY,
         revision INTEGER NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS dropped (
+    CREATE TABLE IF NOT EXISTS attention_dropped (
         id INTEGER PRIMARY KEY CHECK (id = 0),
         items INTEGER NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS item_acks (
+    CREATE TABLE IF NOT EXISTS attention_item_acks (
         actor TEXT NOT NULL,
         key TEXT NOT NULL,
         occurrences INTEGER NOT NULL,
         at_ms INTEGER NOT NULL,
         PRIMARY KEY (actor, key)
     );
-    CREATE TABLE IF NOT EXISTS pending_inputs (
+    CREATE TABLE IF NOT EXISTS attention_pending_inputs (
         question_id TEXT PRIMARY KEY,
         session_id TEXT NOT NULL,
         summary TEXT NOT NULL,
         pending_since_ms INTEGER NOT NULL,
         reminded INTEGER NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS quiet_hours (
+    CREATE TABLE IF NOT EXISTS attention_quiet_hours (
         id INTEGER PRIMARY KEY CHECK (id = 0),
         start_minute INTEGER NOT NULL,
         end_minute INTEGER NOT NULL,
         zone TEXT
     );
-    CREATE TABLE IF NOT EXISTS review_subjects (
+    CREATE TABLE IF NOT EXISTS attention_review_subjects (
         key TEXT PRIMARY KEY,
         kind TEXT NOT NULL,
         session_id TEXT NOT NULL,
@@ -168,25 +171,25 @@ const SCHEMA: &str = "
         version INTEGER NOT NULL,
         at_ms INTEGER NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS review_acks (
+    CREATE TABLE IF NOT EXISTS attention_review_acks (
         actor TEXT NOT NULL,
         subject TEXT NOT NULL,
         version INTEGER NOT NULL,
         at_ms INTEGER NOT NULL,
         PRIMARY KEY (actor, subject)
     );
-    CREATE TABLE IF NOT EXISTS changes (
+    CREATE TABLE IF NOT EXISTS attention_changes (
         cursor INTEGER PRIMARY KEY,
         kind TEXT NOT NULL,
         session_id TEXT NOT NULL,
         summary TEXT NOT NULL,
         at_ms INTEGER NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS change_head (
+    CREATE TABLE IF NOT EXISTS attention_change_head (
         id INTEGER PRIMARY KEY CHECK (id = 0),
         next_cursor INTEGER NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS omitted (
+    CREATE TABLE IF NOT EXISTS attention_omitted (
         at_cursor INTEGER NOT NULL,
         source TEXT NOT NULL,
         from_sequence INTEGER NOT NULL,
@@ -194,7 +197,7 @@ const SCHEMA: &str = "
         position INTEGER NOT NULL,
         PRIMARY KEY (at_cursor, source, from_sequence)
     );
-    CREATE TABLE IF NOT EXISTS summaries (
+    CREATE TABLE IF NOT EXISTS attention_summaries (
         from_cursor INTEGER PRIMARY KEY,
         to_cursor INTEGER NOT NULL,
         from_ms INTEGER NOT NULL,
@@ -202,12 +205,12 @@ const SCHEMA: &str = "
         model TEXT NOT NULL,
         text TEXT NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS visits (
+    CREATE TABLE IF NOT EXISTS attention_visits (
         actor TEXT PRIMARY KEY,
         cursor INTEGER NOT NULL,
         revision INTEGER NOT NULL
     );
-    CREATE TABLE IF NOT EXISTS log_views (
+    CREATE TABLE IF NOT EXISTS attention_log_views (
         actor TEXT NOT NULL,
         view_id TEXT NOT NULL,
         source_offset INTEGER NOT NULL,
@@ -219,22 +222,22 @@ const SCHEMA: &str = "
 
 /// Every table the state lives in, which one write replaces together.
 const TABLES: &[&str] = &[
-    "consumed",
-    "gaps",
-    "items",
-    "actors",
-    "dropped",
-    "item_acks",
-    "pending_inputs",
-    "quiet_hours",
-    "review_subjects",
-    "review_acks",
-    "changes",
-    "change_head",
-    "omitted",
-    "summaries",
-    "visits",
-    "log_views",
+    "attention_consumed",
+    "attention_gaps",
+    "attention_items",
+    "attention_actors",
+    "attention_dropped",
+    "attention_item_acks",
+    "attention_pending_inputs",
+    "attention_quiet_hours",
+    "attention_review_subjects",
+    "attention_review_acks",
+    "attention_changes",
+    "attention_change_head",
+    "attention_omitted",
+    "attention_summaries",
+    "attention_visits",
+    "attention_log_views",
 ];
 
 fn unreadable(field: &'static str) -> Error {
@@ -272,6 +275,23 @@ impl Store {
         Self::prepare(connection)
     }
 
+    /// Opens the store inside the worker's private journal, or in memory when there is none.
+    ///
+    /// The journal opened the file first and owns its own schema version; these tables sit beside
+    /// it under their own names and their own version row, so neither migration reads the other's.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::StoreUnavailable`] when the file cannot be opened or the schema cannot be
+    /// created, and [`Error::StoreUnreadable`] when the file records a schema this build does not
+    /// know.
+    pub fn beside(path: Option<&Path>) -> Result<Self> {
+        match path {
+            Some(path) => Self::open(path),
+            None => Self::in_memory(),
+        }
+    }
+
     /// Opens a store that lives only as long as it is held.
     ///
     /// # Errors
@@ -283,6 +303,10 @@ impl Store {
     }
 
     fn prepare(connection: Connection) -> Result<Self> {
+        // The store shares its file with the receipt journal and the question ledger, so a write
+        // can find another of them holding it. The wait is bounded: past it the caller is told the
+        // store is unavailable rather than left blocked.
+        connection.busy_timeout(BUSY_TIMEOUT)?;
         connection.execute_batch(
             "PRAGMA journal_mode=WAL;
              PRAGMA synchronous=FULL;
@@ -291,10 +315,10 @@ impl Store {
         // The recorded version is read before anything is created, because a table that is already
         // there is left alone and would tell this build nothing about which build wrote it.
         connection.execute_batch(
-            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);",
+            "CREATE TABLE IF NOT EXISTS attention_schema (version INTEGER NOT NULL);",
         )?;
         let recorded: Option<i64> = connection
-            .query_row("SELECT version FROM schema_version LIMIT 1", [], |row| {
+            .query_row("SELECT version FROM attention_schema LIMIT 1", [], |row| {
                 row.get(0)
             })
             .optional()?;
@@ -303,7 +327,7 @@ impl Store {
             Some(_) => return Err(unreadable("schema version")),
             None => {
                 connection.execute(
-                    "INSERT INTO schema_version (version) VALUES (?1)",
+                    "INSERT INTO attention_schema (version) VALUES (?1)",
                     params![SCHEMA_VERSION],
                 )?;
             }
@@ -323,7 +347,7 @@ impl Store {
         let head: Option<i64> = self
             .connection
             .query_row(
-                "SELECT next_cursor FROM change_head WHERE id = 0",
+                "SELECT next_cursor FROM attention_change_head WHERE id = 0",
                 [],
                 |row| row.get(0),
             )
@@ -336,9 +360,11 @@ impl Store {
         };
         let dropped: Option<i64> = self
             .connection
-            .query_row("SELECT items FROM dropped WHERE id = 0", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT items FROM attention_dropped WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
             .optional()?;
         Ok(StoredState {
             items: self.load_items()?,
@@ -376,13 +402,13 @@ impl Store {
         }
         for (source, sequence) in &state.consumed {
             transaction.execute(
-                "INSERT INTO consumed (source, sequence) VALUES (?1, ?2)",
+                "INSERT INTO attention_consumed (source, sequence) VALUES (?1, ?2)",
                 params![source.as_str(), as_i64(*sequence, "consumed cursor")?],
             )?;
         }
         for (position, gap) in state.gaps.iter().enumerate() {
             transaction.execute(
-                "INSERT OR REPLACE INTO gaps (source, from_sequence, to_sequence, position)
+                "INSERT OR REPLACE INTO attention_gaps (source, from_sequence, to_sequence, position)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
                     gap.source.as_str(),
@@ -394,7 +420,7 @@ impl Store {
         }
         for item in &state.items {
             transaction.execute(
-                "INSERT INTO items (
+                "INSERT INTO attention_items (
                      key, rule, source, session_id, summary, routing, level, steps_taken,
                      occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
                      uncertain, deferred
@@ -422,18 +448,18 @@ impl Store {
         }
         for (actor, revision) in &state.revisions {
             transaction.execute(
-                "INSERT INTO actors (actor, revision) VALUES (?1, ?2)",
+                "INSERT INTO attention_actors (actor, revision) VALUES (?1, ?2)",
                 params![actor.as_str(), as_i64(*revision, "actor revision")?],
             )?;
         }
         transaction.execute(
-            "INSERT INTO dropped (id, items) VALUES (0, ?1)",
+            "INSERT INTO attention_dropped (id, items) VALUES (0, ?1)",
             params![as_i64(state.dropped, "dropped count")?],
         )?;
         for (actor, acks) in &state.item_acks {
             for (key, ack) in acks {
                 transaction.execute(
-                    "INSERT INTO item_acks (actor, key, occurrences, at_ms)
+                    "INSERT INTO attention_item_acks (actor, key, occurrences, at_ms)
                      VALUES (?1, ?2, ?3, ?4)",
                     params![
                         actor.as_str(),
@@ -446,7 +472,7 @@ impl Store {
         }
         for (question_id, pending) in &state.pending_inputs {
             transaction.execute(
-                "INSERT INTO pending_inputs (
+                "INSERT INTO attention_pending_inputs (
                      question_id, session_id, summary, pending_since_ms, reminded
                  ) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
@@ -460,7 +486,7 @@ impl Store {
         }
         if let Some(quiet) = state.quiet.as_ref() {
             transaction.execute(
-                "INSERT INTO quiet_hours (id, start_minute, end_minute, zone)
+                "INSERT INTO attention_quiet_hours (id, start_minute, end_minute, zone)
                  VALUES (0, ?1, ?2, ?3)",
                 params![
                     as_i64(quiet.start_minute.get(), "quiet start")?,
@@ -477,7 +503,7 @@ impl Store {
                 }
             };
             transaction.execute(
-                "INSERT INTO review_subjects (key, kind, session_id, object, version, at_ms)
+                "INSERT INTO attention_review_subjects (key, kind, session_id, object, version, at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     key,
@@ -492,7 +518,7 @@ impl Store {
         for (actor, acks) in &state.review_acks {
             for (subject, ack) in acks {
                 transaction.execute(
-                    "INSERT INTO review_acks (actor, subject, version, at_ms)
+                    "INSERT INTO attention_review_acks (actor, subject, version, at_ms)
                      VALUES (?1, ?2, ?3, ?4)",
                     params![
                         actor.as_str(),
@@ -505,7 +531,7 @@ impl Store {
         }
         for change in &state.changes {
             transaction.execute(
-                "INSERT INTO changes (cursor, kind, session_id, summary, at_ms)
+                "INSERT INTO attention_changes (cursor, kind, session_id, summary, at_ms)
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
                     as_i64(change.cursor.get(), "change cursor")?,
@@ -517,12 +543,12 @@ impl Store {
             )?;
         }
         transaction.execute(
-            "INSERT INTO change_head (id, next_cursor) VALUES (0, ?1)",
+            "INSERT INTO attention_change_head (id, next_cursor) VALUES (0, ?1)",
             params![as_i64(state.next_cursor, "change head")?],
         )?;
         for (position, omitted) in state.omitted.iter().enumerate() {
             transaction.execute(
-                "INSERT OR REPLACE INTO omitted (
+                "INSERT OR REPLACE INTO attention_omitted (
                      at_cursor, source, from_sequence, to_sequence, position
                  ) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
@@ -536,7 +562,7 @@ impl Store {
         }
         for summary in &state.summaries {
             transaction.execute(
-                "INSERT INTO summaries (from_cursor, to_cursor, from_ms, to_ms, model, text)
+                "INSERT INTO attention_summaries (from_cursor, to_cursor, from_ms, to_ms, model, text)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     as_i64(summary.from_cursor.get(), "summary start")?,
@@ -550,7 +576,7 @@ impl Store {
         }
         for (actor, visit) in &state.visits {
             transaction.execute(
-                "INSERT INTO visits (actor, cursor, revision) VALUES (?1, ?2, ?3)",
+                "INSERT INTO attention_visits (actor, cursor, revision) VALUES (?1, ?2, ?3)",
                 params![
                     actor.as_str(),
                     as_i64(visit.cursor, "visit cursor")?,
@@ -559,7 +585,7 @@ impl Store {
             )?;
             for (position, view) in visit.views.iter().enumerate() {
                 transaction.execute(
-                    "INSERT OR REPLACE INTO log_views (
+                    "INSERT OR REPLACE INTO attention_log_views (
                          actor, view_id, source_offset, filter, position
                      ) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
@@ -581,7 +607,7 @@ impl Store {
             "SELECT key, rule, source, session_id, summary, routing, level, steps_taken,
                     occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
                     uncertain, deferred
-             FROM items ORDER BY first_seen_ms, key",
+             FROM attention_items ORDER BY first_seen_ms, key",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -644,7 +670,7 @@ impl Store {
     fn load_item_acks(&self) -> Result<BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>>> {
         let mut statement = self
             .connection
-            .prepare("SELECT actor, key, occurrences, at_ms FROM item_acks")?;
+            .prepare("SELECT actor, key, occurrences, at_ms FROM attention_item_acks")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -672,7 +698,7 @@ impl Store {
     fn load_revisions(&self) -> Result<BTreeMap<ActorId, u64>> {
         let mut statement = self
             .connection
-            .prepare("SELECT actor, revision FROM actors")?;
+            .prepare("SELECT actor, revision FROM attention_actors")?;
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -690,7 +716,7 @@ impl Store {
     fn load_consumed(&self) -> Result<BTreeMap<AttentionSource, u64>> {
         let mut statement = self
             .connection
-            .prepare("SELECT source, sequence FROM consumed")?;
+            .prepare("SELECT source, sequence FROM attention_consumed")?;
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -705,7 +731,7 @@ impl Store {
 
     fn load_gaps(&self) -> Result<Vec<AttentionGap>> {
         let mut statement = self.connection.prepare(
-            "SELECT source, from_sequence, to_sequence FROM gaps ORDER BY position, from_sequence",
+            "SELECT source, from_sequence, to_sequence FROM attention_gaps ORDER BY position, from_sequence",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -729,7 +755,7 @@ impl Store {
     fn load_pending(&self) -> Result<BTreeMap<QuestionId, PendingInput>> {
         let mut statement = self.connection.prepare(
             "SELECT question_id, session_id, summary, pending_since_ms, reminded
-             FROM pending_inputs",
+             FROM attention_pending_inputs",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -763,7 +789,7 @@ impl Store {
         let row: Option<(i64, i64, Option<String>)> = self
             .connection
             .query_row(
-                "SELECT start_minute, end_minute, zone FROM quiet_hours WHERE id = 0",
+                "SELECT start_minute, end_minute, zone FROM attention_quiet_hours WHERE id = 0",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
@@ -779,9 +805,9 @@ impl Store {
     }
 
     fn load_subjects(&self) -> Result<BTreeMap<String, Subject>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT key, kind, session_id, object, version, at_ms FROM review_subjects")?;
+        let mut statement = self.connection.prepare(
+            "SELECT key, kind, session_id, object, version, at_ms FROM attention_review_subjects",
+        )?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -829,7 +855,7 @@ impl Store {
     fn load_review_acks(&self) -> Result<BTreeMap<ActorId, BTreeMap<String, ReviewAck>>> {
         let mut statement = self
             .connection
-            .prepare("SELECT actor, subject, version, at_ms FROM review_acks")?;
+            .prepare("SELECT actor, subject, version, at_ms FROM attention_review_acks")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -856,7 +882,7 @@ impl Store {
 
     fn load_changes(&self) -> Result<VecDeque<SemanticChange>> {
         let mut statement = self.connection.prepare(
-            "SELECT cursor, kind, session_id, summary, at_ms FROM changes ORDER BY cursor",
+            "SELECT cursor, kind, session_id, summary, at_ms FROM attention_changes ORDER BY cursor",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -884,7 +910,7 @@ impl Store {
 
     fn load_omitted(&self) -> Result<Vec<Omitted>> {
         let mut statement = self.connection.prepare(
-            "SELECT at_cursor, source, from_sequence, to_sequence FROM omitted
+            "SELECT at_cursor, source, from_sequence, to_sequence FROM attention_omitted
              ORDER BY position, at_cursor, from_sequence",
         )?;
         let rows = statement.query_map([], |row| {
@@ -914,7 +940,7 @@ impl Store {
     fn load_summaries(&self) -> Result<Vec<ChangeSummary>> {
         let mut statement = self.connection.prepare(
             "SELECT from_cursor, to_cursor, from_ms, to_ms, model, text
-             FROM summaries ORDER BY from_cursor",
+             FROM attention_summaries ORDER BY from_cursor",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -944,7 +970,7 @@ impl Store {
     fn load_visits(&self) -> Result<BTreeMap<ActorId, Visit>> {
         let mut statement = self
             .connection
-            .prepare("SELECT actor, cursor, revision FROM visits")?;
+            .prepare("SELECT actor, cursor, revision FROM attention_visits")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -965,7 +991,7 @@ impl Store {
             );
         }
         let mut statement = self.connection.prepare(
-            "SELECT actor, view_id, source_offset, filter FROM log_views ORDER BY position",
+            "SELECT actor, view_id, source_offset, filter FROM attention_log_views ORDER BY position",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((

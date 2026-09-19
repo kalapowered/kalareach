@@ -183,6 +183,8 @@ pub struct WorkerService {
     remote_attachments: Mutex<std::collections::BTreeSet<AttachmentId>>,
     /// The session's questions, and the sources bound to them.
     questions: Arc<crate::questions::Questions>,
+    /// Section 25's attention engine, its feature store and the review state beside it.
+    attention: Arc<crate::attention::Attention>,
     build_id: kr_protocol::ids::BuildId,
 }
 
@@ -225,6 +227,12 @@ impl WorkerService {
     pub fn questions(&self) -> &Arc<crate::questions::Questions> {
         &self.questions
     }
+
+    /// Returns this session's attention engine.
+    #[must_use]
+    pub fn attention(&self) -> &Arc<crate::attention::Attention> {
+        &self.attention
+    }
 }
 
 impl std::fmt::Debug for WorkerService {
@@ -258,6 +266,13 @@ impl WorkerService {
             session_id,
             session_epoch,
         )?);
+        // The engine's feature store lives beside the receipts, in the same private journal, and
+        // takes its readings from the session's own time contract rather than from a clock of its
+        // own.
+        let attention = Arc::new(crate::attention::Attention::open(
+            binding.journal_path.as_deref(),
+            runtime.session().time(),
+        )?);
         let clock = Arc::new(SystemContinuousClock::new());
         // The session's own, not a second one: the check this service makes before a batch is
         // accepted and the fence the writer applies before it is written have to be reading the
@@ -267,6 +282,7 @@ impl WorkerService {
             runtime,
             identity,
             endpoint,
+            attention,
             environment_id: binding.environment_id,
             boot_identity: binding.boot_identity,
             boot_epoch,
@@ -1769,6 +1785,9 @@ impl WorkerService {
             Method::InputWrite => self.input_write(state, &request.params, caller),
             Method::QuestionReadOwn => self.question_read_own(state, &request.params),
             Method::QuestionRead => self.question_read(&request.params),
+            Method::AttentionRead => self.attention_read(&caller.actor_id, &request.params),
+            Method::ReviewRead => self.review_read(&caller.actor_id, &request.params),
+            Method::VisitChanged => self.visit_changed(&caller.actor_id, &request.params),
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a read this worker serves",
                 method.as_str()
@@ -1784,6 +1803,42 @@ impl WorkerService {
             return failure(request.request_id, &error.to_protocol_error());
         }
         respond(request.request_id, outcome)
+    }
+
+    /// Serves `attention.read`: this actor's inbox, with the quiet-hours state beside it.
+    fn attention_read(&self, actor: &ActorId, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::attention::AttentionReadParams = parse(params)?;
+        let time = {
+            let session = self.runtime.session();
+            Self::check_session(&session, params.session_id)?;
+            Arc::clone(session.time())
+        };
+        encode(&self.attention.read(actor, &params, &time)?)
+    }
+
+    /// Serves `review.read`: this actor's review state, bound to the versions the host holds.
+    fn review_read(&self, actor: &ActorId, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::attention::ReviewReadParams = parse(params)?;
+        {
+            let session = self.runtime.session();
+            Self::check_session(&session, params.session_id)?;
+        }
+        encode(&self.attention.review_read(actor, &params)?)
+    }
+
+    /// Serves `visit.changed`: what changed since this actor's last visit.
+    ///
+    /// The oldest output the session can still replay travels with it, because that is what
+    /// decides whether a retained log view can be served from where it was left or has to be told
+    /// about the range retention took.
+    fn visit_changed(&self, actor: &ActorId, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::attention::VisitChangedParams = parse(params)?;
+        let oldest = {
+            let session = self.runtime.session();
+            Self::check_session(&session, params.session_id)?;
+            session.snapshot().oldest_retained_cursor.get()
+        };
+        encode(&self.attention.changed(actor, &params, oldest)?)
     }
 
     /// Runs one mutation through the receipt contract.
@@ -2856,6 +2911,29 @@ impl WorkerService {
                 let _: kr_protocol::receipt::ActionCancelParams = parse(&mutation.params)?;
                 Ok(())
             }
+            // The review and attention group. Each names this session and nothing else: what may
+            // be acknowledged, and at which version, is the engine's own answer, and it is given
+            // inside the effect where the state it is read against cannot move underneath it.
+            Method::AttentionAcknowledge => {
+                let params: kr_protocol::attention::AttentionAcknowledgeParams =
+                    parse(&mutation.params)?;
+                Self::check_session(session, params.session_id)
+            }
+            Method::AttentionQuietHours => {
+                let params: kr_protocol::attention::AttentionQuietHoursParams =
+                    parse(&mutation.params)?;
+                Self::check_session(session, params.session_id)
+            }
+            Method::ReviewAcknowledge => {
+                let params: kr_protocol::attention::ReviewAcknowledgeParams =
+                    parse(&mutation.params)?;
+                Self::check_session(session, params.session_id)
+            }
+            Method::VisitAcknowledge => {
+                let params: kr_protocol::attention::VisitAcknowledgeParams =
+                    parse(&mutation.params)?;
+                Self::check_session(session, params.session_id)
+            }
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a mutation this worker serves",
                 method.as_str()
@@ -3665,6 +3743,36 @@ impl WorkerService {
                     encode(&kr_protocol::receipt::ActionCancelResult { receipt })?,
                     AfterEffect::None,
                 ))
+            }
+            // Each of these moves a row in this session's feature store and nothing else. None of
+            // them approves a command, applies a patch or changes any Git state: section 14 makes
+            // promotion a separate authorised action, and the engine has no operation that
+            // performs one.
+            Method::AttentionAcknowledge => {
+                let params: kr_protocol::attention::AttentionAcknowledgeParams = parse(params)?;
+                let result =
+                    self.attention
+                        .acknowledge(&caller.actor_id, &params, session.time())?;
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            Method::AttentionQuietHours => {
+                let params: kr_protocol::attention::AttentionQuietHoursParams = parse(params)?;
+                let result = self.attention.set_quiet_hours(&params, session.time())?;
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            Method::ReviewAcknowledge => {
+                let params: kr_protocol::attention::ReviewAcknowledgeParams = parse(params)?;
+                let result =
+                    self.attention
+                        .acknowledge_review(&caller.actor_id, &params, session.time())?;
+                Ok((encode(&result)?, AfterEffect::None))
+            }
+            Method::VisitAcknowledge => {
+                let params: kr_protocol::attention::VisitAcknowledgeParams = parse(params)?;
+                let result = self
+                    .attention
+                    .acknowledge_visit(&caller.actor_id, &params)?;
+                Ok((encode(&result)?, AfterEffect::None))
             }
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a mutation this worker serves",

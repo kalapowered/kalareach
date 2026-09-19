@@ -16354,29 +16354,33 @@
       "type": "object"
     },
     "ReviewSubject": {
-      "description": "What a review acknowledgement is attached to.\n\nA subject names what is being reviewed and nothing about which version of it. The version\ntravels beside the subject, in [`ReviewState::current_version`] and\n[`ReviewAcknowledgeParams::version`], because a subject keeps one identity while its versions\nmove: that is what lets a new change reopen review work an older version had closed.",
+      "description": "What a review acknowledgement is attached to.\n\nA subject names what is being reviewed and nothing about which version of it. The version\ntravels beside the subject, in [`ReviewState::current_version`] and\n[`ReviewAcknowledgeParams::version`], because a subject keeps one identity while its versions\nmove: that is what lets a new change reopen review work an older version had closed.\n\nThe two are told apart by which variant is present rather than by a tag beside them. An\ninternally tagged union buffers what it decodes before it knows the variant, and buffering is\nwhere a format's own representation of an identifier is lost: the canonical wire form encodes\none as sixteen bytes, and a buffered decode would ask for a string and refuse it.",
       "oneOf": [
         {
           "additionalProperties": false,
           "description": "One completed agent turn.",
           "properties": {
-            "kind": {
-              "const": "completed_turn",
-              "type": "string"
-            },
-            "session_id": {
-              "$ref": "#/$defs/SessionId",
-              "description": "The session the turn belongs to."
-            },
-            "turn_id": {
-              "$ref": "#/$defs/AgentTurnId",
-              "description": "The turn."
+            "completed_turn": {
+              "additionalProperties": false,
+              "properties": {
+                "session_id": {
+                  "$ref": "#/$defs/SessionId",
+                  "description": "The session the turn belongs to."
+                },
+                "turn_id": {
+                  "$ref": "#/$defs/AgentTurnId",
+                  "description": "The turn."
+                }
+              },
+              "required": [
+                "session_id",
+                "turn_id"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "kind",
-            "session_id",
-            "turn_id"
+            "completed_turn"
           ],
           "type": "object"
         },
@@ -16384,23 +16388,27 @@
           "additionalProperties": false,
           "description": "One captured change set.",
           "properties": {
-            "change_set_id": {
-              "$ref": "#/$defs/ChangeSetId",
-              "description": "The change set."
-            },
-            "kind": {
-              "const": "change_set",
-              "type": "string"
-            },
-            "session_id": {
-              "$ref": "#/$defs/SessionId",
-              "description": "The session the change set was captured in."
+            "change_set": {
+              "additionalProperties": false,
+              "properties": {
+                "change_set_id": {
+                  "$ref": "#/$defs/ChangeSetId",
+                  "description": "The change set."
+                },
+                "session_id": {
+                  "$ref": "#/$defs/SessionId",
+                  "description": "The session the change set was captured in."
+                }
+              },
+              "required": [
+                "session_id",
+                "change_set_id"
+              ],
+              "type": "object"
             }
           },
           "required": [
-            "kind",
-            "session_id",
-            "change_set_id"
+            "change_set"
           ],
           "type": "object"
         }
