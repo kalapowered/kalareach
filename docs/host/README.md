@@ -45,6 +45,21 @@ chunks) and `w<display>.sock` (one worker). On Windows they are named pipes scop
 environment, carrying an owner-only access-control list, because the pipe namespace has no directory
 permissions to inherit.
 
+A session's output spool is created the same way rather than inheriting the process umask, because
+it holds the terminal's own output: mode 0700 on Unix, and on Windows the owner-only access list of
+the state directory above it.
+
+**Keys are OS-protected where the operating system offers protection, and the limit is
+documented.** On macOS the device keys live in the login keychain, and on Windows in the
+credential manager. On Linux the Secret Service is available only where a session keyring is, which
+a headless host usually has not got: there the keys fall back to a file under the owner-only state
+root, protected by the directory's own permissions and by nothing else. That is the documented
+headless Linux limitation, and it is a limitation rather than a defect of this host: a key file an
+account can read is a key its own account can read, and no file permission makes it otherwise.
+A host that must do better needs a hardware-backed store, which is a separate decision from this
+one.
+
+
 ## Descriptors
 
 The control daemon publishes one descriptor per live session, atomically — written to a temporary
@@ -911,6 +926,11 @@ Each worker has its own SQLite journal in write-ahead-logging mode with full syn
 | `results` | the result a duplicate request must receive back |
 | `observations` | additive evidence about an action: its provenance, the subject and version it saw, the source cursor and what it claims |
 | `closure` | the session's final record |
+| `session` | the session's own summary, so a reader with no worker can still say what the session was |
+| `host_events` | an application notice that had no attachment to go to, and where in the output stream it happened |
+| `outbox` | the event each state transition committed with: its immutable identifier, the stream, the subsystem, the actor and action, the subject revision and the content class |
+| `outbox_cursors` | one row per consumer: how far it has taken the outbox and how much it has taken |
+| `journal_gaps` | one row per interval durable writing was unavailable, so no reader reads continuity across it |
 
 The order is the contract. The intent is committed before the caller is told it was accepted. The
 dispatch marker is committed before the effect.
@@ -961,6 +981,187 @@ single-session host and the per-host bound is the stricter of the two once a hos
 
 Raw input is not in these tables. Section 9 makes it a separate ordered stream keyed by connection,
 lease epoch and sequence, with nothing replayed on reconnection.
+
+### What each store promises
+
+`kr_worker::persistence::stores::STORES` is that table as data. Each entry says how much of a
+crash its store survives, what it keeps and for how long, what class of content it holds, what
+protects it where it lies, who removes what it no longer needs, how it is brought back into
+agreement after a restart, whether a history byte cap may evict it and whether the archive serves
+it afterwards. It is data rather than prose because the rules that matter are checkable: a test
+walks the journal's own tables and refuses one with no declaration, and another refuses a
+declaration that would let a byte cap reach authority or dispatch data.
+
+The rule that does the most work is that last one. **Authority, dispatch and causal-budget data
+cannot be evicted under a history byte cap.** A host under output pressure that dropped a dispatch
+marker to make room would forget that an action had been sent, and the next retry would send it
+again. Only the retained output and the host events an attachment never saw are evictable that way.
+
+### What waits for a flush, and what never does
+
+Three commit points wait: the intent before the acknowledgement, the dispatch marker before the
+effect, and the outcome with its receipt revision, its event and its outbox record. Nothing else
+does. Section 24 forbids a per-keystroke, per-output-byte or ordinary prompt and command telemetry
+event from waiting for an fsync, and this host goes further with the first two: a keystroke and an
+output byte write no durable row at all. The live parser is in worker memory and the retained
+output is a bounded indexed spool.
+
+Grouping is the transaction. A receipt transition writes three rows - the receipt, its event and
+its outbox record - in one transaction, so three rows share one flush and either all three are
+durable or none of them is. That is what section 24 permits by "safe grouped commits may share a
+flush", and the invariant that makes it safe is that a commit point is never grouped with work
+nobody is waiting on.
+
+### The outbox, and what reads it
+
+Every state transition commits a small event record in the same transaction. Consumers read the
+outbox from a cursor of their own, and delivery is at-least-once: a consumer that takes a page and
+dies before recording its cursor takes the same page again. The event carries an immutable
+identifier so the consumer can apply it once.
+
+The cursor orders this journal's own events and nothing else. There is no global cross-database
+order here and nothing invents one: an event from the transfer journal and an event from this one
+are not comparable.
+
+Collection is by delivery rather than by whose receipt an event belongs to. An event goes when it
+is past the retention period *and* below every registered consumer's cursor, so a receipt written
+thirty days ago whose outcome event was written this minute does not take that event with it. A
+consumer that has never registered a cursor has no claim; one that intends to rely on this
+registers before it starts.
+
+### When the journal stops answering
+
+A worker whose journal stops answering is not a worker that stops. The condition it publishes is
+`kr_worker::persistence::fault::JournalHealth`, and what reads it decides:
+
+| Condition | What proceeds |
+| --- | --- |
+| healthy | everything |
+| faulted | an authorised stop, raw terminal input and interruption under the live lease, and every read |
+
+Everything else is refused before dispatch, which keeps the refusal a rejection rather than an
+uncertain outcome: nothing was sent, so the caller is told no rather than told nothing. The two
+exceptions are section 7's, which keeps an authorised stop available with `durability=volatile`,
+and section 11's, which keeps the native terminal usable. Neither authorises a hidden rich retry.
+
+A fault is classified from the store's own result code rather than from its message: a full store,
+a store whose pages are corrupt, a store that is absent, and a write that failed for some other
+reason. A full store is told apart from a broken one because a person can act on it.
+
+**Recovery writes the gap down before it clears the condition.** The interval durability was
+unavailable becomes a `journal_gaps` row, and only then does the journal call itself healthy; a
+recovery whose gap could not be written is not a recovery, because the record would read as
+continuous over an interval this host knows it did not write. A store whose *content* could not be
+read stays faulted until the store itself says its pages are sound.
+
+### Migrations
+
+Migrations are forward-only, transactional and keyed by a schema version.
+`kr_worker::persistence::migration::LADDER` is the list of steps, each one transaction, each
+moving one version. A store a newer build wrote is refused rather than read, because reading it
+would mean guessing what a column this build does not know about means. A store older than the
+ladder starts from is refused too, and named: it needs an explicit versioned import rather than
+being restored in part. Code reads one current schema after migration, and there is no branch
+anywhere that reads two.
+
+## Retained output, and what eviction leaves behind
+
+Section 20 gives retained session output three bounds, and all three hold at once: seven days, a
+1 GiB host-wide cap and a 128 MiB per-session cap. They are simultaneous upper bounds rather than
+reserved capacity, so a session well inside its own 128 MiB is still evicted when the host is over
+1 GiB. "The first applicable limit" names which bound is doing the work, which is what a person
+looking at a gap is told; it does not mean checking one instead of the others.
+
+The session cap is the spool's own capacity, so the append path keeps it continuously. The host
+bound is applied on the worker's maintenance tick, from a reading of the environment's whole spool
+directory; what that leaves is stated in this task's handoff rather than hidden.
+
+Eviction is never quiet. Every pass records the cursor range it took and the bound that took it,
+and a reader asking for a cursor inside that range is told both: `history.page` returns the range
+as a gap with a cause. A spool that has evicted everything writes down where its output got to
+before it deletes what supports that, so a session reopened over an empty directory continues its
+cursor and reports the range that went rather than starting again at nought.
+
+Removing output because it is old is expiry-based collection, so section 9's rule applies: a host
+that cannot prove its wall clock does not do it. The caps still apply, because they are about
+bytes rather than about time. The seven-day line is approached from the safe side: a spool segment
+goes only when its newest byte is past the deadline, and the resident window advances only to a
+mark whose own instant is past it, so what is kept past the deadline is bounded by the segment
+rotation interval and the resident mark interval rather than removed early.
+
+Receipts are not part of any of this. Section 20 gives them a separately budgeted store and 30
+days, so history pressure cannot delete a live dispatch barrier or a de-duplication record.
+
+## The archive service
+
+A closed or crashed session's history, final receipts and retained resource references belong to
+the environment archive service, which is a controller module and not a surviving worker.
+
+**Ownership is taken, and only after the worker is gone.** The archive fences the worker's
+published endpoint and descriptor first, so nothing new reaches a worker that may be part way
+through ending, and then asks the kernel whether the recorded process is the process that was
+recorded - both the identifier and the start value, because the kernel reuses identifiers. Only a
+confirmed ending is death. A query the platform declines is not death, and the archive waits
+rather than taking a journal a live worker may still be writing.
+
+**A reader cannot create a worker.** Every read the archive serves is a read of what is already on
+disk. A history request never starts an execution, and a retried create is answered from the
+reservation the first one made.
+
+**A lost or corrupt journal produces an explicit incomplete archive.** Not an error and not an
+empty success: the archive names what it could not account for - a missing journal, one it could
+not read, a closure or summary that did not survive, a range of output that is gone, an interval
+durable writing was lost - so a reader is told the record has holes rather than reading continuity
+into it. "This session kept nothing" and "this host cannot say what this session kept" are
+different answers and a reader is owed the second one.
+
+**A worker crash closes the session.** The controller records the closure, and the closure record
+carries the terminated process identities, the resources known to survive, and an
+ownership-coverage flag that never claims every application was discovered. The archive then
+fences what the session recorded still owning: each identity is checked against the kernel's own
+answer before anything is stopped, one that has already gone is counted as gone, and one the
+platform declines to describe leaves the coverage incomplete. Nothing is rebuilt from terminal
+history.
+
+The transfer service's one retention question is answered here. Section 14 gives a submitted
+attachment its session's retention rather than the seven-day unused window, and the archive is
+what holds a closed session's record: a session it has a record of keeps what was submitted to it,
+one whose journal it cannot read keeps it too, because declining to delete is the answer that
+cannot lose a file, and one neither the registry nor the archive knows about keeps nothing.
+
+## Privacy mode
+
+Enabling privacy mode records a **privacy generation** and asks the same four things of every
+subsystem it reaches. They are one contract rather than four hooks, because a subsystem that did
+three of them would leave the fourth undone somewhere a person could not see.
+
+1. **Fence** what is content-bearing, immediately. Not "stop producing more": stop the queue that
+   already holds content from reaching anything outside this host.
+2. **Cancel** the work that was admitted and never dispatched. It has not left, so it can be taken
+   back rather than followed.
+3. **Reject a late result.** Work that had already left is still out there and its answer will
+   come back. An answer produced under the generation before this one is refused.
+4. **Reconcile** before completion is reported. In-flight cleanup is finished when every subsystem
+   says it has nothing outstanding, not when it was asked for.
+
+Content-history retention, description inference, sync production and backup production are
+disabled prospectively, together. Retained local output, semantic-history caches and generated
+descriptions are removed, and titles become metadata only.
+
+What stays is named rather than quietly retained: the receipt journal's operation metadata, the
+minimal local authority this host holds, live pending questions and approvals, which keep working
+under the grants they already have without their bodies being exported as historical content, and
+user-pinned labels, which are kept locally unless explicitly cleared and excluded from later sync
+while privacy mode is on. A host that claimed a functioning durable control system wrote no state
+at all would be claiming something untrue.
+
+What has already left the host is shown rather than erased. An uploaded archive or notification is
+listed with a separately authorised deletion action; this host does not silently delete unrelated
+backup collections and does not claim a copy somebody else holds can be recalled. Local deletion
+is logical cleanup of this host's own records rather than a claim of physical secure erase.
+
+Turning privacy mode off starts retention again from that moment. It reconstructs nothing, and the
+generation does not go back, so a late result from the private interval is still refused.
 
 ## What an idle session wakes for
 
