@@ -1017,7 +1017,11 @@ mod tests {
             package.executable(),
             root.path().join("zsh/identity-1/bin/shell")
         );
-        assert_eq!(package.interactive_flags(), vec!["-l", "-i"]);
+        // What this platform does when nothing says otherwise, which is not the same on all three.
+        assert_eq!(
+            package.interactive_flags(),
+            package.arguments(StartupMode::for_host())
+        );
         let identity = package.identity();
         assert_eq!(identity.kind, ShellKind::Zsh);
         assert_eq!(identity.editor_abi, "zle-5.9");

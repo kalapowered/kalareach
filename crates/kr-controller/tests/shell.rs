@@ -28,7 +28,7 @@ use kr_protocol::session::{EnvironmentVariable, Presentation, SessionCreateParam
 use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::{
     CURRENT_BASENAME, MANIFEST_BASENAME, PACKAGE_ROOT_VARIABLE, PackageManifest, PackageSet,
-    PackageShell, PackageStartupEntry,
+    PackageShell, PackageStartupEntry, StartupMode,
 };
 use kr_shell_integration::host::startup::{self, Change, HomeLayout};
 use kr_shell_integration::host::terminal::{
@@ -251,7 +251,7 @@ async fn a_stock_shell_is_labelled_rather_than_claiming_the_managed_contract() {
 
 /// KR-REQ-07.16, KR-REQ-07.17.
 #[test]
-fn a_managed_session_launches_the_package_binary_as_an_interactive_login_shell() {
+fn a_managed_session_launches_the_package_binary_with_this_platforms_arguments() {
     let packages = tempfile::tempdir().expect("a directory");
     install_package(packages.path(), ShellKind::Zsh);
     let set = PackageSet::discover(packages.path()).expect("reads the package");
@@ -261,9 +261,15 @@ fn a_managed_session_launches_the_package_binary_as_an_interactive_login_shell()
         packages.path().join("zsh/identity-1/bin/zsh"),
         "the exact binary the reader patch was built into"
     );
-    // The arguments belong to the shell family rather than to the record: a package says what it
-    // was built from, not how a session starts it.
-    assert_eq!(package.interactive_flags(), vec!["-l", "-i"]);
+    // The arguments belong to the host rather than to the record: a package says what it was built
+    // from, not how a session starts it. Section 7 gives macOS the login startup and Linux the
+    // interactive one, so what this asserts is the mode rather than one platform's answer.
+    assert_eq!(package.arguments(StartupMode::Login), vec!["-l", "-i"]);
+    assert_eq!(package.arguments(StartupMode::Interactive), vec!["-i"]);
+    assert_eq!(
+        package.interactive_flags(),
+        package.arguments(StartupMode::for_host())
+    );
     let identity = package.identity();
     assert_eq!(identity.kind, ShellKind::Zsh);
     assert_eq!(identity.upstream_version, "5.9");
