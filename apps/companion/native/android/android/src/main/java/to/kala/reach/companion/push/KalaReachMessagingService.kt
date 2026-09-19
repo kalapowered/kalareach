@@ -3,6 +3,7 @@ package to.kala.reach.companion.push
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
+import android.os.Build
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.work.Data
@@ -75,10 +76,14 @@ class KalaReachMessagingService : FirebaseMessagingService() {
     }
 
     private fun show(decision: PreviewDecision, generic: String) {
-        val manager = getSystemService(NotificationManager::class.java) ?: return
-        manager.createNotificationChannel(
-            NotificationChannel(CHANNEL, CHANNEL_LABEL, NotificationManager.IMPORTANCE_HIGH)
-        )
+        // Channels arrived after this application's minimum, so the call is guarded rather than
+        // assumed: on an older device the notification simply has no channel.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val manager = getSystemService(NotificationManager::class.java) ?: return
+            manager.createNotificationChannel(
+                NotificationChannel(CHANNEL, CHANNEL_LABEL, NotificationManager.IMPORTANCE_HIGH)
+            )
+        }
         val body =
             when (decision) {
                 is PreviewDecision.Reveal -> decision.text

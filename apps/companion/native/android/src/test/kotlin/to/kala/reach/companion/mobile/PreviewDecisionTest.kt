@@ -1,6 +1,5 @@
 package to.kala.reach.companion.mobile
 
-import java.util.Base64
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
@@ -139,8 +138,21 @@ class PreviewDecisionTest {
 
     private fun openingTo(text: String) = PreviewOpening { _, _ -> Result.success(text) }
 
-    private fun encode(bytes: ByteArray): String =
-        Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+    /** base64url without padding, written out so the test does not need a platform decoder. */
+    private fun encode(bytes: ByteArray): String {
+        val alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        val bits = bytes.joinToString("") { byte ->
+            (byte.toInt() and 0xff).toString(2).padStart(8, '0')
+        }
+        return buildString {
+            var position = 0
+            while (position < bits.length) {
+                val chunk = bits.substring(position, minOf(position + 6, bits.length)).padEnd(6, '0')
+                append(alphabet[chunk.toInt(2)])
+                position += 6
+            }
+        }
+    }
 }
 
 /** Where a message's work runs, and the signing rule. */

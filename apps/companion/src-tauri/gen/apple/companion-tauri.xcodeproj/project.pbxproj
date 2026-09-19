@@ -295,14 +295,14 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
-		"TEMP_DB6B6A3F-4348-4B15-A36A-D096B4E808EF" /* x86_64 */ = {
+		"TEMP_9531DF7C-5FF0-42A2-A425-73DF67FAB6AC" /* x86_64 */ = {
 			isa = PBXGroup;
 			children = (
 			);
 			path = x86_64;
 			sourceTree = "<group>";
 		};
-		"TEMP_FCA55F1F-B80D-43B4-96C7-86BB51F8A4B8" /* arm64 */ = {
+		"TEMP_AADF47A5-8660-40A3-BC2A-382A349439A0" /* arm64 */ = {
 			isa = PBXGroup;
 			children = (
 			);

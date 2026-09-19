@@ -17,6 +17,7 @@ import { Banner, Button, CommitButton, Sheet } from '../../components/ui'
 import { useApp } from '../../app/state'
 import { failureMessage } from '../../host/port'
 import type { AttentionEntry, AttentionInbox } from '../../model/pending'
+import { ask } from '../model/call'
 import { count, emptyMessage, filter, locationOf, order, type InboxFilter } from '../model/inbox'
 import { minimumTarget, type Surface } from '../platform'
 
@@ -46,8 +47,7 @@ export function Inbox({
   const target = minimumTarget(surface)
 
   const read = useCallback(() => {
-    port
-      .attentionRead({})
+    ask(() => port.attentionRead({}))
       .then((answer) => {
         setInbox(answer)
         setError(null)
@@ -78,11 +78,12 @@ export function Inbox({
   const shown = filter(rows, chosen)
 
   const respond = (entry: AttentionEntry, allowed: boolean) => {
-    port
-      .approvalRespond(
+    ask(() =>
+      port.approvalRespond(
         { approval_request_id: entry.approval_request_id, decision: allowed ? 'allow' : 'deny' },
         { sessionId: entry.session_id ?? undefined, sessionEpoch: entry.session_epoch ?? undefined }
       )
+    )
       .then((settled) => {
         // The receipt is the outcome. A request that was accepted is not a request that was applied.
         const state = settled.receipt?.state ?? 'unknown'

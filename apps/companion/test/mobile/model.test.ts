@@ -254,37 +254,75 @@ describe('the raw terminal on a touch screen (KR-REQ-13.18, 13.17)', () => {
 describe('the durable store (KR-ACC-012)', () => {
   it('keeps a record across a restart', () => {
     const store = memoryStore()
-    writeRecord(store, DRAFTS_KEY, [{ draftId: 'd-1' }])
-    expect(readRecord<{ draftId: string }[]>(store, DRAFTS_KEY)).toEqual([{ draftId: 'd-1' }])
+    expect(writeRecord(store, DRAFTS_KEY, [{ draftId: 'd-1' }])).toBe(true)
+    expect(readRecord<{ draftId: string }[]>(store, DRAFTS_KEY)).toEqual({
+      kind: 'read',
+      value: [{ draftId: 'd-1' }]
+    })
   })
 
-  it('leaves a record it does not understand where it is', () => {
+  it('leaves a record it does not understand where it is, and never replaces it', () => {
     const store = memoryStore()
     store.write(DRAFTS_KEY, JSON.stringify({ version: 99, value: ['keep me'] }))
-    expect(readRecord(store, DRAFTS_KEY)).toBeNull()
+    expect(readRecord(store, DRAFTS_KEY)).toEqual({ kind: 'unsupported', version: 99 })
+    expect(writeRecord(store, DRAFTS_KEY, [])).toBe(false)
     expect(store.read(DRAFTS_KEY)).toContain('keep me')
   })
 
+  it('tells an unreadable record from an absent one', () => {
+    const store = memoryStore()
+    store.write(DRAFTS_KEY, 'not json at all')
+    expect(readRecord(store, DRAFTS_KEY)).toEqual({ kind: 'invalid' })
+  })
+
   it('still runs when the device will not store anything', () => {
-    const refusing = {
-      getItem: () => {
-        throw new Error('denied')
+    const store = deviceStore(refusingStorage())
+    expect(writeRecord(store, DRAFTS_KEY, ['a'])).toBe(true)
+    expect(readRecord<string[]>(store, DRAFTS_KEY)).toEqual({ kind: 'read', value: ['a'] })
+    expect(store.isDurable(DRAFTS_KEY)).toBe(false)
+  })
+
+  it('never answers with what the device held before a write it refused', () => {
+    // The device keeps the older value: reading it back would show the person a draft older than
+    // the one they typed, which is worse than saying the run has no durability.
+    const values = new Map<string, string>([[DRAFTS_KEY, JSON.stringify({ version: 1, value: ['old'] })]])
+    const failing = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        if (key === DRAFTS_KEY) throw new Error('quota')
+        values.set(key, value)
       },
-      setItem: () => {
-        throw new Error('denied')
-      },
-      removeItem: () => {
-        throw new Error('denied')
+      removeItem: (key: string) => {
+        values.delete(key)
       },
       key: () => null,
       clear: () => undefined,
       length: 0
     } as unknown as Storage
-    const store = deviceStore(refusing)
-    writeRecord(store, DRAFTS_KEY, ['a'])
-    expect(readRecord<string[]>(store, DRAFTS_KEY)).toEqual(['a'])
+    const store = deviceStore(failing)
+    expect(writeRecord(store, DRAFTS_KEY, ['new'])).toBe(true)
+    expect(readRecord<string[]>(store, DRAFTS_KEY)).toEqual({ kind: 'read', value: ['new'] })
+    expect(store.isDurable(DRAFTS_KEY)).toBe(false)
   })
 })
+
+/** A device that refuses every write, which is a private window or a full disk. */
+function refusingStorage(): Storage {
+  return {
+    getItem: () => {
+      throw new Error('denied')
+    },
+    setItem: () => {
+      throw new Error('denied')
+    },
+    removeItem: () => {
+      throw new Error('denied')
+    },
+    key: () => null,
+    clear: () => undefined,
+    length: 0
+  }
+}
 
 describe('recovery after suspension, termination and a network change (KR-ACC-012, KR-REQ-13.02)', () => {
   const target = { sessionId: 's-1', applicationInstanceId: 'app-1', agentBindingRevision: '4' }
@@ -349,8 +387,8 @@ describe('recovery after suspension, termination and a network change (KR-ACC-01
     const summary = summarise(restored)
     expect(summary.kept).toBe(1)
     expect(summary.unresolvedActions).toBe(1)
-    const banner = recoveryBanner('terminated', summary)
-    expect(banner?.title).toBe('Started again after the system closed it')
+    const banner = recoveryBanner('restarted', summary)
+    expect(banner?.title).toBe('Started again')
     expect(banner?.detail).toContain('no confirmed outcome')
     expect(banner?.detail).toContain('Nothing was sent again.')
     for (const forbidden of ['applied', 'succeeded', 'sent successfully', 'completed']) {

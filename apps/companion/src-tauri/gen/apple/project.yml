@@ -98,6 +98,16 @@ targets:
           - UIInterfaceOrientationLandscapeRight
         CFBundleShortVersionString: 0.1.0
         CFBundleVersion: "0.1.0"
+        # The interface offers the platform's camera and photo pickers, and iOS refuses to show
+        # either without the application saying in its own words what it wants them for.
+        NSCameraUsageDescription:
+          Take a photo to attach it to a session on one of your hosts.
+        NSPhotoLibraryUsageDescription:
+          Choose a photo or a video to attach it to a session on one of your hosts.
+        NSMicrophoneUsageDescription:
+          Speak to a session on one of your hosts.
+        UIBackgroundModes:
+          - remote-notification
     entitlements:
       path: ../../../native/ios/App/companion-tauri_iOS.entitlements
     scheme:

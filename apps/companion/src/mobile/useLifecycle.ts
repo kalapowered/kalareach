@@ -28,7 +28,13 @@ import {
 } from './model/lifecycle'
 import { deviceStore, memoryStore, type DurableStore } from './model/store'
 
-/** The key the marker that tells a resume from a cold start is written under. */
+/**
+ * The key a run writes to say it has started.
+ *
+ * It says a previous run existed, and nothing more. A phone is under no obligation to tell an
+ * application it is about to be taken away, so what ended the previous run is not knowable from
+ * here and this never claims to know it.
+ */
 const RUN_MARKER = 'kr.mobile.run'
 
 /** What the hook gives a screen. */
@@ -61,7 +67,7 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
   )
 
   const [resumption, setResumption] = useState<Resumption>(() =>
-    durable.read(RUN_MARKER) === null ? 'cold_start' : 'terminated'
+    durable.read(RUN_MARKER) === null ? 'cold_start' : 'restarted'
   )
   const [state, setState] = useState<DurableState>(() => {
     const restored = restore(durable)
@@ -71,14 +77,14 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
   })
   const [dismissed, setDismissed] = useState(false)
 
-  // The marker says a run has started. It is removed when the page goes away cleanly, so a record
-  // found beside no marker is one the system took the process away from.
+  // The marker says a run has started here. A later run finding it knows there was one before,
+  // which is all it can know: nothing on a phone is told that it is about to be terminated.
   useEffect(() => {
     durable.write(RUN_MARKER, '1')
   }, [durable])
 
-  // Writing on the way out is the only reliable moment: a phone is not obliged to tell an
-  // application it is about to be terminated, and `pagehide` is the last event it does send.
+  // Every change is written as it happens, because a phone is not obliged to tell an application
+  // it is about to be terminated. These two are a second chance rather than the only one.
   useEffect(() => {
     const write = () => {
       persist(durable, state)

@@ -199,6 +199,39 @@ describe('local feedback and the receipt (KR-REQ-13.05, KR-ACC-012)', () => {
     })
   })
 
+  it('leaves what was written in the composer when the host refuses it', async () => {
+    const person = userEvent.setup()
+    const { controls } = start('ios')
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    const composer = await screen.findByLabelText('Message this session')
+    await person.type(composer, 'do not lose me')
+    controls.setConnected(false)
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => {
+      expect(screen.getByText(/not in contact/i)).toBeInTheDocument()
+    })
+    // The submission did not happen, so the text is still exactly where the person left it.
+    expect(screen.getByLabelText('Message this session')).toHaveValue('do not lose me')
+  })
+
+  it('never shows one session an outcome that belongs to another', async () => {
+    const person = userEvent.setup()
+    start('ios')
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await person.type(await screen.findByLabelText('Message this session'), 'in session one')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+    await waitFor(() => {
+      expect(screen.getByText('Applied')).toBeInTheDocument()
+    })
+
+    await person.click(screen.getByRole('button', { name: 'Back to sessions' }))
+    await person.click(await screen.findByRole('button', { name: /Session 2/ }))
+    await screen.findByLabelText('Message this session')
+    expect(screen.queryByText('Applied')).toBeNull()
+  })
+
   it('recovers a draft written before the process was taken away', async () => {
     const person = userEvent.setup()
     const storage = fakeStorage()

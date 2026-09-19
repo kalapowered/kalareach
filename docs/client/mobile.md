@@ -14,9 +14,16 @@ This describes what is there, how it is put together and how to run it.
 | The native code | `apps/companion/native/ios`, `apps/companion/native/android` | Push reception, the limited preview key, the audio session, the share sheet and the signing rule — all of which run when no interface is running at all |
 
 The generated Tauri projects are committed at `apps/companion/src-tauri/gen/apple` and
-`.../gen/android`, so a clean checkout builds without regenerating anything. They reference the
-hand-written native sources by relative path, which is why those sources live outside the generated
-directories: `tauri ios init` and `tauri android init` rewrite what is inside them.
+`.../gen/android`, so a clean checkout has the project files without regenerating them. They
+reference the hand-written native sources by relative path, which is why those sources live outside
+the generated directories: `tauri ios init` and `tauri android init` rewrite what is inside them.
+
+**The packaged applications do not build yet.** The shared native client reaches both mobile
+targets through the crate's `cdylib`, and two crates in that graph have no mobile support: `kr-ipc`
+has a platform module for Linux, macOS and Windows and none for Android, and `kr-term` pulls in a
+terminal library whose `termios` dependency has no iOS support. Until those are resolved, what is
+described below is exercised in the platform's own engine on both simulators and by the native
+targets' own tests, and `tauri ios build` and `tauri android build` do not complete.
 
 ## One bundle, two shells
 
@@ -78,6 +85,10 @@ offers a rebind, and only the same authorised device against an unchanged target
 changed application or binding revision is a conflict the person resolves, and a session that has
 gone orphans the draft. Nothing is ever submitted automatically.
 
+The rebind itself is not yet driven by the connection: `rebindAll` is the decision, and the screen
+that calls it with what the host reports about each draft's target is not built. A draft that came
+back is therefore kept and shown, and is not yet re-bound to an editor.
+
 **The connection coming back is not an outcome.** A submission in flight when contact was lost is
 unresolved until a receipt says otherwise. Queued, sent and applied are three different states and
 only a receipt produces the third. The banner after a recovery reports what was kept and what has
@@ -97,8 +108,9 @@ no confirmed outcome, and ends by saying that nothing was sent again.
 ## Push, keys and audio, with no interface running
 
 The iOS Notification Service Extension and the Android messaging service are started by the system,
-with no application and no JavaScript context anywhere. Both make the same decision in the same
-order:
+with no application and no JavaScript context anywhere. What is built is the decision each of them
+makes, with its own tests; registering this device with the gateway, and the payload shape the
+gateway actually sends, are not wired up yet. Both make the same decision in the same order:
 
 1. A message with no preview shows the generic alert the host chose.
 2. A preview this build cannot read, or one whose lifetime has run out, or one addressed to a key
@@ -107,9 +119,13 @@ order:
 4. A preview that does not decrypt shows the generic alert.
 5. Only a key that opened a live envelope addressed to this device replaces the alert.
 
-The key is a limited preview key and nothing else: on iOS it is in a Keychain access group the
-extension is entitled to and the device authorisation key is not; on Android it is wrapped by the
-hardware-backed keystore. Neither the extension nor the background worker can sign anything —
+The key is a limited preview key and nothing else: on iOS it belongs in a Keychain access group the
+extension is entitled to and the device authorisation key is not, and on Android it is wrapped by
+the hardware-backed keystore. The iOS group is named but not yet resolved from the build, so on a
+device the extension finds no key and shows the generic alert. Nothing here can decrypt yet either:
+the sealing construction belongs to the shared client library and neither the extension nor the
+worker links it, so every preview falls back to the generic alert, which is the specified
+behaviour for a preview that cannot be opened. Neither the extension nor the background worker can sign anything —
 signing needs the application's own authentication, and they have none.
 
 Android hands work on rather than attempting it: anything that needs the host, or that would run
@@ -134,8 +150,11 @@ cd apps/companion/src-tauri/gen/apple && xcodebuild test \
 cd apps/companion/src-tauri/gen/android && ./gradlew :krnative:test
 ```
 
-`scripts/e2e-mobile.sh` never starts a simulator or an emulator that is already running and stops
-only what it started. Screenshots go to `/tmp`; everything else goes to
+`scripts/e2e-mobile.sh` never starts a simulator or an emulator that is already running, stops only
+what it started, and changes a device's settings only on one it started itself. A platform that is
+not available exits 3 and says so rather than passing quietly. It opens each screen and
+photographs it; it does not yet assert what is on the screen, drive typing, rotate a device or
+exercise suspension. Screenshots go to `/tmp`; everything else goes to
 `${KR_TEST_ARTIFACTS_DIR:-/tmp/kr-test-artifacts}`. `KR_IOS_DEVICE` and `KR_ANDROID_AVD` choose the
 device.
 
@@ -147,6 +166,8 @@ picker and nothing else, applies to iOS and Android only, and is held to that by
 the page may listen for an event without being able to emit one. The interface is bundled: no
 mobile build loads its own code from the managed service.
 
-The mobile builds sign in and show usage. They carry no payment form, no embedded checkout and no
-control whose purpose is to send a person somewhere to buy something. Everything local works
-without an account at all, and the account screen says so.
+The account screen offers signing in and shows usage. It carries no payment form, no embedded
+checkout and no control whose purpose is to send a person somewhere to buy something, and the
+mobile tests read the rendered screen and fail on any of them. What is not there yet is the
+authentication itself and the call that reads usage: the screen draws what it is given. Everything
+local works without an account at all, and the screen says so.

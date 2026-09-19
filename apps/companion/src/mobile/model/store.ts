@@ -17,6 +17,8 @@ export interface DurableStore {
   read(key: string): string | null
   write(key: string, value: string): void
   remove(key: string): void
+  /** Whether what was written under this key will survive the process going away. */
+  isDurable(key: string): boolean
 }
 
 /** The shape version written into every record. */
@@ -31,6 +33,10 @@ interface Record<T> {
 /** The browser's own persistent storage, where it is available and permitted. */
 export function deviceStore(storage: Storage | null | undefined): DurableStore {
   const memory = new Map<string, string>()
+  // A key whose write the device refused. Reading it from the device again would answer with what
+  // was there before the refusal, which is worse than saying nothing: the person would be shown an
+  // older draft than the one they typed.
+  const degraded = new Set<string>()
   const usable = (() => {
     if (!storage) return false
     try {
@@ -46,11 +52,11 @@ export function deviceStore(storage: Storage | null | undefined): DurableStore {
 
   return {
     read(key) {
-      if (!usable) return memory.get(key) ?? null
+      if (!usable || degraded.has(key)) return memory.get(key) ?? null
       try {
         return storage?.getItem(key) ?? null
       } catch {
-        return null
+        return memory.get(key) ?? null
       }
     },
     write(key, value) {
@@ -60,18 +66,27 @@ export function deviceStore(storage: Storage | null | undefined): DurableStore {
       }
       try {
         storage?.setItem(key, value)
+        degraded.delete(key)
       } catch {
+        // The device would not take it. This run keeps it, and every later read of this key comes
+        // from here rather than from the older value the device still holds.
         memory.set(key, value)
+        degraded.add(key)
       }
     },
     remove(key) {
       memory.delete(key)
+      degraded.delete(key)
       if (!usable) return
       try {
         storage?.removeItem(key)
       } catch {
         // Nothing to do: the record is gone from memory and the device will not keep it either.
       }
+    },
+    /** True for a key the device refused, which is durability this run does not have. */
+    isDurable(key) {
+      return usable && !degraded.has(key)
     }
   }
 }
@@ -86,32 +101,54 @@ export function memoryStore(): DurableStore {
     },
     remove: (key) => {
       memory.delete(key)
-    }
+    },
+    // Nothing here survives the process, and saying so is the point of the method.
+    isDurable: () => false
   }
 }
+
+/** What a read of a record found. */
+export type RecordRead<T> =
+  /** Nothing has ever been written under this key. */
+  | { readonly kind: 'absent' }
+  /** A record this build reads. */
+  | { readonly kind: 'read'; readonly value: T }
+  /** A record this build does not understand, which it must neither read nor replace. */
+  | { readonly kind: 'unsupported'; readonly version: number }
+  /** Something under the key that is not a record at all. */
+  | { readonly kind: 'invalid' }
 
 /**
  * Reads one record.
  *
- * A record written by a newer build is left where it is and reported as absent, because a build
- * that cannot read a draft must not be the build that deletes it.
+ * A record written by a newer build is reported as unsupported rather than as absent, because a
+ * build that cannot read a draft must not be the build that deletes it, and "absent" is what a
+ * caller would overwrite.
  */
-export function readRecord<T>(store: DurableStore, key: string): T | null {
+export function readRecord<T>(store: DurableStore, key: string): RecordRead<T> {
   const raw = store.read(key)
-  if (raw === null) return null
+  if (raw === null) return { kind: 'absent' }
   try {
     const parsed = JSON.parse(raw) as Record<T>
-    if (typeof parsed !== 'object' || parsed === null) return null
-    if (parsed.version !== RECORD_VERSION) return null
-    return parsed.value
+    if (typeof parsed !== 'object' || parsed === null) return { kind: 'invalid' }
+    if (typeof parsed.version !== 'number') return { kind: 'invalid' }
+    if (parsed.version !== RECORD_VERSION) return { kind: 'unsupported', version: parsed.version }
+    return { kind: 'read', value: parsed.value }
   } catch {
-    return null
+    return { kind: 'invalid' }
   }
 }
 
-/** Writes one record with its version. */
-export function writeRecord<T>(store: DurableStore, key: string, value: T): void {
+/**
+ * Writes one record with its version.
+ *
+ * A key holding a record from a newer build is left alone: replacing it would destroy something
+ * the build that wrote it can still read.
+ */
+export function writeRecord<T>(store: DurableStore, key: string, value: T): boolean {
+  if (readRecord<T>(store, key).kind === 'unsupported') return false
   store.write(key, JSON.stringify({ version: RECORD_VERSION, value } satisfies Record<T>))
+  return true
 }
 
 /** The key one session's drafts are kept under. */

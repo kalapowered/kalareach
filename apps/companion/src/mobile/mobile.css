@@ -482,8 +482,12 @@
   -webkit-tap-highlight-color: transparent;
 }
 
+/*
+ * A terminal key is pressed over and over, sometimes several times a second. It gets colour on the
+ * press, which is instant, and no travel at all: a scale that has to settle is a delay between
+ * every key and the next.
+ */
 .m-key:active {
-  transform: scale(0.94);
   background: var(--subtle);
 }
 
@@ -542,6 +546,18 @@
   block-size: 100%;
   border-radius: 3px;
   background: var(--accent);
+}
+
+/*
+ * Every control inside the phone's shell is at least the platform's minimum in both dimensions,
+ * including the shared components the desktop window sizes for a precise pointer.
+ */
+.m-shell .segmented button,
+.m-shell .btn,
+.m-shell .icon-btn,
+.m-shell .switch-control {
+  min-block-size: var(--target);
+  min-inline-size: var(--target);
 }
 
 /* ---- Landscape and larger screens ------------------------------------------------------------ */

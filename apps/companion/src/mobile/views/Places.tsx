@@ -12,6 +12,7 @@ import type { EnvironmentListResult, SessionListResult } from '@kalareach/protoc
 import { useApp } from '../../app/state'
 import { failureMessage } from '../../host/port'
 import { Banner } from '../../components/ui'
+import { ask } from '../model/call'
 import { minimumTarget, type Surface } from '../platform'
 
 interface Row {
@@ -36,8 +37,7 @@ export function MobileSessions({
   const target = minimumTarget(surface)
 
   const read = useCallback(() => {
-    port
-      .sessionList({})
+    ask(() => port.sessionList({}))
       .then((answer) => {
         const sessions = (answer satisfies SessionListResult).sessions ?? []
         setRows(
@@ -99,8 +99,7 @@ export function MobileHosts({ surface }: { readonly surface: Surface }): ReactNo
   const target = minimumTarget(surface)
 
   useEffect(() => {
-    port
-      .environmentList()
+    ask(() => port.environmentList())
       .then((answer: EnvironmentListResult) => {
         setRows(
           answer.environments.map((environment) => ({

@@ -1,7 +1,5 @@
 package to.kala.reach.companion.mobile
 
-import java.util.Base64
-
 /**
  * The sealed preview a push message carries, and what can be decided about it before it is opened.
  *
@@ -77,14 +75,37 @@ class PreviewEnvelope(
             )
         }
 
+        /**
+         * Decodes one base64url field.
+         *
+         * Written out rather than taken from the platform: the library decoder arrived in a later
+         * Android than this application's minimum, and this same code runs in a receiver, in a
+         * worker and in a test on a developer's machine.
+         */
         private fun decode(value: String?): ByteArray? {
             if (value.isNullOrEmpty()) return null
-            return try {
-                Base64.getUrlDecoder().decode(value.trimEnd('='))
-            } catch (_: IllegalArgumentException) {
-                null
+            val text = value.trimEnd('=')
+            val bits = StringBuilder()
+            for (character in text) {
+                val index = ALPHABET.indexOf(character)
+                if (index < 0) return null
+                bits.append(index.toString(2).padStart(6, '0'))
             }
+            val whole = bits.length / 8
+            val bytes = ByteArray(whole)
+            for (position in 0 until whole) {
+                bytes[position] =
+                    bits.substring(position * 8, position * 8 + 8).toInt(2).toByte()
+            }
+            // Whatever is left is the padding the encoder dropped, and it must be zero: anything
+            // else is a field that was not produced by a base64url encoder.
+            val remainder = bits.substring(whole * 8)
+            if (remainder.any { it != '0' }) return null
+            return bytes
         }
+
+        private const val ALPHABET =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
     }
 }
 

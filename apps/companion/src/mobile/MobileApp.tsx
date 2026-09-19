@@ -28,6 +28,7 @@ import { Inbox } from './views/Inbox'
 import { MobileHosts, MobileSessions } from './views/Places'
 import { MobileSession } from './views/MobileSession'
 import type { Channel, AccountState, Usage } from './model/account'
+import { ask } from './model/call'
 import { useKeyboardInset, useLifecycle } from './useLifecycle'
 import { detectSurface, type Surface } from './platform'
 import './mobile.css'
@@ -107,11 +108,27 @@ export function MobileApp({
     }
   }, [resolved])
 
+  // The last input device decides whether anything animates. A hardware keyboard is used dozens
+  // of times a minute, and a transition on every key is a delay the person feels; a finger is not.
+  useEffect(() => {
+    const keyboard = () => {
+      document.documentElement.dataset.input = 'keyboard'
+    }
+    const pointer = () => {
+      document.documentElement.dataset.input = 'pointer'
+    }
+    window.addEventListener('keydown', keyboard, true)
+    window.addEventListener('pointerdown', pointer, true)
+    return () => {
+      window.removeEventListener('keydown', keyboard, true)
+      window.removeEventListener('pointerdown', pointer, true)
+    }
+  }, [])
+
   useEffect(() => {
     let watching = true
     const read = () => {
-      port
-        .connectionState()
+      ask(() => port.connectionState())
         .then((state) => {
           if (!watching) return
           setConnection({ connected: state.connected, reason: state.reason })

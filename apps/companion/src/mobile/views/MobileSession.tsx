@@ -16,7 +16,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 
 import { useApp } from '../../app/state'
 import { Badge, Banner, Button, Segmented } from '../../components/ui'
-import { failureMessage } from '../../host/port'
+import { failureCode, failureMessage } from '../../host/port'
 import {
   edit,
   notSubmittableBecause,
@@ -30,6 +30,8 @@ import {
   reconnectBanner,
   sent,
   settled,
+  stateOfReceipt,
+  wasRefused,
   failed
 } from '../../model/receipts'
 import { renderMarkdown } from '../../markdown/render'
@@ -37,8 +39,9 @@ import { ZOOM_DEFAULT_INDEX, ZOOM_STEPS, zoomBy, type ViewMode } from '../../ter
 import { AccessoryRow } from '../components/keys'
 import { AttachmentPicker } from '../components/picker'
 import { sequenceForKeyPress, afterKey, pressModifier, sequenceFor, NO_LATCH, type Latch } from '../model/accessory'
+import { ask } from '../model/call'
 import { describeMode, routeGesture, type TouchGesture } from '../model/gestures'
-import { admit, describeBytes } from '../model/media'
+import { admit, describeBytes, type Picked } from '../model/media'
 import type { Lifecycle } from '../useLifecycle'
 import { minimumTarget, type Surface } from '../platform'
 
@@ -56,6 +59,22 @@ interface ReadNode {
 
 /** No image has been imported: a renderer never fetches one on a person's behalf. */
 const NO_IMAGES: ReadonlyMap<string, string> = new Map()
+
+/**
+ * This device's identity for one submission.
+ *
+ * The session is in it because the submissions are held for the whole device: an outcome from one
+ * session shown under another is a person told their message was applied when it was somebody
+ * else's that was.
+ */
+function localId(sessionId: string, now: number): string {
+  return `local:${sessionId}:${now}`
+}
+
+/** Whether a submission belongs to one session. */
+function isForSession(id: string, sessionId: string): boolean {
+  return id.startsWith(`local:${sessionId}:`)
+}
 
 /** The session screen. */
 export function MobileSession({
@@ -78,6 +97,10 @@ export function MobileSession({
   const [pan, setPan] = useState({ x: 0, y: 0 })
   const [latch, setLatch] = useState<Latch>(NO_LATCH)
   const [busy, setBusy] = useState(false)
+  // What the person picked, held here until there is a command that carries bytes to a host. It
+  // is shown rather than dropped, because a file that vanishes after a success message is worse
+  // than one that says plainly it has not gone anywhere.
+  const [heldFiles, setHeldFiles] = useState<readonly Picked[]>([])
   const target = minimumTarget(surface)
   // One scroll position per view, kept across a switch: coming back to a view you were reading
   // halfway down and finding the top of it is losing your place.
@@ -110,8 +133,7 @@ export function MobileSession({
   )
 
   useEffect(() => {
-    port
-      .agentSnapshot({ session_id: sessionId })
+    ask(() => port.agentSnapshot({ session_id: sessionId }))
       .then((answer) => {
         setNodes(answer.nodes.slice(-80).map(readNode))
       })
@@ -122,8 +144,7 @@ export function MobileSession({
 
   useEffect(() => {
     if (pane !== 'terminal') return
-    port
-      .terminalProjection({ session_id: sessionId })
+    ask(() => port.terminalProjection({ session_id: sessionId }))
       .then((projection) => {
         setScreen(
           projection.rows.map((row) => row.cells.map((cell) => cell.text || ' ').join(''))
@@ -150,13 +171,17 @@ export function MobileSession({
   const send = useCallback(
     (text: string) => {
       const now = Date.now()
-      const submission = queued(`local-${now}`, text.slice(0, 60), now, text)
+      // The session is in the identity, so one session's outcome is never shown under another.
+      const submission = queued(localId(sessionId, now), text.slice(0, 60), now, text)
+      // The revision the person submitted. Anything typed after it is a newer draft, and a late
+      // answer about the older one must not take it away.
+      const submittedRevision = draft.revision
       // Local feedback first, and it says queued rather than sent, because it has not left yet.
       lifecycle.setSubmissions((current) => [...current, submission])
       setBusy(true)
-      port
-        .composerSubmit({ session_id: sessionId, text }, { sessionId })
+      ask(() => port.composerSubmit({ session_id: sessionId, text }, { sessionId }))
         .then((answer) => {
+          const state = answer.receipt ? stateOfReceipt(answer.receipt) : 'sent'
           lifecycle.setSubmissions((current) =>
             current.map((each) => {
               if (each.localId !== submission.localId) return each
@@ -165,36 +190,56 @@ export function MobileSession({
               return answer.receipt ? settled(withAction, answer.receipt) : withAction
             })
           )
-          setDraft(edit(draft, '', Date.now()))
+          if (wasRefused(state)) {
+            // The submission did not happen. The text stays exactly where it was.
+            say(`The host refused it. What you wrote is still here.`, 'danger')
+            return
+          }
+          // The composer is cleared only when it still holds what was submitted. A person who
+          // typed the next thing while this one was in flight keeps what they typed.
+          lifecycle.setDrafts((drafts) =>
+            drafts.map((each) =>
+              each.draftId === draft.draftId && each.revision === submittedRevision
+                ? edit(each, '', Date.now())
+                : each
+            )
+          )
         })
         .catch((failure: unknown) => {
           lifecycle.setSubmissions((current) =>
             current.map((each) =>
               each.localId === submission.localId
-                ? failed(each, { code: 'REQUEST_FAILED', message: failureMessage(failure) })
+                ? // The host's own code, kept: `OUTCOME_UNKNOWN` is the one state that must never
+                  // be rounded up to a refusal, and rewriting the code would round it up.
+                  failed(each, {
+                    code: failureCode(failure) ?? 'REQUEST_FAILED',
+                    message: failureMessage(failure)
+                  })
                 : each
             )
           )
-          // The text comes back. A refusal must never be a way to lose what someone wrote.
           say(failureMessage(failure), 'danger')
         })
         .finally(() => {
           setBusy(false)
         })
     },
-    [draft, lifecycle, port, say, sessionId, setDraft]
+    [draft, lifecycle, port, say, sessionId]
   )
 
   const sendKeys = useCallback(
     (bytes: string) => {
-      port.terminalInput({ session_id: sessionId, bytes }).catch((failure: unknown) => {
+      ask(() => port.terminalInput({ session_id: sessionId, bytes })).catch((failure: unknown) => {
         say(failureMessage(failure), 'danger')
       })
     },
     [port, say, sessionId]
   )
 
-  const banner = reconnectBanner(connected, lifecycle.state.submissions)
+  const banner = reconnectBanner(
+    connected,
+    lifecycle.state.submissions.filter((submission) => isForSession(submission.localId, sessionId))
+  )
   const blocked = notSubmittableBecause(draft)
 
   return (
@@ -240,7 +285,7 @@ export function MobileSession({
                     <div>
                       {renderMarkdown(node.text, {
                         openLink: (url) => {
-                          port.openExternal(url).catch((failure: unknown) => {
+                          ask(() => port.openExternal(url)).catch((failure: unknown) => {
                             say(failureMessage(failure), 'danger')
                           })
                         },
@@ -303,7 +348,7 @@ export function MobileSession({
           </>
         ) : null}
 
-        {draft.attachments.length > 0 ? (
+        {draft.attachments.length > 0 || heldFiles.length > 0 ? (
           <div className="m-attachments">
             {draft.attachments.map((attachment) => (
               <span key={attachment.transferId} className="m-attachment">
@@ -311,7 +356,22 @@ export function MobileSession({
                 <span className="m-row-detail">{describeBytes(attachment.byteLen)}</span>
               </span>
             ))}
+            {heldFiles.map((picked) => (
+              <span key={`${picked.name}-${picked.byteLen}`} className="m-attachment">
+                {picked.name}
+                <span className="m-row-detail">
+                  {`${describeBytes(picked.byteLen)} · held on this device`}
+                </span>
+              </span>
+            ))}
           </div>
+        ) : null}
+        {heldFiles.length > 0 ? (
+          <p className="m-hint">
+            {heldFiles.length === 1 ? 'That file is' : 'Those files are'} on this device and{' '}
+            {heldFiles.length === 1 ? 'has' : 'have'} not been sent: this build has no command that
+            carries picked bytes to a host. Nothing has been discarded.
+          </p>
         ) : null}
 
         <label className="visually-hidden" htmlFor={`composer-${sessionId}`}>
@@ -351,7 +411,7 @@ export function MobileSession({
                 say(admission.reason, 'danger')
                 continue
               }
-              say(`${picked.name} is ready to send.`, 'success')
+              setHeldFiles((current) => [...current, picked])
             }
           }}
         />
@@ -367,14 +427,23 @@ export function MobileSession({
           >
             Send
           </Button>
-          {lifecycle.state.submissions.slice(-1).map((submission) => (
-            <Badge
-              key={submission.localId}
-              tone={submission.state === 'applied' ? 'success' : submission.state === 'queued' ? 'neutral' : 'accent'}
-            >
-              {describeState(submission.state)}
-            </Badge>
-          ))}
+          {lifecycle.state.submissions
+            .filter((submission) => isForSession(submission.localId, sessionId))
+            .slice(-1)
+            .map((submission) => (
+              <Badge
+                key={submission.localId}
+                tone={
+                  submission.state === 'applied'
+                    ? 'success'
+                    : submission.state === 'queued'
+                      ? 'neutral'
+                      : 'accent'
+                }
+              >
+                {describeState(submission.state)}
+              </Badge>
+            ))}
         </div>
       </div>
     </div>
@@ -400,7 +469,12 @@ function RawTerminal({
   readonly onApplicationScroll: (lines: number) => void
 }): ReactNode {
   const pointers = useRef(new Map<number, { x: number; y: number }>())
-  const start = useRef<{ x: number; y: number; spread: number } | null>(null)
+  // Where the gesture began, and where the pan was when it began. A drag is the displacement from
+  // that origin, not a sum of each move's step: adding steps makes the view keep going when the
+  // finger reverses, and makes the distance depend on how many events the device sent.
+  const start = useRef<{ x: number; y: number; spread: number; pan: { x: number; y: number } } | null>(
+    null
+  )
 
   const gestureFrom = (event: React.PointerEvent): TouchGesture => {
     const origin = start.current
@@ -439,29 +513,37 @@ function RawTerminal({
           spread:
             points.length >= 2 && points[0] && points[1]
               ? Math.hypot(points[0].x - points[1].x, points[0].y - points[1].y)
-              : 0
+              : 0,
+          pan
         }
       }}
       onPointerMove={(event) => {
         if (!pointers.current.has(event.pointerId)) return
         pointers.current.set(event.pointerId, { x: event.clientX, y: event.clientY })
+        const origin = start.current
         const outcome = routeGesture(mode, gestureFrom(event))
-        if (outcome.kind === 'pan') {
-          onPan({ x: pan.x - outcome.columns, y: pan.y - outcome.rows })
+        if (outcome.kind === 'pan' && origin) {
+          onPan({ x: origin.pan.x - outcome.columns, y: origin.pan.y - outcome.rows })
         }
       }}
       onPointerUp={(event) => {
         const gesture = gestureFrom(event)
         const outcome = routeGesture(mode, gesture)
         pointers.current.delete(event.pointerId)
-        start.current = null
+        // The gesture ends only when the last finger leaves. Clearing the origin while another
+        // pointer is still down would restart the drag from wherever that finger happened to be.
+        if (pointers.current.size === 0) start.current = null
         if (outcome.kind === 'zoom') onZoom(outcome.steps)
         // In control mode the movement was the program's, so it is handed over rather than used.
         if (outcome.kind === 'application' && outcome.lines !== 0) onApplicationScroll(outcome.lines)
       }}
       onPointerCancel={(event) => {
         pointers.current.delete(event.pointerId)
-        start.current = null
+        if (pointers.current.size === 0) start.current = null
+      }}
+      onLostPointerCapture={(event) => {
+        pointers.current.delete(event.pointerId)
+        if (pointers.current.size === 0) start.current = null
       }}
     >
       <pre className="m-terminal-grid">{rows.join('\n')}</pre>

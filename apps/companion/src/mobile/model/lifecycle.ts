@@ -25,8 +25,8 @@ import { DRAFTS_KEY, SUBMISSIONS_KEY, readRecord, writeRecord, type DurableStore
 export type Resumption =
   /** The process stayed alive; the operating system suspended and resumed it. */
   | 'suspended'
-  /** The system reclaimed the process in the background and started it again. */
-  | 'terminated'
+  /** A previous run existed and this is a new process: the system started it again. */
+  | 'restarted'
   /** Wi-Fi became cellular, or the other way round: a new transport, the same process. */
   | 'network_changed'
   /** The person started the application from nothing. */
@@ -37,8 +37,8 @@ export function describeResumption(resumption: Resumption): string {
   switch (resumption) {
     case 'suspended':
       return 'Resumed'
-    case 'terminated':
-      return 'Started again after the system closed it'
+    case 'restarted':
+      return 'Started again'
     case 'network_changed':
       return 'The network changed'
     case 'cold_start':
@@ -55,10 +55,16 @@ export interface DurableState {
 /** Nothing kept. */
 export const EMPTY_DURABLE_STATE: DurableState = { drafts: [], submissions: [] }
 
-/** Writes the state a restart must find. Only what is unresolved is worth keeping. */
-export function persist(store: DurableStore, state: DurableState): void {
-  writeRecord(store, DRAFTS_KEY, state.drafts)
-  writeRecord(store, SUBMISSIONS_KEY, unresolved(state.submissions))
+/**
+ * Writes the state a restart must find. Only what is unresolved is worth keeping.
+ *
+ * Answers false when either record could not be written, which is this run having no durability
+ * rather than having lost anything: what is in memory is still exactly what the person typed.
+ */
+export function persist(store: DurableStore, state: DurableState): boolean {
+  const drafts = writeRecord(store, DRAFTS_KEY, state.drafts)
+  const submissions = writeRecord(store, SUBMISSIONS_KEY, unresolved(state.submissions))
+  return drafts && submissions && store.isDurable(DRAFTS_KEY) && store.isDurable(SUBMISSIONS_KEY)
 }
 
 /**
@@ -68,14 +74,38 @@ export function persist(store: DurableStore, state: DurableState): void {
  * of unknown outcome. Both are recoveries, not failures, and neither is a claim.
  */
 export function restore(store: DurableStore): DurableState {
-  const drafts = readRecord<Draft[]>(store, DRAFTS_KEY) ?? []
-  const submissions = readRecord<Submission[]>(store, SUBMISSIONS_KEY) ?? []
+  const drafts = readList<Draft>(store, DRAFTS_KEY, (each) => typeof each.draftId === 'string')
+  const submissions = readList<Submission>(
+    store,
+    SUBMISSIONS_KEY,
+    (each) => typeof each.localId === 'string'
+  )
   return {
     drafts: drafts.map(connectionLost),
     submissions: submissions.map((submission) =>
       submission.state === 'queued' ? submission : { ...submission, state: 'unknown' as const }
     )
   }
+}
+
+/**
+ * Reads a list of records, keeping only the entries that are the shape this build expects.
+ *
+ * A record is bytes a previous run wrote, and a build that mapped over whatever it found would
+ * fail on the first entry that was not what it assumed. One unreadable entry is one lost draft,
+ * not a broken application.
+ */
+function readList<T>(
+  store: DurableStore,
+  key: string,
+  recognised: (value: Record<string, unknown>) => boolean
+): T[] {
+  const found = readRecord<unknown>(store, key)
+  if (found.kind !== 'read' || !Array.isArray(found.value)) return []
+  return found.value.filter(
+    (each): each is T =>
+      typeof each === 'object' && each !== null && recognised(each as Record<string, unknown>)
+  )
 }
 
 /**
@@ -90,7 +120,7 @@ export function onResume(
   current: DurableState,
   store: DurableStore
 ): DurableState {
-  if (resumption === 'cold_start' || resumption === 'terminated') return restore(store)
+  if (resumption === 'cold_start' || resumption === 'restarted') return restore(store)
   return {
     drafts: current.drafts.map(connectionLost),
     submissions: current.submissions

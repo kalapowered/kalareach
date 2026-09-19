@@ -11,6 +11,9 @@
 # It never starts a simulator or an emulator that is already running, and it stops only what it
 # started itself. Screenshots go under /tmp; everything else goes to the artefact directory.
 #
+# A platform that is not available here is a run that did not happen: the script exits 3 and says
+# which one, rather than exiting 0 and leaving a reader to infer from missing files.
+#
 # Usage:
 #   scripts/e2e-mobile.sh              # both platforms
 #   scripts/e2e-mobile.sh ios          # one of them
@@ -67,8 +70,8 @@ run_ios() {
     udid="$(xcrun simctl list devices available -j |
         python3 "$here/scripts/simulator-identity.py" udid "$device")"
     if [ -z "$udid" ]; then
-        say "no iOS simulator named $device; skipping iOS"
-        return 0
+        say "no iOS simulator named $device"
+        return 3
     fi
     local state
     state="$(xcrun simctl list devices available -j |
@@ -107,15 +110,15 @@ run_android() {
     local adb="$sdk/platform-tools/adb" emulator="$sdk/emulator/emulator"
     local serial started=0 pid=0
     if [ ! -x "$adb" ]; then
-        say "no Android platform tools; skipping Android"
-        return 0
+        say "no Android platform tools"
+        return 3
     fi
     serial="$("$adb" devices | awk '/^emulator-[0-9]+\tdevice$/ {print $1; exit}')"
     if [ -z "$serial" ]; then
         local avd="${KR_ANDROID_AVD:-$("$emulator" -list-avds | head -n 1)}"
         if [ -z "$avd" ]; then
-            say "no Android virtual device; skipping Android"
-            return 0
+            say "no Android virtual device"
+            return 3
         fi
         say "starting the emulator $avd"
         "$emulator" -avd "$avd" -no-snapshot-save -no-boot-anim -netdelay none -netspeed full \
@@ -132,8 +135,8 @@ run_android() {
         say "using the already running $serial"
     fi
     if [ -z "$serial" ]; then
-        say "the emulator did not come up; skipping Android"
-        return 0
+        say "the emulator did not come up"
+        return 3
     fi
 
     {
@@ -146,18 +149,22 @@ run_android() {
     # 10.0.2.2 is the host as the emulator addresses it.
     "$adb" -s "$serial" reverse "tcp:$port" "tcp:$port" >/dev/null 2>&1 || true
 
-    # A browser that has never been opened shows its own first-run screens over the page. These
-    # switches are the browser's own way of saying this is an automated run.
-    "$adb" -s "$serial" shell \
-        "echo 'chrome --disable-fre --no-default-browser-check --no-first-run --disable-features=Translate' > /data/local/tmp/chrome-command-line" \
-        >/dev/null 2>&1 || true
-    "$adb" -s "$serial" shell am set-debug-app --persistent com.android.chrome >/dev/null 2>&1 || true
-    "$adb" -s "$serial" shell am force-stop com.android.chrome >/dev/null 2>&1 || true
-    # An emulator sharing a busy machine drops frames during a transition, and a screenshot taken
-    # mid-transition is a photograph of a fade. Turning the transitions off removes the race.
-    "$adb" -s "$serial" shell \
-        "settings put global window_animation_scale 0; settings put global transition_animation_scale 0; settings put global animator_duration_scale 0" \
-        >/dev/null 2>&1 || true
+    if [ "$started" = 1 ]; then
+        # Only on an emulator this run started. A browser that has never been opened shows its own
+        # first-run screens over the page, and an emulator sharing a busy machine drops frames
+        # during a transition, so a screenshot can be a photograph of a fade.
+        "$adb" -s "$serial" shell \
+            "echo 'chrome --disable-fre --no-default-browser-check --no-first-run --disable-features=Translate' > /data/local/tmp/chrome-command-line" \
+            >/dev/null 2>&1 || true
+        "$adb" -s "$serial" shell am set-debug-app --persistent com.android.chrome >/dev/null 2>&1 || true
+        "$adb" -s "$serial" shell \
+            "settings put global window_animation_scale 0; settings put global transition_animation_scale 0; settings put global animator_duration_scale 0" \
+            >/dev/null 2>&1 || true
+    else
+        # Someone else's emulator. Nothing about it is this run's to change or to stop, so the
+        # settle time is lengthened instead and its settings are left exactly as they are.
+        say "the emulator was already running: its settings are left alone"
+    fi
     for screen in "${screens[@]}"; do
         local name="${screen%%|*}" query="${screen#*|}"
         # The address is quoted for the device's own shell: an unquoted ampersand there would
