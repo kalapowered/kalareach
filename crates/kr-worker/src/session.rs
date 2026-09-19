@@ -811,7 +811,7 @@ impl Session {
             if let Some(journal) = self.journal.as_mut()
                 && let Err(error) = journal.record_session(&summary)
             {
-                self.journal_failure = Some(error.to_string());
+                self.note_journal_failure(error);
             }
         }
         lost
