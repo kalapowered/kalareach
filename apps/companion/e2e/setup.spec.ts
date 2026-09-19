@@ -30,8 +30,20 @@ async function capture(page: Page, name: string): Promise<void> {
   await page.setViewportSize(size)
 }
 
+/**
+ * Where the harness bundle is served from.
+ *
+ * The suite's own server is the default. `KR_COMPANION_HARNESS_URL` points a run at a bundle
+ * somewhere else, which is what a machine running two checkouts of this package at once needs:
+ * the preview port is fixed, and a run that reused the other checkout's server would be testing
+ * the other checkout's interface.
+ */
+const HARNESS =
+  (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
+    ?.KR_COMPANION_HARNESS_URL ?? '/harness.html'
+
 async function openSetup(page: Page): Promise<void> {
-  await page.goto('/harness.html')
+  await page.goto(HARNESS)
   await page.waitForSelector('.app-shell')
   await page.getByRole('button', { name: 'Set up this Mac' }).click()
   await page.getByTestId('setup').waitFor()
