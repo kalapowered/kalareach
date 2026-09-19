@@ -1204,11 +1204,27 @@ fn nested_repositories(
     // in the set too, so a directory that is that object reaches the same refusal whatever it is
     // called here.
     let mut refused: BTreeSet<(u64, u64)> = BTreeSet::new();
-    // Not a directory called `.git`: the directory **this repository resolves its own data to**,
-    // whatever it is called and however it is reached. A filesystem that ignores case, a `.git`
-    // file naming somewhere else, a link: none of them changes what that object is.
-    let own = repository.identity().git_dir;
-    refused.insert((own.device, own.file_id));
+    // Not a directory called `.git`: the directories **this repository resolves its own data to**,
+    // whatever they are called and however they are reached. A filesystem that ignores case, a
+    // `.git` file naming somewhere else, a link: none of them changes what those objects are.
+    //
+    // There can be two. The common one holds the configuration, the references and the objects,
+    // and a worktree of its own holds that worktree's `HEAD` and index; an ordinary repository has
+    // them in one place and a split one does not. Both are this repository's own data.
+    let common = repository.identity().git_dir;
+    refused.insert((common.device, common.file_id));
+    let here = tree.identity();
+    if (common.device, common.file_id) == (here.device, here.file_id) {
+        // Its own data **is** this working tree. Everything in it is administrative and none of it
+        // is content, which is not a tree this host captures.
+        return Err(unplaceable("this working tree"));
+    }
+    if let Some(own) = own_administrative_directory(repository) {
+        if own == (here.device, here.file_id) {
+            return Err(unplaceable("this working tree"));
+        }
+        refused.insert(own);
+    }
     for (directory, held) in &opened {
         let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
         let kind = match held.probe(&administrative) {
@@ -1275,6 +1291,22 @@ fn nested_repositories(
         }
     }
     Ok(found)
+}
+
+/// Returns what this repository keeps **this working tree's** own data in, when it is reachable.
+///
+/// A split repository has two administrative directories: the common one, which the project
+/// service already establishes, and one of this worktree's own. This opens the second through the
+/// working tree's handle when it is inside the tree, which is the only case a capture could reach
+/// it at all, and answers what that directory **is**.
+fn own_administrative_directory(repository: &OpenedRepository) -> Option<(u64, u64)> {
+    let inside = repository
+        .git_dir_path()
+        .strip_prefix(repository.top_level())
+        .ok()?;
+    let name = RelativeName::parse(&inside.to_string_lossy()).ok()?;
+    let held = repository.work_tree().subdirectory(&name).ok()?;
+    Some(identity_of(&held))
 }
 
 /// Returns the object one open directory is.
@@ -1416,10 +1448,13 @@ const MAX_GIT_FILE_BYTES: u64 = 4096;
 /// Two rules: any `.git` component, whatever its case, and the directory this repository actually
 /// keeps its administrative data in, which a `.git` file can point anywhere inside the tree.
 fn administrative(request: Scope<'_>, path: &str) -> bool {
+    // The name rule alone. **Where** this repository keeps its own data is decided by identity, in
+    // `nested_repositories`, which opens every directory this capture names and compares the
+    // object rather than the spelling; a case-sensitive prefix comparison could not do that. This
+    // rule stays because `.git` in a path is administrative whatever is at it, and excluding one
+    // more directory that happens to be called that is a refusal, never an admission.
+    let _ = request;
     crate::grant::is_administrative(path)
-        || request
-            .administrative_prefix
-            .is_some_and(|prefix| crate::grant::under(path, prefix))
 }
 
 /// Returns the refusal a grant or a secret rule makes, when it makes one.

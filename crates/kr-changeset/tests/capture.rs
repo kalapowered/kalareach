@@ -1143,8 +1143,10 @@ fn a_submodule_whose_data_is_elsewhere_refuses_the_capture() {
 /// KR-REQ-14.33 and D-087: this repository's own data is excluded by what it is, not by its name.
 ///
 /// A repository can keep its own data under any name, said in a `.git` file, and a filesystem that
-/// ignores case can then open the same directory under a spelling no name rule matches. What the
-/// directory **is** does not change, and that is what decides.
+/// ignores case then opens the same directory under a spelling no name rule matches. What the
+/// directory **is** does not change, and that is what decides. This runs the whole thing: the data
+/// at `meta`, a file pointing at it, and a path under the other spelling committed and staged, so
+/// the capture has every reason to reach it.
 #[test]
 fn this_repository_s_own_data_is_excluded_by_what_it_is() {
     let fixture = Fixture::create();
@@ -1153,35 +1155,67 @@ fn this_repository_s_own_data_is_excluded_by_what_it_is() {
     std::fs::rename(path.join(".git"), path.join("meta"))
         .expect("this repository keeps its data under another name");
     std::fs::write(path.join(".git"), b"gitdir: meta\n").expect("and points at it");
+    // Committed and staged under the other spelling. Where the filesystem ignores case this is
+    // the same directory reached by a name no prefix rule matches; where it does not, this is a
+    // second directory whose content is ordinary and stays in the version.
+    let other = path.join("META");
+    let aliased = other.exists() || std::fs::create_dir_all(&other).is_ok();
+    if aliased {
+        let _ = std::fs::write(other.join("config.extra"), b"[remote]\n\turl = secret\n");
+        git_raw(&path, ["add", "--force", "META/config.extra"]);
+        git_raw(&path, ["commit", "--quiet", "-m", "the other spelling"]);
+    }
 
     let workspace = fixture.workspace("named-tree");
-    let record = fixture.capture_with(
+    let outcome = fixture.capture_with(
         workspace,
         &include_everything(),
         &kr_protocol::changeset::FileGrant::default(),
         None,
         None,
     );
-    let Ok(record) = record else {
-        // A repository this host will not read at all is a refusal, not an exposure.
-        return;
+    let record = match outcome {
+        Ok(record) => record,
+        // A repository this host will not read at all is a refusal, not an exposure, and it says
+        // which shape it would not read.
+        Err(refusal) => {
+            assert!(
+                refusal
+                    .to_string()
+                    .contains("could not reach by descending")
+                    || refusal.to_string().contains("nested at"),
+                "a refusal says which shape it would not read: {refusal}"
+            );
+            return;
+        }
     };
     let manifest = fixture
         .service()
         .manifest(record.change_set_id, record.version)
         .expect("its manifest");
-    assert!(
-        manifest
-            .paths
-            .iter()
-            .all(|entry| !entry.path.to_ascii_lowercase().starts_with("meta/")),
-        "this repository's own data is not in its own version, whatever it is called: {:?}",
-        manifest
-            .paths
-            .iter()
-            .map(|entry| entry.path.as_str())
-            .collect::<Vec<_>>()
-    );
+    // On a filesystem that ignores case, `META` **is** `meta`, and nothing of it is in the
+    // version. On one that does not, `META` is an ordinary directory of this tree's own and its
+    // content is content; what must not be there either way is the data directory itself.
+    let same_directory = std::fs::canonicalize(path.join("META"))
+        .ok()
+        .zip(std::fs::canonicalize(path.join("meta")).ok())
+        .is_some_and(|(one, two)| one == two);
+    for entry in &manifest.paths {
+        let lower = entry.path.to_ascii_lowercase();
+        if same_directory || !aliased {
+            assert!(
+                !lower.starts_with("meta/"),
+                "this repository's own data is not in its own version, whatever it is called: {}",
+                entry.path
+            );
+        } else {
+            assert!(
+                !entry.path.starts_with("meta/"),
+                "its own data is not in its own version: {}",
+                entry.path
+            );
+        }
+    }
 }
 
 /// KR-REQ-14.32: a quiescence declaration is recorded and never decides the consistency class,
