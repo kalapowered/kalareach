@@ -28,7 +28,6 @@ use kr_protocol::method::Method;
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
-use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -81,12 +80,7 @@ async fn host_sized(script: &str, canonical: Dimensions) -> Host {
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: DisplayNumber::new(1),
-        shell: ShellCommand {
-            program: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script.to_owned()],
-            cwd: "/".to_owned(),
-            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
-        },
+        shell: kr_worker::testing::posix_script(script),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),

@@ -36,7 +36,6 @@ use kr_protocol::method::Method;
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams};
 use kr_protocol::scalars::{CanonicalSet, Nullable};
 use kr_protocol::session::{Dimensions, DisplayNumber, SessionState, ShellMode};
-use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -81,15 +80,9 @@ async fn a_client_that_stops_reading_is_resynchronised_and_holds_nothing_up() {
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: display,
-        shell: ShellCommand {
-            program: "/bin/sh".to_owned(),
-            arguments: vec![
-                "-c".to_owned(),
-                "while true; do i=0; while [ $i -lt 2000 ]; do printf 'line-%s-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' $i; i=$((i+1)); done; sleep 1; done".to_owned(),
-            ],
-            cwd: "/".to_owned(),
-            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
-        },
+        shell: kr_worker::testing::posix_script(
+            "while true; do i=0; while [ $i -lt 2000 ]; do printf 'line-%s-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' $i; i=$((i+1)); done; sleep 1; done",
+        ),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),

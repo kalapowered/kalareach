@@ -205,15 +205,9 @@ async fn unpumped() -> Unpumped {
     // A shell that echoes what it is sent and ignores an interrupt, because one of these tests
     // sends the configured native interrupt and still expects the application to be there to
     // receive what the machine released on the same boundary.
-    config.shell = ShellCommand {
-        program: "/bin/sh".to_owned(),
-        arguments: vec![
-            "-c".to_owned(),
-            "trap '' INT; while IFS= read -r line; do printf '%s\\n' \"$line\"; done".to_owned(),
-        ],
-        cwd: "/".to_owned(),
-        environment: vec![("TERM".to_owned(), "xterm-256color".to_owned())],
-    };
+    config.shell = kr_worker::testing::posix_script(
+        "trap '' INT; while IFS= read -r line; do printf '%s\\n' \"$line\"; done",
+    );
     let session_id = config.session_id;
     let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
     let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");

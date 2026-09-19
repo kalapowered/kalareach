@@ -62,6 +62,12 @@ pub struct Pty {
     /// reader already started, and this is how the waiter beside it waits for that read.
     #[cfg(windows)]
     output_event: std::os::windows::io::OwnedHandle,
+    /// The console's own input, which the interrupt is written into.
+    ///
+    /// Separate from the writer the session takes, because an interrupt that queued behind input
+    /// an application had stopped reading would be no interrupt at all.
+    #[cfg(windows)]
+    console_input: std::sync::Arc<crate::windows::conpty::Input>,
     dimensions: Dimensions,
 }
 
@@ -115,15 +121,17 @@ impl Pty {
     #[cfg(windows)]
     pub fn open(dimensions: Dimensions) -> Result<Self> {
         dimensions.validate()?;
-        let (master, slave) = crate::conpty::open(pty_size(dimensions))
+        let (master, slave) = crate::windows::conpty::open(pty_size(dimensions))
             .map_err(|error| WorkerError::pty("create the pseudo-terminal", error))?;
         let output_event = master
             .output_event()
             .map_err(|error| WorkerError::pty("create the pseudo-terminal", error))?;
+        let console_input = master.input();
         Ok(Self {
             master: Box::new(master),
             slave: Some(Box::new(slave)),
             output_event,
+            console_input,
             dimensions,
         })
     }
@@ -277,16 +285,43 @@ impl Pty {
         }
     }
 
+    /// Delivers the console's interrupt to the application attached to it.
+    ///
+    /// This platform has no foreground process group and no signal to send one. What it has is the
+    /// console's own input: the byte a console turns into a control event for whatever is attached
+    /// to it. It is written through the console rather than through the session's input, so an
+    /// application that has stopped reading cannot hold it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::Pty`] when the console will not take it.
+    #[cfg(windows)]
+    pub fn interrupt_foreground(&self) -> Result<()> {
+        self.console_input
+            .write(&[0x03])
+            .map_err(|error| WorkerError::pty("interrupt the foreground application", error))
+            .and_then(|written| {
+                if written == 1 {
+                    Ok(())
+                } else {
+                    Err(WorkerError::pty(
+                        "interrupt the foreground application",
+                        "the console took none of the interrupt",
+                    ))
+                }
+            })
+    }
+
     /// Sends the terminal's interrupt to the group it has in the foreground.
     ///
     /// # Errors
     ///
-    /// Always returns an error: a Windows console pseudo-terminal has no foreground process group.
-    #[cfg(not(unix))]
+    /// Always returns an error: this platform names no foreground process group.
+    #[cfg(not(any(unix, windows)))]
     pub fn interrupt_foreground(&self) -> Result<()> {
         Err(WorkerError::pty(
             "interrupt the foreground application",
-            "a console pseudo-terminal has no foreground process group",
+            "this platform names no foreground process group",
         ))
     }
 
@@ -431,18 +466,18 @@ impl RootShell {
     #[cfg(not(unix))]
     fn signal_group(&mut self, signal: Signal) -> Result<()> {
         match signal {
-            // The per-session Job Object carries group termination on Windows; the child killer
-            // ends the shell itself.
+            // The session's job object carries the group on this platform: closing it, or
+            // terminating it, reaches every descendant. The child killer ends the shell itself,
+            // which is what a caller holding only the shell can do.
             Signal::Terminate | Signal::Kill => self
                 .child
                 .kill()
                 .map_err(|error| WorkerError::pty("signal the root shell", error)),
-            // There is no Unix signal to send. The configured console interrupt belongs to the
-            // Windows qualification pass, and reporting success for an action that did not happen
-            // would be worse than saying so.
+            // The interrupt is the console's, not the process's, so it is delivered through the
+            // console rather than here. A caller that reaches this has no console to write into.
             Signal::Interrupt => Err(WorkerError::pty(
                 "interrupt the foreground application",
-                "the Windows console interrupt is not yet qualified",
+                "an interrupt is delivered through the console rather than to a process",
             )),
         }
     }
@@ -487,21 +522,6 @@ fn pty_size(dimensions: Dimensions) -> PtySize {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn shell(program: &str, arguments: &[&str]) -> ShellCommand {
-        ShellCommand {
-            program: program.to_owned(),
-            arguments: arguments
-                .iter()
-                .map(|argument| (*argument).to_owned())
-                .collect(),
-            cwd: "/".to_owned(),
-            environment: vec![
-                ("TERM".to_owned(), "xterm-256color".to_owned()),
-                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
-            ],
-        }
-    }
 
     #[test]
     fn the_terminal_exists_before_any_shell_runs() {
@@ -626,7 +646,7 @@ mod tests {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut reader = pty.reader().expect("a reader");
         let mut shell = pty
-            .launch(&shell("/bin/sh", &["-c", "printf hello"]))
+            .launch(&crate::testing::posix_script("printf hello"))
             .expect("launches");
         assert!(shell.identity().pid.get() > 0);
         let seen = read_until(&pty, &mut reader, b"hello");
@@ -649,9 +669,8 @@ mod tests {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut reader = pty.reader().expect("a reader");
         let mut shell = pty
-            .launch(&shell(
-                "/bin/sh",
-                &["-c", "printf %s \"[${HOME:-absent}]\""],
+            .launch(&crate::testing::posix_script(
+                "printf %s \"[${HOME:-absent}]\"",
             ))
             .expect("launches");
         let seen = read_until(&pty, &mut reader, b"[absent]");
@@ -666,11 +685,11 @@ mod tests {
     fn a_second_shell_cannot_be_started_in_the_same_terminal() {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut first = pty
-            .launch(&shell("/bin/sh", &["-c", "exit 0"]))
+            .launch(&crate::testing::posix_script("exit 0"))
             .expect("launches");
         first.wait().expect("waits");
         assert!(matches!(
-            pty.launch(&shell("/bin/sh", &["-c", "exit 0"])),
+            pty.launch(&crate::testing::posix_script("exit 0")),
             Err(WorkerError::Pty { .. })
         ));
     }
@@ -692,7 +711,7 @@ mod tests {
     fn a_stop_request_reaches_the_shell_and_its_group() {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut shell = pty
-            .launch(&shell("/bin/sh", &["-c", "sleep 30"]))
+            .launch(&crate::testing::posix_script("sleep 30"))
             .expect("launches");
         shell.request_stop().expect("asks");
         let exit = shell.wait().expect("waits");
@@ -704,9 +723,8 @@ mod tests {
     fn a_shell_that_ignores_the_request_is_ended_by_force() {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut shell = pty
-            .launch(&shell(
-                "/bin/sh",
-                &["-c", "trap '' TERM; while :; do sleep 1; done"],
+            .launch(&crate::testing::posix_script(
+                "trap '' TERM; while :; do sleep 1; done",
             ))
             .expect("launches");
         shell.force_stop().expect("forces");
@@ -719,7 +737,7 @@ mod tests {
     fn signalling_a_shell_that_has_already_ended_succeeds() {
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut shell = pty
-            .launch(&shell("/bin/sh", &["-c", "exit 3"]))
+            .launch(&crate::testing::posix_script("exit 3"))
             .expect("launches");
         let exit = shell.wait().expect("waits");
         assert_eq!(exit.code, 3);
@@ -863,7 +881,7 @@ fn answer_rather_than_wait(master: &dyn MasterPty) {
 
 /// Waiting for the terminal's output, which on Windows is waiting for the read that was started.
 #[cfg(windows)]
-pub use crate::conpty::OutputWaiter;
+pub use crate::windows::conpty::OutputWaiter;
 
 /// Builds a Windows command line the way the operating system takes one apart again.
 ///

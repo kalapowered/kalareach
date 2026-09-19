@@ -31,7 +31,6 @@ use kr_protocol::method::{Method, MethodVersion};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{CanonicalSet, Nullable, U64, Uuid};
 use kr_protocol::session::{ClosureReason, Dimensions, DisplayNumber, ShellMode};
-use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -200,16 +199,7 @@ async fn wired(script: &str) -> Wired {
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: DisplayNumber::new(1),
-        shell: ShellCommand {
-            program: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script.to_owned()],
-            cwd: "/".to_owned(),
-            environment: vec![
-                ("TERM".to_owned(), "xterm-256color".to_owned()),
-                ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
-                ("PS1".to_owned(), String::new()),
-            ],
-        },
+        shell: kr_worker::testing::posix_script(script),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),

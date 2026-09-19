@@ -1064,6 +1064,7 @@ mod tests {
     #[test]
     fn an_absolute_facility_is_checked_where_it_is() {
         assert!(installed("/definitely/not/here").is_none());
-        assert!(installed("/bin/sh").is_some(), "this host has a shell");
+        let shell = crate::testing::posix_shell();
+        assert!(installed(&shell).is_some(), "this host has a shell");
     }
 }

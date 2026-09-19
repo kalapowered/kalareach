@@ -180,9 +180,17 @@ fn contains(boundary: &OwnershipBoundary, pid: u32) -> bool {
                 .filter_map(|line| line.trim().parse::<u32>().ok())
                 .any(|member| member == pid)
         }
-        // A job object holds every descendant, and testing membership from outside the process
-        // needs a call this crate does not make. The ancestry walk covers the same ground here.
-        OwnershipBoundary::JobObject => false,
+        // The job holds every descendant, so its own process list is the answer.
+        #[cfg(windows)]
+        OwnershipBoundary::JobObject { root } => crate::windows::job::holding(*root)
+            .and_then(|job| job.process_ids().ok())
+            .is_some_and(|members| members.contains(&pid)),
+        // No job exists on this platform, so nothing is ever held by one.
+        #[cfg(not(windows))]
+        OwnershipBoundary::JobObject { .. } => false,
+        // A reduced-ownership profile tracks the root shell and nothing else, which is what makes
+        // it reduced. The ancestry walk is what covers the rest.
+        OwnershipBoundary::ReducedOwnership { root, .. } => *root == pid,
     }
 }
 

@@ -44,7 +44,6 @@ use kr_protocol::session::{
     SessionReadParams, SessionReadResult, SessionState, ShellMode,
 };
 use kr_worker::desktop;
-use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::session::{Session, SessionConfig};
 
@@ -197,7 +196,7 @@ fn create_params(
     SessionCreateParams {
         environment_id,
         presentation,
-        shell: Nullable::some("/bin/sh".to_owned()),
+        shell: Nullable::some(kr_worker::testing::posix_shell()),
         shell_mode: ShellMode::NativeCompat,
         cwd: Nullable::some(cwd.display().to_string()),
         dimensions: Nullable::null(),
@@ -600,12 +599,7 @@ async fn a_desktop_bound_session_closes_with_desktop_lost_when_its_login_ends() 
         session_epoch: SessionEpoch::V1,
         environment_id: host.environment_id(),
         display_number: DisplayNumber::new(1),
-        shell: ShellCommand {
-            program: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), "exec cat".to_owned()],
-            cwd: "/".to_owned(),
-            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
-        },
+        shell: kr_worker::testing::posix_script("exec cat"),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::DesktopBound,
         // A desktop no host is in: another user, another session, another generation, another
@@ -1186,7 +1180,7 @@ async fn a_headless_session_inherits_no_graphical_access_and_logout_is_reported_
         )
         .environment_snapshot,
         &context,
-        "/bin/sh",
+        &kr_worker::testing::posix_shell(),
         "0",
         created.session.session_id,
     );

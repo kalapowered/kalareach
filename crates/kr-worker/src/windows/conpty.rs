@@ -14,10 +14,8 @@
 //! Everything else follows from owning the pipes: a console has to be created around them, and a
 //! shell has to be started inside that console.
 //!
-//! **None of this has been run.** It is compiled for `x86_64-pc-windows-gnu` in the acceptance, and
-//! the runtime proof on Windows belongs to T-024 and T-059, on a machine that has one.
-
-#![cfg(windows)]
+//! The shell does not simply start: it is created suspended, put into the session's job object,
+//! and only then resumed, so that nothing it does happens outside the boundary that owns it.
 
 use std::io::{Read, Write};
 use std::os::windows::io::OwnedHandle;
@@ -34,11 +32,20 @@ const PIPE_BYTES: u32 = 64 * 1024;
 /// One read at a time, which is what the read loop asks for.
 const READ_BYTES: usize = 64 * 1024;
 
+/// The byte a console turns into an interrupt for the application attached to it.
+const INTERRUPT_BYTE: u8 = 0x03;
+
 /// The pseudo-console, with the two ends of the two pipes this host keeps.
 pub struct Console {
     console: Arc<handle::PseudoConsole>,
     /// The end this host writes input into. It answers rather than waits.
-    input: Mutex<Option<OwnedHandle>>,
+    ///
+    /// Shared rather than handed over, because two things write into it: the session's input,
+    /// which takes the writer once, and the interrupt, which is not input and must not queue
+    /// behind it. The lock inside makes each of them one whole write.
+    input: Arc<Input>,
+    /// Whether the session has already taken the writer.
+    writer_taken: Mutex<bool>,
     /// The end this host reads output from, and the event a read of it is signalled on. They are
     /// taken together, once, by the one reader this terminal has.
     ///
@@ -50,6 +57,33 @@ pub struct Console {
     /// A view of that event for the waiter, which waits for what the reader started.
     event: OwnedHandle,
     size: Mutex<PtySize>,
+    /// The job every process started inside this console joins before it runs.
+    job: Arc<super::job::SessionJob>,
+}
+
+/// The end this host writes input into, shared by the session's writer and the interrupt.
+///
+/// The pipe answers rather than waits, so holding the lock is bounded by one system call and no
+/// writer is ever left inside it while a lease changes underneath.
+#[derive(Debug)]
+pub struct Input {
+    handle: Mutex<OwnedHandle>,
+}
+
+impl Input {
+    /// Writes what the console has room for, and says so when that is nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`std::io::ErrorKind::WouldBlock`] when the console took none of it, and the
+    /// operating system's failure when the console has gone.
+    pub fn write(&self, bytes: &[u8]) -> std::io::Result<usize> {
+        let handle = self
+            .handle
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        handle::write(&handle, bytes)
+    }
 }
 
 impl std::fmt::Debug for Console {
@@ -75,16 +109,22 @@ pub fn open(size: PtySize) -> std::io::Result<(Console, Slave)> {
     // shell exits, so the read loop would never see the end of the output.
     drop(pipes.console_input);
     drop(pipes.console_output);
+    let job = Arc::new(super::job::SessionJob::create()?);
     let slave = Slave {
         console: Arc::clone(&console),
+        job: Arc::clone(&job),
     };
     Ok((
         Console {
             console,
-            input: Mutex::new(Some(pipes.input)),
+            input: Arc::new(Input {
+                handle: Mutex::new(pipes.input),
+            }),
+            writer_taken: Mutex::new(false),
             output: Mutex::new(Some((Arc::new(pipes.output), event.try_clone()?))),
             event,
             size: Mutex::new(size),
+            job,
         },
         slave,
     ))
@@ -98,6 +138,45 @@ impl Console {
     /// Returns the operating system's failure when the handle cannot be duplicated.
     pub fn output_event(&self) -> std::io::Result<OwnedHandle> {
         self.event.try_clone()
+    }
+
+    /// Returns the console's input, which an interrupt reaches without the session's writer.
+    #[must_use]
+    pub fn input(&self) -> Arc<Input> {
+        Arc::clone(&self.input)
+    }
+
+    /// Returns the job every process inside this console is held by.
+    #[must_use]
+    pub fn job(&self) -> Arc<super::job::SessionJob> {
+        Arc::clone(&self.job)
+    }
+
+    /// Delivers the console's interrupt to whatever is attached to it.
+    ///
+    /// There is no foreground process group here and no signal to send one. What a console host
+    /// has is the console's own input: the end-of-text byte written into it is what the console
+    /// turns into a control event for the attached application, exactly as a keystroke would be,
+    /// and the application's own console mode is what decides whether it is processed or read as
+    /// a byte. That is the whole mechanism a terminal emulator has on this platform, and claiming
+    /// a stronger one would be claiming something that is not there.
+    ///
+    /// It is written through the console's input rather than through the session's writer, so it
+    /// is not queued behind input the application has not read.
+    ///
+    /// # Errors
+    ///
+    /// Returns the operating system's failure when the console will not take it, including the
+    /// case where the console is full and took none of it.
+    pub fn interrupt(&self) -> std::io::Result<()> {
+        match self.input.write(&[INTERRUPT_BYTE]) {
+            Ok(1) => Ok(()),
+            Ok(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "the console took none of the interrupt",
+            )),
+            Err(failure) => Err(failure),
+        }
     }
 }
 
@@ -123,19 +202,26 @@ impl MasterPty for Console {
     }
 
     fn take_writer(&self) -> Result<Box<dyn Write + Send>, anyhow::Error> {
-        let handle = self
-            .input
+        let mut taken = self
+            .writer_taken
             .lock()
-            .expect("the terminal's input is not poisoned")
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("the terminal's writer has already been taken"))?;
-        Ok(Box::new(Writer { handle }))
+            .expect("the terminal's input is not poisoned");
+        if *taken {
+            return Err(anyhow::anyhow!(
+                "the terminal's writer has already been taken"
+            ));
+        }
+        *taken = true;
+        Ok(Box::new(Writer {
+            input: Arc::clone(&self.input),
+        }))
     }
 }
 
 /// What starts the root shell inside the pseudo-console.
 pub struct Slave {
     console: Arc<handle::PseudoConsole>,
+    job: Arc<super::job::SessionJob>,
 }
 
 impl SlavePty for Slave {
@@ -143,18 +229,22 @@ impl SlavePty for Slave {
         &self,
         command: CommandBuilder,
     ) -> Result<Box<dyn Child + Send + Sync>, anyhow::Error> {
-        Ok(Box::new(handle::spawn(&self.console, &command)?))
+        let spawned = handle::spawn(&self.console, &self.job, &command)?;
+        // The boundary is established from the root shell's identity, after this call and away
+        // from the terminal that made it, so the job is recorded where that lookup can find it.
+        super::job::record(spawned.identifier(), &self.job);
+        Ok(Box::new(spawned))
     }
 }
 
 /// The end this host writes input into, in the mode where a write answers rather than waits.
 struct Writer {
-    handle: OwnedHandle,
+    input: Arc<Input>,
 }
 
 impl Write for Writer {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        handle::write(&self.handle, bytes)
+        self.input.write(bytes)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -222,7 +312,8 @@ impl OutputWaiter {
 
 /// The calls that have no safe form, and the handles they own.
 ///
-/// This crate denies unsafe code and relaxes the rule here and in [`crate::pty::descriptor`] alone.
+/// This crate denies unsafe code and relaxes the rule here, in the job object beside it, and in the
+/// Unix terminal's descriptor module alone.
 /// Creating a console and its pipes, driving them without waiting, and starting a process inside
 /// the console are all calls with out-parameters and handle ownership that only the caller can
 /// promise.
@@ -238,9 +329,8 @@ mod handle {
 
     use portable_pty::{CommandBuilder, ExitStatus, PtySize};
     use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING,
-        ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-        WAIT_TIMEOUT,
+        ERROR_BROKEN_PIPE, ERROR_IO_INCOMPLETE, ERROR_IO_PENDING, ERROR_PIPE_NOT_CONNECTED,
+        GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
@@ -255,10 +345,11 @@ mod handle {
         SetNamedPipeHandleState,
     };
     use windows_sys::Win32::System::Threading::{
-        CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW, DeleteProcThreadAttributeList,
-        EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
+        CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW,
+        DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
         InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-        STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+        ResumeThread, STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute,
+        WaitForSingleObject,
     };
 
     /// The attribute that puts a new process inside a pseudo-console.
@@ -638,17 +729,31 @@ mod handle {
         identifier: u32,
     }
 
+    impl Spawned {
+        /// Returns the operating system's identifier for the process.
+        pub(super) const fn identifier(&self) -> u32 {
+            self.identifier
+        }
+    }
+
     /// What can end that shell from a thread that is not waiting on it.
     #[derive(Debug)]
     struct Killer(Arc<OwnedHandle>);
 
-    /// Starts a process inside the console.
+    /// Starts a process inside the console, inside the job, in that order.
     ///
     /// The console reaches the child through a process attribute rather than through inherited
     /// standard handles, which is what keeps this host's own handles out of it: nothing is
     /// inherited.
+    ///
+    /// The child is created **suspended**. Section 7 requires an owned child to join the session's
+    /// job object *before* execution, and a process that had already run could have started
+    /// children of its own outside the job in the moment before it was assigned. So: create
+    /// suspended, assign, resume. A failure at either of the last two steps ends the process
+    /// rather than leaving one running that this host cannot account for.
     pub(super) fn spawn(
         console: &PseudoConsole,
+        job: &super::super::job::SessionJob,
         command: &CommandBuilder,
     ) -> std::io::Result<Spawned> {
         let mut line = command_line(command);
@@ -711,7 +816,7 @@ mod handle {
                 std::ptr::null(),
                 std::ptr::null(),
                 0,
-                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT,
+                EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED,
                 environment.as_ptr().cast::<std::ffi::c_void>().cast_mut(),
                 directory
                     .as_ref()
@@ -726,11 +831,28 @@ mod handle {
         if spawned == 0 {
             return Err(std::io::Error::last_os_error());
         }
-        // SAFETY: the call reported both handles. The thread's is not needed here, and closing it
-        // does not end the thread.
-        unsafe { CloseHandle(started.hThread) };
-        // SAFETY: the process handle is this process's own and nothing else holds it.
+        // SAFETY: the call reported both handles, and each is this process's own with nothing else
+        // holding it. The thread's handle is kept until the process has been resumed.
         let process = unsafe { OwnedHandle::from_raw_handle(started.hProcess.cast()) };
+        // SAFETY: as above.
+        let thread = unsafe { OwnedHandle::from_raw_handle(started.hThread.cast()) };
+
+        // Suspended, so nothing has run yet. This is the only moment at which the job can be
+        // joined before execution, and a failure here is a failure to start: a process outside the
+        // boundary is one this host could never honestly close.
+        if let Err(failure) = job.hold(&process) {
+            let _ = end(&process);
+            return Err(failure);
+        }
+        // SAFETY: the thread is the one the call above created, suspended, and this handle is the
+        // only one for it. Resuming it is what starts the process running.
+        let resumed = unsafe { ResumeThread(thread.as_raw_handle().cast()) };
+        if resumed == u32::MAX {
+            let failure = std::io::Error::last_os_error();
+            let _ = end(&process);
+            return Err(failure);
+        }
+        drop(thread);
         Ok(Spawned {
             process: Arc::new(process),
             identifier: started.dwProcessId,

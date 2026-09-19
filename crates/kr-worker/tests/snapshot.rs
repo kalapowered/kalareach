@@ -33,7 +33,6 @@ use kr_protocol::projection::{
 use kr_protocol::recovery::{EventStream, EventsSubscribeParams, EventsSubscribeResult};
 use kr_protocol::scalars::{Bytes, CanonicalSet, Nullable};
 use kr_protocol::session::{Dimensions, DisplayNumber, ShellMode};
-use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -154,12 +153,7 @@ async fn host_with(
         session_epoch: SessionEpoch::V1,
         environment_id,
         display_number: DisplayNumber::new(1),
-        shell: ShellCommand {
-            program: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), script.to_owned()],
-            cwd: "/".to_owned(),
-            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
-        },
+        shell: kr_worker::testing::posix_script(script),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
@@ -2182,12 +2176,7 @@ async fn a_queue_too_small_for_any_screen_is_refused_when_it_is_asked_for() {
         session_epoch: SessionEpoch::V1,
         environment_id: temp.environment_id(),
         display_number: DisplayNumber::new(1),
-        shell: ShellCommand {
-            program: "/bin/sh".to_owned(),
-            arguments: vec!["-c".to_owned(), "exec cat".to_owned()],
-            cwd: "/".to_owned(),
-            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
-        },
+        shell: kr_worker::testing::posix_script("exec cat"),
         shell_mode: ShellMode::NativeCompat,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),
