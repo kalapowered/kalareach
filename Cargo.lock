@@ -1155,6 +1155,7 @@ dependencies = [
  "block2",
  "kr-cbor",
  "kr-client",
+ "kr-ipc",
  "kr-protocol",
  "kr-term",
  "objc2",
