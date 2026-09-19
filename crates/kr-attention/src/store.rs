@@ -3,8 +3,13 @@
 //! Section 24 gives attention, quiet hours, escalation, review and visit acknowledgements one
 //! owner: an environment feature store with per-actor revisions and consumed event cursors, from
 //! which the state is reconstructed idempotently. This is that store, a small table set of its own
-//! beside the session's journal rather than inside it, because what it holds is a projection of
-//! the journal's events rather than a receipt.
+//! beside the session's journal rather than inside it.
+//!
+//! Half of what it holds is a projection of the journal's events, and a replay rebuilds it. The
+//! other half is not, and no replay restores it: the acknowledgements, the per-actor revisions,
+//! the visits and their log views, the quiet-hours window, the identities already given to
+//! announcements and the secret the keys are derived under are records in their own right, and
+//! this is where they live.
 //!
 //! # Why the whole state is written at once
 //!
@@ -71,8 +76,10 @@ use crate::visit::{Omitted, Visit};
 /// A store written under any other version is refused rather than read. Two things in here are
 /// derived rather than stored on their own - an item's key, and the order a review page continues
 /// by - so a row written under a different derivation would be read under a name that does not
-/// describe it, which is worse than not reading it at all.
-pub const SCHEMA_VERSION: i64 = 3;
+/// describe it, which is worse than not reading it at all. Every row also has to say which of its
+/// moments were taken on a clock somebody could prove, and a row that predates those columns
+/// cannot answer.
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// How long a write waits for another holder of the same file before it is refused.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -92,6 +99,11 @@ pub struct StoredState {
     pub gaps: Vec<AttentionGap>,
     /// How many items the host has let go of to stay inside its bound.
     pub dropped: u64,
+    /// The secret this store derives its item keys under.
+    ///
+    /// It is generated once, when a store first has state to write, and read back with the rest.
+    /// A store that has never been written gives a fresh one, which is right: it has no keys.
+    pub keys: crate::key::KeySecret,
     /// The highest identity this store has given an announcement.
     ///
     /// It only goes forward, and it outlives the item whose decision it named, so an identity a
@@ -151,6 +163,7 @@ const SCHEMA: &str = "
         notification TEXT NOT NULL,
         last_notified_ms INTEGER,
         announced_proven INTEGER NOT NULL,
+        anchor_proven INTEGER NOT NULL,
         announced_level TEXT,
         announcements INTEGER NOT NULL,
         pending_handoff INTEGER,
@@ -164,6 +177,10 @@ const SCHEMA: &str = "
     CREATE TABLE IF NOT EXISTS attention_dropped (
         id INTEGER PRIMARY KEY CHECK (id = 0),
         items INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS attention_key_secret (
+        id INTEGER PRIMARY KEY CHECK (id = 0),
+        secret BLOB NOT NULL
     );
     CREATE TABLE IF NOT EXISTS attention_announcements (
         id INTEGER PRIMARY KEY CHECK (id = 0),
@@ -181,7 +198,8 @@ const SCHEMA: &str = "
         session_id TEXT NOT NULL,
         summary TEXT NOT NULL,
         pending_since_ms INTEGER NOT NULL,
-        reminded INTEGER NOT NULL
+        reminded INTEGER NOT NULL,
+        anchor_proven INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS attention_quiet_hours (
         id INTEGER PRIMARY KEY CHECK (id = 0),
@@ -255,6 +273,7 @@ const TABLES: &[&str] = &[
     "attention_actors",
     "attention_dropped",
     "attention_announcements",
+    "attention_key_secret",
     "attention_item_acks",
     "attention_pending_inputs",
     "attention_quiet_hours",
@@ -394,6 +413,21 @@ impl Store {
                 |row| row.get(0),
             )
             .optional()?;
+        let secret: Option<Vec<u8>> = self
+            .connection
+            .query_row(
+                "SELECT secret FROM attention_key_secret WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let keys = match secret {
+            Some(bytes) => crate::key::KeySecret::from_bytes(
+                <[u8; crate::key::SECRET_BYTES]>::try_from(bytes.as_slice())
+                    .map_err(|_| unreadable("key secret"))?,
+            ),
+            None => crate::key::KeySecret::fresh(),
+        };
         let announcement: Option<i64> = self
             .connection
             .query_row(
@@ -412,6 +446,7 @@ impl Store {
                 Some(value) => as_u64(value, "dropped count")?,
                 None => 0,
             },
+            keys,
             next_announcement: match announcement {
                 Some(value) => as_u64(value, "announcement counter")?,
                 None => 0,
@@ -464,9 +499,9 @@ impl Store {
                      key, rule, source, session_id, summary, routing, level, steps_taken,
                      occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
                      announced_proven, announced_level, announcements, pending_handoff, uncertain,
-                     deferred
+                     deferred, anchor_proven
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                           ?17, ?18, ?19)",
+                           ?17, ?18, ?19, ?20)",
                 params![
                     item.key.as_str(),
                     item.rule.as_str(),
@@ -491,6 +526,7 @@ impl Store {
                         .transpose()?,
                     i64::from(item.uncertain),
                     i64::from(item.deferred),
+                    i64::from(item.anchor_wall_proven),
                 ],
             )?;
         }
@@ -503,6 +539,10 @@ impl Store {
         transaction.execute(
             "INSERT INTO attention_dropped (id, items) VALUES (0, ?1)",
             params![as_i64(state.dropped, "dropped count")?],
+        )?;
+        transaction.execute(
+            "INSERT INTO attention_key_secret (id, secret) VALUES (0, ?1)",
+            params![state.keys.as_bytes().as_slice()],
         )?;
         transaction.execute(
             "INSERT INTO attention_announcements (id, next) VALUES (0, ?1)",
@@ -525,14 +565,15 @@ impl Store {
         for (question_id, pending) in &state.pending_inputs {
             transaction.execute(
                 "INSERT INTO attention_pending_inputs (
-                     question_id, session_id, summary, pending_since_ms, reminded
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                     question_id, session_id, summary, pending_since_ms, reminded, anchor_proven
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 params![
                     question_id.to_string(),
                     pending.session_id.to_string(),
                     pending.summary,
                     as_i64(pending.pending_since_ms.get(), "pending since")?,
-                    i64::from(pending.reminded)
+                    i64::from(pending.reminded),
+                    i64::from(pending.anchor_wall_proven)
                 ],
             )?;
         }
@@ -661,7 +702,7 @@ impl Store {
             "SELECT key, rule, source, session_id, summary, routing, level, steps_taken,
                     occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
                     announced_proven, announced_level, announcements, pending_handoff, uncertain,
-                    deferred
+                    deferred, anchor_proven
              FROM attention_items ORDER BY first_seen_ms, key",
         )?;
         let rows = statement.query_map([], |row| {
@@ -685,6 +726,7 @@ impl Store {
                 row.get::<_, Option<i64>>(16)?,
                 row.get::<_, i64>(17)?,
                 row.get::<_, i64>(18)?,
+                row.get::<_, i64>(19)?,
             ))
         })?;
         let unanchored = Elapsed::starting(HostReading::new(0, 0, false));
@@ -715,6 +757,7 @@ impl Store {
                 notification: NotificationState::from_wire(&row.11)
                     .ok_or_else(|| unreadable("notification"))?,
                 last_notified_ms,
+                anchor_wall_proven: row.19 != 0,
                 announced_wall_proven: row.13 != 0,
                 announced_level: row
                     .14
@@ -825,7 +868,7 @@ impl Store {
 
     fn load_pending(&self) -> Result<BTreeMap<QuestionId, PendingInput>> {
         let mut statement = self.connection.prepare(
-            "SELECT question_id, session_id, summary, pending_since_ms, reminded
+            "SELECT question_id, session_id, summary, pending_since_ms, reminded, anchor_proven
              FROM attention_pending_inputs",
         )?;
         let rows = statement.query_map([], |row| {
@@ -835,12 +878,13 @@ impl Store {
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
             ))
         })?;
         let unanchored = Elapsed::starting(HostReading::new(0, 0, false));
         let mut pending = BTreeMap::new();
         for row in rows {
-            let (question_id, session_id, summary, since, reminded) = row?;
+            let (question_id, session_id, summary, since, reminded, anchored) = row?;
             pending.insert(
                 QuestionId::from_str(&question_id).map_err(|_| unreadable("question"))?,
                 PendingInput {
@@ -850,6 +894,7 @@ impl Store {
                     pending_since_ms: TimestampMs::new(as_u64(since, "pending since")?),
                     waited: unanchored,
                     reminded: reminded != 0,
+                    anchor_wall_proven: anchored != 0,
                 },
             );
         }

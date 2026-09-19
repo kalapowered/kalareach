@@ -150,8 +150,8 @@ fn adapter_failed(sequence: u64, at_ms: u64) -> SourceEvent {
 }
 
 /// The key one rule and one subject land on, derived the way the engine derives it.
-fn key(id: AttentionRule, subject: &str) -> AttentionKey {
-    kr_attention::key::attention_key(id, subject)
+fn key(attention: &Attention, id: AttentionRule, subject: &str) -> AttentionKey {
+    attention.key_for(id, subject)
 }
 
 /// Takes every outstanding announcement and settles it, which is what a delivery consumer does
@@ -178,8 +178,9 @@ fn notice_body(sequence: u64) -> String {
 }
 
 /// The key an unidentified notice of session one lands on.
-fn notice_key(body: &str) -> AttentionKey {
+fn notice_key(attention: &Attention, body: &str) -> AttentionKey {
     key(
+        attention,
         AttentionRule::ApplicationNotice,
         &format!("{}|{body}", session(1)),
     )
@@ -712,7 +713,7 @@ fn one_actor_s_acknowledgement_does_not_silence_the_host_s_reminder() {
     attention
         .acknowledge(
             &actor("device:phone"),
-            &[key(AttentionRule::AdapterFailed, "git")],
+            &[key(&attention, AttentionRule::AdapterFailed, "git")],
             reading(1),
         )
         .expect("the store records the acknowledgement");
@@ -851,7 +852,7 @@ fn an_acknowledgement_affects_only_the_actor_that_made_it() {
     let acknowledged = attention
         .acknowledge(
             &actor("device:phone"),
-            &[key(AttentionRule::PendingApproval, "req-1")],
+            &[key(&attention, AttentionRule::PendingApproval, "req-1")],
             reading(1_000),
         )
         .expect("the store records the acknowledgement");
@@ -880,7 +881,7 @@ fn a_later_occurrence_is_work_an_earlier_acknowledgement_does_not_cover() {
     attention
         .acknowledge(
             &actor("device:phone"),
-            &[key(AttentionRule::PendingApproval, "req-1")],
+            &[key(&attention, AttentionRule::PendingApproval, "req-1")],
             reading(1_000),
         )
         .expect("the store records the acknowledgement");
@@ -907,7 +908,11 @@ fn acknowledging_a_key_the_host_holds_no_item_for_records_nothing() {
     let acknowledged = attention
         .acknowledge(
             &actor("device:phone"),
-            &[key(AttentionRule::PendingApproval, "never-raised")],
+            &[key(
+                &attention,
+                AttentionRule::PendingApproval,
+                "never-raised",
+            )],
             reading(0),
         )
         .expect("the store records the acknowledgement");
@@ -1428,7 +1433,7 @@ fn a_gap_in_the_retained_events_is_never_an_answered_approval() {
     );
     let first = whole_inbox(&attention)
         .into_iter()
-        .find(|item| item.key == key(AttentionRule::PendingApproval, "req-1"))
+        .find(|item| item.key == key(&attention, AttentionRule::PendingApproval, "req-1"))
         .expect("the first approval is still in the inbox");
     assert!(
         first.uncertain,
@@ -1574,13 +1579,17 @@ fn a_rebuild_from_nothing_holds_the_same_items_as_the_live_engine() {
         .rebuild(&events, reading(0))
         .expect("the store records the rebuild");
 
-    let keys = |attention: &Attention| -> Vec<AttentionKey> {
-        whole_inbox(attention)
+    // Two stores derive their keys under two secrets, so what is compared is the conditions the
+    // items stand for rather than the names this store happened to give them.
+    let conditions = |attention: &Attention| -> Vec<(AttentionRule, String, AttentionLevel)> {
+        let mut held: Vec<_> = whole_inbox(attention)
             .into_iter()
-            .map(|item| item.key)
-            .collect()
+            .map(|item| (item.rule, item.summary.0.unwrap_or_default(), item.level))
+            .collect();
+        held.sort();
+        held
     };
-    assert_eq!(keys(&rebuilt), keys(&live));
+    assert_eq!(conditions(&rebuilt), conditions(&live));
     assert_eq!(
         review_states(&rebuilt, "local:501", session(1)),
         review_states(&live, "local:501", session(1))
@@ -1631,7 +1640,7 @@ fn the_state_comes_back_as_it_was_after_the_store_is_reopened() {
         attention
             .acknowledge(
                 &actor("local:501"),
-                &[key(AttentionRule::PendingApproval, "req-2")],
+                &[key(&attention, AttentionRule::PendingApproval, "req-2")],
                 reading(1_000),
             )
             .expect("the store records the acknowledgement");
@@ -2269,7 +2278,7 @@ fn one_more_actor_than_the_store_admits_is_refused_rather_than_displacing_one() 
     attention
         .apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
-    let key = key(AttentionRule::PendingApproval, "req-1");
+    let key = key(&attention, AttentionRule::PendingApproval, "req-1");
     for index in 0..MAX_RETAINED_ACTORS {
         attention
             .acknowledge(
@@ -2305,7 +2314,7 @@ fn a_page_that_continues_after_a_key_the_inbox_no_longer_holds_is_refused() {
     attention
         .apply(&approval(1, 1_000, "req-1"), reading(0))
         .expect("the store records the decision");
-    let gone = key(AttentionRule::PendingApproval, "req-gone");
+    let gone = key(&attention, AttentionRule::PendingApproval, "req-gone");
     let refused = attention.read(
         &actor("local:501"),
         &AttentionReadParams {
@@ -2405,6 +2414,7 @@ fn a_key_carries_none_of_the_text_the_condition_came_from() {
     assert_eq!(
         command_key,
         key(
+            &attention,
             AttentionRule::CommandFailed,
             &format!("{}|{secret}", session(1))
         )
@@ -2509,7 +2519,7 @@ fn a_decision_no_consumer_has_settled_is_never_let_go_of() {
     attention
         .apply(&notice(1, 1_000, "the first notice", false), reading(0))
         .expect("the store records the decision");
-    let held = notice_key("the first notice");
+    let held = notice_key(&attention, "the first notice");
     assert_eq!(attention.awaiting_delivery(), 1);
     let bound = MAX_RETAINED_ATTENTION_ITEMS;
     for sequence in 2..=bound + 10 {
@@ -2551,7 +2561,7 @@ fn a_decision_quiet_hours_are_holding_is_never_let_go_of() {
     attention
         .apply(&notice(1, 1_000, "the first notice", false), reading(0))
         .expect("the store records the decision");
-    let held = notice_key("the first notice");
+    let held = notice_key(&attention, "the first notice");
     assert!(
         whole_inbox(&attention)
             .iter()
@@ -2801,7 +2811,7 @@ fn a_condition_nobody_has_decided_about_yet_is_never_let_go_of() {
         attention.awaiting_delivery(),
         usize::try_from(bound).expect("a small bound")
     );
-    let newest = notice_key("the newest notice");
+    let newest = notice_key(&attention, "the newest notice");
     attention
         .apply(
             &notice(bound + 1, 2_000 + bound, "the newest notice", false),
@@ -2984,7 +2994,7 @@ fn a_settled_decision_is_kept_until_its_window_has_run() {
     // one inside its window would announce the same condition twice in under a minute.
     let mut attention = engine();
     let bound = MAX_RETAINED_ATTENTION_ITEMS;
-    let first = notice_key("the first notice");
+    let first = notice_key(&attention, "the first notice");
     for sequence in 1..=bound + 1 {
         attention
             .apply(
@@ -3265,5 +3275,86 @@ fn an_announcement_stamped_on_an_unprovable_clock_is_not_measured_against_a_prov
     assert!(
         notified(&repeated).is_empty(),
         "and the same condition inside the window is counted rather than announced: {repeated:?}"
+    );
+}
+
+// ----- What a clock nobody could prove may not anchor, continued ------------------------------
+
+#[test]
+fn a_request_stamped_on_an_unprovable_clock_does_not_come_back_five_minutes_old() {
+    // The reminder is measured from the moment the request became pending. A host that could not
+    // prove its clock then cannot measure against that moment once it can: the wait starts again,
+    // which raises the reminder late rather than the instant the session comes back.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    {
+        let mut attention = Attention::open(&path, HostReading::new(0, 1_000, false))
+            .expect("the feature store opens");
+        attention
+            .apply(
+                &event(
+                    AttentionSource::Questions,
+                    1,
+                    0,
+                    EventKind::QuestionPending {
+                        question_id: question(9),
+                        session_id: session(1),
+                        verified: true,
+                        pending_since_ms: TimestampMs::new(1_000),
+                        summary: "which branch?".to_owned(),
+                    },
+                ),
+                HostReading::new(10_000, 1_000, false),
+            )
+            .expect("the store records the decision");
+    }
+    // Two seconds of the machine's own clock later, with the wall clock corrected an hour ahead.
+    let mut reopened = Attention::open(&path, HostReading::new(12_000, 3_603_000, true))
+        .expect("the feature store reopens");
+    let decided = reopened
+        .tick(HostReading::new(12_000, 3_603_000, true))
+        .expect("the store records the decision");
+    assert!(
+        !raised(&decided).contains(&AttentionRule::InputIdleReminder),
+        "two seconds is not five minutes, whatever subtracting one clock from the other says: \
+         {decided:?}"
+    );
+    // And the reminder is still owed, at five minutes from where the wait started again.
+    let late = reopened
+        .tick(HostReading::new(
+            12_000 + IDLE_REMINDER_MS + 1,
+            3_603_000,
+            true,
+        ))
+        .expect("the store records the decision");
+    assert!(
+        raised(&late).contains(&AttentionRule::InputIdleReminder),
+        "the reminder is late rather than lost: {late:?}"
+    );
+}
+
+#[test]
+fn an_escalation_stamped_on_an_unprovable_clock_does_not_come_back_urgent() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    {
+        let mut attention = Attention::open(&path, HostReading::new(0, 1_000, false))
+            .expect("the feature store opens");
+        attention
+            .apply(
+                &adapter_failed(1, 0),
+                HostReading::new(10_000, 1_000, false),
+            )
+            .expect("the store records the decision");
+    }
+    let mut reopened = Attention::open(&path, HostReading::new(12_000, 3_603_000, true))
+        .expect("the feature store reopens");
+    reopened
+        .tick(HostReading::new(12_000, 3_603_000, true))
+        .expect("the store records the decision");
+    assert_eq!(
+        whole_inbox(&reopened)[0].level,
+        AttentionLevel::Notable,
+        "an adapter that failed two seconds ago has not been down for five minutes"
     );
 }

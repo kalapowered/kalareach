@@ -8,10 +8,12 @@
 //! # Where the state lives
 //!
 //! Beside the receipts, in the session's own private journal file, under its own table names and
-//! its own schema version. That is section 24's environment feature store for this worker: a
-//! projection of the journal's events rather than a second copy of them, reconstructed from the
-//! retained events whenever it has to be. A session with no retained journal keeps it for the life
-//! of the process, which is what that session already does with its receipts.
+//! its own schema version. That is section 24's environment feature store for this worker. What it
+//! decided is a projection of the journal's events, reconstructed from the retained events
+//! whenever it has to be; what people and clients put there - the acknowledgements, the revisions,
+//! the visits and their views, the quiet-hours window - is a record in its own right that no
+//! replay restores. A session with no retained journal keeps all of it for the life of the
+//! process, which is what that session already does with its receipts.
 //!
 //! # Which clock
 //!
@@ -63,11 +65,11 @@ pub const MAX_ZONE_LEN: usize = 64;
 /// dispatched rather than failing to store afterwards.
 pub const MAX_STORED_COUNTER: u64 = i64::MAX as u64;
 
-/// How many retained records one maintenance pass takes from each source.
+/// How many retained records one page takes from each source.
 ///
-/// A pass is bounded so a session that has been running for a week does not read its whole history
-/// on the tick after a restart. What is left is taken on the next pass, and the cursor is what says
-/// where that is.
+/// A page is bounded so a session that has been running for a week does not read its whole history
+/// in one read. A pass takes as many pages as it needs, up to its own bound; what is left after
+/// that is taken on the next pass, and the cursor is what says where that is.
 pub const PAGE: usize = 512;
 
 /// Returns the one line a refusal names a review subject by.
@@ -203,6 +205,22 @@ impl Attention {
         self.locked()?
             .read(actor, params, reading(time), content)
             .map_err(translate)
+    }
+
+    /// Returns the key one rule and one subject land on in this session's store.
+    ///
+    /// The derivation is under a secret of that store's, so a producer names an item by asking
+    /// rather than by deriving one of its own.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the engine cannot be reached.
+    pub fn key_for(
+        &self,
+        rule: kr_protocol::attention::AttentionRule,
+        subject: &str,
+    ) -> Result<kr_protocol::attention::AttentionKey> {
+        Ok(self.locked()?.key_for(rule, subject))
     }
 
     /// Returns how far the engine has read one retained source.

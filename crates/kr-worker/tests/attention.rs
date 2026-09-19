@@ -765,10 +765,13 @@ async fn a_question_in_the_ledger_becomes_pending_input_when_the_host_reads_its_
     assert!(item.trusted);
     assert_eq!(
         item.key,
-        kr_attention::key::attention_key(
-            AttentionRule::PendingInput,
-            &created.question.question_id.to_string()
-        ),
+        host.service
+            .attention()
+            .key_for(
+                AttentionRule::PendingInput,
+                &created.question.question_id.to_string()
+            )
+            .expect("the engine names its own items"),
         "and it is keyed on the question it is about, by derivation rather than by name"
     );
     assert!(
@@ -1100,10 +1103,13 @@ async fn a_question_answered_inside_a_backlog_owes_no_reminder_when_the_host_cat
     assert_eq!(waiting.len(), 1, "only the open request is waiting");
     assert_eq!(
         waiting[0].key,
-        kr_attention::key::attention_key(
-            AttentionRule::PendingInput,
-            &open.question.question_id.to_string()
-        )
+        host.service
+            .attention()
+            .key_for(
+                AttentionRule::PendingInput,
+                &open.question.question_id.to_string()
+            )
+            .expect("the engine names its own items")
     );
     assert!(
         !read

@@ -45,7 +45,6 @@ use kr_protocol::ids::{ActorId, QuestionId, SessionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
 use crate::event::{EventKind, SourceEvent};
-use crate::key;
 use crate::rule::rule;
 use crate::time::{Elapsed, HostReading, MS_IN_MINUTE};
 
@@ -91,6 +90,13 @@ pub struct Item {
     pub notification: NotificationState,
     /// When the last announcement was decided, when there has been one.
     pub last_notified_ms: Option<TimestampMs>,
+    /// Whether the clock was proved when this item's own moments were stamped.
+    ///
+    /// [`Item::first_seen_ms`] is what an interval measured against the present starts from, and a
+    /// host that could not prove its clock when it consumed the event cannot say what that moment
+    /// means on a clock it can prove later. So the two are kept together: an age is measured only
+    /// when both ends were taken on a clock somebody could vouch for, and starts again otherwise.
+    pub anchor_wall_proven: bool,
     /// Whether the clock that stamped [`Item::last_notified_ms`] could be proved at the time.
     ///
     /// A host that cannot prove its wall clock still stamps the moment it read, because the
@@ -288,6 +294,12 @@ pub struct PendingInput {
     pub waited: Elapsed,
     /// Whether the reminder has already been raised for this request.
     pub reminded: bool,
+    /// Whether the clock was proved when [`PendingInput::pending_since_ms`] was taken.
+    ///
+    /// The five-minute reminder is measured from that moment, so a host that could not prove its
+    /// clock then cannot measure against it once it can. The wait starts again instead, which
+    /// raises the reminder late rather than at once.
+    pub anchor_wall_proven: bool,
 }
 
 /// The attention engine.
@@ -301,6 +313,7 @@ pub struct Engine {
     quiet: Option<QuietHours>,
     dropped: u64,
     next_announcement: u64,
+    keys: crate::key::KeySecret,
 }
 
 /// Returns `text` clipped to the bound one summary carries, on a character boundary.
@@ -373,6 +386,21 @@ impl Engine {
     #[must_use]
     pub const fn dropped(&self) -> u64 {
         self.dropped
+    }
+
+    /// Returns the key one rule and one subject land on in this store.
+    ///
+    /// It is derived under the store's own secret, so a caller cannot work one out and a host that
+    /// holds an item can always name it again.
+    #[must_use]
+    pub fn key_for(&self, rule: AttentionRule, subject: &str) -> AttentionKey {
+        self.keys.attention_key(rule, subject)
+    }
+
+    /// Returns the secret this store derives its keys under, for the store to write down.
+    #[must_use]
+    pub const fn key_secret(&self) -> crate::key::KeySecret {
+        self.keys
     }
 
     /// Returns the highest announcement identity this store has handed out.
@@ -687,15 +715,18 @@ impl Engine {
             .values()
             .filter_map(|item| item.pending_handoff)
             .fold(restored.next_announcement, u64::max);
+        self.keys = restored.keys;
     }
 
     /// Re-anchors every interval at `reading`, from the wall-clock moments the store kept.
     ///
     /// The continuous clock restarts with the machine, so the durable half of an interval is the
-    /// moment it started. A host that can prove its wall clock keeps every interval whose anchor
-    /// was also stamped on a proved clock, including one that is already overdue. Every other
-    /// interval starts again, which is the conservative answer rather than arithmetic across two
-    /// readings that are not on the same scale.
+    /// moment it started. An interval is measured again only when both ends were taken on a clock
+    /// somebody could prove: this reading, and the reading that stamped the anchor. That keeps an
+    /// interval exactly where it was, including one already overdue, whenever it can be trusted,
+    /// and starts every other one again rather than subtracting two readings that are not on the
+    /// same scale. Starting again makes a reminder late; the arithmetic would make it immediate,
+    /// which is the failure that matters.
     pub(crate) fn reanchor(&mut self, reading: HostReading) {
         let since = |recorded: TimestampMs| {
             if reading.wall_proven {
@@ -705,7 +736,15 @@ impl Engine {
             }
         };
         for item in self.items.values_mut() {
-            item.age = Elapsed::already(since(item.first_seen_ms), reading);
+            let anchored = item.anchor_wall_proven;
+            item.age = Elapsed::already(
+                if anchored {
+                    since(item.first_seen_ms)
+                } else {
+                    0
+                },
+                reading,
+            );
             // Both ends of the interval have to be on a clock somebody can vouch for. An anchor
             // stamped while this host could not prove its clock is not one, whatever the clock
             // says now, so that interval starts again rather than being measured against it.
@@ -715,7 +754,15 @@ impl Engine {
                 .map(|at| Elapsed::already(if announced { since(at) } else { 0 }, reading));
         }
         for pending in self.pending_inputs.values_mut() {
-            pending.waited = Elapsed::already(since(pending.pending_since_ms), reading);
+            let anchored = pending.anchor_wall_proven;
+            pending.waited = Elapsed::already(
+                if anchored {
+                    since(pending.pending_since_ms)
+                } else {
+                    0
+                },
+                reading,
+            );
         }
     }
 
@@ -795,6 +842,7 @@ impl Engine {
                         pending_since_ms: *pending_since_ms,
                         waited: Elapsed::already(waited, reading),
                         reminded: false,
+                        anchor_wall_proven: reading.wall_proven,
                     },
                 );
                 self.raise(
@@ -967,7 +1015,7 @@ impl Engine {
     }
 
     fn raise(&mut self, raise: Raise, reading: HostReading, mode: Mode) -> Vec<Outcome> {
-        let key = key::attention_key(raise.id, &raise.subject);
+        let key = self.keys.attention_key(raise.id, &raise.subject);
         let policy = rule(raise.id);
         let summary = clip_summary(&raise.summary);
         let mut outcomes = Vec::new();
@@ -1025,6 +1073,7 @@ impl Engine {
             first_seen_ms: raise.at_ms,
             last_seen_ms: raise.at_ms,
             notification: NotificationState::Pending,
+            anchor_wall_proven: reading.wall_proven,
             last_notified_ms: None,
             announced_wall_proven: false,
             announced_level: None,
@@ -1169,7 +1218,7 @@ impl Engine {
     /// quiet hours defer an announcement about something outstanding, and nothing here is
     /// outstanding any more.
     fn resolve(&mut self, id: AttentionRule, subject: &str) -> Vec<Outcome> {
-        let key = key::attention_key(id, subject);
+        let key = self.keys.attention_key(id, subject);
         if self.items.remove(&key).is_none() {
             return Vec::new();
         }
@@ -1294,4 +1343,5 @@ pub(crate) struct Restored {
     pub(crate) quiet: Option<QuietHours>,
     pub(crate) dropped: u64,
     pub(crate) next_announcement: u64,
+    pub(crate) keys: crate::key::KeySecret,
 }

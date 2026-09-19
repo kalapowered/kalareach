@@ -1289,10 +1289,12 @@ suppresses the owner's delivery rather than one actor's.
 
 ### Review, and what it does not do
 
-A version only goes forward. A record of a turn or a change set at a version the host has already
-reached is a record arriving late rather than new review work: it moves the source's cursor, so
-what follows it is not read as a range retention took, and it raises nothing, reopens no completed
-review and is not a change since anybody's visit.
+A version only goes forward, and each version an event names is weighed on its own. A turn at a
+version the host has already reached is a record arriving late rather than new review work: it
+moves the source's cursor, so what follows it is not read as a range retention took, and it raises
+nothing, reopens no completed review and is not a change since anybody's visit. A change set named
+beside that turn is weighed separately, so one arriving at a version the host has not seen is
+recorded, is review work again, and is a change since a visit, whatever the turn beside it said.
 
 A review acknowledgement records that one actor read one version of one subject: a completed turn,
 or a captured change set. It approves no command, applies no patch and changes no Git state.

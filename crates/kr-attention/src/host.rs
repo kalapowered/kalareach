@@ -45,7 +45,6 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 use crate::engine::{Announcement, Content, Engine, Outcome, Restored};
 use crate::error::Result;
 use crate::event::{EventKind, SourceEvent};
-use crate::key;
 use crate::review::Reviews;
 use crate::store::{Store, StoredState};
 use crate::time::HostReading;
@@ -109,6 +108,7 @@ impl Attention {
             quiet: stored.quiet,
             dropped: stored.dropped,
             next_announcement: stored.next_announcement,
+            keys: stored.keys,
         });
         engine.reanchor(reading);
         let mut reviews = Reviews::new();
@@ -169,6 +169,20 @@ impl Attention {
             consume(state, event, reading, false, &mut outcomes);
             outcomes
         })
+    }
+
+    /// Returns the key one rule and one subject land on in this session's store.
+    ///
+    /// A producer that wants to name an item it raised asks here rather than deriving one of its
+    /// own: the derivation is under a secret of this store's, which is what stops a reader served
+    /// the record without the session's text working the key out from a guess at the text.
+    #[must_use]
+    pub fn key_for(
+        &self,
+        rule: kr_protocol::attention::AttentionRule,
+        subject: &str,
+    ) -> AttentionKey {
+        self.state.engine.key_for(rule, subject)
     }
 
     /// Returns the continuous reading the next timer is due at.
@@ -384,7 +398,7 @@ impl Attention {
                     turn_id,
                 } = subject
             {
-                let key = key::attention_key(
+                let key = state.engine.key_for(
                     AttentionRule::ReviewReady,
                     &format!("{session_id}|{turn_id}"),
                 );
@@ -746,6 +760,7 @@ fn snapshot(state: &State) -> StoredState {
         gaps: state.engine.gaps().to_vec(),
         dropped: state.engine.dropped(),
         next_announcement: state.engine.next_announcement(),
+        keys: state.engine.key_secret(),
         pending_inputs: state.engine.pending_inputs().clone(),
         quiet: state.engine.quiet_hours().cloned(),
         subjects: state

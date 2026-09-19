@@ -2012,10 +2012,12 @@ impl WorkerService {
 
     /// Returns how much of the retained content this caller is served.
     ///
-    /// A local caller is this operating-system user, whose own session it is. A caller the daemon
-    /// forwarded holds a grant, and section 10 narrows retained content to what that grant asked
-    /// for; this host cannot narrow a grant's lower bound to an item's text, so it serves the
-    /// host's own record without it rather than more than the grant allows.
+    /// A caller that arrived over this session's own socket is this operating-system user, whose
+    /// session it is. A caller that arrived from anywhere else reached the host through a grant,
+    /// and section 10 narrows retained content to what that grant asked for; this host cannot
+    /// narrow a grant's lower bound to an item's text, so it serves its own record without the
+    /// text rather than more than the grant allows. What is tested is the ingress, not the grant:
+    /// a caller the daemon forwarded over the local socket is served the whole record.
     const fn attention_content(caller: &Caller) -> kr_attention::Content {
         if caller.is_remote() {
             kr_attention::Content::Narrowed
