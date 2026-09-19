@@ -88,6 +88,21 @@ const MARKER: &str = "kalareach-ran";
 /// The command that produces it.
 const MARKER_COMMAND: &str = "printf 'kala%s-ran\n' reach\n";
 
+/// What a second command prints, and the command that prints it.
+///
+/// The resume below is only worth checking from a position the session actually reached, and a
+/// client that has applied nothing but the *first* chunk of a stream holds position zero honestly.
+/// So something is produced, waited for and applied before the position that travels is taken: the
+/// first command's bytes are then behind the second command's chunk, and the cursor the client
+/// carries is a resume rather than a restart. Which shell the host has decides nothing here. On
+/// macOS `/bin/sh` is bash and prints a startup diagnostic before a device ever subscribes; on
+/// Linux it is dash, which with an empty `PS1` prints nothing at all and leaves the subscription
+/// at zero.
+const SECOND_MARKER: &str = "kalareach-again";
+
+/// The command that produces it.
+const SECOND_MARKER_COMMAND: &str = "printf 'kala%s-again\n' reach\n";
+
 /// A host tree on the internal disk, with the worker beside it.
 struct Host {
     /// The tree, held in an option so cleanup can keep it rather than remove it.
@@ -992,11 +1007,13 @@ async fn observe(
         }
         let event: OutputEvent = notification.payload.to_typed().expect("an output event");
         seen.push_str(&String::from_utf8_lossy(event.bytes.as_slice()));
-        // The event's own cursor, never a position derived from how many bytes it carried. Every
-        // chunk this attachment receives is a rendering of the screen at the cursor it names -
-        // which is what attaching separately to watch and to type buys - so the cursor *is* the
-        // position applying the chunk reaches, and adding the rendering's length would claim a
-        // position the session never produced.
+        // The event's own cursor, never a position derived from how many bytes it carried. One
+        // event type carries two things: a span of the stream, whose cursor is where its bytes
+        // begin, and a rendering of the canonical screen, whose cursor is the state it describes.
+        // Adding a length is right for the first and claims a position the session never produced
+        // for the second, so neither is added here. The start cursor is a position this consumer
+        // has certainly reached, and a resume from it is served the chunk again rather than served
+        // nothing - which is the safe direction for a terminal to be wrong in.
         session
             .applied_content(&output_stream(), event.cursor)
             .await;
@@ -1147,6 +1164,23 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     .await;
     assert!(seen.contains(MARKER));
 
+    // A second command, waited for like the first, on the lease the first one took. It is what
+    // puts the first command's bytes behind the position the client carries below, whatever the
+    // host's shell printed before any of this started.
+    let mut events = session.events();
+    session
+        .write_input(&InputWriteParams {
+            session_id,
+            attachment_id: attached.typing,
+            epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
+            sequence: kr_protocol::ids::InputSequence::new(1),
+            bytes: kr_protocol::scalars::Bytes::new(SECOND_MARKER_COMMAND.as_bytes().to_vec()),
+        })
+        .await
+        .expect("the second command is accepted");
+    let seen = observe(&session, &mut events, SECOND_MARKER).await;
+    assert!(seen.contains(SECOND_MARKER));
+
     // Something is typed that the device will *not* wait for, and then its connection is lost.
     // What the session produces next happens while the device is away, which is what makes the
     // restoration on the next connection worth checking.
@@ -1156,11 +1190,11 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
             session_id,
             attachment_id: attached.typing,
             epoch: kr_protocol::ids::InputLeaseEpoch::new(1),
-            sequence: kr_protocol::ids::InputSequence::new(1),
+            sequence: kr_protocol::ids::InputSequence::new(2),
             bytes: kr_protocol::scalars::Bytes::new(away.as_bytes().to_vec()),
         })
         .await
-        .expect("the second batch is accepted");
+        .expect("the third batch is accepted");
 
     // The control stream is lost. What the client carries across is the content position, not the
     // previous connection's event sequences.
@@ -1218,7 +1252,10 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
         .cursors
         .applied_cursor(&output_stream())
         .expect("the client holds a position");
-    assert!(resumed_from.get() > 0);
+    assert!(
+        resumed_from.get() > 0,
+        "the position that travels is one the session reached, not the start of its stream"
+    );
     assert_eq!(
         carried.cursors.received(&output_stream()),
         None,
