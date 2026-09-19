@@ -287,3 +287,136 @@ fn no_command_is_a_shell_a_path_or_a_method_the_page_chooses() {
         }
     }
 }
+
+/* ---- The mobile targets ---------------------------------------------------------------------
+ *
+ * A phone is the same boundary as a desktop window with one addition: the file picker, which is
+ * how a WebView reaches the camera, the photo library and the file browser on both platforms. The
+ * tests below hold the mobile capability to that addition and nothing else, and hold the mobile
+ * bundle blocks to naming a platform floor without inventing an identity only a release can have.
+ */
+
+fn mobile_capabilities() -> serde_json::Value {
+    read(&crate_root().join("capabilities/mobile.json"))
+}
+
+/// The permissions a capability file grants, whether each is named plainly or with a scope.
+fn granted(capabilities: &serde_json::Value) -> Vec<String> {
+    capabilities["permissions"]
+        .as_array()
+        .expect("the capability file lists its permissions")
+        .iter()
+        .map(|permission| match permission {
+            serde_json::Value::String(name) => name.clone(),
+            other => other["identifier"]
+                .as_str()
+                .expect("a permission names itself")
+                .to_owned(),
+        })
+        .collect()
+}
+
+#[test]
+fn the_mobile_capability_applies_only_to_the_two_mobile_platforms() {
+    let capabilities = mobile_capabilities();
+    let platforms: Vec<String> = capabilities["platforms"]
+        .as_array()
+        .expect("a capability that is not for every platform names the ones it is for")
+        .iter()
+        .map(|platform| platform.as_str().expect("a platform name").to_owned())
+        .collect();
+    assert_eq!(platforms, vec!["iOS".to_owned(), "android".to_owned()]);
+    assert_eq!(
+        capabilities["windows"],
+        serde_json::json!(["main"]),
+        "the grant is to the application's own window and to no other"
+    );
+    assert_eq!(
+        capabilities["local"],
+        serde_json::Value::Bool(true),
+        "the grant is to the bundled interface, never to remote content"
+    );
+}
+
+#[test]
+fn the_mobile_capability_is_no_wider_than_the_desktop_one() {
+    let mobile = granted(&mobile_capabilities());
+
+    for forbidden in ["shell:", "fs:", "http:", "process:", "os:"] {
+        assert!(
+            !mobile.iter().any(|name| name.starts_with(forbidden)),
+            "the mobile interface is granted {forbidden}, which the boundary does not permit"
+        );
+    }
+    assert!(
+        !mobile.iter().any(|name| name == "core:default"),
+        "the core default set includes emitting events, which is more than a phone needs either"
+    );
+    assert!(
+        !mobile
+            .iter()
+            .any(|name| name.starts_with("core:event:allow-emit")),
+        "a page that can emit an event can tell the backend something happened that did not"
+    );
+    // The one addition, and the reason for the file: a picker is the platform's own camera, photo
+    // library and file browser, and it hands the page what the person chose rather than a path.
+    assert_eq!(
+        mobile,
+        vec!["dialog:allow-open".to_owned()],
+        "the mobile grant is the file picker and nothing else"
+    );
+}
+
+#[test]
+fn the_mobile_builds_carry_the_interface_in_the_bundle() {
+    let configuration = configuration();
+    // The same fact the desktop build states, restated for the phones: section 13 forbids a
+    // production application loading its own code from the managed service, and the one place
+    // that could happen is the configuration that says where the interface comes from.
+    let dist = configuration["build"]["frontendDist"]
+        .as_str()
+        .expect("the build names where the interface comes from");
+    assert!(!dist.starts_with("http"));
+    for platform in ["iOS", "android"] {
+        let block = &configuration["bundle"][platform];
+        assert!(
+            block.is_object(),
+            "the {platform} bundle block states this build's platform floor"
+        );
+        assert!(
+            block["frontendDist"].is_null(),
+            "no platform may point the interface somewhere else"
+        );
+    }
+}
+
+#[test]
+fn the_mobile_bundle_names_a_platform_floor_and_no_release_identity() {
+    let configuration = configuration();
+    assert_eq!(
+        configuration["bundle"]["iOS"]["minimumSystemVersion"],
+        serde_json::json!("14.0")
+    );
+    assert_eq!(
+        configuration["bundle"]["android"]["minSdkVersion"],
+        serde_json::json!(24)
+    );
+    // A signing identity, a development team and a provisioning profile belong to whoever holds
+    // the accounts, not to this repository. Inventing one here would produce a build that looks
+    // signed and is not.
+    for invented in [
+        "developmentTeam",
+        "provisioningProfile",
+        "signingIdentity",
+        "certificate",
+    ] {
+        assert!(
+            configuration["bundle"]["iOS"][invented].is_null(),
+            "the iOS bundle block states {invented}, which is a release decision"
+        );
+        assert!(
+            configuration["bundle"]["android"][invented].is_null(),
+            "the Android bundle block states {invented}, which is a release decision"
+        );
+    }
+}

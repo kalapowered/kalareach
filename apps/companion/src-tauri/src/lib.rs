@@ -46,6 +46,10 @@ pub use state::AppState;
 ///
 /// Panics when the window cannot be created, which is not a condition the application can
 /// continue past.
+///
+/// iOS and Android do not run a binary of their own: the system starts the process and calls into
+/// this library, so the same function that opens the desktop window is the mobile entry point.
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())

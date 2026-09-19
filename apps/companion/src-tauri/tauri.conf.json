@@ -50,6 +50,12 @@
     "macOS": {
       "minimumSystemVersion": "13.0"
     },
+    "iOS": {
+      "minimumSystemVersion": "14.0"
+    },
+    "android": {
+      "minSdkVersion": 24
+    },
     "linux": {
       "deb": {
         "depends": []

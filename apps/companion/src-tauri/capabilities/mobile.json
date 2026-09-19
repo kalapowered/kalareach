@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "mobile",
+  "description": "What the bundled interface may reach on a phone, beyond what every platform grants it: one file picker, which is how the platform's camera, photo library and file browser are reached. Nothing here is a shell, a filesystem path or a general HTTP request, and the page still may not emit an event.",
+  "platforms": ["iOS", "android"],
+  "windows": ["main"],
+  "local": true,
+  "permissions": ["dialog:allow-open"]
+}
