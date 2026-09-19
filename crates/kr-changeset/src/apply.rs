@@ -721,20 +721,24 @@ fn proposal(
         change_set_id: proposal.change_set_id,
         version: proposal.version,
     };
-    service.locked()?.begin_apply(&ApplyRow {
-        action_id: order.action_id,
-        change_set_id: order.version.change_set_id,
-        version: order.version.version,
-        workspace_id: order.workspace_id,
-        destination: order.destination,
-        outcome: None,
-        before_version: Some((before.change_set_id, before.version)),
-        after_version: None,
-        staged_name: None,
-        detail: "a proposal writes nothing".to_owned(),
-        started_at_ms: now,
-        decided_at_ms: None,
-    })?;
+    service.locked()?.begin_apply(
+        &ApplyRow {
+            action_id: order.action_id,
+            change_set_id: order.version.change_set_id,
+            version: order.version.version,
+            workspace_id: order.workspace_id,
+            destination: order.destination,
+            outcome: None,
+            before_version: Some((before.change_set_id, before.version)),
+            after_version: None,
+            staged_name: None,
+            detail: "a proposal writes nothing".to_owned(),
+            started_at_ms: now,
+            decided_at_ms: None,
+        },
+        // A proposal writes to no working tree, so there is no plan of destination paths to record.
+        &[],
+    )?;
     // `applied` is every requested operation carried. A proposal that could not carry one is not
     // an applied change, whatever it did carry.
     let (outcome, detail) = if unresolved.is_empty() {
@@ -919,32 +923,34 @@ fn direct(
     let before = capture_destination(service, order, None, "before")?;
     let now = kr_ipc::now_ms();
     let staged_name = format!("apply-{}", order.action_id);
-    service.locked()?.begin_apply(&ApplyRow {
-        action_id: order.action_id,
-        change_set_id: order.version.change_set_id,
-        version: order.version.version,
-        workspace_id: order.workspace_id,
-        destination: order.destination,
-        outcome: None,
-        before_version: Some((before.change_set_id, before.version)),
-        after_version: None,
-        staged_name: Some(staged_name.clone()),
-        detail: "the destination was as the request expected and the content is being staged"
-            .to_owned(),
-        started_at_ms: now,
-        decided_at_ms: None,
-    })?;
+    // The header and **every path this apply plans** go in together, before anything is attempted,
+    // so a daemon that dies half way through leaves a row for each. A row that still says
+    // `planned` means this host did not establish what became of that path, which is not the same
+    // as saying it did not write it; a run that stops on its own settles the ones it never
+    // reached as skipped.
+    let planned: Vec<String> = operations.iter().map(|(path, _)| path.clone()).collect();
+    service.locked()?.begin_apply(
+        &ApplyRow {
+            action_id: order.action_id,
+            change_set_id: order.version.change_set_id,
+            version: order.version.version,
+            workspace_id: order.workspace_id,
+            destination: order.destination,
+            outcome: None,
+            before_version: Some((before.change_set_id, before.version)),
+            after_version: None,
+            staged_name: Some(staged_name.clone()),
+            detail: "the destination was as the request expected and the content is being staged"
+                .to_owned(),
+            started_at_ms: now,
+            decided_at_ms: None,
+        },
+        &planned,
+    )?;
     // Staged and validated: every byte is written into a private directory of this host's own and
     // read back against its digest, so a recoverable copy of what this apply meant to install
     // exists before the destination is touched.
     stage(service, &staged_name, &operations)?;
-    // Every path this apply plans is recorded **before any of them is attempted**, so a daemon
-    // that dies half way through leaves a row for each. A row that still says `planned` means this
-    // host did not establish what became of that path, which is not the same as saying it did not
-    // write it; a run that stops on its own settles the ones it never reached as skipped.
-    for (path, _) in &operations {
-        service.locked()?.plan_path(order.action_id, path)?;
-    }
     // Once installation can begin, every exit goes through the outcome: a failure after a write
     // that returned early would leave a caller with an ordinary error and no record of what had
     // already landed.
@@ -967,8 +973,18 @@ fn direct(
         Err(error) => {
             // Whatever went wrong, what this host established about each path is what its own
             // row says, and the paths it confirmed it changed are read back from those rows
-            // rather than forgotten.
-            let rows = service.locked()?.progress(order.action_id)?;
+            // rather than forgotten. A journal that cannot be read either leaves nothing to say
+            // what happened, which is what `OUTCOME_UNKNOWN` is for.
+            let rows = read_progress(service, order.action_id).map_err(|store| {
+                ChangeSetError::OutcomeUnknown {
+                    detail: format!(
+                        "this apply stopped ({error}) and this host could not read back what it \
+                         had recorded about each path ({store}), so it cannot say what the \
+                         destination holds"
+                    )
+                    .into(),
+                }
+            })?;
             let known: Vec<String> = rows
                 .iter()
                 .filter(|row| row.state == PathProgressState::Written)
@@ -999,7 +1015,19 @@ fn direct(
             after_digest: None,
             detail: "the apply stopped before it reached this path".to_owned(),
         };
-        service.locked()?.settle_path(order.action_id, &row)?;
+        // A journal that refuses this leaves the row saying `planned`, which is what a recovery
+        // reads and what this answer then says too, rather than turning a whole apply into an
+        // ordinary error after it has written to the destination.
+        if let Err(error) = settle_one(service, order.action_id, &row) {
+            stopped = Some((
+                ApplyOutcomeClass::UncertainOutcome,
+                format!(
+                    "this apply could not record what it did not reach, so its own rows are \
+                     what is known and no more: {error}"
+                ),
+            ));
+            break;
+        }
         progress.push(wire_progress(&row));
     }
     let after = match capture_destination(service, order, Some(before.change_set_id), "after") {
@@ -1054,15 +1082,29 @@ fn direct(
         }
     });
     let now = kr_ipc::now_ms();
-    service.locked()?.settle_apply(
-        order.action_id,
-        outcome,
-        after
-            .as_ref()
-            .map(|after| (after.change_set_id, after.version)),
-        &detail,
-        now,
-    )?;
+    // The destination has already been written to. A journal that will not record the outcome is
+    // therefore not an ordinary failure of the request: the apply happened and no record of it
+    // exists, which is exactly what a caller must be told rather than being handed an error that
+    // reads like nothing was done.
+    if let Err(error) = service.locked().and_then(|mut store| {
+        store.settle_apply(
+            order.action_id,
+            outcome,
+            after
+                .as_ref()
+                .map(|after| (after.change_set_id, after.version)),
+            &detail,
+            now,
+        )
+    }) {
+        return Err(ChangeSetError::OutcomeUnknown {
+            detail: format!(
+                "this apply wrote to the destination and this host could not record what it came \
+                 to, so its outcome is not established: {error}"
+            )
+            .into(),
+        });
+    }
     let conflicted: Vec<PathConflict> = progress
         .iter()
         .filter(|row| row.state == PathProgressState::Conflicted)
@@ -1199,6 +1241,16 @@ fn operation_for(
             }
         }
     }
+}
+
+/// Reads back every progress row one apply recorded.
+fn read_progress(service: &ChangeSetService, action_id: ActionId) -> Result<Vec<ProgressRow>> {
+    service.locked()?.progress(action_id)
+}
+
+/// Records one path's outcome.
+fn settle_one(service: &ChangeSetService, action_id: ActionId, row: &ProgressRow) -> Result<()> {
+    service.locked()?.settle_path(action_id, row)
 }
 
 /// Runs one apply's operations, recording each one's outcome as it goes.
@@ -1448,12 +1500,25 @@ fn install(
                 return Ok(Installed::Unresolved(error.to_string()));
             }
             here.sync()?;
-            return match here.probe(&leaf_name) {
-                Err(kr_transfer::Escape::NotFound { .. }) => Ok(Installed::Written(digest_of(&[]))),
-                Ok(_) => Ok(Installed::Unresolved(
-                    "the path is still there after this host removed it".to_owned(),
+            match here.probe(&leaf_name) {
+                Err(kr_transfer::Escape::NotFound { .. }) => {}
+                Ok(_) => {
+                    return Ok(Installed::Unresolved(
+                        "the path is still there after this host removed it".to_owned(),
+                    ));
+                }
+                Err(error) => return Ok(Installed::Unresolved(error.to_string())),
+            }
+            // And the path the request names resolves to nothing either. The handle this host
+            // removed through could belong to a directory somebody moved aside while this apply
+            // was running, and a removal confirmed only there would be a claim about another tree.
+            return match resolved_again(repository, path)? {
+                None => Ok(Installed::Written(digest_of(&[]))),
+                Some(_) => Ok(Installed::Unresolved(
+                    "the path this request names still resolves to a file: a directory above it \
+                     was moved while this apply was running"
+                        .to_owned(),
                 )),
-                Err(error) => Ok(Installed::Unresolved(error.to_string())),
             };
         }
         Operation::Install { bytes, executable } => (bytes, *executable),
@@ -1499,6 +1564,20 @@ fn install(
         if let Some(act) = before_rename {
             act(path);
         }
+        // The name this host is about to rename has to still be the file it created. A name
+        // somebody replaced between the creation and here is a file this host neither wrote nor
+        // checked, and publishing it would put content in the destination that this apply never
+        // validated.
+        match here.open_read(&temporary, ObjectPolicy::ReadableFile) {
+            Ok(found) if found.identity() == staged_identity => {}
+            _ => {
+                return Ok(Installed::Unresolved(
+                    "the name this host staged through is not the file it created any more, so \
+                     it published nothing"
+                        .to_owned(),
+                ));
+            }
+        }
         here.rename_into(&temporary, &here, &leaf_name)?;
         here.sync()?;
         // What actually landed, read **twice**: once through the handle this host published
@@ -1515,12 +1594,16 @@ fn install(
                         .to_owned(),
                 ))
             }
+            // The path this request names has to resolve to **the object this host renamed into
+            // place**, not merely to something holding the same bytes: a rename keeps the file's
+            // identity, so this is one comparison that covers the content, the mode and which
+            // directory the path actually reaches.
             Some(landed) if landed == expected => match resolved_again(repository, path)? {
-                Some(again) if again == expected => Ok(Installed::Written(landed)),
+                Some(again) if again == staged_identity => Ok(Installed::Written(landed)),
                 _ => Ok(Installed::Unresolved(
                     "the content is in the directory this host published through, and the path \
-                     this request names does not resolve to it: a directory above it was moved \
-                     while this apply was running"
+                     this request names does not resolve to the object it published: a directory \
+                     above it was moved while this apply was running"
                         .to_owned(),
                 )),
             },
@@ -1552,10 +1635,27 @@ fn install(
 /// level, and this asks the working tree what the whole path names now. Two resolutions agreeing
 /// is what turns a directory moved out from under the publication into a refusal rather than a
 /// success about somewhere else.
-fn resolved_again(repository: &OpenedRepository, path: &str) -> Result<Option<Digest256>> {
-    match read_working_tree(repository, path)? {
-        WorkingRead::Content { bytes, .. } => Ok(Some(digest_of(&bytes))),
-        _ => Ok(None),
+fn resolved_again(
+    repository: &OpenedRepository,
+    path: &str,
+) -> Result<Option<kr_transfer::ObjectIdentity>> {
+    let name = RelativeName::parse(path)?;
+    let components = name.components();
+    let Some((leaf, parents)) = components.split_last() else {
+        return Ok(None);
+    };
+    let mut here = clone_handle(repository.work_tree())?;
+    for component in parents {
+        here = match here.subdirectory(&RelativeName::parse(component)?) {
+            Ok(directory) => directory,
+            Err(kr_transfer::Escape::NotFound { .. }) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+    }
+    match here.open_read(&RelativeName::parse(leaf)?, ObjectPolicy::ReadableFile) {
+        Ok(file) => Ok(Some(file.identity())),
+        Err(kr_transfer::Escape::NotFound { .. }) => Ok(None),
+        Err(error) => Err(error.into()),
     }
 }
 
@@ -2244,11 +2344,34 @@ pub fn read_apply(service: &ChangeSetService, action_id: ActionId) -> Result<Dif
             change_set_id: row.change_set_id,
             version: row.version,
         },
-        proposal_version: Nullable(None),
+        // A proposal's own version is the reading it recorded on the far side of the apply, which
+        // is where it was settled. A direct apply's far side is the destination as it stood
+        // afterwards, and there the proposal is not a version at all.
+        proposal_version: Nullable(
+            row.after_version
+                .filter(|_| row.destination == DestinationClass::Proposal)
+                .map(|(change_set_id, version)| VersionRef {
+                    change_set_id,
+                    version,
+                }),
+        ),
         reference: Nullable(None),
         changed_paths: changed,
         unresolved_paths: unresolved,
-        conflicts: Vec::new(),
+        // Rebuilt from the rows rather than left empty: a path this apply found was not what the
+        // request expected recorded that, and a caller reading this answer back is owed it.
+        conflicts: progress
+            .iter()
+            .filter(|entry| entry.state == PathProgressState::Conflicted)
+            .map(|entry| PathConflict {
+                path: entry.path.clone(),
+                expected_worktree_digest: Nullable(None),
+                observed_worktree_digest: Nullable(entry.before_digest),
+                expected_index_object_id: Nullable(None),
+                observed_index_object_id: Nullable(None),
+                detail: entry.detail.clone(),
+            })
+            .collect(),
         progress: progress.iter().map(wire_progress).collect(),
         recovery: RecoveryObjects {
             before_version: Nullable(row.before_version.map(|(change_set_id, version)| {

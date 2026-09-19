@@ -1567,7 +1567,7 @@ impl Store {
     /// # Errors
     ///
     /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
-    pub fn begin_apply(&mut self, row: &ApplyRow) -> Result<()> {
+    pub fn begin_apply(&mut self, row: &ApplyRow, planned: &[String]) -> Result<()> {
         let transaction = self
             .connection
             .transaction()
@@ -1600,6 +1600,24 @@ impl Store {
                 ],
             )
             .map_err(ChangeSetError::store)?;
+        // The whole plan goes in with the header. A daemon that stopped between them would leave
+        // a recovery that could not say which paths the apply was going to touch, and a path with
+        // no row at all is indistinguishable from a path nothing was ever planned for.
+        for path in planned {
+            transaction
+                .execute(
+                    "INSERT OR REPLACE INTO apply_progress
+                       (action_id, path, state, before_digest, after_digest, detail)
+                     VALUES (?1, ?2, ?3, NULL, NULL, ?4)",
+                    params![
+                        uuid_bytes(row.action_id.get()),
+                        path,
+                        progress_text(PathProgressState::Planned),
+                        "this host recorded that it was going to write this path",
+                    ],
+                )
+                .map_err(ChangeSetError::store)?;
+        }
         transaction.commit().map_err(ChangeSetError::store)
     }
 
@@ -2124,23 +2142,24 @@ mod tests {
         let row = version_row(change_set_id, 1);
         store.insert_version(&row, &[]).expect("a version");
         store
-            .begin_apply(&ApplyRow {
-                action_id,
-                change_set_id,
-                version: ChangeSetVersion::new(1),
-                workspace_id: None,
-                destination: DestinationClass::SharedExisting,
-                outcome: None,
-                before_version: None,
-                after_version: None,
-                staged_name: None,
-                detail: "beginning".to_owned(),
-                started_at_ms: TimestampMs::new(1),
-                decided_at_ms: None,
-            })
-            .expect("the apply begins");
-        store.plan_path(action_id, "a.txt").expect("a plan");
-        store.plan_path(action_id, "b.txt").expect("a plan");
+            .begin_apply(
+                &ApplyRow {
+                    action_id,
+                    change_set_id,
+                    version: ChangeSetVersion::new(1),
+                    workspace_id: None,
+                    destination: DestinationClass::SharedExisting,
+                    outcome: None,
+                    before_version: None,
+                    after_version: None,
+                    staged_name: None,
+                    detail: "beginning".to_owned(),
+                    started_at_ms: TimestampMs::new(1),
+                    decided_at_ms: None,
+                },
+                &["a.txt".to_owned(), "b.txt".to_owned()],
+            )
+            .expect("the apply begins with its whole plan");
         let progress = store.progress(action_id).expect("a read");
         assert_eq!(progress.len(), 2);
         assert!(
