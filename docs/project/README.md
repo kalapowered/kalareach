@@ -639,12 +639,16 @@ removes is never opened at all:
 
 1. A repository's own administrative data, and any other repository's whole tree. `.git` in any
    component is refused whatever its case, and so is the directory **this** repository resolves its
-   own data to. Every directory the capture's own readings name is then asked whether it holds a
-   `.git`: one that does is another repository, whose tree this host does not read inside at all,
-   and whose `.git` **file** is read for where that repository keeps its data, which is refused
-   wherever inside the working tree it lands, beside the tree or above it. What is inside would
-   otherwise be that repository's configuration, which holds its remotes and can hold a credential,
-   and its object database, which holds every version of every file in it.
+   own data to. Every path the capture's own readings name, and every directory above it, is then
+   asked whether it holds a `.git`: one that does is another repository, whose tree this host does
+   not read inside at all, and whose `.git` **file** is read for where that repository keeps its
+   data, which is refused wherever inside the working tree it lands, beside the tree or above it.
+   An absolute target this host cannot place inside or outside the tree is an answer it does not
+   have, and the capture is refused rather than taken without it. What is inside would otherwise be
+   that repository's configuration, which holds its remotes and can hold a credential, and its
+   object database, which holds every version of every file in it. What this covers is what a
+   capture reads: a repository in a directory no path of the capture goes near is one the capture
+   does not reach either.
 2. This host's own secret rules: `.env` and its variants, a private key by name or by suffix, a
    credential or authentication file, and everything under `.ssh`, `.gnupg` or `.aws`. No wire field
    turns them off, and the version records that they were applied.
@@ -747,7 +751,9 @@ lives in: a file whose protection is its mode bits alone carries none. A directo
 inside it, so the copy this host stages is asked as well: on Linux that inherited list is taken off
 it, through the copy's own descriptor, before the mode is set, and elsewhere a copy that has one
 ends the operation and the destination is left exactly as it was. Every question about whether a
-file has a list at all is asked of the handle this host holds on that file, never of its name. On a platform whose lists this host does not read, only the mode bits
+file has a list at all is asked of the handle this host holds on that file, never of its name, and
+an answer this host cannot establish refuses the replacement. A platform whose lists it does not
+know how to ask answers that there is none, which leaves the mode bits carried alone. On a platform whose lists this host does not read, only the mode bits
 are carried. **Preserving** a destination's own list is not implemented at all: a destination that
 has one is refused. Content is written byte for
 byte, so a line ending is whatever the version holds.

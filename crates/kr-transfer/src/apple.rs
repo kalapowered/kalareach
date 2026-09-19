@@ -27,15 +27,19 @@ unsafe extern "C" {
 
 /// Returns true when the file behind one descriptor carries an access-control list.
 ///
-/// A file whose protection is its mode bits alone has none, and this platform answers that with a
-/// null list. A list with no entries in it says nothing the mode bits do not, and is not one
-/// either.
+/// A file whose protection is its mode bits alone has none, and this platform says so by handing
+/// back nothing and naming it: the list is *not found*. Nothing else it says means that. A call
+/// that fails for any other reason leaves this host unable to say what protects the file, and the
+/// answer it gives then is the one that stops a caller replacing it.
+///
+/// A list with no entries in it says nothing the mode bits do not, and is not one either.
 pub(crate) fn carries_access_control(fd: BorrowedFd<'_>) -> bool {
     // Safe: the descriptor is borrowed for the whole call, the list is asked for and given back
     // here and nowhere else, and the entry pointer is only ever written by the platform.
     let acl = unsafe { acl_get_fd(fd.as_raw_fd()) };
     if acl.is_null() {
-        return false;
+        let why = std::io::Error::last_os_error();
+        return why.raw_os_error() != Some(libc::ENOENT);
     }
     let mut entry: AclEntry = core::ptr::null_mut();
     let held = unsafe { acl_get_entry(acl, ACL_FIRST_ENTRY, &raw mut entry) } == 0;

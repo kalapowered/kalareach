@@ -1113,20 +1113,21 @@ fn nested_repositories(
         .index
         .keys()
         .chain(reading.differences.keys())
+        .chain(reading.staged.keys())
         .map(String::as_str)
         .chain(reading.status.iter().map(|entry| entry.path.as_str()));
     for path in paths {
         let path = path.trim_end_matches('/');
+        // The path itself as well as every directory above it. A submodule the index records is
+        // one entry with no descendants, and a whole directory the status reported is one entry
+        // too; both are directories this capture names and both can hold a repository's own data.
+        directories.insert(path);
         let mut at = path;
         while let Some((parent, _)) = at.rsplit_once('/') {
             if !directories.insert(parent) {
                 break;
             }
             at = parent;
-        }
-        // A whole directory the status reported is one to ask about itself as well.
-        if path.ends_with('/') || !reading.index.contains_key(path) {
-            directories.insert(path);
         }
     }
     let tree = repository.work_tree();
@@ -1158,7 +1159,7 @@ fn nested_repositories(
         if !matches!(held, kr_transfer::authority::ObjectKind::File) {
             continue;
         }
-        if let Some(target) = administrative_target(tree, &name, directory) {
+        if let Some(target) = administrative_target(tree, &name, directory)? {
             found.insert(target);
         }
     }
@@ -1167,65 +1168,96 @@ fn nested_repositories(
 
 /// Returns where one nested repository's `.git` **file** points, relative to this working tree.
 ///
-/// The line is `gitdir: <path>`, and Git accepts every spelling of one place. Each is resolved
-/// against the directory the file is in, by arithmetic on the path rather than by asking the
-/// filesystem, and answered only when it lands inside this working tree. A target outside it is
-/// one this capture never reaches.
+/// The line is `gitdir: <path>`, and Git accepts every spelling of one place. The target's own
+/// components are joined to the directory the file is in and only then reduced, so a `..` cancels
+/// the directory rather than nothing, and a target that lands outside this working tree is one
+/// this capture never reaches. An absolute target this host cannot place inside or outside the
+/// tree is an answer it does not have, and the capture is refused rather than taken without it.
 fn administrative_target(
     tree: &kr_transfer::AuthorisedDirectory,
     name: &RelativeName,
     directory: &str,
-) -> Option<String> {
+) -> Result<Option<String>> {
     use std::io::Read as _;
 
-    let mut file = tree.open_read(name, ObjectPolicy::ReadableFile).ok()?;
+    let Ok(mut file) = tree.open_read(name, ObjectPolicy::ReadableFile) else {
+        return Ok(None);
+    };
     if file.byte_len() > MAX_GIT_FILE_BYTES {
-        return None;
+        return Ok(None);
     }
     let mut text = String::new();
-    file.handle_mut()
+    if file
+        .handle_mut()
         .take(MAX_GIT_FILE_BYTES)
         .read_to_string(&mut text)
-        .ok()?;
-    let target = text.trim().strip_prefix("gitdir:")?.trim();
+        .is_err()
+    {
+        return Ok(None);
+    }
+    let Some(target) = text.trim().strip_prefix("gitdir:").map(str::trim) else {
+        return Ok(None);
+    };
     if target.is_empty() {
-        return None;
+        return Ok(None);
     }
     let root = tree.display_path();
-    let absolute = std::path::Path::new(target).is_absolute();
-    let resolved = if absolute {
-        lexical(std::path::Path::new(target))
-    } else {
-        let mut parts = lexical(std::path::Path::new(root));
-        parts.extend(lexical(std::path::Path::new(directory)));
-        parts.extend(lexical(std::path::Path::new(target)));
-        lexical_parts(parts)
-    };
     let inside = lexical(std::path::Path::new(root));
-    if resolved.len() <= inside.len() || resolved[..inside.len()] != inside[..] {
-        return None;
+    let absolute = std::path::Path::new(target).is_absolute();
+    // The pieces, joined and only then reduced: reducing the target on its own would throw away a
+    // leading `..` with nothing to cancel, and the answer would name a directory under the nested
+    // tree rather than the one beside it that the target actually points at.
+    let mut parts: Vec<std::ffi::OsString> = if absolute {
+        Vec::new()
+    } else {
+        let mut here = inside.clone();
+        here.extend(components(std::path::Path::new(directory)));
+        here
+    };
+    parts.extend(components(std::path::Path::new(target)));
+    let resolved = lexical_parts(parts);
+    if resolved.len() > inside.len() && resolved[..inside.len()] == inside[..] {
+        let rest: Vec<String> = resolved[inside.len()..]
+            .iter()
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect();
+        return Ok(Some(rest.join("/")));
     }
-    let rest: Vec<String> = resolved[inside.len()..]
-        .iter()
-        .map(|part| part.to_string_lossy().into_owned())
-        .collect();
-    Some(rest.join("/"))
+    if !absolute {
+        // A relative target that reduces to nothing inside the tree points above it, which is
+        // somewhere this capture's own readings never name.
+        return Ok(None);
+    }
+    // An absolute target that does not match this tree's own spelling may still be this tree,
+    // reached through a link or another mount. This host cannot tell, and a capture that might
+    // hold another repository's configuration is not one it takes.
+    Err(ChangeSetError::Unsupported {
+        detail: format!(
+            "a repository nested at {} keeps its own data at a path this host cannot place \
+             inside or outside this working tree, so it did not read the tree at all",
+            kr_project::git::redact(directory)
+        )
+        .into(),
+    })
 }
 
 /// Reduces one path to its components without touching the filesystem.
 fn lexical(path: &std::path::Path) -> Vec<std::ffi::OsString> {
-    lexical_parts(
-        path.components()
-            .map(|part| match part {
-                std::path::Component::Normal(part) => part.to_owned(),
-                std::path::Component::CurDir => std::ffi::OsString::from("."),
-                std::path::Component::ParentDir => std::ffi::OsString::from(".."),
-                std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                    std::ffi::OsString::from("/")
-                }
-            })
-            .collect(),
-    )
+    lexical_parts(components(path))
+}
+
+/// Returns one path's components, with `.`, `..` and a root kept as they are.
+fn components(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+    path.components()
+        .map(|part| match part {
+            std::path::Component::Normal(part) => part.to_owned(),
+            std::path::Component::CurDir => std::ffi::OsString::from("."),
+            std::path::Component::ParentDir => std::ffi::OsString::from(".."),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                std::ffi::OsString::from("/")
+            }
+        })
+        .collect()
 }
 
 /// Cancels `.` and `..` in a component list, and starts it again at a root.
@@ -1268,7 +1300,7 @@ fn refused_here(request: Scope<'_>, path: &str) -> Option<Plan> {
         return Some(Plan::Exclude {
             reason: ExclusionReason::Unsupported,
             detail: "this path is a repository nested in this tree, or its own administrative \
-                     data, rather than this repository's content"
+                     data, rather than this repository's content: this host never reads inside one"
                 .to_owned(),
         });
     }

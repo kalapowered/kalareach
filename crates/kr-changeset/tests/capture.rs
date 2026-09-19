@@ -958,17 +958,31 @@ fn a_nested_repository_that_renamed_its_own_data_is_never_captured() {
         ],
     );
     write(&nested, "inner.txt", "inner content\n");
-    std::fs::rename(nested.join(".git"), nested.join("repo-data"))
-        .expect("the repository keeps its data under another name");
+    let mut held = nested.join(".git");
     let workspace = fixture.workspace("renamed-tree");
 
-    // Every spelling Git accepts for the same place, including one that points above the nested
-    // tree and one that names the whole absolute path.
-    for target in [
-        "repo-data".to_owned(),
-        "./repo-data".to_owned(),
-        nested.join("repo-data").display().to_string(),
+    // Every spelling Git accepts, and every place it can point at: beside the tree, above it, and
+    // named by the whole absolute path.
+    for (target, where_it_is) in [
+        ("repo-data".to_owned(), nested.join("repo-data")),
+        ("./repo-data".to_owned(), nested.join("repo-data")),
+        (
+            nested.join("repo-data").display().to_string(),
+            nested.join("repo-data"),
+        ),
+        (
+            "../repo-data".to_owned(),
+            path.join("vendor").join("repo-data"),
+        ),
     ] {
+        if held != where_it_is {
+            if where_it_is.exists() {
+                std::fs::remove_dir_all(&where_it_is).expect("a clean start for this spelling");
+            }
+            std::fs::create_dir_all(where_it_is.parent().expect("a parent")).expect("its parent");
+            std::fs::rename(&held, &where_it_is).expect("the data moves to where this says");
+            held = where_it_is.clone();
+        }
         std::fs::write(
             nested.join(".git"),
             format!("gitdir: {target}\n").as_bytes(),

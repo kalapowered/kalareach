@@ -1919,9 +1919,7 @@ fn clear_inherited_access_control(staged: &kr_transfer::AuthorisedFile) -> bool 
         // There was one and it is off.
         Ok(()) => true,
         // There was none to take off, which is the ordinary case.
-        Err(
-            rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP | rustix::io::Errno::OPNOTSUPP,
-        ) => true,
+        Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => true,
         Err(_) => false,
     }
 }

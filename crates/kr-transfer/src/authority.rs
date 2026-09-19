@@ -1030,11 +1030,7 @@ impl AuthorisedFile {
                 // There is one, and this asked for its length rather than reading it.
                 Ok(_) | Err(rustix::io::Errno::RANGE) => true,
                 // No such attribute, or a filesystem that keeps none.
-                Err(
-                    rustix::io::Errno::NODATA
-                    | rustix::io::Errno::NOTSUP
-                    | rustix::io::Errno::OPNOTSUPP,
-                ) => false,
+                Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => false,
                 // A file this host could not ask about is one whose protection it cannot say it
                 // can carry across.
                 Err(_) => true,
@@ -1042,6 +1038,9 @@ impl AuthorisedFile {
         }
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
+            // A platform this host does not know how to ask. It answers false, which leaves a
+            // caller carrying the mode bits alone, and that is what the callers state as a limit
+            // rather than something this establishes.
             false
         }
     }
