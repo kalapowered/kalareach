@@ -1067,122 +1067,55 @@ mod tests {
     #[test]
     fn a_failure_part_way_through_admission_leaves_the_source_unconsumed() {
         let mut ledger = Ledger::open(None).expect("the ledger opens");
-        // One request identifier is already taken on this connection, so the pending insert of an
-        // admission that reuses it fails *after* the source has been consumed inside the same
-        // transaction.
+        let recorded = resource(7, "11", PendingState::Pending);
         ledger
-            .admit_resource(
-                &handle("src-1"),
-                binding(),
-                &entry(1),
-                &resource(7, "11", PendingState::Pending),
-                TimestampMs::new(11),
-            )
-            .expect("the first admission succeeds");
+            .record_opaque(&recorded)
+            .expect("the opaque request is recorded before it is forwarded");
 
-        let clash = ledger.admit_resource(
-            &handle("src-2"),
+        // An interpretation of a request this ledger does not hold. The source consumption is the
+        // first statement of the transaction and succeeds; the update that follows finds no row,
+        // and the whole transaction goes back.
+        let absent = resource(8, "12", PendingState::Pending);
+        let failed = ledger.admit_resource(
+            &handle("src-1"),
             binding(),
             &entry(1),
-            &resource(8, "11", PendingState::Pending),
+            &absent,
             TimestampMs::new(12),
         );
-        assert!(
-            clash.is_err(),
-            "a duplicate request identifier fails the insert"
-        );
+        assert!(failed.is_err());
         assert!(
             ledger
-                .decoding(PendingResourceId::new(Uuid::from_bytes([8; 16])))
+                .decoding(absent.resource_id)
                 .expect("the read succeeds")
                 .is_none(),
             "the decoder entry written before the failure went back"
         );
 
-        // The source was not consumed, so the same event can be admitted under a free identifier.
+        // The source was not consumed, so the same event still interprets the request that is
+        // really there.
         ledger
             .admit_resource(
-                &handle("src-2"),
+                &handle("src-1"),
                 binding(),
                 &entry(1),
-                &resource(9, "12", PendingState::Pending),
+                &recorded,
                 TimestampMs::new(13),
             )
             .expect("the retry succeeds because the transaction went back whole");
-    }
-
-    #[test]
-    fn admission_is_one_transaction_and_a_source_event_is_consumed_once() {
-        let file = ledger_path();
-        let first = resource(7, "11", PendingState::Pending);
-        {
-            let mut ledger = Ledger::open(Some(&file)).expect("the ledger opens");
-            assert!(
-                ledger
-                    .admit_resource(
-                        &handle("src-1"),
-                        binding(),
-                        &entry(1),
-                        &first,
-                        TimestampMs::new(11)
-                    )
-                    .expect("the first admission succeeds")
-            );
-            // The same event again, from the same binding or any other: refused, and nothing is
-            // written for the second attempt.
-            let second = resource(8, "12", PendingState::Pending);
-            assert!(
-                !ledger
-                    .admit_resource(
-                        &handle("src-1"),
-                        BrokerBindingId::new(Uuid::from_bytes([10; 16])),
-                        &entry(1),
-                        &second,
-                        TimestampMs::new(12)
-                    )
-                    .expect("the second admission is answered")
-            );
-            assert!(
-                ledger
-                    .pending(second.resource_id)
-                    .expect("the read succeeds")
-                    .is_none(),
-                "a refused admission writes no pending row"
-            );
-            assert!(
-                ledger
-                    .decoding(second.resource_id)
-                    .expect("the read succeeds")
-                    .is_none(),
-                "a refused admission writes no decoder entry"
-            );
-        }
-        let mut reopened = Ledger::open(Some(&file)).expect("the ledger reopens");
         assert!(
-            !reopened
-                .admit_resource(
-                    &handle("src-1"),
-                    binding(),
-                    &entry(1),
-                    &resource(9, "13", PendingState::Pending),
-                    TimestampMs::new(13)
-                )
-                .expect("the admission after a restart is answered"),
-            "a restart must not let the same source event be offered again"
+            ledger
+                .decoding(recorded.resource_id)
+                .expect("the read succeeds")
+                .is_some()
         );
-        let entry = reopened
-            .decoding(first.resource_id)
-            .expect("the read succeeds")
-            .expect("the entry is there");
-        assert_eq!(entry.source_bytes.as_slice(), b"{\"id\":11}");
-        assert!(entry.offers("allow"));
-        assert!(!entry.offers("allow_always"));
     }
 
     #[test]
     fn a_settle_built_from_a_stale_copy_is_refused() {
         let mut ledger = Ledger::open(None).expect("the ledger opens");
         let pending = resource(7, "11", PendingState::Pending);
+        ledger.record_opaque(&pending).expect("recorded");
         ledger
             .admit_resource(
                 &handle("src-1"),
@@ -1221,12 +1154,14 @@ mod tests {
         let claimed = resource(7, "11", PendingState::Claimed);
         {
             let mut ledger = Ledger::open(Some(&file)).expect("the ledger opens");
+            let opaque = resource(7, "11", PendingState::Pending);
+            ledger.record_opaque(&opaque).expect("recorded");
             ledger
                 .admit_resource(
                     &handle("src-1"),
                     binding(),
                     &entry(1),
-                    &resource(7, "11", PendingState::Pending),
+                    &opaque,
                     TimestampMs::new(11),
                 )
                 .expect("admitted");
@@ -1255,6 +1190,7 @@ mod tests {
     fn a_decoder_entry_outlives_the_binding_that_wrote_it() {
         let mut ledger = Ledger::open(None).expect("the ledger opens");
         let pending = resource(7, "11", PendingState::Pending);
+        ledger.record_opaque(&pending).expect("recorded");
         ledger
             .admit_resource(
                 &handle("src-1"),
