@@ -1010,9 +1010,11 @@ async fn asking_whether_the_desktop_has_gone_takes_no_reading() {
     let _ = kr_worker::desktop::Probe::Session.take();
     let reading = probing.elapsed();
 
+    // What the answer is depends on the host: a machine with no graphical login has already lost
+    // the desktop a desktop-bound session was created for. What this is about is the cost.
     let asking = std::time::Instant::now();
     for _ in 0..1_000 {
-        assert!(!session.desktop_lost(), "this session's desktop is here");
+        let _ = std::hint::black_box(session.desktop_lost());
     }
     let asked = asking.elapsed();
     assert!(
