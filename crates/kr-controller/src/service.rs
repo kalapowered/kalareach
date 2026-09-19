@@ -4606,9 +4606,10 @@ impl Controller {
         // Section 9's recovery rules are the worker's, and a worker that crashed never ran them.
         // They run once here instead, before anything is served: a dispatch marker with no
         // authoritative outcome becomes `unknown`, and an accepted intent with no marker is
-        // rejected. A failure is not a reason to leave the session open, so it is recorded in the
-        // closure's own durability rather than stopping the closure.
-        let recovered = archive.recover_journal(&ownership);
+        // rejected. A failure is not a reason to leave the session open, so the closure is still
+        // written; what says the store was not reconciled is the archive, which reports an action
+        // still accepted or still dispatching when a reader asks.
+        let _ = archive.recover_journal(&ownership);
         let reason = self.why_a_worker_is_gone(session_id, record.profile);
         // Section 7's second half, before the session identity is released: whatever the session
         // still owns is fenced, and what this host cannot account for is recorded. A closure
