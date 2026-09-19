@@ -515,7 +515,7 @@ impl SharingService {
         })
     }
 
-    /// Revokes a grant and its descendants.    /// Revokes a grant and its descendants.
+    /// Revokes a grant and its descendants.
     ///
     /// # Errors
     ///

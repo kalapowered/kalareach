@@ -2927,7 +2927,7 @@ impl Controller {
         )
     }
 
-    /// Lists the grants this host's owner may see.    /// Lists the grants this host's owner may see.    /// Lists the grants this host's owner may see.
+    /// Lists the grants this host's owner may see.
     ///
     /// A local caller is the operating-system owner of this environment, so the issuer it lists
     /// grants for is this host itself: the grants it issued, and everything delegated from them.
