@@ -102,41 +102,50 @@ fn make_our_own(temporary: &Path) -> PathBuf {
 /// Removes the directories that earlier runs of these suites left in `temporary`, given `ours`,
 /// the one this run made.
 ///
-/// A directory is one of ours if it is a directory, if the user who owns it is the user who owns
-/// `ours`, and if its name is the prefix above followed by the number of the process that made it.
-/// Whether the name of a test binary stands between the two makes no difference: that is the form
-/// each suite used while it kept a copy of this helper of its own, and it is the form of every
-/// directory those runs left behind, so a run that swept only its own form would tidy nothing that
-/// is actually there.
+/// A candidate's name is the prefix above and then, at its end, the number of the process that made
+/// it. Whether the name of a test binary or the moment of a run stands between the two makes no
+/// difference: those are the forms this helper has used, and every directory left behind is in one
+/// of them, so a sweep that knew only the newest form would tidy nothing that is actually there.
 ///
-/// The question put about the owner is whether it exists, not whether this process could signal
-/// it. `ps` answers the first and `kill -0` answers the second, and they differ: a process of this
-/// user that some security policy puts out of this one's reach is refused a signal while plainly
-/// existing, and a directory whose owner is still launching binaries out of it must not be taken
-/// away. Only `ps` saying that nothing holds that number - a plain exit code of one - removes
-/// anything. A question that was never asked, one whose asker was itself ended by a signal, and any
-/// other exit all leave the directory where it is. Confining the sweep to this user's own
-/// directories settles, in the same way, what a shared temporary directory's sticky bit would
-/// otherwise leave half-done.
+/// Four things are then established before anything is removed, and each of them answers a way
+/// this could take away something it should not.
 ///
-/// Whether the owner exists is asked of the operating system rather than assumed from an age: a
-/// suite of these can take minutes. The cost of asking is that a number since given to some other
-/// process keeps a directory for as long as that process lives, which on a machine that has been
-/// up for weeks can be a long time; it is the safe direction to err in, and the directories it
-/// holds are the few whose numbers came round again.
+/// * It is a directory, read without following a symbolic link, and the user who owns it is the
+///   user who owns `ours` - which is a directory this process made, so that user is this process's.
+///   This is also what settles what a shared temporary directory's sticky bit would leave
+///   half-done.
+/// * It was last written to before `ours` was made. A directory that has been touched since this
+///   run began is one something else is using, and this is what keeps a sweep from reaching a run
+///   that took a name back while this one was deciding about it. Everything genuinely left behind
+///   is older than this run.
+/// * `ps` cannot find the number. That question is whether a process exists, not whether this one
+///   may signal it.
+/// * `kill -0` cannot signal the number. That question is the other one, and it is asked because
+///   the first can answer no about a process that is plainly there: a `ps` that does not take
+///   `-p`, one that was ended by a signal, a `/proc` mounted so that it shows fewer processes than
+///   are running. Between them, a process this user is running is invisible to both only if it is
+///   hidden and out of reach at once.
+///
+/// Both questions must be answered, and answered plainly: only an exit code of one counts, so a
+/// question that could not be asked at all and a question whose asker was ended both leave the
+/// directory where it is. A number since given to another process keeps a directory for as long as
+/// that process lives, which on a machine that has been up for weeks can be a long time; that is
+/// the safe direction to err in, and the directories it holds are the few whose numbers came round
+/// again.
 fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
     use std::os::unix::fs::MetadataExt;
 
-    let Ok(mine) = std::fs::metadata(ours).map(|data| data.uid()) else {
+    let Ok(us) = std::fs::metadata(ours) else {
+        return;
+    };
+    let Ok(began) = us.modified() else {
         return;
     };
     let Ok(entries) = std::fs::read_dir(temporary) else {
         return;
     };
     for entry in entries.flatten() {
-        // Never the one this run is about to launch binaries out of. Nothing below would remove
-        // it, because the process it is named after is this one; saying so here is cheaper than
-        // relying on that.
+        // Never the one this run is about to launch binaries out of.
         if entry.path() == ours {
             continue;
         }
@@ -148,31 +157,44 @@ fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
         if owner.is_empty() || !owner.bytes().all(|byte| byte.is_ascii_digit()) {
             continue;
         }
-        // Not followed through a symbolic link, and not somebody else's.
         let Ok(about) = entry.metadata() else {
             continue;
         };
-        if !about.is_dir() || about.uid() != mine {
+        if !about.is_dir() || about.uid() != us.uid() {
             continue;
         }
-        let Ok(answer) = std::process::Command::new("ps")
-            .arg("-p")
-            .arg(owner)
-            .arg("-o")
-            .arg("pid=")
+        if !about.modified().is_ok_and(|written| written < began) {
+            continue;
+        }
+        if !nothing_holds(owner) {
+            continue;
+        }
+        let _ = std::fs::remove_dir_all(entry.path());
+    }
+}
+
+/// Whether both of the questions above answer that no process holds `number`.
+///
+/// Each is put to a command, and only a plain exit code of one is taken for an answer: that is
+/// `ps` finding nothing and `kill` refusing the number. Anything else - a command that could not
+/// be started, one that was ended by a signal, any other exit - is not an answer, and one
+/// unanswered question is enough to leave the directory alone.
+fn nothing_holds(number: &str) -> bool {
+    let asked = [vec!["-p", number, "-o", "pid="], vec!["-0", number]];
+    for (command, arguments) in ["ps", "kill"].into_iter().zip(asked) {
+        let Ok(answer) = std::process::Command::new(command)
+            .args(arguments)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
         else {
-            continue;
+            return false;
         };
-        // `Some(1)`, which is "no process holds that number", and nothing else. A question that
-        // was never asked and a question whose asker was killed both arrive here looking like a
-        // failure, and neither says anything about the process this directory is named after.
-        if answer.code() == Some(1) {
-            let _ = std::fs::remove_dir_all(entry.path());
+        if answer.code() != Some(1) {
+            return false;
         }
     }
+    true
 }
 
 /// The `kr` these tests launch.
