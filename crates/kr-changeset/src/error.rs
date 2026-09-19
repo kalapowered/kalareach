@@ -67,6 +67,13 @@ pub enum ChangeSetError {
         /// Which limit, and what it is.
         detail: Diagnostic,
     },
+    /// The same action identifier was reused for a different request.
+    IdConflict {
+        /// The identifier.
+        action: Diagnostic,
+        /// The method it was first used for.
+        method: Diagnostic,
+    },
     /// A request field is malformed.
     InvalidArgument(Diagnostic),
     /// A faithful interpretation of the request needs something this host does not do.
@@ -105,6 +112,7 @@ impl ChangeSetError {
             Self::OutcomeUnknown { .. } => "OutcomeUnknown",
             Self::WrongState { .. } => "WrongState",
             Self::QuotaExceeded { .. } => "QuotaExceeded",
+            Self::IdConflict { .. } => "IdConflict",
             Self::InvalidArgument(_) => "InvalidArgument",
             Self::Unsupported { .. } => "Unsupported",
             Self::Project { .. } => "Project",
@@ -119,6 +127,9 @@ impl ChangeSetError {
             }
             Self::StorageUnavailable { detail } => {
                 format!("the change-set service's directories are unavailable: {detail}")
+            }
+            Self::IdConflict { action, method } => {
+                format!("action {action} was already used for {method}")
             }
             Self::UnknownVersion { detail }
             | Self::UnknownMaterialisation { detail }
@@ -162,6 +173,7 @@ impl ChangeSetError {
             Self::OutcomeUnknown { .. } => ErrorCode::OutcomeUnknown,
             Self::WrongState { .. } => ErrorCode::ResourceUnavailable,
             Self::QuotaExceeded { .. } => ErrorCode::QuotaExceeded,
+            Self::IdConflict { .. } => ErrorCode::IdConflict,
             Self::InvalidArgument(_) => ErrorCode::InvalidArgument,
             Self::Unsupported { .. } => ErrorCode::UnsupportedCapability,
             Self::Project { code, .. } => *code,
@@ -257,6 +269,10 @@ mod tests {
             },
             ChangeSetError::QuotaExceeded {
                 detail: HOSTILE.into(),
+            },
+            ChangeSetError::IdConflict {
+                action: HOSTILE.into(),
+                method: HOSTILE.into(),
             },
             ChangeSetError::InvalidArgument(HOSTILE.into()),
             ChangeSetError::Unsupported {

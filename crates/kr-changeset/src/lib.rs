@@ -1,5 +1,6 @@
 //! The KalaReach change-set service.
 
+pub mod answer;
 pub mod apply;
 pub mod capture;
 pub mod error;

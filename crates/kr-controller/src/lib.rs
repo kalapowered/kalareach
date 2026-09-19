@@ -25,11 +25,13 @@
 //! | [`transfer`] | The environment's transfer service, its attachment-chunk endpoint and its sweep |
 //! | [`voice`] | The voice coordinator's seams over the history filter, the grant store and this host's dispatch |
 //! | [`project`] | The environment's project service: repositories, workspaces and the restricted Git profile |
+//! | [`changeset`] | The environment's change-set service: immutable versions, materialisations and applies |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
 pub mod agent_tools;
 pub mod archive;
 pub mod authority;
+pub mod changeset;
 pub mod desktop;
 pub mod directory;
 pub mod error;

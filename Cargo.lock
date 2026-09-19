@@ -4080,6 +4080,7 @@ dependencies = [
  "iroh",
  "iroh-relay",
  "kr-cbor",
+ "kr-changeset",
  "kr-client",
  "kr-crypto",
  "kr-ipc",

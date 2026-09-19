@@ -20,9 +20,10 @@ use kr_protocol::changeset::{
     ApplyOutcomeClass, DestinationClass, EvidenceKind, MaterialisationPurpose, PathProgressState,
     SourceConsistency, TestedSource,
 };
+use kr_protocol::error::ErrorCode;
 use kr_protocol::ids::{
-    ActionId, ChangeSetId, ChangeSetVersion, EnvironmentId, MaterialisationId, ProjectRepositoryId,
-    WorkspaceId,
+    ActionId, ActorId, ChangeSetId, ChangeSetVersion, EnvironmentId, MaterialisationId,
+    ProjectRepositoryId, WorkspaceId,
 };
 use kr_protocol::scalars::{Digest256, TimestampMs, Uuid};
 use rusqlite::{Connection, OptionalExtension as _, Transaction, params};
@@ -179,6 +180,23 @@ pub struct ProgressRow {
     pub detail: String,
 }
 
+/// What one action's row holds: its method, its payload digest, and its outcome.
+type StoredAction = (String, Vec<u8>, Option<Vec<u8>>, Option<String>, Option<String>);
+
+/// One action's retained outcome.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RetainedOutcome {
+    /// The canonical encoding of the typed result the first attempt returned.
+    Ok(Vec<u8>),
+    /// The refusal it returned, under the code it decided.
+    Error {
+        /// The code.
+        code: ErrorCode,
+        /// The protected sentence.
+        detail: String,
+    },
+}
+
 /// The change-set journal of one environment.
 #[derive(Debug)]
 pub struct Store {
@@ -317,6 +335,17 @@ impl Store {
                      detail                  TEXT NOT NULL,
                      started_at_ms           INTEGER NOT NULL,
                      decided_at_ms           INTEGER
+                 );
+                 CREATE TABLE IF NOT EXISTS actions (
+                     actor_id       TEXT NOT NULL,
+                     action_id      BLOB NOT NULL,
+                     method         TEXT NOT NULL,
+                     payload_digest BLOB NOT NULL,
+                     result         BLOB,
+                     error_code     TEXT,
+                     error_detail   TEXT,
+                     recorded_at_ms INTEGER NOT NULL,
+                     PRIMARY KEY (actor_id, action_id)
                  );
                  CREATE TABLE IF NOT EXISTS apply_progress (
                      action_id     BLOB NOT NULL,
@@ -1057,6 +1086,119 @@ impl Store {
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(ChangeSetError::store)?;
         Ok(rows)
+    }
+
+    // ----- actions ---------------------------------------------------------------------------
+
+    /// Returns one action's retained outcome, when this service has one.
+    ///
+    /// A successful answer is kept whole and carries free text of its own, so it comes back
+    /// through the rule: this is the last place this host can reach what an earlier build recorded
+    /// before a repeat of the action returns it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::IdConflict`] when the identifier was used for a different
+    /// request, and [`ChangeSetError::StoreUnavailable`] when the read fails.
+    pub fn retained_action(
+        &self,
+        actor_id: &ActorId,
+        action_id: Uuid,
+        method: &str,
+        payload_digest: Digest256,
+    ) -> Result<Option<RetainedOutcome>> {
+        let row: Option<StoredAction> = self
+            .connection
+            .query_row(
+                "SELECT method, payload_digest, result, error_code, error_detail
+                   FROM actions WHERE actor_id = ?1 AND action_id = ?2",
+                params![actor_id.as_str(), action_id.as_bytes().to_vec()],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(ChangeSetError::store)?;
+        let Some((stored_method, stored_digest, result, code, detail)) = row else {
+            return Ok(None);
+        };
+        if stored_method != method || digest_of_slice(&stored_digest) != Some(payload_digest) {
+            return Err(ChangeSetError::IdConflict {
+                action: action_id.to_string().into(),
+                method: stored_method.into(),
+            });
+        }
+        // A claim with no outcome is not an answer: the request reaches the service, which
+        // finishes what its claim started rather than telling the caller the outcome is unknown
+        // for ever.
+        match (result, code) {
+            (Some(result), _) => Ok(Some(RetainedOutcome::Ok(
+                crate::answer::protect_stored_result(method, &result)?,
+            ))),
+            (None, Some(code)) => Ok(Some(RetainedOutcome::Error {
+                code: ErrorCode::from_wire(&code).unwrap_or(ErrorCode::OutcomeUnknown),
+                detail: kr_project::git::redact(&detail.unwrap_or_default()),
+            })),
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// Records one action's outcome, leaving an existing row alone.
+    ///
+    /// Returns the record that was already there, when another copy of the action recorded first.
+    /// That record is the answer both callers get: one action, one receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::IdConflict`] when the identifier was used for a different
+    /// request, and [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn record_action(
+        &self,
+        actor_id: &ActorId,
+        action_id: Uuid,
+        method: &str,
+        payload_digest: Digest256,
+        outcome: &RetainedOutcome,
+    ) -> Result<Option<RetainedOutcome>> {
+        let (result, code, detail) = match outcome {
+            RetainedOutcome::Ok(result) => (Some(result.clone()), None, None),
+            RetainedOutcome::Error { code, detail } => (
+                None,
+                Some(code.as_str().to_owned()),
+                // A retained failure is read back by whoever repeats the action, and it is kept,
+                // so the rule is applied here as well as where the message was composed.
+                Some(kr_project::git::redact(detail)),
+            ),
+        };
+        let inserted = self
+            .connection
+            .execute(
+                "INSERT INTO actions (actor_id, action_id, method, payload_digest, result,
+                                      error_code, error_detail, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT (actor_id, action_id) DO NOTHING",
+                params![
+                    actor_id.as_str(),
+                    action_id.as_bytes().to_vec(),
+                    method,
+                    payload_digest.as_bytes().to_vec(),
+                    result,
+                    code,
+                    detail,
+                    kr_ipc::now_ms().get() as i64,
+                ],
+            )
+            .map_err(ChangeSetError::store)?;
+        if inserted == 1 {
+            return Ok(None);
+        }
+        self.retained_action(actor_id, action_id, method, payload_digest)
     }
 
     // ----- applies --------------------------------------------------------------------------------

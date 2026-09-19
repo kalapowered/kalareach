@@ -755,6 +755,45 @@ pub struct Holder {
 }
 
 impl ChangeSetService {
+    /// Returns one action's retained outcome, when this service has one.
+    ///
+    /// The change-set service keeps its own action record rather than sharing the project
+    /// service's: a stored reply is read back through the rule by the code that knows which of its
+    /// fields are this host's own explanations, and only this service knows that about its own
+    /// results.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::IdConflict`] when the identifier was used for a different
+    /// request.
+    pub fn retained_action(
+        &self,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: kr_protocol::scalars::Uuid,
+        method: &str,
+        payload_digest: kr_protocol::scalars::Digest256,
+    ) -> Result<Option<crate::store::RetainedOutcome>> {
+        self.locked()?
+            .retained_action(actor_id, action_id, method, payload_digest)
+    }
+
+    /// Records one action's outcome, leaving an existing row alone.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ChangeSetError::StoreUnavailable`] when the write fails.
+    pub fn record_action(
+        &self,
+        actor_id: &kr_protocol::ids::ActorId,
+        action_id: kr_protocol::scalars::Uuid,
+        method: &str,
+        payload_digest: kr_protocol::scalars::Digest256,
+        outcome: &crate::store::RetainedOutcome,
+    ) -> Result<Option<crate::store::RetainedOutcome>> {
+        self.locked()?
+            .record_action(actor_id, action_id, method, payload_digest, outcome)
+    }
+
     /// Resolves whatever an earlier daemon left unfinished.
     ///
     /// # Errors

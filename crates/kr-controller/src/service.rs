@@ -310,6 +310,9 @@ pub struct Controller {
     /// This host's half of the remote authority feed: the revisions only it issues, the revocation
     /// records it retains, and the synchronisation it owes before it serves remote work again.
     feed: std::sync::Mutex<crate::grants::AuthorityFeed>,
+    /// The environment's change-set service, which reads repositories through the project
+    /// service's own profile and boundary.
+    changesets: Arc<crate::changeset::ChangeSetModule>,
     /// The serial boundary every contact-skill installation passes through.
     ///
     /// Reading an action's record, writing its dispatch marker, changing the files and recording
@@ -471,6 +474,13 @@ impl Controller {
         let authority_revision = registry.authority_revision()?;
         let transfer = Arc::new(crate::transfer::TransferModule::open(&setup.paths).await?);
         let project = Arc::new(crate::project::ProjectModule::open(&setup.paths).await?);
+        // The change-set service reads every repository through the project service's own opened
+        // handles and restricted execution profile, so it takes that service rather than opening
+        // a second one.
+        let changesets = Arc::new(
+            crate::changeset::ChangeSetModule::open(&setup.paths, Arc::clone(project.service()))
+                .await?,
+        );
         // The executable the daemon was told to start, resolved here rather than at the launch: a
         // worker runs in a directory of its own, so a relative name would be looked for beneath
         // that instead of beneath the directory this daemon was started in. It is resolved before
@@ -534,6 +544,7 @@ impl Controller {
             devices,
             policy: std::sync::Mutex::new(policy),
             feed: std::sync::Mutex::new(feed),
+            changesets,
             agent_tools: tokio::sync::Mutex::new(()),
             worker_program,
             build_id: setup.build_id,
@@ -1921,6 +1932,12 @@ impl Controller {
         &self.project
     }
 
+    /// Returns the environment's change-set service.
+    #[must_use]
+    pub const fn changesets(&self) -> &Arc<crate::changeset::ChangeSetModule> {
+        &self.changesets
+    }
+
     /// Returns the registry, for a module that needs to read the environment's own records.
     pub(crate) const fn registry_handle(&self) -> &Mutex<Registry> {
         &self.registry
@@ -2780,6 +2797,9 @@ impl Controller {
             _ if crate::project::ProjectModule::serves(method) => {
                 crate::project::ProjectModule::check_subject(method, mutation)?;
             }
+            _ if crate::changeset::ChangeSetModule::serves(method) => {
+                crate::changeset::ChangeSetModule::check_subject(method, mutation)?;
+            }
             _ => {
                 return Err(ControllerError::InvalidArgument(format!(
                     "{} is not a mutation this daemon serves",
@@ -3073,6 +3093,9 @@ impl Controller {
         if retained.is_none() && crate::project::ProjectModule::serves(method) {
             retained = self.project.retained(actor_id, &mutation, method).await;
         }
+        if retained.is_none() && crate::changeset::ChangeSetModule::serves(method) {
+            retained = self.changesets.retained(actor_id, &mutation, method).await;
+        }
         if let Some(retained) = retained {
             if let Err(error) = self.authorised(connection_id) {
                 return error_reply(
@@ -3249,6 +3272,9 @@ impl Controller {
                 .read_frame(device_id, request, wall_clock_ms())
                 .await;
         }
+        if crate::changeset::ChangeSetModule::serves(method) {
+            return self.changesets.read_frame(request).await;
+        }
         let outcome = match method {
             Method::HostInfo => self.host_info().await,
             Method::EnvironmentCapabilities => self.environment_capabilities(&request.params).await,
@@ -3401,6 +3427,33 @@ impl Controller {
                 self.project_mutation(actor_id, mutation, method, carried)
                     .await,
             );
+        }
+        if crate::changeset::ChangeSetModule::serves(method) {
+            // Everything between the envelope check and this point can wait: for this task to be
+            // scheduled and for a blocking thread. An action whose accepted deadline passed while
+            // it queued does not go on to write, and neither does one whose connection lost its
+            // authority in the meantime.
+            if accepted.is_none_or(|accepted| self.clock.now() >= accepted.deadline) {
+                return respond(
+                    mutation.request_id,
+                    Err(ControllerError::WindowExpired {
+                        detail: "the deadline this action was admitted under passed before it \
+                                 could run"
+                            .to_owned(),
+                    }),
+                );
+            }
+            if let Err(error) = self.authorised(connection_id) {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    error.to_string(),
+                );
+            }
+            return self
+                .changesets
+                .write_frame(actor_id, mutation, method)
+                .await;
         }
         // The admission the mutation carries into its transaction: the deadline this daemon
         // accepted, the authority revision it was admitted under, and the connection it arrived
