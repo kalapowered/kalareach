@@ -36,6 +36,13 @@ use crate::attention::{
     VisitChangedResult,
 };
 use crate::authority::MethodEntry;
+use crate::changeset::{
+    ChangeSetVersionRecord, ChangeSetVersionSummary, ChangesetCaptureParams,
+    ChangesetCaptureResult, ChangesetMaterializeParams, ChangesetMaterializeResult,
+    ChangesetReadParams, ChangesetReadResult, DiffApplyParams, DiffApplyResult, DiffEntry,
+    DiffReadParams, DiffReadResult, EvidenceReference, MaterialisationRecord,
+    MaterialisationResult,
+};
 use crate::desktop::{
     CapabilityRecord, DesktopCapabilityReport, DesktopContext, EnvironmentCapabilitiesParams,
     EnvironmentCapabilitiesResult, SleepInhibitionState,
@@ -432,6 +439,25 @@ pub fn protocol_schema() -> Value {
         "workspace_remove_params" => WorkspaceRemoveParams,
         "workspace_remove_result" => WorkspaceRemoveResult,
         "workspace_summary" => WorkspaceSummary,
+        // Immutable change sets: the captured version, its materialisations and the results
+        // recorded against them, and the diff read, apply and revert contract. Appended for the
+        // same reason: these are independent root messages that no earlier one refers to.
+        "change_set_version_record" => ChangeSetVersionRecord,
+        "change_set_version_summary" => ChangeSetVersionSummary,
+        "changeset_capture_params" => ChangesetCaptureParams,
+        "changeset_capture_result" => ChangesetCaptureResult,
+        "changeset_materialize_params" => ChangesetMaterializeParams,
+        "changeset_materialize_result" => ChangesetMaterializeResult,
+        "changeset_read_params" => ChangesetReadParams,
+        "changeset_read_result" => ChangesetReadResult,
+        "diff_apply_params" => DiffApplyParams,
+        "diff_apply_result" => DiffApplyResult,
+        "diff_entry" => DiffEntry,
+        "diff_read_params" => DiffReadParams,
+        "diff_read_result" => DiffReadResult,
+        "evidence_reference" => EvidenceReference,
+        "materialisation_record" => MaterialisationRecord,
+        "materialisation_result" => MaterialisationResult,
         // Agent contact: the questions an agent asks the person, the alerts it raises and the
         // installation of the skill that carries them. Appended for the same reason.
         "alert" => Alert,
@@ -561,6 +587,7 @@ fn identifier_vocabulary(generator: &mut SchemaGenerator) -> Schema {
         "installation_id" => ids::InstallationId,
         "invitation_id" => ids::InvitationId,
         "machine_id" => ids::MachineId,
+        "materialisation_id" => ids::MaterialisationId,
         "notification_id" => ids::NotificationId,
         "organisation_id" => ids::OrganisationId,
         "pairing_sequence" => ids::PairingSequence,

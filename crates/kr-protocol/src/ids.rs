@@ -320,6 +320,11 @@ uuid_id!(
     "One immutable captured change set."
 );
 uuid_id!(
+    /// One independent materialisation of one exact change-set version.
+    MaterialisationId,
+    "One independent materialisation of one exact change-set version."
+);
+uuid_id!(
     /// One automation definition.
     WorkflowId,
     "One automation definition."

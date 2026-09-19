@@ -1,0 +1,27 @@
+[package]
+name = "kr-changeset"
+description = "The KalaReach change-set service: immutable captured versions, independent materialisations and the diff apply contract"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kr-cbor.workspace = true
+kr-ipc.workspace = true
+kr-project = { workspace = true }
+kr-protocol.workspace = true
+kr-transfer.workspace = true
+rusqlite = { workspace = true, features = ["bundled"] }
+serde.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+kr-ipc = { workspace = true, features = ["testing"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

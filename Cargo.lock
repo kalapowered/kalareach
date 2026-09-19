@@ -4007,6 +4007,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-changeset"
+version = "0.1.0"
+dependencies = [
+ "kr-cbor",
+ "kr-ipc",
+ "kr-project",
+ "kr-protocol",
+ "kr-transfer",
+ "rusqlite",
+ "serde",
+ "sha2 0.11.0",
+ "tempfile",
+ "uuid",
+]
+
+[[package]]
 name = "kr-cli"
 version = "0.1.0"
 dependencies = [

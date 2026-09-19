@@ -4,6 +4,7 @@ members = [
     "apps/companion/src-tauri",
     "crates/kr-attention",
     "crates/kr-cbor",
+    "crates/kr-changeset",
     "crates/kr-cli",
     "crates/kr-client",
     "crates/kr-controller",
@@ -59,6 +60,7 @@ iroh-relay = { version = "=1.2.0", default-features = false }
 keyring = "=4.2.0"
 kr-attention = { path = "crates/kr-attention", version = "=0.1.0" }
 kr-cbor = { path = "crates/kr-cbor", version = "=0.1.0" }
+kr-changeset = { path = "crates/kr-changeset", version = "=0.1.0" }
 kr-cli = { path = "crates/kr-cli", version = "=0.1.0" }
 # The shared native client. Its local-terminal path is a feature rather than a default here, so a
 # member says whether it has a terminal to paint; the desktop and host crates turn it on.

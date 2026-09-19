@@ -45,6 +45,7 @@
 //! | [`desktop`] | The desktop execution context, capability evidence and the power setting |
 //! | [`digest`] | The mutation payload digest |
 //! | [`project`] | Project repositories, workspaces, inclusion previews and repository operations |
+//! | [`changeset`] | Immutable change-set versions, materialisations and the diff apply contract |
 //! | [`limits`] | Protocol defaults |
 //! | [`local`] | The local IPC handshake and the control-stream message union |
 //! | [`identity`] | Boot, process-start and worker-profile identities |
@@ -103,6 +104,7 @@ pub mod archive;
 pub mod attachment;
 pub mod attention;
 pub mod authority;
+pub mod changeset;
 pub mod desktop;
 pub mod digest;
 pub mod envelope;

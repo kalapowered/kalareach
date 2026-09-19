@@ -524,6 +524,44 @@
         }
       ]
     },
+    "AffectedVersion": {
+      "additionalProperties": false,
+      "description": "What one apply established about one path before it wrote anything.",
+      "properties": {
+        "expected_index_object_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The Git object the caller expects the index to hold for it."
+        },
+        "expected_worktree_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of the working-tree file the caller expects to find, or nothing for an absent\npath."
+        },
+        "path": {
+          "description": "The path, relative to the repository's top level.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "expected_worktree_digest",
+        "expected_index_object_id"
+      ],
+      "type": "object"
+    },
     "AgentBindingRevision": {
       "description": "Changes when the active upstream execution owner or selected thread changes.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -993,6 +1031,36 @@
         {
           "const": "awaiting_approval",
           "description": "A pending approval is waiting for a decision.",
+          "type": "string"
+        }
+      ]
+    },
+    "ApplyOutcomeClass": {
+      "description": "What one apply or revert came to.\n\nFive classes and no sixth. A crash after one file reaches\n[`Self::InterruptedApply`] rather than [`Self::Applied`], because this host records\n[`Self::Applied`] only once every path it planned has been confirmed in the destination.",
+      "oneOf": [
+        {
+          "const": "preflight_conflict",
+          "description": "The destination was not what the request expected, and nothing was written anywhere.",
+          "type": "string"
+        },
+        {
+          "const": "applied",
+          "description": "Every path landed and this host confirmed each one.",
+          "type": "string"
+        },
+        {
+          "const": "conflict_after_partial_writes",
+          "description": "Some paths landed, and then the destination stopped being what the request expected.",
+          "type": "string"
+        },
+        {
+          "const": "interrupted_apply",
+          "description": "Some paths landed, and this host stopped before finishing.",
+          "type": "string"
+        },
+        {
+          "const": "uncertain_outcome",
+          "description": "This host cannot say what the destination holds.",
           "type": "string"
         }
       ]
@@ -2721,6 +2789,103 @@
       ],
       "type": "object"
     },
+    "CapturePolicy": {
+      "additionalProperties": false,
+      "description": "The whole policy one capture ran under.",
+      "properties": {
+        "grant": {
+          "$ref": "#/$defs/FileGrant",
+          "description": "What the caller's grant selected and excluded."
+        },
+        "inclusion": {
+          "$ref": "#/$defs/InclusionPolicy",
+          "description": "One decision per class of the working tree."
+        },
+        "quiescence_declared": {
+          "description": "True when the caller declared the working tree quiesced for the capture.\n\nA declaration alone never decides the consistency class: this host verifies that nothing it\nread changed, and a declaration that fails that verification is a per-file capture.",
+          "type": "boolean"
+        },
+        "required_consistency": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceConsistency"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The class the caller required, when it required one."
+        }
+      },
+      "required": [
+        "inclusion",
+        "grant",
+        "quiescence_declared",
+        "required_consistency"
+      ],
+      "type": "object"
+    },
+    "CapturedPath": {
+      "additionalProperties": false,
+      "description": "One path of a captured tree.",
+      "properties": {
+        "base_object_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The Git object the base revision holds for this path, when it has one."
+        },
+        "byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "The content's length in bytes."
+        },
+        "change": {
+          "$ref": "#/$defs/ChangeKind",
+          "description": "What change the working tree held for it when it was captured."
+        },
+        "class": {
+          "$ref": "#/$defs/InclusionClass",
+          "description": "Which class of the working tree it belongs to."
+        },
+        "content": {
+          "$ref": "#/$defs/ContentClass",
+          "description": "What the content is, by Git's own test."
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The SHA-256 digest of the content, which is also its name in the store."
+        },
+        "executable": {
+          "description": "True when the file is executable.\n\nThe one permission bit a captured tree carries. A materialisation sets it and a\nmaterialisation of a tree without it never sets it, which is what \"permissions preserved\"\ncomes to for content this host copies.",
+          "type": "boolean"
+        },
+        "origin": {
+          "$ref": "#/$defs/ContentOrigin",
+          "description": "Where it was read from."
+        },
+        "path": {
+          "description": "The path, relative to the repository's top level.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "content_digest",
+        "byte_len",
+        "executable",
+        "content",
+        "origin",
+        "class",
+        "change",
+        "base_object_id"
+      ],
+      "type": "object"
+    },
     "CausalRootId": {
       "description": "The root of a bounded cross-run causal chain.",
       "format": "uuid",
@@ -3123,6 +3288,200 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "ChangeSetVersionRecord": {
+      "additionalProperties": false,
+      "description": "One immutable change-set version.\n\nThe record a caller receives. The whole manifest is in the host's own content-addressed store;\nwhat travels is the identity, the digest, the exact counts and the changes, because a captured\ntree can hold far more paths than one control frame carries.",
+      "properties": {
+        "base_reference": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The reference that revision was named by, when it was named by one."
+        },
+        "base_revision": {
+          "description": "The revision it was captured against.",
+          "type": "string"
+        },
+        "captured_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was captured."
+        },
+        "change_set_id": {
+          "$ref": "#/$defs/ChangeSetId",
+          "description": "The change set this version belongs to."
+        },
+        "changes": {
+          "description": "The paths whose content differs from the base, bounded by [`MAX_CHANGESET_ENTRIES`].",
+          "items": {
+            "$ref": "#/$defs/CapturedPath"
+          },
+          "type": "array"
+        },
+        "consistency": {
+          "$ref": "#/$defs/SourceConsistency",
+          "description": "How consistent the source was."
+        },
+        "consistency_detail": {
+          "description": "What decided that class, in this host's own words.",
+          "type": "string"
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest that identifies this version exactly.\n\nTaken over the repository and workspace identity, the base revision, every captured path\nwith its content digest and mode, the exclusions and the capture policy. Two versions with\nthe same digest are the same captured work; a version whose digest differs is different\nwork, whatever else it shares."
+        },
+        "counts": {
+          "description": "One row per class, with exact counts.",
+          "items": {
+            "$ref": "#/$defs/PreviewCount"
+          },
+          "type": "array"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns it."
+        },
+        "exclusions": {
+          "description": "The paths this capture left out, bounded by [`MAX_CHANGESET_ENTRIES`].",
+          "items": {
+            "$ref": "#/$defs/Exclusion"
+          },
+          "type": "array"
+        },
+        "label": {
+          "description": "The label the caller gave the change set.",
+          "type": "string"
+        },
+        "limitations": {
+          "description": "What this version cannot promise, in the host's own words.\n\nIdentical source does not promise hermetic reproduction: network services, dependencies,\nsecrets and graphical state are external inputs a captured tree says nothing about.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "omitted_changes": {
+          "$ref": "#/$defs/U64",
+          "description": "How many changed paths the list above left out."
+        },
+        "omitted_exclusions": {
+          "$ref": "#/$defs/U64",
+          "description": "How many exclusions the list above left out."
+        },
+        "policy": {
+          "$ref": "#/$defs/CapturePolicy",
+          "description": "The policy it was captured under."
+        },
+        "project_repository_id": {
+          "$ref": "#/$defs/ProjectRepositoryId",
+          "description": "The repository it was captured from."
+        },
+        "provenance": {
+          "$ref": "#/$defs/Provenance",
+          "description": "Where it came from."
+        },
+        "repository_identity": {
+          "$ref": "#/$defs/FilesystemIdentity",
+          "description": "The stable filesystem identity of the repository's Git directory."
+        },
+        "summary": {
+          "$ref": "#/$defs/TreeSummary",
+          "description": "What the captured tree holds."
+        },
+        "version": {
+          "$ref": "#/$defs/ChangeSetVersion",
+          "description": "Which version it is, counting from one."
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId",
+          "description": "The workspace it was captured from."
+        },
+        "worktree_identity": {
+          "$ref": "#/$defs/FilesystemIdentity",
+          "description": "The stable filesystem identity of the working tree it was captured from."
+        }
+      },
+      "required": [
+        "change_set_id",
+        "version",
+        "content_digest",
+        "label",
+        "environment_id",
+        "project_repository_id",
+        "workspace_id",
+        "repository_identity",
+        "worktree_identity",
+        "base_revision",
+        "base_reference",
+        "consistency",
+        "consistency_detail",
+        "policy",
+        "provenance",
+        "summary",
+        "counts",
+        "changes",
+        "omitted_changes",
+        "exclusions",
+        "omitted_exclusions",
+        "limitations",
+        "captured_at_ms"
+      ],
+      "type": "object"
+    },
+    "ChangeSetVersionSummary": {
+      "additionalProperties": false,
+      "description": "One version, as a list of them names it.",
+      "properties": {
+        "base_revision": {
+          "description": "The revision it was captured against.",
+          "type": "string"
+        },
+        "captured_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was captured."
+        },
+        "change_set_id": {
+          "$ref": "#/$defs/ChangeSetId",
+          "description": "The change set."
+        },
+        "consistency": {
+          "$ref": "#/$defs/SourceConsistency",
+          "description": "How consistent its source was."
+        },
+        "content_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest that identifies it exactly."
+        },
+        "derived_from": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VersionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version it is derived from, when it is derived."
+        },
+        "version": {
+          "$ref": "#/$defs/ChangeSetVersion",
+          "description": "Which version it is."
+        }
+      },
+      "required": [
+        "change_set_id",
+        "version",
+        "content_digest",
+        "consistency",
+        "base_revision",
+        "derived_from",
+        "captured_at_ms"
+      ],
+      "type": "object"
+    },
     "ChangeSummary": {
       "additionalProperties": false,
       "description": "A model's summary of an interval, carried beside the authoritative events.\n\nSection 25 requires a summary to name its source interval and stay separate from the events. It\nis never merged into [`VisitChangedResult::changes`] and never stands in for one: a client that\nignores it loses nothing authoritative.",
@@ -3159,6 +3518,240 @@
         "from_ms",
         "to_ms",
         "model"
+      ],
+      "type": "object"
+    },
+    "ChangesetCaptureParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `changeset.capture`.",
+      "properties": {
+        "change_set_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChangeSetId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The change set to append a version to, or nothing to start a new one."
+        },
+        "grant": {
+          "$ref": "#/$defs/FileGrant",
+          "description": "What the caller's grant selects and excludes."
+        },
+        "label": {
+          "description": "The label a new change set is given. Ignored when appending.",
+          "type": "string"
+        },
+        "note": {
+          "description": "What the caller wants recorded about it.",
+          "type": "string"
+        },
+        "pin": {
+          "description": "Pin the version against the workspace, so a removal accounts for it.",
+          "type": "boolean"
+        },
+        "policy": {
+          "$ref": "#/$defs/InclusionPolicy",
+          "description": "One decision per class of the working tree."
+        },
+        "quiescence_declared": {
+          "description": "True when the caller has quiesced the working tree for this capture.",
+          "type": "boolean"
+        },
+        "required_consistency": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SourceConsistency"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The consistency class the caller requires, when it requires one.\n\nA capture that cannot reach it is refused rather than served a weaker class under a name\nthe caller asked for."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session this capture belongs to, for the provenance."
+        },
+        "workflow_run_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowRunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The automation run this capture belongs to, for the provenance."
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId",
+          "description": "The workspace to capture."
+        }
+      },
+      "required": [
+        "workspace_id",
+        "change_set_id",
+        "label",
+        "policy",
+        "grant",
+        "quiescence_declared",
+        "required_consistency",
+        "pin",
+        "session_id",
+        "workflow_run_id",
+        "note"
+      ],
+      "type": "object"
+    },
+    "ChangesetCaptureResult": {
+      "additionalProperties": false,
+      "description": "Result of `changeset.capture`.",
+      "properties": {
+        "pinned": {
+          "description": "True when the version is pinned against its workspace.",
+          "type": "boolean"
+        },
+        "version": {
+          "$ref": "#/$defs/ChangeSetVersionRecord",
+          "description": "The version that now exists."
+        }
+      },
+      "required": [
+        "version",
+        "pinned"
+      ],
+      "type": "object"
+    },
+    "ChangesetMaterializeParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `changeset.materialize`.",
+      "properties": {
+        "change_set_id": {
+          "$ref": "#/$defs/ChangeSetId",
+          "description": "The change set."
+        },
+        "label": {
+          "description": "The label the caller gave it.",
+          "type": "string"
+        },
+        "purpose": {
+          "$ref": "#/$defs/MaterialisationPurpose",
+          "description": "What the materialisation is for."
+        },
+        "version": {
+          "$ref": "#/$defs/ChangeSetVersion",
+          "description": "The exact version to materialise."
+        }
+      },
+      "required": [
+        "change_set_id",
+        "version",
+        "purpose",
+        "label"
+      ],
+      "type": "object"
+    },
+    "ChangesetMaterializeResult": {
+      "additionalProperties": false,
+      "description": "Result of `changeset.materialize`.",
+      "properties": {
+        "limitations": {
+          "description": "What an identical source does not promise, in this host's own words.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "materialisation": {
+          "$ref": "#/$defs/MaterialisationRecord",
+          "description": "The materialisation that now exists."
+        }
+      },
+      "required": [
+        "materialisation",
+        "limitations"
+      ],
+      "type": "object"
+    },
+    "ChangesetReadParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `changeset.read`.",
+      "properties": {
+        "change_set_id": {
+          "$ref": "#/$defs/ChangeSetId",
+          "description": "The change set to read."
+        },
+        "version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChangeSetVersion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version to read, or nothing for the latest."
+        }
+      },
+      "required": [
+        "change_set_id",
+        "version"
+      ],
+      "type": "object"
+    },
+    "ChangesetReadResult": {
+      "additionalProperties": false,
+      "description": "Result of `changeset.read`.",
+      "properties": {
+        "evidence": {
+          "description": "Everything that names this version and has to be accounted for before it is deleted.",
+          "items": {
+            "$ref": "#/$defs/EvidenceReference"
+          },
+          "type": "array"
+        },
+        "materialisations": {
+          "description": "The materialisations of the version that was asked for.",
+          "items": {
+            "$ref": "#/$defs/MaterialisationRecord"
+          },
+          "type": "array"
+        },
+        "results": {
+          "description": "The results recorded against those materialisations.",
+          "items": {
+            "$ref": "#/$defs/MaterialisationResult"
+          },
+          "type": "array"
+        },
+        "version": {
+          "$ref": "#/$defs/ChangeSetVersionRecord",
+          "description": "The version that was asked for."
+        },
+        "versions": {
+          "description": "Every version of this change set, oldest first.\n\nThis is what attention reads to say \"version 3 passed these tests and was reviewed; version\n4 has later changes\": the earlier version stays exactly as it was and the later one is\nvisible beside it.",
+          "items": {
+            "$ref": "#/$defs/ChangeSetVersionSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "version",
+        "versions",
+        "materialisations",
+        "results",
+        "evidence"
       ],
       "type": "object"
     },
@@ -3764,6 +4357,21 @@
         {
           "const": "unknown",
           "description": "Not read, so neither.",
+          "type": "string"
+        }
+      ]
+    },
+    "ContentOrigin": {
+      "description": "Where one captured path's content came from.",
+      "oneOf": [
+        {
+          "const": "git_object",
+          "description": "An immutable Git object, named by the index listing this capture read.",
+          "type": "string"
+        },
+        {
+          "const": "working_tree",
+          "description": "The working tree's own file, read while it was live.",
           "type": "string"
         }
       ]
@@ -4427,6 +5035,26 @@
         }
       ]
     },
+    "DestinationClass": {
+      "description": "Where an apply or a revert puts what it carries.\n\nThere is no default. Section 14 makes an apply default to an immutable proposal rather than to\na blind overwrite of an actively edited working tree, and this type is how that default is\nexpressed: a caller that wants the working tree written names [`Self::SharedExisting`] and is\nshown its limitation before it can choose it.",
+      "oneOf": [
+        {
+          "const": "proposal",
+          "description": "An immutable proposal: a new change-set version, and no write to any working tree.\n\nThe default, and the only class that cannot lose somebody's work. What it produces is a\nversion a reviewer can materialise and a person can decide about.",
+          "type": "string"
+        },
+        {
+          "const": "versioned_reference",
+          "description": "A versioned Git reference, updated by expected-old-value compare-and-swap.\n\nCompare-and-swap on the **reference**. It does not atomically update a dirty working tree,\nand this host says so in the result rather than letting a caller assume otherwise.",
+          "type": "string"
+        },
+        {
+          "const": "shared_existing",
+          "description": "The user's own working tree, written in place.\n\nBest-effort conflict detection, not universal no-clobber compare-and-swap. The limitation\ntravels in [`DiffApplyResult::limitations`] and is returned by a preflight before the class\ncan be chosen.",
+          "type": "string"
+        }
+      ]
+    },
     "DestinationRequest": {
       "additionalProperties": false,
       "description": "Where a repository operation puts what it creates.\n\nA parent the caller already holds authority over, and one single-component name inside it. The\nparent is named by a path the host resolves **once**, with its own ambient authority, into a\ndirectory handle; everything after that is relative to the handle. A multi-component name is\nrefused, because the operation that creates the entry must not depend on a prefix resolved\nafter the check.",
@@ -4719,6 +5347,423 @@
       "maxLength": 256,
       "minLength": 1,
       "type": "string"
+    },
+    "DiffApplyParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `diff.apply` and `diff.revert`.",
+      "properties": {
+        "acknowledged_limitations": {
+          "description": "The limitations of the chosen destination, as the caller was shown them.\n\nA direct apply to a shared working tree is refused until the caller passes back the\nlimitation this host returned for it, so the limitation is shown before the class is\nchosen rather than after.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "affected": {
+          "description": "What the request expects each affected path to hold now.\n\nThe preflight compares every one of these with what is there. A path the request does not\nname is a path the preflight cannot check, so a request that names none is refused for a\ndestination that writes.",
+          "items": {
+            "$ref": "#/$defs/AffectedVersion"
+          },
+          "type": "array"
+        },
+        "change_set_id": {
+          "$ref": "#/$defs/ChangeSetId",
+          "description": "The change set whose content is applied."
+        },
+        "destination": {
+          "$ref": "#/$defs/DestinationClass",
+          "description": "Where it goes. Explicit, with no default."
+        },
+        "expected_reference": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ExpectedReference"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The reference and its expected old value, for a versioned Git reference."
+        },
+        "paths": {
+          "description": "Which of the version's changed paths to apply. Empty means all of them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "preflight_only": {
+          "description": "Run the preflight and stop, whatever it finds.",
+          "type": "boolean"
+        },
+        "version": {
+          "$ref": "#/$defs/ChangeSetVersion",
+          "description": "The exact version of it."
+        },
+        "workspace_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The workspace the destination names, for every class but a bare proposal."
+        }
+      },
+      "required": [
+        "change_set_id",
+        "version",
+        "destination",
+        "workspace_id",
+        "expected_reference",
+        "affected",
+        "paths",
+        "preflight_only",
+        "acknowledged_limitations"
+      ],
+      "type": "object"
+    },
+    "DiffApplyResult": {
+      "additionalProperties": false,
+      "description": "Result of `diff.apply` and `diff.revert`.",
+      "properties": {
+        "action_id": {
+          "$ref": "#/$defs/ActionId",
+          "description": "The action it was performed under."
+        },
+        "applied_version": {
+          "$ref": "#/$defs/VersionRef",
+          "description": "The version the request carried."
+        },
+        "changed_paths": {
+          "description": "Exactly the paths this host confirmed it changed.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "conflicts": {
+          "description": "What the preflight found, when it found anything.",
+          "items": {
+            "$ref": "#/$defs/PathConflict"
+          },
+          "type": "array"
+        },
+        "decided_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was decided."
+        },
+        "destination": {
+          "$ref": "#/$defs/DestinationClass",
+          "description": "Where it was applied."
+        },
+        "detail": {
+          "description": "Why it came to what it came to.",
+          "type": "string"
+        },
+        "limitations": {
+          "description": "What this apply cannot promise, in the host's own words.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "outcome": {
+          "$ref": "#/$defs/ApplyOutcomeClass",
+          "description": "Which of the five classes it came to."
+        },
+        "progress": {
+          "description": "Every path's progress, recorded before and after its write.",
+          "items": {
+            "$ref": "#/$defs/PathProgress"
+          },
+          "type": "array"
+        },
+        "proposal_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VersionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The immutable proposal a proposal apply produced."
+        },
+        "recovery": {
+          "$ref": "#/$defs/RecoveryObjects",
+          "description": "What a person or a later apply can recover from."
+        },
+        "reference": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReferenceOutcome"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What became of the reference, for a versioned Git reference."
+        },
+        "unresolved_paths": {
+          "description": "Exactly the paths whose state this host could not establish.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "action_id",
+        "outcome",
+        "destination",
+        "applied_version",
+        "proposal_version",
+        "reference",
+        "changed_paths",
+        "unresolved_paths",
+        "conflicts",
+        "progress",
+        "recovery",
+        "limitations",
+        "detail",
+        "decided_at_ms"
+      ],
+      "type": "object"
+    },
+    "DiffEntry": {
+      "additionalProperties": false,
+      "description": "One path a diff read names.",
+      "properties": {
+        "base_object_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The immutable Git object the base holds for this path, when it has one.\n\nThis is the content revision of the base side."
+        },
+        "byte_len": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its size in bytes, when this host could read one."
+        },
+        "change": {
+          "$ref": "#/$defs/ChangeKind",
+          "description": "What change is held for it."
+        },
+        "class": {
+          "$ref": "#/$defs/InclusionClass",
+          "description": "Which class of the working tree it belongs to."
+        },
+        "content": {
+          "$ref": "#/$defs/ContentClass",
+          "description": "What its content is."
+        },
+        "content_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of the content the working tree or the captured version holds.\n\nThis is the content revision of the other side."
+        },
+        "path": {
+          "description": "The path, relative to the repository's top level.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "class",
+        "change",
+        "content",
+        "byte_len",
+        "base_object_id",
+        "content_digest"
+      ],
+      "type": "object"
+    },
+    "DiffReadParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `diff.read`.\n\nExactly one of the two subjects is named: a workspace, which reads its live working tree, or a\nchange-set version, which reads what was captured.",
+      "properties": {
+        "change_set_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChangeSetId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The change set to read."
+        },
+        "version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChangeSetVersion"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version of it to read, or nothing for the latest."
+        },
+        "workspace_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkspaceId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The workspace to read."
+        }
+      },
+      "required": [
+        "workspace_id",
+        "change_set_id",
+        "version"
+      ],
+      "type": "object"
+    },
+    "DiffReadResult": {
+      "additionalProperties": false,
+      "description": "Result of `diff.read`.",
+      "properties": {
+        "base_reference": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The reference that revision was named by, when it was named by one."
+        },
+        "base_revision": {
+          "description": "The revision the changes are against.",
+          "type": "string"
+        },
+        "counts": {
+          "description": "One row per class, with exact counts.",
+          "items": {
+            "$ref": "#/$defs/PreviewCount"
+          },
+          "type": "array"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns the subject."
+        },
+        "head_reference": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The reference `HEAD` is on now, when it is on one."
+        },
+        "head_revision": {
+          "description": "The revision `HEAD` names now.",
+          "type": "string"
+        },
+        "limitations": {
+          "description": "What this read cannot promise, in the host's own words.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "omitted_entries": {
+          "$ref": "#/$defs/U64",
+          "description": "How many entries the two lists left out. The counts still cover them."
+        },
+        "project_repository_id": {
+          "$ref": "#/$defs/ProjectRepositoryId",
+          "description": "The repository it is a read of."
+        },
+        "read_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was taken."
+        },
+        "repository_identity": {
+          "$ref": "#/$defs/FilesystemIdentity",
+          "description": "The stable filesystem identity of the repository's Git directory."
+        },
+        "source_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VersionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version this read is of, when it reads a captured version rather than a live tree."
+        },
+        "tracked": {
+          "description": "The tracked paths with a change, bounded by [`MAX_CHANGESET_ENTRIES`].",
+          "items": {
+            "$ref": "#/$defs/DiffEntry"
+          },
+          "type": "array"
+        },
+        "untracked": {
+          "description": "The untracked and ignored paths, bounded by [`MAX_CHANGESET_ENTRIES`].",
+          "items": {
+            "$ref": "#/$defs/DiffEntry"
+          },
+          "type": "array"
+        },
+        "workspace_id": {
+          "$ref": "#/$defs/WorkspaceId",
+          "description": "The workspace it is a read of."
+        },
+        "worktree_identity": {
+          "$ref": "#/$defs/FilesystemIdentity",
+          "description": "The stable filesystem identity of the working tree."
+        }
+      },
+      "required": [
+        "environment_id",
+        "project_repository_id",
+        "workspace_id",
+        "repository_identity",
+        "worktree_identity",
+        "base_revision",
+        "base_reference",
+        "head_revision",
+        "head_reference",
+        "source_version",
+        "tracked",
+        "untracked",
+        "omitted_entries",
+        "counts",
+        "limitations",
+        "read_at_ms"
+      ],
+      "type": "object"
     },
     "Digest256": {
       "contentEncoding": "base64url",
@@ -6535,6 +7580,181 @@
       ],
       "type": "object"
     },
+    "EvidenceKind": {
+      "description": "What kind of evidence names a version.",
+      "oneOf": [
+        {
+          "const": "review_acknowledgement",
+          "description": "A reviewer acknowledged this version.",
+          "type": "string"
+        },
+        {
+          "const": "test_result",
+          "description": "A test result attests this version.",
+          "type": "string"
+        },
+        {
+          "const": "materialisation",
+          "description": "A materialisation of this version exists.",
+          "type": "string"
+        },
+        {
+          "const": "applied_change",
+          "description": "An apply produced or consumed this version.",
+          "type": "string"
+        }
+      ]
+    },
+    "EvidenceReference": {
+      "additionalProperties": false,
+      "description": "One thing that names a version and has to be accounted for before it is deleted.",
+      "properties": {
+        "detail": {
+          "description": "What it is, in this host's own words.",
+          "type": "string"
+        },
+        "kind": {
+          "$ref": "#/$defs/EvidenceKind",
+          "description": "What kind of evidence it is."
+        },
+        "recorded_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was recorded."
+        },
+        "version": {
+          "$ref": "#/$defs/VersionRef",
+          "description": "The version it names."
+        }
+      },
+      "required": [
+        "version",
+        "kind",
+        "detail",
+        "recorded_at_ms"
+      ],
+      "type": "object"
+    },
+    "Exclusion": {
+      "additionalProperties": false,
+      "description": "One path a capture left out, and why.",
+      "properties": {
+        "detail": {
+          "description": "What this host can say about it, in its own words.",
+          "type": "string"
+        },
+        "path": {
+          "description": "The path, relative to the repository's top level.",
+          "type": "string"
+        },
+        "reason": {
+          "$ref": "#/$defs/ExclusionReason",
+          "description": "Why it is not in the captured tree."
+        }
+      },
+      "required": [
+        "path",
+        "reason",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "ExclusionReason": {
+      "description": "Why one path is not in a captured tree.",
+      "oneOf": [
+        {
+          "const": "policy",
+          "description": "The inclusion policy's choice for its class left it out.",
+          "type": "string"
+        },
+        {
+          "const": "grant",
+          "description": "The caller's file grant did not select it, or excluded it by name.",
+          "type": "string"
+        },
+        {
+          "const": "secret_rule",
+          "description": "A secret rule covers it. Such a path is never read at all.",
+          "type": "string"
+        },
+        {
+          "const": "unsupported",
+          "description": "It is not file content: a symbolic link, a device, a socket, a submodule's own tree.",
+          "type": "string"
+        },
+        {
+          "const": "unreadable",
+          "description": "This host could not read it.",
+          "type": "string"
+        }
+      ]
+    },
+    "ExecutionReceipt": {
+      "additionalProperties": false,
+      "description": "What one execution did.",
+      "properties": {
+        "detail": {
+          "description": "What the caller says about it.",
+          "type": "string"
+        },
+        "ended_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it ended."
+        },
+        "exit_status": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Its exit status, when it ended with one."
+        },
+        "started_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it started."
+        },
+        "stopped": {
+          "description": "True when something stopped it rather than it finishing.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "started_at_ms",
+        "ended_at_ms",
+        "exit_status",
+        "stopped",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "ExpectedReference": {
+      "additionalProperties": false,
+      "description": "The reference an apply to a versioned Git reference names, and the value it expects it at.",
+      "properties": {
+        "expected_old_value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The value it is expected to hold, or nothing when it is expected not to exist."
+        },
+        "name": {
+          "description": "The full reference name, such as `refs/heads/main`.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "expected_old_value"
+      ],
+      "type": "object"
+    },
     "ExpirationTombstone": {
       "additionalProperties": false,
       "description": "The record an expired object leaves behind.\n\nIt outlives a retrust deliberately. Section 9 keeps old expiration tombstones when the wall\nclock becomes trusted again, which is what stops a clock correction from reviving something\nthat had already run out.",
@@ -6891,6 +8111,36 @@
       "required": [
         "actor_id",
         "action_id"
+      ],
+      "type": "object"
+    },
+    "FileGrant": {
+      "additionalProperties": false,
+      "description": "Which paths a caller's grant selects, before the inclusion policy decides anything.\n\nA grant is applied **before** the capture reads anything, which is what stops a secret becoming\nattachment material. An empty [`Self::included_paths`] means every path the policy allows; a\nnon-empty one means exactly those prefixes and nothing else.",
+      "properties": {
+        "excluded_paths": {
+          "description": "The path prefixes the caller excluded, whatever the policy says.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "included_paths": {
+          "description": "The path prefixes the caller selected. Empty means the policy decides alone.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "secret_rules_applied": {
+          "description": "Apply this host's own secret rules as well.\n\nThere is no way to turn them off through the wire. The field exists so a record says the\nrules were applied rather than leaving a reader to assume it.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "included_paths",
+        "excluded_paths",
+        "secret_rules_applied"
       ],
       "type": "object"
     },
@@ -9188,6 +10438,190 @@
       ],
       "type": "object"
     },
+    "MaterialisationId": {
+      "description": "One independent materialisation of one exact change-set version.",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "type": "string"
+    },
+    "MaterialisationPurpose": {
+      "description": "What a materialisation of a version is for.",
+      "oneOf": [
+        {
+          "const": "test",
+          "description": "A test run.",
+          "type": "string"
+        },
+        {
+          "const": "review",
+          "description": "A reviewer's own copy.",
+          "type": "string"
+        },
+        {
+          "const": "inspection",
+          "description": "Somebody looking at it.",
+          "type": "string"
+        }
+      ]
+    },
+    "MaterialisationRecord": {
+      "additionalProperties": false,
+      "description": "One independent materialisation of one exact version.\n\nIt is written from the host's own content-addressed store into a private directory, so the\nagent whose working tree was captured can keep working without changing anybody's inputs. It\ntouches neither the repository nor the workspace it came from.",
+      "properties": {
+        "content_digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "The digest of the version it was written from."
+        },
+        "created_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was made."
+        },
+        "directory_path": {
+          "description": "Where it is, for a person and for a tool the caller runs.",
+          "type": "string"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that owns it."
+        },
+        "filesystem_identity": {
+          "$ref": "#/$defs/FilesystemIdentity",
+          "description": "The stable filesystem identity of that directory."
+        },
+        "label": {
+          "description": "The label the caller gave it.",
+          "type": "string"
+        },
+        "materialisation_id": {
+          "$ref": "#/$defs/MaterialisationId",
+          "description": "Its identity."
+        },
+        "paths_written": {
+          "$ref": "#/$defs/U64",
+          "description": "How many paths were written into it."
+        },
+        "purpose": {
+          "$ref": "#/$defs/MaterialisationPurpose",
+          "description": "What it is for."
+        },
+        "released_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When it was released, once it has been."
+        },
+        "unapplied": {
+          "description": "The paths the version holds that this host could not write.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "version": {
+          "$ref": "#/$defs/VersionRef",
+          "description": "The version it holds."
+        }
+      },
+      "required": [
+        "materialisation_id",
+        "version",
+        "content_digest",
+        "environment_id",
+        "purpose",
+        "label",
+        "directory_path",
+        "filesystem_identity",
+        "paths_written",
+        "unapplied",
+        "created_at_ms",
+        "released_at_ms"
+      ],
+      "type": "object"
+    },
+    "MaterialisationResult": {
+      "additionalProperties": false,
+      "description": "What one test or reviewer session did with one materialisation.",
+      "properties": {
+        "attestation": {
+          "description": "What this result does and does not say, in this host's own words.",
+          "type": "string"
+        },
+        "command": {
+          "description": "The command that was executed, as the caller names it.",
+          "type": "string"
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment it ran in."
+        },
+        "input_version": {
+          "$ref": "#/$defs/VersionRef",
+          "description": "The version that was materialised."
+        },
+        "materialisation_id": {
+          "$ref": "#/$defs/MaterialisationId",
+          "description": "The materialisation it ran against."
+        },
+        "outputs": {
+          "description": "What it produced.",
+          "items": {
+            "$ref": "#/$defs/OutputReference"
+          },
+          "type": "array"
+        },
+        "profile": {
+          "description": "The profile it was executed under, as the caller names it.",
+          "type": "string"
+        },
+        "receipt": {
+          "$ref": "#/$defs/ExecutionReceipt",
+          "description": "What the execution did."
+        },
+        "recorded_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was recorded."
+        },
+        "tested_source": {
+          "$ref": "#/$defs/TestedSource",
+          "description": "What was actually tested."
+        },
+        "tested_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VersionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version the result attests, when it attests one.\n\nThe input version for [`TestedSource::UnmodifiedVersion`], the derived version for\n[`TestedSource::DerivedVersion`], and nothing at all for [`TestedSource::Indeterminate`]."
+        },
+        "tool": {
+          "$ref": "#/$defs/ToolIdentity",
+          "description": "Which tool produced it."
+        }
+      },
+      "required": [
+        "materialisation_id",
+        "input_version",
+        "tested_source",
+        "tested_version",
+        "command",
+        "profile",
+        "environment_id",
+        "tool",
+        "receipt",
+        "outputs",
+        "attestation",
+        "recorded_at_ms"
+      ],
+      "type": "object"
+    },
     "MembershipLease": {
       "additionalProperties": false,
       "description": "A signed statement that one account held one role in one organisation.",
@@ -10899,6 +12333,35 @@
       ],
       "type": "object"
     },
+    "OutputReference": {
+      "additionalProperties": false,
+      "description": "One thing an execution produced.",
+      "properties": {
+        "byte_len": {
+          "$ref": "#/$defs/U64",
+          "description": "Its length in bytes."
+        },
+        "digest": {
+          "$ref": "#/$defs/Digest256",
+          "description": "Its digest."
+        },
+        "kind": {
+          "description": "What kind of thing it is: a log, a report, an artefact.",
+          "type": "string"
+        },
+        "label": {
+          "description": "What it is.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label",
+        "digest",
+        "byte_len",
+        "kind"
+      ],
+      "type": "object"
+    },
     "OwnerConfirmationProof": {
       "additionalProperties": false,
       "description": "An owner's answer to a confirmation challenge.\n\nThe verification ceremony itself is platform code; this object records its result and binds it\nto the exact challenge. The host's acceptance record keeps the user-presence evidence and the\nchallenge-consumption transition together.",
@@ -11500,6 +12963,151 @@
     "ParamsValue": {
       "description": "An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.",
       "tsType": "unknown"
+    },
+    "PathConflict": {
+      "additionalProperties": false,
+      "description": "One path whose destination was not what the request expected.",
+      "properties": {
+        "detail": {
+          "description": "What the difference is, in this host's own words.",
+          "type": "string"
+        },
+        "expected_index_object_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the request expected the index to hold."
+        },
+        "expected_worktree_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What the request expected the working tree to hold."
+        },
+        "observed_index_object_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What this host found."
+        },
+        "observed_worktree_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "What this host found."
+        },
+        "path": {
+          "description": "The path.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "path",
+        "expected_worktree_digest",
+        "observed_worktree_digest",
+        "expected_index_object_id",
+        "observed_index_object_id",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "PathProgress": {
+      "additionalProperties": false,
+      "description": "One path's progress, recorded before and after the write.",
+      "properties": {
+        "after_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of what is there now, when this host read it."
+        },
+        "before_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of what was there before, when this host read it."
+        },
+        "detail": {
+          "description": "What this host can say about it.",
+          "type": "string"
+        },
+        "path": {
+          "description": "The path.",
+          "type": "string"
+        },
+        "state": {
+          "$ref": "#/$defs/PathProgressState",
+          "description": "What became of it."
+        }
+      },
+      "required": [
+        "path",
+        "state",
+        "before_digest",
+        "after_digest",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "PathProgressState": {
+      "description": "What became of one path an apply set out to write.",
+      "oneOf": [
+        {
+          "const": "planned",
+          "description": "The apply recorded that it was going to write this path and has not established what\nbecame of it.\n\nThis is what a crash between the write and the record leaves, and it means exactly that:\nnot \"unwritten\". A person or a later apply decides.",
+          "type": "string"
+        },
+        {
+          "const": "written",
+          "description": "The content is in the destination and this host confirmed it.",
+          "type": "string"
+        },
+        {
+          "const": "conflicted",
+          "description": "The destination was not what the request expected, so nothing was written to it.",
+          "type": "string"
+        },
+        {
+          "const": "unresolved",
+          "description": "This host could not establish what is at the destination.",
+          "type": "string"
+        },
+        {
+          "const": "skipped",
+          "description": "The path was not attempted, because the apply stopped before reaching it.",
+          "type": "string"
+        }
+      ]
     },
     "PayerAuthorisation": {
       "description": "Why this payer is the one billed.\n\nA relay credential cannot move the bill to another account. A sponsored lease names the\nauthorisation the sponsor gave, so the service can show which record made the transfer lawful\nand can refuse a lease that names none.",
@@ -13182,6 +14790,71 @@
       "required": [
         "major",
         "minor"
+      ],
+      "type": "object"
+    },
+    "Provenance": {
+      "additionalProperties": false,
+      "description": "Where one version came from.",
+      "properties": {
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The actor whose request produced it."
+        },
+        "derivation": {
+          "description": "Why it is derived, in this host's own words.",
+          "type": "string"
+        },
+        "derived_from": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VersionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version this one is derived from, when it is derived.\n\nA version derived from a modified materialisation names the version that was materialised.\nA version derived from an apply names the version that was applied."
+        },
+        "method": {
+          "description": "The method that produced it.",
+          "type": "string"
+        },
+        "note": {
+          "description": "What the caller said about it.",
+          "type": "string"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session it was captured for, when it was captured for one."
+        },
+        "workflow_run_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/WorkflowRunId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The automation run it was captured for, when it was captured for one."
+        }
+      },
+      "required": [
+        "actor_id",
+        "method",
+        "session_id",
+        "workflow_run_id",
+        "derived_from",
+        "derivation",
+        "note"
       ],
       "type": "object"
     },
@@ -15242,6 +16915,121 @@
         "seed_checksum",
         "service_origins",
         "bundle_locator"
+      ],
+      "type": "object"
+    },
+    "RecoveryObjects": {
+      "additionalProperties": false,
+      "description": "What a person or a later apply can recover from.",
+      "properties": {
+        "after_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VersionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The immutable version of the destination as it stands after the apply."
+        },
+        "applied_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VersionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version the apply carried."
+        },
+        "before_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/VersionRef"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The immutable version of the destination as it stood before the apply.\n\nCaptured before anything is written, so a person can see exactly what was replaced and a\nrevert has something to put back."
+        },
+        "detail": {
+          "description": "What these objects are and are not, in this host's own words.",
+          "type": "string"
+        },
+        "staged_path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The staging directory the validated content was written through, while it is still there."
+        }
+      },
+      "required": [
+        "before_version",
+        "after_version",
+        "applied_version",
+        "staged_path",
+        "detail"
+      ],
+      "type": "object"
+    },
+    "ReferenceOutcome": {
+      "additionalProperties": false,
+      "description": "What became of a versioned Git reference.",
+      "properties": {
+        "compare_and_swap_held": {
+          "description": "True when the two agreed, which is what a compare-and-swap requires.",
+          "type": "boolean"
+        },
+        "expected_old_value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The value the request expected."
+        },
+        "limitation": {
+          "description": "What this host did not do, and why, in its own words.",
+          "type": "string"
+        },
+        "name": {
+          "description": "The reference the request named.",
+          "type": "string"
+        },
+        "observed_old_value": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The value this host found."
+        },
+        "updated": {
+          "description": "True when this host moved the reference.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "name",
+        "expected_old_value",
+        "observed_old_value",
+        "compare_and_swap_held",
+        "updated",
+        "limitation"
       ],
       "type": "object"
     },
@@ -18968,6 +20756,26 @@
       ],
       "type": "object"
     },
+    "SourceConsistency": {
+      "description": "How consistent the source of one capture was.\n\nThere is no default and no fourth member that means \"probably fine\". A live multi-file capture\nis [`Self::PerFileCapture`] unless a real mechanism made it something stronger, which is what\nsection 14 means by never advertising a point-in-time snapshot without one.",
+      "oneOf": [
+        {
+          "const": "atomic_snapshot",
+          "description": "Every captured path's content came from an immutable Git object.\n\nThe object identifiers were listed by one invocation, so they name one point in time, and a\nGit object never changes once it exists. That is a real point-in-time snapshot rather than a\nclaim about timing, and it is the only way a capture reaches this class here: no filesystem\nthis host runs on offers an unprivileged atomic snapshot of a directory tree.",
+          "type": "string"
+        },
+        {
+          "const": "quiesced_capture",
+          "description": "The caller declared the working tree quiesced and this host observed no change.\n\nThe declaration is the caller's; the verification is this host's. Every file's identity,\nsize and modification time are read before and after its content, and the selection is read\nagain at the end. What this class asserts is both facts together, and neither alone.",
+          "type": "string"
+        },
+        {
+          "const": "per_file_capture",
+          "description": "Files were read one at a time from a live working tree.\n\nConcurrent changes are detected and retried within [`MAX_PATH_RETRIES`] and\n[`MAX_CAPTURE_RETRIES`], and beyond that the capture is rejected with `SOURCE_CHANGED`. The\ncaptured tree is still immutable and exactly identified; what it is not is one instant of\nthe working tree.",
+          "type": "string"
+        }
+      ]
+    },
     "SourceEventHandle": {
       "description": "A private broker handle for immutable upstream bytes and their execution provenance.",
       "maxLength": 256,
@@ -19393,6 +21201,26 @@
       ],
       "type": "object"
     },
+    "TestedSource": {
+      "description": "What a result was actually run against.",
+      "oneOf": [
+        {
+          "const": "unmodified_version",
+          "description": "The materialisation still held exactly the version, so the result attests that version.",
+          "type": "string"
+        },
+        {
+          "const": "derived_version",
+          "description": "The materialisation was modified, so the result attests a derived version of its own.",
+          "type": "string"
+        },
+        {
+          "const": "indeterminate",
+          "description": "This host could not establish what was tested, so the result attests nothing.\n\nA result must not say the unmodified version passed when the tested source cannot be\nestablished. This is what it says instead.",
+          "type": "string"
+        }
+      ]
+    },
     "TimeAdapterReading": {
       "additionalProperties": false,
       "description": "One reading of the platform time adapter.\n\nEvery field is what the operating system reported, classified into this build's vocabulary. No\nfield is a measurement of our own, and nothing here contacts a time server: section 9 requires\nthe actual supported platform service and forbids an invented universal authenticated call.",
@@ -19555,11 +21383,64 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "ToolIdentity": {
+      "additionalProperties": false,
+      "description": "Which tool produced a result.",
+      "properties": {
+        "name": {
+          "description": "Its name.",
+          "type": "string"
+        },
+        "version": {
+          "description": "Its version, as the tool itself reports it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "version"
+      ],
+      "type": "object"
+    },
     "TransferId": {
       "description": "One upload or download transfer.",
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "TreeSummary": {
+      "additionalProperties": false,
+      "description": "What a captured tree holds, in exact counts.",
+      "properties": {
+        "deleted_paths": {
+          "$ref": "#/$defs/U64",
+          "description": "How many tracked paths the working tree had deleted, so the captured tree does not hold\nthem."
+        },
+        "from_git_objects": {
+          "$ref": "#/$defs/U64",
+          "description": "How many of them came from an immutable Git object."
+        },
+        "from_working_tree": {
+          "$ref": "#/$defs/U64",
+          "description": "How many of them were read from the live working tree."
+        },
+        "total_bytes": {
+          "$ref": "#/$defs/U64",
+          "description": "Their total size in bytes."
+        },
+        "total_paths": {
+          "$ref": "#/$defs/U64",
+          "description": "How many paths the captured tree holds."
+        }
+      },
+      "required": [
+        "total_paths",
+        "total_bytes",
+        "from_git_objects",
+        "from_working_tree",
+        "deleted_paths"
+      ],
+      "type": "object"
     },
     "TrustedWriter": {
       "additionalProperties": false,
@@ -19987,6 +21868,25 @@
         "approval_request_id",
         "details_digest",
         "approved"
+      ],
+      "type": "object"
+    },
+    "VersionRef": {
+      "additionalProperties": false,
+      "description": "One exact version of one change set.",
+      "properties": {
+        "change_set_id": {
+          "$ref": "#/$defs/ChangeSetId",
+          "description": "The change set."
+        },
+        "version": {
+          "$ref": "#/$defs/ChangeSetVersion",
+          "description": "The version within it, counting from one."
+        }
+      },
+      "required": [
+        "change_set_id",
+        "version"
       ],
       "type": "object"
     },
@@ -22269,8 +24169,32 @@
     "change_operation": {
       "$ref": "#/$defs/ChangeOperation"
     },
+    "change_set_version_record": {
+      "$ref": "#/$defs/ChangeSetVersionRecord"
+    },
+    "change_set_version_summary": {
+      "$ref": "#/$defs/ChangeSetVersionSummary"
+    },
     "change_summary": {
       "$ref": "#/$defs/ChangeSummary"
+    },
+    "changeset_capture_params": {
+      "$ref": "#/$defs/ChangesetCaptureParams"
+    },
+    "changeset_capture_result": {
+      "$ref": "#/$defs/ChangesetCaptureResult"
+    },
+    "changeset_materialize_params": {
+      "$ref": "#/$defs/ChangesetMaterializeParams"
+    },
+    "changeset_materialize_result": {
+      "$ref": "#/$defs/ChangesetMaterializeResult"
+    },
+    "changeset_read_params": {
+      "$ref": "#/$defs/ChangesetReadParams"
+    },
+    "changeset_read_result": {
+      "$ref": "#/$defs/ChangesetReadResult"
     },
     "client_offer": {
       "$ref": "#/$defs/ClientOffer"
@@ -22313,6 +24237,21 @@
     },
     "device_summary": {
       "$ref": "#/$defs/DeviceSummary"
+    },
+    "diff_apply_params": {
+      "$ref": "#/$defs/DiffApplyParams"
+    },
+    "diff_apply_result": {
+      "$ref": "#/$defs/DiffApplyResult"
+    },
+    "diff_entry": {
+      "$ref": "#/$defs/DiffEntry"
+    },
+    "diff_read_params": {
+      "$ref": "#/$defs/DiffReadParams"
+    },
+    "diff_read_result": {
+      "$ref": "#/$defs/DiffReadResult"
     },
     "direct_challenge": {
       "$ref": "#/$defs/DirectChallenge"
@@ -22373,6 +24312,9 @@
     },
     "events_subscribe_result": {
       "$ref": "#/$defs/EventsSubscribeResult"
+    },
+    "evidence_reference": {
+      "$ref": "#/$defs/EvidenceReference"
     },
     "expiration_tombstone": {
       "$ref": "#/$defs/ExpirationTombstone"
@@ -22581,6 +24523,9 @@
         "machine_id": {
           "$ref": "#/$defs/MachineId"
         },
+        "materialisation_id": {
+          "$ref": "#/$defs/MaterialisationId"
+        },
         "notification_id": {
           "$ref": "#/$defs/NotificationId"
         },
@@ -22745,6 +24690,12 @@
     },
     "log_view_state": {
       "$ref": "#/$defs/LogViewState"
+    },
+    "materialisation_record": {
+      "$ref": "#/$defs/MaterialisationRecord"
+    },
+    "materialisation_result": {
+      "$ref": "#/$defs/MaterialisationResult"
     },
     "membership_lease": {
       "$ref": "#/$defs/MembershipLease"

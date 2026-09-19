@@ -60,7 +60,7 @@ export type ChangeOperation =
     }
   | {
       /**
-       * The digest of the content written. A removal that finds different content stops.
+       * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
        */
       digest: string
       operation: 'write_file'
@@ -160,6 +160,26 @@ export type CapabilityInvalidation =
  * A host-derived desktop session identity binding OS user, boot identity and login-session generation.
  */
 export type DesktopSessionId = string
+/**
+ * How consistent the source of one capture was.
+ *
+ * There is no default and no fourth member that means "probably fine". A live multi-file capture
+ * is [`Self::PerFileCapture`] unless a real mechanism made it something stronger, which is what
+ * section 14 means by never advertising a point-in-time snapshot without one.
+ */
+export type SourceConsistency = 'atomic_snapshot' | 'quiesced_capture' | 'per_file_capture'
+/**
+ * One automation run.
+ */
+export type WorkflowRunId = string
+/**
+ * One immutable captured change set.
+ */
+export type ChangeSetId = string
+/**
+ * The exact version of a change set that was tested or reviewed.
+ */
+export type ChangeSetVersion = string
 /**
  * A versioned capability name. Capabilities describe feasibility, never authority.
  */
@@ -346,6 +366,10 @@ export type ActionRight =
  */
 export type ActionId = string
 /**
+ * One selected working copy and its policy.
+ */
+export type WorkspaceId = string
+/**
  * One upload or download transfer.
  */
 export type TransferId = string
@@ -503,14 +527,6 @@ export type CapabilityRevision = string
  */
 export type CausalRootId = string
 /**
- * One immutable captured change set.
- */
-export type ChangeSetId = string
-/**
- * The exact version of a change set that was tested or reviewed.
- */
-export type ChangeSetVersion = string
-/**
  * The host clock epoch, advanced when wall-clock trust changes.
  */
 export type ClockEpoch = string
@@ -574,6 +590,10 @@ export type InvitationId = string
  * A logical machine group. Not a hardware identity.
  */
 export type MachineId = string
+/**
+ * One independent materialisation of one exact change-set version.
+ */
+export type MaterialisationId = string
 /**
  * One notification, named by the host that produced it. 128 random bits, opaque to the gateway and the provider.
  */
@@ -690,14 +710,6 @@ export type VoiceSessionId = string
  * One automation definition.
  */
 export type WorkflowId = string
-/**
- * One automation run.
- */
-export type WorkflowRunId = string
-/**
- * One selected working copy and its policy.
- */
-export type WorkspaceId = string
 /**
  * Where a request entered the host.
  *
@@ -1212,7 +1224,15 @@ export interface KalaReachProtocol {
   capability_record?: CapabilityRecord
   change_manifest?: ChangeManifest1
   change_operation?: ChangeOperation
+  change_set_version_record?: ChangeSetVersionRecord
+  change_set_version_summary?: ChangeSetVersionSummary
   change_summary?: ChangeSummary
+  changeset_capture_params?: ChangesetCaptureParams
+  changeset_capture_result?: ChangesetCaptureResult
+  changeset_materialize_params?: ChangesetMaterializeParams
+  changeset_materialize_result?: ChangesetMaterializeResult
+  changeset_read_params?: ChangesetReadParams
+  changeset_read_result?: ChangesetReadResult
   client_offer?: ClientOffer
   closure_record?: ClosureRecord
   connect_reply?: ConnectReply
@@ -1227,6 +1247,11 @@ export interface KalaReachProtocol {
   device_preview_key_update_result?: DevicePreviewKeyUpdateResult
   device_revoke_params?: DeviceRevokeParams
   device_summary?: DeviceSummary
+  diff_apply_params?: DiffApplyParams
+  diff_apply_result?: DiffApplyResult
+  diff_entry?: DiffEntry
+  diff_read_params?: DiffReadParams
+  diff_read_result?: DiffReadResult
   direct_challenge?: DirectChallenge
   direct_redeem_proof?: DirectRedeemProof
   download_begin_params?: DownloadBeginParams
@@ -1247,6 +1272,7 @@ export interface KalaReachProtocol {
   events_snapshot_result?: EventsSnapshotResult
   events_subscribe_params?: EventsSubscribeParams
   events_subscribe_result?: EventsSubscribeResult
+  evidence_reference?: EvidenceReference
   expiration_tombstone?: ExpirationTombstone
   fence_evidence?: FenceEvidence
   fenced_action?: FencedAction
@@ -1319,6 +1345,7 @@ export interface KalaReachProtocol {
     installation_id?: InstallationId
     invitation_id?: InvitationId
     machine_id?: MachineId
+    materialisation_id?: MaterialisationId
     notification_id?: NotificationId
     organisation_id?: OrganisationId
     pairing_sequence?: PairingSequence
@@ -1374,6 +1401,8 @@ export interface KalaReachProtocol {
   local_hello?: LocalHello
   local_hello_ack?: LocalHelloAck
   log_view_state?: LogViewState
+  materialisation_record?: MaterialisationRecord1
+  materialisation_result?: MaterialisationResult
   membership_lease?: MembershipLease
   method_entry?: MethodEntry
   mutation_request?: MutationRequest
@@ -2003,7 +2032,7 @@ export interface AttachmentHandle {
    */
   byte_len: string
   /**
-   * The verified whole-file SHA-256 digest.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   content_digest: string
   /**
@@ -2729,7 +2758,7 @@ export interface AttachmentHandle1 {
    */
   byte_len: string
   /**
-   * The verified whole-file SHA-256 digest.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   content_digest: string
   /**
@@ -3593,6 +3622,382 @@ export interface ChangeManifest1 {
   skill_version: string
 }
 /**
+ * One immutable change-set version.
+ *
+ * The record a caller receives. The whole manifest is in the host's own content-addressed store;
+ * what travels is the identity, the digest, the exact counts and the changes, because a captured
+ * tree can hold far more paths than one control frame carries.
+ */
+export interface ChangeSetVersionRecord {
+  /**
+   * The reference that revision was named by, when it was named by one.
+   */
+  base_reference: string | null
+  /**
+   * The revision it was captured against.
+   */
+  base_revision: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  captured_at_ms: string
+  /**
+   * The change set this version belongs to.
+   */
+  change_set_id: string
+  /**
+   * The paths whose content differs from the base, bounded by [`MAX_CHANGESET_ENTRIES`].
+   */
+  changes: CapturedPath[]
+  /**
+   * How consistent the source of one capture was.
+   *
+   * There is no default and no fourth member that means "probably fine". A live multi-file capture
+   * is [`Self::PerFileCapture`] unless a real mechanism made it something stronger, which is what
+   * section 14 means by never advertising a point-in-time snapshot without one.
+   */
+  consistency: 'atomic_snapshot' | 'quiesced_capture' | 'per_file_capture'
+  /**
+   * What decided that class, in this host's own words.
+   */
+  consistency_detail: string
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  content_digest: string
+  /**
+   * One row per class, with exact counts.
+   */
+  counts: PreviewCount[]
+  /**
+   * The environment that owns it.
+   */
+  environment_id: string
+  /**
+   * The paths this capture left out, bounded by [`MAX_CHANGESET_ENTRIES`].
+   */
+  exclusions: Exclusion[]
+  /**
+   * The label the caller gave the change set.
+   */
+  label: string
+  /**
+   * What this version cannot promise, in the host's own words.
+   *
+   * Identical source does not promise hermetic reproduction: network services, dependencies,
+   * secrets and graphical state are external inputs a captured tree says nothing about.
+   */
+  limitations: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted_changes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted_exclusions: string
+  policy: CapturePolicy
+  /**
+   * The repository it was captured from.
+   */
+  project_repository_id: string
+  provenance: Provenance
+  repository_identity: FilesystemIdentity
+  summary: TreeSummary
+  /**
+   * Which version it is, counting from one.
+   */
+  version: string
+  /**
+   * The workspace it was captured from.
+   */
+  workspace_id: string
+  worktree_identity: FilesystemIdentity1
+}
+/**
+ * One path of a captured tree.
+ */
+export interface CapturedPath {
+  /**
+   * The Git object the base revision holds for this path, when it has one.
+   */
+  base_object_id: string | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  byte_len: string
+  /**
+   * What change the working tree held for it when it was captured.
+   */
+  change: 'present' | 'deleted' | 'unmerged'
+  /**
+   * Which class of the working tree it belongs to.
+   */
+  class: 'dirty_file' | 'untracked_file' | 'submodule' | 'binary_file' | 'generated_artefact'
+  /**
+   * What the content is, by Git's own test.
+   */
+  content: 'text' | 'binary' | 'unknown'
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  content_digest: string
+  /**
+   * True when the file is executable.
+   *
+   * The one permission bit a captured tree carries. A materialisation sets it and a
+   * materialisation of a tree without it never sets it, which is what "permissions preserved"
+   * comes to for content this host copies.
+   */
+  executable: boolean
+  /**
+   * Where it was read from.
+   */
+  origin: 'git_object' | 'working_tree'
+  /**
+   * The path, relative to the repository's top level.
+   */
+  path: string
+}
+/**
+ * One class's counts in a preview.
+ */
+export interface PreviewCount {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  byte_len: string
+  /**
+   * The class.
+   */
+  class: 'dirty_file' | 'untracked_file' | 'submodule' | 'binary_file' | 'generated_artefact'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  included: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  total: string
+}
+/**
+ * One path a capture left out, and why.
+ */
+export interface Exclusion {
+  /**
+   * What this host can say about it, in its own words.
+   */
+  detail: string
+  /**
+   * The path, relative to the repository's top level.
+   */
+  path: string
+  /**
+   * Why it is not in the captured tree.
+   */
+  reason: 'policy' | 'grant' | 'secret_rule' | 'unsupported' | 'unreadable'
+}
+/**
+ * The policy it was captured under.
+ */
+export interface CapturePolicy {
+  grant: FileGrant
+  inclusion: InclusionPolicy
+  /**
+   * True when the caller declared the working tree quiesced for the capture.
+   *
+   * A declaration alone never decides the consistency class: this host verifies that nothing it
+   * read changed, and a declaration that fails that verification is a per-file capture.
+   */
+  quiescence_declared: boolean
+  /**
+   * The class the caller required, when it required one.
+   */
+  required_consistency: SourceConsistency | null
+}
+/**
+ * What the caller's grant selected and excluded.
+ */
+export interface FileGrant {
+  /**
+   * The path prefixes the caller excluded, whatever the policy says.
+   */
+  excluded_paths: string[]
+  /**
+   * The path prefixes the caller selected. Empty means the policy decides alone.
+   */
+  included_paths: string[]
+  /**
+   * Apply this host's own secret rules as well.
+   *
+   * There is no way to turn them off through the wire. The field exists so a record says the
+   * rules were applied rather than leaving a reader to assume it.
+   */
+  secret_rules_applied: boolean
+}
+/**
+ * One decision per class of the working tree.
+ */
+export interface InclusionPolicy {
+  /**
+   * Files whose content Git reports as binary.
+   */
+  binary_files: 'include' | 'exclude'
+  /**
+   * Tracked files with uncommitted modifications.
+   */
+  dirty_files: 'include' | 'exclude'
+  /**
+   * Files an ignore rule covers, which is what a build usually produces.
+   */
+  generated_artefacts: 'include' | 'exclude'
+  /**
+   * Submodule working trees.
+   */
+  submodules: 'include' | 'exclude'
+  /**
+   * Files Git does not track and does not ignore.
+   */
+  untracked_files: 'include' | 'exclude'
+}
+/**
+ * Where it came from.
+ */
+export interface Provenance {
+  /**
+   * The actor whose request produced it.
+   */
+  actor_id: string
+  /**
+   * Why it is derived, in this host's own words.
+   */
+  derivation: string
+  /**
+   * The version this one is derived from, when it is derived.
+   *
+   * A version derived from a modified materialisation names the version that was materialised.
+   * A version derived from an apply names the version that was applied.
+   */
+  derived_from: VersionRef | null
+  /**
+   * The method that produced it.
+   */
+  method: string
+  /**
+   * What the caller said about it.
+   */
+  note: string
+  /**
+   * The session it was captured for, when it was captured for one.
+   */
+  session_id: SessionId | null
+  /**
+   * The automation run it was captured for, when it was captured for one.
+   */
+  workflow_run_id: WorkflowRunId | null
+}
+/**
+ * One exact version of one change set.
+ */
+export interface VersionRef {
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * The version within it, counting from one.
+   */
+  version: string
+}
+/**
+ * The stable filesystem identity of the repository's Git directory.
+ */
+export interface FilesystemIdentity {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  device: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  file_id: string
+}
+/**
+ * What the captured tree holds.
+ */
+export interface TreeSummary {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  deleted_paths: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  from_git_objects: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  from_working_tree: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  total_bytes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  total_paths: string
+}
+/**
+ * The stable filesystem identity of the working tree it was captured from.
+ */
+export interface FilesystemIdentity1 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  device: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  file_id: string
+}
+/**
+ * One version, as a list of them names it.
+ */
+export interface ChangeSetVersionSummary {
+  /**
+   * The revision it was captured against.
+   */
+  base_revision: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  captured_at_ms: string
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * How consistent the source of one capture was.
+   *
+   * There is no default and no fourth member that means "probably fine". A live multi-file capture
+   * is [`Self::PerFileCapture`] unless a real mechanism made it something stronger, which is what
+   * section 14 means by never advertising a point-in-time snapshot without one.
+   */
+  consistency: 'atomic_snapshot' | 'quiesced_capture' | 'per_file_capture'
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  content_digest: string
+  /**
+   * The version it is derived from, when it is derived.
+   */
+  derived_from: VersionRef | null
+  /**
+   * Which version it is.
+   */
+  version: string
+}
+/**
  * A model's summary of an interval, carried beside the authoritative events.
  *
  * Section 25 requires a summary to name its source interval and stay separate from the events. It
@@ -3624,6 +4029,629 @@ export interface ChangeSummary {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   to_ms: string
+}
+/**
+ * Parameters of `changeset.capture`.
+ */
+export interface ChangesetCaptureParams {
+  /**
+   * The change set to append a version to, or nothing to start a new one.
+   */
+  change_set_id: ChangeSetId | null
+  grant: FileGrant1
+  /**
+   * The label a new change set is given. Ignored when appending.
+   */
+  label: string
+  /**
+   * What the caller wants recorded about it.
+   */
+  note: string
+  /**
+   * Pin the version against the workspace, so a removal accounts for it.
+   */
+  pin: boolean
+  policy: InclusionPolicy1
+  /**
+   * True when the caller has quiesced the working tree for this capture.
+   */
+  quiescence_declared: boolean
+  /**
+   * The consistency class the caller requires, when it requires one.
+   *
+   * A capture that cannot reach it is refused rather than served a weaker class under a name
+   * the caller asked for.
+   */
+  required_consistency: SourceConsistency | null
+  /**
+   * The session this capture belongs to, for the provenance.
+   */
+  session_id: SessionId | null
+  /**
+   * The automation run this capture belongs to, for the provenance.
+   */
+  workflow_run_id: WorkflowRunId | null
+  /**
+   * The workspace to capture.
+   */
+  workspace_id: string
+}
+/**
+ * What the caller's grant selects and excludes.
+ */
+export interface FileGrant1 {
+  /**
+   * The path prefixes the caller excluded, whatever the policy says.
+   */
+  excluded_paths: string[]
+  /**
+   * The path prefixes the caller selected. Empty means the policy decides alone.
+   */
+  included_paths: string[]
+  /**
+   * Apply this host's own secret rules as well.
+   *
+   * There is no way to turn them off through the wire. The field exists so a record says the
+   * rules were applied rather than leaving a reader to assume it.
+   */
+  secret_rules_applied: boolean
+}
+/**
+ * One decision per class of the working tree.
+ */
+export interface InclusionPolicy1 {
+  /**
+   * Files whose content Git reports as binary.
+   */
+  binary_files: 'include' | 'exclude'
+  /**
+   * Tracked files with uncommitted modifications.
+   */
+  dirty_files: 'include' | 'exclude'
+  /**
+   * Files an ignore rule covers, which is what a build usually produces.
+   */
+  generated_artefacts: 'include' | 'exclude'
+  /**
+   * Submodule working trees.
+   */
+  submodules: 'include' | 'exclude'
+  /**
+   * Files Git does not track and does not ignore.
+   */
+  untracked_files: 'include' | 'exclude'
+}
+/**
+ * Result of `changeset.capture`.
+ */
+export interface ChangesetCaptureResult {
+  /**
+   * True when the version is pinned against its workspace.
+   */
+  pinned: boolean
+  version: ChangeSetVersionRecord1
+}
+/**
+ * The version that now exists.
+ */
+export interface ChangeSetVersionRecord1 {
+  /**
+   * The reference that revision was named by, when it was named by one.
+   */
+  base_reference: string | null
+  /**
+   * The revision it was captured against.
+   */
+  base_revision: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  captured_at_ms: string
+  /**
+   * The change set this version belongs to.
+   */
+  change_set_id: string
+  /**
+   * The paths whose content differs from the base, bounded by [`MAX_CHANGESET_ENTRIES`].
+   */
+  changes: CapturedPath[]
+  /**
+   * How consistent the source of one capture was.
+   *
+   * There is no default and no fourth member that means "probably fine". A live multi-file capture
+   * is [`Self::PerFileCapture`] unless a real mechanism made it something stronger, which is what
+   * section 14 means by never advertising a point-in-time snapshot without one.
+   */
+  consistency: 'atomic_snapshot' | 'quiesced_capture' | 'per_file_capture'
+  /**
+   * What decided that class, in this host's own words.
+   */
+  consistency_detail: string
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  content_digest: string
+  /**
+   * One row per class, with exact counts.
+   */
+  counts: PreviewCount[]
+  /**
+   * The environment that owns it.
+   */
+  environment_id: string
+  /**
+   * The paths this capture left out, bounded by [`MAX_CHANGESET_ENTRIES`].
+   */
+  exclusions: Exclusion[]
+  /**
+   * The label the caller gave the change set.
+   */
+  label: string
+  /**
+   * What this version cannot promise, in the host's own words.
+   *
+   * Identical source does not promise hermetic reproduction: network services, dependencies,
+   * secrets and graphical state are external inputs a captured tree says nothing about.
+   */
+  limitations: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted_changes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted_exclusions: string
+  policy: CapturePolicy
+  /**
+   * The repository it was captured from.
+   */
+  project_repository_id: string
+  provenance: Provenance
+  repository_identity: FilesystemIdentity
+  summary: TreeSummary
+  /**
+   * Which version it is, counting from one.
+   */
+  version: string
+  /**
+   * The workspace it was captured from.
+   */
+  workspace_id: string
+  worktree_identity: FilesystemIdentity1
+}
+/**
+ * Parameters of `changeset.materialize`.
+ */
+export interface ChangesetMaterializeParams {
+  /**
+   * One immutable captured change set.
+   */
+  change_set_id: string
+  /**
+   * The label the caller gave it.
+   */
+  label: string
+  /**
+   * What the materialisation is for.
+   */
+  purpose: 'test' | 'review' | 'inspection'
+  /**
+   * The exact version to materialise.
+   */
+  version: string
+}
+/**
+ * Result of `changeset.materialize`.
+ */
+export interface ChangesetMaterializeResult {
+  /**
+   * What an identical source does not promise, in this host's own words.
+   */
+  limitations: string[]
+  materialisation: MaterialisationRecord
+}
+/**
+ * The materialisation that now exists.
+ */
+export interface MaterialisationRecord {
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  content_digest: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * Where it is, for a person and for a tool the caller runs.
+   */
+  directory_path: string
+  /**
+   * The environment that owns it.
+   */
+  environment_id: string
+  filesystem_identity: FilesystemIdentity2
+  /**
+   * The label the caller gave it.
+   */
+  label: string
+  /**
+   * Its identity.
+   */
+  materialisation_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  paths_written: string
+  /**
+   * What it is for.
+   */
+  purpose: 'test' | 'review' | 'inspection'
+  /**
+   * When it was released, once it has been.
+   */
+  released_at_ms: TimestampMs | null
+  /**
+   * The paths the version holds that this host could not write.
+   */
+  unapplied: string[]
+  version: VersionRef1
+}
+/**
+ * The stable filesystem identity of that directory.
+ */
+export interface FilesystemIdentity2 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  device: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  file_id: string
+}
+/**
+ * One exact version of one change set.
+ */
+export interface VersionRef1 {
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * The version within it, counting from one.
+   */
+  version: string
+}
+/**
+ * Parameters of `changeset.read`.
+ */
+export interface ChangesetReadParams {
+  /**
+   * One immutable captured change set.
+   */
+  change_set_id: string
+  /**
+   * The version to read, or nothing for the latest.
+   */
+  version: ChangeSetVersion | null
+}
+/**
+ * Result of `changeset.read`.
+ */
+export interface ChangesetReadResult {
+  /**
+   * Everything that names this version and has to be accounted for before it is deleted.
+   */
+  evidence: EvidenceReference[]
+  /**
+   * The materialisations of the version that was asked for.
+   */
+  materialisations: MaterialisationRecord1[]
+  /**
+   * The results recorded against those materialisations.
+   */
+  results: MaterialisationResult[]
+  version: ChangeSetVersionRecord2
+  /**
+   * Every version of this change set, oldest first.
+   *
+   * This is what attention reads to say "version 3 passed these tests and was reviewed; version
+   * 4 has later changes": the earlier version stays exactly as it was and the later one is
+   * visible beside it.
+   */
+  versions: ChangeSetVersionSummary[]
+}
+/**
+ * One thing that names a version and has to be accounted for before it is deleted.
+ */
+export interface EvidenceReference {
+  /**
+   * What it is, in this host's own words.
+   */
+  detail: string
+  /**
+   * What kind of evidence it is.
+   */
+  kind: 'review_acknowledgement' | 'test_result' | 'materialisation' | 'applied_change'
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  recorded_at_ms: string
+  version: VersionRef2
+}
+/**
+ * One exact version of one change set.
+ */
+export interface VersionRef2 {
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * The version within it, counting from one.
+   */
+  version: string
+}
+/**
+ * One independent materialisation of one exact version.
+ *
+ * It is written from the host's own content-addressed store into a private directory, so the
+ * agent whose working tree was captured can keep working without changing anybody's inputs. It
+ * touches neither the repository nor the workspace it came from.
+ */
+export interface MaterialisationRecord1 {
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  content_digest: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * Where it is, for a person and for a tool the caller runs.
+   */
+  directory_path: string
+  /**
+   * The environment that owns it.
+   */
+  environment_id: string
+  filesystem_identity: FilesystemIdentity2
+  /**
+   * The label the caller gave it.
+   */
+  label: string
+  /**
+   * Its identity.
+   */
+  materialisation_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  paths_written: string
+  /**
+   * What it is for.
+   */
+  purpose: 'test' | 'review' | 'inspection'
+  /**
+   * When it was released, once it has been.
+   */
+  released_at_ms: TimestampMs | null
+  /**
+   * The paths the version holds that this host could not write.
+   */
+  unapplied: string[]
+  version: VersionRef1
+}
+/**
+ * What one test or reviewer session did with one materialisation.
+ */
+export interface MaterialisationResult {
+  /**
+   * What this result does and does not say, in this host's own words.
+   */
+  attestation: string
+  /**
+   * The command that was executed, as the caller names it.
+   */
+  command: string
+  /**
+   * The environment it ran in.
+   */
+  environment_id: string
+  input_version: VersionRef3
+  /**
+   * The materialisation it ran against.
+   */
+  materialisation_id: string
+  /**
+   * What it produced.
+   */
+  outputs: OutputReference[]
+  /**
+   * The profile it was executed under, as the caller names it.
+   */
+  profile: string
+  receipt: ExecutionReceipt
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  recorded_at_ms: string
+  /**
+   * What was actually tested.
+   */
+  tested_source: 'unmodified_version' | 'derived_version' | 'indeterminate'
+  /**
+   * The version the result attests, when it attests one.
+   *
+   * The input version for [`TestedSource::UnmodifiedVersion`], the derived version for
+   * [`TestedSource::DerivedVersion`], and nothing at all for [`TestedSource::Indeterminate`].
+   */
+  tested_version: VersionRef | null
+  tool: ToolIdentity
+}
+/**
+ * One exact version of one change set.
+ */
+export interface VersionRef3 {
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * The version within it, counting from one.
+   */
+  version: string
+}
+/**
+ * One thing an execution produced.
+ */
+export interface OutputReference {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  byte_len: string
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  digest: string
+  /**
+   * What kind of thing it is: a log, a report, an artefact.
+   */
+  kind: string
+  /**
+   * What it is.
+   */
+  label: string
+}
+/**
+ * What the execution did.
+ */
+export interface ExecutionReceipt {
+  /**
+   * What the caller says about it.
+   */
+  detail: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  ended_at_ms: string
+  /**
+   * Its exit status, when it ended with one.
+   */
+  exit_status: U64 | null
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  started_at_ms: string
+  /**
+   * True when something stopped it rather than it finishing.
+   */
+  stopped: boolean
+}
+/**
+ * Which tool produced it.
+ */
+export interface ToolIdentity {
+  /**
+   * Its name.
+   */
+  name: string
+  /**
+   * Its version, as the tool itself reports it.
+   */
+  version: string
+}
+/**
+ * The version that was asked for.
+ */
+export interface ChangeSetVersionRecord2 {
+  /**
+   * The reference that revision was named by, when it was named by one.
+   */
+  base_reference: string | null
+  /**
+   * The revision it was captured against.
+   */
+  base_revision: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  captured_at_ms: string
+  /**
+   * The change set this version belongs to.
+   */
+  change_set_id: string
+  /**
+   * The paths whose content differs from the base, bounded by [`MAX_CHANGESET_ENTRIES`].
+   */
+  changes: CapturedPath[]
+  /**
+   * How consistent the source of one capture was.
+   *
+   * There is no default and no fourth member that means "probably fine". A live multi-file capture
+   * is [`Self::PerFileCapture`] unless a real mechanism made it something stronger, which is what
+   * section 14 means by never advertising a point-in-time snapshot without one.
+   */
+  consistency: 'atomic_snapshot' | 'quiesced_capture' | 'per_file_capture'
+  /**
+   * What decided that class, in this host's own words.
+   */
+  consistency_detail: string
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  content_digest: string
+  /**
+   * One row per class, with exact counts.
+   */
+  counts: PreviewCount[]
+  /**
+   * The environment that owns it.
+   */
+  environment_id: string
+  /**
+   * The paths this capture left out, bounded by [`MAX_CHANGESET_ENTRIES`].
+   */
+  exclusions: Exclusion[]
+  /**
+   * The label the caller gave the change set.
+   */
+  label: string
+  /**
+   * What this version cannot promise, in the host's own words.
+   *
+   * Identical source does not promise hermetic reproduction: network services, dependencies,
+   * secrets and graphical state are external inputs a captured tree says nothing about.
+   */
+  limitations: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted_changes: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted_exclusions: string
+  policy: CapturePolicy
+  /**
+   * The repository it was captured from.
+   */
+  project_repository_id: string
+  provenance: Provenance
+  repository_identity: FilesystemIdentity
+  summary: TreeSummary
+  /**
+   * Which version it is, counting from one.
+   */
+  version: string
+  /**
+   * The workspace it was captured from.
+   */
+  workspace_id: string
+  worktree_identity: FilesystemIdentity1
 }
 /**
  * The client's complete `hello` offer.
@@ -5136,6 +6164,416 @@ export interface DeviceRevokeParams {
    * One paired device.
    */
   device_id: string
+}
+/**
+ * Parameters of `diff.apply` and `diff.revert`.
+ */
+export interface DiffApplyParams {
+  /**
+   * The limitations of the chosen destination, as the caller was shown them.
+   *
+   * A direct apply to a shared working tree is refused until the caller passes back the
+   * limitation this host returned for it, so the limitation is shown before the class is
+   * chosen rather than after.
+   */
+  acknowledged_limitations: string[]
+  /**
+   * What the request expects each affected path to hold now.
+   *
+   * The preflight compares every one of these with what is there. A path the request does not
+   * name is a path the preflight cannot check, so a request that names none is refused for a
+   * destination that writes.
+   */
+  affected: AffectedVersion[]
+  /**
+   * One immutable captured change set.
+   */
+  change_set_id: string
+  /**
+   * Where it goes. Explicit, with no default.
+   */
+  destination: 'proposal' | 'versioned_reference' | 'shared_existing'
+  /**
+   * The reference and its expected old value, for a versioned Git reference.
+   */
+  expected_reference: ExpectedReference | null
+  /**
+   * Which of the version's changed paths to apply. Empty means all of them.
+   */
+  paths: string[]
+  /**
+   * Run the preflight and stop, whatever it finds.
+   */
+  preflight_only: boolean
+  /**
+   * The exact version of a change set that was tested or reviewed.
+   */
+  version: string
+  /**
+   * The workspace the destination names, for every class but a bare proposal.
+   */
+  workspace_id: WorkspaceId | null
+}
+/**
+ * What one apply established about one path before it wrote anything.
+ */
+export interface AffectedVersion {
+  /**
+   * The Git object the caller expects the index to hold for it.
+   */
+  expected_index_object_id: string | null
+  /**
+   * The digest of the working-tree file the caller expects to find, or nothing for an absent
+   * path.
+   */
+  expected_worktree_digest: Digest256 | null
+  /**
+   * The path, relative to the repository's top level.
+   */
+  path: string
+}
+/**
+ * The reference an apply to a versioned Git reference names, and the value it expects it at.
+ */
+export interface ExpectedReference {
+  /**
+   * The value it is expected to hold, or nothing when it is expected not to exist.
+   */
+  expected_old_value: string | null
+  /**
+   * The full reference name, such as `refs/heads/main`.
+   */
+  name: string
+}
+/**
+ * Result of `diff.apply` and `diff.revert`.
+ */
+export interface DiffApplyResult {
+  /**
+   * One submitted intent and its receipt, generated as a UUIDv4.
+   */
+  action_id: string
+  applied_version: VersionRef4
+  /**
+   * Exactly the paths this host confirmed it changed.
+   */
+  changed_paths: string[]
+  /**
+   * What the preflight found, when it found anything.
+   */
+  conflicts: PathConflict[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  decided_at_ms: string
+  /**
+   * Where it was applied.
+   */
+  destination: 'proposal' | 'versioned_reference' | 'shared_existing'
+  /**
+   * Why it came to what it came to.
+   */
+  detail: string
+  /**
+   * What this apply cannot promise, in the host's own words.
+   */
+  limitations: string[]
+  /**
+   * Which of the five classes it came to.
+   */
+  outcome:
+    | 'preflight_conflict'
+    | 'applied'
+    | 'conflict_after_partial_writes'
+    | 'interrupted_apply'
+    | 'uncertain_outcome'
+  /**
+   * Every path's progress, recorded before and after its write.
+   */
+  progress: PathProgress[]
+  /**
+   * The immutable proposal a proposal apply produced.
+   */
+  proposal_version: VersionRef | null
+  recovery: RecoveryObjects
+  /**
+   * What became of the reference, for a versioned Git reference.
+   */
+  reference: ReferenceOutcome | null
+  /**
+   * Exactly the paths whose state this host could not establish.
+   */
+  unresolved_paths: string[]
+}
+/**
+ * One exact version of one change set.
+ */
+export interface VersionRef4 {
+  /**
+   * The change set.
+   */
+  change_set_id: string
+  /**
+   * The version within it, counting from one.
+   */
+  version: string
+}
+/**
+ * One path whose destination was not what the request expected.
+ */
+export interface PathConflict {
+  /**
+   * What the difference is, in this host's own words.
+   */
+  detail: string
+  /**
+   * What the request expected the index to hold.
+   */
+  expected_index_object_id: string | null
+  /**
+   * What the request expected the working tree to hold.
+   */
+  expected_worktree_digest: Digest256 | null
+  /**
+   * What this host found.
+   */
+  observed_index_object_id: string | null
+  /**
+   * What this host found.
+   */
+  observed_worktree_digest: Digest256 | null
+  /**
+   * The path.
+   */
+  path: string
+}
+/**
+ * One path's progress, recorded before and after the write.
+ */
+export interface PathProgress {
+  /**
+   * The digest of what is there now, when this host read it.
+   */
+  after_digest: Digest256 | null
+  /**
+   * The digest of what was there before, when this host read it.
+   */
+  before_digest: Digest256 | null
+  /**
+   * What this host can say about it.
+   */
+  detail: string
+  /**
+   * The path.
+   */
+  path: string
+  /**
+   * What became of it.
+   */
+  state: 'planned' | 'written' | 'conflicted' | 'unresolved' | 'skipped'
+}
+/**
+ * What a person or a later apply can recover from.
+ */
+export interface RecoveryObjects {
+  /**
+   * The immutable version of the destination as it stands after the apply.
+   */
+  after_version: VersionRef | null
+  /**
+   * The version the apply carried.
+   */
+  applied_version: VersionRef | null
+  /**
+   * The immutable version of the destination as it stood before the apply.
+   *
+   * Captured before anything is written, so a person can see exactly what was replaced and a
+   * revert has something to put back.
+   */
+  before_version: VersionRef | null
+  /**
+   * What these objects are and are not, in this host's own words.
+   */
+  detail: string
+  /**
+   * The staging directory the validated content was written through, while it is still there.
+   */
+  staged_path: string | null
+}
+/**
+ * What became of a versioned Git reference.
+ */
+export interface ReferenceOutcome {
+  /**
+   * True when the two agreed, which is what a compare-and-swap requires.
+   */
+  compare_and_swap_held: boolean
+  /**
+   * The value the request expected.
+   */
+  expected_old_value: string | null
+  /**
+   * What this host did not do, and why, in its own words.
+   */
+  limitation: string
+  /**
+   * The reference the request named.
+   */
+  name: string
+  /**
+   * The value this host found.
+   */
+  observed_old_value: string | null
+  /**
+   * True when this host moved the reference.
+   */
+  updated: boolean
+}
+/**
+ * One path a diff read names.
+ */
+export interface DiffEntry {
+  /**
+   * The immutable Git object the base holds for this path, when it has one.
+   *
+   * This is the content revision of the base side.
+   */
+  base_object_id: string | null
+  /**
+   * Its size in bytes, when this host could read one.
+   */
+  byte_len: U64 | null
+  /**
+   * What change is held for it.
+   */
+  change: 'present' | 'deleted' | 'unmerged'
+  /**
+   * Which class of the working tree it belongs to.
+   */
+  class: 'dirty_file' | 'untracked_file' | 'submodule' | 'binary_file' | 'generated_artefact'
+  /**
+   * What its content is.
+   */
+  content: 'text' | 'binary' | 'unknown'
+  /**
+   * The digest of the content the working tree or the captured version holds.
+   *
+   * This is the content revision of the other side.
+   */
+  content_digest: Digest256 | null
+  /**
+   * The path, relative to the repository's top level.
+   */
+  path: string
+}
+/**
+ * Parameters of `diff.read`.
+ *
+ * Exactly one of the two subjects is named: a workspace, which reads its live working tree, or a
+ * change-set version, which reads what was captured.
+ */
+export interface DiffReadParams {
+  /**
+   * The change set to read.
+   */
+  change_set_id: ChangeSetId | null
+  /**
+   * The version of it to read, or nothing for the latest.
+   */
+  version: ChangeSetVersion | null
+  /**
+   * The workspace to read.
+   */
+  workspace_id: WorkspaceId | null
+}
+/**
+ * Result of `diff.read`.
+ */
+export interface DiffReadResult {
+  /**
+   * The reference that revision was named by, when it was named by one.
+   */
+  base_reference: string | null
+  /**
+   * The revision the changes are against.
+   */
+  base_revision: string
+  /**
+   * One row per class, with exact counts.
+   */
+  counts: PreviewCount[]
+  /**
+   * The environment that owns the subject.
+   */
+  environment_id: string
+  /**
+   * The reference `HEAD` is on now, when it is on one.
+   */
+  head_reference: string | null
+  /**
+   * The revision `HEAD` names now.
+   */
+  head_revision: string
+  /**
+   * What this read cannot promise, in the host's own words.
+   */
+  limitations: string[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  omitted_entries: string
+  /**
+   * The repository it is a read of.
+   */
+  project_repository_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  read_at_ms: string
+  repository_identity: FilesystemIdentity3
+  /**
+   * The version this read is of, when it reads a captured version rather than a live tree.
+   */
+  source_version: VersionRef | null
+  /**
+   * The tracked paths with a change, bounded by [`MAX_CHANGESET_ENTRIES`].
+   */
+  tracked: DiffEntry[]
+  /**
+   * The untracked and ignored paths, bounded by [`MAX_CHANGESET_ENTRIES`].
+   */
+  untracked: DiffEntry[]
+  /**
+   * One selected working copy and its policy.
+   */
+  workspace_id: string
+  worktree_identity: FilesystemIdentity4
+}
+/**
+ * The stable filesystem identity of the repository's Git directory.
+ */
+export interface FilesystemIdentity3 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  device: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  file_id: string
+}
+/**
+ * The stable filesystem identity of the working tree.
+ */
+export interface FilesystemIdentity4 {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  device: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  file_id: string
 }
 /**
  * The host challenge a direct redemption starts from. Single use, and it expires with the
@@ -7168,7 +8606,7 @@ export interface InclusionPreview {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   omitted_entries: string
-  policy: InclusionPolicy
+  policy: InclusionPolicy2
   /**
    * The repository the preview was taken on.
    */
@@ -7181,27 +8619,6 @@ export interface InclusionPreview {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   unknown_content: string
-}
-/**
- * One class's counts in a preview.
- */
-export interface PreviewCount {
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  byte_len: string
-  /**
-   * The class.
-   */
-  class: 'dirty_file' | 'untracked_file' | 'submodule' | 'binary_file' | 'generated_artefact'
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  included: string
-  /**
-   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
-   */
-  total: string
 }
 /**
  * One path an inclusion preview names.
@@ -7238,7 +8655,7 @@ export interface PreviewEntry {
 /**
  * The policy it was taken under.
  */
-export interface InclusionPolicy {
+export interface InclusionPolicy2 {
   /**
    * Files whose content Git reports as binary.
    */
@@ -8465,7 +9882,7 @@ export interface ProjectSummary {
    * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
-  filesystem_identity: FilesystemIdentity
+  filesystem_identity: FilesystemIdentity5
   /**
    * The label the user gave it.
    */
@@ -8494,7 +9911,7 @@ export interface ProjectSummary {
 /**
  * The stable filesystem identity of its Git directory.
  */
-export interface FilesystemIdentity {
+export interface FilesystemIdentity5 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -8642,7 +10059,7 @@ export interface ProjectSummary1 {
    * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
-  filesystem_identity: FilesystemIdentity
+  filesystem_identity: FilesystemIdentity5
   /**
    * The label the user gave it.
    */
@@ -8778,7 +10195,7 @@ export interface ProjectSummary2 {
    * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
-  filesystem_identity: FilesystemIdentity
+  filesystem_identity: FilesystemIdentity5
   /**
    * The label the user gave it.
    */
@@ -8841,7 +10258,7 @@ export interface ProjectSummary3 {
    * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
-  filesystem_identity: FilesystemIdentity
+  filesystem_identity: FilesystemIdentity5
   /**
    * The label the user gave it.
    */
@@ -8981,7 +10398,7 @@ export interface ProjectSummary4 {
    * One installed OS, distribution or container environment and OS user.
    */
   environment_id: string
-  filesystem_identity: FilesystemIdentity
+  filesystem_identity: FilesystemIdentity5
   /**
    * The label the user gave it.
    */
@@ -9056,7 +10473,7 @@ export interface WorkspaceSummary {
    * materialisation did not get as far as creating the tree. An absent identity is what refuses
    * a removal: this host does not delete a directory it cannot prove it created.
    */
-  filesystem_identity: FilesystemIdentity1 | null
+  filesystem_identity: FilesystemIdentity6 | null
   /**
    * How an isolated workspace is separated, when it is one.
    */
@@ -9069,7 +10486,7 @@ export interface WorkspaceSummary {
    * The label the user gave it.
    */
   label: string
-  policy: InclusionPolicy1
+  policy: InclusionPolicy3
   /**
    * The repository it is a working copy of.
    */
@@ -9083,7 +10500,7 @@ export interface WorkspaceSummary {
    */
   state: 'ready' | 'materialising' | 'removal_pending' | 'removed'
   /**
-   * Its identity.
+   * One selected working copy and its policy.
    */
   workspace_id: string
 }
@@ -9094,7 +10511,7 @@ export interface WorkspaceSummary {
  * and the file index on Windows. They are metadata a client can display and compare; they are
  * never an authority, because authority is the opened handle the host holds.
  */
-export interface FilesystemIdentity1 {
+export interface FilesystemIdentity6 {
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
@@ -9107,7 +10524,7 @@ export interface FilesystemIdentity1 {
 /**
  * The inclusion policy it was created under.
  */
-export interface InclusionPolicy1 {
+export interface InclusionPolicy3 {
   /**
    * Files whose content Git reports as binary.
    */
@@ -15060,7 +16477,7 @@ export interface AttachmentHandle2 {
    */
   byte_len: string
   /**
-   * The verified whole-file SHA-256 digest.
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
    */
   content_digest: string
   /**
@@ -16330,7 +17747,7 @@ export interface WorkspaceCreateParams {
    * The label the user gave it.
    */
   label: string
-  policy: InclusionPolicy2
+  policy: InclusionPolicy4
   /**
    * Return the preview and create nothing.
    *
@@ -16370,7 +17787,7 @@ export interface DestinationRequest3 {
 /**
  * The inclusion policy, one decision per class.
  */
-export interface InclusionPolicy2 {
+export interface InclusionPolicy4 {
   /**
    * Files whose content Git reports as binary.
    */
@@ -16458,7 +17875,7 @@ export interface InclusionPreview1 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   omitted_entries: string
-  policy: InclusionPolicy
+  policy: InclusionPolicy2
   /**
    * The repository the preview was taken on.
    */
@@ -16499,7 +17916,7 @@ export interface WorkspaceListResult {
  */
 export interface WorkspaceReadParams {
   /**
-   * The workspace to read.
+   * One selected working copy and its policy.
    */
   workspace_id: string
 }
@@ -16558,7 +17975,7 @@ export interface WorkspaceSummary1 {
    * materialisation did not get as far as creating the tree. An absent identity is what refuses
    * a removal: this host does not delete a directory it cannot prove it created.
    */
-  filesystem_identity: FilesystemIdentity1 | null
+  filesystem_identity: FilesystemIdentity6 | null
   /**
    * How an isolated workspace is separated, when it is one.
    */
@@ -16571,7 +17988,7 @@ export interface WorkspaceSummary1 {
    * The label the user gave it.
    */
   label: string
-  policy: InclusionPolicy1
+  policy: InclusionPolicy3
   /**
    * The repository it is a working copy of.
    */
@@ -16585,7 +18002,7 @@ export interface WorkspaceSummary1 {
    */
   state: 'ready' | 'materialising' | 'removal_pending' | 'removed'
   /**
-   * Its identity.
+   * One selected working copy and its policy.
    */
   workspace_id: string
 }
@@ -16598,7 +18015,7 @@ export interface WorkspaceRemoveParams {
    */
   retention: 'keep_everything' | 'remove_retained'
   /**
-   * The workspace to remove.
+   * One selected working copy and its policy.
    */
   workspace_id: string
 }
@@ -16671,7 +18088,7 @@ export interface WorkspaceSummary2 {
    * materialisation did not get as far as creating the tree. An absent identity is what refuses
    * a removal: this host does not delete a directory it cannot prove it created.
    */
-  filesystem_identity: FilesystemIdentity1 | null
+  filesystem_identity: FilesystemIdentity6 | null
   /**
    * How an isolated workspace is separated, when it is one.
    */
@@ -16684,7 +18101,7 @@ export interface WorkspaceSummary2 {
    * The label the user gave it.
    */
   label: string
-  policy: InclusionPolicy1
+  policy: InclusionPolicy3
   /**
    * The repository it is a working copy of.
    */
@@ -16698,7 +18115,7 @@ export interface WorkspaceSummary2 {
    */
   state: 'ready' | 'materialising' | 'removal_pending' | 'removed'
   /**
-   * Its identity.
+   * One selected working copy and its policy.
    */
   workspace_id: string
 }
