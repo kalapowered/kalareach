@@ -862,6 +862,15 @@ async fn drive(
                                 .payload
                                 .to_typed::<kr_protocol::recovery::OutputEvent>()
                         {
+                            // Bytes drawn while this terminal holds no projection are its own
+                            // stream or its restoration, and both are the live screen: what it is
+                            // showing from here is not somebody's history. A bell routed to the
+                            // lease holder arrives the same way, so the screen decides whether
+                            // this is a redraw: a terminal holding a projection is still drawing
+                            // that projection.
+                            if !display.holds_screen() {
+                                showing_history = false;
+                            }
                             let mut handle = output.as_ref();
                             if handle.write_all(event.bytes.as_slice()).is_err() {
                                 return AttachOutcome::Disconnected;
@@ -1097,13 +1106,6 @@ async fn drive(
                                     >()
                                 {
                                     parked = landed(result.position.0);
-                                    if result.presentation
-                                        == kr_protocol::attachment::TerminalPresentationMode::Direct
-                                    {
-                                        // The session is handing this terminal its own bytes
-                                        // again, which it does only for the live screen.
-                                        showing_history = false;
-                                    }
                                     geometry_epoch = result.geometry.epoch;
                                     owns_geometry =
                                         result.geometry.owner.as_ref() == Some(&attachment_id);
@@ -1172,13 +1174,6 @@ async fn drive(
                                     >()
                                 {
                                     parked = landed(result.position.0);
-                                    if result.presentation
-                                        == kr_protocol::attachment::TerminalPresentationMode::Direct
-                                    {
-                                        // The session is handing this terminal its own bytes
-                                        // again, which it does only for the live screen.
-                                        showing_history = false;
-                                    }
                                 }
                                 // What the person asked for while this was in flight, resolved
                                 // against where the window actually ended up. A refusal leaves the
