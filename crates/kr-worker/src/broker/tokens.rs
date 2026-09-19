@@ -45,6 +45,8 @@ pub struct Invocation {
     pub binding_revision: AgentBindingRevision,
     /// The declared action.
     pub action: ActionName,
+    /// The draft this invocation acts on, where it acts on one.
+    pub draft_id: Option<kr_protocol::ids::DraftId>,
     /// The capability this action needs, and the revision the caller read it at.
     ///
     /// Section 11: "Every action rechecks its current capability revision and grant
@@ -131,6 +133,7 @@ impl TokenStore {
             binding_revision: invocation.binding_revision,
             action: invocation.action.clone(),
             parameter_hash: Digest256::from_bytes(kr_cbor::sha256(&invocation.parameters)),
+            draft_id: kr_protocol::scalars::Nullable::from(invocation.draft_id),
             issued_at: now,
         };
         self.unspent.insert(
@@ -223,6 +226,7 @@ mod tests {
             application_instance_id: ApplicationInstanceId::new(Uuid::from_bytes([2; 16])),
             binding_revision: AgentBindingRevision::new(4),
             action: ActionName::new("prompt.submit").expect("valid"),
+            draft_id: None,
             capability: None,
             parameters: b"{\"text\":\"hello\"}".to_vec(),
         }

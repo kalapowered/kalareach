@@ -213,6 +213,24 @@ impl UpstreamDispatch for RecordingUpstream {
     }
 }
 
+/// A draft store that holds exactly the drafts it was told about.
+#[derive(Debug)]
+struct KnownDrafts {
+    known: std::collections::BTreeSet<kr_protocol::ids::DraftId>,
+}
+
+impl kr_worker::broker::DraftResolver for KnownDrafts {
+    fn resolve(&self, draft_id: &kr_protocol::ids::DraftId) -> Result<(), BrokerError> {
+        if self.known.contains(draft_id) {
+            Ok(())
+        } else {
+            Err(BrokerError::PreconditionFailed {
+                detail: format!("no draft {draft_id}"),
+            })
+        }
+    }
+}
+
 /// A broker with every capability the agent mutations need, and a transport that records.
 fn agent_broker_with(upstream: std::sync::Arc<RecordingUpstream>) -> Broker {
     let broker = agent_broker();
@@ -246,7 +264,6 @@ fn agent_broker() -> Broker {
     broker.pin_table(instance(), &table());
     broker
         .open_native_connection(
-            GatewayConnectionId::new(1),
             instance(),
             &CREDENTIAL,
             &process_identity(),
@@ -765,11 +782,26 @@ fn kr_req_23_30_a_plugin_action_validates_its_action_grant_effect_and_preconditi
     let missing_draft = invoke("draft.attach", Nullable::null())
         .expect_err("a precondition the action declares is checked");
     assert_eq!(missing_draft.code(), ErrorCode::DraftConflict);
-    invoke(
-        "draft.attach",
-        Nullable::some(kr_protocol::ids::DraftId::new(Uuid::from_bytes([4; 16]))),
-    )
-    .expect("and it runs once the draft is named");
+
+    // Naming one is not enough either: a draft this host cannot resolve is a precondition nobody
+    // has established, and the action waits for it rather than being sent hopefully.
+    let draft = kr_protocol::ids::DraftId::new(Uuid::from_bytes([4; 16]));
+    let unresolvable =
+        invoke("draft.attach", Nullable::some(draft)).expect_err("nothing here resolves a draft");
+    assert_eq!(unresolvable.code(), ErrorCode::DraftConflict);
+    broker.bind_drafts(std::sync::Arc::new(KnownDrafts {
+        known: [draft].into_iter().collect(),
+    }));
+    assert!(
+        invoke(
+            "draft.attach",
+            Nullable::some(kr_protocol::ids::DraftId::new(Uuid::from_bytes([5; 16]))),
+        )
+        .is_err(),
+        "and a draft the store does not hold is refused"
+    );
+    invoke("draft.attach", Nullable::some(draft))
+        .expect("and it runs once the draft is one this host can resolve");
 
     // The grant is the binding's, not the action's wish: withdrawing it refuses the action.
     broker
@@ -1113,4 +1145,140 @@ fn kr_req_11_31_a_disabled_provider_refuses_its_own_dispatch_beside_a_working_on
         0,
         "nothing reached the upstream through a disabled provider"
     );
+}
+
+/// KR-REQ-11.28: a returned effect plan may use only what the invocation it was prepared under
+/// permits.
+///
+/// Proposing is not doing. Four ways a component could ask for something it was not invited to do
+/// are refused here: another action's name, an operation whose grant the binding does not hold, a
+/// class that disagrees with what the operation does, and a draft other than the invocation's own.
+#[test]
+fn kr_req_11_28_a_prepared_effect_may_use_only_what_its_invocation_permits() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    let draft = kr_protocol::ids::DraftId::new(Uuid::from_bytes([4; 16]));
+    broker.bind_drafts(std::sync::Arc::new(KnownDrafts {
+        known: [draft].into_iter().collect(),
+    }));
+    broker
+        .register_actions(
+            binding(),
+            [RegisteredAction {
+                name: ActionName::new("draft.attach").expect("valid"),
+                grant: BrokerGrant::UpstreamAction,
+                effect: EffectClass::Write,
+                capability: None,
+                needs_draft: true,
+            }],
+        )
+        .expect("the actions are registered");
+    let admitted = broker
+        .admit_plugin_action(
+            &caller(),
+            binding(),
+            &PluginActionInvokeParams {
+                target: target(1),
+                plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+                action: ActionName::new("draft.attach").expect("valid"),
+                draft_id: Nullable::some(draft),
+                parameters: Bytes::from(b"{}".to_vec()),
+            },
+            TimestampMs::new(2),
+        )
+        .expect("the invocation is admitted");
+
+    let plan = |action: &str,
+                class: EffectClass,
+                operation: kr_protocol::broker::PreparedOperation,
+                draft_id: Nullable<kr_protocol::ids::DraftId>| {
+        kr_protocol::broker::PreparedEffect {
+            action: ActionName::new(action).expect("valid"),
+            class,
+            operation,
+            draft_id,
+            argument_hash: Digest256::from_bytes([8; 32]),
+        }
+    };
+    let attachment = kr_protocol::broker::PreparedOperation::UpstreamAttachment;
+
+    broker
+        .validate_effect(
+            &admitted,
+            &plan(
+                "draft.attach",
+                EffectClass::Write,
+                attachment,
+                Nullable::some(draft),
+            ),
+        )
+        .expect("the plan is the invocation's own");
+
+    // Another action's name.
+    assert!(matches!(
+        broker
+            .validate_effect(
+                &admitted,
+                &plan(
+                    "prompt.submit",
+                    EffectClass::Write,
+                    attachment,
+                    Nullable::some(draft),
+                ),
+            )
+            .expect_err("a plan belongs to the invocation it was prepared under"),
+        BrokerError::Token(_)
+    ));
+
+    // A class that disagrees with what the operation does.
+    assert!(
+        broker
+            .validate_effect(
+                &admitted,
+                &plan(
+                    "draft.attach",
+                    EffectClass::Read,
+                    attachment,
+                    Nullable::some(draft),
+                ),
+            )
+            .is_err()
+    );
+
+    // A draft other than the one the invocation named.
+    let elsewhere = kr_protocol::ids::DraftId::new(Uuid::from_bytes([6; 16]));
+    assert_eq!(
+        broker
+            .validate_effect(
+                &admitted,
+                &plan(
+                    "draft.attach",
+                    EffectClass::Write,
+                    attachment,
+                    Nullable::some(elsewhere),
+                ),
+            )
+            .expect_err("a plan acts on the invocation's own draft")
+            .code(),
+        ErrorCode::DraftConflict
+    );
+
+    // And an operation whose grant the binding no longer holds.
+    broker
+        .withdraw_grant(binding(), BrokerGrant::UpstreamAction)
+        .expect("the grant is withdrawn");
+    assert!(matches!(
+        broker
+            .validate_effect(
+                &admitted,
+                &plan(
+                    "draft.attach",
+                    EffectClass::Write,
+                    attachment,
+                    Nullable::some(draft),
+                ),
+            )
+            .expect_err("a grant withdrawn while the component worked is not a grant"),
+        BrokerError::Grant(_)
+    ));
 }

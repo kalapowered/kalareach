@@ -187,7 +187,6 @@ fn broker() -> Arc<Broker> {
     broker.pin_table(instance(), &table());
     broker
         .open_native_connection(
-            GatewayConnectionId::new(1),
             instance(),
             &CREDENTIAL,
             &process_identity(),

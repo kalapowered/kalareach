@@ -414,6 +414,17 @@
           "$ref": "#/$defs/AgentBindingRevision",
           "description": "The binding revision in force when the token was issued.\n\nA native `/new`, `/resume` or thread selection advances it, so a token issued before the\nswitch cannot act on the conversation after it."
         },
+        "draft_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DraftId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The draft the invocation acts on, where it acts on one.\n\nSection 11 binds a token to the invocation it was issued for, and a draft-dependent action\nacts on a specific draft. Without this the token would authorise the same action against\nwhatever draft the effect plan happened to name."
+        },
         "grant": {
           "$ref": "#/$defs/BrokerGrant",
           "description": "Which of the three grants authorised this invocation."
@@ -451,6 +462,7 @@
         "binding_revision",
         "action",
         "parameter_hash",
+        "draft_id",
         "issued_at"
       ],
       "type": "object"

@@ -179,6 +179,7 @@ fn invocation(instance_id: ApplicationInstanceId, revision: u64, action: &str) -
         application_instance_id: instance_id,
         binding_revision: AgentBindingRevision::new(revision),
         action: ActionName::new(action).expect("valid"),
+        draft_id: None,
         capability: None,
         parameters: b"{\"text\":\"hello\"}".to_vec(),
     }
@@ -254,7 +255,6 @@ fn broker_with(grants: BrokerGrants, decoding: Option<DecodingTrust>) -> Broker 
     broker.pin_table(instance(2), &declarative_table());
     broker
         .open_native_connection(
-            GatewayConnectionId::new(1),
             instance(2),
             &CREDENTIAL,
             &process_identity(41, 900),
@@ -533,7 +533,6 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
         broker.pin_table(instance(2), &declarative_table());
         broker
             .open_native_connection(
-                GatewayConnectionId::new(1),
                 instance(2),
                 &CREDENTIAL,
                 &process_identity(41, 900),
@@ -548,7 +547,6 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
         broker.pin_table(instance(3), &declarative_table());
         broker
             .open_native_connection(
-                GatewayConnectionId::new(2),
                 instance(3),
                 &CREDENTIAL,
                 &process_identity(41, 900),
@@ -1377,7 +1375,6 @@ fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
         broker.pin_table(instance(2), &declarative_table());
         broker
             .open_native_connection(
-                GatewayConnectionId::new(1),
                 instance(2),
                 &CREDENTIAL,
                 &process_identity(41, 900),

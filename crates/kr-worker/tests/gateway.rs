@@ -194,7 +194,6 @@ fn gateway(path: Option<&std::path::Path>) -> Broker {
     broker.pin_table(instance(2), &table());
     broker
         .open_native_connection(
-            GatewayConnectionId::new(1),
             instance(2),
             &CREDENTIAL,
             &process_identity(41, 900),
@@ -338,7 +337,6 @@ fn kr_req_11_32_only_the_launch_binding_and_the_private_exchange_open_a_native_c
     // A rich client connects and is refused the native path.
     broker
         .open_connection(
-            GatewayConnectionId::new(2),
             instance(2),
             ConnectionOrigin::RichClient,
             table(),
@@ -358,7 +356,6 @@ fn kr_req_11_32_only_the_launch_binding_and_the_private_exchange_open_a_native_c
     // A component cannot either.
     broker
         .open_connection(
-            GatewayConnectionId::new(3),
             instance(2),
             ConnectionOrigin::Component,
             table(),
@@ -381,7 +378,6 @@ fn kr_req_11_32_only_the_launch_binding_and_the_private_exchange_open_a_native_c
     assert!(
         broker
             .open_native_connection(
-                GatewayConnectionId::new(4),
                 instance(2),
                 &[8; 32],
                 &process_identity(41, 900),
@@ -395,7 +391,6 @@ fn kr_req_11_32_only_the_launch_binding_and_the_private_exchange_open_a_native_c
     assert!(
         broker
             .open_native_connection(
-                GatewayConnectionId::new(5),
                 instance(2),
                 &CREDENTIAL,
                 &process_identity(42, 900),
@@ -479,7 +474,6 @@ fn kr_req_12_13_downstream_identifiers_are_namespaced_and_transition_once() {
     broker.pin_table(instance(3), &table());
     broker
         .open_native_connection(
-            GatewayConnectionId::new(2),
             instance(3),
             &CREDENTIAL,
             &process_identity(41, 900),
@@ -551,7 +545,6 @@ fn kr_req_12_11_both_mutators_are_admitted_by_the_gateway_and_observers_are_list
     let broker = gateway(None);
     broker
         .open_connection(
-            GatewayConnectionId::new(2),
             instance(2),
             ConnectionOrigin::RichClient,
             table(),
@@ -562,7 +555,6 @@ fn kr_req_12_11_both_mutators_are_admitted_by_the_gateway_and_observers_are_list
     broker.pin_table(instance(3), &table());
     broker
         .open_connection(
-            GatewayConnectionId::new(3),
             instance(3),
             ConnectionOrigin::RichClient,
             table(),
@@ -823,7 +815,6 @@ fn kr_req_12_16_a_reverse_request_names_the_agents_own_environment_and_user() {
     // behalf.
     broker
         .open_connection(
-            GatewayConnectionId::new(2),
             instance(2),
             ConnectionOrigin::RichClient,
             table(),
@@ -948,7 +939,6 @@ fn kr_req_11_35_the_fence_keeps_native_recording_and_arbitration_and_exposes_the
     // Nothing is relabelled: a rich client is still a rich client, and it still cannot forward.
     broker
         .open_connection(
-            GatewayConnectionId::new(2),
             instance(2),
             ConnectionOrigin::RichClient,
             table(),
@@ -1138,7 +1128,6 @@ fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
     broker.pin_table(instance(3), &table());
     broker
         .open_native_connection(
-            GatewayConnectionId::new(2),
             instance(3),
             &CREDENTIAL,
             &process_identity(41, 900),
@@ -1418,7 +1407,6 @@ fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_what_i
     broker.pin_table(instance(2), &table());
     broker
         .open_native_connection(
-            GatewayConnectionId::new(2),
             instance(2),
             &CREDENTIAL,
             &process_identity(41, 900),

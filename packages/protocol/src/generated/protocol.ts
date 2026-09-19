@@ -32,6 +32,10 @@ export type SessionId = string
  */
 export type ParamsValue = unknown
 /**
+ * One durable device-owned draft, independent of an attachment.
+ */
+export type DraftId = string
+/**
  * One host-issued authority object.
  */
 export type GrantId = string
@@ -98,10 +102,6 @@ export type InstanceInvalidation =
  * One foreground application within a terminal session.
  */
 export type ApplicationInstanceId = string
-/**
- * One durable device-owned draft, independent of an attachment.
- */
-export type DraftId = string
 /**
  * Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition.
  */
@@ -2090,6 +2090,14 @@ export interface ActionToken {
    */
   binding_revision: string
   /**
+   * The draft the invocation acts on, where it acts on one.
+   *
+   * Section 11 binds a token to the invocation it was issued for, and a draft-dependent action
+   * acts on a specific draft. Without this the token would authorise the same action against
+   * whatever draft the effect plan happened to name.
+   */
+  draft_id: DraftId | null
+  /**
    * Which of the three grants authorised this invocation.
    */
   grant: 'observation' | 'upstream_action' | 'approval_interpreter'
@@ -2622,7 +2630,7 @@ export interface AgentCommand {
 export interface AgentDraftAddAttachmentParams {
   contribution: AttachmentContribution
   /**
-   * The draft.
+   * One durable device-owned draft, independent of an attachment.
    */
   draft_id: string
   /**
@@ -2858,7 +2866,7 @@ export interface DraftRecord {
    */
   device_id: DeviceId | null
   /**
-   * The draft's identity.
+   * One durable device-owned draft, independent of an attachment.
    */
   draft_id: string
   /**
@@ -8422,7 +8430,7 @@ export interface DraftRecord1 {
    */
   device_id: DeviceId | null
   /**
-   * The draft's identity.
+   * One durable device-owned draft, independent of an attachment.
    */
   draft_id: string
   /**
@@ -8474,7 +8482,7 @@ export interface DraftRecord2 {
    */
   device_id: DeviceId | null
   /**
-   * The draft's identity.
+   * One durable device-owned draft, independent of an attachment.
    */
   draft_id: string
   /**
@@ -8546,7 +8554,7 @@ export interface DraftRecord3 {
    */
   device_id: DeviceId | null
   /**
-   * The draft's identity.
+   * One durable device-owned draft, independent of an attachment.
    */
   draft_id: string
   /**

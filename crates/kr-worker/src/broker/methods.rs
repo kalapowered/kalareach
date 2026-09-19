@@ -1018,12 +1018,93 @@ impl Broker {
             application_instance_id: params.target.subject.application_instance_id,
             binding_revision: params.target.binding_revision,
             action: params.action.clone(),
+            draft_id: params.draft_id.as_ref().copied(),
             capability: registered
                 .capability
                 .clone()
                 .map(|capability| (capability, None)),
             parameters: params.parameters.as_slice().to_vec(),
         }
+    }
+
+    /// Validates the effect one component prepared against the token it prepared it under.
+    ///
+    /// Section 11: "Its effect plan can use only resources and operations permitted by that
+    /// invocation." Four things are compared, and each of them is a way a component could ask for
+    /// something it was not invited to do: the action, the operation's own grant, the effect class
+    /// the action declared, and the draft the invocation named.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Token`] when the plan is not the invocation's,
+    /// [`BrokerError::Grant`] when the binding does not hold the grant the operation needs,
+    /// [`BrokerError::InvalidArgument`] when the declared class disagrees with the operation, and
+    /// [`BrokerError::PreconditionFailed`] when the draft the plan acts on is not the one the
+    /// invocation named or is one this host cannot resolve.
+    pub fn validate_effect(
+        &self,
+        admitted: &MutationAdmission,
+        effect: &kr_protocol::broker::PreparedEffect,
+    ) -> Result<()> {
+        let token = admitted
+            .token()
+            .ok_or_else(|| BrokerError::invalid("this admission carries no action token"))?;
+        if effect.action != token.action {
+            return Err(BrokerError::Token(
+                kr_protocol::broker::TokenError::Mismatch { field: "action" },
+            ));
+        }
+        // The operation's own grant, checked against the binding as it stands rather than against
+        // the grant the token was issued under: a grant withdrawn while the component was working
+        // is not a grant.
+        let binding_id = match admitted.responsible() {
+            Responsible::Binding(binding_id) => binding_id,
+            Responsible::Transport => {
+                return Err(BrokerError::invalid(
+                    "an effect plan belongs to a component invocation and this admission names \
+                     none",
+                ));
+            }
+        };
+        let grants = self.grants(binding_id)?;
+        grants.require(effect.operation.grant())?;
+        // A read cannot arrive on the write path, and an operation that changes the upstream is
+        // not a read whatever the plan calls it.
+        if effect.class != EffectClass::Write || !effect.operation.writes() {
+            return Err(BrokerError::invalid(format!(
+                "{} changes the upstream and this plan declares it {:?}",
+                effect.operation, effect.class
+            )));
+        }
+        // And the draft. An operation that acts on one acts on the invocation's own, and a draft
+        // this host cannot resolve is a precondition nobody has established rather than one to
+        // assume.
+        if effect.operation.acts_on_a_draft() {
+            let named =
+                effect
+                    .draft_id
+                    .as_ref()
+                    .ok_or_else(|| BrokerError::PreconditionFailed {
+                        detail: format!(
+                            "{} acts on a draft and this plan named none",
+                            effect.operation
+                        ),
+                    })?;
+            if token.draft_id.as_ref() != Some(named) {
+                return Err(BrokerError::PreconditionFailed {
+                    detail: format!(
+                        "this plan acts on draft {named} and the invocation named another"
+                    ),
+                });
+            }
+            self.resolve_draft(named)?;
+        } else if effect.draft_id.is_present() {
+            return Err(BrokerError::invalid(format!(
+                "{} acts on no draft and this plan named one",
+                effect.operation
+            )));
+        }
+        Ok(())
     }
 
     /// Checks everything a plugin action call declares, without running it.
@@ -1052,10 +1133,27 @@ impl Broker {
                 params.action
             )));
         }
-        if registered.needs_draft && !params.draft_id.is_present() {
-            return Err(BrokerError::PreconditionFailed {
-                detail: format!("{} acts on a draft and this call named none", params.action),
-            });
+        if registered.needs_draft {
+            // A draft-dependent action names a draft *and* the draft is one this host can
+            // resolve. Checking only that an identifier was given would send an operation against
+            // a draft that may have moved or gone, which is the outcome nobody can establish that
+            // section 9 refuses to produce.
+            let draft_id =
+                params
+                    .draft_id
+                    .as_ref()
+                    .ok_or_else(|| BrokerError::PreconditionFailed {
+                        detail: format!(
+                            "{} acts on a draft and this call named none",
+                            params.action
+                        ),
+                    })?;
+            self.resolve_draft(draft_id)?;
+        } else if params.draft_id.is_present() {
+            return Err(BrokerError::invalid(format!(
+                "{} acts on no draft and this call named one",
+                params.action
+            )));
         }
         Ok(registered)
     }

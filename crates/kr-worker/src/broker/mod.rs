@@ -309,6 +309,20 @@ pub struct NativeAnswer {
     pub frame: Vec<u8>,
 }
 
+/// What resolves a draft the broker is asked to act on.
+///
+/// The draft store is not the broker's, so this is a seam. What the broker needs of it is one
+/// answer: is this draft one an operation may act on now? A draft that has gone, or that moved
+/// since the invocation named it, is `DRAFT_CONFLICT` rather than an operation sent hopefully.
+pub trait DraftResolver: Send + Sync + core::fmt::Debug {
+    /// Answers whether one draft can be acted on now.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PreconditionFailed`] when the draft has gone or has moved.
+    fn resolve(&self, draft_id: &kr_protocol::ids::DraftId) -> Result<()>;
+}
+
 /// What stopping an instance actually does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StopOutcome {
@@ -339,6 +353,8 @@ struct BrokerState {
     capabilities: CapabilityOwner,
     volatile: VolatileState,
     next_connection: u64,
+    /// What resolves a draft this host is asked to act on, where anything does.
+    drafts: Option<std::sync::Arc<dyn DraftResolver>>,
     /// The declarative tables this host pinned at installation, by instance and package.
     ///
     /// Section 11: "Tables are pinned and qualified against the installed protocol version under
@@ -415,6 +431,7 @@ impl Broker {
                 capabilities: CapabilityOwner::new(),
                 volatile,
                 next_connection,
+                drafts: None,
                 pinned_tables: BTreeMap::new(),
             }),
         })
@@ -1270,6 +1287,38 @@ impl Broker {
 
     // -- action tokens ------------------------------------------------------------------------
 
+    /// Binds what resolves a draft this host acts on.
+    ///
+    /// A draft-dependent action names a draft, and the broker refuses one it cannot resolve rather
+    /// than sending an operation against a draft that may have moved. The draft store itself is
+    /// not the broker's; this is the seam it is reached through.
+    pub fn bind_drafts(&self, drafts: std::sync::Arc<dyn DraftResolver>) {
+        self.state().drafts = Some(drafts);
+    }
+
+    /// Returns true when this host can resolve a draft at all.
+    #[must_use]
+    pub fn resolves_drafts(&self) -> bool {
+        self.state().drafts.is_some()
+    }
+
+    /// Checks that one draft is one this host can act on.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PreconditionFailed`] when nothing resolves drafts here, and whatever
+    /// the resolver refuses for a draft that has gone or moved.
+    pub fn resolve_draft(&self, draft_id: &kr_protocol::ids::DraftId) -> Result<()> {
+        let drafts = self.state().drafts.clone();
+        let drafts = drafts.ok_or_else(|| BrokerError::PreconditionFailed {
+            detail: format!(
+                "this host cannot resolve draft {draft_id}, so an operation that acts on it is \
+                 refused rather than sent against a draft nobody checked"
+            ),
+        })?;
+        drafts.resolve(draft_id)
+    }
+
     /// Issues an action token for one invocation.
     ///
     /// Everything the invocation names is checked against what this broker holds *now*: that the
@@ -1842,17 +1891,15 @@ impl Broker {
     /// Returns [`BrokerError::Table`] when a table does not qualify, and
     /// [`BrokerError::PermissionDenied`] when the presented credential and process identity are
     /// not the launch this broker made.
-    #[allow(clippy::too_many_arguments)]
     pub fn open_native_connection(
         &self,
-        connection: GatewayConnectionId,
         application_instance_id: ApplicationInstanceId,
         presented_credential: &[u8],
         process: &ProcessStartIdentity,
         table: kr_protocol::gateway::DeclarativeTable,
         rich: kr_protocol::gateway::RichMethodTable,
         installed_protocol_version: &str,
-    ) -> Result<()> {
+    ) -> Result<GatewayConnectionId> {
         let mut state = self.state();
         let instance = state
             .instances
@@ -1871,6 +1918,10 @@ impl Broker {
             ));
         }
         state.check_pinned_table(application_instance_id, &table)?;
+        // The identifier is minted here, inside the admission, rather than taken from the caller.
+        // An identifier a caller chose could be one this host already used, and a response on the
+        // new connection would then correlate to a resource the old one recorded.
+        let connection = state.mint_connection();
         state.gateway.open_native(
             connection,
             application_instance_id,
@@ -1878,7 +1929,8 @@ impl Broker {
             table,
             rich,
             installed_protocol_version,
-        )
+        )?;
+        Ok(connection)
     }
 
     /// Opens a connection for a rich client or a component.
@@ -1889,19 +1941,96 @@ impl Broker {
     /// [`BrokerError::InvalidArgument`] when the caller asks for the native origin here.
     pub fn open_connection(
         &self,
-        connection: GatewayConnectionId,
         application_instance_id: ApplicationInstanceId,
         origin: ConnectionOrigin,
         table: kr_protocol::gateway::DeclarativeTable,
         rich: kr_protocol::gateway::RichMethodTable,
         installed_protocol_version: &str,
-    ) -> Result<()> {
+    ) -> Result<GatewayConnectionId> {
         let mut state = self.state();
         state.check_pinned_table(application_instance_id, &table)?;
+        let connection = state.mint_connection();
         state.gateway.open(
             connection,
             application_instance_id,
             origin,
+            table,
+            rich,
+            installed_protocol_version,
+        )?;
+        Ok(connection)
+    }
+
+    /// Restores one connection a restart left behind, keeping its identifier.
+    ///
+    /// A reconnect has to reach the resources it left pending, and those are namespaced by the
+    /// identifier the old connection had. Reusing one is therefore permitted, but only for the
+    /// instance that owned it and only while no live connection holds it: an identifier reopened
+    /// for another instance would correlate that instance's responses to somebody else's
+    /// resources, which is the defect this refuses rather than documents.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::PermissionDenied`] when the identifier is live, belongs to another
+    /// instance, or names no retained resource of this one, and whatever
+    /// [`Broker::open_native_connection`] refuses.
+    #[allow(clippy::too_many_arguments)]
+    pub fn restore_native_connection(
+        &self,
+        connection: GatewayConnectionId,
+        application_instance_id: ApplicationInstanceId,
+        presented_credential: &[u8],
+        process: &ProcessStartIdentity,
+        table: kr_protocol::gateway::DeclarativeTable,
+        rich: kr_protocol::gateway::RichMethodTable,
+        installed_protocol_version: &str,
+    ) -> Result<()> {
+        let mut state = self.state();
+        if state.gateway.connection(connection).is_some() {
+            return Err(BrokerError::denied(format!(
+                "{connection} is a live connection, and a restoration is not a replacement"
+            )));
+        }
+        let retained = state
+            .arbitration
+            .iter()
+            .find(|pending| pending.resource.request.connection == connection);
+        match retained {
+            Some(pending)
+                if pending.resource.application_instance_id == application_instance_id => {}
+            Some(pending) => {
+                return Err(BrokerError::denied(format!(
+                    "{connection} holds resources of {} and this restoration names {application_instance_id}",
+                    pending.resource.application_instance_id
+                )));
+            }
+            None => {
+                return Err(BrokerError::denied(format!(
+                    "{connection} names no retained resource, so there is nothing to restore"
+                )));
+            }
+        }
+        let instance = state
+            .instances
+            .get(&application_instance_id)
+            .ok_or_else(|| unknown_instance(application_instance_id))?;
+        let launched = instance.process.as_ref().ok_or_else(|| {
+            BrokerError::denied(
+                "this host did not launch this application, so nothing about it is a native \
+                 connection it can authenticate",
+            )
+        })?;
+        if !launched.authenticates(presented_credential, process) {
+            return Err(BrokerError::denied(
+                "this connection does not present the launch binding and the private exchange of \
+                 a terminal this worker started",
+            ));
+        }
+        state.check_pinned_table(application_instance_id, &table)?;
+        state.gateway.open_native(
+            connection,
+            application_instance_id,
+            process.clone(),
             table,
             rich,
             installed_protocol_version,
@@ -2167,9 +2296,7 @@ impl Broker {
     /// Downstream request identifiers are namespaced by it, so two connections that both start at
     /// one are two different sets of pending resources.
     pub fn next_connection(&self) -> GatewayConnectionId {
-        let mut state = self.state();
-        state.next_connection = state.next_connection.saturating_add(1);
-        GatewayConnectionId::new(state.next_connection)
+        self.state().mint_connection()
     }
 
     /// Builds a namespaced downstream identifier.
@@ -2282,6 +2409,7 @@ impl BrokerState {
             application_instance_id: token.application_instance_id,
             binding_revision: token.binding_revision,
             action: token.action.clone(),
+            draft_id: token.draft_id.as_ref().copied(),
             capability: capability.clone(),
             parameters: Vec::new(),
         };
@@ -2436,6 +2564,12 @@ impl BrokerState {
             )));
         }
         Ok(())
+    }
+
+    /// Mints the next gateway connection identifier, above everything this ledger has seen.
+    fn mint_connection(&mut self) -> GatewayConnectionId {
+        self.next_connection = self.next_connection.saturating_add(1);
+        GatewayConnectionId::new(self.next_connection)
     }
 
     /// Returns one pending resource, or says this broker does not hold it.
