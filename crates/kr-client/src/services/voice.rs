@@ -44,7 +44,8 @@ use std::sync::Arc;
 use kr_protocol::error::{ErrorCode, ProtocolError};
 use serde::{Deserialize, Serialize};
 
-use super::{ServiceFuture, ServiceHttp, ServiceHttpAnswer};
+use super::ServiceFuture;
+pub use super::{ServiceHttp, ServiceHttpAnswer};
 use crate::error::{ClientError, Result};
 use crate::retry::UserAction;
 

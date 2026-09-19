@@ -24,6 +24,7 @@ kr-project.workspace = true
 kr-shell-integration.workspace = true
 kr-transfer.workspace = true
 kr-transport.workspace = true
+kr-voice.workspace = true
 kr-worker.workspace = true
 rusqlite = { workspace = true, features = ["bundled"] }
 rustix = { workspace = true, features = ["fs", "process"] }

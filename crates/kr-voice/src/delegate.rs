@@ -134,6 +134,16 @@ impl Coordinator {
         }
     }
 
+    /// Replaces the provider this coordinator brokers through.
+    ///
+    /// The seam is filled by the managed broker, by a backend of the person's own, or by nothing
+    /// at all. Nothing else in this crate changes with it.
+    #[must_use]
+    pub fn with_provider(mut self, provider: Option<Arc<dyn ManagedVoiceService>>) -> Self {
+        self.provider = provider;
+        self
+    }
+
     /// Replaces the secret patterns this host strips as a secondary measure.
     #[must_use]
     pub fn with_secret_patterns(mut self, patterns: SecretPatterns) -> Self {

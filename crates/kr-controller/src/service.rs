@@ -292,6 +292,9 @@ pub struct Controller {
     project: Arc<crate::project::ProjectModule>,
     /// The environment's grants and invitations, which the sharing and device method groups act on.
     sharing: Arc<crate::sharing::SharingService>,
+    /// The environment's voice service: the coordinator and the seams it reads and proposes
+    /// through. Built after the daemon exists, because two of its seams hold a weak reference back.
+    voice: std::sync::OnceLock<Arc<crate::voice::VoiceModule>>,
     /// The paired devices, for the device method group.
     ///
     /// A view on this daemon's own registry database, which is the file the network half keeps its
@@ -514,6 +517,7 @@ impl Controller {
             transfer,
             project,
             sharing,
+            voice: std::sync::OnceLock::new(),
             devices,
             policy: std::sync::Mutex::new(policy),
             feed: std::sync::Mutex::new(feed),
@@ -550,6 +554,7 @@ impl Controller {
         // Recovery has settled every reservation it can, so what is left under the workers
         // directory that no session claims is nothing's.
         controller.sweep_worker_dirs().await?;
+        controller.start_voice();
         crate::transfer::serve(&controller)?;
         // The owner's setting is the owner's setting across a restart. A daemon that waited for a
         // client to ask before it looked would leave an enabled setting doing nothing until
@@ -1178,6 +1183,11 @@ impl Controller {
 
     /// The environment's grants and invitations.
     #[must_use]
+    pub fn devices(&self) -> &Arc<net::devices::DeviceDirectory> {
+        &self.devices
+    }
+
+    /// The environment's grants and invitations.
     pub fn sharing(&self) -> &Arc<crate::sharing::SharingService> {
         &self.sharing
     }
@@ -2210,6 +2220,145 @@ impl Controller {
         })
     }
 
+    /// Registers the voice coordinator beside the other services.
+    ///
+    /// After the daemon exists, because two of the coordinator's seams hold a weak reference back
+    /// to it: a service built inside `Arc::new_cyclic` could not read a session or propose an
+    /// effect, which is most of what those seams are for.
+    ///
+    /// The managed broker is configured only when an origin is set. A host without one is a
+    /// complete host: a person's own provider credential and the agent already running in the
+    /// session both still work, and `voice.start` says so rather than failing obscurely.
+    fn start_voice(self: &Arc<Self>) {
+        let authority = Arc::new(crate::voice::GrantAuthority::new(
+            Arc::clone(&self.sharing),
+            Arc::clone(&self.devices),
+            self.sharing.host_device_id(),
+        ));
+        // No managed provider is configured here. Reaching a managed service needs an HTTP
+        // exchange, which `kr-client` deliberately leaves to the embedder, and this repository
+        // carries no implementation of one yet. An embedder that has one attaches it with
+        // `VoiceModule::with_provider`.
+        let provider = None;
+        let module = crate::voice::VoiceModule::new(
+            Arc::new(crate::voice::ControllerFacts::new(self.me.clone())),
+            authority,
+            Arc::new(crate::voice::ControllerDispatch::new(self.me.clone())),
+            provider,
+            self.sharing.host_device_id(),
+            self.paths.environment_id(),
+            std::env::var(crate::voice::VOICE_BROKER_ORIGIN_VARIABLE).unwrap_or_default(),
+        );
+        let _ = self.voice.set(Arc::new(module));
+    }
+
+    /// The environment's voice service.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the daemon has not finished starting, which no request path can observe: the
+    /// endpoint is served after startup returns.
+    #[must_use]
+    pub fn voice(&self) -> &Arc<crate::voice::VoiceModule> {
+        self.voice.get().expect("the voice service is registered")
+    }
+
+    /// The device a paired actor acts as, when this host knows one.
+    ///
+    /// A voice method is reachable from a paired device and nothing else, so the actor has to
+    /// resolve to a device record before the coordinator sees it. An actor that resolves to no
+    /// live device reaches nothing.
+    pub(crate) fn paired_device(&self, actor_id: &ActorId) -> Option<kr_protocol::ids::DeviceId> {
+        self.devices
+            .devices()
+            .ok()?
+            .into_iter()
+            .find(|record| record.is_paired() && &record.principal() == actor_id)
+            .map(|record| record.device_id)
+    }
+
+    /// The facts the voice coordinator may read about one session.
+    ///
+    /// Read through this daemon's ordinary session read, so voice sees what any other reader sees
+    /// and nothing more. What this daemon does not hold — the worker's semantic history and its
+    /// pending decisions — is reported as unavailable rather than left out silently.
+    pub(crate) async fn voice_session_snapshot(
+        self: &Arc<Self>,
+        session_id: SessionId,
+    ) -> Result<crate::voice::SessionSnapshot> {
+        let params = ParamsValue::from_typed(&SessionReadParams { session_id })
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
+        let summary = read.session;
+        let observed_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| {
+                u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+            });
+        let item = |text: String| kr_voice::seams::ContextItem::new(text, observed_at_ms);
+        Ok(crate::voice::SessionSnapshot {
+            // The session's own description is the shell it runs and where it runs it until a
+            // generated description exists; both are facts this daemon already holds.
+            description: Some(item(format!(
+                "session {} running {}",
+                summary.display_number, summary.shell_path
+            ))),
+            working_directory: Some(item(summary.cwd.clone())),
+            active_application: Some(item(summary.application_state.0.as_ref().map_or_else(
+                || "no foreground application".to_owned(),
+                |state| format!("{state:?}"),
+            ))),
+            pending_decisions: Vec::new(),
+            recent_messages: Vec::new(),
+            selected: Vec::new(),
+            resources: vec![format!("session:{session_id}")],
+            unavailable: vec![kr_voice::seams::WithheldRun {
+                reason: "this host does not hold the worker's semantic history".to_owned(),
+                count: 0,
+            }],
+        })
+    }
+
+    /// Performs one voice proposal under the method the registry lists for its effect.
+    ///
+    /// The reads this daemon serves are performed here. Everything else belongs to the worker's
+    /// own dispatch, which this daemon does not forward, so it is **admitted and not performed**:
+    /// section 15 ¶10 makes the receipt the authority, and reporting an effect this daemon did not
+    /// cause would be the exact mistake that paragraph forbids.
+    pub(crate) async fn voice_perform(
+        self: &Arc<Self>,
+        method: Method,
+        action_id: kr_protocol::ids::ActionId,
+        session_id: Option<SessionId>,
+    ) -> Result<kr_voice::seams::HostReceipt> {
+        if method == Method::SessionRead {
+            let session_id = session_id.ok_or_else(|| {
+                ControllerError::InvalidArgument("that action names a session".to_owned())
+            })?;
+            let params = ParamsValue::from_typed(&SessionReadParams { session_id })
+                .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+            let read: SessionReadResult = parse(&self.session_read(&params).await?)?;
+            return Ok(kr_voice::seams::HostReceipt {
+                action_id,
+                performed: true,
+                summary: format!(
+                    "session {} is {} in {}",
+                    read.session.display_number,
+                    read.session.state.as_str(),
+                    read.session.cwd
+                ),
+            });
+        }
+        Ok(kr_voice::seams::HostReceipt {
+            action_id,
+            performed: false,
+            summary: format!(
+                "{} belongs to the session's worker, which this host does not dispatch",
+                method.as_str()
+            ),
+        })
+    }
+
     /// Issues an action window for one authenticated connection.
     ///
     /// # Errors
@@ -2357,6 +2506,9 @@ impl Controller {
                     ));
                 }
                 let _: kr_protocol::sharing::DeviceRevokeParams = parse(&mutation.params)?;
+            }
+            _ if crate::voice::VoiceModule::serves(method) => {
+                crate::voice::VoiceModule::check_subject(method, mutation)?;
             }
             _ if crate::transfer::TransferModule::serves(method) => {
                 crate::transfer::TransferModule::check_subject(method, mutation)?;
@@ -2817,6 +2969,22 @@ impl Controller {
         if crate::project::ProjectModule::serves(method) {
             return self.project.read_frame(request).await;
         }
+        if crate::voice::VoiceModule::serves(method) {
+            // Voice is reachable from a paired device and nothing else, which is the registry's
+            // own entry rather than a rule restated here. An actor that resolves to no live device
+            // reaches none of it.
+            let Some(device_id) = self.paired_device(actor_id) else {
+                return error_reply(
+                    request.request_id,
+                    ErrorCode::PermissionDenied,
+                    "voice is reachable from a paired device",
+                );
+            };
+            return self
+                .voice()
+                .read_frame(device_id, request, wall_clock_ms())
+                .await;
+        }
         let outcome = match method {
             Method::HostInfo => self.host_info().await,
             Method::EnvironmentCapabilities => self.environment_capabilities(&request.params).await,
@@ -2890,6 +3058,32 @@ impl Controller {
                 );
             }
             return self.transfer.write_frame(actor_id, mutation, method).await;
+        }
+        if crate::voice::VoiceModule::serves(method) {
+            let Some(device_id) = self.paired_device(actor_id) else {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    "voice is reachable from a paired device",
+                );
+            };
+            // The revision this daemon is at, read now: a voice grant is written under the
+            // authority in force at the moment of the write rather than the one a connection was
+            // admitted under.
+            let authority_revision = self.policy.lock().map_or_else(
+                |_| AuthorityRevision::new(0),
+                |policy| policy.authority_revision(),
+            );
+            return self
+                .voice()
+                .write_frame(
+                    device_id,
+                    mutation,
+                    method,
+                    authority_revision,
+                    wall_clock_ms(),
+                )
+                .await;
         }
         if crate::project::ProjectModule::serves(method) {
             let Some(admitted_revision) = admitted else {
@@ -5294,6 +5488,18 @@ fn remaining_deadline(
     let deadline = lease.map_or(accepted, |lease| lease.min(accepted));
     let remaining = deadline.saturating_duration_since(now);
     kr_ipc::clock::transferred_deadline(shared_now, remaining).map(U64::new)
+}
+
+/// This machine's wall clock, in UTC milliseconds.
+///
+/// The voice service's deadlines are wall-clock figures, because a paired device and a managed
+/// service both read them and neither can read this host's anchored clock.
+fn wall_clock_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            u64::try_from(since.as_millis()).unwrap_or(u64::MAX)
+        })
 }
 
 /// Returns whether this daemon forwards the method to the worker that owns the session.

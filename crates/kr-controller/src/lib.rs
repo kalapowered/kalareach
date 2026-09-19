@@ -23,6 +23,7 @@
 //! | [`service`] | Admission, the rendezvous and the local endpoint |
 //! | [`sharing`] | Roles compiled to grants, single-use invitations and transfer of control |
 //! | [`transfer`] | The environment's transfer service, its attachment-chunk endpoint and its sweep |
+//! | [`voice`] | The voice coordinator's seams over the history filter, the grant store and this host's dispatch |
 //! | [`project`] | The environment's project service: repositories, workspaces and the restricted Git profile |
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
@@ -40,5 +41,6 @@ pub mod sharing;
 pub mod singleton;
 pub mod supervision;
 pub mod transfer;
+pub mod voice;
 
 pub use crate::error::{ControllerError, Result};

@@ -4072,6 +4072,7 @@ dependencies = [
  "kr-shell-integration",
  "kr-transfer",
  "kr-transport",
+ "kr-voice",
  "kr-worker",
  "rusqlite",
  "rustix",

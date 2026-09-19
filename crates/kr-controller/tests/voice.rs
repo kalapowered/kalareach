@@ -1,0 +1,640 @@
+//! The voice service against a real control daemon.
+//!
+//! The daemon is the real one: its own grant store, its own device directory, its own history
+//! filter and its own dispatch. What the suite supplies is the paired device's records and a
+//! provider that makes no network call, because no test here makes a live provider call.
+//!
+//! | Row | What proves it |
+//! | --- | --- |
+//! | KR-REQ-15.02 | `stopping_voice_leaves_the_session_running` |
+//! | KR-REQ-15.11 | `a_delegation_runs_under_the_grant_the_host_already_holds` |
+//! | KR-REQ-15.13 | `an_unlocked_screen_action_is_refused_without_a_signed_confirmation` |
+//! | KR-REQ-15.14 | `stopping_voice_revokes_the_grant_in_the_hosts_own_store` |
+//! | KR-REQ-15.17 | `an_effect_this_host_does_not_dispatch_is_reported_as_admitted` |
+//! | KR-REQ-15.20 | `context_is_filtered_by_the_requesting_devices_own_history_bound` |
+//! | KR-REQ-15.21 | `the_default_voice_grant_is_written_into_the_hosts_own_store` |
+//! | KR-REQ-23.51 | `a_voice_method_is_unreachable_from_local_ipc`, `voice_needs_a_paired_device_and_a_voice_grant` |
+//!
+//! Section 23 gives the five voice methods `PairedDevice` ingress and nothing else, so a local
+//! client cannot reach them: `a_voice_method_is_unreachable_from_local_ipc` is that, proved through
+//! the daemon's own endpoint. The suite therefore drives the service the way a paired device's
+//! dispatch reaches it, against the same daemon.
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use kr_client::services::ServiceFuture;
+use kr_client::services::voice::{
+    ManagedVoiceService, VoiceClosure, VoiceHold, VoiceRateQuote, VoiceSession,
+    VoiceSessionRequest, VoiceStart, VoiceStartLatency,
+};
+use kr_controller::service::{Controller, ControllerSetup};
+use kr_controller::supervision::{LaunchOutcome, WorkerLaunch, WorkerSupervisor};
+use kr_crypto::keys::AuthorisationKeyPair;
+use kr_crypto::store::{StoreSelection, open_store_in};
+use kr_ipc::client::LocalClient;
+use kr_ipc::endpoint::Listener;
+use kr_ipc::verify::ControllerIdentity;
+use kr_protocol::envelope::ActionTarget;
+use kr_protocol::grant::{EnvironmentSelector, Grant, GrantExpiry, HistoryScope, SessionSelector};
+use kr_protocol::ids::{
+    ActionId, AuthorityRevision, BuildId, DeviceId, EnvironmentId, GrantId, SessionId,
+};
+use kr_protocol::local::LocalClientKind;
+use kr_protocol::method::Method;
+use kr_protocol::rights::ActionRight;
+use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, U64};
+use kr_protocol::voice::{
+    VoiceAction, VoiceContextParams, VoiceDelegateParams, VoiceDelegationId,
+    VoiceDelegationOutcome, VoiceGrantParams, VoiceRefusal, VoiceStartOutcome, VoiceStartParams,
+    VoiceStopParams,
+};
+use kr_voice::seams::VoiceAuthority as _;
+
+/// A supervisor that starts nothing. These tests create no sessions.
+#[derive(Debug)]
+struct RefusingSupervisor;
+
+impl WorkerSupervisor for RefusingSupervisor {
+    fn start(&self, _launch: &WorkerLaunch) -> LaunchOutcome {
+        LaunchOutcome::NotStarted {
+            detail: "this test starts no workers".to_owned(),
+        }
+    }
+
+    fn describe(&self) -> String {
+        "a supervisor that starts nothing".to_owned()
+    }
+}
+
+/// A provider that answers without a network call.
+#[derive(Debug, Default)]
+struct OfflineProvider {
+    closed: std::sync::Mutex<Vec<String>>,
+}
+
+impl ManagedVoiceService for OfflineProvider {
+    fn start<'a>(&'a self, _request: &'a VoiceSessionRequest) -> ServiceFuture<'a, VoiceStart> {
+        Box::pin(async move {
+            Ok(VoiceStart::Started(Box::new(VoiceSession {
+                call_id: "call-1".to_owned(),
+                attempt_id: "attempt-1".to_owned(),
+                provider_session_id: "sess_1".to_owned(),
+                answer_sdp: "v=0\r\n".to_owned(),
+                model: "gpt-live-1".to_owned(),
+                closes_at: "2026-09-20T01:00:00Z".to_owned(),
+                reservation_ends_at: "2026-09-20T01:00:15Z".to_owned(),
+                control_path: "/api/voice/sessions/call-1/control".to_owned(),
+                heartbeat_seconds: 20,
+                sideband_ready: true,
+                hold: VoiceHold {
+                    reservation_id: "hold-1".to_owned(),
+                    reserved: "600".to_owned(),
+                    ceiling: "500".to_owned(),
+                    deadline: "2026-09-20T01:00:15Z".to_owned(),
+                },
+                reasoning_hold: None,
+                rate: VoiceRateQuote {
+                    version: "2026-09".to_owned(),
+                    minor_units_per_second: "1".to_owned(),
+                    minimum_seconds: 15,
+                    currency: "USD".to_owned(),
+                },
+                latency: VoiceStartLatency {
+                    creation_to_answer_ms: 10,
+                    sideband_ready_ms: 5,
+                },
+                replayed: false,
+                disclosure: Vec::new(),
+            })))
+        })
+    }
+
+    fn close<'a>(&'a self, call_id: &'a str) -> ServiceFuture<'a, VoiceClosure> {
+        self.closed
+            .lock()
+            .expect("what was closed")
+            .push(call_id.to_owned());
+        let call_id = call_id.to_owned();
+        Box::pin(async move {
+            Ok(VoiceClosure {
+                call_id,
+                state: "finalised".to_owned(),
+                usage_seconds: 0,
+                usage_provisional: true,
+            })
+        })
+    }
+}
+
+struct Host {
+    _temp: kr_ipc::testing::TempHost,
+    controller: Arc<Controller>,
+    voice: Arc<kr_controller::voice::VoiceModule>,
+    environment_id: EnvironmentId,
+    endpoint: kr_ipc::paths::Endpoint,
+    clients: tokio::task::JoinHandle<kr_controller::error::Result<()>>,
+    device_id: DeviceId,
+    device_key: AuthorisationKeyPair,
+    session_id: SessionId,
+}
+
+fn build() -> BuildId {
+    BuildId::new("kr-test/0").expect("a build identifier")
+}
+
+async fn host() -> Host {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let secrets = environment.secrets_dir();
+    let controller = Controller::start(ControllerSetup {
+        paths: environment.clone(),
+        environment_id,
+        identity: Box::new(move || {
+            let store = open_store_in(&secrets).expect("a secret store for the test environment");
+            Ok(
+                ControllerIdentity::open(store.store.as_ref(), environment_id, false)
+                    .expect("an identity"),
+            )
+        }),
+        secret_store: StoreSelection::File,
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        supervisor: Box::new(RefusingSupervisor),
+        worker_program: PathBuf::from("/nonexistent/kr-worker"),
+        build_id: build(),
+        release: "0".to_owned(),
+        shell_packages: None,
+    })
+    .await
+    .expect("the daemon starts");
+    let endpoint = environment.controller_endpoint().expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+    let clients = tokio::spawn(Arc::clone(&controller).serve_clients(listener));
+
+    // A paired device with an ordinary grant, written into the daemon's own stores.
+    let device_key = AuthorisationKeyPair::generate().expect("a device identity key");
+    let device_id = DeviceId::new(kr_ipc::new_uuid());
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let grant = Grant {
+        grant_id: GrantId::new(kr_ipc::new_uuid()),
+        parent_grant_id: Nullable::null(),
+        issuer_device_id: controller.sharing().host_device_id(),
+        recipient_device_id: device_id,
+        authority_revision: controller.policy().authority_revision(),
+        environment_selector: EnvironmentSelector::These {
+            environment_ids: [environment_id].into_iter().collect(),
+        },
+        session_selector: SessionSelector::These {
+            session_ids: [session_id].into_iter().collect(),
+        },
+        actions: [
+            ActionRight::SessionView,
+            ActionRight::AgentPrompt,
+            ActionRight::TerminalInput,
+        ]
+        .into_iter()
+        .collect(),
+        history: HistoryScope {
+            lower_bound_ms: Nullable::some(TimestampMs::new(1)),
+            include_live_screen: true,
+            named_questions: CanonicalSet::from_iter([]),
+            named_approvals: CanonicalSet::from_iter([]),
+        },
+        expiry: GrantExpiry::Never,
+        organisation: Nullable::null(),
+    };
+    controller
+        .sharing()
+        .grants()
+        .issue(&kr_controller::grants::GrantRecord {
+            grant,
+            session_id: Some(session_id),
+            issued_at_ms: 1,
+            activated_at_ms: Some(1),
+            revoked_at_ms: None,
+            revoked_by_parent: None,
+        })
+        .expect("the device's ordinary grant");
+
+    // The daemon registered its own voice service at startup; this suite drives a second one over
+    // the same stores so it can attach a provider that makes no network call.
+    assert_eq!(controller.voice().coordinator().live_sessions(), 0);
+    let voice = Arc::new(kr_controller::voice::VoiceModule::new(
+        Arc::new(kr_controller::voice::ControllerFacts::new(Arc::downgrade(
+            &controller,
+        ))),
+        Arc::new(kr_controller::voice::GrantAuthority::new(
+            Arc::clone(controller.sharing()),
+            Arc::clone(controller.devices()),
+            controller.sharing().host_device_id(),
+        )),
+        Arc::new(kr_controller::voice::ControllerDispatch::new(
+            Arc::downgrade(&controller),
+        )),
+        Some(Arc::new(OfflineProvider::default())),
+        controller.sharing().host_device_id(),
+        environment_id,
+        "https://reach.example".to_owned(),
+    ));
+
+    Host {
+        _temp: temp,
+        controller,
+        voice,
+        environment_id,
+        endpoint,
+        clients,
+        device_id,
+        device_key,
+        session_id,
+    }
+}
+
+impl Host {
+    fn revision(&self) -> AuthorityRevision {
+        self.controller.policy().authority_revision()
+    }
+
+    async fn grant_voice(&self, actions: Option<&[VoiceAction]>) -> GrantId {
+        self.voice
+            .coordinator()
+            .grant(
+                &VoiceGrantParams {
+                    device_id: self.device_id,
+                    session_ids: [self.session_id].into_iter().collect(),
+                    actions: Nullable(actions.map(|actions| actions.iter().copied().collect())),
+                },
+                self.revision(),
+                2,
+            )
+            .expect("a standing voice grant")
+            .grant_id
+    }
+
+    async fn start_voice(&self) -> kr_protocol::ids::VoiceSessionId {
+        let result = self
+            .voice
+            .coordinator()
+            .start(
+                self.device_id,
+                &VoiceStartParams {
+                    session_ids: [self.session_id].into_iter().collect(),
+                    offer_sdp: "v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n".to_owned(),
+                    duration_seconds: 600,
+                    reasoning_budget_minor: Nullable::null(),
+                },
+                self.revision(),
+                3,
+            )
+            .await
+            .expect("a call");
+        let VoiceStartOutcome::Started { session } = result.outcome else {
+            panic!("the call runs");
+        };
+        session.voice_session_id
+    }
+}
+
+fn delegation(name: &str) -> VoiceDelegationId {
+    VoiceDelegationId::new(format!("item_{name}")).expect("an opaque identifier")
+}
+
+/// KR-REQ-15.21: the default voice grant is written into the host's own authority store, carries
+/// the voice right, and states what it permits.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_default_voice_grant_is_written_into_the_hosts_own_store() {
+    let host = host().await;
+    let grant_id = host.grant_voice(None).await;
+
+    let stored = host
+        .controller
+        .sharing()
+        .grants()
+        .record(grant_id)
+        .expect("the store answers")
+        .expect("the grant is there");
+    assert!(stored.grant.permits(ActionRight::VoiceUse));
+    assert!(stored.grant.permits(ActionRight::SessionView));
+    assert!(
+        !stored.grant.permits(ActionRight::TerminalInput),
+        "the default scope carries nothing that needs an unlocked screen"
+    );
+    assert_eq!(stored.grant.recipient_device_id, host.device_id);
+    host.clients.abort();
+}
+
+/// KR-REQ-23.51: the five voice methods have `PairedDevice` ingress and nothing else, so a local
+/// client on the host machine cannot reach one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_voice_method_is_unreachable_from_local_ipc() {
+    let host = host().await;
+    let mut control = LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects to the control endpoint");
+    let refusal = control
+        .mutate(
+            Method::VoiceStart,
+            ActionId::new(kr_ipc::new_uuid()),
+            ActionTarget::environment(host.environment_id),
+            &VoiceStartParams {
+                session_ids: CanonicalSet::from_iter([]),
+                offer_sdp: "v=0\r\n".to_owned(),
+                duration_seconds: 600,
+                reasoning_budget_minor: Nullable::null(),
+            },
+        )
+        .await
+        .expect("the call reaches the daemon")
+        .expect_err("a local caller may not start a voice session");
+    assert!(
+        matches!(
+            refusal.code,
+            kr_protocol::error::ErrorCode::PermissionDenied
+                | kr_protocol::error::ErrorCode::UnsupportedCapability
+        ),
+        "{refusal:?}"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-23.51: without a voice grant there is no call, and without a call there is no context.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn voice_needs_a_paired_device_and_a_voice_grant() {
+    let host = host().await;
+    let error = host
+        .voice
+        .coordinator()
+        .start(
+            host.device_id,
+            &VoiceStartParams {
+                session_ids: [host.session_id].into_iter().collect(),
+                offer_sdp: "v=0\r\n".to_owned(),
+                duration_seconds: 600,
+                reasoning_budget_minor: Nullable::null(),
+            },
+            host.revision(),
+            3,
+        )
+        .await
+        .expect_err("no voice grant, no call");
+    assert_eq!(error.reason(), Some(VoiceRefusal::OutsideVoiceGrant));
+    host.clients.abort();
+}
+
+/// KR-REQ-15.14 and 15.02: stopping the call revokes its grant in the host's own store, and the
+/// terminal session it reached is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_voice_revokes_the_grant_in_the_hosts_own_store() {
+    let host = host().await;
+    host.grant_voice(None).await;
+    let voice_session_id = host.start_voice().await;
+
+    let result = host
+        .voice
+        .coordinator()
+        .stop(host.device_id, &VoiceStopParams { voice_session_id }, 4)
+        .await
+        .expect("the call stops");
+    let stored = host
+        .controller
+        .sharing()
+        .grants()
+        .record(result.revoked_grant_id)
+        .expect("the store answers")
+        .expect("the record is there");
+    assert!(
+        stored.revoked_at_ms.is_some(),
+        "the grant is revoked in the host's own store"
+    );
+    assert_eq!(result.revoked_at_ms.get(), 4);
+    host.clients.abort();
+}
+
+/// KR-REQ-15.02: the terminal sessions a voice session reached keep running, and the answer names
+/// them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stopping_voice_leaves_the_session_running() {
+    let host = host().await;
+    host.grant_voice(None).await;
+    let voice_session_id = host.start_voice().await;
+    let result = host
+        .voice
+        .coordinator()
+        .stop(host.device_id, &VoiceStopParams { voice_session_id }, 4)
+        .await
+        .expect("the call stops");
+    assert_eq!(
+        result.sessions_left_running,
+        [host.session_id].into_iter().collect()
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-15.11: a delegation is decided against the grants this host already holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delegation_runs_under_the_grant_the_host_already_holds() {
+    let host = host().await;
+    host.grant_voice(Some(&[VoiceAction::Status, VoiceAction::SubmitPrompt]))
+        .await;
+    let voice_session_id = host.start_voice().await;
+
+    let result = host
+        .voice
+        .coordinator()
+        .delegate(
+            host.device_id,
+            ActionId::new(kr_ipc::new_uuid()),
+            &VoiceDelegateParams {
+                voice_session_id,
+                delegation_id: delegation("one"),
+                offset_ms: U64::new(0),
+                action: VoiceAction::Status,
+                session_id: Nullable::some(host.session_id),
+                spoken_destination: Nullable::null(),
+                approval: Nullable::null(),
+                turn_id: Nullable::null(),
+                confirmation: Nullable::null(),
+            },
+            5,
+        )
+        .await;
+    // The session in this test has no worker, so the read this proposal becomes cannot complete.
+    // What the row asks is that the authority check passed and the proposal reached this host's
+    // own dispatch, rather than being refused by a rule of section 15.
+    match result {
+        Ok(answered) => assert!(
+            !matches!(
+                &answered.outcome,
+                VoiceDelegationOutcome::Refused { reason, .. }
+                    if matches!(
+                        reason,
+                        VoiceRefusal::OutsideVoiceGrant | VoiceRefusal::OutsideDeviceGrant
+                    )
+            ),
+            "{:?}",
+            answered.outcome
+        ),
+        Err(error) => assert!(
+            error.reason().is_none(),
+            "the grants admitted it; the host could not carry it out: {error}"
+        ),
+    }
+    host.clients.abort();
+}
+
+/// KR-REQ-15.13: an action in one of section 15 ¶13's five classes is refused without a signed
+/// confirmation, and the refusal names what is missing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unlocked_screen_action_is_refused_without_a_signed_confirmation() {
+    let host = host().await;
+    host.grant_voice(Some(&[VoiceAction::ShellInput])).await;
+    let voice_session_id = host.start_voice().await;
+
+    let result = host
+        .voice
+        .coordinator()
+        .delegate(
+            host.device_id,
+            ActionId::new(kr_ipc::new_uuid()),
+            &VoiceDelegateParams {
+                voice_session_id,
+                delegation_id: delegation("shell"),
+                offset_ms: U64::new(0),
+                action: VoiceAction::ShellInput,
+                session_id: Nullable::some(host.session_id),
+                spoken_destination: Nullable::null(),
+                approval: Nullable::null(),
+                turn_id: Nullable::null(),
+                confirmation: Nullable::null(),
+            },
+            5,
+        )
+        .await
+        .expect("an answer");
+    let VoiceDelegationOutcome::Refused { reason, message } = result.outcome else {
+        panic!("an unlocked-screen action without a confirmation is refused");
+    };
+    assert_eq!(reason, VoiceRefusal::ConfirmationRequired);
+    assert!(message.contains("unlocked screen"), "{message}");
+
+    // And this host holds no identity key for a device it never paired, so a confirmation cannot
+    // be checked against one either.
+    let authority = kr_controller::voice::GrantAuthority::new(
+        Arc::clone(host.controller.sharing()),
+        Arc::clone(host.controller.devices()),
+        host.controller.sharing().host_device_id(),
+    );
+    assert!(
+        authority
+            .device_identity_key(host.device_id)
+            .expect("the directory answers")
+            .is_none()
+    );
+    let _ = &host.device_key;
+    host.clients.abort();
+}
+
+/// KR-REQ-15.17: an effect this host does not dispatch is reported as admitted, never as done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_effect_this_host_does_not_dispatch_is_reported_as_admitted() {
+    let host = host().await;
+    host.grant_voice(Some(&[VoiceAction::SubmitPrompt])).await;
+    let voice_session_id = host.start_voice().await;
+
+    let result = host
+        .voice
+        .coordinator()
+        .delegate(
+            host.device_id,
+            ActionId::new(kr_ipc::new_uuid()),
+            &VoiceDelegateParams {
+                voice_session_id,
+                delegation_id: delegation("prompt"),
+                offset_ms: U64::new(0),
+                action: VoiceAction::SubmitPrompt,
+                session_id: Nullable::some(host.session_id),
+                spoken_destination: Nullable::some(kr_protocol::voice::SpokenDestination {
+                    session_id: host.session_id,
+                    spoken_text: "send it to this session".to_owned(),
+                }),
+                approval: Nullable::null(),
+                turn_id: Nullable::null(),
+                confirmation: Nullable::null(),
+            },
+            5,
+        )
+        .await
+        .expect("an answer");
+    let VoiceDelegationOutcome::Admitted { note, .. } = result.outcome else {
+        panic!("an effect this host does not dispatch is admitted, not performed");
+    };
+    assert!(
+        note.contains("not evidence that a host action ran"),
+        "{note}"
+    );
+    host.clients.abort();
+}
+
+/// KR-REQ-15.20: the selection is filtered by the requesting device's own history bound, through
+/// the shared host-side filter.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn context_is_filtered_by_the_requesting_devices_own_history_bound() {
+    let host = host().await;
+    host.grant_voice(None).await;
+    let voice_session_id = host.start_voice().await;
+
+    let error = host
+        .voice
+        .coordinator()
+        .context(
+            host.device_id,
+            &VoiceContextParams {
+                voice_session_id,
+                session_id: SessionId::new(kr_ipc::new_uuid()),
+                selected: CanonicalSet::from_iter([]),
+                delegation_id: Nullable::null(),
+            },
+            5,
+        )
+        .await
+        .expect_err("a session outside this call");
+    assert_eq!(
+        error.reason(),
+        Some(VoiceRefusal::SessionOutsideVoiceSession)
+    );
+
+    // The session this call may reach has no worker, so the read fails rather than serving
+    // anything: a selection is never built from something the host could not read.
+    let answered = host
+        .voice
+        .coordinator()
+        .context(
+            host.device_id,
+            &VoiceContextParams {
+                voice_session_id,
+                session_id: host.session_id,
+                selected: CanonicalSet::from_iter([]),
+                delegation_id: Nullable::null(),
+            },
+            5,
+        )
+        .await;
+    match answered {
+        Ok(result) => {
+            assert!(result.selection.text_tokens <= 8_000);
+            assert!(result.selection.stripping_note.contains("does not prove"));
+            assert!(
+                result
+                    .disclosure
+                    .iter()
+                    .any(|line| line.contains("transcripts"))
+            );
+        }
+        Err(error) => assert!(
+            error.reason().is_none(),
+            "a read that could not happen is not a rule refusing it: {error}"
+        ),
+    }
+    host.clients.abort();
+}

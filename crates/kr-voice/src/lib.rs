@@ -56,6 +56,13 @@
 
 #![forbid(unsafe_code)]
 
+/// The managed voice broker contract, re-exported.
+///
+/// A host that hosts this coordinator needs the broker's types to configure one, and re-exporting
+/// them here is what keeps the dependency edge the one decision D-089 draws: `kr-controller`
+/// depends on `kr-voice`, and `kr-voice` depends on `kr-client`.
+pub use kr_client::services::voice as broker;
+
 pub mod confirm;
 pub mod context;
 pub mod delegate;
