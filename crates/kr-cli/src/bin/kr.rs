@@ -741,7 +741,20 @@ async fn run(cli: Cli) -> Result<Completion> {
         Command::Shell(arguments) => {
             // Nothing here reaches the host: setup configures this user's own shell, and the
             // diagnostics read the installed packages and the files those shells actually read.
-            let layout = HomeLayout::from_environment();
+            //
+            // Where this installation has a PowerShell package, that package's own executable is
+            // the shell asked where its profile is: two editions keep theirs in different places,
+            // and an entry written for one is never read by the other.
+            let layout = kr_cli::shell::packages()
+                .ok()
+                .and_then(|packages| {
+                    packages
+                        .get(kr_shell_integration::contract::qualification::ShellKind::PowerShell)
+                        .map(|package| package.executable())
+                })
+                .map_or_else(HomeLayout::from_environment, |powershell| {
+                    HomeLayout::from_environment().launching(powershell)
+                });
             let selector = shell_selector(&arguments);
             let reports = match &arguments.command {
                 // Removal is the one operation that needs no package: it takes out the marked lines

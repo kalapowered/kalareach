@@ -55,7 +55,9 @@ pub struct HomeLayout {
     ///
     /// Asked where its own profile is, rather than having a path derived for it: PowerShell keeps
     /// that file where the platform puts the user's documents, and on Windows a redirection can
-    /// move it anywhere.
+    /// move it anywhere. Two editions answer differently, so this has to be the executable a
+    /// session would actually start: [`Self::launching`] is how a caller that has resolved a
+    /// package says which.
     pub powershell: Option<PathBuf>,
 }
 
@@ -71,6 +73,17 @@ impl HomeLayout {
             xdg_config_home: std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
             powershell: powershell_on_path(),
         }
+    }
+
+    /// Returns this layout with the PowerShell a session would launch.
+    ///
+    /// A qualified package's own executable rather than whichever PowerShell is on the path: the
+    /// two can be different editions, and on Windows they keep their profiles in different
+    /// directories, so an entry written for one is never read by the other.
+    #[must_use]
+    pub fn launching(mut self, powershell: PathBuf) -> Self {
+        self.powershell = Some(powershell);
+        self
     }
 
     /// Returns where this shell's guarded entry goes.
@@ -146,21 +159,19 @@ impl HomeLayout {
         // The shell's own answer, read from a shell started with no profile of its own so that
         // nothing a user wrote decides where their profile is. `CurrentUserCurrentHost` is the one
         // `kr shell install` adds to: the per-user file this host's PowerShell reads.
-        let printed = std::process::Command::new(shell)
-            .args([
+        //
+        // Bounded, and written to a file rather than a pipe: `kr shell status` runs this, and a
+        // shell that will not start must not hold that command open.
+        let said = ask(
+            shell,
+            &[
                 "-NoProfile",
                 "-NonInteractive",
                 "-NoLogo",
                 "-Command",
                 "$PROFILE.CurrentUserCurrentHost",
-            ])
-            .stdin(std::process::Stdio::null())
-            .output()
-            .ok()?;
-        if !printed.status.success() {
-            return None;
-        }
-        let said = String::from_utf8_lossy(&printed.stdout);
+            ],
+        )?;
         let said = said.trim();
         (!said.is_empty()).then(|| PathBuf::from(said))
     }
@@ -180,13 +191,68 @@ impl HomeLayout {
             let Ok(contents) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if contents.lines().any(sources_bashrc) {
+            if runs_bashrc(&contents) {
                 return None;
             }
             return Some(path);
         }
         None
     }
+}
+
+/// How long a shell is given to answer a question about itself.
+const ASK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Asks one program a question and returns what it printed, or nothing.
+///
+/// The answer goes to a file rather than a pipe, so nothing has to read while the program runs and
+/// a descendant that inherited the handle holds nothing of this host's open. The wait is bounded,
+/// and a program that outlasts it is terminated and reaped: a shell that will not start must not
+/// hold `kr shell` open.
+fn ask(program: &Path, arguments: &[&str]) -> Option<String> {
+    let directory = std::env::temp_dir().join(format!("kr-shell-ask-{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&directory);
+    let printed = directory.join(format!(
+        "said-{}",
+        std::time::Instant::now().elapsed().as_nanos()
+    ));
+    let to = std::fs::File::create(&printed).ok()?;
+    let started = std::process::Command::new(program)
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(to))
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match started {
+        Ok(child) => child,
+        Err(_) => {
+            let _ = std::fs::remove_file(&printed);
+            return None;
+        }
+    };
+    let deadline = std::time::Instant::now() + ASK_DEADLINE;
+    let mut ended = false;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                ended = true;
+                break Some(status);
+            }
+            Ok(None) => {}
+            Err(_) => break None,
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    };
+    if !ended {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let said = std::fs::read_to_string(&printed).ok();
+    let _ = std::fs::remove_file(&printed);
+    status.filter(std::process::ExitStatus::success).and(said)
 }
 
 /// Returns the PowerShell this host would launch, when one is on the path.
@@ -205,6 +271,48 @@ fn powershell_on_path() -> Option<PathBuf> {
             .map(|directory| directory.join(name))
             .find(|candidate| candidate.is_file())
     })
+}
+
+/// Returns whether a login file runs `.bashrc`.
+///
+/// Reading shell text without a shell is a judgement, so the rule is which way to be wrong. A file
+/// this host wrongly thinks sources `.bashrc` gets no entry of its own, and a login shell then has
+/// no integration at all; a file it wrongly thinks does not gets one more marked entry, which is
+/// guarded, idempotent and removed by `kr shell remove`. The second is the harmless direction, so
+/// anything this cannot establish reads as "it does not".
+///
+/// What that rules out here: the body of a here-document is text the shell passes on rather than
+/// commands it runs, so `cat <<EOF` … `source ~/.bashrc` … `EOF` is skipped.
+fn runs_bashrc(contents: &str) -> bool {
+    let mut ending: Option<String> = None;
+    for line in contents.lines() {
+        if let Some(marker) = ending.as_ref() {
+            if line.trim() == marker {
+                ending = None;
+            }
+            continue;
+        }
+        if let Some(marker) = here_document(line) {
+            ending = Some(marker);
+            // The line that opens one can still be a command that sources it.
+        }
+        if sources_bashrc(line) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Returns the word that ends a here-document this line opens, when it opens one.
+fn here_document(line: &str) -> Option<String> {
+    let at = line.find("<<")?;
+    let rest = line[at + 2..].trim_start_matches(['-', '~']).trim_start();
+    let marker: String = rest
+        .chars()
+        .take_while(|character| !character.is_whitespace())
+        .filter(|character| !matches!(character, '"' | '\'' | '\\'))
+        .collect();
+    (!marker.is_empty()).then_some(marker)
 }
 
 /// Returns whether one line of a login file sources `.bashrc`.
@@ -270,12 +378,16 @@ fn sources_bashrc(line: &str) -> bool {
             '\\' => {
                 escaped = true;
                 started = true;
+                next_command_position = false;
             }
             '\'' | '"' => {
                 quoted = true;
                 quote = character;
                 any_quoted = true;
                 started = true;
+                // A word has begun, so the next one is an argument. `"echo" source ~/.bashrc`
+                // passes `source` to `echo`.
+                next_command_position = false;
             }
             // A comment begins at a `#` that begins a word, and ends the command.
             '#' if !started => break,
@@ -301,11 +413,16 @@ fn sources_bashrc(line: &str) -> bool {
     let mut at_command = true;
     let mut verbs: Vec<usize> = Vec::new();
     for (index, word) in words.iter().enumerate() {
-        let introduces = matches!(
-            word.text.as_str(),
-            "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "!"
-        );
-        if (at_command || word.command_position) && !word.quoted && !introduces {
+        let here = at_command || word.command_position;
+        // A keyword is only a keyword where a command stands and only unquoted: `echo if source
+        // ~/.bashrc` passes `if` to `echo`, and `"if"` is the word rather than the keyword.
+        let introduces = here
+            && !word.quoted
+            && matches!(
+                word.text.as_str(),
+                "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "!"
+            );
+        if here && !word.quoted && !introduces {
             verbs.push(index);
         }
         at_command = introduces;
@@ -553,6 +670,11 @@ impl FileLock {
     fn take(path: &Path) -> std::io::Result<Self> {
         use std::os::windows::fs::OpenOptionsExt as _;
 
+        /// What Windows says when another handle holds the file.
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        /// What it says when a region of it is locked.
+        const ERROR_LOCK_VIOLATION: i32 = 33;
+
         let lock = Self::beside(path)?;
         let deadline = std::time::Instant::now() + LOCK_PATIENCE;
         loop {
@@ -570,11 +692,14 @@ impl FileLock {
                         held: Some(file),
                     });
                 }
-                // Somebody is holding it. The platform reports a sharing violation as a denial.
+                // Somebody is holding it. The platform says so with a sharing or lock violation,
+                // and it is the raw code that says which: the standard library does not map either
+                // to a kind of its own, so a writer that matched on the kind would give up at once
+                // and a real permission failure would wait out the whole deadline.
                 Err(error)
                     if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AlreadyExists
+                        error.raw_os_error(),
+                        Some(ERROR_SHARING_VIOLATION | ERROR_LOCK_VIOLATION)
                     ) => {}
                 Err(error) => return Err(error),
             }
@@ -845,6 +970,9 @@ mod tests {
             "echo source ~/.bashrc\n",
             "echo \"please \\\" source ~/.bashrc\"\n",
             "printf '%s\\n' source ~/.bashrc\n",
+            "echo if source ~/.bashrc\n",
+            "\"echo\" source ~/.bashrc\n",
+            "cat <<EOF\nsource ~/.bashrc\nEOF\n",
         ] {
             std::fs::write(root.path().join(".bash_profile"), mentions).expect("writes");
             assert_eq!(
@@ -943,6 +1071,11 @@ mod tests {
     }
 
     /// KR-REQ-07.29: PowerShell's profile is the one that shell itself names.
+    ///
+    /// Unix, because the shell it asks is a program this test writes, and writing one needs a
+    /// shebang and an executable bit. What the code under test does with the answer is the same on
+    /// every platform.
+    #[cfg(unix)]
     #[test]
     fn the_powershell_profile_is_the_one_that_shell_names() {
         let root = tempfile::tempdir().expect("a directory");

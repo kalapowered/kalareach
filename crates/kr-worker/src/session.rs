@@ -754,7 +754,7 @@ impl Session {
         }
     }
 
-    /// Decides what one interactive invocation resolves to, and establishes its backend first.
+    /// Decides what one interactive invocation resolves to.
     ///
     /// Section 12's order is the point: the worker-owned backend has to exist before the native
     /// program does. This host establishes none, so an invocation that would take the integration

@@ -220,69 +220,36 @@ enum Printed {
 /// into a command line: the argument vector is a vector.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn run(program: &str, arguments: &[&str]) -> Printed {
-    // A reading whose capture never finished leaves two threads on a pipe some descendant is
-    // holding open. Every session on this host reads on its own cadence, so some are legitimately
-    // in flight at once; what must not happen is accumulation. This is the ceiling: above it the
-    // platform is not asked at all and the answer is `NotRun`, so a facility that has stopped
-    // answering costs a bounded number of threads rather than two more on every cadence.
-    static CAPTURING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    const OUTSTANDING_CAPTURES: usize = 8;
-
-    if CAPTURING.load(std::sync::atomic::Ordering::Acquire) >= OUTSTANDING_CAPTURES {
+    // The child writes to files of this reading's own rather than to pipes. A pipe has to be read
+    // while the child runs, or the child blocks on a full one; reading it needs either a thread or
+    // a non-blocking descriptor, and a descendant that inherited the pipe can hold that reader
+    // open long after the child this host started has gone. A file has none of those properties:
+    // nothing has to read it while the command runs, and a descendant still holding it open costs
+    // this host nothing.
+    let Some((out, err, directory)) = capture_files() else {
         return Printed::NotRun;
-    }
-    let mut command = std::process::Command::new(program);
-    command
+    };
+    let opened = (
+        std::fs::File::create(&out).ok(),
+        std::fs::File::create(&err).ok(),
+    );
+    let (Some(to_out), Some(to_err)) = opened else {
+        let _ = std::fs::remove_dir_all(&directory);
+        return Printed::NotRun;
+    };
+    let started = std::process::Command::new(program)
         .args(arguments)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    // Its own process group, so a descendant that inherited a pipe is ended with the child rather
-    // than left holding the capture open.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-
-        command.process_group(0);
-    }
-    let Ok(mut child) = command.spawn() else {
+        .stdout(std::process::Stdio::from(to_out))
+        .stderr(std::process::Stdio::from(to_err))
+        .spawn();
+    let Ok(mut child) = started else {
+        let _ = std::fs::remove_dir_all(&directory);
         return Printed::NotRun;
     };
     // The reading has a deadline. A session facility that has stopped answering must not hold this
     // probe open: what a command that did not finish in time establishes is nothing, which is what
     // `NotRun` means, and never that a desktop ended.
-    // Both pipes are drained while the wait runs, by threads that send what they read rather than
-    // by joins this wait would sit on: a command that prints more than one pipe holds blocks until
-    // somebody reads it, and a descendant that inherited a pipe can hold it open after the child
-    // this host started has gone. Neither may outlast the deadline.
-    let out = child.stdout.take().map(|mut stream| {
-        let (said, heard) = std::sync::mpsc::channel();
-        CAPTURING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        std::thread::spawn(move || {
-            use std::io::Read as _;
-
-            let mut read = Vec::new();
-            let _ = stream.read_to_end(&mut read);
-            // Counted down before the answer is handed over, so a caller that has its answer sees
-            // no capture outstanding and the next reading is not refused by this one's tail.
-            CAPTURING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            let _ = said.send(read);
-        });
-        heard
-    });
-    let err = child.stderr.take().map(|mut stream| {
-        let (said, heard) = std::sync::mpsc::channel();
-        CAPTURING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-        std::thread::spawn(move || {
-            use std::io::Read as _;
-
-            let mut read = Vec::new();
-            let _ = stream.read_to_end(&mut read);
-            CAPTURING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-            let _ = said.send(read);
-        });
-        heard
-    });
     let deadline = std::time::Instant::now() + PROBE_DEADLINE;
     let mut ended = false;
     let status = loop {
@@ -293,7 +260,7 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
             }
             Ok(None) => {}
             // The wait itself failed, which says nothing about the child: it is ended and reaped
-            // here rather than left behind.
+            // below rather than left behind.
             Err(_) => break None,
         }
         if std::time::Instant::now() >= deadline {
@@ -302,35 +269,15 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     if !ended {
-        // Terminated and reaped, the whole group where the platform has them: a child left running
-        // would outlive every probe after it, one left unreaped would outlive the process, and a
-        // descendant left holding a pipe would hold this reading's capture open.
-        #[cfg(unix)]
-        {
-            let group = rustix::process::Pid::from_raw(-(child.id() as i32));
-            if let Some(group) = group {
-                let _ = rustix::process::kill_process(group, rustix::process::Signal::KILL);
-            }
-        }
+        // Terminated and reaped: a child left running would outlive every probe after it, and one
+        // left unreaped would outlive the process.
         let _ = child.kill();
         let _ = child.wait();
     }
-    // What the readers managed to send by the deadline. A reader still waiting on a pipe that some
-    // descendant holds open is left to end on its own, and a capture that did not finish is not
-    // output: an empty answer where a session facility's words should be reads as "no desktop",
-    // and a reading this host could not take establishes nothing of the kind.
-    let taken = |heard: Option<std::sync::mpsc::Receiver<Vec<u8>>>| match heard {
-        None => Some(Vec::new()),
-        Some(heard) => {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            heard
-                .recv_timeout(left.max(std::time::Duration::from_millis(50)))
-                .ok()
-        }
-    };
-    let printed = taken(out);
-    let failed = taken(err);
-    let (Some(status), Some(printed), Some(failed)) = (status, printed, failed) else {
+    let printed = std::fs::read(&out).unwrap_or_default();
+    let failed = std::fs::read(&err).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&directory);
+    let Some(status) = status else {
         return Printed::NotRun;
     };
     if status.success() {
@@ -340,6 +287,17 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
         said.push_str(&String::from_utf8_lossy(&printed));
         Printed::Failed(said.to_ascii_lowercase())
     }
+}
+
+/// Returns the two files one reading captures into, in a directory of its own.
+///
+/// A directory of its own so the two names cannot collide with another reading's, and so removing
+/// it takes both files with it however the reading ended.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn capture_files() -> Option<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
+    let directory = std::env::temp_dir().join(format!("kr-desktop-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir(&directory).ok()?;
+    Some((directory.join("out"), directory.join("err"), directory))
 }
 
 /// How long a platform command is given before the reading is abandoned.
