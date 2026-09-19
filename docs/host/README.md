@@ -736,19 +736,26 @@ adopting, `workspace.manage` for creating and removing a working copy. The four 
 right of their own, so a grant that covers the environment reads the whole repository and workspace
 surface.
 
-Three limits of that, stated rather than implied:
+**Five of the mutations are not served to a device at all yet.** `project.init`, `project.clone`,
+`project.adopt`, `workspace.create` and `workspace.remove` each name a destination or a source that
+this host cannot check a device's authority over. A creation carries the absolute parent directory
+it wants and this host resolves it once with its own filesystem authority; a working copy's source
+is bounded by nothing but the environment. For a caller on the machine's own socket that is the
+user's own authority over the user's own filesystem, and those five run as they always have. For a
+device the grant's action right would be the whole of the restriction — `project.create` would
+reach any directory this host can open, `workspace.manage` every repository the environment holds —
+and section 14 asks for an authorised destination handle while section 23 asks for a destination
+policy and for source and destination grants. So a device is refused them by name, with a refusal
+that says which subject it cannot authorise. It keeps the four reads, and `project.operation.cancel`
+for work it started itself. The refusal is lifted when the project service bounds a destination and
+a source by the grant that asked.
 
-* **A destination is a path the request names.** A creation carries the absolute parent directory
-  it wants, and this host resolves it once with its own filesystem authority. The grant is
-  therefore the whole of the restriction on where a device may create a repository or a working
-  copy: `project.create` reaches any directory this host can open. What the resolution does
-  establish is that the directory it opened is the one the effect writes into, by the identity it
-  recorded, so nothing is substituted underneath it.
-* **A workspace's source is not separately authorised either.** `workspace.manage` covers creating
-  and removing a working copy of a repository this environment already holds; `project.create`
-  covers bringing a repository into the environment in the first place. Neither carries a further
-  check on which repository a working copy is taken from, so a grant that carries
-  `workspace.manage` reaches every repository the environment holds.
+What the resolution does establish, for the caller that is served, is that the directory it opened
+is the one the effect writes into, by the identity it recorded, so nothing is substituted
+underneath it.
+
+One further limit, stated rather than implied.
+
 * **`action.read` does not answer for an action this host owns.** A receipt lives in the journal of
   the session an action was performed on, and a create or a repository mutation belongs to no
   session. What such an action leaves is kept by the service, which is not a receipt in the shape

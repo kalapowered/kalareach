@@ -843,6 +843,11 @@ impl RemoteConnection {
             // worker proxy, and the admission travels with them so the service can ask about it
             // again after the waiting it does of its own.
             _ if crate::project::ProjectModule::serves(entry.method) => {
+                // Five of these name a destination or a source that this host cannot yet check a
+                // device's authority over. Until it can, they are not served to one.
+                if let Err(error) = resource_authority(entry.method) {
+                    return failure(mutation.request_id, error);
+                }
                 // A project mutation claims its action identity the way every other mutation
                 // does, with this host named as the owner of what it produces. Storage that
                 // cannot record the route refuses it: only section 7's stop goes on without one.
@@ -1667,6 +1672,44 @@ impl RemoteConnection {
             },
         }
     }
+}
+
+/// Refuses a project mutation whose destination or source this host cannot authorise for a device.
+///
+/// Section 14 requires an authorised destination handle for a creation, and section 23's rows
+/// require a destination and remote-credential policy for one and source and destination grants
+/// for a working copy. The project service has neither: it resolves the absolute parent directory
+/// the request names with this host's own filesystem authority, and it bounds the repository a
+/// working copy is taken from by nothing but the environment. For a caller on the machine's own
+/// socket that is the user's own authority over the user's own filesystem. For a paired device it
+/// is not, and the grant's action right would be the whole of the restriction: `project.create`
+/// would reach every directory this host can open, and `workspace.manage` every repository the
+/// environment holds.
+///
+/// So this host refuses those five rather than acting on a destination or a source nobody
+/// authorised it to reach. The reads, and cancelling work the caller itself started, are
+/// unaffected. The refusal is lifted when the project service bounds a destination and a source by
+/// the grant that asked.
+fn resource_authority(method: Method) -> std::result::Result<(), ProtocolError> {
+    let names = match method {
+        Method::ProjectInit | Method::ProjectClone | Method::ProjectAdopt => {
+            "the directory it creates a repository in"
+        }
+        Method::WorkspaceCreate => "the repository it takes a working copy from",
+        Method::WorkspaceRemove => "the working copy it removes",
+        _ => return Ok(()),
+    };
+    Err(ProtocolError::new(
+        ErrorCode::PermissionDenied,
+        format!(
+            "{} names {}, and this host does not yet establish a paired device's authority over \
+             one: the project service resolves it with the host's own authority and checks \
+             nothing else against the device. Until it does, this host serves the repository and \
+             workspace reads to a device and not this.",
+            method.as_str(),
+            names
+        ),
+    ))
 }
 
 /// Returns whether one request claims or adds a geometry claim.

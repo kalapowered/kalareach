@@ -189,94 +189,60 @@ fn workspace_params(
     }
 }
 
-/// KR-REQ-23.42 and KR-REQ-23.43: every project and workspace method runs over both ingresses.
+/// KR-REQ-23.42 and KR-REQ-23.43: every method a device may reach answers it and the owner alike.
 ///
-/// Each mutation is performed once from each door, against a destination of its own, and each read
-/// is asked on both doors for the same subject and the two answers compared. A mutation cannot be
-/// run twice against the same destination and still be the same request, so what the mutations
-/// demonstrate is that the device reaches the service and gets the service's own result; what the
-/// reads demonstrate is that the answer itself does not depend on which door asked.
+/// The owner runs all ten. A device runs the four reads and the cancellation, which is everything
+/// this host serves it while it cannot check a device's authority over a destination or a source;
+/// the other five are the next test. Each read is asked on both doors for the same subject and the
+/// two answers compared, because the answer must not depend on which door asked.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn every_project_and_workspace_method_answers_a_paired_device_and_the_owner_alike() {
+async fn every_project_method_a_device_may_reach_answers_it_and_the_owner_alike() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let mut control = host.client().await;
     let (_device, session) = net_support::paired_device(&host, &owner, PROJECT_RIGHTS).await;
     let source = repository(host.work(), "source");
 
-    // `project.init`, from each door.
-    let locally_made: ProjectInitResult = typed(
+    // The owner performs the five creations and the two workspace mutations.
+    let initialised: ProjectInitResult = typed(
         &local_mutation(
             &mut control,
             host.environment_id,
             Method::ProjectInit,
             &ProjectInitParams {
-                destination: destination(&host, "fresh-owner"),
-                label: "fresh-owner".to_owned(),
+                destination: destination(&host, "fresh"),
+                label: "fresh".to_owned(),
                 initial_branch: Nullable::some("main".to_owned()),
             },
         )
         .await
         .expect("project.init succeeds locally"),
     );
-    let remotely_made: ProjectInitResult = typed(
-        &remote_mutation(
-            &session,
-            host.environment_id,
-            Method::ProjectInit,
-            &ProjectInitParams {
-                destination: destination(&host, "fresh-device"),
-                label: "fresh-device".to_owned(),
-                initial_branch: Nullable::some("main".to_owned()),
-            },
-        )
-        .await
-        .expect("project.init succeeds for a paired device"),
-    );
-    assert_eq!(locally_made.operation.state, OperationState::Completed);
-    assert_eq!(remotely_made.operation.state, OperationState::Completed);
-    assert!(host.work().join("fresh-device/.git").is_dir());
-
-    // `project.clone`, from each door.
-    let remote = |name: &str| ProjectCloneParams {
-        destination: destination(&host, name),
-        label: name.to_owned(),
-        remote: RemoteSpecification {
-            remote_name: "origin".to_owned(),
-            transport: RemoteTransport::LocalPath,
-            url: source.display().to_string(),
-            provider: String::new(),
-            credential_broker: String::new(),
-        },
-    };
-    let locally_cloned: ProjectCloneResult = typed(
+    assert_eq!(initialised.operation.state, OperationState::Completed);
+    let cloned: ProjectCloneResult = typed(
         &local_mutation(
             &mut control,
             host.environment_id,
             Method::ProjectClone,
-            &remote("cloned-owner"),
+            &ProjectCloneParams {
+                destination: destination(&host, "cloned"),
+                label: "cloned".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: String::new(),
+                    credential_broker: String::new(),
+                },
+            },
         )
         .await
         .expect("project.clone succeeds locally"),
     );
-    let remotely_cloned: ProjectCloneResult = typed(
-        &remote_mutation(
-            &session,
-            host.environment_id,
-            Method::ProjectClone,
-            &remote("cloned-device"),
-        )
-        .await
-        .expect("project.clone succeeds for a paired device"),
-    );
-    assert_eq!(locally_cloned.operation.state, OperationState::Completed);
-    assert_eq!(remotely_cloned.operation.state, OperationState::Completed);
-    assert!(host.work().join("cloned-device/README.md").is_file());
-
-    // `project.adopt`: the device adopts the checkout the fixture built.
+    assert_eq!(cloned.operation.state, OperationState::Completed);
     let adopted: ProjectAdoptResult = typed(
-        &remote_mutation(
-            &session,
+        &local_mutation(
+            &mut control,
             host.environment_id,
             Method::ProjectAdopt,
             &ProjectAdoptParams {
@@ -286,26 +252,30 @@ async fn every_project_and_workspace_method_answers_a_paired_device_and_the_owne
             },
         )
         .await
-        .expect("project.adopt succeeds for a paired device"),
+        .expect("project.adopt succeeds locally"),
     );
     let project = adopted.project.project_repository_id;
-    let owner_adopted: ProjectAdoptResult = typed(
+    let created: WorkspaceCreateResult = typed(
         &local_mutation(
             &mut control,
             host.environment_id,
-            Method::ProjectAdopt,
-            &ProjectAdoptParams {
-                destination: destination(&host, "cloned-owner"),
-                label: "cloned-owner-adopted".to_owned(),
-                flow: AdoptionFlow::ExistingCheckout,
-            },
+            Method::WorkspaceCreate,
+            &workspace_params(&host, project, "review"),
         )
         .await
-        .expect("project.adopt succeeds locally"),
+        .expect("workspace.create succeeds locally"),
     );
-    assert_ne!(owner_adopted.project.project_repository_id, project);
+    let workspace = created
+        .workspace
+        .0
+        .expect("a creation returns the workspace");
+    assert_eq!(
+        std::fs::read_to_string(host.work().join("review/README.md"))
+            .expect("the workspace is there"),
+        "changed after the commit\n"
+    );
 
-    // The two reads of the repository surface, asked on both doors for the same subject.
+    // The four reads, on both doors, for the same subject.
     let list_params = ProjectListParams {
         environment_id: host.environment_id,
     };
@@ -319,7 +289,7 @@ async fn every_project_and_workspace_method_answers_a_paired_device_and_the_owne
         owner_list, device_list,
         "project.list is the same answer on both ingresses"
     );
-    assert_eq!(owner_list.projects.len(), 6);
+    assert_eq!(owner_list.projects.len(), 3);
 
     let read_params = ProjectReadParams {
         project_repository_id: project,
@@ -336,39 +306,6 @@ async fn every_project_and_workspace_method_answers_a_paired_device_and_the_owne
     );
     assert_eq!(device_read.project.label, "source");
 
-    // `workspace.create`, from each door, each into a directory of its own.
-    let device_created: WorkspaceCreateResult = typed(
-        &remote_mutation(
-            &session,
-            host.environment_id,
-            Method::WorkspaceCreate,
-            &workspace_params(&host, project, "review-device"),
-        )
-        .await
-        .expect("workspace.create succeeds for a paired device"),
-    );
-    let device_workspace = device_created
-        .workspace
-        .0
-        .expect("a creation returns the workspace");
-    let owner_created: WorkspaceCreateResult = typed(
-        &local_mutation(
-            &mut control,
-            host.environment_id,
-            Method::WorkspaceCreate,
-            &workspace_params(&host, project, "review-owner"),
-        )
-        .await
-        .expect("workspace.create succeeds locally"),
-    );
-    // The dirty file came across, which is what the inclusion policy asked for.
-    assert_eq!(
-        std::fs::read_to_string(host.work().join("review-device/README.md"))
-            .expect("the workspace is there"),
-        "changed after the commit\n"
-    );
-
-    // The two workspace reads, asked on both doors for the same subject.
     let list_params = WorkspaceListParams {
         environment_id: host.environment_id,
         project_repository_id: Nullable::some(project),
@@ -383,10 +320,10 @@ async fn every_project_and_workspace_method_answers_a_paired_device_and_the_owne
         owner_list, device_list,
         "workspace.list is the same answer on both ingresses"
     );
-    assert_eq!(owner_list.workspaces.len(), 2);
+    assert_eq!(owner_list.workspaces.len(), 1);
 
     let read_params = WorkspaceReadParams {
-        workspace_id: device_workspace.workspace_id,
+        workspace_id: workspace.workspace_id,
     };
     let owner_read: WorkspaceReadResult =
         locally(&mut control, Method::WorkspaceRead, &read_params).await;
@@ -399,78 +336,217 @@ async fn every_project_and_workspace_method_answers_a_paired_device_and_the_owne
         "workspace.read is the same answer on both ingresses"
     );
 
-    // `project.operation.cancel` of work that has finished: it undoes nothing and says so.
-    let device_cancelled: ProjectOperationCancelResult = typed(
-        &remote_mutation(
-            &session,
-            host.environment_id,
-            Method::ProjectOperationCancel,
-            &ProjectOperationCancelParams {
-                operation_action_id: remotely_cloned.operation.action_id,
-            },
-        )
-        .await
-        .expect("project.operation.cancel succeeds for a paired device"),
-    );
-    let owner_cancelled: ProjectOperationCancelResult = typed(
+    // `project.operation.cancel` reaches a device, and section 23 puts it under the resource
+    // owner's authority: the operation is the resource, and one the owner started is not the
+    // device's to stop. So the device reaches the method and is refused the owner's work.
+    let refused = remote_mutation(
+        &session,
+        host.environment_id,
+        Method::ProjectOperationCancel,
+        &ProjectOperationCancelParams {
+            operation_action_id: cloned.operation.action_id,
+        },
+    )
+    .await
+    .expect_err("an operation another actor started is not this device's to stop");
+    assert_eq!(refused.code(), ErrorCode::PermissionDenied);
+    let cancelled: ProjectOperationCancelResult = typed(
         &local_mutation(
             &mut control,
             host.environment_id,
             Method::ProjectOperationCancel,
             &ProjectOperationCancelParams {
-                operation_action_id: locally_cloned.operation.action_id,
+                operation_action_id: cloned.operation.action_id,
             },
         )
         .await
-        .expect("project.operation.cancel succeeds locally"),
+        .expect("the owner cancels its own finished work"),
     );
-    assert_eq!(device_cancelled.operation.state, OperationState::Completed);
-    assert_eq!(owner_cancelled.operation.state, OperationState::Completed);
-    assert!(host.work().join("cloned-device/README.md").is_file());
+    assert_eq!(cancelled.operation.state, OperationState::Completed);
 
-    // `workspace.remove`, from each door.
-    let device_removed: WorkspaceRemoveResult = typed(
-        &remote_mutation(
-            &session,
-            host.environment_id,
-            Method::WorkspaceRemove,
-            &WorkspaceRemoveParams {
-                workspace_id: device_workspace.workspace_id,
-                retention: RetentionPolicy::RemoveRetained,
-            },
-        )
-        .await
-        .expect("workspace.remove succeeds for a paired device"),
-    );
-    assert_eq!(
-        device_removed.workspace.workspace_id, device_workspace.workspace_id,
-        "the removal names the workspace it removed"
-    );
-    let owner_removed: WorkspaceRemoveResult = typed(
+    // And the owner removes the working copy it made.
+    let removed: WorkspaceRemoveResult = typed(
         &local_mutation(
             &mut control,
             host.environment_id,
             Method::WorkspaceRemove,
             &WorkspaceRemoveParams {
-                workspace_id: owner_created
-                    .workspace
-                    .0
-                    .expect("a creation returns the workspace")
-                    .workspace_id,
+                workspace_id: workspace.workspace_id,
                 retention: RetentionPolicy::RemoveRetained,
             },
         )
         .await
         .expect("workspace.remove succeeds locally"),
     );
-    assert_eq!(
-        owner_removed.working_files_removed, device_removed.working_files_removed,
-        "the same removal leaves the same state on both ingresses"
+    assert!(removed.working_files_removed);
+
+    session.close();
+    host.stop().await;
+}
+
+/// KR-REQ-23.42 and KR-REQ-23.43: what a device is refused while its destination is unauthorised.
+///
+/// Section 14 asks for an authorised destination handle and section 23 for a destination policy
+/// and for source and destination grants. The project service resolves the absolute parent
+/// directory a request names with this host's own authority and bounds a working copy's source by
+/// nothing but the environment, so a device holding `project.create` would reach every directory
+/// this host can open. Until that authority exists these five are refused to a device, by name,
+/// and the owner's own path is untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_device_is_refused_the_five_whose_destination_this_host_cannot_authorise() {
+    let owner = DeviceKeys::generate().expect("owner keys");
+    let host = Host::start(&owner).await;
+    let mut control = host.client().await;
+    let (_device, session) = net_support::paired_device(&host, &owner, PROJECT_RIGHTS).await;
+    let source = repository(host.work(), "source");
+
+    // The owner builds a repository and a workspace, so the two workspace mutations name real
+    // subjects and the refusal is about the authority rather than about the subject.
+    let adopted: ProjectAdoptResult = typed(
+        &local_mutation(
+            &mut control,
+            host.environment_id,
+            Method::ProjectAdopt,
+            &ProjectAdoptParams {
+                destination: destination(&host, "source"),
+                label: "source".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            },
+        )
+        .await
+        .expect("project.adopt succeeds locally"),
+    );
+    let project = adopted.project.project_repository_id;
+    let created: WorkspaceCreateResult = typed(
+        &local_mutation(
+            &mut control,
+            host.environment_id,
+            Method::WorkspaceCreate,
+            &workspace_params(&host, project, "review"),
+        )
+        .await
+        .expect("workspace.create succeeds locally"),
+    );
+    let workspace = created
+        .workspace
+        .0
+        .expect("a creation returns the workspace");
+
+    for (method, params) in [
+        (
+            Method::ProjectInit,
+            ParamsValue::from_typed(&ProjectInitParams {
+                destination: destination(&host, "never"),
+                label: "never".to_owned(),
+                initial_branch: Nullable::null(),
+            })
+            .expect("encodes"),
+        ),
+        (
+            Method::ProjectClone,
+            ParamsValue::from_typed(&ProjectCloneParams {
+                destination: destination(&host, "never"),
+                label: "never".to_owned(),
+                remote: RemoteSpecification {
+                    remote_name: "origin".to_owned(),
+                    transport: RemoteTransport::LocalPath,
+                    url: source.display().to_string(),
+                    provider: String::new(),
+                    credential_broker: String::new(),
+                },
+            })
+            .expect("encodes"),
+        ),
+        (
+            Method::ProjectAdopt,
+            ParamsValue::from_typed(&ProjectAdoptParams {
+                destination: destination(&host, "never"),
+                label: "never".to_owned(),
+                flow: AdoptionFlow::ExistingCheckout,
+            })
+            .expect("encodes"),
+        ),
+        (
+            Method::WorkspaceCreate,
+            ParamsValue::from_typed(&workspace_params(&host, project, "never")).expect("encodes"),
+        ),
+        (
+            Method::WorkspaceRemove,
+            ParamsValue::from_typed(&WorkspaceRemoveParams {
+                workspace_id: workspace.workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+            })
+            .expect("encodes"),
+        ),
+    ] {
+        let refused = remote_mutation(&session, host.environment_id, method, &params)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            refused.code(),
+            ErrorCode::PermissionDenied,
+            "{} is refused to a device",
+            method.as_str()
+        );
+        assert!(
+            refused.to_string().contains(method.as_str())
+                && refused
+                    .to_string()
+                    .contains("does not yet establish a paired device's authority"),
+            "the refusal names the method and why: {refused}"
+        );
+    }
+    assert!(
+        !host.work().join("never").exists(),
+        "a refused creation created nothing"
     );
     assert!(
-        device_removed.working_files_removed,
-        "an isolated workspace's own working files go with it"
+        host.work().join("review/README.md").is_file(),
+        "and a refused removal removed nothing"
     );
+
+    // The owner's own path is unchanged: it still creates and removes.
+    let initialised: ProjectInitResult = typed(
+        &local_mutation(
+            &mut control,
+            host.environment_id,
+            Method::ProjectInit,
+            &ProjectInitParams {
+                destination: destination(&host, "fresh"),
+                label: "fresh".to_owned(),
+                initial_branch: Nullable::some("main".to_owned()),
+            },
+        )
+        .await
+        .expect("project.init succeeds locally"),
+    );
+    assert_eq!(initialised.operation.state, OperationState::Completed);
+    let removed: WorkspaceRemoveResult = typed(
+        &local_mutation(
+            &mut control,
+            host.environment_id,
+            Method::WorkspaceRemove,
+            &WorkspaceRemoveParams {
+                workspace_id: workspace.workspace_id,
+                retention: RetentionPolicy::RemoveRetained,
+            },
+        )
+        .await
+        .expect("workspace.remove succeeds locally"),
+    );
+    assert!(removed.working_files_removed);
+
+    // And the device still reads.
+    let listed: ProjectListResult = session
+        .read(
+            Method::ProjectList,
+            &ProjectListParams {
+                environment_id: host.environment_id,
+            },
+        )
+        .await
+        .expect("project.list is served to the device");
+    assert_eq!(listed.projects.len(), 2);
 
     session.close();
     host.stop().await;
@@ -739,6 +815,12 @@ async fn a_project_envelope_naming_a_session_or_another_environment_is_refused_o
 /// A device whose reply was lost submits the same action again. Section 9 makes that one
 /// operation: the service's retained record answers it, nothing is performed twice, and an
 /// identifier reused with a different payload is refused outright rather than acted on.
+///
+/// The action is `project.operation.cancel` against an operation this device did not start, which
+/// the service refuses under section 23's resource-owner rule. A refusal is retained exactly as a
+/// result is, and it is what a device can reach: the five mutations that name their own
+/// destination are refused before the service sees them, and an operation a device started is one
+/// it could only have started through those.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_performed_again() {
     let owner = DeviceKeys::generate().expect("owner keys");
@@ -754,61 +836,59 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
     let raw = net_support::RawDevice::connect(&host, &device, &record).await;
     raw.claim();
 
-    let params = ProjectInitParams {
-        destination: destination(&host, "once"),
-        label: "once".to_owned(),
-        initial_branch: Nullable::some("main".to_owned()),
+    let params = ProjectOperationCancelParams {
+        operation_action_id: ActionId::new(kr_ipc::new_uuid()),
     };
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let target = ActionTarget::environment(host.environment_id);
-    let first: ProjectInitResult = typed(
-        &raw.mutate(Method::ProjectInit, action_id, target.clone(), &params)
-            .await
-            .expect("project.init succeeds for a paired device"),
-    );
-    let again: ProjectInitResult = typed(
-        &raw.mutate(Method::ProjectInit, action_id, target.clone(), &params)
-            .await
-            .expect("the repeat is answered"),
-    );
-    assert_eq!(
-        first.project.project_repository_id, again.project.project_repository_id,
-        "the repeat is answered from the record the first submission wrote"
-    );
+    let first = raw
+        .mutate(
+            Method::ProjectOperationCancel,
+            action_id,
+            target.clone(),
+            &params,
+        )
+        .await
+        .expect_err("no such operation");
+    let again = raw
+        .mutate(
+            Method::ProjectOperationCancel,
+            action_id,
+            target.clone(),
+            &params,
+        )
+        .await
+        .expect_err("the repeat is answered from the record the first submission wrote");
+    assert_eq!(first.code, again.code);
+    assert_eq!(first.message, again.message);
 
     // The same identifier with a different payload is a different action, and section 9 refuses it.
     let conflicting = raw
         .mutate(
-            Method::ProjectInit,
+            Method::ProjectOperationCancel,
             action_id,
             target,
-            &ProjectInitParams {
-                destination: destination(&host, "twice"),
-                label: "twice".to_owned(),
-                initial_branch: Nullable::some("main".to_owned()),
+            &ProjectOperationCancelParams {
+                operation_action_id: ActionId::new(kr_ipc::new_uuid()),
             },
         )
         .await
         .expect_err("a reused identifier carrying another request is refused");
     assert_eq!(conflicting.code, ErrorCode::IdConflict);
-    assert!(
-        !host.work().join("twice").exists(),
-        "and nothing was created under it"
-    );
 
     raw.close();
     host.stop().await;
 }
 
-/// KR-REQ-23.42: a device recovers its own project result under the authority the subject needs.
+/// KR-REQ-23.42: a device recovers its own project outcome under the authority the subject needs.
 ///
 /// Section 23 has present view authority over the subject decide whether a retained result goes
-/// back. The subject of a repository mutation is a repository, not a session, so a grant that
-/// carries `project.create` and nothing else performs the action and is given its own result back
-/// on a repeat. Demanding `session.view` for that would ask for authority over something the
-/// answer is not about, and it would leave a device that lost its reply unable to recover it.
+/// back. The subject of a repository mutation is a repository or an operation, not a session, so a
+/// grant that carries no `session.view` at all is given its own outcome back on a repeat.
+/// Demanding `session.view` for that would ask for authority over something the answer is not
+/// about, and would leave a device that lost its reply unable to recover it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_device_without_session_view_still_recovers_its_own_project_result() {
+async fn a_device_without_session_view_still_recovers_its_own_project_outcome() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
     let device = net_support::Device::create().await;
@@ -822,44 +902,31 @@ async fn a_device_without_session_view_still_recovers_its_own_project_result() {
     let raw = net_support::RawDevice::connect(&host, &device, &record).await;
     raw.claim();
 
-    let params = ProjectInitParams {
-        destination: destination(&host, "alone"),
-        label: "alone".to_owned(),
-        initial_branch: Nullable::some("main".to_owned()),
+    let params = ProjectOperationCancelParams {
+        operation_action_id: ActionId::new(kr_ipc::new_uuid()),
     };
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let target = ActionTarget::environment(host.environment_id);
-    let first: ProjectInitResult = typed(
-        &raw.mutate(Method::ProjectInit, action_id, target.clone(), &params)
-            .await
-            .expect("project.init succeeds under project.create alone"),
-    );
-    let again: ProjectInitResult = typed(
-        &raw.mutate(Method::ProjectInit, action_id, target.clone(), &params)
-            .await
-            .expect("the repeat is answered rather than refused"),
-    );
-    assert_eq!(
-        first.project.project_repository_id,
-        again.project.project_repository_id
-    );
-
-    // And a reused identifier carrying another request is still refused, rather than being lost
-    // behind a refusal about authority.
-    let conflicting = raw
+    let first = raw
         .mutate(
-            Method::ProjectInit,
+            Method::ProjectOperationCancel,
             action_id,
-            target,
-            &ProjectInitParams {
-                destination: destination(&host, "second"),
-                label: "second".to_owned(),
-                initial_branch: Nullable::some("main".to_owned()),
-            },
+            target.clone(),
+            &params,
         )
         .await
-        .expect_err("a reused identifier carrying another request is refused");
-    assert_eq!(conflicting.code, ErrorCode::IdConflict);
+        .expect_err("no such operation");
+    let again = raw
+        .mutate(Method::ProjectOperationCancel, action_id, target, &params)
+        .await
+        .expect_err("the repeat is answered rather than refused for an unrelated right");
+    assert_eq!(first.code, again.code);
+    assert_eq!(first.message, again.message);
+    assert_ne!(
+        again.code,
+        ErrorCode::PermissionDenied,
+        "the repeat is the action's own answer, not a refusal about session.view: {again:?}"
+    );
 
     raw.close();
     host.stop().await;
@@ -889,20 +956,17 @@ async fn action_read_says_how_to_obtain_an_outcome_this_host_owns() {
     let session = net_support::connect(&host, &device, &record).await;
 
     let action_id = ActionId::new(kr_ipc::new_uuid());
-    let _: ProjectInitResult = typed(
-        &raw.mutate(
-            Method::ProjectInit,
+    let _ = raw
+        .mutate(
+            Method::ProjectOperationCancel,
             action_id,
             ActionTarget::environment(host.environment_id),
-            &ProjectInitParams {
-                destination: destination(&host, "recorded"),
-                label: "recorded".to_owned(),
-                initial_branch: Nullable::some("main".to_owned()),
+            &ProjectOperationCancelParams {
+                operation_action_id: ActionId::new(kr_ipc::new_uuid()),
             },
         )
         .await
-        .expect("project.init succeeds"),
-    );
+        .expect_err("no such operation, and the outcome is recorded under this identifier");
 
     let refused = session
         .read::<_, kr_protocol::receipt::ActionReadResult>(
