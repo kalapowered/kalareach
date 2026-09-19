@@ -723,6 +723,57 @@ fn a_store_whose_worker_may_still_own_it_is_not_migrated() {
     );
 }
 
+#[test]
+#[cfg(unix)]
+fn a_descriptor_this_host_cannot_read_refuses_the_migration_rather_than_guessing() {
+    // A migration is a write. Absence of a descriptor is the ordinary archive case - a session
+    // this host fenced published none - but a descriptor that is *there* and cannot be read
+    // answers nothing at all, and a write must not be made on nothing.
+    use std::os::unix::fs::PermissionsExt as _;
+    let (_temp, archive) = host();
+    let session_id = session();
+    {
+        let mut journal = journal_for(&archive, session_id);
+        journal
+            .record_session(&summary(session_id))
+            .expect("records the summary");
+    }
+    let path = archive.paths().journal_database(session_id);
+    {
+        let connection = rusqlite::Connection::open(&path).expect("opens the store");
+        connection
+            .execute_batch(
+                "DROP TABLE privacy;
+                 DROP TABLE outbox;
+                 DROP TABLE outbox_cursors;
+                 DROP TABLE journal_gaps;
+                 UPDATE schema_version SET version = 3;",
+            )
+            .expect("puts it back to the earlier shape");
+    }
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    publish_descriptor(&archive, session_id, &ended);
+    let descriptor = archive.paths().descriptor_file(session_id);
+    let mode = std::fs::metadata(&descriptor).expect("reads").permissions();
+    std::fs::set_permissions(&descriptor, std::fs::Permissions::from_mode(0o000))
+        .expect("makes the descriptor unreadable");
+
+    archive.bring_forward(session_id);
+    let refused = kr_worker::journal::Journal::recorded_schema_version(&path).expect("reads it");
+    std::fs::set_permissions(&descriptor, mode).expect("puts the permissions back");
+    assert_eq!(
+        refused, 3,
+        "a descriptor this host could not read is not a death it can act on"
+    );
+
+    // Readable again, and the same call brings it forward.
+    archive.bring_forward(session_id);
+    assert_eq!(
+        kr_worker::journal::Journal::recorded_schema_version(&path).expect("reads it"),
+        kr_worker::persistence::migration::CURRENT
+    );
+}
+
 /// Publishes a descriptor for a session, as a worker does when it starts.
 fn publish_descriptor(
     archive: &ArchiveService,

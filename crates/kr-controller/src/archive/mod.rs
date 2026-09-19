@@ -369,14 +369,23 @@ impl ArchiveService {
     /// that there is nothing there.
     #[must_use]
     fn a_worker_may_still_own(&self, session_id: SessionId) -> bool {
-        let Ok(Some(descriptor)) = kr_ipc::descriptor::read(&self.paths, session_id) else {
-            // No descriptor is no worker to have published one.
-            return false;
-        };
-        !matches!(
-            kr_ipc::identity::process_state(&descriptor.process_start_identity),
-            kr_ipc::identity::ProcessState::Ended
-        )
+        match kr_ipc::descriptor::read(&self.paths, session_id) {
+            // A descriptor names the process. Only `Ended` clears this: `Running` is a worker, and
+            // a query the platform declines establishes nothing, which is not the same as
+            // establishing that there is nothing there.
+            Ok(Some(descriptor)) => !matches!(
+                kr_ipc::identity::process_state(&descriptor.process_start_identity),
+                kr_ipc::identity::ProcessState::Ended
+            ),
+            // No descriptor is a session this host fenced or one that never published, and either
+            // way there is nothing here to ask about. Absence is not a death, which is why this
+            // only ever gates a *write*: a read of a store nobody published a descriptor for is
+            // the ordinary archive case, and the caller's own liveness check covers it.
+            Ok(None) => false,
+            // A directory this host could not read answers nothing at all, and a migration is a
+            // write. It is refused rather than guessed at.
+            Err(_) => true,
+        }
     }
 
     /// Brings a store an earlier build wrote forward, so this build's one reader can read it.
