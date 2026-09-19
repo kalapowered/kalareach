@@ -107,7 +107,9 @@ the window this terminal is looking through and never reach the session. The com
 new position through `attachment.viewport`, the host installs the pages that cover it, and the
 input lease does not move: section 8 puts passive scrollback among the things that never seize it,
 so a terminal that may not type can still read what is above the live page. A step is one window
-less the line that joins the two pages, and a read of several of the key is that many pages.
+less the line that joins the two pages, and a read of several of the key is that many pages. The
+wheel does the same while the window is above the live page, where this terminal's own scrollback
+holds nothing and the reports would otherwise address rows the application's grid does not have.
 
 A read is one of those keys or it is the session's, whole and unchanged. That is the rule rather
 than a reader that looks inside a batch, because looking inside is how a command starts altering
@@ -127,8 +129,8 @@ The window this terminal is looking through is the session's answer to say. A sc
 waits for the one before it, and what the person presses meanwhile is measured from where the
 window actually landed. A report about this terminal's *size* goes out when the size changes,
 whatever else is in flight, because a window drawn for a size the terminal no longer has is wrong
-about every row; it carries whatever a report in flight asked for, and otherwise the window the
-screen says this terminal is drawing.
+about every row; it carries what the newest report still waiting for an answer asked for, and
+otherwise the window the screen says this terminal is drawing.
 
 They are this terminal's keys only where this terminal has no history of its own. A terminal being
 handed the session's bytes has them, so its own scrollback holds what scrolled past and the command
@@ -137,13 +139,16 @@ window is the only way above its screen. They are also the application's while a
 program is running, because its buffer keeps no history and it has its own use for those keys; the
 window comes back to the live screen with the screen that program took.
 
-While the window is above the live page a read that is nothing but pointer reports reaches no
-application. It would address a cell of the live screen, and the rows the person is looking at are
-not on it; section 8 gives that case its answer, that input outside the visible grid has no
-application effect. A report a read boundary cut in half, or one among other bytes, is forwarded
-like every other byte, so a click there reaches the application at the coordinates the terminal
-wrote. The command does not map pointer coordinates at all: that belongs with the rest of a
-window's pointer handling.
+While the window is above the live page no pointer report reaches the application. It would address
+a cell of the live screen, and the rows the person is looking at are not on it; section 8 gives that
+case its answer, that input outside the visible grid has no application effect. Every report is
+taken, whether it arrives on its own, among other bytes, or in halves a read boundary cut it into,
+and the wheel among them moves the window. Typing goes to the application wherever the window is,
+and with `--follow-live` the first key brings the window back to the live screen, because what a
+person types is answered there.
+
+The command does not map pointer coordinates for a window that is panned across the columns; that
+belongs with the rest of a window's pointer handling.
 
 A window stays where the person put it while the session goes on writing underneath. `--follow-live`
 brings it back to the live screen as soon as the session writes something, which the command reads

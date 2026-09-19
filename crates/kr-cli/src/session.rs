@@ -192,41 +192,160 @@ impl PasteWatch {
     }
 }
 
-/// Whether a read is nothing but reports about the pointer.
+/// The longest a pointer report can be before it is not one.
+///
+/// `CSI <` and three numbers and a terminator. The numbers are a button, a column and a row, and a
+/// terminal that has not finished one within this many bytes is not sending one.
+const LONGEST_POINTER_REPORT: usize = 24;
+
+/// What a pointer report says, as far as this terminal needs it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PointerReport {
+    /// How far the wheel turned: positive back through the history, negative towards the live
+    /// screen, and zero for a report that is not a wheel.
+    wheel: i64,
+}
+
+/// The pointer reports a terminal sent, taken out of what it sent.
+///
+/// This runs only while the window is above the live page, where a report is a thing the session
+/// must not be given: it names a cell of the live screen, and the rows the person is looking at
+/// are not on it. Section 8 answers that case directly, that input outside the visible grid has no
+/// application effect, so the reports are consumed here and the wheel among them moves the window.
+///
+/// A report the read boundary cut in half is held until the rest of it arrives or until what is
+/// held cannot be a report, which is a few bytes and a moment rather than input held back:
+/// forwarding half a report, or coordinates that describe somebody's history, is a click in a cell
+/// nobody pointed at.
+#[derive(Debug, Default)]
+struct PointerReports {
+    /// The beginning of a report, waiting for the rest of it.
+    held: Vec<u8>,
+}
+
+/// What the classifier took out of one batch.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Pointers {
+    /// The reports, in the order they arrived.
+    reports: Vec<PointerReport>,
+    /// The bytes that are not part of any report.
+    input: Vec<u8>,
+    /// Whether the beginning of a report is being held.
+    holding: bool,
+}
+
+/// How much of a pointer report a run of bytes is.
+enum Match {
+    /// A whole report, this many bytes long.
+    Whole(usize, PointerReport),
+    /// The beginning of one, and nothing yet that says it is not.
+    Partial,
+    /// Not one.
+    None,
+}
+
+/// Reads the beginning of `bytes` as a pointer report.
 ///
 /// The two encodings this host advertises: xterm's SGR reports, which are three numbers between
-/// `CSI <` and a press or a release, and the legacy form, which is three bytes after `CSI M`. A
-/// read is all of them or it is none: one press and its release arrive together, and a read with
-/// anything else in it is the session's like any other.
-fn is_pointer_report(bytes: &[u8]) -> bool {
-    let mut at = 0_usize;
-    let mut found = false;
-    while at < bytes.len() {
-        let rest = &bytes[at..];
-        if let Some(body) = rest.strip_prefix(b"\x1b[<") {
-            let Some(end) = body.iter().position(|byte| *byte == b'M' || *byte == b'm') else {
-                return false;
-            };
-            let fields: Vec<&[u8]> = body[..end].split(|byte| *byte == b';').collect();
-            if fields.len() != 3
-                || !fields
-                    .iter()
-                    .all(|field| !field.is_empty() && field.iter().all(u8::is_ascii_digit))
-            {
-                return false;
+/// `CSI <` and a press or a release, and the legacy form, which is three bytes after `CSI M`.
+fn pointer_report(bytes: &[u8]) -> Match {
+    for prefix in [b"\x1b[<".as_slice(), b"\x1b[M".as_slice()] {
+        if bytes.len() < prefix.len() {
+            if prefix.starts_with(bytes) {
+                return Match::Partial;
             }
-            at += 3 + end + 1;
-            found = true;
             continue;
         }
-        if rest.starts_with(b"\x1b[M") && rest.len() >= 6 {
-            at += 6;
-            found = true;
+        if !bytes.starts_with(prefix) {
             continue;
         }
-        return false;
+        if prefix == b"\x1b[M" {
+            return if bytes.len() >= 6 {
+                Match::Whole(6, PointerReport { wheel: 0 })
+            } else {
+                Match::Partial
+            };
+        }
+        let body = &bytes[prefix.len()..];
+        let Some(end) = body.iter().position(|byte| *byte == b'M' || *byte == b'm') else {
+            return if body.len() < LONGEST_POINTER_REPORT
+                && body
+                    .iter()
+                    .all(|byte| byte.is_ascii_digit() || *byte == b';')
+            {
+                Match::Partial
+            } else {
+                Match::None
+            };
+        };
+        let fields: Vec<&[u8]> = body[..end].split(|byte| *byte == b';').collect();
+        if fields.len() != 3
+            || !fields
+                .iter()
+                .all(|field| !field.is_empty() && field.iter().all(u8::is_ascii_digit))
+        {
+            return Match::None;
+        }
+        // The button, whose wheel bits are the only part this terminal reads: 64 turns the wheel
+        // back through the history and 65 turns it towards the live screen.
+        let button: u64 = std::str::from_utf8(fields[0])
+            .ok()
+            .and_then(|text| text.parse().ok())
+            .unwrap_or_default();
+        let wheel = match button & 0xc3 {
+            64 => 1,
+            65 => -1,
+            _ => 0,
+        };
+        return Match::Whole(prefix.len() + end + 1, PointerReport { wheel });
     }
-    found
+    Match::None
+}
+
+impl PointerReports {
+    /// Splits one batch into the reports it carries and the bytes that are not part of one.
+    fn take(&mut self, bytes: &[u8]) -> Pointers {
+        let mut buffer = std::mem::take(&mut self.held);
+        buffer.extend_from_slice(bytes);
+        let mut taken = Pointers::default();
+        let mut at = 0_usize;
+        while at < buffer.len() {
+            match pointer_report(&buffer[at..]) {
+                Match::Whole(length, report) => {
+                    taken.reports.push(report);
+                    at += length;
+                }
+                Match::Partial => break,
+                Match::None => {
+                    taken.input.push(buffer[at]);
+                    at += 1;
+                }
+            }
+        }
+        self.held = buffer[at..].to_vec();
+        taken.holding = !self.held.is_empty();
+        taken
+    }
+
+    /// Gives back what is being held, because nothing came to finish it.
+    fn release(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.held)
+    }
+}
+
+/// How long the beginning of a pointer report waits for the rest of itself.
+///
+/// The same window section 8 gives a held input prefix. A terminal writes one report in one go, so
+/// nothing normally waits at all; what this covers is a read boundary landing inside one, and a
+/// wait longer than this would be a keystroke held for a report the person never made.
+const POINTER_DEADLINE: std::time::Duration = std::time::Duration::from_millis(25);
+
+/// Waits until a held report's own deadline, or for ever when nothing is being held.
+async fn pointer_expiry(until: Option<tokio::time::Instant>) {
+    match until {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// The row an answer says this window landed on, or `None` for the live screen.
@@ -574,6 +693,10 @@ async fn drive(
 
     // Whether a bracketed paste is open, so that nothing inside one is read as a key.
     let mut paste = PasteWatch::default();
+    // The pointer reports this terminal sends while its window is above the live page, and the
+    // moment a report it is part way through stops waiting for the rest of itself.
+    let mut pointers = PointerReports::default();
+    let mut pointer_deadline: Option<tokio::time::Instant> = None;
     let mut sequence = 0_u64;
     let mut outstanding: std::collections::BTreeMap<kr_protocol::ids::RequestId, Outstanding> =
         std::collections::BTreeMap::new();
@@ -582,12 +705,16 @@ async fn drive(
     // the live screen. It is reported with every size report as well, so a window the person has
     // scrolled back to stays where they put it when they resize their terminal.
     let mut parked: Option<u64> = None;
-    // What the report in flight asked for, when one is in flight, exactly as it asked: a distance
-    // above the live screen is not the row it resolves to, and a size report that turned one into
-    // the other would name somewhere else. A size report sent meanwhile carries this rather than
-    // the position the window has left, because the session answers them in the order they arrive
-    // and the later one is the one it keeps.
-    let mut requested: Option<Option<ViewportPosition>> = None;
+    // What each report still in flight asked for, exactly as it asked: a distance above the live
+    // screen is not the row it resolves to, and a size report that turned one into the other would
+    // name somewhere else. A size report sent meanwhile carries what the newest of them asked for
+    // rather than the position the window has left, because the session answers them in the order
+    // they arrive and the last one is the one it keeps. They are kept per request, so an older
+    // answer cannot forget what a newer request is still waiting to be told.
+    let mut requested: std::collections::BTreeMap<
+        kr_protocol::ids::RequestId,
+        Option<ViewportPosition>,
+    > = std::collections::BTreeMap::new();
     // Movement the person has asked for and the session has not answered yet, the step it was
     // measured with, and the size that report carried.
     let mut queued = 0_i64;
@@ -738,7 +865,7 @@ async fn drive(
                                 outstanding.insert(request_id, Outstanding::Scrollback);
                                 // Like every other report that names a position: a size report
                                 // sent before this is answered carries what this asked for.
-                                requested = Some(None);
+                                requested.insert(request_id, None);
                             }
                             if !drawn.bytes.is_empty() {
                                 let mut handle = output.as_ref();
@@ -782,9 +909,13 @@ async fn drive(
                         }
                     }
                     Ok(ControlFrame::Response(response)) => {
-                        let Some(what) = outstanding.remove(&response.request_id) else {
+                        let answered = response.request_id;
+                        let Some(what) = outstanding.remove(&answered) else {
                             continue;
                         };
+                        // Only this request's own record: an older answer must not forget what a
+                        // newer request is still waiting to be told.
+                        requested.remove(&answered);
                         match (what, response.outcome) {
                             // A size report is a report, not an insistence. Another attachment may
                             // own the size, and the answer then says so; the terminal is shown that
@@ -828,14 +959,20 @@ async fn drive(
                                                 u64::from(size.rows),
                                             ),
                                             position: Nullable(
-                                                requested.unwrap_or_else(|| {
-                                                    display
-                                                        .window_above_the_live_page()
-                                                        .unwrap_or(parked)
-                                                        .map(|row| {
-                                                            ViewportPosition::Row(U64::new(row))
-                                                        })
-                                                }),
+                                                requested
+                                                    .values()
+                                                    .next_back()
+                                                    .copied()
+                                                    .unwrap_or_else(|| {
+                                                        display
+                                                            .window_above_the_live_page()
+                                                            .unwrap_or(parked)
+                                                            .map(|row| {
+                                                                ViewportPosition::Row(U64::new(
+                                                                    row,
+                                                                ))
+                                                            })
+                                                    }),
                                             ),
                                         };
                                     if !send_geometry(
@@ -938,7 +1075,6 @@ async fn drive(
                                     .then(|| scrolled(parked, queued, step))
                                     .flatten();
                                 queued = 0;
-                                requested = None;
                                 if let Some(position) = asked {
                                     let request_id =
                                         kr_protocol::ids::RequestId::new(next_request);
@@ -961,7 +1097,7 @@ async fn drive(
                                         return AttachOutcome::Disconnected;
                                     }
                                     outstanding.insert(request_id, Outstanding::Scrollback);
-                                    requested = Some(position);
+                                    requested.insert(request_id, position);
                                 }
                             }
                             // The screen follows as ordinary output. A refusal means the session no
@@ -1021,14 +1157,17 @@ async fn drive(
                     let params = kr_protocol::attachment::AttachmentViewportParams {
                         attachment_id,
                         dimensions,
-                        position: Nullable(requested.unwrap_or_else(|| {
-                            // The window this terminal is drawing, not the last thing an answer
-                            // said about it: a screen is newer than an answer that crossed it.
-                            display
-                                .window_above_the_live_page()
-                                .unwrap_or(parked)
-                                .map(|row| ViewportPosition::Row(U64::new(row)))
-                        })),
+                        position: Nullable(requested.values().next_back().copied().unwrap_or_else(
+                            || {
+                                // The window this terminal is drawing, not the last thing an
+                                // answer said about it: a screen is newer than an answer that
+                                // crossed it.
+                                display
+                                    .window_above_the_live_page()
+                                    .unwrap_or(parked)
+                                    .map(|row| ViewportPosition::Row(U64::new(row)))
+                            },
+                        )),
                     };
                     (
                         send_geometry(
@@ -1046,6 +1185,35 @@ async fn drive(
                     return AttachOutcome::Disconnected;
                 }
                 outstanding.insert(request_id, what);
+            }
+            () = pointer_expiry(pointer_deadline) => {
+                // Nothing came to finish it, so it was not a report. What was held is the
+                // person's, and it goes to the application now.
+                pointer_deadline = None;
+                let held = pointers.release();
+                if !held.is_empty()
+                    && let Some(epoch) = epoch
+                {
+                    let request_id = kr_protocol::ids::RequestId::new(next_request);
+                    next_request += 1;
+                    if !send_input(
+                        client,
+                        request_id,
+                        session_id,
+                        attachment_id,
+                        epoch,
+                        sequence,
+                        held,
+                    )
+                    .await
+                    {
+                        return AttachOutcome::DeliveryUncertain(
+                            "the connection ended while input was being sent".to_owned(),
+                        );
+                    }
+                    outstanding.insert(request_id, Outstanding::Input(sequence));
+                    sequence += 1;
+                }
             }
             bytes = input.recv() => {
                 let Some(bytes) = bytes else {
@@ -1067,9 +1235,39 @@ async fn drive(
                 // whole, like everything else here, so a paste is open from the read that begins
                 // with one to the read that ends with the other.
                 let pasting = paste.observe(&bytes);
+                // What this terminal is showing, which is what a pointer report would address.
+                let above_the_live_page =
+                    display.window_above_the_live_page().flatten().is_some();
+                // Every pointer report is this terminal's while it is showing history: a report
+                // names a cell of the live screen, and the rows the person is looking at are not
+                // on it. Section 8 answers that directly, that input outside the visible grid has
+                // no application effect, so they are taken here and the wheel among them moves the
+                // window. A report the read boundary cut in half waits for the rest of it rather
+                // than reaching the application as half of one.
+                let (bytes, wheel) = if above_the_live_page && !pasting {
+                    let taken = pointers.take(&bytes);
+                    pointer_deadline = taken
+                        .holding
+                        .then(|| {
+                            pointer_deadline
+                                .unwrap_or_else(|| tokio::time::Instant::now() + POINTER_DEADLINE)
+                        });
+                    let wheel = taken
+                        .reports
+                        .iter()
+                        .fold(0_i64, |total, report| total.saturating_add(report.wheel));
+                    (taken.input, wheel)
+                } else {
+                    // The window is on the live screen, so a report addresses the cell it names.
+                    // Anything the classifier was holding goes first, in the order it was typed.
+                    pointer_deadline = None;
+                    let mut input = pointers.release();
+                    input.extend_from_slice(&bytes);
+                    (input, 0)
+                };
                 let mine = !pasting && display.holds_screen() && display.showing_history_buffer();
                 if mine
-                    && let Some(steps) = scroll_keys(&bytes)
+                    && let Some(steps) = scroll_keys(&bytes).or((wheel != 0).then_some(wheel))
                     && let Ok(size) = terminal.size()
                     && size.columns > 0
                     && size.rows > 0
@@ -1117,30 +1315,48 @@ async fn drive(
                             return AttachOutcome::Disconnected;
                         }
                         outstanding.insert(request_id, Outstanding::Scrollback);
-                        requested = Some(position);
+                        requested.insert(request_id, position);
                         }
                     }
                     // The key was this terminal's, so nothing of it reaches the session, whether
                     // or not the window had anywhere to go.
                     continue;
                 }
-                // A click addresses a cell of the live screen, and a window above it is showing
-                // rows the application's grid does not have. Section 8 gives that its answer:
-                // input outside the visible grid has no application effect. Whole reads again, for
-                // the same reason the keys are, and with the same limit: a report a read boundary
-                // cut in half, or one among other bytes, is forwarded like every other byte.
-                // The screen decides this and not what an answer last said: what a click would
-                // address is what this terminal is drawing, and a screen is the session's own
-                // account of that.
-                let above_the_live_page = display
-                    .window_above_the_live_page()
-                    .flatten()
-                    .is_some();
-                if !pasting && above_the_live_page && is_pointer_report(&bytes) {
-                    continue;
-                }
                 if bytes.is_empty() {
                     continue;
+                }
+                // Typing goes to the application wherever the window is. A person who asked to
+                // follow the live screen is taken back to it by the first key they press, because
+                // what they type is answered there and not in what they were reading.
+                if follow_live
+                    && above_the_live_page
+                    && let Ok(size) = terminal.size()
+                    && size.columns > 0
+                    && size.rows > 0
+                {
+                    let request_id = kr_protocol::ids::RequestId::new(next_request);
+                    next_request += 1;
+                    let params = kr_protocol::attachment::AttachmentViewportParams {
+                        attachment_id,
+                        dimensions: Dimensions::new(
+                            u64::from(size.columns),
+                            u64::from(size.rows),
+                        ),
+                        position: Nullable(None),
+                    };
+                    if !send_geometry(
+                        client,
+                        descriptor,
+                        request_id,
+                        Method::AttachmentViewport,
+                        &params,
+                    )
+                    .await
+                    {
+                        return AttachOutcome::Disconnected;
+                    }
+                    outstanding.insert(request_id, Outstanding::Scrollback);
+                    requested.insert(request_id, None);
                 }
                 let Some(epoch) = epoch else {
                     // This terminal may not type. The bytes go nowhere, and the attachment goes on
@@ -1425,31 +1641,86 @@ mod tests {
 
     /// Section 8: input outside the visible grid has no application effect.
     #[test]
-    fn a_pointer_report_is_recognised_whole_or_not_at_all() {
-        use super::is_pointer_report;
+    fn every_pointer_report_is_taken_while_the_window_shows_history() {
+        use super::PointerReports;
 
-        assert!(is_pointer_report(b"\x1b[<0;10;4M"), "a press");
-        assert!(is_pointer_report(b"\x1b[<0;10;4m"), "and a release");
-        assert!(is_pointer_report(b"\x1b[M !!"), "and the legacy form");
-        assert!(
-            is_pointer_report(b"\x1b[<0;10;4M\x1b[<0;10;4m"),
-            "a press and its release arrive together"
+        let mut pointers = PointerReports::default();
+        let taken = pointers.take(b"\x1b[<0;10;4M");
+        assert_eq!(taken.reports.len(), 1, "a press");
+        assert!(taken.input.is_empty(), "and nothing of it reaches anybody");
+        let taken = pointers.take(b"\x1b[<0;10;4m");
+        assert_eq!(taken.reports.len(), 1, "a release");
+        let taken = pointers.take(b"\x1b[M !!");
+        assert_eq!(taken.reports.len(), 1, "and the legacy form");
+        let taken = pointers.take(b"\x1b[<0;10;4M\x1b[<0;10;4m");
+        assert_eq!(taken.reports.len(), 2, "a press and its release together");
+    }
+
+    /// A report among other bytes is the report and the rest, each to where it belongs.
+    #[test]
+    fn a_report_among_other_bytes_is_split_from_them() {
+        use super::PointerReports;
+
+        let mut pointers = PointerReports::default();
+        let taken = pointers.take(b"ab\x1b[<0;10;4Mcd");
+        assert_eq!(taken.reports.len(), 1, "the report is taken");
+        assert_eq!(taken.input, b"abcd", "and the typing around it is not");
+        assert!(!taken.holding);
+    }
+
+    /// And one the read boundary cut in half waits for the rest of itself.
+    #[test]
+    fn a_report_split_across_reads_is_still_one_report() {
+        use super::PointerReports;
+
+        let mut pointers = PointerReports::default();
+        let first = pointers.take(b"ls\x1b[<0;10");
+        assert_eq!(first.input, b"ls", "what was whole goes on");
+        assert!(first.reports.is_empty());
+        assert!(first.holding, "and the beginning of the report waits");
+        let second = pointers.take(b";4M");
+        assert_eq!(second.reports.len(), 1, "the two halves are one report");
+        assert!(second.input.is_empty());
+        assert!(!second.holding);
+    }
+
+    /// Something that starts like a report and is not one goes to the application.
+    #[test]
+    fn what_is_not_a_report_is_the_applications() {
+        use super::PointerReports;
+
+        let mut pointers = PointerReports::default();
+        let taken = pointers.take(b"ls -l\r");
+        assert!(taken.reports.is_empty());
+        assert_eq!(taken.input, b"ls -l\r");
+        let taken = pointers.take(b"\x1b[<not a report");
+        assert!(taken.reports.is_empty());
+        assert_eq!(
+            taken.input, b"\x1b[<not a report",
+            "a sequence that cannot finish as a report is forwarded whole"
         );
-        assert!(!is_pointer_report(b""), "nothing is not a report");
-        assert!(!is_pointer_report(b"ls -l"), "ordinary typing is not");
-        assert!(
-            !is_pointer_report(b"\x1b[<0;10;4Mls"),
-            "and neither is a report with typing after it"
+        let held = pointers.take(b"\x1b[<0;1");
+        assert!(held.holding, "and one that still could waits");
+        assert_eq!(
+            pointers.release(),
+            b"\x1b[<0;1",
+            "until nothing comes, and then it is the person's"
         );
-        assert!(!is_pointer_report(b"\x1b[<0;10"), "nor half of one");
-        assert!(
-            !is_pointer_report(b"\x1b[<M"),
-            "nor a report with no numbers in it"
-        );
-        assert!(
-            !is_pointer_report(b"\x1b[<0;10M"),
-            "nor one with two numbers where there are three"
-        );
+    }
+
+    /// The wheel moves the window while the person is reading their history.
+    #[test]
+    fn the_wheel_moves_the_window() {
+        use super::PointerReports;
+
+        let mut pointers = PointerReports::default();
+        let back = pointers.take(b"\x1b[<64;10;4M");
+        assert_eq!(back.reports.len(), 1);
+        assert_eq!(back.reports[0].wheel, 1, "the wheel turns back");
+        let forward = pointers.take(b"\x1b[<65;10;4M");
+        assert_eq!(forward.reports[0].wheel, -1, "and towards the live screen");
+        let click = pointers.take(b"\x1b[<0;10;4M");
+        assert_eq!(click.reports[0].wheel, 0, "a click turns nothing");
     }
 
     /// The step is the window this terminal is shown, not the lines it happens to have.
