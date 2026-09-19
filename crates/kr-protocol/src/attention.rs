@@ -345,8 +345,14 @@ pub struct AttentionItem {
     pub level: AttentionLevel,
     /// The session it belongs to, when it belongs to one.
     pub session_id: Nullable<SessionId>,
-    /// One line naming the subject.
-    pub summary: String,
+    /// One line naming the subject, when this caller may be served it.
+    ///
+    /// Null means the host withheld it. An item's text comes from retained content - a question's
+    /// wording, a command line, what an application printed - and a caller whose grant the host
+    /// cannot narrow that content to is served the item without it rather than more than its grant
+    /// allows. What is left says which rule, at what level, how often and when, which is the
+    /// host's own record rather than the session's.
+    pub summary: Nullable<String>,
     /// Whether the host itself observed the condition.
     ///
     /// False for an application notice, which any process writing to the terminal can emit. A
@@ -544,8 +550,10 @@ pub struct SemanticChange {
     pub kind: SemanticChangeKind,
     /// The session it belongs to.
     pub session_id: SessionId,
-    /// One line naming it.
-    pub summary: String,
+    /// One line naming it, when this caller may be served it.
+    ///
+    /// Null means the host withheld it, for the same reason an attention item's text is withheld.
+    pub summary: Nullable<String>,
     /// When the host recorded it.
     pub at_ms: TimestampMs,
 }

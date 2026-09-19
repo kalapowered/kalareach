@@ -2933,9 +2933,15 @@ export interface AttentionItem {
    */
   source: 'receipts' | 'questions' | 'host_events' | 'semantic'
   /**
-   * One line naming the subject.
+   * One line naming the subject, when this caller may be served it.
+   *
+   * Null means the host withheld it. An item's text comes from retained content - a question's
+   * wording, a command line, what an application printed - and a caller whose grant the host
+   * cannot narrow that content to is served the item without it rather than more than its grant
+   * allows. What is left says which rule, at what level, how often and when, which is the
+   * host's own record rather than the session's.
    */
-  summary: string
+  summary: string | null
   /**
    * Whether the host itself observed the condition.
    *
@@ -12952,9 +12958,11 @@ export interface SemanticChange {
    */
   session_id: string
   /**
-   * One line naming it.
+   * One line naming it, when this caller may be served it.
+   *
+   * Null means the host withheld it, for the same reason an attention item's text is withheld.
    */
-  summary: string
+  summary: string | null
 }
 /**
  * Where a reader continues a semantic snapshot that stopped short.

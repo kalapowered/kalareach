@@ -36,13 +36,13 @@ use std::path::Path;
 use kr_protocol::attention::{
     AttentionAcknowledgeResult, AttentionGap, AttentionItem, AttentionKey, AttentionReadParams,
     AttentionReadResult, AttentionRule, AttentionSource, ChangeSummary, LogViewState,
-    MAX_ATTENTION_ITEMS, QuietHours, ReviewAcknowledgeResult, ReviewState, ReviewSubject,
-    SemanticChangeKind, VisitAcknowledgeResult, VisitChangedResult,
+    MAX_ATTENTION_ITEMS, MAX_RETAINED_ACTORS, QuietHours, ReviewAcknowledgeResult, ReviewState,
+    ReviewSubject, SemanticChangeKind, VisitAcknowledgeResult, VisitChangedResult,
 };
-use kr_protocol::ids::{ActorId, AgentTurnId, SessionId};
+use kr_protocol::ids::{ActorId, SessionId};
 use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
-use crate::engine::{Announcement, Engine, Outcome, Restored};
+use crate::engine::{Announcement, Content, Engine, Outcome, Restored};
 use crate::error::Result;
 use crate::event::{EventKind, SourceEvent};
 use crate::key;
@@ -214,8 +214,15 @@ impl Attention {
 
     /// Returns the inbox one actor sees.
     #[must_use]
-    pub fn inbox(&self, actor: &ActorId, include_acknowledged: bool) -> Vec<AttentionItem> {
-        self.state.engine.inbox(actor, include_acknowledged)
+    pub fn inbox(
+        &self,
+        actor: &ActorId,
+        include_acknowledged: bool,
+        content: Content,
+    ) -> Vec<AttentionItem> {
+        self.state
+            .engine
+            .inbox(actor, include_acknowledged, content)
     }
 
     /// Returns one page of the inbox one actor sees, with the quiet-hours state beside it.
@@ -230,8 +237,12 @@ impl Attention {
         actor: &ActorId,
         params: &AttentionReadParams,
         reading: HostReading,
+        content: Content,
     ) -> Result<AttentionReadResult> {
-        let all = self.state.engine.inbox(actor, params.include_acknowledged);
+        let all = self
+            .state
+            .engine
+            .inbox(actor, params.include_acknowledged, content);
         let start = match params.after.as_ref() {
             Some(after) => all
                 .iter()
@@ -257,14 +268,23 @@ impl Attention {
         })
     }
 
-    /// Takes the announcements the host has decided and not yet handed over.
+    /// Returns the announcements the host has decided and no consumer has settled.
+    ///
+    /// Nothing is forgotten by asking. A consumer records what it is given and then calls
+    /// [`Attention::settle_announcements`]; anything it does not settle is offered again.
+    #[must_use]
+    pub fn take_announcements(&self) -> Vec<Announcement> {
+        self.state.engine.take_announcements()
+    }
+
+    /// Forgets the announcements a consumer has taken durable responsibility for.
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written. Nothing is
-    /// taken then: an announcement this host could not record as taken is one it offers again.
-    pub fn take_announcements(&mut self) -> Result<Vec<Announcement>> {
-        self.commit(|state| state.engine.take_announcements())
+    /// Returns [`crate::Error::StoreUnavailable`] when the state cannot be written, in which case
+    /// nothing is forgotten and the same announcements are offered again.
+    pub fn settle_announcements(&mut self, settled: &[(AttentionKey, u64)]) -> Result<()> {
+        self.commit(|state| state.engine.settle_announcements(settled))
     }
 
     /// Returns how many decided announcements are waiting to be taken.
@@ -284,14 +304,15 @@ impl Attention {
         keys: &[AttentionKey],
         reading: HostReading,
     ) -> Result<AttentionAcknowledgeResult> {
-        self.commit(|state| {
+        self.try_commit(|state| {
+            admit(state, actor)?;
             let acknowledged = state.engine.acknowledge(actor, keys, reading);
             let revision = bump(state, actor);
-            AttentionAcknowledgeResult {
+            Ok(AttentionAcknowledgeResult {
                 actor_id: actor.clone(),
                 acknowledged,
                 revision: U64::new(revision),
-            }
+            })
         })
     }
 
@@ -329,6 +350,7 @@ impl Attention {
         reading: HostReading,
     ) -> Result<ReviewAcknowledgeResult> {
         self.try_commit(|state| {
+            admit(state, actor)?;
             let review = state
                 .reviews
                 .acknowledge(actor, subject, version, reading.wall_ms)?;
@@ -364,15 +386,16 @@ impl Attention {
         cursor: u64,
         views: Vec<LogViewState>,
     ) -> Result<VisitAcknowledgeResult> {
-        self.commit(|state| {
+        self.try_commit(|state| {
+            admit(state, actor)?;
             let revision = bump(state, actor);
             let visit = state.visits.acknowledge(actor, cursor, views, revision);
-            VisitAcknowledgeResult {
+            Ok(VisitAcknowledgeResult {
                 actor_id: actor.clone(),
                 acknowledged_cursor: U64::new(visit.cursor),
                 views: visit.views,
                 revision: U64::new(revision),
-            }
+            })
         })
     }
 
@@ -398,10 +421,11 @@ impl Attention {
         actor: &ActorId,
         max_changes: u64,
         oldest_output_cursor: u64,
+        content: Content,
     ) -> Changed {
         self.state
             .visits
-            .changed_since(actor, max_changes, oldest_output_cursor)
+            .changed_since(actor, max_changes, oldest_output_cursor, content)
     }
 
     /// Answers what changed since one actor's last visit, as the wire type.
@@ -411,8 +435,9 @@ impl Attention {
         actor: &ActorId,
         max_changes: u64,
         oldest_output_cursor: u64,
+        content: Content,
     ) -> VisitChangedResult {
-        let changed = self.changed_since(actor, max_changes, oldest_output_cursor);
+        let changed = self.changed_since(actor, max_changes, oldest_output_cursor, content);
         VisitChangedResult {
             actor_id: actor.clone(),
             from_cursor: U64::new(changed.from_cursor),
@@ -483,6 +508,20 @@ fn bump(state: &mut State, actor: &ActorId) -> u64 {
     *revision
 }
 
+/// Admits one actor to the feature store, or refuses a new one past the bound.
+///
+/// An acknowledgement is that actor's own record, and this store never deletes one to make room:
+/// the bound is on admission instead. An actor already here is always admitted, so nothing anybody
+/// has already acknowledged stops working when the bound is reached.
+fn admit(state: &State, actor: &ActorId) -> Result<()> {
+    if state.revisions.contains_key(actor) || state.revisions.len() < MAX_RETAINED_ACTORS {
+        return Ok(());
+    }
+    Err(crate::Error::TooManyActors {
+        bound: MAX_RETAINED_ACTORS,
+    })
+}
+
 /// Applies one event to a candidate state, live or as a replay.
 fn consume(
     state: &mut State,
@@ -512,34 +551,34 @@ fn consume(
 }
 
 /// Keeps the review subjects bounded, without letting go of one an inbox item still points at.
+///
+/// The reference goes from the subject to the item, never the other way: a subject derives the key
+/// an `attention.review_ready` item for it would carry, and the engine is asked whether it holds
+/// one. Reading a subject back out of a key would not work, because a key whose subject was too
+/// long or carried a separator is a digest of it and names nothing.
 fn bound_reviews(state: &mut State) {
     let referenced: BTreeSet<String> = state
-        .engine
-        .items()
-        .filter(|item| item.rule == AttentionRule::ReviewReady)
-        .filter_map(|item| {
-            item.session_id.map(|session_id| {
-                crate::review::subject_key(&ReviewSubject::CompletedTurn {
-                    session_id,
-                    turn_id: turn_of(&item.key),
-                })
-            })
+        .reviews
+        .subjects()
+        .filter_map(|subject| {
+            let ReviewSubject::CompletedTurn {
+                session_id,
+                turn_id,
+            } = &subject.subject
+            else {
+                return None;
+            };
+            let item = key::attention_key(
+                AttentionRule::ReviewReady,
+                &format!("{session_id}|{turn_id}"),
+            );
+            state
+                .engine
+                .item(&item)
+                .map(|_| crate::review::subject_key(&subject.subject))
         })
         .collect();
     state.reviews.enforce_bound(&referenced);
-}
-
-/// Returns the turn an `attention.review_ready` key was built from.
-///
-/// The key is `<rule>|<session>|<turn>`, derived rather than allocated, so the turn can be read
-/// back out of it. A key whose subject was derived from a digest reads back as that digest, which
-/// names no subject and therefore protects none; the subject it belonged to is bounded like any
-/// other.
-fn turn_of(key: &AttentionKey) -> AgentTurnId {
-    let turn = key.as_str().rsplit('|').next().unwrap_or_default();
-    AgentTurnId::new(turn).unwrap_or_else(|_| {
-        AgentTurnId::new("unknown").expect("a constant identifier is well formed")
-    })
 }
 
 /// Puts every gap the engine recorded where a visit can see it.

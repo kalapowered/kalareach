@@ -97,13 +97,19 @@ pub struct Item {
     /// Keeping it durable is what stops a restart announcing everything at the level it already
     /// announced.
     pub announced_level: Option<AttentionLevel>,
-    /// Whether a decided announcement is still waiting to be taken by a delivery consumer.
+    /// How many announcements this item has produced.
     ///
-    /// The decision is written down before the caller is handed it, and it stays written down
-    /// until somebody takes it. A host that decided an announcement and then died re-offers it at
-    /// its next start rather than losing it, which is the half of the delivery contract the
-    /// feature store can keep on its own.
-    pub pending_handoff: bool,
+    /// It is what gives each decision an identity of its own: an item's key names a condition, and
+    /// one condition produces many announcements over its life.
+    pub announcements: u64,
+    /// The announcement, by its own number, that no delivery consumer has settled yet.
+    ///
+    /// A decision is written down before the caller is handed it and stays written down until a
+    /// consumer says it has taken durable responsibility for it. Taking one is therefore two
+    /// steps: [`Engine::take_announcements`] offers what is outstanding without forgetting it, and
+    /// [`Engine::settle_announcements`] forgets it once the consumer has recorded it. A host that
+    /// decided an announcement and died at any point before that offers it again.
+    pub pending_handoff: Option<u64>,
     /// Whether a gap in the retained events could have resolved it.
     pub uncertain: bool,
     /// How long the item has stood.
@@ -114,24 +120,37 @@ pub struct Item {
     pub deferred: bool,
 }
 
+/// How much of the retained content a caller is served.
+///
+/// A caller whose grant the host cannot narrow retained content to is served the host's own record
+/// of a condition without the session's text. That is the same direction section 10 takes for a
+/// history page a host cannot narrow: serve less than the grant allows rather than more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Content {
+    /// Everything, including the text the condition came from.
+    Whole,
+    /// The host's own record, without the session's text.
+    Narrowed,
+}
+
 impl Item {
     /// Returns this item as the wire type, for one actor.
     #[must_use]
-    pub fn to_wire(&self, acknowledged: bool) -> AttentionItem {
+    pub fn to_wire(&self, acknowledged: bool, content: Content) -> AttentionItem {
         AttentionItem {
             key: self.key.clone(),
             rule: self.rule,
             source: self.source,
             level: self.level,
             session_id: Nullable(self.session_id),
-            summary: self.summary.clone(),
+            summary: Nullable((content == Content::Whole).then(|| self.summary.clone())),
             trusted: rule(self.rule).trusted,
             routing: self.routing,
             occurrences: U64::new(self.occurrences),
             first_seen_ms: self.first_seen_ms,
             last_seen_ms: self.last_seen_ms,
             notification: self.notification,
-            awaiting_delivery: self.pending_handoff,
+            awaiting_delivery: self.pending_handoff.is_some(),
             acknowledged,
             uncertain: self.uncertain,
         }
@@ -213,6 +232,12 @@ pub enum Outcome {
 pub struct Announcement {
     /// The item.
     pub key: AttentionKey,
+    /// Which of that item's announcements this is.
+    ///
+    /// The pair of the key and this number is the decision's identity, and it is what a consumer
+    /// settles by: a newer decision about the same condition is a different announcement and is
+    /// not settled by an older one.
+    pub number: u64,
     /// Its rule.
     pub rule: AttentionRule,
     /// What it asks for.
@@ -390,13 +415,18 @@ impl Engine {
 
     /// Returns the inbox one actor sees, oldest first.
     #[must_use]
-    pub fn inbox(&self, actor: &ActorId, include_acknowledged: bool) -> Vec<AttentionItem> {
+    pub fn inbox(
+        &self,
+        actor: &ActorId,
+        include_acknowledged: bool,
+        content: Content,
+    ) -> Vec<AttentionItem> {
         let mut items: Vec<_> = self
             .items
             .values()
             .filter_map(|item| {
                 let acknowledged = self.is_acknowledged(actor, item);
-                (include_acknowledged || !acknowledged).then(|| item.to_wire(acknowledged))
+                (include_acknowledged || !acknowledged).then(|| item.to_wire(acknowledged, content))
             })
             .collect();
         items.sort_by(|left, right| {
@@ -513,28 +543,42 @@ impl Engine {
         outcomes
     }
 
-    /// Takes the announcements the host has decided and not yet handed to a delivery consumer.
+    /// Returns the announcements the host has decided and no consumer has settled.
     ///
-    /// Each one stays here until it is taken, so a host that decided an announcement and then died
-    /// re-offers it at its next start. What becomes of it afterwards - the attempts, the receipts,
-    /// the destinations - is the delivery journal's, not this store's.
-    pub fn take_announcements(&mut self) -> Vec<Announcement> {
-        let mut taken = Vec::new();
-        for item in self.items.values_mut() {
-            if !item.pending_handoff {
-                continue;
+    /// Nothing is forgotten here. A consumer takes these, records them durably, and then calls
+    /// [`Engine::settle_announcements`] with what it recorded; anything it did not settle is
+    /// offered again, at this start or the next one. Forgetting one at the moment it was handed
+    /// over would lose it to a crash between the handing and the recording.
+    #[must_use]
+    pub fn take_announcements(&self) -> Vec<Announcement> {
+        self.items
+            .values()
+            .filter_map(|item| {
+                item.pending_handoff.map(|number| Announcement {
+                    key: item.key.clone(),
+                    number,
+                    rule: item.rule,
+                    level: item.level,
+                    routing: item.routing,
+                    session_id: item.session_id,
+                    summary: item.summary.clone(),
+                })
+            })
+            .collect()
+    }
+
+    /// Forgets the announcements a consumer has taken durable responsibility for.
+    ///
+    /// An identity that names an announcement the item has since replaced settles nothing: the
+    /// newer decision is a different announcement, and it is still outstanding.
+    pub fn settle_announcements(&mut self, settled: &[(AttentionKey, u64)]) {
+        for (key, number) in settled {
+            if let Some(item) = self.items.get_mut(key)
+                && item.pending_handoff == Some(*number)
+            {
+                item.pending_handoff = None;
             }
-            item.pending_handoff = false;
-            taken.push(Announcement {
-                key: item.key.clone(),
-                rule: item.rule,
-                level: item.level,
-                routing: item.routing,
-                session_id: item.session_id,
-                summary: item.summary.clone(),
-            });
         }
-        taken
     }
 
     /// Returns the announcements waiting to be taken, without taking them.
@@ -542,7 +586,7 @@ impl Engine {
     pub fn awaiting_delivery(&self) -> usize {
         self.items
             .values()
-            .filter(|item| item.pending_handoff)
+            .filter(|item| item.pending_handoff.is_some())
             .count()
     }
 
@@ -845,14 +889,15 @@ impl Engine {
     /// Keeps the pending requests inside [`MAX_RETAINED_PENDING_INPUTS`].
     ///
     /// The question ledger is where a request lives; this is only what the reminder is measured
-    /// from. What goes is the request that has been pending longest, which is the one whose
-    /// reminder has already been raised if any has.
+    /// from. What goes is the request that has been pending longest *and* has already had its
+    /// reminder raised, so the bound never takes away a reminder that is still owed. When every
+    /// request is still owed one, the set goes over its bound rather than losing one.
     fn bound_pending_inputs(&mut self, keep: QuestionId) {
         while self.pending_inputs.len() >= MAX_RETAINED_PENDING_INPUTS {
             let Some(oldest) = self
                 .pending_inputs
                 .iter()
-                .filter(|(question_id, _)| **question_id != keep)
+                .filter(|(question_id, pending)| **question_id != keep && pending.reminded)
                 .min_by(|left, right| {
                     left.1
                         .pending_since_ms
@@ -942,7 +987,8 @@ impl Engine {
             notification: NotificationState::Pending,
             last_notified_ms: None,
             announced_level: None,
-            pending_handoff: false,
+            announcements: 0,
+            pending_handoff: None,
             uncertain: false,
             age: Elapsed::already(Self::waited(raise.at_ms, raise.at_ms, reading), reading),
             since_notified: None,
@@ -976,6 +1022,7 @@ impl Engine {
             let Some(victim) = self
                 .items
                 .values()
+                .filter(|item| rule(item.rule).droppable)
                 .min_by(|left, right| {
                     left.level
                         .cmp(&right.level)
@@ -984,6 +1031,10 @@ impl Engine {
                 })
                 .map(|item| item.key.clone())
             else {
+                // Everything in the inbox is a condition somebody or something is still waiting
+                // on. The inbox goes over its bound rather than forgetting one of those: section
+                // 25 keeps an outstanding approval in the inbox, and a host that dropped one would
+                // be answering that nothing is waiting when something is.
                 break;
             };
             self.items.remove(&victim);
@@ -1022,7 +1073,8 @@ impl Engine {
         item.deferred = false;
         item.notification = NotificationState::Delivered;
         item.announced_level = Some(level);
-        item.pending_handoff = true;
+        item.announcements = item.announcements.saturating_add(1);
+        item.pending_handoff = Some(item.announcements);
         vec![if released {
             Outcome::Released {
                 key: key.clone(),

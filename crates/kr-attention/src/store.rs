@@ -133,7 +133,8 @@ const SCHEMA: &str = "
         notification TEXT NOT NULL,
         last_notified_ms INTEGER,
         announced_level TEXT,
-        pending_handoff INTEGER NOT NULL,
+        announcements INTEGER NOT NULL,
+        pending_handoff INTEGER,
         uncertain INTEGER NOT NULL,
         deferred INTEGER NOT NULL
     );
@@ -184,7 +185,7 @@ const SCHEMA: &str = "
         cursor INTEGER PRIMARY KEY,
         kind TEXT NOT NULL,
         session_id TEXT NOT NULL,
-        summary TEXT NOT NULL,
+        summary TEXT,
         at_ms INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS attention_change_head (
@@ -425,9 +426,9 @@ impl Store {
                 "INSERT INTO attention_items (
                      key, rule, source, session_id, summary, routing, level, steps_taken,
                      occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
-                     announced_level, pending_handoff, uncertain, deferred
+                     announced_level, announcements, pending_handoff, uncertain, deferred
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                           ?17)",
+                           ?17, ?18)",
                 params![
                     item.key.as_str(),
                     item.rule.as_str(),
@@ -445,7 +446,10 @@ impl Store {
                         .map(|at| as_i64(at.get(), "last announced"))
                         .transpose()?,
                     item.announced_level.map(AttentionLevel::as_str),
-                    i64::from(item.pending_handoff),
+                    as_i64(item.announcements, "announcement count")?,
+                    item.pending_handoff
+                        .map(|number| as_i64(number, "announcement number"))
+                        .transpose()?,
                     i64::from(item.uncertain),
                     i64::from(item.deferred),
                 ],
@@ -542,7 +546,7 @@ impl Store {
                     as_i64(change.cursor.get(), "change cursor")?,
                     change.kind.as_str(),
                     change.session_id.to_string(),
-                    change.summary,
+                    change.summary.as_ref(),
                     as_i64(change.at_ms.get(), "change recorded at")?
                 ],
             )?;
@@ -611,7 +615,7 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT key, rule, source, session_id, summary, routing, level, steps_taken,
                     occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
-                    announced_level, pending_handoff, uncertain, deferred
+                    announced_level, announcements, pending_handoff, uncertain, deferred
              FROM attention_items ORDER BY first_seen_ms, key",
         )?;
         let rows = statement.query_map([], |row| {
@@ -631,8 +635,9 @@ impl Store {
                 row.get::<_, Option<i64>>(12)?,
                 row.get::<_, Option<String>>(13)?,
                 row.get::<_, i64>(14)?,
-                row.get::<_, i64>(15)?,
+                row.get::<_, Option<i64>>(15)?,
                 row.get::<_, i64>(16)?,
+                row.get::<_, i64>(17)?,
             ))
         })?;
         let unanchored = Elapsed::starting(HostReading::new(0, 0, false));
@@ -669,13 +674,17 @@ impl Store {
                         AttentionLevel::from_wire(&level).ok_or_else(|| unreadable("level"))
                     })
                     .transpose()?,
-                pending_handoff: row.14 != 0,
-                uncertain: row.15 != 0,
+                announcements: as_u64(row.14, "announcement count")?,
+                pending_handoff: row
+                    .15
+                    .map(|number| as_u64(number, "announcement number"))
+                    .transpose()?,
+                uncertain: row.16 != 0,
                 // Both intervals are re-anchored before anything reads them; the values here stand
                 // only until `Attention::open` does that.
                 age: unanchored,
                 since_notified: last_notified_ms.map(|_| unanchored),
-                deferred: row.16 != 0,
+                deferred: row.17 != 0,
             });
         }
         Ok(items)
@@ -903,7 +912,7 @@ impl Store {
                 row.get::<_, i64>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(3)?,
                 row.get::<_, i64>(4)?,
             ))
         })?;
@@ -915,7 +924,7 @@ impl Store {
                 kind: SemanticChangeKind::from_wire(&kind)
                     .ok_or_else(|| unreadable("change kind"))?,
                 session_id: SessionId::from_str(&session).map_err(|_| unreadable("session"))?,
-                summary,
+                summary: Nullable(summary),
                 at_ms: TimestampMs::new(as_u64(at_ms, "change recorded at")?),
             });
         }

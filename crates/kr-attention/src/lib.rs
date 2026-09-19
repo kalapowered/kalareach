@@ -89,7 +89,7 @@ pub mod store;
 pub mod time;
 pub mod visit;
 
-pub use crate::engine::{Engine, Item, Outcome};
+pub use crate::engine::{Content, Engine, Item, Outcome};
 pub use crate::error::{Error, Result};
 pub use crate::event::{EventCursor, EventKind, SourceEvent};
 pub use crate::host::Attention;

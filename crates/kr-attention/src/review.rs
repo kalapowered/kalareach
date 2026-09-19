@@ -128,17 +128,26 @@ impl Reviews {
     /// `referenced` names the subjects something else still points at - an inbox item that says a
     /// turn is waiting to be reviewed, most of all. Those are never let go of: an item that says
     /// there is review work, beside a subject that has gone, is a review nobody can complete.
-    /// What is let go of is the subject whose version was recorded longest ago, with the
-    /// acknowledgements that named it.
+    /// Neither is a subject any actor has acknowledged, because an acknowledgement is that actor's
+    /// own record of what it read and nothing here can reconstruct it. What is let go of is a
+    /// subject nobody has pointed at and nobody has read, whose version was recorded longest ago.
+    ///
+    /// When everything left is referenced or acknowledged the table goes over its bound rather
+    /// than forgetting one of those.
     ///
     /// Returns the subjects that were let go of.
     pub fn enforce_bound(&mut self, referenced: &BTreeSet<String>) -> Vec<String> {
+        let acknowledged: BTreeSet<&String> = self
+            .acks
+            .values()
+            .flat_map(std::collections::BTreeMap::keys)
+            .collect();
         let mut released = Vec::new();
         while self.subjects.len() > MAX_RETAINED_REVIEW_SUBJECTS {
             let Some(oldest) = self
                 .subjects
                 .iter()
-                .filter(|(key, _)| !referenced.contains(*key))
+                .filter(|(key, _)| !referenced.contains(*key) && !acknowledged.contains(key))
                 .min_by(|left, right| {
                     left.1
                         .at_ms
@@ -148,15 +157,9 @@ impl Reviews {
                 })
                 .map(|(key, _)| key.clone())
             else {
-                // Everything left is still referenced. The table goes over its bound rather than
-                // leaving an inbox item pointing at nothing; what bounds it then is the inbox's
-                // own bound, which is enforced where the items are raised.
                 break;
             };
             self.subjects.remove(&oldest);
-            for acks in self.acks.values_mut() {
-                acks.remove(&oldest);
-            }
             released.push(oldest);
         }
         released

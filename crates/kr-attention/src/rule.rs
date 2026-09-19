@@ -43,6 +43,14 @@ pub struct Rule {
     ///
     /// False only for an application notice, which any process writing to the terminal can emit.
     pub trusted: bool,
+    /// Whether the inbox's own bound may let go of one of these.
+    ///
+    /// False for anything somebody or something is still waiting on: an unanswered approval, an
+    /// unanswered request, an adapter that is still down, a host still out of contact. Those are
+    /// outstanding conditions rather than a record of one, and section 25 keeps an outstanding
+    /// approval in the inbox. What the bound lets go of is the rest: a command that has already
+    /// exited, a turn already waiting, a notice an application printed.
+    pub droppable: bool,
 }
 
 const fn step(after_ms: u64, level: AttentionLevel) -> EscalationStep {
@@ -70,6 +78,7 @@ pub static RULES: &[Rule] = &[
         repeat_ms: Some(REMINDER_INTERVAL_MS),
         dedup_window_ms: DEDUPLICATION_WINDOW_MS,
         trusted: true,
+        droppable: false,
     },
     // A verified pending request is worth telling the person about at once. What it is not yet is
     // an interruption: that is the idle reminder's job, five minutes later, and having one rule
@@ -81,6 +90,7 @@ pub static RULES: &[Rule] = &[
         repeat_ms: None,
         dedup_window_ms: DEDUPLICATION_WINDOW_MS,
         trusted: true,
+        droppable: false,
     },
     Rule {
         id: AttentionRule::InputIdleReminder,
@@ -89,6 +99,7 @@ pub static RULES: &[Rule] = &[
         repeat_ms: Some(REMINDER_INTERVAL_MS),
         dedup_window_ms: DEDUPLICATION_WINDOW_MS,
         trusted: true,
+        droppable: false,
     },
     // History. Nothing is waiting on the person, so it is announced once and stays in the inbox.
     Rule {
@@ -98,6 +109,7 @@ pub static RULES: &[Rule] = &[
         repeat_ms: None,
         dedup_window_ms: DEDUPLICATION_WINDOW_MS,
         trusted: true,
+        droppable: true,
     },
     Rule {
         id: AttentionRule::ReviewReady,
@@ -106,6 +118,7 @@ pub static RULES: &[Rule] = &[
         repeat_ms: None,
         dedup_window_ms: DEDUPLICATION_WINDOW_MS,
         trusted: true,
+        droppable: true,
     },
     // A capability that has gone is worth knowing about immediately and worth interrupting for
     // once it is clear it is not coming back on its own.
@@ -116,6 +129,7 @@ pub static RULES: &[Rule] = &[
         repeat_ms: Some(REMINDER_INTERVAL_MS),
         dedup_window_ms: DEDUPLICATION_WINDOW_MS,
         trusted: true,
+        droppable: false,
     },
     Rule {
         id: AttentionRule::HostContactLost,
@@ -124,6 +138,7 @@ pub static RULES: &[Rule] = &[
         repeat_ms: Some(REMINDER_INTERVAL_MS),
         dedup_window_ms: DEDUPLICATION_WINDOW_MS,
         trusted: true,
+        droppable: false,
     },
     // Untrusted, and deliberately at the bottom of the set. An application that wants attention
     // can ask for it; it cannot award itself any.
@@ -134,6 +149,7 @@ pub static RULES: &[Rule] = &[
         repeat_ms: None,
         dedup_window_ms: DEDUPLICATION_WINDOW_MS,
         trusted: false,
+        droppable: true,
     },
 ];
 
@@ -194,6 +210,25 @@ mod tests {
             assert_eq!(
                 rule.dedup_window_ms, 60_000,
                 "{} keeps section 25's window",
+                rule.id
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_anybody_is_waiting_on_is_one_the_bound_may_let_go_of() {
+        for rule in RULES {
+            let waiting = matches!(
+                rule.id,
+                AttentionRule::PendingApproval
+                    | AttentionRule::PendingInput
+                    | AttentionRule::InputIdleReminder
+                    | AttentionRule::AdapterFailed
+                    | AttentionRule::HostContactLost
+            );
+            assert_eq!(
+                rule.droppable, !waiting,
+                "{} says whether the inbox's bound may let go of it",
                 rule.id
             );
         }

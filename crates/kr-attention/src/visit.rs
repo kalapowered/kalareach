@@ -188,7 +188,7 @@ impl Visits {
             cursor: U64::new(cursor),
             kind,
             session_id,
-            summary: crate::engine::clip_summary(&summary),
+            summary: Nullable::some(crate::engine::clip_summary(&summary)),
             at_ms,
         });
         self.next_cursor = cursor.saturating_add(1);
@@ -301,6 +301,7 @@ impl Visits {
         actor: &ActorId,
         max_changes: u64,
         oldest_output_cursor: u64,
+        content: crate::engine::Content,
     ) -> Changed {
         let visit = self.visits.get(actor);
         let from = visit.map_or(0, |visit| visit.cursor);
@@ -325,18 +326,33 @@ impl Visits {
             .iter()
             .filter(|change| change.cursor.get() >= start)
             .take(limit)
-            .cloned()
+            .map(|change| SemanticChange {
+                summary: Nullable(
+                    (content == crate::engine::Content::Whole)
+                        .then(|| change.summary.as_ref().cloned())
+                        .flatten(),
+                ),
+                ..change.clone()
+            })
             .collect();
         let to_cursor = changes
             .last()
             .map_or(self.next_cursor.max(start), |change| {
                 change.cursor.get().saturating_add(1)
             });
-        let summary = self
-            .summaries
-            .iter()
-            .rfind(|summary| summary.to_cursor.get() <= to_cursor && summary.to_cursor.get() > from)
-            .cloned();
+        // A model summary is written from the session's own content, so it goes where the text
+        // goes: a caller served the host's record without the text is not served a paraphrase of
+        // it either.
+        let summary = (content == crate::engine::Content::Whole)
+            .then(|| {
+                self.summaries
+                    .iter()
+                    .rfind(|summary| {
+                        summary.to_cursor.get() <= to_cursor && summary.to_cursor.get() > from
+                    })
+                    .cloned()
+            })
+            .flatten();
         Changed {
             from_cursor: from,
             to_cursor,

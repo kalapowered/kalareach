@@ -1666,8 +1666,15 @@
           "description": "The retained source the condition was observed in.\n\nIt is what a gap is weighed against: a range that retention took from this source is a\nrange that could have resolved this item, and a range taken from another source is not."
         },
         "summary": {
-          "description": "One line naming the subject.",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "One line naming the subject, when this caller may be served it.\n\nNull means the host withheld it. An item's text comes from retained content - a question's\nwording, a command line, what an application printed - and a caller whose grant the host\ncannot narrow that content to is served the item without it rather than more than its grant\nallows. What is left says which rule, at what level, how often and when, which is the\nhost's own record rather than the session's."
         },
         "trusted": {
           "description": "Whether the host itself observed the condition.\n\nFalse for an application notice, which any process writing to the terminal can emit. A\nclient must not present an untrusted item as a host decision, and nothing untrusted is ever\na pending approval.",
@@ -17331,8 +17338,15 @@
           "description": "The session it belongs to."
         },
         "summary": {
-          "description": "One line naming it.",
-          "type": "string"
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "One line naming it, when this caller may be served it.\n\nNull means the host withheld it, for the same reason an attention item's text is withheld."
         }
       },
       "required": [

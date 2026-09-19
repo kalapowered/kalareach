@@ -21,6 +21,16 @@
 //! it reads. A host that cannot prove it does not suppress: a withheld notification at an hour
 //! nobody chose is the failure that matters.
 //!
+//! # What a caller is served
+//!
+//! An item's text and a change's text come from retained content: a question's wording, a command
+//! line, what an application printed. Section 10 narrows retained content to the grant that asked
+//! for it, and this host cannot narrow a moment in time to a byte range, which is why it refuses a
+//! retained history page to a paired device outright. An attention item is not a history page, so
+//! it is narrowed rather than refused: a caller that did not arrive over the local socket is served
+//! the host's own record of a condition - which rule, at what level, how often, when - without the
+//! session's text, and [`Content`] is what says which.
+//!
 //! # What a review method may not do
 //!
 //! Anything to the code. Section 14 makes promotion a separate authorised action and section 23
@@ -32,7 +42,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kr_attention::event::{ApplicationNotice, EventCursor, EventKind, SourceEvent};
-use kr_attention::{Attention as Engine, HostReading, Outcome};
+use kr_attention::{Attention as Engine, Content, HostReading, Outcome};
 use kr_protocol::action::WallClockTrust;
 use kr_protocol::attention::{
     AttentionAcknowledgeParams, AttentionAcknowledgeResult, AttentionQuietHoursParams,
@@ -45,6 +55,13 @@ use kr_protocol::ids::ActorId;
 
 /// Largest time-zone name a quiet-hours window records.
 pub const MAX_ZONE_LEN: usize = 64;
+
+/// The largest counter the feature store writes down.
+///
+/// Its rows are signed integers, and a value it could not read back as the one it was given would
+/// be worse than a refusal. Anything a caller names past this is refused before the action is
+/// dispatched rather than failing to store afterwards.
+pub const MAX_STORED_COUNTER: u64 = i64::MAX as u64;
 
 /// How many retained records one maintenance pass takes from each source.
 ///
@@ -86,6 +103,16 @@ pub fn reading(time: &TimeContract) -> HostReading {
     )
 }
 
+/// Refuses a value the feature store could not write down as the one it was given.
+fn storable(value: u64, what: &str) -> Result<()> {
+    if value > MAX_STORED_COUNTER {
+        return Err(WorkerError::InvalidArgument(format!(
+            "{what} is at most {MAX_STORED_COUNTER}"
+        )));
+    }
+    Ok(())
+}
+
 fn translate(error: kr_attention::Error) -> WorkerError {
     match error {
         kr_attention::Error::UnknownReviewSubject { subject } => {
@@ -106,6 +133,11 @@ fn translate(error: kr_attention::Error) -> WorkerError {
         },
         kr_attention::Error::UnknownContinuation { key } => WorkerError::PreconditionFailed {
             detail: format!("this inbox no longer holds {key}, so a page cannot continue after it"),
+        },
+        kr_attention::Error::TooManyActors { bound } => WorkerError::QuotaExceeded {
+            detail: format!(
+                "this session's attention store holds {bound} actors, which is its bound"
+            ),
         },
     }
 }
@@ -164,9 +196,10 @@ impl Attention {
         actor: &ActorId,
         params: &AttentionReadParams,
         time: &TimeContract,
+        content: Content,
     ) -> Result<AttentionReadResult> {
         self.locked()?
-            .read(actor, params, reading(time))
+            .read(actor, params, reading(time), content)
             .map_err(translate)
     }
 
@@ -179,13 +212,31 @@ impl Attention {
         Ok(self.locked()?.engine().consumed(source))
     }
 
-    /// Takes the announcements the host has decided and not yet handed over.
+    /// Returns the announcements the host has decided and no consumer has settled.
+    ///
+    /// Asking forgets nothing. A consumer records what it is given and then calls
+    /// [`Attention::settle_announcements`]; anything it does not settle is offered again.
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::JournalUnavailable`] when the state cannot be written.
+    /// Returns [`WorkerError::JournalUnavailable`] when the engine cannot be reached.
     pub fn take_announcements(&self) -> Result<Vec<kr_attention::engine::Announcement>> {
-        self.locked()?.take_announcements().map_err(translate)
+        Ok(self.locked()?.take_announcements())
+    }
+
+    /// Forgets the announcements a consumer has taken durable responsibility for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the state cannot be written, in which case
+    /// nothing is forgotten.
+    pub fn settle_announcements(
+        &self,
+        settled: &[(kr_protocol::attention::AttentionKey, u64)],
+    ) -> Result<()> {
+        self.locked()?
+            .settle_announcements(settled)
+            .map_err(translate)
     }
 
     /// Refuses, before anything is dispatched, a review acknowledgement this host can decide about.
@@ -199,6 +250,7 @@ impl Attention {
     /// Returns [`WorkerError::InvalidArgument`] when the subject is not one this session holds and
     /// [`WorkerError::PreconditionFailed`] when the version is not one it holds.
     pub fn check_review(&self, params: &ReviewAcknowledgeParams) -> Result<()> {
+        storable(params.version.get(), "a review version")?;
         let engine = self.locked()?;
         let state = engine
             .reviews()
@@ -259,6 +311,7 @@ impl Attention {
     /// Returns [`WorkerError::InvalidArgument`] for a view identifier or a filter past its bound,
     /// or for more views than one actor may retain.
     pub fn check_visit(params: &VisitAcknowledgeParams) -> Result<()> {
+        storable(params.acknowledged_cursor.get(), "an acknowledged cursor")?;
         if params.views.len() > usize::try_from(MAX_RETAINED_LOG_VIEWS).unwrap_or(usize::MAX) {
             return Err(WorkerError::InvalidArgument(format!(
                 "an actor retains at most {MAX_RETAINED_LOG_VIEWS} log views"
@@ -275,6 +328,7 @@ impl Attention {
                     "a log view filter is at most {MAX_LOG_VIEW_FILTER_LEN} bytes"
                 )));
             }
+            storable(view.source_offset.get(), "a log view offset")?;
         }
         Ok(())
     }
@@ -393,10 +447,14 @@ impl Attention {
         actor: &ActorId,
         params: &VisitChangedParams,
         oldest_output_cursor: u64,
+        content: Content,
     ) -> Result<VisitChangedResult> {
-        Ok(self
-            .locked()?
-            .changed_result(actor, params.max_changes.get(), oldest_output_cursor))
+        Ok(self.locked()?.changed_result(
+            actor,
+            params.max_changes.get(),
+            oldest_output_cursor,
+            content,
+        ))
     }
 
     /// Reads the retained sources this worker holds and gives the engine what it has not seen.

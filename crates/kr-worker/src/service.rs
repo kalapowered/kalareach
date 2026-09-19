@@ -92,6 +92,13 @@ pub const LOCAL_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(
 /// would otherwise wait for the next request.
 pub const HOST_MAINTENANCE: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// How many bounded pages one attention pass reads from each retained source before it decides.
+///
+/// A host that has been away has a backlog, and deciding its timers against a half-read history
+/// would raise a reminder for a request whose answer is still in the next page. The bound is what
+/// stops one pass reading a week of records in one go; what it does not read is read on the next.
+pub const ATTENTION_CATCH_UP_PAGES: usize = 64;
+
 /// The event stream name output notifications carry.
 pub const OUTPUT_STREAM: &str = "session.output";
 
@@ -367,10 +374,10 @@ impl WorkerService {
     /// journal itself keeps rather than on this one.
     async fn maintain(self: Arc<Self>) {
         let mut tick = tokio::time::interval(HOST_MAINTENANCE);
+        // The first pass happens at once, so a host that has just come up collects, looks at its
+        // clocks and reads its sources before it waits a minute to do any of them.
+        tick.tick().await;
         loop {
-            // The first tick completes at once, so a host that has just come up collects and looks
-            // at its clocks before it waits a minute to do either.
-            tick.tick().await;
             let closed = {
                 // Maintenance passes through the same serial boundary a mutation does. Section 9
                 // puts the revalidation a discontinuity owes *before* the host serves a mutation,
@@ -397,13 +404,39 @@ impl WorkerService {
             };
             // Outside the barrier: the attention engine reads the retained sources and writes its
             // own tables, and nothing a mutation does depends on the answer. A failure here is a
-            // failure of maintenance, which is retried on the next tick rather than reported to
+            // failure of maintenance, which is retried on the next pass rather than reported to
             // somebody who did not ask.
             self.attention_pass();
             if closed {
                 break;
             }
+            // The next pass is the earlier of this loop's own cadence and the moment the attention
+            // engine says a timer is due. An idle reminder is five minutes from a request, not
+            // five minutes rounded up to the next minute this loop happens to wake on.
+            match self.attention_deadline() {
+                Some(wait) => {
+                    tokio::select! {
+                        () = tokio::time::sleep(wait) => {}
+                        _ = tick.tick() => {}
+                    }
+                }
+                None => {
+                    tick.tick().await;
+                }
+            }
         }
+    }
+
+    /// Returns how long until the attention engine's next timer, when it has one.
+    ///
+    /// The engine answers on the machine's own continuous clock, which is the clock every interval
+    /// it measures is measured on. A deadline that has already passed is no wait at all.
+    fn attention_deadline(&self) -> Option<std::time::Duration> {
+        let time = Arc::clone(self.runtime.session().time());
+        let deadline = self.attention.next_deadline(&time).ok().flatten()?;
+        Some(std::time::Duration::from_millis(
+            deadline.saturating_sub(kr_ipc::clock::boot_elapsed_ms()),
+        ))
     }
 
     /// Gives the attention engine what the retained sources hold that it has not seen, and
@@ -419,12 +452,26 @@ impl WorkerService {
     /// effects that had no attachment to go to, which is what an `OSC 9`, `OSC 99` or `OSC 777`
     /// notification becomes when nobody holds the input lease.
     ///
-    /// The other rules of the set - a pending approval, a command's exit status, a completed turn,
-    /// an adapter failure, lost host contact - have no producer in this build, because the upstream
-    /// agent interface, the shell adapter's command blocks and the plugin host are other tasks'.
-    /// Each has its typed event waiting for it.
+    /// The rest of the rule set - a pending approval, a command's exit status, a completed turn,
+    /// an adapter failure, lost host contact - reaches the engine the same way. A producer builds
+    /// a `kr_attention::event::SourceEvent` with its own source's cursor and calls
+    /// [`crate::attention::Attention::observe`]; a record it consumed that no rule covers is
+    /// `EventKind::Observed`, which moves the cursor and raises nothing.
     pub fn attention_pass(&self) {
         let time = Arc::clone(self.runtime.session().time());
+        // Catch up before deciding anything. A pass takes a bounded page from each source, and a
+        // host that has been away reads several: deciding the timers against a half-read history
+        // would raise a reminder for a request whose answer is still in the next page.
+        for _ in 0..ATTENTION_CATCH_UP_PAGES {
+            if !self.attention_page(&time) {
+                break;
+            }
+        }
+        let _ = self.attention.tick(&time);
+    }
+
+    /// Reads one bounded page from each retained source. Returns true when it read anything.
+    fn attention_page(&self, time: &Arc<crate::action::time::TimeContract>) -> bool {
         let mut events = Vec::new();
         let from = self
             .attention
@@ -466,8 +513,9 @@ impl WorkerService {
                     crate::attention::host_event(index.saturating_add(1) as u64, session_id, event)
                 }),
         );
-        let _ = self.attention.feed(&events, &time);
-        let _ = self.attention.tick(&time);
+        let read = events.len();
+        let _ = self.attention.feed(&events, time);
+        read >= crate::attention::PAGE
     }
 
     /// Looks at the host's clocks, and revalidates what a discontinuity invalidated.
@@ -1854,9 +1902,9 @@ impl WorkerService {
             Method::InputWrite => self.input_write(state, &request.params, caller),
             Method::QuestionReadOwn => self.question_read_own(state, &request.params),
             Method::QuestionRead => self.question_read(&request.params),
-            Method::AttentionRead => self.attention_read(&caller.actor_id, &request.params),
+            Method::AttentionRead => self.attention_read(caller, &request.params),
             Method::ReviewRead => self.review_read(&caller.actor_id, &request.params),
-            Method::VisitChanged => self.visit_changed(&caller.actor_id, &request.params),
+            Method::VisitChanged => self.visit_changed(caller, &request.params),
             _ => Err(WorkerError::InvalidArgument(format!(
                 "{} is not a read this worker serves",
                 method.as_str()
@@ -1875,14 +1923,33 @@ impl WorkerService {
     }
 
     /// Serves `attention.read`: this actor's inbox, with the quiet-hours state beside it.
-    fn attention_read(&self, actor: &ActorId, params: &ParamsValue) -> Result<ParamsValue> {
+    fn attention_read(&self, caller: &Caller, params: &ParamsValue) -> Result<ParamsValue> {
         let params: kr_protocol::attention::AttentionReadParams = parse(params)?;
         let time = {
             let session = self.runtime.session();
             Self::check_session(&session, params.session_id)?;
             Arc::clone(session.time())
         };
-        encode(&self.attention.read(actor, &params, &time)?)
+        encode(&self.attention.read(
+            &caller.actor_id,
+            &params,
+            &time,
+            Self::attention_content(caller),
+        )?)
+    }
+
+    /// Returns how much of the retained content this caller is served.
+    ///
+    /// A local caller is this operating-system user, whose own session it is. A caller the daemon
+    /// forwarded holds a grant, and section 10 narrows retained content to what that grant asked
+    /// for; this host cannot narrow a grant's lower bound to an item's text, so it serves the
+    /// host's own record without it rather than more than the grant allows.
+    const fn attention_content(caller: &Caller) -> kr_attention::Content {
+        if caller.is_remote() {
+            kr_attention::Content::Narrowed
+        } else {
+            kr_attention::Content::Whole
+        }
     }
 
     /// Serves `review.read`: this actor's review state, bound to the versions the host holds.
@@ -1900,14 +1967,19 @@ impl WorkerService {
     /// The oldest output the session can still replay travels with it, because that is what
     /// decides whether a retained log view can be served from where it was left or has to be told
     /// about the range retention took.
-    fn visit_changed(&self, actor: &ActorId, params: &ParamsValue) -> Result<ParamsValue> {
+    fn visit_changed(&self, caller: &Caller, params: &ParamsValue) -> Result<ParamsValue> {
         let params: kr_protocol::attention::VisitChangedParams = parse(params)?;
         let oldest = {
             let session = self.runtime.session();
             Self::check_session(&session, params.session_id)?;
             session.snapshot().oldest_retained_cursor.get()
         };
-        encode(&self.attention.changed(actor, &params, oldest)?)
+        encode(&self.attention.changed(
+            &caller.actor_id,
+            &params,
+            oldest,
+            Self::attention_content(caller),
+        )?)
     }
 
     /// Runs one mutation through the receipt contract.

@@ -442,8 +442,8 @@ async fn an_acknowledgement_reaches_only_the_actor_that_made_it() {
             request: request(Method::AttentionRead, typed(&read_params(&host))),
             actor: ActorEnvelope {
                 actor_id: ActorId::new("device:phone").expect("a principal"),
-                ingress: ActorIngress::LocalIpc,
-                device_id: Nullable::null(),
+                ingress: ActorIngress::PairedDevice,
+                device_id: Nullable::some(kr_protocol::ids::DeviceId::new(kr_ipc::new_uuid())),
                 grant_id: Nullable::null(),
                 grant_revision: Nullable::null(),
                 controller_generation: ControllerGeneration::new(1),
@@ -459,6 +459,15 @@ async fn an_acknowledgement_reaches_only_the_actor_that_made_it() {
         "another actor has not seen it"
     );
     assert_eq!(forwarded.items[0].key, key);
+    assert_eq!(
+        forwarded.items[0].summary,
+        Nullable::null(),
+        "and a caller the host cannot narrow gets the record without the session's text"
+    );
+    assert!(
+        mine.items[0].summary.is_present(),
+        "while this user's own session tells them what it was about"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -826,6 +835,11 @@ async fn a_notification_with_no_attachment_to_go_to_becomes_an_untrusted_notice(
         .expect("the notice is retained in Attention");
     assert!(!item.trusted, "any process can print one");
     assert_eq!(
+        item.summary.as_ref().map(String::as_str),
+        Some("Normal: build - finished"),
+        "and this user's own session is told what it said"
+    );
+    assert_eq!(
         item.routing,
         kr_protocol::attention::AttentionRouting::OwnerPolicy,
         "with no lease holder it goes through the owner's notification policy"
@@ -911,7 +925,7 @@ async fn the_state_lives_in_the_session_s_journal_and_comes_back_from_it() {
     let reading = kr_worker::attention::reading(host.service.runtime().session().time());
     let restored = kr_attention::Attention::beside(Some(&host.journal_path), reading)
         .expect("the feature store reopens");
-    let items = restored.inbox(&actor, true);
+    let items = restored.inbox(&actor, true, kr_attention::Content::Whole);
     assert_eq!(items.len(), 1, "the item is where the journal kept it");
     assert_eq!(items[0].key, key);
     assert!(items[0].acknowledged, "and so is the acknowledgement");

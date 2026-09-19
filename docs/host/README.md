@@ -1218,11 +1218,17 @@ every decision that depends on time takes a reading of the host time contract fr
 
 ### Where its events come from
 
-The host's own maintenance reads the retained sources on every tick and gives the engine what it
-has not seen, keyed by each source's own cursor. Two sources reach it: the question ledger, whose
-events carry the moment a request became pending, and the journal's host events, which are the
-terminal side effects that had no attachment to go to. A record that no rule covers moves the
-cursor and raises nothing, so a later record is not read as a range retention took.
+The host's own maintenance reads the retained sources and gives the engine what it has not seen,
+keyed by each source's own cursor. Two sources reach it: the question ledger, whose events carry
+the moment a request became pending, and the journal's host events, which are the terminal side
+effects that had no attachment to go to. A record that no rule covers moves the cursor and raises
+nothing, so a later record is not read as a range retention took. A pass reads bounded pages until
+it has caught up before it decides any timer, because deciding against a half-read history would
+raise a reminder for a request whose answer is in the next page.
+
+Maintenance wakes at the earlier of its own cadence and the moment the engine says a timer is due,
+so a five-minute reminder is five minutes from the request rather than five minutes rounded up to
+the next time the host happened to look.
 
 ### The rule set
 
@@ -1312,9 +1318,12 @@ Every mutating call writes the new state before it publishes the decision. A wri
 leaves the engine where it was, so the same event can be offered again and produces the same
 answer.
 
-A decided announcement stays written down until a delivery consumer takes it, so a host that
-decided one and then died re-offers it at its next start rather than losing it. What becomes of it
-after that - the destinations, the attempts, the receipts - belongs to the delivery journal.
+A decided announcement stays written down until a delivery consumer says it has taken durable
+responsibility for it. Taking one is two steps for that reason: the host offers what is outstanding
+without forgetting it, and forgets it only once the consumer has settled it by its own identity,
+which is the item and the number of that item's announcement. A host that died at any point before
+that offers the announcement again. What becomes of it afterwards - the destinations, the attempts,
+the receipts - belongs to the delivery journal.
 
 A jump in a source's sequence means the records between were evicted. The engine records the range,
 marks every unresolved item from that same source uncertain, and leaves it in the inbox. A gap is
@@ -1329,13 +1338,26 @@ decides what still needs saying.
 
 The inbox is a working set rather than a record: the receipts, the question ledger and the retained
 output are where the history lives. Past five hundred items the host lets go of its least urgent
-and oldest, weighing the item that has just arrived with the rest, so a fresh informational notice
-does not displace an urgent approval merely by being the newest thing there. The read says how many
-items the host has let go of.
+and oldest, weighing the item that has just arrived with the rest, so a fresh notice does not
+displace anything merely by being the newest thing there. The read says how many items the host has
+let go of.
 
-Review subjects are bounded the same way, with one exception: a subject an inbox item still points
-at is never let go of, because an item that says review work is waiting, beside a subject that has
-gone, is a review nobody can complete.
+What the bound never lets go of is a condition somebody or something is still waiting on: an
+unanswered approval, an unanswered request, an adapter still down, a host still out of contact.
+When the whole inbox is those, it goes over its bound rather than answering that nothing is
+waiting. Review subjects are bounded the same way, and a subject an inbox item points at or an
+actor has acknowledged is never let go of. A feature store admits two hundred and fifty-six actors;
+past that a new actor's acknowledgement is refused rather than an existing actor's being deleted.
+
+### What a caller is served
+
+An item's text and a change's text come from retained content: a question's wording, a command
+line, what an application printed. Section 10 narrows retained content to the grant that asked for
+it, and this host cannot narrow a moment in time to an item's text, which is why it refuses a
+retained history page to a paired device outright. An attention item is not a history page, so it
+is narrowed rather than refused: a caller that did not arrive over the local socket is served the
+host's own record of a condition - which rule, at what level, how often, when - with the text left
+out and said to be left out, and no model summary either.
 
 ## Closure
 
