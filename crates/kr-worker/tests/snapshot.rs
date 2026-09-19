@@ -416,13 +416,14 @@ enum Event {
 
 /// How long a wait for something to happen is given.
 ///
-/// A liveness bound is not a measurement. Every wait in this file is for a condition the session
-/// itself reports - a screen installed, an update carrying a line, a presentation the host names, a
-/// byte in the retained stream - and this window only has to outlast the slowest host the suite
-/// runs on while every other suite runs beside it. A test that hangs fails here and says what it
-/// was waiting for; a test that is merely slow is not a failure. Nothing here samples what arrives
-/// inside a window, because a window that catches a delivery on an idle machine and misses it on a
-/// busy one proves nothing either way.
+/// A liveness bound is not a measurement. Every wait in this file but one is for a condition the
+/// session itself reports - a screen installed, an update carrying a line, a presentation the host
+/// names, a byte in the retained stream - and this bound is what a test that never reaches its
+/// condition fails at, rather than hanging. It is deliberately far outside the range the slowest
+/// host reaches under the load of every other suite beside it, so a test that is merely slow is
+/// not a failure. Nothing here samples what arrives inside a window, because a window that catches
+/// a delivery on an idle machine and misses it on a busy one proves nothing either way. The one
+/// exception is `HANDOFF_WINDOW`, which is about a product bound rather than about waiting.
 const LIVENESS_DEADLINE: Duration = Duration::from_secs(120);
 
 /// Section 8's live-forwarding handoff window, which an attachment mid-sequence outlives.
@@ -516,47 +517,23 @@ async fn collect_until_resync(client: &mut LocalClient, what: &str) -> Vec<Event
     .await
 }
 
-/// Collects until `enough` is satisfied, or until the session has told this client to resynchronise.
+/// Collects until `enough` is satisfied, or until this client is told to resynchronise instead.
 ///
 /// Those are the only two answers there are for a subscriber the session is keeping up with or has
-/// given up on, and a test that watched only the socket would wait out its whole deadline for the
-/// second one: a client told to resynchronise is sent nothing at all until it asks again. Which of
-/// the two arrived is then the caller's assertion rather than this wait's.
+/// given up on, and a test that waited only for the first would wait out its whole deadline for the
+/// second. The second is read from the socket rather than from the session, because the marker is
+/// queued behind whatever the subscriber has not read yet: a client whose queue has just filled is
+/// still owed every delivery already in it, and the session's own flag is set before those arrive.
+/// Which of the two answers came is then the caller's assertion rather than this wait's.
 async fn collect_until_drawn_or_told(
-    host: &Host,
-    attached: &mut Attached,
+    client: &mut LocalClient,
+    what: &str,
     mut enough: impl FnMut(&[Event]) -> bool,
 ) -> Vec<Event> {
-    let started = tokio::time::Instant::now();
-    let deadline = started + LIVENESS_DEADLINE;
-    let mut seen = Vec::new();
-    loop {
-        if enough(&seen)
-            || host
-                .runtime
-                .session()
-                .is_resynchronising(attached.attachment_id)
-        {
-            return seen;
-        }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "waited {:?} for this client to be drawn something or told to resynchronise: {seen:?}",
-            started.elapsed()
-        );
-        // The session's own answer can arrive while nothing is on the socket, so the wait on the
-        // socket is broken often enough to read it and never long enough to be a sampling window.
-        let tick = remaining.min(Duration::from_millis(50));
-        if let Ok(received) = tokio::time::timeout(tick, attached.client.recv()).await {
-            let frame = received.unwrap_or_else(|error| {
-                panic!("the connection ended while this client was being drawn: {error}")
-            });
-            if let ControlFrame::Notification(notification) = frame {
-                seen.push(decode(notification));
-            }
-        }
-    }
+    collect_until(client, what, |seen| {
+        enough(seen) || seen.iter().any(|event| matches!(event, Event::Resync(_)))
+    })
+    .await
 }
 
 /// Returns the resynchronisation marker a run of events carries.
@@ -599,14 +576,16 @@ fn updated_text(events: &[Event]) -> Vec<String> {
 ///
 /// A marker names what the *terminal* carried, which is not byte for byte what the application
 /// printed: the line discipline turns each line feed into a carriage return and a line feed, so a
-/// line the application ended with `\r\n` arrives as `\r\r\n`. Markers here therefore end at the
-/// first carriage return, which is the same in both.
+/// line the application ended with `\r\n` arrives as `\r\r\n` and one it ended with `\n` arrives
+/// as `\r\n`. A marker carries whichever of those the fixture produces, whole, because a marker
+/// stopping short of the line ending would be satisfied while a line feed that has still to scroll
+/// the grid is on its way.
 async fn produced(runtime: &SessionRuntime, marker: &[u8]) {
     let started = tokio::time::Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
     loop {
         let seen = retained(runtime);
-        if seen.windows(marker.len()).any(|window| window == marker) {
+        if carries(&seen, marker) {
             return;
         }
         assert!(
@@ -658,6 +637,25 @@ async fn resubscribe(host: &Host, attached: &mut Attached, from: u64) -> EventsS
         .expect("the subscription succeeds")
         .to_typed()
         .expect("decodes")
+}
+
+/// Returns whether `haystack` carries `needle`.
+fn carries(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// Returns the bytes of a run of output batches, end to end.
+///
+/// A marker a test is waiting for is a property of the stream rather than of one delivery, and a
+/// host that split it across two batches would be answering correctly; a condition that looked
+/// inside each batch on its own would wait for ever for something that had already arrived.
+fn joined(batches: &[(u64, Vec<u8>)]) -> Vec<u8> {
+    batches
+        .iter()
+        .flat_map(|(_, bytes)| bytes.iter().copied())
+        .collect()
 }
 
 /// Collects the output batches a client receives until `enough` is satisfied, with their cursors.
@@ -821,7 +819,7 @@ async fn a_snapshot_carries_the_state_of_a_screen_and_then_its_rows_in_pages() {
          printf '\\033[?1000h'; \
          printf '\\033[5;1H\\033H'; \
          printf '\\033)0'; \
-         sleep 20",
+         read -r _",
     )
     .await;
     // The last of those sequences, waited for rather than allowed a while: what the snapshot has
@@ -995,11 +993,16 @@ async fn a_snapshot_carries_the_state_of_a_screen_and_then_its_rows_in_pages() {
 /// KR-REQ-08.57, KR-REQ-08.83: ordinary output is a bounded update, never a repaint per batch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_projected_attachment_receives_bounded_updates_rather_than_a_repaint_per_batch() {
-    // Three separate batches. Nothing here is spaced by a timer: the application writes a line
-    // when this test types one, and the test types the next only once the update carrying the
-    // previous one has arrived, so each batch is a read of its own however slow the machine is.
-    let host = host("stty -echo; printf 'first\\r\\n'; exec cat").await;
-    produced(&host.runtime, b"first\r").await;
+    // Separate batches. Nothing here is spaced by a timer: the application writes a line when this
+    // test types one, and the test types the next only once the update carrying the previous one
+    // has arrived, so no two of them can be one production however slow the machine is.
+    //
+    // The last line is a fence rather than a batch under test. Every assertion below is about the
+    // whole of what this client was sent, and a repaint the session queued behind the third
+    // batch's update would escape a run that stopped at that update; the fence's own update cannot
+    // arrive before anything queued in front of it.
+    let host = host("stty -echo -echonl || exit 1; printf 'first\\r\\n'; exec cat").await;
+    produced(&host.runtime, b"first\r\r\n").await;
     let mut typist = typist(&host).await;
     let mut attached = attach(
         &host,
@@ -1008,7 +1011,7 @@ async fn a_projected_attachment_receives_bounded_updates_rather_than_a_repaint_p
     )
     .await;
     let mut events = collect_until_installed(&mut attached.client).await;
-    for batch in ["second", "third"] {
+    for batch in ["second", "third", "kr-fence"] {
         typist
             .type_bytes(&host, format!("{batch}\n").as_bytes())
             .await;
@@ -1081,12 +1084,12 @@ async fn a_projected_attachment_receives_bounded_updates_rather_than_a_repaint_p
 async fn subscribing_returns_the_state_at_a_cursor_and_queues_what_follows() {
     // The two halves of this are ordered by the test rather than by two sleeps hoping to land
     // between them: the application writes what came before this client when it is typed, and the
-    // line that follows the subscription only after the subscription has been answered.
-    let host = host("stty -echo; printf 'kr-ready\\r\\n'; exec cat").await;
-    produced(&host.runtime, b"kr-ready\r").await;
+    // line that follows only once the subscription has been answered.
+    let host = host("stty -echo -echonl || exit 1; printf 'kr-ready\\r\\n'; exec cat").await;
+    produced(&host.runtime, b"kr-ready\r\r\n").await;
     let mut typist = typist(&host).await;
     typist.type_bytes(&host, b"before anybody attached\n").await;
-    produced(&host.runtime, b"before anybody attached\r").await;
+    produced(&host.runtime, b"before anybody attached\r\n").await;
 
     let mut attached = attach(
         &host,
@@ -1099,16 +1102,20 @@ async fn subscribing_returns_the_state_at_a_cursor_and_queues_what_follows() {
         at > 0,
         "the session had produced output before this client arrived"
     );
-    let mut events = collect_until_installed(&mut attached.client).await;
+    // Written while the screen is still being installed, which is the half of this requirement a
+    // client attaching to a quiet session never reaches: what follows the cursor has to be queued
+    // behind the screen rather than folded into it or dropped for arriving too early.
     typist.type_bytes(&host, b"after\n").await;
-    events.extend(
-        collect_until(
-            &mut attached.client,
-            "the update for the output that followed the cursor",
-            |seen| updated_text(seen).iter().any(|row| row.contains("after")),
-        )
-        .await,
-    );
+    let events = collect_until(
+        &mut attached.client,
+        "the screen at the cursor and the update for the output that followed it",
+        |seen| {
+            seen.iter()
+                .any(|event| matches!(event, Event::Rows(page) if !page.more))
+                && updated_text(seen).iter().any(|row| row.contains("after"))
+        },
+    )
+    .await;
     let header = events
         .iter()
         .find_map(|event| match event {
@@ -1163,11 +1170,11 @@ async fn a_buffer_switch_sends_an_explicit_projection_reset() {
     // The application takes the screen when this test asks it to, rather than a fixed moment after
     // it started that an attachment has to be squeezed in before.
     let host = host(
-        "stty -echo; printf 'the shell\\r\\n'; read -r _; \
+        "stty -echo -echonl || exit 1; printf 'the shell\\r\\n'; read -r _; \
          printf '\\033[?1049h'; printf 'the application\\r\\n'; read -r _",
     )
     .await;
-    produced(&host.runtime, b"the shell\r").await;
+    produced(&host.runtime, b"the shell\r\r\n").await;
     let mut typist = typist(&host).await;
     let mut attached = attach(
         &host,
@@ -1241,7 +1248,7 @@ async fn a_projection_carries_no_side_effect_the_history_contained() {
     let host = host(
         "printf '\\a'; printf '\\033]52;c;c2VjcmV0\\033\\\\'; printf '\\033]99;;hello\\033\\\\'; \
          printf '\\033]2;a title\\033\\\\'; printf '\\033]8;;https://example.invalid/g\\033\\\\linked\\033]8;;\\033\\\\\\r\\n'; \
-         printf '\\033[c'; sleep 20",
+         printf '\\033[c'; read -r _",
     )
     .await;
     produced(&host.runtime, b"\x1b[c").await;
@@ -1257,7 +1264,10 @@ async fn a_projection_carries_no_side_effect_the_history_contained() {
     // notify, download, launch or ask anything, so the closure is the proof.
     for event in &events {
         assert!(
-            !matches!(event, Event::Other(_)),
+            matches!(
+                event,
+                Event::Reset(_) | Event::Snapshot(_) | Event::Rows(_) | Event::Delta(_)
+            ),
             "a projected client receives projection events and nothing else: {event:?}"
         );
     }
@@ -1297,10 +1307,10 @@ async fn a_projection_carries_no_side_effect_the_history_contained() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hyperlink_survives_a_reconnection_and_a_resize() {
     let host = host(
-        "printf '\\033]8;;https://example.invalid/guide\\033\\\\the guide\\033]8;;\\033\\\\\\r\\n'; sleep 20",
+        "printf '\\033]8;;https://example.invalid/guide\\033\\\\the guide\\033]8;;\\033\\\\\\r\\n'; read -r _",
     )
     .await;
-    produced(&host.runtime, b"the guide\x1b]8;;\x1b\\\r").await;
+    produced(&host.runtime, b"the guide\x1b]8;;\x1b\\\r\r\n").await;
 
     let link_of = |events: &[Event]| -> Vec<(u64, u64, u64, String)> {
         events
@@ -1392,8 +1402,8 @@ async fn a_hyperlink_survives_a_reconnection_and_a_resize() {
 /// grid inside the old window, and for an idle application nothing would ever correct it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_resize_draws_the_owners_fresh_screen_for_its_new_window() {
-    let host = host("printf 'before the resize\r\n'; sleep 20").await;
-    produced(&host.runtime, b"before the resize\r").await;
+    let host = host("printf 'before the resize\r\n'; read -r _").await;
+    produced(&host.runtime, b"before the resize\r\r\n").await;
     // An owner with no declared profile: it owns the size and is still projected, because nothing
     // qualifies it to be handed the stream. That is the attachment whose window a resize moves.
     let mut owner = attach_claiming(&host, Dimensions::new(CANONICAL.0, CANONICAL.1), None).await;
@@ -1462,8 +1472,8 @@ async fn a_resize_draws_the_owners_fresh_screen_for_its_new_window() {
 /// of the size that left, and for an idle application nothing would ever correct it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn succession_draws_the_remaining_client_for_the_size_it_inherits() {
-    let host = host("printf 'before the succession\r\n'; sleep 20").await;
-    produced(&host.runtime, b"before the succession\r").await;
+    let host = host("printf 'before the succession\r\n'; read -r _").await;
+    produced(&host.runtime, b"before the succession\r\r\n").await;
     // Two claiming attachments with no declared profile: the first owns the size, the second is
     // next in the order, and both are projected because nothing qualifies either for the stream.
     let owner = attach_claiming(&host, Dimensions::new(100, 30), None).await;
@@ -1537,7 +1547,7 @@ async fn succession_draws_the_remaining_client_for_the_size_it_inherits() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_palette_source_is_recorded_at_creation_and_succession_does_not_change_it() {
     let host = host_with(
-        "sleep 20",
+        "read -r _",
         Dimensions::new(CANONICAL.0, CANONICAL.1),
         Some(PaletteChoice::DarkPreset),
         1024 * 1024,
@@ -1610,7 +1620,7 @@ async fn each_palette_a_creation_can_name_is_recorded_as_what_it_was() {
         ),
     ] {
         let host = host_with(
-            "sleep 20",
+            "read -r _",
             Dimensions::new(CANONICAL.0, CANONICAL.1),
             Some(choice),
             1024 * 1024,
@@ -1686,9 +1696,11 @@ async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() 
     let mut quick = attach(&host, Dimensions::new(30, 8), Some("xterm-256color")).await;
 
     // The quick client keeps reading while the slow one does not read at all.
-    let seen = collect_until_drawn_or_told(&host, &mut quick, |seen| {
-        seen.iter().any(|event| matches!(event, Event::Delta(_)))
-    })
+    let seen = collect_until_drawn_or_told(
+        &mut quick.client,
+        "an update for the client that keeps up",
+        |seen| seen.iter().any(|event| matches!(event, Event::Delta(_))),
+    )
     .await;
     assert!(
         seen.iter().any(|event| matches!(event, Event::Delta(_))),
@@ -1725,10 +1737,14 @@ async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() 
     // resynchronise itself. Both are answers, and neither is a length of time: a client that has
     // been told to resynchronise is sent nothing until it asks again, so the session is watched
     // beside the socket rather than a window being given to whichever arrives first.
-    let after = collect_until_drawn_or_told(&host, &mut quick, |seen| {
-        seen.iter()
-            .any(|event| matches!(event, Event::Delta(_) | Event::Rows(_) | Event::Snapshot(_)))
-    })
+    let after = collect_until_drawn_or_told(
+        &mut quick.client,
+        "this client to be drawn the session or told it had fallen behind too",
+        |seen| {
+            seen.iter()
+                .any(|event| matches!(event, Event::Delta(_) | Event::Rows(_) | Event::Snapshot(_)))
+        },
+    )
     .await;
     // That the cursor moves is the assertion; how long it takes to move is the machine's business.
     // A window measured in seconds would be a second race beside the first one.
@@ -1816,9 +1832,9 @@ async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() 
 async fn the_viewport_names_the_first_row_of_the_page_and_a_scroll_moves_it() {
     // More lines than the grid has rows, so the page has moved off the first row.
     let host =
-        host("i=0; while [ $i -lt 60 ]; do printf 'row %d\\r\\n' $i; i=$((i+1)); done; sleep 20")
+        host("i=0; while [ $i -lt 60 ]; do printf 'row %d\\r\\n' $i; i=$((i+1)); done; read -r _")
             .await;
-    produced(&host.runtime, b"row 59\r").await;
+    produced(&host.runtime, b"row 59\r\r\n").await;
     let mut attached = attach(
         &host,
         Dimensions::new(SMALLER.0, SMALLER.1),
@@ -1870,18 +1886,20 @@ async fn presented_as(
 ) {
     let started = tokio::time::Instant::now();
     let deadline = started + LIVENESS_DEADLINE;
-    loop {
-        let reported = reported_presentation(host, client, attachment_id).await;
-        if reported == Some(expected) {
-            return;
+    // The whole loop is bounded, the answers inside it included: a request that is never answered
+    // is a hung test like any other, and a deadline checked only between two answers would never
+    // be reached.
+    let waited = tokio::time::timeout_at(deadline, async {
+        loop {
+            let reported = reported_presentation(host, client, attachment_id).await;
+            if reported == Some(expected) {
+                return reported;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "waited {:?} for {what}: the session reports {reported:?}",
-            started.elapsed()
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    })
+    .await;
+    assert!(waited.is_ok(), "waited {:?} for {what}", started.elapsed());
 }
 
 /// Reads what the session says about one attachment right now.
@@ -1921,11 +1939,11 @@ async fn subscribing_again_while_the_parser_is_mid_sequence_is_served_a_projecti
     // stays open while this test subscribes again. Each step waits for a line this test types, so
     // the sequence is open for exactly as long as the test needs it open.
     let host = host(
-        "stty -echo; printf 'settled\\r\\n'; read -r _; printf 'open\\033[1'; read -r _; \
-         printf 'm-closed\\r\\n'; read -r _",
+        "stty -echo -echonl || exit 1; printf 'settled\\r\\n'; read -r _; \
+         printf 'open\\033[1'; read -r _; printf 'm-closed\\r\\n'; read -r _",
     )
     .await;
-    produced(&host.runtime, b"settled\r").await;
+    produced(&host.runtime, b"settled\r\r\n").await;
     let mut attached = attach(
         &host,
         Dimensions::new(CANONICAL.0, CANONICAL.1),
@@ -1989,8 +2007,9 @@ async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() 
     // stream: the next byte it would be given is the middle of that sequence, and it stays that way
     // until this test says otherwise rather than for a second and a bit.
     let host = host(
-        "stty -echo; printf 'ready\\033[1'; read -r _; printf 'm-done\\r\\n'; read -r _; \
-         printf 'after-the-handoff\\r\\n'; read -r _",
+        "stty -echo -echonl || exit 1; printf 'ready\\033[1'; read -r _; \
+         printf 'm-done\\r\\n'; read -r _; printf 'after-the-handoff\\r\\n'; read -r _; \
+         printf 'kr-fence\\r\\n'; read -r _",
     )
     .await;
     produced(&host.runtime, b"ready\x1b[1").await;
@@ -2052,6 +2071,10 @@ async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() 
         "once the parser is on ground the terminal takes the stream",
     )
     .await;
+    // The boundary can be reached part of the way through the line that completes the sequence, so
+    // the whole of that line is waited for before a screen is asked for: a restoration taken
+    // between two halves of it would be the state at a cursor this test never named.
+    produced(&host.runtime, b"m-done\r\r\n").await;
     let boundary = resync_of(&held).cursor.get();
 
     // The client answers it the way the command does: it subscribes again. What it is handed is a
@@ -2070,27 +2093,25 @@ async fn an_attachment_stays_projected_until_a_parser_ground_boundary_arrives() 
         "with nothing missing: {:?}",
         again.gap
     );
-    // The screen arrives first, and the application writes again only afterwards, so what the
-    // restoration carried and what the live stream carried cannot be mistaken for one another
-    // whatever order a busy machine would otherwise have delivered them in.
+    // The application writes again with the subscription answered and the screen not yet read, so
+    // the screen carrying nothing of what came after its cursor is this host's answer rather than
+    // an application that had not got there yet.
+    typist.release(&host).await;
     let mut batches = collect_output_until(
         &mut attached.client,
-        "the terminal to be handed its screen as bytes now that it is direct",
-        |seen| !seen.is_empty(),
+        "the screen as bytes and the live stream the application wrote after the handoff",
+        |seen| carries(&joined(seen), b"after-the-handoff"),
     )
     .await;
+    // One more line, released only once the last one has arrived, so everything the session had
+    // queued behind it is here: a byte of the screen sent a second time as though it were live
+    // would otherwise be behind the assertion rather than inside it.
     typist.release(&host).await;
     batches.extend(
         collect_output_until(
             &mut attached.client,
-            "the live bytes the application wrote after the handoff",
-            |seen| {
-                seen.iter().any(|(_, bytes)| {
-                    bytes
-                        .windows(b"after-the-handoff".len())
-                        .any(|window| window == b"after-the-handoff")
-                })
-            },
+            "the line after it, which is this run's fence",
+            |seen| carries(&joined(seen), b"kr-fence"),
         )
         .await,
     );
@@ -2296,7 +2317,8 @@ fn installed_rows(events: &[Event], buffer: ProjectedBuffer) -> Vec<(u64, String
 /// before the screen is taken away, however long the window takes to arrange.
 fn alternate_after(lines: u32) -> String {
     format!(
-        "stty -echo; i=0; while [ $i -lt {lines} ]; do printf 'line %d\r\n' $i; i=$((i+1)); done; \
+        "stty -echo -echonl || exit 1; \
+         i=0; while [ $i -lt {lines} ]; do printf 'line %d\r\n' $i; i=$((i+1)); done; \
          read -r _; printf '\x1b[?1049h'; read -r _"
     )
 }
@@ -2304,7 +2326,7 @@ fn alternate_after(lines: u32) -> String {
 /// A session that has printed `lines` numbered lines and is then idle.
 fn numbered(lines: u32) -> String {
     format!(
-        "i=0; while [ $i -lt {lines} ]; do printf 'line %d\\r\\n' $i; i=$((i+1)); done; sleep 20"
+        "i=0; while [ $i -lt {lines} ]; do printf 'line %d\\r\\n' $i; i=$((i+1)); done; read -r _"
     )
 }
 
@@ -2319,7 +2341,7 @@ async fn a_viewport_above_the_live_page_installs_the_pages_that_cover_it() {
         1024 * 1024,
     )
     .await;
-    produced(&host.runtime, b"line 399\r").await;
+    produced(&host.runtime, b"line 399\r\r\n").await;
 
     let window = Dimensions::new(SMALLER.0, SMALLER.1);
     let mut watcher = attach(&host, window, Some("xterm-256color")).await;
@@ -2441,7 +2463,7 @@ async fn a_viewport_that_names_an_evicted_row_is_given_the_oldest_page_and_the_m
         1024 * 1024,
     )
     .await;
-    produced(&host.runtime, b"line 4499\r").await;
+    produced(&host.runtime, b"line 4499\r\r\n").await;
 
     let window = Dimensions::new(SMALLER.0, SMALLER.1);
     let mut watcher = attach(&host, window, Some("xterm-256color")).await;
@@ -2513,13 +2535,13 @@ async fn a_viewport_that_names_an_evicted_row_is_given_the_oldest_page_and_the_m
 async fn a_hyperlink_and_a_selection_in_history_survive_a_reconnection() {
     let host = host_with(
         "printf '\\033]8;;https://example.invalid/deep\\033\\\\the deep link\\033]8;;\\033\\\\\\r\\n'; \
-         i=0; while [ $i -lt 200 ]; do printf 'line %d\\r\\n' $i; i=$((i+1)); done; sleep 20",
+         i=0; while [ $i -lt 200 ]; do printf 'line %d\\r\\n' $i; i=$((i+1)); done; read -r _",
         Dimensions::new(CANONICAL.0, CANONICAL.1),
         None,
         1024 * 1024,
     )
     .await;
-    produced(&host.runtime, b"line 199\r").await;
+    produced(&host.runtime, b"line 199\r\r\n").await;
 
     // Everything one page carries about its cells: the row, each run's column, its width and its
     // text, and the link over it. A copy selection reads exactly this.
@@ -2623,7 +2645,7 @@ async fn scrolling_back_does_not_seize_the_input_lease() {
         1024 * 1024,
     )
     .await;
-    produced(&host.runtime, b"line 299\r").await;
+    produced(&host.runtime, b"line 299\r\r\n").await;
 
     // One attachment that types, and one that watches. The watcher scrolls.
     let mut typist = attach_with_input(&host, Dimensions::new(CANONICAL.0, CANONICAL.1)).await;
@@ -2716,7 +2738,7 @@ async fn an_attachment_shown_only_the_live_screen_cannot_look_above_it() {
         1024 * 1024,
     )
     .await;
-    produced(&host.runtime, b"line 299\r").await;
+    produced(&host.runtime, b"line 299\r\r\n").await;
 
     let window = Dimensions::new(SMALLER.0, SMALLER.1);
     let mut watcher = attach(&host, window, Some("xterm-256color")).await;
@@ -2764,7 +2786,7 @@ async fn a_terminal_reading_its_history_is_served_the_grid_rather_than_the_strea
         1024 * 1024,
     )
     .await;
-    produced(&host.runtime, b"line 299\r").await;
+    produced(&host.runtime, b"line 299\r\r\n").await;
 
     // The session's own size and a qualified profile: this terminal takes the stream directly.
     let canonical = Dimensions::new(CANONICAL.0, CANONICAL.1);
@@ -2819,7 +2841,7 @@ async fn a_window_above_the_live_page_says_where_the_live_screen_begins() {
         1024 * 1024,
     )
     .await;
-    produced(&host.runtime, b"line 299\r").await;
+    produced(&host.runtime, b"line 299\r\r\n").await;
 
     let window = Dimensions::new(SMALLER.0, SMALLER.1);
     let mut watcher = attach(&host, window, Some("xterm-256color")).await;
@@ -2881,7 +2903,7 @@ async fn a_window_too_large_for_this_queue_is_refused_rather_than_resynchronised
         1024 * 1024,
     )
     .await;
-    produced(&host.runtime, b"line 399\r").await;
+    produced(&host.runtime, b"line 399\r\r\n").await;
 
     let window = Dimensions::new(SMALLER.0, SMALLER.1);
     let mut watcher = attach(&host, window, Some("xterm-256color")).await;
@@ -2958,7 +2980,7 @@ async fn a_buffer_switch_brings_every_window_back_to_the_live_screen() {
         1024 * 1024,
     )
     .await;
-    produced(&host.runtime, b"line 299\r").await;
+    produced(&host.runtime, b"line 299\r\r\n").await;
     let mut typist = typist(&host).await;
 
     let window = Dimensions::new(SMALLER.0, SMALLER.1);
@@ -3030,7 +3052,7 @@ async fn a_buffer_switch_reaches_a_window_whose_client_is_behind() {
         1024 * 1024,
     )
     .await;
-    produced(&host.runtime, b"line 299\r").await;
+    produced(&host.runtime, b"line 299\r\r\n").await;
     let mut typist = typist(&host).await;
 
     let window = Dimensions::new(SMALLER.0, SMALLER.1);
