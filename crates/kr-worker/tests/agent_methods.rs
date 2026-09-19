@@ -16,7 +16,7 @@ use kr_protocol::broker::{
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{
     DeclarativeEntry, DeclarativeTable, NativeFraming, NativeMethodClass, PendingState,
-    RichMethodTable,
+    RichMethodTable, RichOperation,
 };
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
@@ -112,8 +112,12 @@ fn projection() -> DecodedProjection {
     }
 }
 
+fn package() -> PluginId {
+    PluginId::new("kalareach.codex").expect("valid")
+}
+
 fn table() -> DeclarativeTable {
-    DeclarativeTable {
+    let mut table = DeclarativeTable {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
         publisher_id: PublisherId::new("kalareach").expect("valid"),
         table_version: MethodTableVersion::new(1),
@@ -130,9 +134,12 @@ fn table() -> DeclarativeTable {
             method: method("session/request_permission"),
             class: NativeMethodClass::Mutation,
             expects_response: true,
+            approval_option_field: Nullable::some("option_id".to_owned()),
             reverse: Nullable::null(),
         }],
-    }
+    };
+    table.digest = table.canonical_digest().expect("encodable");
+    table
 }
 
 fn rich() -> RichMethodTable {
@@ -143,6 +150,7 @@ fn rich() -> RichMethodTable {
             method: method("session/cancel"),
             class: NativeMethodClass::Mutation,
             required_right: ActionRight::AgentCancel,
+            operation: Nullable::some(RichOperation::TurnCancel),
             provenance: ActionProvenance::UpstreamTypedRpc,
         }],
     }
@@ -261,14 +269,15 @@ fn agent_broker() -> Broker {
             TimestampMs::new(1),
         )
         .expect("the binding is recorded");
-    broker.pin_table(instance(), &table());
+    broker
+        .pin_table(instance(), table(), rich())
+        .expect("the installed tables are pinned");
     broker
         .open_native_connection(
             instance(),
             &CREDENTIAL,
             &process_identity(),
-            table(),
-            rich(),
+            &package(),
             "1",
         )
         .expect("the native connection is authenticated");
@@ -403,7 +412,7 @@ fn kr_req_23_39_an_agent_read_names_the_instance_carries_its_evidence_and_report
 /// KR-REQ-23.40 and KR-REQ-12.06: the five agent mutations have five distinct rights, and every
 /// one of them refuses a revision that is not the one in force.
 #[test]
-fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding() {
+fn kr_req_23_40_the_five_mutations_carry_the_registrys_rights_and_check_their_binding() {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     broker
@@ -493,7 +502,7 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
         .expect("the cancellation applies");
 
     // Each of those reached the upstream, with the operation it was for.
-    let submitted: Vec<kr_worker::broker::UpstreamOperation> = upstream
+    let submitted: Vec<kr_protocol::gateway::RichOperation> = upstream
         .submitted()
         .into_iter()
         .map(|request| request.operation)
@@ -501,10 +510,10 @@ fn kr_req_23_40_the_five_mutations_have_distinct_rights_and_check_their_binding(
     assert_eq!(
         submitted,
         vec![
-            kr_worker::broker::UpstreamOperation::PromptSubmit,
-            kr_worker::broker::UpstreamOperation::PromptQueue,
-            kr_worker::broker::UpstreamOperation::TurnSteer,
-            kr_worker::broker::UpstreamOperation::TurnCancel,
+            kr_protocol::gateway::RichOperation::PromptSubmit,
+            kr_protocol::gateway::RichOperation::PromptQueue,
+            kr_protocol::gateway::RichOperation::TurnSteer,
+            kr_protocol::gateway::RichOperation::TurnCancel,
         ],
         "a mutation that reports success is one that reached the upstream"
     );
@@ -1039,7 +1048,7 @@ fn kr_req_11_22_one_admission_carries_every_check_and_the_transport_it_will_use(
     );
     assert_eq!(
         admitted.request().operation,
-        kr_worker::broker::UpstreamOperation::PromptSubmit
+        kr_protocol::gateway::RichOperation::PromptSubmit
     );
     assert!(
         upstream.submitted().is_empty(),

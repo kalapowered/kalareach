@@ -25,7 +25,7 @@ use kr_protocol::agent::{
 };
 use kr_protocol::authority::EffectClass;
 use kr_protocol::broker::{ActionName, ActionProvenance, ActionToken, BrokerGrant};
-use kr_protocol::gateway::PendingState;
+use kr_protocol::gateway::{PendingState, RichOperation};
 use kr_protocol::ids::{
     ActorId, AgentBindingRevision, ApplicationInstanceId, BrokerBindingId, CapabilityId, GrantId,
     SessionId, StreamCursor,
@@ -38,44 +38,6 @@ use crate::broker::semantic::HistoryFilter;
 use crate::broker::tokens::Invocation;
 use crate::broker::{Broker, DispatchAdmission};
 
-/// What one agent mutation asks of the upstream.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum UpstreamOperation {
-    /// Submit a prompt now.
-    PromptSubmit,
-    /// Queue a prompt behind the current turn.
-    PromptQueue,
-    /// Steer the turn that is running.
-    TurnSteer,
-    /// Cancel the turn that is running.
-    TurnCancel,
-    /// Answer a pending approval.
-    ApprovalRespond,
-    /// Invoke a registered plugin action.
-    PluginAction,
-}
-
-impl UpstreamOperation {
-    /// Returns the stable name.
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::PromptSubmit => "prompt.submit",
-            Self::PromptQueue => "prompt.queue",
-            Self::TurnSteer => "turn.steer",
-            Self::TurnCancel => "turn.cancel",
-            Self::ApprovalRespond => "approval.respond",
-            Self::PluginAction => "plugin.action",
-        }
-    }
-}
-
-impl core::fmt::Display for UpstreamOperation {
-    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
 /// One prepared operation, on its way to the upstream.
 #[derive(Clone, Debug)]
 pub struct UpstreamRequest {
@@ -84,7 +46,7 @@ pub struct UpstreamRequest {
     /// The binding revision it was admitted at.
     pub binding_revision: kr_protocol::ids::AgentBindingRevision,
     /// What it asks for.
-    pub operation: UpstreamOperation,
+    pub operation: RichOperation,
     /// The turn it acts on, where it acts on one.
     pub turn_id: Option<kr_protocol::ids::AgentTurnId>,
     /// What the operation is, with everything the connector needs to encode it.
@@ -477,7 +439,7 @@ impl Broker {
         caller: &Caller,
         target: &AgentMutationTarget,
         capability: &str,
-        operation: UpstreamOperation,
+        operation: RichOperation,
         turn_id: Option<kr_protocol::ids::AgentTurnId>,
         body: UpstreamBody,
         now: TimestampMs,
@@ -511,9 +473,9 @@ impl Broker {
     ) -> Result<MutationAdmission> {
         params.validate().map_err(BrokerError::invalid)?;
         let (capability, operation) = if queued {
-            ("agent.prompt.queue", UpstreamOperation::PromptQueue)
+            ("agent.prompt.queue", RichOperation::PromptQueue)
         } else {
-            ("agent.prompt", UpstreamOperation::PromptSubmit)
+            ("agent.prompt", RichOperation::PromptSubmit)
         };
         self.admit_mutation(
             caller,
@@ -544,7 +506,7 @@ impl Broker {
             caller,
             &params.target,
             "agent.steer",
-            UpstreamOperation::TurnSteer,
+            RichOperation::TurnSteer,
             Some(params.turn_id.clone()),
             UpstreamBody::Steer {
                 text: params.text.as_str().to_owned(),
@@ -568,7 +530,7 @@ impl Broker {
             caller,
             &params.target,
             "agent.cancel",
-            UpstreamOperation::TurnCancel,
+            RichOperation::TurnCancel,
             Some(params.turn_id.clone()),
             UpstreamBody::Cancel,
             now,
@@ -684,7 +646,7 @@ impl Broker {
         let admitted = state.admit_mutation_in(
             &params.target,
             Some(capability_id),
-            UpstreamOperation::ApprovalRespond,
+            RichOperation::ApprovalRespond,
             None,
             responsible,
             UpstreamBody::Cancel,
@@ -791,7 +753,7 @@ impl Broker {
         let admitted = state.admit_mutation_in(
             &params.target,
             registered.capability.clone(),
-            UpstreamOperation::PluginAction,
+            RichOperation::PluginAction,
             None,
             Responsible::Binding(binding_id),
             UpstreamBody::PluginAction {
@@ -882,7 +844,7 @@ impl Broker {
         caller: &Caller,
         target: &AgentMutationTarget,
         capability: &str,
-        action: UpstreamOperation,
+        action: RichOperation,
         turn_id: Option<kr_protocol::ids::AgentTurnId>,
         now: TimestampMs,
     ) -> Result<()> {
@@ -911,7 +873,7 @@ impl Broker {
             .admit_mutation_in(
                 target,
                 None,
-                UpstreamOperation::PluginAction,
+                RichOperation::PluginAction,
                 None,
                 Responsible::Transport,
                 UpstreamBody::Cancel,
@@ -1041,7 +1003,7 @@ impl Broker {
         state.admit_mutation_in(
             &params.target,
             registered.capability.clone(),
-            UpstreamOperation::PluginAction,
+            RichOperation::PluginAction,
             None,
             Responsible::Binding(binding_id),
             UpstreamBody::Cancel,

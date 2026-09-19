@@ -6199,6 +6199,17 @@
       "additionalProperties": false,
       "description": "One entry of a connector's declarative table.",
       "properties": {
+        "approval_option_field": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The member of a response's result that carries the decision, for a method a person answers.\n\nAn approval's answer is written by the core, so the core has to know the shape the upstream\nreads. Protocols disagree about it: one wants `{\"option_id\": \"allow\"}` and the next wants\n`{\"behavior\": \"allow\"}`. The qualified table states the member name, and a method that\nnames none is one this host will not write an answer for."
+        },
         "class": {
           "$ref": "#/$defs/NativeMethodClass",
           "description": "What it does."
@@ -6227,7 +6238,8 @@
         "method",
         "class",
         "expects_response",
-        "reverse"
+        "reverse",
+        "approval_option_field"
       ],
       "type": "object"
     },
@@ -22334,6 +22346,17 @@
           "$ref": "#/$defs/UpstreamMethod",
           "description": "The upstream method."
         },
+        "operation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/RichOperation"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The operation this method is, where it is one of the core's own.\n\nA table may also list a method that no core operation encodes, which is why this is\noptional: it is listed so the method is admissible, not so the core will send it."
+        },
         "provenance": {
           "$ref": "#/$defs/ActionProvenance",
           "description": "How a successful invocation's provenance is recorded."
@@ -22347,6 +22370,7 @@
         "method",
         "class",
         "required_right",
+        "operation",
         "provenance"
       ],
       "type": "object"
@@ -22377,6 +22401,41 @@
         "entries"
       ],
       "type": "object"
+    },
+    "RichOperation": {
+      "description": "One operation the core carries to an upstream on a person's behalf.\n\nSection 23 gives the five agent mutations five separate rights, and two of them share one:\nsubmitting a prompt, queueing one and steering a turn all need `agent.prompt`. The right is\ntherefore not what names the upstream method, and this is: a table says which of its methods\neach operation is, so submitting a prompt cannot encode as steering a turn.",
+      "oneOf": [
+        {
+          "const": "prompt_submit",
+          "description": "Submit a prompt now.",
+          "type": "string"
+        },
+        {
+          "const": "prompt_queue",
+          "description": "Queue a prompt behind the current turn.",
+          "type": "string"
+        },
+        {
+          "const": "turn_steer",
+          "description": "Steer the turn that is running.",
+          "type": "string"
+        },
+        {
+          "const": "turn_cancel",
+          "description": "Cancel the turn that is running.",
+          "type": "string"
+        },
+        {
+          "const": "approval_respond",
+          "description": "Answer a pending approval.",
+          "type": "string"
+        },
+        {
+          "const": "plugin_action",
+          "description": "Invoke a registered plugin action.\n\nThis one is named by the action the package declared rather than by the table, because the\naction *is* the method. The table still has to list it, so an unknown rich mutation is\nrejected rather than guessed at.",
+          "type": "string"
+        }
+      ]
     },
     "RightCondition": {
       "description": "When a required authority applies.",

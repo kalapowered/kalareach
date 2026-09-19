@@ -39,6 +39,9 @@ use crate::session::Durability;
 /// A table is a contract a person can read, not a dump of a vendor's surface.
 pub const MAX_TABLE_METHODS: usize = 256;
 
+/// The domain a declarative table's content digest is separated by.
+pub const DECLARATIVE_TABLE_DOMAIN: &str = "kr-declarative-table/1";
+
 // ---------------------------------------------------------------------------------------------
 // Classification
 // ---------------------------------------------------------------------------------------------
@@ -193,6 +196,13 @@ pub struct DeclarativeEntry {
     /// the protocol, so the qualified table states it rather than leaving the core to guess from a
     /// method name.
     pub reverse: Nullable<ReverseOperation>,
+    /// The member of a response's result that carries the decision, for a method a person answers.
+    ///
+    /// An approval's answer is written by the core, so the core has to know the shape the upstream
+    /// reads. Protocols disagree about it: one wants `{"option_id": "allow"}` and the next wants
+    /// `{"behavior": "allow"}`. The qualified table states the member name, and a method that
+    /// names none is one this host will not write an answer for.
+    pub approval_option_field: Nullable<String>,
 }
 
 /// A connector's qualified declarative table.
@@ -260,6 +270,89 @@ impl DeclarativeTable {
             .iter()
             .find(|entry| &entry.method == method)
             .and_then(|entry| entry.reverse.as_ref().copied())
+    }
+
+    /// Returns the member an answer to one method carries the decision in.
+    #[must_use]
+    pub fn approval_option_field(&self, method: &UpstreamMethod) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|entry| &entry.method == method)
+            .and_then(|entry| entry.approval_option_field.as_ref())
+            .map(String::as_str)
+    }
+
+    /// Returns the digest of everything this table says about the protocol.
+    ///
+    /// It covers every semantic field: the framing, the member names the core reads a frame by,
+    /// and each entry's method, class, response expectation, reverse operation and answer shape.
+    /// It does not cover the [`digest`](Self::digest) member itself, which is where this value is
+    /// recorded.
+    ///
+    /// The reason it exists is the one section 11 states: a table is qualified under the
+    /// publisher's semantic trust grant, and a qualification has to name what was qualified.
+    /// A digest over labels alone would let a package keep the digest of a qualified table while
+    /// changing what the core does with its frames.
+    ///
+    /// # Errors
+    ///
+    /// Returns a CBOR error when a field cannot be represented in KR-CBOR-1.
+    pub fn canonical_digest(&self) -> Result<Digest256, kr_cbor::CborError> {
+        let mut covered = kr_cbor::CanonicalMap::new();
+        covered.insert(
+            "entries".to_owned(),
+            kr_cbor::to_canonical_value(&self.entries)?,
+        )?;
+        covered.insert(
+            "error_field".to_owned(),
+            kr_cbor::to_canonical_value(&self.error_field)?,
+        )?;
+        covered.insert(
+            "framing".to_owned(),
+            kr_cbor::to_canonical_value(&self.framing)?,
+        )?;
+        covered.insert(
+            "method_field".to_owned(),
+            kr_cbor::to_canonical_value(&self.method_field)?,
+        )?;
+        covered.insert(
+            "params_field".to_owned(),
+            kr_cbor::to_canonical_value(&self.params_field)?,
+        )?;
+        covered.insert(
+            "plugin_id".to_owned(),
+            kr_cbor::to_canonical_value(&self.plugin_id)?,
+        )?;
+        covered.insert(
+            "publisher_id".to_owned(),
+            kr_cbor::to_canonical_value(&self.publisher_id)?,
+        )?;
+        covered.insert(
+            "request_id_field".to_owned(),
+            kr_cbor::to_canonical_value(&self.request_id_field)?,
+        )?;
+        covered.insert(
+            "response_id_field".to_owned(),
+            kr_cbor::to_canonical_value(&self.response_id_field)?,
+        )?;
+        covered.insert(
+            "result_field".to_owned(),
+            kr_cbor::to_canonical_value(&self.result_field)?,
+        )?;
+        covered.insert(
+            "table_version".to_owned(),
+            kr_cbor::to_canonical_value(&self.table_version)?,
+        )?;
+        covered.insert(
+            "upstream_protocol_version".to_owned(),
+            kr_cbor::to_canonical_value(&self.upstream_protocol_version)?,
+        )?;
+        Ok(Digest256::from_bytes(kr_cbor::sha256(&kr_cbor::encode(
+            &kr_cbor::signing_value(
+                DECLARATIVE_TABLE_DOMAIN,
+                vec![kr_cbor::CanonicalValue::Map(covered)],
+            ),
+        ))))
     }
 
     /// Classifies one upstream method.
@@ -346,6 +439,25 @@ impl DeclarativeTable {
         {
             return Err(TableError::Unordered);
         }
+        for entry in &self.entries {
+            if entry
+                .approval_option_field
+                .as_ref()
+                .is_some_and(String::is_empty)
+            {
+                return Err(TableError::MissingField {
+                    field: "approval_option_field",
+                });
+            }
+        }
+        // And the digest names this table's own content. Without this the digest is a label a
+        // package chooses, and every later comparison of it says only that the label is unchanged.
+        let computed = self
+            .canonical_digest()
+            .map_err(|_| TableError::Unrepresentable)?;
+        if computed != self.digest {
+            return Err(TableError::DigestMismatch);
+        }
         Ok(())
     }
 
@@ -400,6 +512,18 @@ pub enum TableError {
     /// The entries were not in ascending method order.
     #[error("a table's entries must be in ascending method order")]
     Unordered,
+    /// The recorded digest is not the digest of what the table says.
+    #[error("this table's digest is not the digest of the protocol semantics it declares")]
+    DigestMismatch,
+    /// A field of the table cannot be represented canonically, so it cannot be digested.
+    #[error("this table carries a field that cannot be encoded canonically")]
+    Unrepresentable,
+    /// Two methods claimed one of the core's own operations.
+    #[error("a table names one method for {operation} and this one names several")]
+    RepeatedOperation {
+        /// The operation that was claimed twice.
+        operation: RichOperation,
+    },
     /// The table is pinned to another upstream version.
     #[error("this table is pinned to upstream protocol {pinned} and {installed} is installed")]
     VersionMismatch {
@@ -414,6 +538,74 @@ pub enum TableError {
 // The closed rich method table
 // ---------------------------------------------------------------------------------------------
 
+/// One operation the core carries to an upstream on a person's behalf.
+///
+/// Section 23 gives the five agent mutations five separate rights, and two of them share one:
+/// submitting a prompt, queueing one and steering a turn all need `agent.prompt`. The right is
+/// therefore not what names the upstream method, and this is: a table says which of its methods
+/// each operation is, so submitting a prompt cannot encode as steering a turn.
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum RichOperation {
+    /// Submit a prompt now.
+    PromptSubmit,
+    /// Queue a prompt behind the current turn.
+    PromptQueue,
+    /// Steer the turn that is running.
+    TurnSteer,
+    /// Cancel the turn that is running.
+    TurnCancel,
+    /// Answer a pending approval.
+    ApprovalRespond,
+    /// Invoke a registered plugin action.
+    ///
+    /// This one is named by the action the package declared rather than by the table, because the
+    /// action *is* the method. The table still has to list it, so an unknown rich mutation is
+    /// rejected rather than guessed at.
+    PluginAction,
+}
+
+impl RichOperation {
+    /// Every operation.
+    pub const ALL: &'static [Self] = &[
+        Self::PromptSubmit,
+        Self::PromptQueue,
+        Self::TurnSteer,
+        Self::TurnCancel,
+        Self::ApprovalRespond,
+        Self::PluginAction,
+    ];
+
+    /// Returns the stable name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PromptSubmit => "prompt.submit",
+            Self::PromptQueue => "prompt.queue",
+            Self::TurnSteer => "turn.steer",
+            Self::TurnCancel => "turn.cancel",
+            Self::ApprovalRespond => "approval.respond",
+            Self::PluginAction => "plugin.action",
+        }
+    }
+
+    /// Returns true when a table entry names this operation.
+    ///
+    /// A plugin action is named by its own action name, so no entry claims it as an operation.
+    #[must_use]
+    pub const fn is_named_by_the_table(self) -> bool {
+        !matches!(self, Self::PluginAction)
+    }
+}
+
+impl fmt::Display for RichOperation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// One entry of the closed rich method table.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -424,6 +616,11 @@ pub struct RichMethodEntry {
     pub class: NativeMethodClass,
     /// The right an actor must hold to invoke it through the gateway.
     pub required_right: ActionRight,
+    /// The operation this method is, where it is one of the core's own.
+    ///
+    /// A table may also list a method that no core operation encodes, which is why this is
+    /// optional: it is listed so the method is admissible, not so the core will send it.
+    pub operation: Nullable<RichOperation>,
     /// How a successful invocation's provenance is recorded.
     pub provenance: ActionProvenance,
 }
@@ -472,6 +669,35 @@ impl RichMethodTable {
         Ok(entry)
     }
 
+    /// Returns the admitted entry for one core operation.
+    ///
+    /// This is the only way the core chooses what to send. It is by operation rather than by the
+    /// right the operation needs, because three operations share one right and sending any of the
+    /// three as another is sending something nobody asked for.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RichRejection::NoOperation`] when the table names no method for the operation or
+    /// names more than one, and whatever [`RichMethodTable::admit`] refuses for the method found.
+    pub fn for_operation(
+        &self,
+        operation: RichOperation,
+    ) -> Result<&RichMethodEntry, RichRejection> {
+        let mut found = self
+            .entries
+            .iter()
+            .filter(|entry| entry.operation.as_ref() == Some(&operation));
+        let entry = found
+            .next()
+            .ok_or(RichRejection::NoOperation { operation })?;
+        // Two methods for one operation is a table that does not say what to send, and picking
+        // the first would make the answer depend on the order somebody wrote it in.
+        if found.next().is_some() {
+            return Err(RichRejection::NoOperation { operation });
+        }
+        self.admit(&entry.method)
+    }
+
     /// Checks that the table is well formed and pinned to the installed upstream version.
     ///
     /// # Errors
@@ -493,6 +719,23 @@ impl RichMethodTable {
             .all(|pair| pair[0].method < pair[1].method)
         {
             return Err(TableError::Unordered);
+        }
+        // One operation, one method. A table that names two methods for submitting a prompt does
+        // not say which one to send, and the core will not choose for it.
+        for operation in RichOperation::ALL
+            .iter()
+            .filter(|operation| operation.is_named_by_the_table())
+        {
+            let named = self
+                .entries
+                .iter()
+                .filter(|entry| entry.operation.as_ref() == Some(operation))
+                .count();
+            if named > 1 {
+                return Err(TableError::RepeatedOperation {
+                    operation: *operation,
+                });
+            }
         }
         if self.upstream_protocol_version == installed_protocol_version {
             Ok(())
@@ -519,6 +762,12 @@ pub enum RichRejection {
     Unsupported {
         /// The method that was named.
         method: UpstreamMethod,
+    },
+    /// The table names no single method for one of the core's own operations.
+    #[error("this upstream's rich table names no one method for {operation}")]
+    NoOperation {
+        /// The operation the core was asked to encode.
+        operation: RichOperation,
     },
 }
 
@@ -978,7 +1227,7 @@ mod tests {
     }
 
     fn table() -> DeclarativeTable {
-        DeclarativeTable {
+        let mut table = DeclarativeTable {
             plugin_id: PluginId::new("kalareach.codex").expect("valid"),
             publisher_id: PublisherId::new("kalareach").expect("valid"),
             table_version: MethodTableVersion::new(1),
@@ -997,15 +1246,19 @@ mod tests {
                     class: NativeMethodClass::Mutation,
                     expects_response: true,
                     reverse: Nullable::null(),
+                    approval_option_field: Nullable::some("option_id".to_owned()),
                 },
                 DeclarativeEntry {
                     method: method("session/update"),
                     class: NativeMethodClass::Observation,
                     expects_response: false,
                     reverse: Nullable::null(),
+                    approval_option_field: Nullable::null(),
                 },
             ],
-        }
+        };
+        table.digest = table.canonical_digest().expect("encodable");
+        table
     }
 
     #[test]
@@ -1077,12 +1330,14 @@ mod tests {
                     method: method("session/cancel"),
                     class: NativeMethodClass::Mutation,
                     required_right: ActionRight::AgentCancel,
+                    operation: Nullable::some(RichOperation::TurnCancel),
                     provenance: ActionProvenance::UpstreamTypedRpc,
                 },
                 RichMethodEntry {
                     method: method("session/set_provider_key"),
                     class: NativeMethodClass::Unsupported,
                     required_right: ActionRight::AgentPrompt,
+                    operation: Nullable::some(RichOperation::PromptSubmit),
                     provenance: ActionProvenance::UpstreamTypedRpc,
                 },
             ],

@@ -36,7 +36,7 @@ fn trust() -> DecodingTrust {
 }
 
 fn table() -> DeclarativeTable {
-    DeclarativeTable {
+    let mut table = DeclarativeTable {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
         publisher_id: PublisherId::new("kalareach").expect("valid"),
         table_version: MethodTableVersion::new(1),
@@ -54,16 +54,20 @@ fn table() -> DeclarativeTable {
                 method: method("fs/write_text_file"),
                 class: NativeMethodClass::Mutation,
                 expects_response: true,
+                approval_option_field: Nullable::null(),
                 reverse: Nullable::null(),
             },
             DeclarativeEntry {
                 method: method("session/update"),
                 class: NativeMethodClass::Observation,
                 expects_response: false,
+                approval_option_field: Nullable::null(),
                 reverse: Nullable::null(),
             },
         ],
-    }
+    };
+    table.digest = table.canonical_digest().expect("encodable");
+    table
 }
 
 /// KR-REQ-11.35: the declarative table is not something a fence or a component fault can reach.

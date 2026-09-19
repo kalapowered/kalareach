@@ -13,7 +13,7 @@ use kr_protocol::broker::{
 };
 use kr_protocol::gateway::{
     DeclarativeEntry, DeclarativeTable, DownstreamRequestId, NativeFraming, NativeMethodClass,
-    PendingKind, PendingResource, PendingState, RichMethodEntry, RichMethodTable,
+    PendingKind, PendingResource, PendingState, RichMethodEntry, RichMethodTable, RichOperation,
 };
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
@@ -185,8 +185,12 @@ fn invocation(instance_id: ApplicationInstanceId, revision: u64, action: &str) -
     }
 }
 
+fn package() -> PluginId {
+    PluginId::new("kalareach.codex").expect("valid")
+}
+
 fn declarative_table() -> DeclarativeTable {
-    DeclarativeTable {
+    let mut table = DeclarativeTable {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
         publisher_id: PublisherId::new("kalareach").expect("valid"),
         table_version: MethodTableVersion::new(1),
@@ -204,16 +208,20 @@ fn declarative_table() -> DeclarativeTable {
                 method: permission_method(),
                 class: NativeMethodClass::Mutation,
                 expects_response: true,
+                approval_option_field: Nullable::some("option_id".to_owned()),
                 reverse: Nullable::null(),
             },
             DeclarativeEntry {
                 method: UpstreamMethod::new("session/update").expect("valid"),
                 class: NativeMethodClass::Observation,
                 expects_response: false,
+                approval_option_field: Nullable::null(),
                 reverse: Nullable::null(),
             },
         ],
-    }
+    };
+    table.digest = table.canonical_digest().expect("encodable");
+    table
 }
 
 fn rich_table() -> RichMethodTable {
@@ -224,6 +232,7 @@ fn rich_table() -> RichMethodTable {
             method: UpstreamMethod::new("session/cancel").expect("valid"),
             class: NativeMethodClass::Mutation,
             required_right: ActionRight::AgentCancel,
+            operation: Nullable::some(RichOperation::TurnCancel),
             provenance: ActionProvenance::UpstreamTypedRpc,
         }],
     }
@@ -252,14 +261,15 @@ fn broker_with(grants: BrokerGrants, decoding: Option<DecodingTrust>) -> Broker 
             TimestampMs::new(1),
         )
         .expect("the binding is recorded");
-    broker.pin_table(instance(2), &declarative_table());
+    broker
+        .pin_table(instance(2), declarative_table(), rich_table())
+        .expect("the installed tables are pinned");
     broker
         .open_native_connection(
             instance(2),
             &CREDENTIAL,
             &process_identity(41, 900),
-            declarative_table(),
-            rich_table(),
+            &package(),
             "1",
         )
         .expect("the native connection is authenticated");
@@ -530,28 +540,30 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
                 TimestampMs::new(1),
             )
             .expect("the binding is recorded");
-        broker.pin_table(instance(2), &declarative_table());
+        broker
+            .pin_table(instance(2), declarative_table(), rich_table())
+            .expect("the installed tables are pinned");
         broker
             .open_native_connection(
                 instance(2),
                 &CREDENTIAL,
                 &process_identity(41, 900),
-                declarative_table(),
-                rich_table(),
+                &package(),
                 "1",
             )
             .expect("the native connection is authenticated");
 
         // Binding: a request of another application is not this binding's to interpret. The
         // frame is not a thing a caller names at all: the broker recorded it with the request.
-        broker.pin_table(instance(3), &declarative_table());
+        broker
+            .pin_table(instance(3), declarative_table(), rich_table())
+            .expect("the installed tables are pinned");
         broker
             .open_native_connection(
                 instance(3),
                 &CREDENTIAL,
                 &process_identity(41, 900),
-                declarative_table(),
-                rich_table(),
+                &package(),
                 "1",
             )
             .expect("the other instance's connection is authenticated");
@@ -1372,14 +1384,15 @@ fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes()
             )
             .expect("the binding is recorded");
 
-        broker.pin_table(instance(2), &declarative_table());
+        broker
+            .pin_table(instance(2), declarative_table(), rich_table())
+            .expect("the installed tables are pinned");
         broker
             .open_native_connection(
                 instance(2),
                 &CREDENTIAL,
                 &process_identity(41, 900),
-                declarative_table(),
-                rich_table(),
+                &package(),
                 "1",
             )
             .expect("the native connection is authenticated");
@@ -1491,5 +1504,93 @@ fn unconsumed_source_frames_are_bounded() {
             .source(instance(2), handles.last().expect("a handle"))
             .is_some(),
         "the newest is still there"
+    );
+}
+
+/// KR-REQ-11.16 and KR-REQ-11.17: evidence names the exact installation it was gathered against,
+/// and every field it names is compared with what this host established itself.
+#[test]
+fn kr_req_11_17_evidence_names_the_package_publisher_schema_and_binary_it_was_gathered_against() {
+    let broker = broker_with(BrokerGrants::granted([BrokerGrant::UpstreamAction]), None);
+
+    // A record that names the package, its bytes, its publisher, its schema and the binary this
+    // host is talking to is accepted.
+    let mut complete = evidence(
+        "agent.prompt",
+        InstanceCapabilityState::QualifiedAvailable,
+        InstanceInvalidation::BinaryChanged,
+        instance(2),
+    );
+    complete.identity.plugin_id = Nullable::some(package());
+    complete.identity.package_digest = Nullable::some(Digest256::from_bytes([5; 32]));
+    complete.identity.publisher_id = Nullable::some(PublisherId::new("kalareach").expect("valid"));
+    complete.identity.schema_version =
+        Nullable::some(kr_protocol::broker::MethodTableVersionText("1".to_owned()));
+    complete.identity.binding_id = Nullable::some(binding(9));
+    broker
+        .record_capability(complete.clone())
+        .expect("evidence about this installation is recorded");
+
+    // Each field on its own is enough to make the record about something else.
+    let mut other_package = complete.clone();
+    other_package.identity.plugin_id =
+        Nullable::some(PluginId::new("vendor.other").expect("valid"));
+    let mut other_bytes = complete.clone();
+    other_bytes.identity.package_digest = Nullable::some(Digest256::from_bytes([6; 32]));
+    let mut other_publisher = complete.clone();
+    other_publisher.identity.publisher_id =
+        Nullable::some(PublisherId::new("someone-else").expect("valid"));
+    let mut other_schema = complete.clone();
+    other_schema.identity.schema_version =
+        Nullable::some(kr_protocol::broker::MethodTableVersionText("2".to_owned()));
+    let mut other_binary = complete.clone();
+    other_binary.identity.binary_digest = Nullable::some(Digest256::from_bytes([9; 32]));
+    for (what, record) in [
+        ("another package", other_package),
+        ("other package bytes", other_bytes),
+        ("another publisher", other_publisher),
+        ("another upstream schema", other_schema),
+        ("another binary", other_binary),
+    ] {
+        assert!(
+            broker.record_capability(record).is_err(),
+            "evidence about {what} is not evidence about this installation"
+        );
+    }
+
+    // And a field this host cannot check is refused rather than believed: package bytes with no
+    // binding names bytes nothing loaded, and a schema with no pinned table names a protocol
+    // nothing qualified.
+    let mut unbound_bytes = complete.clone();
+    unbound_bytes.identity.binding_id = Nullable::null();
+    assert!(
+        broker.record_capability(unbound_bytes).is_err(),
+        "package bytes are known through the binding that loaded them"
+    );
+    let mut unnamed_package = complete.clone();
+    unnamed_package.identity.plugin_id = Nullable::null();
+    unnamed_package.identity.package_digest = Nullable::null();
+    unnamed_package.identity.publisher_id = Nullable::null();
+    assert!(
+        broker.record_capability(unnamed_package).is_err(),
+        "a schema version says nothing without the package it belongs to"
+    );
+
+    // An instance with no launch profile and no managed process has no binary identity, so
+    // evidence about a binary is refused instead of accepted unchecked.
+    let adopted = Broker::open(None, session()).expect("the broker opens");
+    adopted
+        .register_instance(instance(4), IntegrationMode::Gateway, None, None)
+        .expect("the instance is registered");
+    let mut about_a_binary = evidence(
+        "agent.prompt",
+        InstanceCapabilityState::QualifiedAvailable,
+        InstanceInvalidation::BinaryChanged,
+        instance(4),
+    );
+    about_a_binary.identity.plugin_id = Nullable::null();
+    assert!(
+        adopted.record_capability(about_a_binary).is_err(),
+        "there is nothing here to check a binary digest against"
     );
 }

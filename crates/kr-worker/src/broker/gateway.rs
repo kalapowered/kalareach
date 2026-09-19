@@ -24,6 +24,8 @@
 use std::collections::BTreeMap;
 
 use kr_protocol::broker::ActionProvenance;
+#[cfg(test)]
+use kr_protocol::gateway::RichOperation;
 use kr_protocol::gateway::{
     DeclarativeTable, DownstreamRequestId, NativeClassification, ReverseExecutionSite,
     ReverseOperation, RichMethodEntry, RichMethodTable,
@@ -389,10 +391,17 @@ impl Gateway {
     /// string eleven goes back as `"11"` and the number eleven as `11`, because they are two
     /// identifiers and a response to one must not resolve the other.
     ///
+    /// The decision is written into the member the qualified table names for that method. A
+    /// protocol that reads `behavior` does not read `option_id`, and writing the wrong member
+    /// would send an answer the upstream cannot act on while this host recorded the resource
+    /// resolved.
+    ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::UnknownSubject`] when the connection is unknown, and
-    /// [`BrokerError::InvalidArgument`] when the identifier is not one this host can write back.
+    /// Returns [`BrokerError::UnknownSubject`] when the connection is unknown,
+    /// [`BrokerError::UnsupportedCapability`] when the table names no answer member for the
+    /// method, and [`BrokerError::InvalidArgument`] when the identifier is not one this host can
+    /// write back.
     pub fn prepare_response(
         &self,
         connection: GatewayConnectionId,
@@ -419,11 +428,19 @@ impl Gateway {
                  identifier"
             )));
         }
+        let option_field = held.table.approval_option_field(method).ok_or_else(|| {
+            BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "this upstream's qualified table says nothing about how {method} is answered, \
+                     so the core has no answer shape to write"
+                ),
+            }
+        })?;
         let mut frame = serde_json::Map::new();
         frame.insert(held.table.response_id_field.clone(), identifier);
         frame.insert(
             held.table.result_field.clone(),
-            serde_json::json!({ "option_id": option_id }),
+            serde_json::json!({ option_field: option_id }),
         );
         let frame = serde_json::to_vec(&serde_json::Value::Object(frame)).map_err(|error| {
             BrokerError::invalid(format!("this answer will not encode: {error}"))
@@ -721,7 +738,7 @@ mod tests {
     }
 
     fn table() -> DeclarativeTable {
-        DeclarativeTable {
+        let mut table = DeclarativeTable {
             plugin_id: PluginId::new("kalareach.codex").expect("valid"),
             publisher_id: PublisherId::new("kalareach").expect("valid"),
             table_version: MethodTableVersion::new(1),
@@ -739,22 +756,27 @@ mod tests {
                     method: method("fs/write_text_file"),
                     class: NativeMethodClass::Mutation,
                     expects_response: true,
+                    approval_option_field: Nullable::null(),
                     reverse: Nullable::null(),
                 },
                 DeclarativeEntry {
                     method: method("session/request_permission"),
                     class: NativeMethodClass::Mutation,
                     expects_response: true,
+                    approval_option_field: Nullable::some("option_id".to_owned()),
                     reverse: Nullable::null(),
                 },
                 DeclarativeEntry {
                     method: method("session/update"),
                     class: NativeMethodClass::Observation,
                     expects_response: false,
+                    approval_option_field: Nullable::null(),
                     reverse: Nullable::null(),
                 },
             ],
-        }
+        };
+        table.digest = table.canonical_digest().expect("encodable");
+        table
     }
 
     fn rich() -> RichMethodTable {
@@ -766,12 +788,14 @@ mod tests {
                     method: method("session/cancel"),
                     class: NativeMethodClass::Mutation,
                     required_right: ActionRight::AgentCancel,
+                    operation: Nullable::some(RichOperation::TurnCancel),
                     provenance: ActionProvenance::UpstreamTypedRpc,
                 },
                 RichMethodEntry {
                     method: method("session/set_provider_key"),
                     class: NativeMethodClass::Unsupported,
                     required_right: ActionRight::AgentPrompt,
+                    operation: Nullable::null(),
                     provenance: ActionProvenance::UpstreamTypedRpc,
                 },
             ],
@@ -1044,6 +1068,34 @@ mod tests {
             .correlate_response(GatewayConnectionId::new(1), br#"{"id":11,"result":{}}"#)
             .expect("correlated");
         assert_eq!(Some(correlated), forwarded.request);
+    }
+
+    #[test]
+    fn an_answer_goes_in_the_member_the_table_names_and_nowhere_else() {
+        let gateway = native_gateway();
+        let prepared = gateway
+            .prepare_response(
+                GatewayConnectionId::new(1),
+                &UpstreamRequestId::new("11").expect("valid"),
+                &method("session/request_permission"),
+                "allow",
+            )
+            .expect("the core prepares the answer");
+        let frame: serde_json::Value = serde_json::from_slice(&prepared.frame).expect("readable");
+        assert_eq!(frame["result"]["option_id"], serde_json::json!("allow"));
+
+        // A method the table says nothing about answering is one the core will not answer. The
+        // alternative is writing a shape this upstream does not read while recording the resource
+        // resolved.
+        let refusal = gateway
+            .prepare_response(
+                GatewayConnectionId::new(1),
+                &UpstreamRequestId::new("12").expect("valid"),
+                &method("session/update"),
+                "allow",
+            )
+            .expect_err("no answer shape is declared for it");
+        assert!(matches!(refusal, BrokerError::UnsupportedCapability { .. }));
     }
 
     #[test]

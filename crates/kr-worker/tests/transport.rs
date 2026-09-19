@@ -12,7 +12,7 @@ use kr_protocol::broker::{
 };
 use kr_protocol::gateway::{
     DeclarativeEntry, DeclarativeTable, NativeFraming, NativeMethodClass, PendingState,
-    ReverseOperation, RichMethodEntry, RichMethodTable,
+    ReverseOperation, RichMethodEntry, RichMethodTable, RichOperation,
 };
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
@@ -23,7 +23,7 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, U64, Uuid};
 use kr_worker::broker::{
     BoundEndpoint, Broker, BrokerTransport, Credential, Framing, Link, ManagedProcess,
-    TransportHandle, UpstreamOperation,
+    TransportHandle,
 };
 use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
@@ -95,8 +95,12 @@ fn projection() -> DecodedProjection {
     }
 }
 
+fn package() -> PluginId {
+    PluginId::new("kalareach.codex").expect("valid")
+}
+
 fn table() -> DeclarativeTable {
-    DeclarativeTable {
+    let mut table = DeclarativeTable {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
         publisher_id: PublisherId::new("kalareach").expect("valid"),
         table_version: MethodTableVersion::new(1),
@@ -114,16 +118,22 @@ fn table() -> DeclarativeTable {
                 method: method("fs/read_text_file"),
                 class: NativeMethodClass::Observation,
                 expects_response: true,
+                approval_option_field: Nullable::null(),
                 reverse: Nullable::some(ReverseOperation::FilesystemRead),
             },
             DeclarativeEntry {
                 method: method("session/request_permission"),
                 class: NativeMethodClass::Mutation,
                 expects_response: true,
+                // This upstream reads its decision from `behavior`, which is why the table says
+                // so rather than the core assuming a member name.
+                approval_option_field: Nullable::some("behavior".to_owned()),
                 reverse: Nullable::null(),
             },
         ],
-    }
+    };
+    table.digest = table.canonical_digest().expect("encodable");
+    table
 }
 
 fn rich() -> RichMethodTable {
@@ -131,19 +141,60 @@ fn rich() -> RichMethodTable {
         table_version: MethodTableVersion::new(1),
         upstream_protocol_version: "1".to_owned(),
         entries: vec![
-            RichMethodEntry {
-                method: method("session/cancel"),
-                class: NativeMethodClass::Mutation,
-                required_right: ActionRight::AgentCancel,
-                provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
-            },
-            RichMethodEntry {
-                method: method("session/prompt"),
-                class: NativeMethodClass::Mutation,
-                required_right: ActionRight::AgentPrompt,
-                provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
-            },
+            // Ordered by method, as a qualified table is. Three of the four need one right
+            // between them, and each is still its own upstream method.
+            rich_entry(
+                "session/answer",
+                ActionRight::AgentApprovalRespond,
+                Some(RichOperation::ApprovalRespond),
+                NativeMethodClass::Mutation,
+            ),
+            rich_entry(
+                "session/cancel",
+                ActionRight::AgentCancel,
+                Some(RichOperation::TurnCancel),
+                NativeMethodClass::Mutation,
+            ),
+            rich_entry(
+                "session/prompt",
+                ActionRight::AgentPrompt,
+                Some(RichOperation::PromptSubmit),
+                NativeMethodClass::Mutation,
+            ),
+            rich_entry(
+                "session/queue",
+                ActionRight::AgentPrompt,
+                Some(RichOperation::PromptQueue),
+                NativeMethodClass::Mutation,
+            ),
+            rich_entry(
+                "session/set_provider_key",
+                ActionRight::AgentPrompt,
+                None,
+                NativeMethodClass::Unsupported,
+            ),
+            rich_entry(
+                "session/steer",
+                ActionRight::AgentPrompt,
+                Some(RichOperation::TurnSteer),
+                NativeMethodClass::Mutation,
+            ),
         ],
+    }
+}
+
+fn rich_entry(
+    name: &str,
+    required_right: ActionRight,
+    operation: Option<RichOperation>,
+    class: NativeMethodClass,
+) -> RichMethodEntry {
+    RichMethodEntry {
+        method: method(name),
+        class,
+        required_right,
+        operation: Nullable::from(operation),
+        provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
     }
 }
 
@@ -184,14 +235,15 @@ fn broker() -> Arc<Broker> {
             TimestampMs::new(1),
         )
         .expect("the binding is recorded");
-    broker.pin_table(instance(), &table());
+    broker
+        .pin_table(instance(), table(), rich())
+        .expect("the installed tables are pinned");
     broker
         .open_native_connection(
             instance(),
             &CREDENTIAL,
             &process_identity(),
-            table(),
-            rich(),
+            &package(),
             "1",
         )
         .expect("the native connection is authenticated");
@@ -300,7 +352,7 @@ async fn kr_req_12_11_a_real_transport_forwards_a_request_and_carries_the_answer
         &kr_worker::broker::UpstreamRequest {
             application_instance_id: instance(),
             binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
-            operation: UpstreamOperation::ApprovalRespond,
+            operation: kr_protocol::gateway::RichOperation::ApprovalRespond,
             turn_id: None,
             body: kr_worker::broker::UpstreamBody::Approval {
                 resource_id,
@@ -319,7 +371,15 @@ async fn kr_req_12_11_a_real_transport_forwards_a_request_and_carries_the_answer
         serde_json::json!(11),
         "the identifier keeps its JSON type"
     );
-    assert_eq!(answer["result"]["option_id"], serde_json::json!("allow"));
+    assert_eq!(
+        answer["result"]["behavior"],
+        serde_json::json!("allow"),
+        "the decision goes in the member this upstream's table names"
+    );
+    assert!(
+        answer["result"].get("option_id").is_none(),
+        "and in no member the core invented"
+    );
     broker
         .resolve(&claim, TimestampMs::new(5))
         .expect("the upstream took it");
@@ -514,4 +574,127 @@ async fn kr_req_11_32_the_read_loop_carries_what_arrives_on_the_socket() {
         .expect("the loop ends when its end closes")
         .expect("the loop did not panic");
     drained.abort();
+}
+
+/// KR-REQ-12.08 and KR-REQ-12.12: each operation is encoded as the method its own table names,
+/// with the turn it acts on, and an operation the table names nothing for sends nothing.
+#[tokio::test]
+async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_its_turn() {
+    let broker = broker();
+    let (link, upstream, _client, drained) = link_over_sockets(&broker).await;
+    let mut upstream_reader = tokio::io::BufReader::new(upstream);
+    let dispatch = link.dispatch().expect("the link carries operations");
+    let turn = kr_protocol::ids::AgentTurnId::new("turn-7").expect("valid");
+
+    // Four operations, three of which need one right between them. Each goes out as its own
+    // method, with its own parameters, and never as whichever the table happened to list first.
+    let expected = [
+        (
+            kr_protocol::gateway::RichOperation::PromptSubmit,
+            None,
+            kr_worker::broker::UpstreamBody::Prompt {
+                draft_id: None,
+                text: Some("hello".to_owned()),
+            },
+            "session/prompt",
+            serde_json::json!({ "draft_id": null, "text": "hello" }),
+        ),
+        (
+            kr_protocol::gateway::RichOperation::PromptQueue,
+            None,
+            kr_worker::broker::UpstreamBody::Prompt {
+                draft_id: None,
+                text: Some("and then this".to_owned()),
+            },
+            "session/queue",
+            serde_json::json!({ "draft_id": null, "text": "and then this" }),
+        ),
+        (
+            kr_protocol::gateway::RichOperation::TurnSteer,
+            Some(turn.clone()),
+            kr_worker::broker::UpstreamBody::Steer {
+                text: "try the other file".to_owned(),
+            },
+            "session/steer",
+            serde_json::json!({ "text": "try the other file", "turn_id": "turn-7" }),
+        ),
+        (
+            kr_protocol::gateway::RichOperation::TurnCancel,
+            Some(turn.clone()),
+            kr_worker::broker::UpstreamBody::Cancel,
+            "session/cancel",
+            serde_json::json!({ "turn_id": "turn-7" }),
+        ),
+    ];
+    for (operation, turn_id, body, method_name, parameters) in expected {
+        kr_worker::broker::UpstreamDispatch::submit(
+            dispatch.as_ref(),
+            &kr_worker::broker::UpstreamRequest {
+                application_instance_id: instance(),
+                binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+                operation,
+                turn_id,
+                body,
+            },
+        )
+        .unwrap_or_else(|error| panic!("{operation} is carried: {error}"));
+        let frame = next_line(&mut upstream_reader).await;
+        let frame: serde_json::Value = serde_json::from_str(frame.trim()).expect("readable");
+        assert_eq!(
+            frame["method"],
+            serde_json::json!(method_name),
+            "{operation} encodes as the method its table names"
+        );
+        assert_eq!(
+            frame["params"], parameters,
+            "{operation} carries exactly what it asks for"
+        );
+    }
+
+    // A table that names no method for an operation encodes nothing, and one whose method this
+    // build does not support encodes nothing either. Both refuse before any byte is written.
+    let bare = Broker::open(None, session()).expect("the broker opens");
+    bare.register_instance(instance(), IntegrationMode::Gateway, None, Some(managed()))
+        .expect("the instance is registered");
+    let mut without_steer = rich();
+    without_steer
+        .entries
+        .retain(|entry| entry.operation.as_ref() != Some(&RichOperation::TurnSteer));
+    bare.pin_table(instance(), table(), without_steer)
+        .expect("the installed tables are pinned");
+    bare.open_native_connection(
+        instance(),
+        &CREDENTIAL,
+        &process_identity(),
+        &package(),
+        "1",
+    )
+    .expect("the native connection is authenticated");
+    let bare = Arc::new(bare);
+    let (unsteerable, _upstream, _client, other_drain) = link_over_sockets(&bare).await;
+    let refusal = kr_worker::broker::UpstreamDispatch::submit(
+        unsteerable
+            .dispatch()
+            .expect("it carries operations")
+            .as_ref(),
+        &kr_worker::broker::UpstreamRequest {
+            application_instance_id: instance(),
+            binding_revision: kr_protocol::ids::AgentBindingRevision::new(1),
+            operation: kr_protocol::gateway::RichOperation::TurnSteer,
+            turn_id: Some(turn),
+            body: kr_worker::broker::UpstreamBody::Steer {
+                text: "nowhere to send this".to_owned(),
+            },
+        },
+    )
+    .expect_err("a table that names no steer cannot steer");
+    assert_eq!(
+        refusal.code(),
+        kr_protocol::error::ErrorCode::UnsupportedCapability
+    );
+
+    drop(link);
+    drop(upstream_reader);
+    drained.abort();
+    other_drain.abort();
 }

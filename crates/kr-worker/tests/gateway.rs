@@ -11,7 +11,7 @@ use kr_protocol::broker::{
 use kr_protocol::error::ErrorCode;
 use kr_protocol::gateway::{
     DeclarativeEntry, DeclarativeTable, GatewayMode, NativeFraming, NativeMethodClass, PendingKind,
-    PendingState, ReverseOperation, RichMethodEntry, RichMethodTable,
+    PendingState, ReverseOperation, RichMethodEntry, RichMethodTable, RichOperation,
 };
 use kr_protocol::identity::{ProcessStartIdentity, ProcessStartSource};
 use kr_protocol::ids::{
@@ -99,8 +99,12 @@ fn projection() -> DecodedProjection {
     }
 }
 
+fn package() -> PluginId {
+    PluginId::new("kalareach.codex").expect("valid")
+}
+
 fn table() -> DeclarativeTable {
-    DeclarativeTable {
+    let mut table = DeclarativeTable {
         plugin_id: PluginId::new("kalareach.codex").expect("valid"),
         publisher_id: PublisherId::new("kalareach").expect("valid"),
         table_version: MethodTableVersion::new(1),
@@ -118,22 +122,27 @@ fn table() -> DeclarativeTable {
                 method: method("fs/write_text_file"),
                 class: NativeMethodClass::Mutation,
                 expects_response: true,
+                approval_option_field: Nullable::null(),
                 reverse: Nullable::null(),
             },
             DeclarativeEntry {
                 method: method("session/request_permission"),
                 class: NativeMethodClass::Mutation,
                 expects_response: true,
+                approval_option_field: Nullable::some("option_id".to_owned()),
                 reverse: Nullable::null(),
             },
             DeclarativeEntry {
                 method: method("session/update"),
                 class: NativeMethodClass::Observation,
                 expects_response: false,
+                approval_option_field: Nullable::null(),
                 reverse: Nullable::null(),
             },
         ],
-    }
+    };
+    table.digest = table.canonical_digest().expect("encodable");
+    table
 }
 
 fn rich() -> RichMethodTable {
@@ -145,12 +154,14 @@ fn rich() -> RichMethodTable {
                 method: method("session/cancel"),
                 class: NativeMethodClass::Mutation,
                 required_right: ActionRight::AgentCancel,
+                operation: Nullable::some(RichOperation::TurnCancel),
                 provenance: ActionProvenance::UpstreamTypedRpc,
             },
             RichMethodEntry {
                 method: method("session/set_provider_key"),
                 class: NativeMethodClass::Unsupported,
                 required_right: ActionRight::AgentPrompt,
+                operation: Nullable::null(),
                 provenance: ActionProvenance::UpstreamTypedRpc,
             },
         ],
@@ -191,14 +202,15 @@ fn gateway(path: Option<&std::path::Path>) -> Broker {
             TimestampMs::new(1),
         )
         .expect("the binding is recorded");
-    broker.pin_table(instance(2), &table());
+    broker
+        .pin_table(instance(2), table(), rich())
+        .expect("the installed tables are pinned");
     broker
         .open_native_connection(
             instance(2),
             &CREDENTIAL,
             &process_identity(41, 900),
-            table(),
-            rich(),
+            &package(),
             "1",
         )
         .expect("the native connection is authenticated");
@@ -336,13 +348,7 @@ fn kr_req_11_32_only_the_launch_binding_and_the_private_exchange_open_a_native_c
 
     // A rich client connects and is refused the native path.
     broker
-        .open_connection(
-            instance(2),
-            ConnectionOrigin::RichClient,
-            table(),
-            rich(),
-            "1",
-        )
+        .open_connection(instance(2), ConnectionOrigin::RichClient, &package(), "1")
         .expect("a rich client connects");
     let refusal = broker
         .forward_native(
@@ -355,13 +361,7 @@ fn kr_req_11_32_only_the_launch_binding_and_the_private_exchange_open_a_native_c
 
     // A component cannot either.
     broker
-        .open_connection(
-            instance(2),
-            ConnectionOrigin::Component,
-            table(),
-            rich(),
-            "1",
-        )
+        .open_connection(instance(2), ConnectionOrigin::Component, &package(), "1")
         .expect("a component connects");
     assert!(
         broker
@@ -381,8 +381,7 @@ fn kr_req_11_32_only_the_launch_binding_and_the_private_exchange_open_a_native_c
                 instance(2),
                 &[8; 32],
                 &process_identity(41, 900),
-                table(),
-                rich(),
+                &package(),
                 "1",
             )
             .is_err(),
@@ -394,8 +393,7 @@ fn kr_req_11_32_only_the_launch_binding_and_the_private_exchange_open_a_native_c
                 instance(2),
                 &CREDENTIAL,
                 &process_identity(42, 900),
-                table(),
-                rich(),
+                &package(),
                 "1",
             )
             .is_err(),
@@ -471,14 +469,15 @@ fn kr_req_12_13_downstream_identifiers_are_namespaced_and_transition_once() {
             Some(managed(instance(3))),
         )
         .expect("the instance is registered");
-    broker.pin_table(instance(3), &table());
+    broker
+        .pin_table(instance(3), table(), rich())
+        .expect("the installed tables are pinned");
     broker
         .open_native_connection(
             instance(3),
             &CREDENTIAL,
             &process_identity(41, 900),
-            table(),
-            rich(),
+            &package(),
             "1",
         )
         .expect("a second native connection");
@@ -544,23 +543,13 @@ fn kr_req_12_13_downstream_identifiers_are_namespaced_and_transition_once() {
 fn kr_req_12_11_both_mutators_are_admitted_by_the_gateway_and_observers_are_listed() {
     let broker = gateway(None);
     broker
-        .open_connection(
-            instance(2),
-            ConnectionOrigin::RichClient,
-            table(),
-            rich(),
-            "1",
-        )
+        .open_connection(instance(2), ConnectionOrigin::RichClient, &package(), "1")
         .expect("a rich client connects");
-    broker.pin_table(instance(3), &table());
     broker
-        .open_connection(
-            instance(3),
-            ConnectionOrigin::RichClient,
-            table(),
-            rich(),
-            "1",
-        )
+        .pin_table(instance(3), table(), rich())
+        .expect("the installed tables are pinned");
+    broker
+        .open_connection(instance(3), ConnectionOrigin::RichClient, &package(), "1")
         .expect("a client of another instance connects");
 
     // The native terminal's request keeps its own identifier through the gateway.
@@ -814,13 +803,7 @@ fn kr_req_12_16_a_reverse_request_names_the_agents_own_environment_and_user() {
     // A rich client does not own an upstream, so it cannot ask this host to do anything on one's
     // behalf.
     broker
-        .open_connection(
-            instance(2),
-            ConnectionOrigin::RichClient,
-            table(),
-            rich(),
-            "1",
-        )
+        .open_connection(instance(2), ConnectionOrigin::RichClient, &package(), "1")
         .expect("a rich client connects");
     assert!(
         broker
@@ -938,13 +921,7 @@ fn kr_req_11_35_the_fence_keeps_native_recording_and_arbitration_and_exposes_the
 
     // Nothing is relabelled: a rich client is still a rich client, and it still cannot forward.
     broker
-        .open_connection(
-            instance(2),
-            ConnectionOrigin::RichClient,
-            table(),
-            rich(),
-            "1",
-        )
+        .open_connection(instance(2), ConnectionOrigin::RichClient, &package(), "1")
         .expect("a rich client connects");
     assert!(
         broker
@@ -1125,14 +1102,15 @@ fn a_recovery_waits_for_every_upstream_that_owed_it_a_reconciliation() {
             Some(managed(instance(3))),
         )
         .expect("the instance is registered");
-    broker.pin_table(instance(3), &table());
+    broker
+        .pin_table(instance(3), table(), rich())
+        .expect("the installed tables are pinned");
     broker
         .open_native_connection(
             instance(3),
             &CREDENTIAL,
             &process_identity(41, 900),
-            table(),
-            rich(),
+            &package(),
             "1",
         )
         .expect("a second native connection");
@@ -1404,14 +1382,15 @@ fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_what_i
     // A second upstream records its first request while the recovery is running. It has not said
     // what it holds either, so it joins what this recovery owes and finishing the first one does
     // not lift the fence.
-    broker.pin_table(instance(2), &table());
+    broker
+        .pin_table(instance(2), table(), rich())
+        .expect("the installed tables are pinned");
     broker
         .open_native_connection(
             instance(2),
             &CREDENTIAL,
             &process_identity(41, 900),
-            table(),
-            rich(),
+            &package(),
             "1",
         )
         .expect("a second native connection is authenticated");
@@ -1454,4 +1433,67 @@ fn kr_req_11_37_a_reconciliation_names_its_recovery_and_a_new_scope_joins_what_i
     assert!(finished.is_some());
     assert_eq!(broker.mode(), GatewayMode::Normal);
     let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// KR-REQ-11.25 and KR-REQ-11.30: a qualified table's digest names the protocol semantics it
+/// declares, so altering framing, a classification or a reverse operation cannot keep it.
+#[test]
+fn kr_req_11_25_a_tables_digest_names_the_semantics_it_declares() {
+    let broker = gateway(None);
+
+    // What the core interprets frames with is what this host installed. The connection named its
+    // package and presented nothing about the protocol.
+    let pinned = broker
+        .pinned_table(instance(2), &package())
+        .expect("the installed table is held");
+    assert_eq!(pinned.table, table());
+    assert_eq!(
+        broker
+            .connection(GatewayConnectionId::new(1))
+            .expect("the connection is open")
+            .table,
+        table(),
+        "a connection is read with the installed table, not one it supplied"
+    );
+
+    // Three alterations, each keeping the qualified table's own digest. Every one of them is a
+    // different instruction to the core, and every one of them is refused.
+    let qualified = table();
+    let mut reframed = qualified.clone();
+    reframed.framing = NativeFraming::ContentLength;
+    let mut reclassified = qualified.clone();
+    reclassified.entries[2].class = NativeMethodClass::Observation;
+    let mut reversed = qualified.clone();
+    reversed.entries[0].reverse = Nullable::some(ReverseOperation::FilesystemWrite);
+    for (what, altered) in [
+        ("framing", reframed),
+        ("a classification", reclassified),
+        ("a reverse operation", reversed),
+    ] {
+        assert_ne!(
+            altered.canonical_digest().expect("encodable"),
+            qualified.digest,
+            "{what} is part of what the digest covers"
+        );
+        let refusal = broker
+            .pin_table(instance(2), altered, rich())
+            .expect_err("a table whose digest is not its own content is refused");
+        assert_eq!(
+            refusal.code(),
+            ErrorCode::UnsupportedCapability,
+            "{what} altered under the qualified digest is refused"
+        );
+    }
+
+    // And a package with nothing installed opens nothing.
+    let refusal = broker
+        .open_native_connection(
+            instance(2),
+            &CREDENTIAL,
+            &process_identity(41, 900),
+            &PluginId::new("vendor.unqualified").expect("valid"),
+            "1",
+        )
+        .expect_err("nothing is pinned for that package");
+    assert_eq!(refusal.code(), ErrorCode::PermissionDenied);
 }

@@ -26,26 +26,23 @@
 //!
 //! Encoding an operation this host prepared is the other half. An approval's answer was prepared
 //! by the core at admission, so this writes the bytes it was given. The other mutations are
-//! encoded here from the connection's rich table, which names the upstream method for each right,
-//! and the table's own parameter member. A connector whose upstream wants a different body shape
-//! supplies an adapter: section 12 makes the bundled adapters the plugins repository's, and this
-//! is the host side they drive.
+//! encoded here from the connection's rich table, which names one method per operation, and the
+//! table's own parameter member. A connector whose upstream wants a different body shape supplies
+//! an adapter: section 12 makes the bundled adapters the plugins repository's, and this is the
+//! host side they drive.
 
 use std::sync::Arc;
 
 use kr_protocol::broker::ActionProvenance;
 use kr_protocol::gateway::{NativeFraming, ReverseOperation};
 use kr_protocol::ids::{GatewayConnectionId, UpstreamRequestId};
-use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::TimestampMs;
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::broker::Broker;
 use crate::broker::error::{BrokerError, Result};
 use crate::broker::gateway::MAX_NATIVE_FRAME_BYTES;
-use crate::broker::methods::{
-    UpstreamBody, UpstreamDispatch, UpstreamOperation, UpstreamOutcome, UpstreamRequest,
-};
+use crate::broker::methods::{UpstreamBody, UpstreamDispatch, UpstreamOutcome, UpstreamRequest};
 
 /// How many frames wait to be written to one end before the link reports the connection unusable.
 ///
@@ -235,52 +232,52 @@ impl LinkDispatch {
 
     /// Returns the upstream method this connection's closed rich table names for one operation.
     ///
-    /// A prompt, a steer and a cancellation are named by the right they need, because that is what
-    /// the rich table records beside each method. A plugin action is named by the action the
+    /// Each operation is looked up as itself. Submitting a prompt, queueing one and steering a
+    /// turn need one right between them, so choosing by right would send any of the three as
+    /// whichever the table happened to list first. A plugin action is named by the action the
     /// package declared, which is what "declared action" means: the table still has to list it, so
     /// an unknown rich mutation is rejected rather than guessed at.
+    ///
+    /// Either way the method passes the closed table's own admission, so a method the table lists
+    /// as unsupported is refused here rather than written to the socket.
     fn method_for(&self, request: &UpstreamRequest) -> Result<kr_protocol::ids::UpstreamMethod> {
         if let UpstreamBody::PluginAction { action, .. } = &request.body {
             let method =
                 kr_protocol::ids::UpstreamMethod::new(action.as_str()).map_err(|error| {
                     BrokerError::invalid(format!("this action is not a method name: {error}"))
                 })?;
-            self.rich.admit(&method)?;
-            return Ok(method);
+            return self
+                .rich
+                .admit(&method)
+                .map(|entry| entry.method.clone())
+                .map_err(BrokerError::from);
         }
-        let right = match request.operation {
-            UpstreamOperation::PromptSubmit
-            | UpstreamOperation::PromptQueue
-            | UpstreamOperation::TurnSteer => ActionRight::AgentPrompt,
-            UpstreamOperation::TurnCancel => ActionRight::AgentCancel,
-            UpstreamOperation::ApprovalRespond | UpstreamOperation::PluginAction => {
-                ActionRight::AgentApprovalRespond
-            }
-        };
         self.rich
-            .entries
-            .iter()
-            .find(|entry| entry.required_right == right)
+            .for_operation(request.operation)
             .map(|entry| entry.method.clone())
-            .ok_or_else(|| BrokerError::UnsupportedCapability {
-                detail: format!(
-                    "this upstream's rich table names no method for {}, so the core has nothing \
-                     to encode it as",
-                    request.operation
-                ),
-            })
+            .map_err(BrokerError::from)
     }
 
-    fn parameters(body: &UpstreamBody) -> Result<serde_json::Value> {
-        Ok(match body {
+    /// Builds the parameter member of one prepared operation.
+    ///
+    /// The turn travels with every operation that names one. Section 12 binds observation and
+    /// mutation to instance, execution owner, session **and turn**, and a steer or a cancellation
+    /// that reached the upstream without its turn would act on whatever is running when it lands.
+    fn parameters(request: &UpstreamRequest) -> Result<serde_json::Value> {
+        let mut parameters = match &request.body {
             UpstreamBody::Prompt { draft_id, text } => serde_json::json!({
                 "draft_id": draft_id.as_ref().map(ToString::to_string),
                 "text": text,
             }),
             UpstreamBody::Steer { text } => serde_json::json!({ "text": text }),
             UpstreamBody::Cancel => serde_json::json!({}),
-            UpstreamBody::Approval { option_id, .. } => {
-                serde_json::json!({ "option_id": option_id })
+            // An approval's answer is the frame the core prepared at admission, written by
+            // `submit` before it reaches here. There is no second encoding of one.
+            UpstreamBody::Approval { .. } => {
+                return Err(BrokerError::invalid(
+                    "an approval is answered with the frame the core prepared for it, and this \
+                     path encodes a request",
+                ));
             }
             UpstreamBody::PluginAction {
                 plugin_id,
@@ -298,7 +295,19 @@ impl LinkDispatch {
                 // token is what says which invocation that is.
                 "action_token": token.as_ref().map(|token| token.token_id.as_str()),
             }),
-        })
+        };
+        if let Some(turn_id) = request.turn_id.as_ref() {
+            let Some(members) = parameters.as_object_mut() else {
+                return Err(BrokerError::invalid(
+                    "a prepared operation's parameters are a JSON object",
+                ));
+            };
+            members.insert(
+                "turn_id".to_owned(),
+                serde_json::Value::String(turn_id.to_string()),
+            );
+        }
+        Ok(parameters)
     }
 }
 
@@ -334,7 +343,7 @@ impl UpstreamDispatch for LinkDispatch {
             self.method_field.clone(),
             serde_json::Value::String(method.as_str().to_owned()),
         );
-        frame.insert(self.params_field.clone(), Self::parameters(&request.body)?);
+        frame.insert(self.params_field.clone(), Self::parameters(request)?);
         let body = serde_json::to_vec(&serde_json::Value::Object(frame)).map_err(|error| {
             BrokerError::invalid(format!("this operation will not encode: {error}"))
         })?;

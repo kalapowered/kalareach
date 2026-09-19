@@ -92,7 +92,7 @@ pub use crate::broker::listener::{
 };
 pub use crate::broker::methods::{
     Caller, MutationAdmission, RegisteredAction, Responsible, UpstreamBody, UpstreamDispatch,
-    UpstreamOperation, UpstreamOutcome, UpstreamRequest, command, subject,
+    UpstreamOutcome, UpstreamRequest, command, subject,
 };
 pub use crate::broker::process::{
     BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
@@ -363,15 +363,18 @@ struct BrokerState {
     pinned_tables: BTreeMap<(ApplicationInstanceId, PluginId), PinnedTable>,
 }
 
-/// The identity of one declarative table, as the installation pinned it.
+/// The tables one installation was qualified with, as the installation pinned them.
+///
+/// The tables themselves are held, not a description of them. A connection is interpreted with
+/// what this host installed, so there is nothing for a package to present at connection time and
+/// nothing to compare: altered framing, an altered classification or an added reverse operation
+/// cannot reach the core, whatever labels travel beside them.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PinnedTable {
-    /// The publisher whose semantic trust grant qualifies the table.
-    pub publisher_id: PublisherId,
-    /// The digest of the exact table bytes.
-    pub digest: Digest256,
-    /// The version of the table itself.
-    pub table_version: kr_protocol::ids::MethodTableVersion,
+    /// The qualified declarative table the core interprets this installation's frames with.
+    pub table: kr_protocol::gateway::DeclarativeTable,
+    /// The closed rich method table for its upstream version.
+    pub rich: kr_protocol::gateway::RichMethodTable,
 }
 
 /// The trusted broker.
@@ -1854,25 +1857,34 @@ impl Broker {
 
     // -- the gateway --------------------------------------------------------------------------
 
-    /// Pins one connector's declarative table for one installation.
+    /// Pins one connector's qualified tables for one installation.
     ///
     /// A table is qualified at installation, under the publisher's semantic trust grant, and this
-    /// is what that qualification leaves behind. A connection that presents anything else is
-    /// refused: the core interprets frames with this table, so a table nobody installed would be
-    /// a package choosing how its own bytes are read.
+    /// is what that qualification leaves behind. Both tables are held whole, because the core
+    /// interprets frames with them: a table a connection supplied would be a package choosing how
+    /// its own bytes are read.
+    ///
+    /// The declarative table's recorded digest is checked against the digest of what it declares,
+    /// so the qualification names the semantics that were qualified rather than a label beside
+    /// them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Table`] when either table is not one the core will interpret, which
+    /// includes a declarative table whose digest is not the digest of its own content.
     pub fn pin_table(
         &self,
         application_instance_id: ApplicationInstanceId,
-        table: &kr_protocol::gateway::DeclarativeTable,
-    ) {
+        table: kr_protocol::gateway::DeclarativeTable,
+        rich: kr_protocol::gateway::RichMethodTable,
+    ) -> Result<()> {
+        table.validate()?;
+        rich.qualify(&table.upstream_protocol_version)?;
         self.state().pinned_tables.insert(
             (application_instance_id, table.plugin_id.clone()),
-            PinnedTable {
-                publisher_id: table.publisher_id.clone(),
-                digest: table.digest,
-                table_version: table.table_version,
-            },
+            PinnedTable { table, rich },
         );
+        Ok(())
     }
 
     /// Returns what this host pinned for one installation's package.
@@ -1888,20 +1900,38 @@ impl Broker {
             .cloned()
     }
 
-    /// Opens a native connection for a terminal this worker launched and authenticated.
+    /// Returns the digest a declarative table's own content has.
+    ///
+    /// This is what an installation records when it qualifies a table, and what
+    /// [`Broker::pin_table`] checks the table's recorded digest against.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::Table`] when a table does not qualify, and
-    /// [`BrokerError::PermissionDenied`] when the presented credential and process identity are
-    /// not the launch this broker made.
+    /// Returns [`BrokerError::Table`] when the table cannot be encoded canonically.
+    pub fn table_digest(table: &kr_protocol::gateway::DeclarativeTable) -> Result<Digest256> {
+        table
+            .canonical_digest()
+            .map_err(|_| BrokerError::Table(kr_protocol::gateway::TableError::Unrepresentable))
+    }
+
+    /// Opens a native connection for a terminal this worker launched and authenticated.
+    ///
+    /// The connection names the connector package it speaks for, and the core interprets it with
+    /// the tables this host pinned for that package. Nothing about the protocol travels with the
+    /// connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::Table`] when the pinned tables do not qualify against the installed
+    /// upstream version, and [`BrokerError::PermissionDenied`] when no table is pinned for the
+    /// package or the presented credential and process identity are not the launch this broker
+    /// made.
     pub fn open_native_connection(
         &self,
         application_instance_id: ApplicationInstanceId,
         presented_credential: &[u8],
         process: &ProcessStartIdentity,
-        table: kr_protocol::gateway::DeclarativeTable,
-        rich: kr_protocol::gateway::RichMethodTable,
+        plugin_id: &PluginId,
         installed_protocol_version: &str,
     ) -> Result<GatewayConnectionId> {
         let mut state = self.state();
@@ -1911,17 +1941,19 @@ impl Broker {
             .ok_or_else(|| unknown_instance(application_instance_id))?;
         let launched = instance.process.as_ref().ok_or_else(|| {
             BrokerError::denied(
-                "this host did not launch this application, so nothing about it is a native                  connection it can authenticate",
+                "this host did not launch this application, so nothing about it is a native \
+                 connection it can authenticate",
             )
         })?;
         // Both halves. A session identifier that leaked is not a launch binding, and a process
         // that matches without the private exchange is not one either.
         if !launched.authenticates(presented_credential, process) {
             return Err(BrokerError::denied(
-                "this connection does not present the launch binding and the private exchange of                  a terminal this worker started",
+                "this connection does not present the launch binding and the private exchange of \
+                 a terminal this worker started",
             ));
         }
-        state.check_pinned_table(application_instance_id, &table)?;
+        let pinned = state.pinned_table(application_instance_id, plugin_id)?;
         // The identifier is minted here, inside the admission, rather than taken from the caller.
         // An identifier a caller chose could be one this host already used, and a response on the
         // new connection would then correlate to a resource the old one recorded.
@@ -1930,8 +1962,8 @@ impl Broker {
             connection,
             application_instance_id,
             process.clone(),
-            table,
-            rich,
+            pinned.table,
+            pinned.rich,
             installed_protocol_version,
         )?;
         Ok(connection)
@@ -1941,25 +1973,25 @@ impl Broker {
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::Table`] when a table does not qualify, and
+    /// Returns [`BrokerError::Table`] when the pinned tables do not qualify,
+    /// [`BrokerError::PermissionDenied`] when no table is pinned for the package, and
     /// [`BrokerError::InvalidArgument`] when the caller asks for the native origin here.
     pub fn open_connection(
         &self,
         application_instance_id: ApplicationInstanceId,
         origin: ConnectionOrigin,
-        table: kr_protocol::gateway::DeclarativeTable,
-        rich: kr_protocol::gateway::RichMethodTable,
+        plugin_id: &PluginId,
         installed_protocol_version: &str,
     ) -> Result<GatewayConnectionId> {
         let mut state = self.state();
-        state.check_pinned_table(application_instance_id, &table)?;
+        let pinned = state.pinned_table(application_instance_id, plugin_id)?;
         let connection = state.mint_connection();
         state.gateway.open(
             connection,
             application_instance_id,
             origin,
-            table,
-            rich,
+            pinned.table,
+            pinned.rich,
             installed_protocol_version,
         )?;
         Ok(connection)
@@ -1978,15 +2010,13 @@ impl Broker {
     /// Returns [`BrokerError::PermissionDenied`] when the identifier is live, belongs to another
     /// instance, or names no retained resource of this one, and whatever
     /// [`Broker::open_native_connection`] refuses.
-    #[allow(clippy::too_many_arguments)]
     pub fn restore_native_connection(
         &self,
         connection: GatewayConnectionId,
         application_instance_id: ApplicationInstanceId,
         presented_credential: &[u8],
         process: &ProcessStartIdentity,
-        table: kr_protocol::gateway::DeclarativeTable,
-        rich: kr_protocol::gateway::RichMethodTable,
+        plugin_id: &PluginId,
         installed_protocol_version: &str,
     ) -> Result<()> {
         let mut state = self.state();
@@ -2045,13 +2075,13 @@ impl Broker {
                  a terminal this worker started",
             ));
         }
-        state.check_pinned_table(application_instance_id, &table)?;
+        let pinned = state.pinned_table(application_instance_id, plugin_id)?;
         state.gateway.open_native(
             connection,
             application_instance_id,
             process.clone(),
-            table,
-            rich,
+            pinned.table,
+            pinned.rich,
             installed_protocol_version,
         )
     }
@@ -2449,7 +2479,7 @@ impl BrokerState {
         &mut self,
         target: &kr_protocol::agent::AgentMutationTarget,
         capability: Option<CapabilityId>,
-        operation: crate::broker::methods::UpstreamOperation,
+        operation: kr_protocol::gateway::RichOperation,
         turn_id: Option<AgentTurnId>,
         responsible: crate::broker::methods::Responsible,
         body: crate::broker::methods::UpstreamBody,
@@ -2548,41 +2578,22 @@ impl BrokerState {
         Ok(reconciliation)
     }
 
-    /// Checks one presented table against what the installation pinned.
-    fn check_pinned_table(
+    /// Returns the tables this host pinned for one installation's package.
+    fn pinned_table(
         &self,
         application_instance_id: ApplicationInstanceId,
-        table: &kr_protocol::gateway::DeclarativeTable,
-    ) -> Result<()> {
-        let pinned = self
-            .pinned_tables
-            .get(&(application_instance_id, table.plugin_id.clone()))
+        plugin_id: &PluginId,
+    ) -> Result<PinnedTable> {
+        self.pinned_tables
+            .get(&(application_instance_id, plugin_id.clone()))
+            .cloned()
             .ok_or_else(|| {
                 BrokerError::denied(format!(
-                    "no declarative table of {} is pinned for {application_instance_id}, and the \
-                     core interprets frames only with a table this host installed",
-                    table.plugin_id
+                    "no declarative table of {plugin_id} is pinned for \
+                     {application_instance_id}, and the core interprets frames only with a table \
+                     this host installed"
                 ))
-            })?;
-        if pinned.publisher_id != table.publisher_id {
-            return Err(BrokerError::denied(format!(
-                "this table names publisher {} and {} was pinned",
-                table.publisher_id, pinned.publisher_id
-            )));
-        }
-        if pinned.digest != table.digest {
-            return Err(BrokerError::denied(format!(
-                "this table is not the one pinned for {} at {application_instance_id}",
-                table.plugin_id
-            )));
-        }
-        if pinned.table_version != table.table_version {
-            return Err(BrokerError::denied(format!(
-                "this table is version {} and {} was pinned",
-                table.table_version, pinned.table_version
-            )));
-        }
-        Ok(())
+            })
     }
 
     /// Mints the next gateway connection identifier, above everything this ledger has seen.
@@ -2731,10 +2742,15 @@ impl BrokerState {
 
     /// Checks that a capability record is about the installation it names.
     ///
-    /// Evidence that names a binary, a launch profile or a binding has to name *this* one.
-    /// Without the check a newer record gathered against another binary would be accepted for
-    /// this instance and would then pass every later recheck, because those compare the revision
-    /// and the state and not what the evidence was about.
+    /// Evidence that names a binary, a package, a publisher, a schema, a launch profile or a
+    /// binding has to name *this* one. Without the check a record gathered against another binary
+    /// or another package would be accepted for this instance and would then pass every later
+    /// recheck, because those compare the revision and the state and not what the evidence was
+    /// about.
+    ///
+    /// Every field is compared against something this host established itself, and a field it
+    /// cannot check is a field it refuses. Evidence about a binary this host has no recorded
+    /// launch for says nothing verifiable about the process that is running.
     fn check_evidence_identity(&self, record: &InstanceCapabilityRecord) -> Result<()> {
         let instance = self
             .instances
@@ -2749,27 +2765,132 @@ impl BrokerState {
             )));
         }
         if let Some(digest) = record.identity.binary_digest.as_ref() {
-            let launched = self
+            // The launch profile is where this host recorded what it resolved and started. An
+            // instance it adopted rather than launched has no profile and still has a managed
+            // process, whose handle names the executable this host is talking to. Either is an
+            // identity this host established; with neither there is nothing to check against, and
+            // an unverifiable claim about the running binary is the one worth making falsely.
+            let known = self
                 .profiles
                 .profile_of(record.application_instance_id)
-                .map(|profile| profile.binary.digest);
-            if let Some(launched) = launched
-                && &launched != digest
-            {
+                .map(|profile| profile.binary.digest)
+                .or_else(|| {
+                    instance
+                        .process
+                        .as_ref()
+                        .map(|process| process.handle.executable_digest)
+                })
+                .ok_or_else(|| {
+                    BrokerError::invalid(
+                        "this evidence names a binary and this host has neither a launch profile \
+                         nor a managed process for this instance, so there is nothing to check it \
+                         against",
+                    )
+                })?;
+            if &known != digest {
                 return Err(BrokerError::invalid(
                     "this evidence was gathered against another binary than the one running",
                 ));
             }
         }
-        if let Some(binding_id) = record.identity.binding_id.as_ref() {
-            let binding = self
-                .bindings
-                .get(binding_id)
-                .ok_or_else(|| unknown_binding(*binding_id))?;
-            if binding.application_instance_id != record.application_instance_id {
+        let binding = match record.identity.binding_id.as_ref() {
+            Some(binding_id) => {
+                let binding = self
+                    .bindings
+                    .get(binding_id)
+                    .ok_or_else(|| unknown_binding(*binding_id))?;
+                if binding.application_instance_id != record.application_instance_id {
+                    return Err(BrokerError::invalid(format!(
+                        "binding {binding_id} is not bound to {}",
+                        record.application_instance_id
+                    )));
+                }
+                Some(binding)
+            }
+            None => None,
+        };
+        // The package, its bytes and its publisher, against the binding the evidence came through
+        // or the table this host pinned for that package. A record naming a package this
+        // installation does not run is evidence about something else.
+        if let Some(plugin_id) = record.identity.plugin_id.as_ref() {
+            let installed = binding.map_or_else(
+                || {
+                    self.pinned_tables
+                        .contains_key(&(record.application_instance_id, plugin_id.clone()))
+                },
+                |binding| &binding.plugin_id == plugin_id,
+            );
+            if !installed {
                 return Err(BrokerError::invalid(format!(
-                    "binding {binding_id} is not bound to {}",
+                    "this evidence is about {plugin_id}, which is not installed for {}",
                     record.application_instance_id
+                )));
+            }
+        } else if record.identity.package_digest.is_present()
+            || record.identity.publisher_id.is_present()
+            || record.identity.schema_version.is_present()
+        {
+            return Err(BrokerError::invalid(
+                "this evidence names a package's bytes, publisher or schema without naming the \
+                 package, so there is nothing to check them against",
+            ));
+        }
+        if let Some(package_digest) = record.identity.package_digest.as_ref() {
+            let binding = binding.ok_or_else(|| {
+                BrokerError::invalid(
+                    "this evidence names package bytes and no binding, and a binding is where \
+                     this host knows what bytes it loaded",
+                )
+            })?;
+            if &binding.package_digest != package_digest {
+                return Err(BrokerError::invalid(
+                    "this evidence was gathered against other package bytes than the ones bound",
+                ));
+            }
+        }
+        if let Some(publisher_id) = record.identity.publisher_id.as_ref() {
+            let installed = binding.map_or_else(
+                || {
+                    record
+                        .identity
+                        .plugin_id
+                        .as_ref()
+                        .and_then(|plugin_id| {
+                            self.pinned_tables
+                                .get(&(record.application_instance_id, plugin_id.clone()))
+                        })
+                        .is_some_and(|pinned| &pinned.table.publisher_id == publisher_id)
+                },
+                |binding| &binding.publisher_id == publisher_id,
+            );
+            if !installed {
+                return Err(BrokerError::invalid(format!(
+                    "this evidence names publisher {publisher_id} and another publishes what is \
+                     installed here"
+                )));
+            }
+        }
+        // The schema the evidence is about is the upstream version the pinned table qualified
+        // against. Evidence gathered against another version describes another protocol.
+        if let Some(schema_version) = record.identity.schema_version.as_ref() {
+            let pinned = record
+                .identity
+                .plugin_id
+                .as_ref()
+                .and_then(|plugin_id| {
+                    self.pinned_tables
+                        .get(&(record.application_instance_id, plugin_id.clone()))
+                })
+                .ok_or_else(|| {
+                    BrokerError::invalid(
+                        "this evidence names a schema version and no table is pinned for its \
+                         package, so there is nothing to check it against",
+                    )
+                })?;
+            if pinned.table.upstream_protocol_version != schema_version.0 {
+                return Err(BrokerError::invalid(format!(
+                    "this evidence was gathered against upstream schema {} and {} is pinned here",
+                    schema_version.0, pinned.table.upstream_protocol_version
                 )));
             }
         }

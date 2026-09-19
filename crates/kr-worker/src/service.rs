@@ -3540,7 +3540,7 @@ impl WorkerService {
                     &Self::broker_caller(caller),
                     &params.target,
                     capability,
-                    crate::broker::UpstreamOperation::PromptSubmit,
+                    kr_protocol::gateway::RichOperation::PromptSubmit,
                     None,
                     kr_ipc::now_ms(),
                 )?;
@@ -3552,7 +3552,7 @@ impl WorkerService {
                     &Self::broker_caller(caller),
                     &params.target,
                     "agent.steer",
-                    crate::broker::UpstreamOperation::TurnSteer,
+                    kr_protocol::gateway::RichOperation::TurnSteer,
                     Some(params.turn_id.clone()),
                     kr_ipc::now_ms(),
                 )?;
@@ -3564,7 +3564,7 @@ impl WorkerService {
                     &Self::broker_caller(caller),
                     &params.target,
                     "agent.cancel",
-                    crate::broker::UpstreamOperation::TurnCancel,
+                    kr_protocol::gateway::RichOperation::TurnCancel,
                     Some(params.turn_id.clone()),
                     kr_ipc::now_ms(),
                 )?;
@@ -3577,7 +3577,7 @@ impl WorkerService {
                     &Self::broker_caller(caller),
                     &params.target,
                     "agent.approval",
-                    crate::broker::UpstreamOperation::ApprovalRespond,
+                    kr_protocol::gateway::RichOperation::ApprovalRespond,
                     None,
                     kr_ipc::now_ms(),
                 )?;

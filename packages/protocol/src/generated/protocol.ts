@@ -1182,6 +1182,21 @@ export type ReviewSubject =
       }
     }
 /**
+ * One operation the core carries to an upstream on a person's behalf.
+ *
+ * Section 23 gives the five agent mutations five separate rights, and two of them share one:
+ * submitting a prompt, queueing one and steering a turn all need `agent.prompt`. The right is
+ * therefore not what names the upstream method, and this is: a table says which of its methods
+ * each operation is, so submitting a prompt cannot encode as steering a turn.
+ */
+export type RichOperation =
+  | 'prompt_submit'
+  | 'prompt_queue'
+  | 'turn_steer'
+  | 'turn_cancel'
+  | 'approval_respond'
+  | 'plugin_action'
+/**
  * One published editor fence. An identity from an unacknowledged exchange names no fence.
  */
 export type FenceId = string
@@ -7235,6 +7250,15 @@ export interface DeclarativeTable {
  * One entry of a connector's declarative table.
  */
 export interface DeclarativeEntry {
+  /**
+   * The member of a response's result that carries the decision, for a method a person answers.
+   *
+   * An approval's answer is written by the core, so the core has to know the shape the upstream
+   * reads. Protocols disagree about it: one wants `{"option_id": "allow"}` and the next wants
+   * `{"behavior": "allow"}`. The qualified table states the member name, and a method that
+   * names none is one this host will not write an answer for.
+   */
+  approval_option_field: string | null
   /**
    * What it does.
    */
@@ -16571,6 +16595,13 @@ export interface RichMethodEntry {
    * An upstream method name, as a connector's declarative or rich table names it.
    */
   method: string
+  /**
+   * The operation this method is, where it is one of the core's own.
+   *
+   * A table may also list a method that no core operation encodes, which is why this is
+   * optional: it is listed so the method is admissible, not so the core will send it.
+   */
+  operation: RichOperation | null
   /**
    * How a successful invocation's provenance is recorded.
    */

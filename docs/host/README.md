@@ -3017,9 +3017,16 @@ broker issues and spends the token around the operation it dispatches itself.
 
 A per-installation map, not a label on an agent's name: two installations of one agent have two
 maps. Each record names the capability and its version, the exact identity it was gathered against
-(the binary digest, the schema version, the package, the signed qualification profile, the launch
-profile, the binding and its revision), the state, where the evidence came from and what makes it
-stale.
+(the binary digest, the schema version, the package, its bytes, its publisher, the signed
+qualification profile, the launch profile, the binding and its revision), the state, where the
+evidence came from and what makes it stale.
+
+Every field a record names is compared with something this host established itself: the binary
+against the launch profile or the managed process's own handle, the package and its publisher
+against the binding that loaded them or the table this host pinned, the package bytes against the
+binding, and the schema against the upstream version that table was qualified for. A field the host
+has nothing to compare against is refused rather than believed, because evidence about a binary or
+a package this host cannot identify is a claim about something else.
 
 Evidence is never permission. Only a probe this host ran or a binding that performed the operation
 here can say a capability works here; a signed catalogue record is evidence about a version. A
@@ -3065,6 +3072,13 @@ process identity of a launch this host made *and* the private exchange of that l
 client or a component cannot ask for the native origin at all, so nothing can label itself native
 to escape the rich method table.
 
+The table is what the installation qualified, and it is what the core reads frames with. A
+connection names the package it speaks for and presents nothing about the protocol, so there is
+nothing to compare and nothing to substitute. The table's recorded digest covers everything it says
+— the framing, each member name, and every entry's class, response expectation, reverse operation
+and answer shape — so a table whose framing, classification or reverse operations were altered
+cannot carry the digest of the one that was qualified.
+
 A request the table does not classify is presumed mutation-capable, forwarded exactly as it is, and
 suspends that instance's rich mutations until the binding is reconciled. The terminal stays usable
 throughout: suspension is a state a client reads, not an error it hits.
@@ -3094,6 +3108,14 @@ the classification, the recording, the correlation, the arbitration and the admi
 The rich method table is closed and versioned. A method with no entry is rejected; one listed as
 unsupported is rejected with its own reason. Both tables are pinned to an upstream protocol version
 and refused against another.
+
+Each entry also says which of the core's own operations it is, and that is how an operation is
+encoded. Submitting a prompt, queueing one and steering a turn need one right between them, so the
+right cannot name the method; the table names one method per operation, and a table that names none
+for an operation, or two, sends nothing rather than sending the nearest thing. The operation
+travels with the turn it acts on. An approval's answer is written into the member the table names
+for that method, so an upstream that reads its decision from `behavior` is answered in `behavior`,
+and a method the table says nothing about answering is one this host will not answer at all.
 
 An upstream reverse request for a filesystem or terminal operation names the agent's own host
 environment and the user the agent runs as. The instance comes from the connection rather than from
