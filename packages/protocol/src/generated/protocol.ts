@@ -68,6 +68,10 @@ export type Digest256 = string
  */
 export type BrokerBindingId = string
 /**
+ * Changes when the active upstream execution owner or selected thread changes.
+ */
+export type AgentBindingRevision = string
+/**
  * A plugin identifier from its manifest.
  */
 export type PluginId = string
@@ -99,7 +103,7 @@ export type ApplicationInstanceId = string
  */
 export type DraftId = string
 /**
- * Prompt or steering text carried inline, bounded at 64 KiB.
+ * Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition.
  */
 export type PromptText = string
 /**
@@ -147,10 +151,6 @@ export type ChangeOperation =
        */
       path: string
     }
-/**
- * Changes when the active upstream execution owner or selected thread changes.
- */
-export type AgentBindingRevision = string
 /**
  * What an attachment asks to be able to do.
  *
@@ -2479,6 +2479,13 @@ export interface CapabilitySubjectIdentity {
    */
   binding_id: BrokerBindingId | null
   /**
+   * The agent binding revision it was gathered at.
+   *
+   * A binding identifier alone names the binding, not the conversation it was bound to when the
+   * evidence was taken, and a thread selection changes what the upstream can do.
+   */
+  binding_revision: AgentBindingRevision | null
+  /**
    * The desktop session generation the evidence is bound to.
    */
   desktop_generation: U64 | null
@@ -2486,6 +2493,10 @@ export interface CapabilitySubjectIdentity {
    * Whether the operating-system permission the capability needs was held.
    */
   os_permission_held: boolean | null
+  /**
+   * The digest of that package's bytes.
+   */
+  package_digest: Digest256 | null
   /**
    * The package the evidence is about, where it is about one.
    */
@@ -3084,7 +3095,7 @@ export interface AgentSnapshotEntry {
 export interface AgentSteerParams {
   target: AgentMutationTarget3
   /**
-   * Prompt or steering text carried inline, bounded at 64 KiB.
+   * Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition.
    */
   text: string
   /**
@@ -7237,10 +7248,11 @@ export interface DecoderLedgerEntry {
    */
   publisher_id: string
   /**
-   * The original source bytes, so the request can be shown as it arrived.
+   * The original source bytes, whole.
    *
    * A digest proves which bytes these are; it cannot reproduce them, and section 11 requires
-   * the original source to be retained rather than merely identified.
+   * the original source to be retained rather than merely identified. A request too large to
+   * retain whole never becomes an approval, so this is never a partial copy.
    */
   source_bytes: string
   /**
@@ -7251,10 +7263,6 @@ export interface DecoderLedgerEntry {
    * The generation of the source frame the decoder read.
    */
   source_generation: string
-  /**
-   * True when the frame was larger than [`MAX_RETAINED_SOURCE_BYTES`] and was cut.
-   */
-  source_truncated: boolean
   /**
    * An upstream JSON-RPC request identifier, exactly as the upstream wrote it. Correlation data, not authority.
    */

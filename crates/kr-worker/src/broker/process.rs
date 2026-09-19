@@ -37,12 +37,11 @@ const HEX: [u8; 16] = *b"0123456789abcdef";
 /// the broker is about to start, and used to authenticate that process when it connects.
 ///
 /// What this type guarantees, exactly: there is no accessor that returns the bytes, `Debug`
-/// redacts, and the value leaves the broker only through [`ManagedProcess::write_registration`],
-/// into a file the broker creates for the process it is about to start. What it does not
-/// guarantee is secrecy against a reader of this process's memory: the `Drop` overwrite is a
-/// tidiness measure that an optimiser is free to remove, and it is not offered as more than that.
+/// redacts, the value leaves the broker only through [`ManagedProcess::write_registration`], and
+/// the bytes live in the host's own zeroising secret buffer, so the wipe on drop is the one the
+/// cryptography crate performs rather than ordinary stores an optimiser may remove.
 pub struct Credential {
-    bytes: [u8; CREDENTIAL_BYTES],
+    secret: kr_crypto::secret::Secret<CREDENTIAL_BYTES>,
 }
 
 impl Credential {
@@ -53,11 +52,10 @@ impl Credential {
     /// Returns [`BrokerError::LedgerUnavailable`] when the host has no key material, because a
     /// launch that cannot be authenticated is one the broker declines to make.
     pub fn generate() -> Result<Self> {
-        let mut bytes = [0_u8; CREDENTIAL_BYTES];
-        kr_crypto::random_bytes(&mut bytes).map_err(|error| {
+        let secret = kr_crypto::secret::Secret::random().map_err(|error| {
             BrokerError::ledger(format!("no key material for a launch credential: {error}"))
         })?;
-        Ok(Self { bytes })
+        Ok(Self { secret })
     }
 
     /// Builds a credential from known bytes.
@@ -66,7 +64,9 @@ impl Credential {
     /// way to read one back out: the value goes in and nothing comes out.
     #[must_use]
     pub const fn from_bytes(bytes: [u8; CREDENTIAL_BYTES]) -> Self {
-        Self { bytes }
+        Self {
+            secret: kr_crypto::secret::Secret::from_bytes(bytes),
+        }
     }
 
     /// Returns true when the presented value is this credential.
@@ -75,7 +75,8 @@ impl Credential {
     /// is not something a caller can measure.
     #[must_use]
     pub fn authenticates(&self, presented: &[u8]) -> bool {
-        presented.len() == CREDENTIAL_BYTES && kr_crypto::constant_time_eq(&self.bytes, presented)
+        presented.len() == CREDENTIAL_BYTES
+            && kr_crypto::constant_time_eq(self.secret.expose(), presented)
     }
 
     /// Renders the credential for the registration file the launched process reads.
@@ -83,13 +84,13 @@ impl Credential {
     /// Private on purpose: the value leaves the broker through the registration file and nowhere
     /// else. It never goes into an argument vector, an environment variable, a URL or a
     /// diagnostic. The rendering is bytes rather than a `String` so the caller can overwrite it.
-    fn to_registration_bytes(&self) -> Vec<u8> {
+    fn to_registration_bytes(&self) -> kr_crypto::secret::SecretVec {
         let mut rendered = Vec::with_capacity(CREDENTIAL_BYTES * 2);
-        for byte in self.bytes {
+        for byte in self.secret.expose() {
             rendered.push(HEX[usize::from(byte >> 4)]);
             rendered.push(HEX[usize::from(byte & 0x0f)]);
         }
-        rendered
+        kr_crypto::secret::SecretVec::new(rendered)
     }
 
     /// Reads a credential back from its registration text.
@@ -113,24 +114,13 @@ impl Credential {
             *slot = u8::from_str_radix(pair, 16)
                 .map_err(|_| BrokerError::invalid("a launch credential is hexadecimal"))?;
         }
-        Ok(Self { bytes })
+        Ok(Self::from_bytes(bytes))
     }
 }
 
 impl std::fmt::Debug for Credential {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("Credential(<redacted>)")
-    }
-}
-
-impl Drop for Credential {
-    fn drop(&mut self) {
-        // Overwritten rather than left in the allocator's free list. It is not a guarantee against
-        // a reader of this process's memory, and it is not offered as one; it is the cheap half of
-        // not leaving a live secret lying about after the launch it belonged to has ended.
-        for byte in &mut self.bytes {
-            *byte = 0;
-        }
     }
 }
 
@@ -267,31 +257,52 @@ impl ManagedProcess {
         self.credential.authenticates(presented) && self.process.matches(process)
     }
 
+    /// Returns true when this platform publishes the launch credential as a file.
+    ///
+    /// Unix does: the host can read back the owning user and the mode bits of the directory it
+    /// wrote into, so "no other account can read this" is a fact rather than a hope. Windows has
+    /// no mode bits, and the host's shared file publication does not yet install or verify a
+    /// restricted access-control list, so the credential is not written to disk there.
+    #[must_use]
+    pub const fn publishes_credential_file() -> bool {
+        cfg!(unix)
+    }
+
     /// Writes the registration file the launched process reads its credential from.
     ///
     /// The host's own owner-only publication is what writes it: the contents are complete before
     /// the name exists, and the create refuses to replace a name already there, so a file another
     /// writer planted is never written into and never read as though this host had written it.
     ///
-    /// The parent directory is checked first. On Unix that check is the mode bits and the owning
-    /// user. On Windows the host has no mode bits to check and relies on the runtime directory
-    /// living under the user's own profile; the explicit protected access-control list is part of
-    /// the platform's own qualification pass, which this file inherits rather than duplicating.
+    /// **This is a Unix path, and it is refused everywhere else.** The parent directory is checked
+    /// by its owning user and its mode bits, and a platform that cannot answer those questions
+    /// cannot establish that a file holding a secret is closed to other accounts. Rather than
+    /// write the credential into a file whose protection this host cannot verify, the publication
+    /// is refused and the launch authenticates over the endpoint instead, whose access-control
+    /// list the transport sets and whose peer credentials it checks. See
+    /// [`ManagedProcess::publishes_credential_file`].
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::LedgerUnavailable`] when the directory is not private or the file
+    /// Returns [`BrokerError::UnsupportedCapability`] on a platform without verifiable owner-only
+    /// files, and [`BrokerError::LedgerUnavailable`] when the directory is not private or the file
     /// cannot be created or written.
     pub fn write_registration(&self, path: &std::path::Path) -> Result<()> {
+        if !Self::publishes_credential_file() {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: "this platform cannot prove a file is closed to other accounts, so the \
+                         launch credential is not published as a file here"
+                    .to_owned(),
+            });
+        }
         let directory = path
             .parent()
             .ok_or_else(|| BrokerError::ledger(format!("{} names no directory", path.display())))?;
         check_private_directory(directory)?;
-        let mut rendered = self.credential.to_registration_bytes();
-        let written = kr_ipc::paths::create_new_owner_only_file(path, &rendered);
-        // The rendering is a copy of the secret. It goes back to zero before the buffer is freed,
-        // for the same reason and with the same limits as the credential's own drop.
-        rendered.fill(0);
+        let rendered = self.credential.to_registration_bytes();
+        // The rendering is a copy of the secret, and it is wiped when it is dropped at the end of
+        // this function, because it is the host's own zeroising buffer.
+        let written = kr_ipc::paths::create_new_owner_only_file(path, rendered.expose());
         written.map_err(|error| {
             BrokerError::ledger(format!(
                 "could not write the registration file {}: {error}",
@@ -420,9 +431,9 @@ mod tests {
     #[test]
     fn a_registration_round_trip_is_the_only_way_a_credential_moves() {
         let credential = Credential::from_bytes([9; CREDENTIAL_BYTES]);
-        let text =
-            String::from_utf8(credential.to_registration_bytes()).expect("the rendering is ASCII");
-        let read = Credential::from_registration_text(&text).expect("the text is well formed");
+        let rendered = credential.to_registration_bytes();
+        let text = std::str::from_utf8(rendered.expose()).expect("the rendering is ASCII");
+        let read = Credential::from_registration_text(text).expect("the text is well formed");
         assert!(read.authenticates(&[9; CREDENTIAL_BYTES]));
         assert!(!read.authenticates(&[8; CREDENTIAL_BYTES]));
         assert!(!read.authenticates(&[9; 16]));
@@ -442,6 +453,7 @@ mod tests {
         assert!(!managed.authenticates(&[8; CREDENTIAL_BYTES], &process(41, 900)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_registration_file_is_owner_only_and_never_overwrites() {
         let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
@@ -514,6 +526,21 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn a_credential_is_never_written_where_its_protection_cannot_be_proved() {
+        let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
+        std::fs::create_dir_all(&directory).expect("the directory is created");
+        let managed = managed(Credential::from_bytes([9; CREDENTIAL_BYTES]));
+        assert!(!ManagedProcess::publishes_credential_file());
+        assert!(
+            managed
+                .write_registration(&directory.join("registration"))
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&directory);
     }
 
     #[test]

@@ -34,8 +34,11 @@ pub const MAX_INLINE_PROMPT_BYTES: usize = 64 * 1024;
 
 /// Prompt or steering text, bounded by the contract rather than by a caller's restraint.
 ///
-/// The bound is part of the wire type rather than a check somewhere downstream, so the generated
-/// schema states it and a decoder refuses an over-long value before anything allocates it.
+/// **The bound is 65,536 bytes of UTF-8, not 65,536 characters.** JSON Schema's `maxLength` counts
+/// Unicode characters, so the published `maxLength` is a necessary condition and not a sufficient
+/// one: a value of 40,000 accented characters satisfies the schema and is refused here. The
+/// normative check is this type's, which every decoder runs, and the schema's description says so
+/// for a client that validates before it sends.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 #[serde(transparent)]
 pub struct PromptText(String);
@@ -102,7 +105,7 @@ impl JsonSchema for PromptText {
             "type": "string",
             "minLength": 1,
             "maxLength": MAX_INLINE_PROMPT_BYTES,
-            "description": "Prompt or steering text carried inline, bounded at 64 KiB."
+            "description": "Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition."
         })
     }
 }
@@ -392,7 +395,7 @@ mod tests {
     }
 
     #[test]
-    fn inline_text_is_bounded_by_the_contract() {
+    fn inline_text_is_bounded_in_bytes_rather_than_characters() {
         assert!(PromptText::new("hello").is_ok());
         assert!(PromptText::new(String::new()).is_err());
         assert!(PromptText::new("a".repeat(MAX_INLINE_PROMPT_BYTES)).is_ok());
@@ -400,7 +403,24 @@ mod tests {
         let over_long = serde_json::Value::String("a".repeat(MAX_INLINE_PROMPT_BYTES + 1));
         assert!(
             serde_json::from_value::<PromptText>(over_long).is_err(),
-            "the bound is enforced on the way in, not somewhere downstream"
+            "the bound is enforced by the type every decoder runs"
+        );
+
+        // Two bytes per character: half the characters, the same bytes. The schema's character
+        // count would admit this, and the type does not.
+        let multibyte = "é".repeat(MAX_INLINE_PROMPT_BYTES / 2);
+        assert_eq!(multibyte.len(), MAX_INLINE_PROMPT_BYTES);
+        assert_eq!(multibyte.chars().count(), MAX_INLINE_PROMPT_BYTES / 2);
+        assert!(PromptText::new(multibyte.clone()).is_ok());
+        assert!(
+            PromptText::new(format!("{multibyte}é")).is_err(),
+            "the bound is bytes, and a multibyte character spends two of them"
+        );
+        assert!(
+            serde_json::from_value::<PromptText>(serde_json::Value::String(format!(
+                "{multibyte}é"
+            )))
+            .is_err()
         );
     }
 

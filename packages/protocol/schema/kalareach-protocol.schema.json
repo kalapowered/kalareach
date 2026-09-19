@@ -3919,6 +3919,17 @@
           ],
           "description": "The binding the evidence was gathered through."
         },
+        "binding_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AgentBindingRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The agent binding revision it was gathered at.\n\nA binding identifier alone names the binding, not the conversation it was bound to when the\nevidence was taken, and a thread selection changes what the upstream can do."
+        },
         "desktop_generation": {
           "anyOf": [
             {
@@ -3940,6 +3951,17 @@
             }
           ],
           "description": "Whether the operating-system permission the capability needs was held."
+        },
+        "package_digest": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Digest256"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The digest of that package's bytes."
         },
         "plugin_id": {
           "anyOf": [
@@ -4001,10 +4023,12 @@
         "binary_digest",
         "schema_version",
         "plugin_id",
+        "package_digest",
         "publisher_id",
         "qualification_profile_digest",
         "profile_id",
         "binding_id",
+        "binding_revision",
         "desktop_generation",
         "os_permission_held"
       ],
@@ -6619,7 +6643,7 @@
         },
         "source_bytes": {
           "$ref": "#/$defs/Bytes",
-          "description": "The original source bytes, so the request can be shown as it arrived.\n\nA digest proves which bytes these are; it cannot reproduce them, and section 11 requires\nthe original source to be retained rather than merely identified."
+          "description": "The original source bytes, whole.\n\nA digest proves which bytes these are; it cannot reproduce them, and section 11 requires\nthe original source to be retained rather than merely identified. A request too large to\nretain whole never becomes an approval, so this is never a partial copy."
         },
         "source_digest": {
           "$ref": "#/$defs/Digest256",
@@ -6628,10 +6652,6 @@
         "source_generation": {
           "$ref": "#/$defs/SourceGeneration",
           "description": "The generation of the source frame the decoder read."
-        },
-        "source_truncated": {
-          "description": "True when the frame was larger than [`MAX_RETAINED_SOURCE_BYTES`] and was cut.",
-          "type": "boolean"
         },
         "upstream_request_id": {
           "$ref": "#/$defs/UpstreamRequestId",
@@ -6648,7 +6668,6 @@
         "source_generation",
         "source_digest",
         "source_bytes",
-        "source_truncated",
         "projection",
         "deadline_ms",
         "decoded_at"
@@ -18038,7 +18057,7 @@
       "type": "string"
     },
     "PromptText": {
-      "description": "Prompt or steering text carried inline, bounded at 64 KiB.",
+      "description": "Prompt or steering text carried inline. The normative bound is 65536                             bytes of UTF-8; maxLength counts characters and is therefore a                             necessary rather than a sufficient condition.",
       "maxLength": 65536,
       "minLength": 1,
       "type": "string"

@@ -120,6 +120,12 @@ pub struct ReconcileScope {
 pub struct Arbitration {
     by_id: BTreeMap<PendingResourceId, Pending>,
     by_request: BTreeMap<DownstreamRequestId, PendingResourceId>,
+    /// Every resource this arbitration touched while the journal was faulted.
+    ///
+    /// Recovery commits all of them, whatever state they reached. Keeping only the unresolved
+    /// ones would leave a request the upstream withdrew inside the gap recorded as pending for
+    /// ever, because nothing would ever write its ending down.
+    volatile_touched: std::collections::BTreeSet<PendingResourceId>,
 }
 
 impl Arbitration {
@@ -278,9 +284,13 @@ impl Arbitration {
     /// # Errors
     ///
     /// Returns [`BrokerError::UnknownSubject`] or [`BrokerError::PermissionDenied`] as the claim
-    /// requires.
+    /// requires, and [`BrokerError::Arbitration`] when the marker is already set, because a second
+    /// admission to dispatch is a second answer.
     pub fn plan_dispatch(&self, claim: &Claim) -> Result<Transition> {
         let pending = self.claimed_by(claim)?;
+        if pending.dispatched {
+            return Err(BrokerError::Arbitration(ArbitrationError::AlreadyClaimed));
+        }
         Ok(Transition {
             resource: pending.resource.clone(),
             from: pending.resource.state,
@@ -349,6 +359,9 @@ impl Arbitration {
     /// ignored if it ever does.
     pub fn commit(&mut self, transition: Transition) -> Result<PendingResource> {
         let resource_id = transition.resource.resource_id;
+        if transition.resource.durability == Durability::Volatile {
+            self.volatile_touched.insert(resource_id);
+        }
         let pending = self.by_id.get_mut(&resource_id).ok_or_else(|| {
             BrokerError::unknown(format!("no pending resource {resource_id} to commit"))
         })?;
@@ -458,28 +471,32 @@ impl Arbitration {
     pub fn enter_volatile(&mut self) -> (u64, Vec<PendingResource>) {
         let mut carried = 0;
         let mut changed = Vec::new();
-        for pending in self.by_id.values_mut() {
+        let mut touched = Vec::new();
+        for (resource_id, pending) in &mut self.by_id {
             if pending.resource.state.is_terminal() {
                 continue;
             }
             pending.resource.durability = Durability::Volatile;
             changed.push(pending.resource.clone());
+            touched.push(*resource_id);
             if pending.resource.state == PendingState::Claimed || pending.dispatched {
                 carried += 1;
             }
         }
+        self.volatile_touched.extend(touched);
         (carried, changed)
     }
 
-    /// Returns every unresolved resource and whether an answer had gone for it.
+    /// Returns every resource that was touched while the journal was faulted.
     ///
-    /// This is what recovery commits: the resources that lived inside a gap, exactly as they
-    /// stand, rather than a replay of the operations that produced them.
+    /// This is what recovery commits: the resources that lived inside a gap, in whatever state
+    /// they actually reached, rather than a replay of the operations that produced them. A
+    /// resource the upstream withdrew inside the gap is here too, so its ending is written down.
     #[must_use]
-    pub fn unresolved(&self) -> Vec<(PendingResource, Option<BrokerBindingId>, bool)> {
-        self.by_id
-            .values()
-            .filter(|pending| !pending.resource.state.is_terminal())
+    pub fn volatile_records(&self) -> Vec<(PendingResource, Option<BrokerBindingId>, bool)> {
+        self.volatile_touched
+            .iter()
+            .filter_map(|resource_id| self.by_id.get(resource_id))
             .map(|pending| {
                 (
                     pending.resource.clone(),
@@ -488,6 +505,11 @@ impl Arbitration {
                 )
             })
             .collect()
+    }
+
+    /// Forgets the record of what the gap touched, because it has been committed.
+    pub fn clear_volatile_records(&mut self) {
+        self.volatile_touched.clear();
     }
 
     /// Forgets every resource that has reached a terminal state.
@@ -671,16 +693,16 @@ mod tests {
     }
 
     #[test]
-    fn a_native_answer_during_encoding_wins() {
+    fn a_native_answer_that_lands_before_the_recheck_wins() {
         let mut arbitration = Arbitration::new();
         let resource = resource(7, "11");
         let resource_id = resource.resource_id;
         let request = resource.request.clone();
         arbitration.record(resource, None).expect("recorded");
 
-        // The rich answer is encoded first: this is the encode step, before the recheck.
-        let encoded = "allow";
-        // The upstream answers itself while that encoding was happening.
+        // The rich answer has been encoded by its component and has not reached the recheck yet;
+        // the encoding itself happens outside this type, which is the point of the order. The
+        // upstream answers itself in that window.
         let native = arbitration
             .plan_upstream_resolved(&request)
             .expect("the upstream answered itself");
@@ -691,7 +713,7 @@ mod tests {
             arbitration
                 .plan_claim(resource_id, &actor("device-1"), TimestampMs::new(5))
                 .is_err(),
-            "the encoded answer {encoded} must not be dispatched over the native one"
+            "the encoded answer must not be dispatched over the native one"
         );
         assert_eq!(
             arbitration

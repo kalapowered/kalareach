@@ -237,6 +237,23 @@ pub enum InstanceEnding {
     AttachmentClosed,
 }
 
+/// Permission to write one answer to the upstream, once.
+///
+/// It exists only as the return value of [`Broker::admit_dispatch`], which commits the durable
+/// marker before it hands one out, so a caller holding this is a caller whose answer the ledger
+/// already says may have gone.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DispatchAdmission {
+    /// The resource being answered, as it stands.
+    pub resource: PendingResource,
+    /// The decision, checked against the ones the request offered.
+    pub option_id: String,
+    /// The upstream method the original request named.
+    pub method: UpstreamMethod,
+    /// The upstream's own identifier for it.
+    pub upstream_request_id: UpstreamRequestId,
+}
+
 /// What stopping an instance actually does.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StopOutcome {
@@ -737,6 +754,10 @@ impl Broker {
         now: TimestampMs,
     ) -> Result<PendingResource> {
         let mut state = self.state();
+        // Creating a rich approval is rich work. While the journal is faulted the native
+        // forwarding path continues and this does not: a resource nobody could record is one a
+        // restart could not reconcile.
+        state.volatile.require_rich_work()?;
         let binding = state
             .bindings
             .get(&binding_id)
@@ -797,8 +818,18 @@ impl Broker {
             )));
         }
 
-        let durability = state.volatile.mode().durability();
-        let retained = frame.bytes().len().min(MAX_RETAINED_SOURCE_BYTES);
+        // Section 11 requires the ledger to retain the original source, and a partial copy is not
+        // the original. A request too large to keep whole is not turned into an approval: it is
+        // still forwarded opaquely on the native path, which depends on nothing this host stores.
+        if frame.bytes().len() > MAX_RETAINED_SOURCE_BYTES {
+            return Err(BrokerError::UnsupportedCapability {
+                detail: format!(
+                    "source event {handle} is {} bytes and an approval's original source is \
+                     retained whole up to {MAX_RETAINED_SOURCE_BYTES}",
+                    frame.bytes().len()
+                ),
+            });
+        }
         let entry = DecoderLedgerEntry {
             binding_id,
             plugin_id,
@@ -808,8 +839,7 @@ impl Broker {
             upstream_request_id: request.upstream.clone(),
             source_generation: frame.generation,
             source_digest: frame.digest,
-            source_bytes: Bytes::from(frame.bytes()[..retained].to_vec()),
-            source_truncated: retained < frame.bytes().len(),
+            source_bytes: Bytes::from(frame.bytes().to_vec()),
             projection,
             deadline_ms: Nullable::from(deadline_ms),
             decoded_at: now,
@@ -823,19 +853,16 @@ impl Broker {
             classification,
             source_generation: frame.generation,
             state: PendingState::Pending,
-            durability,
+            // Durable by construction: a resource is admitted only while the journal is taking
+            // writes, and it becomes volatile only by living through a gap.
+            durability: Durability::Durable,
             deadline_ms: Nullable::from(deadline_ms),
             recorded_at: now,
             interpretation_verified: true,
         };
-        let admitted = state.ledger.admit_resource(
-            handle,
-            binding_id,
-            &entry,
-            &resource,
-            durability == Durability::Durable,
-            now,
-        )?;
+        let admitted = state
+            .ledger
+            .admit_resource(handle, binding_id, &entry, &resource, now)?;
         if !admitted {
             return Err(BrokerError::PreconditionFailed {
                 detail: format!("source event {handle} has already produced a resource"),
@@ -1009,7 +1036,9 @@ impl Broker {
     /// Returns [`BrokerError::Capability`] when the record breaks a rule or is not newer than the
     /// one held.
     pub fn record_capability(&self, record: CapabilityRecord) -> Result<()> {
-        self.state().capabilities.record(record)
+        let mut state = self.state();
+        state.check_evidence_identity(&record)?;
+        state.capabilities.record(record)
     }
 
     /// Records the result of a probe the host ran.
@@ -1018,7 +1047,9 @@ impl Broker {
     ///
     /// Returns [`BrokerError::InvalidArgument`] when the probe was not one the host would run.
     pub fn record_probe(&self, probe: &Probe, record: CapabilityRecord) -> Result<()> {
-        self.state().capabilities.record_probe(probe, record)
+        let mut state = self.state();
+        state.check_evidence_identity(&record)?;
+        state.capabilities.record_probe(probe, record)
     }
 
     /// Returns one installation's capability map.
@@ -1087,20 +1118,50 @@ impl Broker {
         Ok(claim)
     }
 
-    /// Commits the dispatch marker before the answer is written to the upstream.
+    /// Admits one answer to dispatch, and commits the marker before it goes.
+    ///
+    /// This is the last gate before bytes reach the upstream, and it is one operation because
+    /// everything it checks can change between the claim and the dispatch. Under the lock it
+    /// rechecks that rich work is admitted at all, that the resource is still answerable by this
+    /// claim, that the decision is one the upstream actually offered, and that no answer has gone
+    /// already; then it commits the durable marker. A caller that holds the returned admission may
+    /// write the answer, and nothing else may.
     ///
     /// # Errors
     ///
-    /// Returns [`BrokerError::PermissionDenied`] when another claim holds the resource, and
+    /// Returns [`BrokerError::RichWorkFenced`] while rich work is fenced,
+    /// [`BrokerError::PermissionDenied`] when another claim holds the resource or its decoder may
+    /// no longer answer, [`BrokerError::PreconditionFailed`] when the decision is not one the
+    /// request offered, [`BrokerError::Arbitration`] when an answer has already been admitted, and
     /// [`BrokerError::LedgerUnavailable`] when the marker cannot be committed.
-    pub fn mark_dispatched(&self, claim: &Claim) -> Result<()> {
+    pub fn admit_dispatch(&self, claim: &Claim, option_id: &str) -> Result<DispatchAdmission> {
         let mut state = self.state();
-        let transition = state.arbitration.plan_dispatch(claim)?;
-        if transition.resource.durability == Durability::Durable {
-            state.ledger.mark_dispatched(&transition.resource)?;
+        // Fenced rich work is fenced here too. Without this a claim taken before the journal
+        // faulted could dispatch inside the gap, with no durable marker to stop a second answer.
+        state.volatile.require_rich_work()?;
+        state.recheck_answerable(claim.resource_id)?;
+        let entry = state.ledger.decoding(claim.resource_id)?.ok_or_else(|| {
+            BrokerError::PreconditionFailed {
+                detail: format!(
+                    "{} has no recorded interpretation, so there is nothing to answer",
+                    claim.resource_id
+                ),
+            }
+        })?;
+        if !entry.offers(option_id) {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("{option_id} is not one of the decisions this request offered"),
+            });
         }
-        state.arbitration.commit(transition)?;
-        Ok(())
+        let transition = state.arbitration.plan_dispatch(claim)?;
+        state.ledger.mark_dispatched(&transition.resource)?;
+        let resource = state.arbitration.commit(transition)?;
+        Ok(DispatchAdmission {
+            resource,
+            option_id: option_id.to_owned(),
+            method: entry.method,
+            upstream_request_id: entry.upstream_request_id,
+        })
     }
 
     /// Resolves a claimed resource: the upstream confirmed the answer.
@@ -1237,23 +1298,18 @@ impl Broker {
     pub fn recover(&self, now: TimestampMs) -> Result<VolatileTransition> {
         let mut state = self.state();
         let beginning = state.volatile.begin_recovery(now)?;
-        let unresolved = state.arbitration.unresolved();
-        let commit = (|| -> Result<()> {
-            for (resource, decoder, dispatched) in &unresolved {
-                state.ledger.put_pending(resource, *decoder, *dispatched)?;
-            }
-            match state.volatile.row() {
-                Some(row) => state.ledger.commit_gap(row, &beginning.gap),
-                None => state.ledger.open_gap(&beginning.gap).map(|_| ()),
-            }
-        })();
-        if let Err(error) = commit {
+        let records = state.arbitration.volatile_records();
+        let row = state.volatile.row();
+        if let Err(error) = state.ledger.commit_recovery(&records, &beginning.gap, row) {
+            // Nothing was committed, so the fence goes back over a ledger that has not
+            // half-recorded a recovery.
             let (carried, _) = state.arbitration.enter_volatile();
             state
                 .volatile
                 .fall_back("storage failed again during recovery", carried, now)?;
             return Err(error);
         }
+        state.arbitration.clear_volatile_records();
         state.volatile.finish_recovery()
     }
 
@@ -1313,7 +1369,11 @@ impl BrokerState {
     /// A volatile record is not written: that is what volatile means, and writing it would be the
     /// manufactured durable history section 11 forbids.
     fn write_transition(&self, transition: &Transition, now: TimestampMs) -> Result<()> {
-        if transition.resource.durability != Durability::Durable {
+        // What decides whether a write happens is the mode this host is in now, not the evidence
+        // quality of the resource's own history. A resource that lived through a gap keeps
+        // `durability = volatile` for ever, because that is what its history was; its later
+        // transitions are still written down.
+        if self.volatile.durability() != Durability::Durable {
             return Ok(());
         }
         self.ledger.settle_pending(
@@ -1373,6 +1433,64 @@ impl BrokerState {
             )?;
         }
         Ok(binding.grants.clone())
+    }
+
+    /// Checks that a capability record is about the installation it names.
+    ///
+    /// Evidence that names a binary, a launch profile or a binding has to name *this* one.
+    /// Without the check a newer record gathered against another binary would be accepted for
+    /// this instance and would then pass every later recheck, because those compare the revision
+    /// and the state and not what the evidence was about.
+    fn check_evidence_identity(&self, record: &CapabilityRecord) -> Result<()> {
+        let instance = self
+            .instances
+            .get(&record.application_instance_id)
+            .ok_or_else(|| unknown_instance(record.application_instance_id))?;
+        if let Some(profile_id) = record.identity.profile_id.as_ref()
+            && instance.profile_id.as_ref() != Some(profile_id)
+        {
+            return Err(BrokerError::invalid(format!(
+                "this evidence was gathered under launch profile {profile_id}, and the instance \
+                 was launched under another"
+            )));
+        }
+        if let Some(digest) = record.identity.binary_digest.as_ref() {
+            let launched = self
+                .profiles
+                .profile_of(record.application_instance_id)
+                .map(|profile| profile.binary.digest);
+            if let Some(launched) = launched
+                && &launched != digest
+            {
+                return Err(BrokerError::invalid(
+                    "this evidence was gathered against another binary than the one running",
+                ));
+            }
+        }
+        if let Some(binding_id) = record.identity.binding_id.as_ref() {
+            let binding = self
+                .bindings
+                .get(binding_id)
+                .ok_or_else(|| unknown_binding(*binding_id))?;
+            if binding.application_instance_id != record.application_instance_id {
+                return Err(BrokerError::invalid(format!(
+                    "binding {binding_id} is not bound to {}",
+                    record.application_instance_id
+                )));
+            }
+        }
+        if let Some(revision) = record.identity.binding_revision.as_ref()
+            && *revision != instance.binding_revision
+        {
+            return Err(BrokerError::StaleBinding {
+                detail: format!(
+                    "this evidence was gathered at binding revision {revision} and the binding \
+                     is at {}",
+                    instance.binding_revision
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Checks that one pending resource is still one an answer may be dispatched for.

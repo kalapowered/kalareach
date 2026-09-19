@@ -59,12 +59,17 @@ pub const MAX_OFFERED_DECISIONS: usize = 16;
 /// Maximum length in bytes of one decision identifier or label.
 pub const MAX_DECISION_TEXT_LEN: usize = 256;
 
-/// Maximum bytes of original source the ledger retains per decoded request.
+/// Maximum bytes of original source one decoded request may carry.
 ///
-/// Section 11 requires the ledger to retain the original source. A frame larger than this is
-/// retained up to the bound with [`DecoderLedgerEntry::source_truncated`] set, because a record
-/// that silently held part of a request would be worse than one that says it holds part of it.
-pub const MAX_RETAINED_SOURCE_BYTES: usize = 256 * 1024;
+/// Section 11 requires the ledger to retain the original source, and a partial copy is not the
+/// original. A request whose frame is larger than this is therefore never turned into an
+/// actionable approval: it is forwarded opaquely on the native path, where nothing depends on
+/// this host being able to reproduce it. The bound leaves room inside one canonical record for
+/// the projection and the record's own fields.
+pub const MAX_RETAINED_SOURCE_BYTES: usize = 512 * 1024;
+
+/// Maximum length in bytes of the summary a decoder writes for a person.
+pub const MAX_PROJECTION_SUMMARY_LEN: usize = 4096;
 
 // ---------------------------------------------------------------------------------------------
 // Grants
@@ -301,6 +306,17 @@ impl DecodingTrust {
         if !self.schema_versions.contains(&projection.schema_version) {
             return Err(TrustError::SchemaNotCovered);
         }
+        if projection.schema_version.is_empty()
+            || projection.schema_version.len() > MAX_DECISION_TEXT_LEN
+        {
+            return Err(TrustError::SchemaNotCovered);
+        }
+        if projection.summary.len() > MAX_PROJECTION_SUMMARY_LEN {
+            return Err(TrustError::SummaryTooLong {
+                length: projection.summary.len(),
+                limit: MAX_PROJECTION_SUMMARY_LEN,
+            });
+        }
         if projection.decisions.is_empty() {
             return Err(TrustError::NoDecisions);
         }
@@ -409,6 +425,14 @@ pub enum TrustError {
     /// Two decisions shared one identifier.
     #[error("a decoded projection's decision identifiers must be unique")]
     DuplicateDecision,
+    /// The summary was longer than a record can carry.
+    #[error("a decoded projection's summary is at most {limit} bytes, and this one is {length}")]
+    SummaryTooLong {
+        /// How long it was.
+        length: usize,
+        /// The limit.
+        limit: usize,
+    },
     /// The record named more methods than one record may cover.
     #[error(
         "a decoding trust record covers at most {limit} methods, and this one covers {methods}"
@@ -446,13 +470,12 @@ pub struct DecoderLedgerEntry {
     pub source_generation: SourceGeneration,
     /// The digest of those immutable source bytes.
     pub source_digest: Digest256,
-    /// The original source bytes, so the request can be shown as it arrived.
+    /// The original source bytes, whole.
     ///
     /// A digest proves which bytes these are; it cannot reproduce them, and section 11 requires
-    /// the original source to be retained rather than merely identified.
+    /// the original source to be retained rather than merely identified. A request too large to
+    /// retain whole never becomes an approval, so this is never a partial copy.
     pub source_bytes: Bytes,
-    /// True when the frame was larger than [`MAX_RETAINED_SOURCE_BYTES`] and was cut.
-    pub source_truncated: bool,
     /// The projection the decoder produced, with the exact decisions it offered.
     pub projection: DecodedProjection,
     /// The deadline the upstream put on its request, where it stated one.
@@ -1126,6 +1149,8 @@ pub struct CapabilitySubjectIdentity {
     pub schema_version: Nullable<MethodTableVersionText>,
     /// The package the evidence is about, where it is about one.
     pub plugin_id: Nullable<PluginId>,
+    /// The digest of that package's bytes.
+    pub package_digest: Nullable<Digest256>,
     /// The publisher whose signed record supplied the evidence, where one did.
     pub publisher_id: Nullable<PublisherId>,
     /// The digest of the signed qualification profile the evidence came from, where one did.
@@ -1134,6 +1159,11 @@ pub struct CapabilitySubjectIdentity {
     pub profile_id: Nullable<LaunchProfileId>,
     /// The binding the evidence was gathered through.
     pub binding_id: Nullable<BrokerBindingId>,
+    /// The agent binding revision it was gathered at.
+    ///
+    /// A binding identifier alone names the binding, not the conversation it was bound to when the
+    /// evidence was taken, and a thread selection changes what the upstream can do.
+    pub binding_revision: Nullable<AgentBindingRevision>,
     /// The desktop session generation the evidence is bound to.
     pub desktop_generation: Nullable<U64>,
     /// Whether the operating-system permission the capability needs was held.
@@ -1146,10 +1176,12 @@ impl Default for CapabilitySubjectIdentity {
             binary_digest: Nullable::null(),
             schema_version: Nullable::null(),
             plugin_id: Nullable::null(),
+            package_digest: Nullable::null(),
             publisher_id: Nullable::null(),
             qualification_profile_digest: Nullable::null(),
             profile_id: Nullable::null(),
             binding_id: Nullable::null(),
+            binding_revision: Nullable::null(),
             desktop_generation: Nullable::null(),
             os_permission_held: Nullable::null(),
         }
@@ -1666,6 +1698,12 @@ mod tests {
             trust.check_projection(&projection("kr-approval/1", &[""])),
             Err(TrustError::DecisionText)
         );
+        let mut verbose = projection("kr-approval/1", &["allow"]);
+        verbose.summary = "a".repeat(MAX_PROJECTION_SUMMARY_LEN + 1);
+        assert!(matches!(
+            trust.check_projection(&verbose),
+            Err(TrustError::SummaryTooLong { .. })
+        ));
     }
 
     #[test]
@@ -1680,7 +1718,6 @@ mod tests {
             source_generation: SourceGeneration::new(1),
             source_digest: Digest256::from_bytes([6; 32]),
             source_bytes: Bytes::from(b"{\"id\":11}".to_vec()),
-            source_truncated: false,
             projection: projection("kr-approval/1", &["allow", "deny"]),
             deadline_ms: Nullable::null(),
             decoded_at: TimestampMs::new(2),

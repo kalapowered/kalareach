@@ -326,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn every_action_rechecks_the_revision_it_read() {
+    fn a_recheck_refuses_a_revision_that_has_moved_or_a_capability_nothing_is_known_about() {
         let mut owner = CapabilityOwner::new();
         owner
             .record(record(

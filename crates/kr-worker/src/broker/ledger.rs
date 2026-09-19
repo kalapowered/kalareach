@@ -387,7 +387,6 @@ impl Ledger {
         binding_id: BrokerBindingId,
         entry: &DecoderLedgerEntry,
         resource: &PendingResource,
-        durable: bool,
         now: TimestampMs,
     ) -> Result<bool> {
         let transaction = self.connection.transaction().map_err(BrokerError::ledger)?;
@@ -424,7 +423,7 @@ impl Ledger {
                 ],
             )
             .map_err(BrokerError::ledger)?;
-        if durable {
+        {
             transaction
                 .execute(
                     "INSERT INTO broker_pending
@@ -567,7 +566,7 @@ impl Ledger {
             .connection
             .execute(
                 "UPDATE broker_pending SET dispatched = 1
-                 WHERE resource_id = ?1 AND state = 'claimed'",
+                 WHERE resource_id = ?1 AND state = 'claimed' AND dispatched = 0",
                 params![resource.resource_id.get().as_bytes().as_slice()],
             )
             .map_err(BrokerError::ledger)?;
@@ -575,10 +574,89 @@ impl Ledger {
             Ok(())
         } else {
             Err(BrokerError::ledger(format!(
-                "pending resource {} is not claimed in the ledger",
+                "pending resource {} is not a claimed, undispatched row in the ledger",
                 resource.resource_id
             )))
         }
+    }
+
+    /// Commits an evidence gap and everything that happened inside it, in one transaction.
+    ///
+    /// Section 11 requires the gap to be committed after storage recovers. What is committed is
+    /// the gap and the state each affected resource actually reached, in one transaction: a
+    /// failure part way leaves the whole of it uncommitted, so the fence that follows is a fence
+    /// over a ledger that has not half-recorded a recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`BrokerError::LedgerUnavailable`] when any part of the transaction fails.
+    pub fn commit_recovery(
+        &mut self,
+        records: &[(PendingResource, Option<BrokerBindingId>, bool)],
+        gap: &EvidenceGap,
+        row: Option<i64>,
+    ) -> Result<()> {
+        let transaction = self.connection.transaction().map_err(BrokerError::ledger)?;
+        for (resource, decoder, dispatched) in records {
+            transaction
+                .execute(
+                    "INSERT INTO broker_pending
+                         (resource_id, application_instance_id, connection_id,
+                          upstream_request_id, state, durability, record, dispatched,
+                          decoder_binding_id, recorded_at_ms, resolved_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, NULL)
+                     ON CONFLICT (resource_id) DO UPDATE SET
+                         state = excluded.state,
+                         durability = excluded.durability,
+                         record = excluded.record,
+                         dispatched = MAX(broker_pending.dispatched, excluded.dispatched)",
+                    params![
+                        resource.resource_id.get().as_bytes().as_slice(),
+                        resource.application_instance_id.get().as_bytes().as_slice(),
+                        i64::try_from(resource.request.connection.get()).unwrap_or(i64::MAX),
+                        resource.request.upstream.as_str(),
+                        resource.state.as_str(),
+                        resource.durability.as_str(),
+                        encode(resource)?,
+                        i64::from(*dispatched),
+                        decoder.map(|binding| binding.get().as_bytes().to_vec()),
+                        i64::try_from(resource.recorded_at.get()).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(BrokerError::ledger)?;
+        }
+        match row {
+            Some(row) => {
+                transaction
+                    .execute(
+                        "UPDATE broker_gaps SET closed_at_ms = ?2, record = ?3 WHERE sequence = ?1",
+                        params![
+                            row,
+                            gap.closed_at
+                                .as_ref()
+                                .map(|at| i64::try_from(at.get()).unwrap_or(i64::MAX)),
+                            encode(gap)?,
+                        ],
+                    )
+                    .map_err(BrokerError::ledger)?;
+            }
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO broker_gaps (opened_at_ms, closed_at_ms, record)
+                         VALUES (?1, ?2, ?3)",
+                        params![
+                            i64::try_from(gap.opened_at.get()).unwrap_or(i64::MAX),
+                            gap.closed_at
+                                .as_ref()
+                                .map(|at| i64::try_from(at.get()).unwrap_or(i64::MAX)),
+                            encode(gap)?,
+                        ],
+                    )
+                    .map_err(BrokerError::ledger)?;
+            }
+        }
+        transaction.commit().map_err(BrokerError::ledger)
     }
 
     /// Reads one pending resource.
@@ -918,7 +996,6 @@ mod tests {
             source_generation: SourceGeneration::new(generation),
             source_digest: Digest256::from_bytes([6; 32]),
             source_bytes: Bytes::from(b"{\"id\":11}".to_vec()),
-            source_truncated: false,
             projection: projection(),
             deadline_ms: Nullable::null(),
             decoded_at: TimestampMs::new(12),
@@ -973,6 +1050,53 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_part_way_through_admission_leaves_the_source_unconsumed() {
+        let mut ledger = Ledger::open(None).expect("the ledger opens");
+        // One request identifier is already taken on this connection, so the pending insert of an
+        // admission that reuses it fails *after* the source has been consumed inside the same
+        // transaction.
+        ledger
+            .admit_resource(
+                &handle("src-1"),
+                binding(),
+                &entry(1),
+                &resource(7, "11", PendingState::Pending),
+                TimestampMs::new(11),
+            )
+            .expect("the first admission succeeds");
+
+        let clash = ledger.admit_resource(
+            &handle("src-2"),
+            binding(),
+            &entry(1),
+            &resource(8, "11", PendingState::Pending),
+            TimestampMs::new(12),
+        );
+        assert!(
+            clash.is_err(),
+            "a duplicate request identifier fails the insert"
+        );
+        assert!(
+            ledger
+                .decoding(PendingResourceId::new(Uuid::from_bytes([8; 16])))
+                .expect("the read succeeds")
+                .is_none(),
+            "the decoder entry written before the failure went back"
+        );
+
+        // The source was not consumed, so the same event can be admitted under a free identifier.
+        ledger
+            .admit_resource(
+                &handle("src-2"),
+                binding(),
+                &entry(1),
+                &resource(9, "12", PendingState::Pending),
+                TimestampMs::new(13),
+            )
+            .expect("the retry succeeds because the transaction went back whole");
+    }
+
+    #[test]
     fn admission_is_one_transaction_and_a_source_event_is_consumed_once() {
         let file = ledger_path();
         let first = resource(7, "11", PendingState::Pending);
@@ -985,7 +1109,6 @@ mod tests {
                         binding(),
                         &entry(1),
                         &first,
-                        true,
                         TimestampMs::new(11)
                     )
                     .expect("the first admission succeeds")
@@ -1000,7 +1123,6 @@ mod tests {
                         BrokerBindingId::new(Uuid::from_bytes([10; 16])),
                         &entry(1),
                         &second,
-                        true,
                         TimestampMs::new(12)
                     )
                     .expect("the second admission is answered")
@@ -1028,7 +1150,6 @@ mod tests {
                     binding(),
                     &entry(1),
                     &resource(9, "13", PendingState::Pending),
-                    true,
                     TimestampMs::new(13)
                 )
                 .expect("the admission after a restart is answered"),
@@ -1053,7 +1174,6 @@ mod tests {
                 binding(),
                 &entry(1),
                 &pending,
-                true,
                 TimestampMs::new(11),
             )
             .expect("admitted");
@@ -1092,7 +1212,6 @@ mod tests {
                     binding(),
                     &entry(1),
                     &resource(7, "11", PendingState::Pending),
-                    true,
                     TimestampMs::new(11),
                 )
                 .expect("admitted");
@@ -1127,7 +1246,6 @@ mod tests {
                 binding(),
                 &entry(1),
                 &pending,
-                true,
                 TimestampMs::new(11),
             )
             .expect("admitted");

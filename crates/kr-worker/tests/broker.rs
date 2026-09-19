@@ -272,10 +272,13 @@ fn kr_req_11_22_the_broker_owns_processes_credentials_source_frames_and_arbitrat
     );
 }
 
-/// KR-REQ-11.23: a transport handle binds the executable and the process identity, both halves
-/// are required to authenticate, and a credential has no path out of the broker.
+/// KR-REQ-11.23: a transport handle names the executable and the process identity it reaches,
+/// both halves are required to authenticate, and a credential has no accessor and no rendering.
+///
+/// What this does not establish is that a component never receives one: a component is in another
+/// process and the runtime's own suite covers what crosses that boundary.
 #[test]
-fn kr_req_11_23_a_handle_binds_the_executable_and_identity_and_credentials_stay_here() {
+fn kr_req_11_23_a_handle_names_the_executable_and_both_halves_authenticate() {
     let process = managed(instance(2), true);
     assert_eq!(
         process.handle.executable_digest,
@@ -564,7 +567,6 @@ fn kr_req_11_26_the_broker_checks_role_binding_generation_and_reuse_and_retains_
     assert_eq!(entry.method, permission_method());
     assert_eq!(entry.upstream_request_id.as_str(), "11");
     assert_eq!(entry.source_bytes.as_slice(), b"{\"id\":11}");
-    assert!(!entry.source_truncated);
     assert!(entry.offers("allow"));
     assert!(entry.offers("deny"));
     assert!(
@@ -617,10 +619,21 @@ fn kr_req_11_27_one_resolution_each_and_a_reconnect_never_reissues() {
         "a second answer cannot claim a resource that is already claimed"
     );
 
-    // The answer leaves this host. The marker is committed first, and nothing confirms it.
-    broker
-        .mark_dispatched(&claim)
-        .expect("the dispatch marker is committed");
+    // The answer leaves this host. The admission checks the decision against what the request
+    // offered and commits the marker before anything is written; nothing confirms it afterwards.
+    let admission = broker
+        .admit_dispatch(&claim, "allow")
+        .expect("the answer is admitted and the marker is committed");
+    assert_eq!(admission.option_id, "allow");
+    assert_eq!(admission.upstream_request_id.as_str(), "11");
+    assert!(
+        broker.admit_dispatch(&claim, "allow").is_err(),
+        "one claim admits one answer"
+    );
+    assert!(
+        broker.admit_dispatch(&claim, "allow_always").is_err(),
+        "a decision the request never offered is never admitted"
+    );
 
     // The connection comes back and the upstream still lists the request. This host cannot tell
     // whether its answer landed, so the resource is uncertain and is never answered again.
@@ -1036,6 +1049,28 @@ fn kr_req_11_17_an_action_rechecks_its_capability_and_an_upgrade_spares_a_pinned
             TimestampMs::new(22),
         )
         .expect("a running binding's pinned evidence survives an installed upgrade");
+
+    // And the recheck happens again when the token is spent, not only when it is issued: evidence
+    // withdrawn while the component was working is evidence the dispatch no longer has.
+    let token = broker
+        .issue_token(
+            binding(9),
+            &with_capability("agent.approval", None),
+            TimestampMs::new(23),
+        )
+        .expect("the token is issued");
+    assert_eq!(
+        broker.invalidate_capabilities(
+            CapabilityInvalidation::BindingChanged,
+            "the selected thread changed",
+            TimestampMs::new(24)
+        ),
+        1
+    );
+    assert!(
+        broker.spend_token(&ActionTokenClaim::from(&token)).is_err(),
+        "a token whose capability evidence was withdrawn is not authority to dispatch"
+    );
 }
 
 /// KR-REQ-01.02: the capability map is per installation, and no source that cannot try something
@@ -1208,6 +1243,116 @@ fn kr_req_24_24_a_consumed_cursor_survives_a_restart() {
             .consumed_cursor(instance(2))
             .expect("the read succeeds"),
         Some(StreamCursor::new(40))
+    );
+    let _ = std::fs::remove_dir_all(&directory);
+}
+
+/// A gap commits everything that happened inside it, including endings, and normal operation
+/// afterwards writes every later transition down.
+///
+/// This is the durability half of `native_only_volatile`. The fence itself, the native
+/// arbitration that continues through it and `UPSTREAM_UNAVAILABLE` are the gateway's.
+#[test]
+fn a_committed_gap_records_what_happened_inside_it_and_restores_durable_writes() {
+    let directory = std::env::temp_dir().join(format!("kr-broker-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&directory).expect("the directory is created");
+    let path = directory.join("session.sqlite");
+
+    let (surviving, withdrawn) = {
+        let broker = Broker::open(Some(&path)).expect("the broker opens");
+        broker.register_instance(
+            instance(2),
+            IntegrationMode::Gateway,
+            None,
+            Some(managed(instance(2), true)),
+        );
+        broker
+            .bind(
+                binding(9),
+                instance(2),
+                PluginId::new("kalareach.codex").expect("valid"),
+                PublisherId::new("kalareach").expect("valid"),
+                Digest256::from_bytes([5; 32]),
+                BrokerGrants::granted([BrokerGrant::ApprovalInterpreter]),
+                Some(trust(&[permission_method()], true)),
+                TimestampMs::new(1),
+            )
+            .expect("the binding is recorded");
+
+        let surviving = offer(
+            &broker,
+            instance(2),
+            binding(9),
+            b"{\"id\":11}",
+            request(1, "11"),
+            2,
+        )
+        .expect("the offer is accepted");
+        let withdrawn = offer(
+            &broker,
+            instance(2),
+            binding(9),
+            b"{\"id\":12}",
+            request(1, "12"),
+            4,
+        )
+        .expect("the offer is accepted");
+
+        // The journal faults. No new rich approval is created while it is fenced.
+        broker
+            .enter_volatile("the journal could not be written", TimestampMs::new(6))
+            .expect("the fence is entered");
+        assert!(
+            offer(
+                &broker,
+                instance(2),
+                binding(9),
+                b"{\"id\":13}",
+                request(1, "13"),
+                7,
+            )
+            .is_err(),
+            "rich approvals are fenced while the journal is faulted"
+        );
+
+        // The upstream withdraws one of them inside the gap. That ending is what a recovery that
+        // only committed unresolved resources would lose.
+        broker
+            .upstream_resolved(&request(1, "12"), TimestampMs::new(8))
+            .expect("the upstream answered it itself");
+
+        broker
+            .recover(TimestampMs::new(9))
+            .expect("the gap is committed and rich work resumes");
+
+        // Normal operation again: a claim and an admitted answer are written down, although the
+        // resource's own history says it lived through a gap.
+        let claim = broker
+            .claim(
+                surviving.resource_id,
+                &actor("device-1"),
+                TimestampMs::new(10),
+            )
+            .expect("claimed");
+        broker
+            .admit_dispatch(&claim, "allow")
+            .expect("the answer is admitted");
+        broker
+            .resolve(&claim, TimestampMs::new(11))
+            .expect("the upstream confirmed it");
+
+        (surviving.resource_id, withdrawn.resource_id)
+    };
+
+    // A restart reads back what the gap committed and what happened after it.
+    let restarted = Broker::open(Some(&path)).expect("the broker reopens");
+    assert!(
+        restarted.pending(surviving).is_none(),
+        "a resolved resource is not one a restart offers again"
+    );
+    assert!(
+        restarted.pending(withdrawn).is_none(),
+        "an ending inside the gap was committed rather than left pending for ever"
     );
     let _ = std::fs::remove_dir_all(&directory);
 }
