@@ -1219,9 +1219,11 @@ fn nested_repositories(
         return Err(unplaceable("this working tree"));
     }
     refused.insert((reported.device, reported.file_id));
+    let environment_id = tree.environment_id();
     for path in [repository.git_dir_path(), repository.own_dir_path()] {
-        // A directory outside this working tree is one no path of this capture names.
-        if let Some(identity) = administrative_identity(repository, path)? {
+        // Outside this working tree or inside it, the object is the object: what decides is
+        // whether a directory this capture opens **is** it.
+        if let Some(identity) = administrative_identity(environment_id, path)? {
             if identity == here {
                 return Err(unplaceable("this working tree"));
             }
@@ -1296,40 +1298,26 @@ fn nested_repositories(
     Ok(found)
 }
 
-/// Returns what one administrative directory Git reported **is**, when a capture could reach it.
+/// Returns what one administrative directory Git reported **is**.
 ///
-/// Reached through the working tree's own handle, one component at a time, so a link on the way
-/// ends it. A directory outside this working tree is one no path of this capture names, and
-/// answers nothing; so does one that is not there. Anything else this host could not resolve
-/// refuses the capture, because it cannot then say the tree is free of that repository's own data.
+/// Opened at the path Git named, as an authority of its own, exactly as the project service opens
+/// the repository's: no prefix is compared and no arithmetic is done, so a spelling a filesystem
+/// accepts under another case, a mount that puts the same directory in two places and a link Git
+/// followed all answer the one object. That object is what the exclusion set holds, and a
+/// directory this capture opens is compared with it whatever it is called there.
+///
+/// A path that is not there answers nothing, because there is nothing of it for a version to
+/// hold. Anything else this host could not open refuses the capture: it cannot then say the tree
+/// is free of that repository's own data.
 fn administrative_identity(
-    repository: &OpenedRepository,
+    environment_id: kr_protocol::ids::EnvironmentId,
     path: &std::path::Path,
 ) -> Result<Option<(u64, u64)>> {
-    let Ok(inside) = path.strip_prefix(repository.top_level()) else {
-        return Ok(None);
-    };
-    if inside.as_os_str().is_empty() {
-        let here = repository.work_tree().identity();
-        return Ok(Some((here.device, here.file_id)));
+    match AuthorisedDirectory::open_root(environment_id, path) {
+        Ok(held) => Ok(Some(identity_of(&held))),
+        Err(kr_transfer::Escape::NotFound { .. }) => Ok(None),
+        Err(_) => Err(unplaceable("this repository's own data")),
     }
-    let Some(text) = inside.to_str() else {
-        return Err(unplaceable("this repository's own data"));
-    };
-    let mut held = clone_of(repository.work_tree())?;
-    for component in text.split('/') {
-        let step = RelativeName::parse(component)?;
-        match held.probe(&step) {
-            Ok(kr_transfer::authority::ObjectKind::Directory) => {}
-            // Not there: nothing of it for a capture to hold.
-            Err(kr_transfer::Escape::NotFound { .. }) => return Ok(None),
-            _ => return Err(unplaceable("this repository's own data")),
-        }
-        held = held
-            .subdirectory(&step)
-            .map_err(|_| unplaceable("this repository's own data"))?;
-    }
-    Ok(Some(identity_of(&held)))
 }
 
 /// Returns the object one open directory is.

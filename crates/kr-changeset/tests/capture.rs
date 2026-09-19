@@ -1218,14 +1218,73 @@ fn this_repository_s_own_data_is_excluded_by_what_it_is() {
     }
 }
 
-/// KR-REQ-14.33 and D-087a: **both** administrative directories a repository reports are excluded.
+/// KR-REQ-14.33 and D-087a: **both** administrative directories a repository reports are excluded,
+/// including the split layout where they are two directories inside the captured tree.
 ///
 /// Git reports a common directory, which holds the configuration, the references and the objects,
-/// and this worktree's own, which holds its `HEAD` and its index. A linked worktree is where they
-/// differ, and this builds one with Git itself rather than by hand, because a layout Git would not
-/// accept proves nothing about what this host does with one it would.
+/// and this worktree's own, which holds its `HEAD` and its index. A repository can keep them apart
+/// and both inside its own working tree, and a capture that excluded only one would hold the
+/// other.
 #[test]
 fn both_administrative_directories_a_repository_reports_are_excluded() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "split-tree");
+    // Everything shared at `common`, this worktree's own at `meta`, which is the shape Git accepts
+    // for a repository whose two administrative directories are apart.
+    std::fs::rename(path.join(".git"), path.join("common")).expect("the shared data");
+    std::fs::create_dir_all(path.join("meta")).expect("this worktree's own");
+    for name in ["HEAD", "index"] {
+        let from = path.join("common").join(name);
+        if from.exists() {
+            std::fs::copy(&from, path.join("meta").join(name)).expect("its own copy");
+        }
+    }
+    std::fs::write(path.join("meta/commondir"), b"../common\n").expect("naming the shared one");
+    std::fs::write(
+        path.join("meta/config.worktree"),
+        b"[remote]\n\turl = a-secret\n",
+    )
+    .expect("something only this worktree has");
+    std::fs::write(path.join(".git"), b"gitdir: meta\n").expect("and the file that names it");
+
+    let workspace = fixture.workspace("split-tree");
+    let outcome = fixture.capture_with(
+        workspace,
+        &include_everything(),
+        &kr_protocol::changeset::FileGrant::default(),
+        None,
+        None,
+    );
+    let record = match outcome {
+        Ok(record) => record,
+        // A shape this host will not read at all is a refusal rather than an exposure, and it
+        // says which shape.
+        Err(refusal) => {
+            assert!(
+                refusal.to_string().contains("could not reach")
+                    || refusal.to_string().contains("nested at")
+                    || refusal.to_string().contains("own data"),
+                "a refusal says which shape it would not read: {refusal}"
+            );
+            return;
+        }
+    };
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    for entry in &manifest.paths {
+        assert!(
+            !entry.path.starts_with("meta/") && !entry.path.starts_with("common/"),
+            "neither of this repository's own directories is in its own version: {}",
+            entry.path
+        );
+    }
+}
+
+/// KR-REQ-14.33 and D-087a: a linked worktree's two directories, built by Git itself.
+#[test]
+fn a_linked_worktree_holds_neither_of_its_repository_s_directories() {
     let fixture = Fixture::create();
     let main = ordinary_repository(fixture.work(), "main-tree");
     let linked = fixture.work().join("linked-tree");
@@ -1246,17 +1305,14 @@ fn both_administrative_directories_a_repository_reports_are_excluded() {
         );
         return;
     }
-    // Its own data is inside the main repository, which is outside this tree; what a capture of it
-    // must never hold is anything of either, whichever of the two a path would reach.
     let workspace = fixture.workspace("linked-tree");
-    let outcome = fixture.capture_with(
+    let Ok(record) = fixture.capture_with(
         workspace,
         &include_everything(),
         &kr_protocol::changeset::FileGrant::default(),
         None,
         None,
-    );
-    let Ok(record) = outcome else {
+    ) else {
         return;
     };
     let manifest = fixture
