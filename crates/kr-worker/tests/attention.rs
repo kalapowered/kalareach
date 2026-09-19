@@ -890,6 +890,48 @@ async fn a_refusal_this_host_can_decide_rejects_the_action_rather_than_leaving_i
     );
 }
 
+#[tokio::test]
+async fn a_value_the_store_could_not_write_down_as_it_was_given_is_refused_before_dispatch() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let window = window(&client);
+    let refused = mutation(
+        &window,
+        &host,
+        Method::VisitAcknowledge,
+        typed(&VisitAcknowledgeParams {
+            session_id: host.session_id,
+            acknowledged_cursor: U64::new(0),
+            views: vec![LogViewState {
+                view_id: "build".to_owned(),
+                // One past the largest counter the store writes down.
+                source_offset: U64::new(9_223_372_036_854_775_808),
+                filter: String::new(),
+            }],
+        }),
+    );
+    let action_id = refused.action_id;
+    let answer = send_mutation(&mut client, refused).await;
+    let Outcome::Error(error) = answer else {
+        panic!("an offset the store could not keep cannot be recorded");
+    };
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+
+    let read: kr_protocol::receipt::ActionReadResult = ok(send_request(
+        &mut client,
+        request(
+            Method::ActionRead,
+            typed(&kr_protocol::receipt::ActionReadParams { action_id }),
+        ),
+    )
+    .await);
+    assert_eq!(
+        read.receipt.state,
+        kr_protocol::receipt::ReceiptState::Rejected,
+        "and it is a rejection rather than an outcome nobody can establish"
+    );
+}
+
 // ---------------------------------------------------------------------------------------------
 // The feature store
 // ---------------------------------------------------------------------------------------------

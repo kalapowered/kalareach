@@ -12,8 +12,8 @@ use kr_attention::{Attention, Content, HostReading};
 use kr_protocol::attention::{
     AttentionItem, AttentionKey, AttentionLevel, AttentionReadParams, AttentionRouting,
     AttentionRule, AttentionSource, IDLE_REMINDER_MS, LogViewState, MAX_ATTENTION_SUMMARY_LEN,
-    MAX_RETAINED_ATTENTION_ITEMS, MAX_RETAINED_LOG_VIEWS, MAX_RETAINED_REVIEW_SUBJECTS,
-    NotificationState, QuietHours, ReviewSubject,
+    MAX_RETAINED_ACTORS, MAX_RETAINED_ATTENTION_ITEMS, MAX_RETAINED_LOG_VIEWS,
+    MAX_RETAINED_REVIEW_SUBJECTS, NotificationState, QuietHours, ReviewSubject,
 };
 use kr_protocol::ids::{
     ActorId, AgentTurnId, ApprovalRequestId, ChangeSetId, PluginId, QuestionId, SessionId,
@@ -2067,6 +2067,161 @@ fn a_review_subject_an_inbox_item_still_points_at_is_never_let_go_of() {
     attention
         .acknowledge_review(&actor("local:501"), &turn_subject(), 1, reading(1_000))
         .expect("and the review it says is waiting can be completed");
+}
+
+fn change_set_events(count: usize, from: u64) -> Vec<SourceEvent> {
+    (0..count)
+        .map(|index| {
+            let sequence = u64::try_from(index).expect("a small index") + from;
+            event(
+                AttentionSource::Semantic,
+                sequence,
+                2_000 + sequence,
+                EventKind::ChangeSetCaptured {
+                    session_id: session(1),
+                    change_set_id: ChangeSetId::new(Uuid::from_bytes([
+                        u8::try_from(index % 251).expect("a byte"),
+                        u8::try_from(index / 251).expect("a byte"),
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        9,
+                    ])),
+                    version: 1,
+                    summary: "captured the workspace".to_owned(),
+                },
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_turn_whose_name_a_key_cannot_carry_is_protected_like_any_other() {
+    // A turn identifier that carries the key's own separator, and one long enough that the key is
+    // a digest of it rather than the name itself.
+    for name in ["part|two", &"t".repeat(200)] {
+        let mut attention = engine();
+        let turn_id = AgentTurnId::new(name).expect("an identifier");
+        attention
+            .apply(
+                &event(
+                    AttentionSource::Semantic,
+                    1,
+                    1_000,
+                    EventKind::TurnCompleted {
+                        session_id: session(1),
+                        turn_id: turn_id.clone(),
+                        version: 1,
+                        change_set: None,
+                        summary: "rewrote the parser".to_owned(),
+                    },
+                ),
+                reading(0),
+            )
+            .expect("the store records the decision");
+        for source in change_set_events(MAX_RETAINED_REVIEW_SUBJECTS + 10, 2) {
+            attention
+                .apply(&source, reading(0))
+                .expect("the store records the decision");
+        }
+        let subject = ReviewSubject::CompletedTurn {
+            session_id: session(1),
+            turn_id,
+        };
+        assert!(
+            attention
+                .reviews()
+                .state(&actor("local:501"), &subject)
+                .is_some(),
+            "{name:?} is still a subject the inbox points at"
+        );
+    }
+}
+
+#[test]
+fn a_subject_an_actor_has_acknowledged_is_never_let_go_of() {
+    let mut attention = engine();
+    let early = ChangeSetId::new(Uuid::from_bytes([200; 16]));
+    attention
+        .apply(
+            &event(
+                AttentionSource::Semantic,
+                1,
+                1_000,
+                EventKind::ChangeSetCaptured {
+                    session_id: session(1),
+                    change_set_id: early,
+                    version: 1,
+                    summary: "captured the workspace".to_owned(),
+                },
+            ),
+            reading(0),
+        )
+        .expect("the store records the decision");
+    let subject = ReviewSubject::ChangeSet {
+        session_id: session(1),
+        change_set_id: early,
+    };
+    attention
+        .acknowledge_review(&actor("local:501"), &subject, 1, reading(1_000))
+        .expect("the version is one the host holds");
+
+    for source in change_set_events(MAX_RETAINED_REVIEW_SUBJECTS + 10, 2) {
+        attention
+            .apply(&source, reading(0))
+            .expect("the store records the decision");
+    }
+    let state = attention
+        .reviews()
+        .state(&actor("local:501"), &subject)
+        .expect("what an actor read is still there to be read back");
+    assert_eq!(state.acknowledged_version, Nullable::some(U64::new(1)));
+}
+
+#[test]
+fn one_more_actor_than_the_store_admits_is_refused_rather_than_displacing_one() {
+    let mut attention = engine();
+    attention
+        .apply(&approval(1, 1_000, "req-1"), reading(0))
+        .expect("the store records the decision");
+    let key = key(AttentionRule::PendingApproval, "req-1");
+    for index in 0..MAX_RETAINED_ACTORS {
+        attention
+            .acknowledge(
+                &actor(&format!("device:{index}")),
+                std::slice::from_ref(&key),
+                reading(1_000),
+            )
+            .expect("the store admits it");
+    }
+    let refused = attention.acknowledge(
+        &actor("device:one-too-many"),
+        std::slice::from_ref(&key),
+        reading(1_000),
+    );
+    assert!(refused.is_err(), "a new actor past the bound is refused");
+    assert_eq!(
+        attention.revision(&actor("device:0")),
+        1,
+        "and nothing an actor already here recorded was deleted to make room"
+    );
+    attention
+        .acknowledge(
+            &actor("device:0"),
+            std::slice::from_ref(&key),
+            reading(2_000),
+        )
+        .expect("an actor already here is always admitted");
 }
 
 #[test]
