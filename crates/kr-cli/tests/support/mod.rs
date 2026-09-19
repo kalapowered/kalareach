@@ -9,7 +9,7 @@
 #![allow(dead_code)]
 
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 /// What every one of these directories is called, before what tells one run's from every other's.
 const PREFIX: &str = "kalareach-command-tests-";
@@ -62,28 +62,29 @@ pub fn command_binaries() -> &'static Path {
 
 /// What this run calls its directory: the suite, the process, and a token of this run's own.
 ///
-/// The token is what makes the name this run's and no other's. A number comes round again - the
-/// operating system gives it to a later process, which would then want a name an earlier one had
-/// already used - and a name two runs can both want is a name one of them can take away from the
-/// other. A reading of the clock and a value drawn when this process started never repeat together,
-/// so no run of any build, before this one or beside it, can produce this name.
+/// The token is what makes the name this run's and no other's. A process number comes round again:
+/// the operating system gives it to a later process, which would then want a name an earlier one
+/// had already used, and a name two runs can both want is a name one of them can take away from
+/// the other. The token is a reading of the clock that only ever goes forward, which separates runs
+/// on one machine, and a value the standard library draws for this process from the operating
+/// system, which separates the rest. A machine restarted between two runs begins that clock again,
+/// and the drawn value is what makes the repetition harmless.
 ///
-/// The number stays in it because the sweep below reads it, and the suite's name stays in it
+/// The number stays in the name because the sweep below reads it, and the suite's name stays in it
 /// because a person looking at a temporary directory should be able to see which test made what.
 fn this_runs_name() -> String {
     use std::hash::{BuildHasher, Hasher};
 
-    let started = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |since| since.as_nanos());
-    // Drawn once for this process by the standard library, from the operating system's own source.
+    let started = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
     let drawn = std::collections::hash_map::RandomState::new()
         .build_hasher()
         .finish();
     format!(
-        "{PREFIX}{}-{}-{started:x}{drawn:016x}",
+        "{PREFIX}{}-{}-{:x}{:x}{drawn:016x}",
         env!("CARGO_CRATE_NAME"),
-        std::process::id()
+        std::process::id(),
+        started.tv_sec,
+        started.tv_nsec,
     )
 }
 
@@ -98,14 +99,19 @@ fn this_runs_name() -> String {
 /// every way a process can end, including being killed, and it does not depend on recognising this
 /// process afterwards by a number that may by then belong to something else.
 ///
-/// The end this run holds is kept for the life of the process on purpose. Dropping it would be
-/// telling the watcher to remove the directory these tests are still launching binaries from.
+/// The end this run holds is kept for the life of the process on purpose, and every end this
+/// process ever holds is kept: dropping one would be telling its watcher to remove a directory
+/// these tests are still launching binaries from.
+///
+/// The removal follows the read rather than merely coming after it. A shell that could not run the
+/// read at all, or whose read was ended by a signal, has learned nothing about this process, and a
+/// watcher that has learned nothing leaves the directory for a later run to answer for.
 fn take_it_away_when_this_run_ends(root: &Path) {
-    static HELD: OnceLock<std::process::ChildStdin> = OnceLock::new();
+    static HELD: Mutex<Vec<std::process::ChildStdin>> = Mutex::new(Vec::new());
 
     let Ok(mut watching) = std::process::Command::new("sh")
         .arg("-c")
-        .arg(r#"cat >/dev/null; rm -rf -- "$1""#)
+        .arg(r#"cat >/dev/null && rm -rf -- "$1""#)
         .arg("sh")
         .arg(root)
         .stdin(std::process::Stdio::piped())
@@ -118,7 +124,9 @@ fn take_it_away_when_this_run_ends(root: &Path) {
         return;
     };
     if let Some(end) = watching.stdin.take() {
-        let _ = HELD.set(end);
+        HELD.lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(end);
     }
 }
 
