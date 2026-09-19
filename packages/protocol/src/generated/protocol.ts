@@ -409,6 +409,20 @@ export type ApprovalRequestId = string
  */
 export type QuestionId = string
 /**
+ * A duration in milliseconds, as a decimal string in JSON.
+ */
+export type DurationMs = string
+/**
+ * One consequence of a grant that the issuer is shown before the grant exists.
+ *
+ * Section 10 forbids a label that implies a restrictive sandbox the upstream does not enforce, so
+ * the host decides which notices a set of actions carries and states each one in fixed words.
+ * A surface may translate [`Self::sentence`]; it may not soften it, and it may not decide for
+ * itself that an action is harmless.
+ */
+export type AuthorityNotice =
+  'account_access' | 'agent_permissions' | 'environment_writes' | 'delegation'
+/**
  * The host's answer to a `hello` offer.
  *
  * A major mismatch answers [`ErrorCode::UnsupportedSchema`] here and the connection carries no
@@ -598,10 +612,6 @@ export type QuestionRevision = string
  * An opaque byte string. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
  */
 export type Bytes = string
-/**
- * A duration in milliseconds, as a decimal string in JSON.
- */
-export type DurationMs = string
 /**
  * A 128-bit identifier. On the wire it is a 16-byte string; in JSON it is the canonical hyphenated lower-case text form.
  */
@@ -1079,6 +1089,7 @@ export interface KalaReachProtocol {
   attachment_summary?: AttachmentSummary
   attachment_viewport_params?: AttachmentViewportParams
   attachment_viewport_result?: AttachmentViewportResult
+  authority_feed_status?: AuthorityFeedStatus
   authority_revision_ack?: AuthorityRevisionAck
   authority_revision_notice?: AuthorityRevisionNotice
   authority_revision_record?: AuthorityRevisionRecord
@@ -1095,6 +1106,12 @@ export interface KalaReachProtocol {
   controller_generation_token?: ControllerGenerationToken
   desktop_capability_report?: DesktopCapabilityReport
   desktop_context?: DesktopContext1
+  device_list_params?: DeviceListParams
+  device_list_result?: DeviceListResult
+  device_preview_key_update_params?: DevicePreviewKeyUpdateParams
+  device_preview_key_update_result?: DevicePreviewKeyUpdateResult
+  device_revoke_params?: DeviceRevokeParams
+  device_summary?: DeviceSummary
   direct_challenge?: DirectChallenge
   direct_redeem_proof?: DirectRedeemProof
   download_begin_params?: DownloadBeginParams
@@ -1126,6 +1143,12 @@ export interface KalaReachProtocol {
   geometry_result?: GeometryResult
   geometry_state?: GeometryState3
   grant?: Grant
+  grant_create_params?: GrantCreateParams
+  grant_create_result?: GrantCreateResult
+  grant_list_params?: GrantListParams
+  grant_list_result?: GrantListResult
+  grant_revoke_params?: GrantRevokeParams
+  grant_summary?: GrantSummary
   hello_reply?: HelloReply
   history_page_params?: HistoryPageParams
   history_page_result?: HistoryPageResult
@@ -1229,12 +1252,17 @@ export interface KalaReachProtocol {
   input_write_params?: InputWriteParams
   input_write_result?: InputWriteResult
   installed_file?: InstalledFile
+  invitation_preview?: InvitationPreview1
+  live_screen_preview?: LiveScreenPreview
   local_hello?: LocalHello
   local_hello_ack?: LocalHelloAck
   membership_lease?: MembershipLease
   method_entry?: MethodEntry
   mutation_request?: MutationRequest
+  named_approval_preview?: NamedApprovalPreview
+  named_question_preview?: NamedQuestionPreview
   notification?: Notification
+  offline_validity_policy?: OfflineValidityPolicy
   operation_record?: OperationRecord
   organisation_policy?: OrganisationPolicy
   output_event?: OutputEvent
@@ -1307,6 +1335,8 @@ export interface KalaReachProtocol {
   revocation_acknowledgement?: RevocationAcknowledgement
   revocation_barrier?: RevocationBarrier
   revocation_request?: RevocationRequest
+  revocation_result?: RevocationResult
+  role_selection?: RoleSelection1
   root_command_accepted_params?: RootCommandAcceptedParams
   root_command_accepted_result?: RootCommandAcceptedResult
   root_editor_busy_event?: EditorBusyEvent
@@ -2721,6 +2751,27 @@ export interface Dimensions2 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   rows: string
+}
+/**
+ * What this host shows about the remote authority feed.
+ */
+export interface AuthorityFeedStatus {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  accepted_revision: string
+  /**
+   * The last successful synchronisation, when there has been one.
+   */
+  last_synchronised_at_ms: TimestampMs | null
+  /**
+   * True when the feed could not be reached, so what is shown is stale.
+   */
+  stale: boolean
+  /**
+   * How many retained revocation records have not yet been acknowledged by every enrolled host.
+   */
+  unacknowledged_records: number
 }
 /**
  * A worker's acknowledgement that it is acting under an authority revision.
@@ -4468,6 +4519,107 @@ export interface DesktopContext1 {
   worker_profile: 'desktop_bound' | 'headless_user'
 }
 /**
+ * Parameters of `device.list`.
+ */
+export interface DeviceListParams {
+  /**
+   * Whether revoked devices are included.
+   */
+  include_revoked: boolean
+}
+/**
+ * The result of `device.list`.
+ */
+export interface DeviceListResult {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * The devices, ordered by identity.
+   */
+  devices: DeviceSummary[]
+  /**
+   * True when the feed is unreachable, so the revocation status shown is stale.
+   */
+  feed_stale: boolean
+  /**
+   * The last time this host synchronised the remote authority feed, when it has.
+   */
+  feed_synchronised_at_ms: TimestampMs | null
+}
+/**
+ * One paired device as `device.list` reports it.
+ *
+ * Section 10 puts each host's last acknowledgement in the device list, because an offline host
+ * cannot apply a revocation it has not received and the person has to be able to see that.
+ */
+export interface DeviceSummary {
+  /**
+   * When that acknowledgement arrived.
+   */
+  acknowledged_at_ms: TimestampMs | null
+  /**
+   * The last authority revision this device acknowledged.
+   */
+  acknowledged_revision: AuthorityRevision | null
+  /**
+   * One paired device.
+   */
+  device_id: string
+  /**
+   * The name it was paired under.
+   */
+  display_name: string
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  paired_at_ms: string
+  /**
+   * Whether the device has been revoked.
+   */
+  revoked: boolean
+}
+/**
+ * Parameters of `device.preview_key.update`.
+ */
+export interface DevicePreviewKeyUpdateParams {
+  /**
+   * One paired device.
+   */
+  device_id: string
+  /**
+   * The new notification-preview public key.
+   */
+  notification_preview: string
+}
+/**
+ * The result of `device.preview_key.update`.
+ */
+export interface DevicePreviewKeyUpdateResult {
+  /**
+   * One paired device.
+   */
+  device_id: string
+  /**
+   * The key now on record.
+   */
+  notification_preview: string
+}
+/**
+ * Parameters of `device.revoke`.
+ */
+export interface DeviceRevokeParams {
+  /**
+   * One paired device.
+   */
+  device_id: string
+}
+/**
  * The host challenge a direct redemption starts from. Single use, and it expires with the
  * invitation.
  */
@@ -5652,6 +5804,504 @@ export interface OrganisationRequirement {
   policy_revision: string
 }
 /**
+ * Parameters of `grant.create`.
+ */
+export interface GrantCreateParams {
+  /**
+   * How long the invitation lasts. Null takes [`DEFAULT_INVITATION_LIFETIME_MS`].
+   */
+  lifetime_ms: DurationMs | null
+  /**
+   * The owner's confirmation, when the request enlarges persistent authority.
+   */
+  owner_confirmation: OwnerConfirmationProof | null
+  /**
+   * The grant this one is delegated from. Null issues from the issuer's own authority.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * One paired device.
+   */
+  recipient_device_id: string
+  selection: RoleSelection
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * An owner's answer to a confirmation challenge.
+ *
+ * The verification ceremony itself is platform code; this object records its result and binds it
+ * to the exact challenge. The host's acceptance record keeps the user-presence evidence and the
+ * challenge-consumption transition together.
+ */
+export interface OwnerConfirmationProof {
+  /**
+   * How the confirmation reached the host.
+   */
+  channel:
+    | 'owner_device_presence'
+    | 'paired_owner_device'
+    | 'enrolled_presence_signer'
+    | 'local_bootstrap_terminal'
+    | 'session'
+    | 'plugin'
+    | 'contact_tool'
+  request: OwnerConfirmationRequest
+  /**
+   * The Ed25519 signature over `CBOR(["kr-pair/owner-confirm/1", request, channel])`.
+   */
+  signature: string
+  /**
+   * The key identifier of the signer that produced the proof.
+   */
+  signer_key_id: string
+}
+/**
+ * The challenge this proof answers.
+ */
+export interface OwnerConfirmationRequest {
+  /**
+   * What is being confirmed.
+   */
+  action:
+    | 'issue_invitation'
+    | 'confirm_device'
+    | 'enlarge_grant'
+    | 'trust_repository_root'
+    | 'grant_executable_capability'
+    | 'change_host_authority'
+  /**
+   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
+   */
+  action_digest: string
+  /**
+   * The challenge identity. Single use.
+   */
+  confirmation_id: string
+  /**
+   * The keys the action sends authority to. Null when the action has no destination device.
+   */
+  destination_keys: DevicePublicKeys2 | null
+  /**
+   * The rights the action would grant.
+   */
+  destination_rights: ActionRight[]
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * One paired device.
+   */
+  host_device_id: string
+  /**
+   * The host's iroh endpoint identity.
+   */
+  host_endpoint_id: string
+  /**
+   * The host's fresh challenge nonce.
+   */
+  nonce: string
+}
+/**
+ * One device's four purpose-separated public keys.
+ *
+ * An authenticated pairing exchange binds these public keys and their explicit purposes to one
+ * device record.
+ */
+export interface DevicePublicKeys2 {
+  /**
+   * The Ed25519 authorisation key.
+   */
+  authorisation: string
+  /**
+   * The X25519 notification-preview key.
+   */
+  notification_preview: string
+  /**
+   * The X25519 stored-envelope key.
+   */
+  stored_envelope: string
+  /**
+   * The iroh transport identity.
+   */
+  transport: string
+}
+/**
+ * The role and the explicit choices on top of it.
+ */
+export interface RoleSelection {
+  /**
+   * Earlier history, from this cursor. Null keeps the recipient to the live screen and what
+   * follows it.
+   */
+  history_from_cursor_ms: TimestampMs | null
+  /**
+   * Whether the currently visible screen is included, previewed to the issuer.
+   *
+   * The exception never reaches inactive screen buffers, scrollback or the backing transcript.
+   */
+  include_live_screen: boolean
+  /**
+   * Whether a viewer or reviewer also receives `question.respond`.
+   *
+   * Ignored for controller and owner, which carry it already.
+   */
+  include_question_respond: boolean
+  /**
+   * Current approval requests this invitation names explicitly.
+   */
+  named_approvals: ApprovalRequestId[]
+  /**
+   * Current questions this invitation names explicitly.
+   */
+  named_questions: QuestionId[]
+  /**
+   * The role the issuer chose.
+   */
+  role: 'viewer' | 'reviewer' | 'controller' | 'owner'
+}
+/**
+ * The result of `grant.create`.
+ */
+export interface GrantCreateResult {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  grant: Grant1
+  preview: InvitationPreview
+}
+/**
+ * The grant that was written.
+ */
+export interface Grant1 {
+  /**
+   * The actions it permits.
+   */
+  actions: ActionRight[]
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * Which environments it covers.
+   */
+  environment_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
+      }
+  /**
+   * When it stops being valid.
+   */
+  expiry:
+    | 'never'
+    | {
+        at: {
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+        }
+      }
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  history: HistoryScope
+  /**
+   * One paired device.
+   */
+  issuer_device_id: string
+  /**
+   * An optional organisation membership requirement.
+   */
+  organisation: OrganisationRequirement | null
+  /**
+   * The grant this one was delegated from. Revoking a parent revokes its descendants.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * One paired device.
+   */
+  recipient_device_id: string
+  /**
+   * Which sessions it covers.
+   */
+  session_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted sessions.
+           */
+          session_ids: SessionId[]
+        }
+      }
+    | 'none'
+}
+/**
+ * What the issuer was shown before it was written.
+ */
+export interface InvitationPreview {
+  /**
+   * The actions the role compiled to. The host authorises from these, never from the role.
+   */
+  actions: ActionRight[]
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * Always false. A new recipient receives no historical attachment keys.
+   */
+  historical_attachment_keys: boolean
+  history: HistoryScope1
+  /**
+   * The invitation this preview belongs to.
+   */
+  invitation_id: string
+  /**
+   * The live screen as it stands, when the issuer included it.
+   */
+  live_screen: LiveScreenPreview | null
+  /**
+   * The current approval requests this invitation names.
+   */
+  named_approvals: NamedApprovalPreview[]
+  /**
+   * The current questions this invitation names.
+   */
+  named_questions: NamedQuestionPreview[]
+  /**
+   * The notices the actions carry.
+   */
+  notices: AuthorityNotice[]
+  /**
+   * The role the issuer chose.
+   */
+  role: 'viewer' | 'reviewer' | 'controller' | 'owner'
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * Always true. An invitation is redeemed once.
+   */
+  single_use: boolean
+}
+/**
+ * The history the recipient will reach.
+ */
+export interface HistoryScope1 {
+  /**
+   * Whether the currently visible screen is included. This exception never grants inactive
+   * screen buffers, scrollback or the backing transcript.
+   */
+  include_live_screen: boolean
+  /**
+   * The earliest content this grant may see. Null means no retained history at all.
+   */
+  lower_bound_ms: TimestampMs | null
+  /**
+   * Current approval requests named explicitly, on the same terms.
+   */
+  named_approvals: ApprovalRequestId[]
+  /**
+   * Current questions named explicitly, even when they were created before the lower bound.
+   */
+  named_questions: QuestionId[]
+}
+/**
+ * The live screen as it stands, shown to the issuer before the invitation exists.
+ *
+ * A shared live screen can contain text printed long before the invitation, so the preview shows
+ * the text rather than promising it is recent.
+ */
+export interface LiveScreenPreview {
+  /**
+   * The visible lines, top to bottom, as the recipient would first see them.
+   */
+  lines: string[]
+  /**
+   * True when the preview was cut to [`MAX_PREVIEW_LINES`] or [`MAX_PREVIEW_LINE_CHARS`].
+   */
+  truncated: boolean
+}
+/**
+ * One current approval request an invitation names explicitly.
+ */
+export interface NamedApprovalPreview {
+  /**
+   * An upstream approval request identifier. Opaque to KalaReach.
+   */
+  approval_request_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * What the upstream is asking to do.
+   */
+  summary: string
+}
+/**
+ * One current question an invitation names explicitly.
+ */
+export interface NamedQuestionPreview {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  created_at_ms: string
+  /**
+   * The question itself.
+   */
+  question: string
+  /**
+   * One agent-to-user question.
+   */
+  question_id: string
+  /**
+   * The revision the issuer was shown.
+   */
+  revision: string
+}
+/**
+ * Parameters of `grant.list`.
+ */
+export interface GrantListParams {
+  /**
+   * Whether expired and revoked grants are included.
+   */
+  include_resolved: boolean
+  /**
+   * One session, or null for every session the caller may see.
+   */
+  session_id: SessionId | null
+}
+/**
+ * The result of `grant.list`.
+ */
+export interface GrantListResult {
+  /**
+   * The grants, ordered by identity.
+   */
+  grants: GrantSummary[]
+}
+/**
+ * One grant as `grant.list` reports it.
+ */
+export interface GrantSummary {
+  grant: Grant2
+  /**
+   * When it was revoked, when it was.
+   */
+  revoked_at_ms: TimestampMs | null
+  /**
+   * The grant whose revocation revoked this one, when it was a descendant.
+   */
+  revoked_by_parent: GrantId | null
+  /**
+   * Where it stands now.
+   */
+  state: 'active' | 'expired' | 'revoked'
+}
+/**
+ * The grant itself.
+ */
+export interface Grant2 {
+  /**
+   * The actions it permits.
+   */
+  actions: ActionRight[]
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * Which environments it covers.
+   */
+  environment_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted environments.
+           */
+          environment_ids: EnvironmentId[]
+        }
+      }
+  /**
+   * When it stops being valid.
+   */
+  expiry:
+    | 'never'
+    | {
+        at: {
+          /**
+           * A UTC timestamp in milliseconds, as a decimal string in JSON.
+           */
+          expires_at_ms: string
+        }
+      }
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+  history: HistoryScope
+  /**
+   * One paired device.
+   */
+  issuer_device_id: string
+  /**
+   * An optional organisation membership requirement.
+   */
+  organisation: OrganisationRequirement | null
+  /**
+   * The grant this one was delegated from. Revoking a parent revokes its descendants.
+   */
+  parent_grant_id: GrantId | null
+  /**
+   * One paired device.
+   */
+  recipient_device_id: string
+  /**
+   * Which sessions it covers.
+   */
+  session_selector:
+    | 'any'
+    | {
+        these: {
+          /**
+           * The permitted sessions.
+           */
+          session_ids: SessionId[]
+        }
+      }
+    | 'none'
+}
+/**
+ * Parameters of `grant.revoke`.
+ */
+export interface GrantRevokeParams {
+  /**
+   * One host-issued authority object.
+   */
+  grant_id: string
+}
+/**
  * The host's complete `hello` selection.
  *
  * It echoes the client nonce as well as carrying its own, so the transcript binds one exact
@@ -6254,6 +6904,60 @@ export interface InputWriteResult {
   sequence: string
 }
 /**
+ * What an invitation will share, shown to its issuer before it exists.
+ */
+export interface InvitationPreview1 {
+  /**
+   * The actions the role compiled to. The host authorises from these, never from the role.
+   */
+  actions: ActionRight[]
+  /**
+   * One installed OS, distribution or container environment and OS user.
+   */
+  environment_id: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  expires_at_ms: string
+  /**
+   * Always false. A new recipient receives no historical attachment keys.
+   */
+  historical_attachment_keys: boolean
+  history: HistoryScope1
+  /**
+   * The invitation this preview belongs to.
+   */
+  invitation_id: string
+  /**
+   * The live screen as it stands, when the issuer included it.
+   */
+  live_screen: LiveScreenPreview | null
+  /**
+   * The current approval requests this invitation names.
+   */
+  named_approvals: NamedApprovalPreview[]
+  /**
+   * The current questions this invitation names.
+   */
+  named_questions: NamedQuestionPreview[]
+  /**
+   * The notices the actions carry.
+   */
+  notices: AuthorityNotice[]
+  /**
+   * The role the issuer chose.
+   */
+  role: 'viewer' | 'reviewer' | 'controller' | 'owner'
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * Always true. An invitation is redeemed once.
+   */
+  single_use: boolean
+}
+/**
  * A signed statement that one account held one role in one organisation.
  */
 export interface MembershipLease {
@@ -6627,6 +7331,24 @@ export interface RequiredRight {
     | 'issuing_owner'
 }
 /**
+ * A host owner's bounded offline-validity policy for personal remote access.
+ *
+ * Section 10 makes this optional and explicit. The default personal owner grant stays
+ * account-free and non-expiring, so independent operation never depends on a cloud lease; an
+ * owner who wants a bound chooses one, and the host shows the feed status and the last successful
+ * synchronisation beside it.
+ */
+export interface OfflineValidityPolicy {
+  /**
+   * The last successful synchronisation, when there has been one.
+   */
+  last_synchronised_at_ms: TimestampMs | null
+  /**
+   * A duration in milliseconds, as a decimal string in JSON.
+   */
+  maximum_offline_ms: string
+}
+/**
  * One repository operation, as a read or a cancellation returns it.
  */
 export interface OperationRecord {
@@ -6818,106 +7540,6 @@ export interface OutputEvent {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   cursor: string
-}
-/**
- * An owner's answer to a confirmation challenge.
- *
- * The verification ceremony itself is platform code; this object records its result and binds it
- * to the exact challenge. The host's acceptance record keeps the user-presence evidence and the
- * challenge-consumption transition together.
- */
-export interface OwnerConfirmationProof {
-  /**
-   * How the confirmation reached the host.
-   */
-  channel:
-    | 'owner_device_presence'
-    | 'paired_owner_device'
-    | 'enrolled_presence_signer'
-    | 'local_bootstrap_terminal'
-    | 'session'
-    | 'plugin'
-    | 'contact_tool'
-  request: OwnerConfirmationRequest
-  /**
-   * The Ed25519 signature over `CBOR(["kr-pair/owner-confirm/1", request, channel])`.
-   */
-  signature: string
-  /**
-   * The key identifier of the signer that produced the proof.
-   */
-  signer_key_id: string
-}
-/**
- * The challenge this proof answers.
- */
-export interface OwnerConfirmationRequest {
-  /**
-   * What is being confirmed.
-   */
-  action:
-    | 'issue_invitation'
-    | 'confirm_device'
-    | 'enlarge_grant'
-    | 'trust_repository_root'
-    | 'grant_executable_capability'
-    | 'change_host_authority'
-  /**
-   * A 32-byte SHA-256 digest. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.
-   */
-  action_digest: string
-  /**
-   * The challenge identity. Single use.
-   */
-  confirmation_id: string
-  /**
-   * The keys the action sends authority to. Null when the action has no destination device.
-   */
-  destination_keys: DevicePublicKeys2 | null
-  /**
-   * The rights the action would grant.
-   */
-  destination_rights: ActionRight[]
-  /**
-   * A UTC timestamp in milliseconds, as a decimal string in JSON.
-   */
-  expires_at_ms: string
-  /**
-   * One paired device.
-   */
-  host_device_id: string
-  /**
-   * The host's iroh endpoint identity.
-   */
-  host_endpoint_id: string
-  /**
-   * The host's fresh challenge nonce.
-   */
-  nonce: string
-}
-/**
- * One device's four purpose-separated public keys.
- *
- * An authenticated pairing exchange binds these public keys and their explicit purposes to one
- * device record.
- */
-export interface DevicePublicKeys2 {
-  /**
-   * The Ed25519 authorisation key.
-   */
-  authorisation: string
-  /**
-   * The X25519 notification-preview key.
-   */
-  notification_preview: string
-  /**
-   * The X25519 stored-envelope key.
-   */
-  stored_envelope: string
-  /**
-   * The iroh transport identity.
-   */
-  transport: string
 }
 /**
  * A host-issued owner-confirmation challenge.
@@ -9181,7 +9803,7 @@ export interface ProposedGrant {
           expires_at_ms: string
         }
       }
-  history: HistoryScope1
+  history: HistoryScope2
   /**
    * An optional organisation membership requirement.
    */
@@ -9208,7 +9830,7 @@ export interface ProposedGrant {
 /**
  * How far back it may see.
  */
-export interface HistoryScope1 {
+export interface HistoryScope2 {
   /**
    * Whether the currently visible screen is included. This exception never grants inactive
    * screen buffers, scrollback or the backing transcript.
@@ -11142,6 +11764,75 @@ export interface RevocationRequest {
       }
 }
 /**
+ * The result of `grant.revoke` and `device.revoke`.
+ *
+ * A revocation is not complete when the host records it. It is complete for a worker once that
+ * worker has acknowledged the revision and fenced the undispatched actions it affects, or once
+ * the worker is confirmed ended, so the barrier travels with the answer.
+ */
+export interface RevocationResult {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  barrier: RevocationBarrier1
+  /**
+   * Every grant it revoked: the named one and its descendants.
+   */
+  revoked_grants: GrantId[]
+}
+/**
+ * The per-worker completion status.
+ */
+export interface RevocationBarrier1 {
+  /**
+   * The host's ordered authority revision. Only the host issues its own revisions.
+   */
+  authority_revision: string
+  /**
+   * One entry per affected worker.
+   */
+  workers: WorkerBarrier[]
+}
+/**
+ * What the issuer chose, on top of the role, before the grant was written.
+ *
+ * Every field here is an explicit choice. A default-constructed selection adds nothing to the
+ * role, which is what section 25 requires: earlier history, the live screen, `question.respond`
+ * below controller, and named pre-cutoff resources are each opted into or absent.
+ */
+export interface RoleSelection1 {
+  /**
+   * Earlier history, from this cursor. Null keeps the recipient to the live screen and what
+   * follows it.
+   */
+  history_from_cursor_ms: TimestampMs | null
+  /**
+   * Whether the currently visible screen is included, previewed to the issuer.
+   *
+   * The exception never reaches inactive screen buffers, scrollback or the backing transcript.
+   */
+  include_live_screen: boolean
+  /**
+   * Whether a viewer or reviewer also receives `question.respond`.
+   *
+   * Ignored for controller and owner, which carry it already.
+   */
+  include_question_respond: boolean
+  /**
+   * Current approval requests this invitation names explicitly.
+   */
+  named_approvals: ApprovalRequestId[]
+  /**
+   * Current questions this invitation names explicitly.
+   */
+  named_questions: QuestionId[]
+  /**
+   * The role the issuer chose.
+   */
+  role: 'viewer' | 'reviewer' | 'controller' | 'owner'
+}
+/**
  * Parameters of `root.command.accepted`.
  *
  * Sent from the reader at acceptance, inside the fenced context, before the reader leaves. The
@@ -12558,7 +13249,10 @@ export interface HostBundle {
   proposed_grant: ProposedGrant1
 }
 /**
- * The host's purpose-separated public keys.
+ * One device's four purpose-separated public keys.
+ *
+ * An authenticated pairing exchange binds these public keys and their explicit purposes to one
+ * device record.
  */
 export interface DevicePublicKeys4 {
   /**
@@ -12637,7 +13331,7 @@ export interface ProposedGrant1 {
           expires_at_ms: string
         }
       }
-  history: HistoryScope1
+  history: HistoryScope2
   /**
    * An optional organisation membership requirement.
    */

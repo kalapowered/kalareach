@@ -50,6 +50,7 @@
 //! | [`identity`] | Boot, process-start and worker-profile identities |
 //! | [`question`] | Agent questions, their answers, alerts and the caller token |
 //! | [`session`] | The session lifecycle, closure records and the session method group |
+//! | [`sharing`] | Roles, invitation previews, the notices a grant carries and the sharing method group |
 //! | [`skill`] | Contact-skill installation: agents, scopes and the exact change manifest |
 //! | [`attachment`] | Attachments, geometry ownership and the attachment method group |
 //! | [`input`] | The single input lease and the input method group |
@@ -130,6 +131,7 @@ pub mod schema;
 pub mod semantic;
 pub mod service;
 pub mod session;
+pub mod sharing;
 pub mod skill;
 pub mod sync;
 pub mod transfer;

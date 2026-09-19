@@ -1539,6 +1539,69 @@
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
     },
+    "AuthorityFeedStatus": {
+      "additionalProperties": false,
+      "description": "What this host shows about the remote authority feed.",
+      "properties": {
+        "accepted_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The latest revision this host has accepted. It never goes backwards."
+        },
+        "last_synchronised_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last successful synchronisation, when there has been one."
+        },
+        "stale": {
+          "description": "True when the feed could not be reached, so what is shown is stale.",
+          "type": "boolean"
+        },
+        "unacknowledged_records": {
+          "description": "How many retained revocation records have not yet been acknowledged by every enrolled host.",
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "accepted_revision",
+        "last_synchronised_at_ms",
+        "stale",
+        "unacknowledged_records"
+      ],
+      "type": "object"
+    },
+    "AuthorityNotice": {
+      "description": "One consequence of a grant that the issuer is shown before the grant exists.\n\nSection 10 forbids a label that implies a restrictive sandbox the upstream does not enforce, so\nthe host decides which notices a set of actions carries and states each one in fixed words.\nA surface may translate [`Self::sentence`]; it may not soften it, and it may not decide for\nitself that an action is harmless.",
+      "oneOf": [
+        {
+          "const": "account_access",
+          "description": "`terminal.input`: the recipient types as the shell user.",
+          "type": "string"
+        },
+        {
+          "const": "agent_permissions",
+          "description": "`agent.prompt`, `agent.approval.respond` or `question.respond`: what the recipient sends is\ninput the agent may act on under the agent's own permissions.",
+          "type": "string"
+        },
+        {
+          "const": "environment_writes",
+          "description": "`files.upload`, `files.apply_diff`, `project.create`, `workspace.manage` or\n`changeset.create`: the recipient changes files in this environment.",
+          "type": "string"
+        },
+        {
+          "const": "delegation",
+          "description": "`session.share`: the recipient can delegate what it holds to somebody else.",
+          "type": "string"
+        }
+      ]
+    },
     "AuthorityRevision": {
       "description": "The host's ordered authority revision. Only the host issues its own revisions.",
       "pattern": "^(0|[1-9][0-9]*)$",
@@ -3843,6 +3906,59 @@
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
     },
+    "DeviceListParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `device.list`.",
+      "properties": {
+        "include_revoked": {
+          "description": "Whether revoked devices are included.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "include_revoked"
+      ],
+      "type": "object"
+    },
+    "DeviceListResult": {
+      "additionalProperties": false,
+      "description": "The result of `device.list`.",
+      "properties": {
+        "authority_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The revision in force when the list was taken."
+        },
+        "devices": {
+          "description": "The devices, ordered by identity.",
+          "items": {
+            "$ref": "#/$defs/DeviceSummary"
+          },
+          "type": "array"
+        },
+        "feed_stale": {
+          "description": "True when the feed is unreachable, so the revocation status shown is stale.",
+          "type": "boolean"
+        },
+        "feed_synchronised_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last time this host synchronised the remote authority feed, when it has."
+        }
+      },
+      "required": [
+        "devices",
+        "authority_revision",
+        "feed_synchronised_at_ms",
+        "feed_stale"
+      ],
+      "type": "object"
+    },
     "DeviceName": {
       "description": "A device display name of at most 128 bytes and no control characters. Display text, never authority.",
       "pattern": "^[^\\u0000-\\u001f\\u007f]{1,128}$",
@@ -3878,6 +3994,44 @@
         }
       ]
     },
+    "DevicePreviewKeyUpdateParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `device.preview_key.update`.",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device rotating its key. A device may rotate only its own."
+        },
+        "notification_preview": {
+          "$ref": "#/$defs/NotificationPreviewKey",
+          "description": "The new notification-preview public key."
+        }
+      },
+      "required": [
+        "device_id",
+        "notification_preview"
+      ],
+      "type": "object"
+    },
+    "DevicePreviewKeyUpdateResult": {
+      "additionalProperties": false,
+      "description": "The result of `device.preview_key.update`.",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device whose key changed."
+        },
+        "notification_preview": {
+          "$ref": "#/$defs/NotificationPreviewKey",
+          "description": "The key now on record."
+        }
+      },
+      "required": [
+        "device_id",
+        "notification_preview"
+      ],
+      "type": "object"
+    },
     "DevicePublicKeys": {
       "additionalProperties": false,
       "description": "One device's four purpose-separated public keys.\n\nAn authenticated pairing exchange binds these public keys and their explicit purposes to one\ndevice record.",
@@ -3904,6 +4058,78 @@
         "authorisation",
         "stored_envelope",
         "notification_preview"
+      ],
+      "type": "object"
+    },
+    "DeviceRevokeParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `device.revoke`.",
+      "properties": {
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device to revoke. Every grant it holds goes with it."
+        }
+      },
+      "required": [
+        "device_id"
+      ],
+      "type": "object"
+    },
+    "DeviceSummary": {
+      "additionalProperties": false,
+      "description": "One paired device as `device.list` reports it.\n\nSection 10 puts each host's last acknowledgement in the device list, because an offline host\ncannot apply a revocation it has not received and the person has to be able to see that.",
+      "properties": {
+        "acknowledged_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When that acknowledgement arrived."
+        },
+        "acknowledged_revision": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/AuthorityRevision"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last authority revision this device acknowledged."
+        },
+        "device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device."
+        },
+        "display_name": {
+          "description": "The name it was paired under.",
+          "type": "string"
+        },
+        "grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant it holds."
+        },
+        "paired_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was paired."
+        },
+        "revoked": {
+          "description": "Whether the device has been revoked.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "device_id",
+        "display_name",
+        "grant_id",
+        "paired_at_ms",
+        "acknowledged_revision",
+        "acknowledged_at_ms",
+        "revoked"
       ],
       "type": "object"
     },
@@ -6400,6 +6626,90 @@
       ],
       "type": "object"
     },
+    "GrantCreateParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `grant.create`.",
+      "properties": {
+        "lifetime_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DurationMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "How long the invitation lasts. Null takes [`DEFAULT_INVITATION_LIFETIME_MS`]."
+        },
+        "owner_confirmation": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/OwnerConfirmationProof"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The owner's confirmation, when the request enlarges persistent authority."
+        },
+        "parent_grant_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The grant this one is delegated from. Null issues from the issuer's own authority."
+        },
+        "recipient_device_id": {
+          "$ref": "#/$defs/DeviceId",
+          "description": "The device the grant is issued to."
+        },
+        "selection": {
+          "$ref": "#/$defs/RoleSelection",
+          "description": "The role and the explicit choices on top of it."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session being shared."
+        }
+      },
+      "required": [
+        "session_id",
+        "recipient_device_id",
+        "parent_grant_id",
+        "selection",
+        "lifetime_ms",
+        "owner_confirmation"
+      ],
+      "type": "object"
+    },
+    "GrantCreateResult": {
+      "additionalProperties": false,
+      "description": "The result of `grant.create`.",
+      "properties": {
+        "authority_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The authority revision it was issued under."
+        },
+        "grant": {
+          "$ref": "#/$defs/Grant",
+          "description": "The grant that was written."
+        },
+        "preview": {
+          "$ref": "#/$defs/InvitationPreview",
+          "description": "What the issuer was shown before it was written."
+        }
+      },
+      "required": [
+        "grant",
+        "preview",
+        "authority_revision"
+      ],
+      "type": "object"
+    },
     "GrantExpiry": {
       "description": "When a grant stops being valid.",
       "oneOf": [
@@ -6438,6 +6748,126 @@
       "format": "uuid",
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
+    },
+    "GrantListParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `grant.list`.",
+      "properties": {
+        "include_resolved": {
+          "description": "Whether expired and revoked grants are included.",
+          "type": "boolean"
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "One session, or null for every session the caller may see."
+        }
+      },
+      "required": [
+        "session_id",
+        "include_resolved"
+      ],
+      "type": "object"
+    },
+    "GrantListResult": {
+      "additionalProperties": false,
+      "description": "The result of `grant.list`.",
+      "properties": {
+        "grants": {
+          "description": "The grants, ordered by identity.",
+          "items": {
+            "$ref": "#/$defs/GrantSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "grants"
+      ],
+      "type": "object"
+    },
+    "GrantRevokeParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `grant.revoke`.",
+      "properties": {
+        "grant_id": {
+          "$ref": "#/$defs/GrantId",
+          "description": "The grant to revoke. Its descendants go with it."
+        }
+      },
+      "required": [
+        "grant_id"
+      ],
+      "type": "object"
+    },
+    "GrantState": {
+      "description": "Where a grant is in its life.",
+      "oneOf": [
+        {
+          "const": "active",
+          "description": "Valid now.",
+          "type": "string"
+        },
+        {
+          "const": "expired",
+          "description": "Its expiry passed. It never revives.",
+          "type": "string"
+        },
+        {
+          "const": "revoked",
+          "description": "Revoked, on its own or as the descendant of a revoked parent.",
+          "type": "string"
+        }
+      ]
+    },
+    "GrantSummary": {
+      "additionalProperties": false,
+      "description": "One grant as `grant.list` reports it.",
+      "properties": {
+        "grant": {
+          "$ref": "#/$defs/Grant",
+          "description": "The grant itself."
+        },
+        "revoked_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When it was revoked, when it was."
+        },
+        "revoked_by_parent": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/GrantId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The grant whose revocation revoked this one, when it was a descendant."
+        },
+        "state": {
+          "$ref": "#/$defs/GrantState",
+          "description": "Where it stands now."
+        }
+      },
+      "required": [
+        "grant",
+        "state",
+        "revoked_at_ms",
+        "revoked_by_parent"
+      ],
+      "type": "object"
     },
     "HelloReply": {
       "description": "The host's answer to a `hello` offer.\n\nA major mismatch answers [`ErrorCode::UnsupportedSchema`] here and the connection carries no\nsession data. Every other refusal before device authorisation answers here too, so a client\nnever has to distinguish a closed stream from a rejected offer.",
@@ -7471,6 +7901,101 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "InvitationPreview": {
+      "additionalProperties": false,
+      "description": "What an invitation will share, shown to its issuer before it exists.",
+      "properties": {
+        "actions": {
+          "description": "The actions the role compiled to. The host authorises from these, never from the role.",
+          "items": {
+            "$ref": "#/$defs/ActionRight"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "environment_id": {
+          "$ref": "#/$defs/EnvironmentId",
+          "description": "The environment that session lives in."
+        },
+        "expires_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the invitation expires."
+        },
+        "historical_attachment_keys": {
+          "description": "Always false. A new recipient receives no historical attachment keys.",
+          "type": "boolean"
+        },
+        "history": {
+          "$ref": "#/$defs/HistoryScope",
+          "description": "The history the recipient will reach."
+        },
+        "invitation_id": {
+          "$ref": "#/$defs/InvitationId",
+          "description": "The invitation this preview belongs to."
+        },
+        "live_screen": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/LiveScreenPreview"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The live screen as it stands, when the issuer included it."
+        },
+        "named_approvals": {
+          "description": "The current approval requests this invitation names.",
+          "items": {
+            "$ref": "#/$defs/NamedApprovalPreview"
+          },
+          "type": "array"
+        },
+        "named_questions": {
+          "description": "The current questions this invitation names.",
+          "items": {
+            "$ref": "#/$defs/NamedQuestionPreview"
+          },
+          "type": "array"
+        },
+        "notices": {
+          "description": "The notices the actions carry.",
+          "items": {
+            "$ref": "#/$defs/AuthorityNotice"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "role": {
+          "$ref": "#/$defs/SessionRole",
+          "description": "The role the issuer chose."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session it shares."
+        },
+        "single_use": {
+          "description": "Always true. An invitation is redeemed once.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "invitation_id",
+        "session_id",
+        "environment_id",
+        "role",
+        "actions",
+        "history",
+        "expires_at_ms",
+        "live_screen",
+        "named_questions",
+        "named_approvals",
+        "notices",
+        "historical_attachment_keys",
+        "single_use"
+      ],
+      "type": "object"
+    },
     "IsolationMechanism": {
       "description": "How an isolated workspace is separated from the user's own tree.",
       "oneOf": [
@@ -7652,6 +8177,28 @@
           "type": "object"
         }
       ]
+    },
+    "LiveScreenPreview": {
+      "additionalProperties": false,
+      "description": "The live screen as it stands, shown to the issuer before the invitation exists.\n\nA shared live screen can contain text printed long before the invitation, so the preview shows\nthe text rather than promising it is recent.",
+      "properties": {
+        "lines": {
+          "description": "The visible lines, top to bottom, as the recipient would first see them.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "truncated": {
+          "description": "True when the preview was cut to [`MAX_PREVIEW_LINES`] or [`MAX_PREVIEW_LINE_CHARS`].",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "lines",
+        "truncated"
+      ],
+      "type": "object"
     },
     "LocalClientKind": {
       "description": "What kind of client opened a local connection.",
@@ -9038,6 +9585,59 @@
       ],
       "type": "object"
     },
+    "NamedApprovalPreview": {
+      "additionalProperties": false,
+      "description": "One current approval request an invitation names explicitly.",
+      "properties": {
+        "approval_request_id": {
+          "$ref": "#/$defs/ApprovalRequestId",
+          "description": "The approval request."
+        },
+        "created_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was created, which may be before the history cursor."
+        },
+        "summary": {
+          "description": "What the upstream is asking to do.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "approval_request_id",
+        "summary",
+        "created_at_ms"
+      ],
+      "type": "object"
+    },
+    "NamedQuestionPreview": {
+      "additionalProperties": false,
+      "description": "One current question an invitation names explicitly.",
+      "properties": {
+        "created_at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was created, which may be before the history cursor."
+        },
+        "question": {
+          "description": "The question itself.",
+          "type": "string"
+        },
+        "question_id": {
+          "$ref": "#/$defs/QuestionId",
+          "description": "The question."
+        },
+        "revision": {
+          "$ref": "#/$defs/QuestionRevision",
+          "description": "The revision the issuer was shown."
+        }
+      },
+      "required": [
+        "question_id",
+        "revision",
+        "question",
+        "created_at_ms"
+      ],
+      "type": "object"
+    },
     "NetworkConfig": {
       "additionalProperties": false,
       "description": "The selected discovery and relay configuration a pairing invitation carries.\n\nDiscovery and relay selection are separate configuration choices, and a self-hosted deployment\nreplaces each service independently. Section 17 therefore names the publisher URL, the resolver\nURL, the DNS origin and the relay map separately, and each one is selected on its own: a null\nfield means that service is not selected, never that a default is inherited. There are no\npublic defaults to fall back on, so a receiver that finds a field null simply does without it.",
@@ -9201,6 +9801,32 @@
           "type": "string"
         }
       ]
+    },
+    "OfflineValidityPolicy": {
+      "additionalProperties": false,
+      "description": "A host owner's bounded offline-validity policy for personal remote access.\n\nSection 10 makes this optional and explicit. The default personal owner grant stays\naccount-free and non-expiring, so independent operation never depends on a cloud lease; an\nowner who wants a bound chooses one, and the host shows the feed status and the last successful\nsynchronisation beside it.",
+      "properties": {
+        "last_synchronised_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The last successful synchronisation, when there has been one."
+        },
+        "maximum_offline_ms": {
+          "$ref": "#/$defs/DurationMs",
+          "description": "How long personal remote access stays valid without a successful authority-feed\nsynchronisation."
+        }
+      },
+      "required": [
+        "maximum_offline_ms",
+        "last_synchronised_at_ms"
+      ],
+      "type": "object"
     },
     "OperationRecord": {
       "additionalProperties": false,
@@ -15196,6 +15822,34 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "RevocationResult": {
+      "additionalProperties": false,
+      "description": "The result of `grant.revoke` and `device.revoke`.\n\nA revocation is not complete when the host records it. It is complete for a worker once that\nworker has acknowledged the revision and fenced the undispatched actions it affects, or once\nthe worker is confirmed ended, so the barrier travels with the answer.",
+      "properties": {
+        "authority_revision": {
+          "$ref": "#/$defs/AuthorityRevision",
+          "description": "The revision this revocation advanced to."
+        },
+        "barrier": {
+          "$ref": "#/$defs/RevocationBarrier",
+          "description": "The per-worker completion status."
+        },
+        "revoked_grants": {
+          "description": "Every grant it revoked: the named one and its descendants.",
+          "items": {
+            "$ref": "#/$defs/GrantId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "authority_revision",
+        "revoked_grants",
+        "barrier"
+      ],
+      "type": "object"
+    },
     "RevocationTarget": {
       "description": "What a revocation removes.",
       "oneOf": [
@@ -15322,6 +15976,60 @@
           "type": "string"
         }
       ]
+    },
+    "RoleSelection": {
+      "additionalProperties": false,
+      "description": "What the issuer chose, on top of the role, before the grant was written.\n\nEvery field here is an explicit choice. A default-constructed selection adds nothing to the\nrole, which is what section 25 requires: earlier history, the live screen, `question.respond`\nbelow controller, and named pre-cutoff resources are each opted into or absent.",
+      "properties": {
+        "history_from_cursor_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Earlier history, from this cursor. Null keeps the recipient to the live screen and what\nfollows it."
+        },
+        "include_live_screen": {
+          "description": "Whether the currently visible screen is included, previewed to the issuer.\n\nThe exception never reaches inactive screen buffers, scrollback or the backing transcript.",
+          "type": "boolean"
+        },
+        "include_question_respond": {
+          "description": "Whether a viewer or reviewer also receives `question.respond`.\n\nIgnored for controller and owner, which carry it already.",
+          "type": "boolean"
+        },
+        "named_approvals": {
+          "description": "Current approval requests this invitation names explicitly.",
+          "items": {
+            "$ref": "#/$defs/ApprovalRequestId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "named_questions": {
+          "description": "Current questions this invitation names explicitly.",
+          "items": {
+            "$ref": "#/$defs/QuestionId"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "role": {
+          "$ref": "#/$defs/SessionRole",
+          "description": "The role the issuer chose."
+        }
+      },
+      "required": [
+        "role",
+        "history_from_cursor_ms",
+        "include_live_screen",
+        "include_question_respond",
+        "named_questions",
+        "named_approvals"
+      ],
+      "type": "object"
     },
     "RootCommandAcceptedParams": {
       "additionalProperties": false,
@@ -16368,6 +17076,31 @@
         "session_epoch"
       ],
       "type": "object"
+    },
+    "SessionRole": {
+      "description": "One of the four default roles.\n\nThe order is the order of increasing authority, so a comparison reads the way a person expects.\nIt is a display and composition order only: no check anywhere compares two roles to decide a\nrequest.",
+      "oneOf": [
+        {
+          "const": "viewer",
+          "description": "Sees the selected live screen and future events.",
+          "type": "string"
+        },
+        {
+          "const": "reviewer",
+          "description": "A viewer that also sees selected diffs and files.",
+          "type": "string"
+        },
+        {
+          "const": "controller",
+          "description": "A reviewer that also holds terminal input, prompts and `question.respond`.",
+          "type": "string"
+        },
+        {
+          "const": "owner",
+          "description": "A controller that can also manage grants and close the session.",
+          "type": "string"
+        }
+      ]
     },
     "SessionSelector": {
       "description": "Which sessions a grant covers.",
@@ -18782,6 +19515,9 @@
     "attachment_viewport_result": {
       "$ref": "#/$defs/AttachmentViewportResult"
     },
+    "authority_feed_status": {
+      "$ref": "#/$defs/AuthorityFeedStatus"
+    },
     "authority_revision_ack": {
       "$ref": "#/$defs/AuthorityRevisionAck"
     },
@@ -18829,6 +19565,24 @@
     },
     "desktop_context": {
       "$ref": "#/$defs/DesktopContext"
+    },
+    "device_list_params": {
+      "$ref": "#/$defs/DeviceListParams"
+    },
+    "device_list_result": {
+      "$ref": "#/$defs/DeviceListResult"
+    },
+    "device_preview_key_update_params": {
+      "$ref": "#/$defs/DevicePreviewKeyUpdateParams"
+    },
+    "device_preview_key_update_result": {
+      "$ref": "#/$defs/DevicePreviewKeyUpdateResult"
+    },
+    "device_revoke_params": {
+      "$ref": "#/$defs/DeviceRevokeParams"
+    },
+    "device_summary": {
+      "$ref": "#/$defs/DeviceSummary"
     },
     "direct_challenge": {
       "$ref": "#/$defs/DirectChallenge"
@@ -18922,6 +19676,24 @@
     },
     "grant": {
       "$ref": "#/$defs/Grant"
+    },
+    "grant_create_params": {
+      "$ref": "#/$defs/GrantCreateParams"
+    },
+    "grant_create_result": {
+      "$ref": "#/$defs/GrantCreateResult"
+    },
+    "grant_list_params": {
+      "$ref": "#/$defs/GrantListParams"
+    },
+    "grant_list_result": {
+      "$ref": "#/$defs/GrantListResult"
+    },
+    "grant_revoke_params": {
+      "$ref": "#/$defs/GrantRevokeParams"
+    },
+    "grant_summary": {
+      "$ref": "#/$defs/GrantSummary"
     },
     "hello_reply": {
       "$ref": "#/$defs/HelloReply"
@@ -19223,6 +19995,12 @@
     "installed_file": {
       "$ref": "#/$defs/InstalledFile"
     },
+    "invitation_preview": {
+      "$ref": "#/$defs/InvitationPreview"
+    },
+    "live_screen_preview": {
+      "$ref": "#/$defs/LiveScreenPreview"
+    },
     "local_hello": {
       "$ref": "#/$defs/LocalHello"
     },
@@ -19238,8 +20016,17 @@
     "mutation_request": {
       "$ref": "#/$defs/MutationRequest"
     },
+    "named_approval_preview": {
+      "$ref": "#/$defs/NamedApprovalPreview"
+    },
+    "named_question_preview": {
+      "$ref": "#/$defs/NamedQuestionPreview"
+    },
     "notification": {
       "$ref": "#/$defs/Notification"
+    },
+    "offline_validity_policy": {
+      "$ref": "#/$defs/OfflineValidityPolicy"
     },
     "operation_record": {
       "$ref": "#/$defs/OperationRecord"
@@ -19456,6 +20243,12 @@
     },
     "revocation_request": {
       "$ref": "#/$defs/RevocationRequest"
+    },
+    "revocation_result": {
+      "$ref": "#/$defs/RevocationResult"
+    },
+    "role_selection": {
+      "$ref": "#/$defs/RoleSelection"
     },
     "root_command_accepted_params": {
       "$ref": "#/$defs/RootCommandAcceptedParams"
