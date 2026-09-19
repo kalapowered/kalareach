@@ -250,10 +250,29 @@ impl Journal {
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .optional()
             .map_err(unavailable)?;
-        if recorded.is_none() {
+        let Some(recorded) = recorded else {
             return Err(unavailable_detail(
                 "this file is not a journal this build wrote, so it is not recovered from",
             ));
+        };
+        // A version row is not a schema. Migration creates what is absent, so a journal that has
+        // lost a table would come back from this as a journal with an empty one, and the loss
+        // would never be reported. Every version of this ladder has had these three since the
+        // first, so a store that records a version and is missing one of them has lost it.
+        for table in ["receipts", "receipt_events", "results"] {
+            let present: i64 = connection
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .map_err(unavailable)?;
+            if present == 0 {
+                return Err(unavailable_detail_owned(format!(
+                    "this journal records schema version {recorded} and has no {table} table, so \
+                     what it held is lost rather than recoverable"
+                )));
+            }
         }
         Self::prepare(connection)
     }
@@ -2246,14 +2265,17 @@ impl Journal {
         reason: Option<RejectionReason>,
         now_ms: TimestampMs,
     ) -> Result<usize> {
-        let moving = self.identities_in(&[from])?;
-        if moving.is_empty() {
-            return Ok(0);
-        }
         let transaction = self
             .connection
             .transaction()
             .map_err(|error| faulted(&self.health, error))?;
+        // The rows are read *inside* the transaction that moves them. Reading them outside would
+        // let a second pass select what the first had already moved and then write an event for
+        // a transition that did not happen.
+        let moving = identities_in(&transaction, from)?;
+        if moving.is_empty() {
+            return Ok(0);
+        }
         transaction
             .execute(
                 "UPDATE receipts SET state = ?1, revision = revision + 1, updated_at_ms = ?2,
@@ -2610,15 +2632,19 @@ impl Journal {
     /// produced, and those are the caller's own content: a question's answer text is in one and
     /// the question is in the other.
     ///
-    /// Only a receipt in a terminal state is redacted. A receipt still `accepted` or
-    /// `dispatching` needs its envelope, because recovery reads it and a de-duplicated retry is
-    /// answered from it; taking that away would turn privacy mode into a way of losing an action.
+    /// What is redacted is a receipt that will never be dispatched again: `applied`, `refused`,
+    /// `rejected` and `unknown`. `unknown` is not terminal - a later authoritative answer can
+    /// still move it - but the identifier behind it is never dispatched again, so nothing needs
+    /// the envelope to decide what to send, and supersession reads the subject digest rather than
+    /// the envelope. A receipt still `accepted` or `dispatching` keeps its envelope, because
+    /// recovery reads it and a de-duplicated retry is answered from it; taking that away would
+    /// turn privacy mode into a way of losing an action.
     ///
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
     pub fn redact_settled_content(&mut self) -> Result<u64> {
-        const SETTLED: &str = "state IN ('applied', 'refused', 'rejected', 'unknown', 'failed')";
+        const SETTLED: &str = "state IN ('applied', 'refused', 'rejected', 'unknown')";
         let transaction = self
             .connection
             .transaction()
@@ -3304,6 +3330,27 @@ struct NamedAction<'a> {
     method: Option<&'a str>,
     /// The receipt state the name was taken at.
     state: Option<&'a str>,
+}
+
+/// Returns the receipts in one state, read through the caller's own transaction.
+fn identities_in(
+    transaction: &rusqlite::Transaction<'_>,
+    state: ReceiptState,
+) -> Result<Vec<(ActorId, ActionId)>> {
+    let mut statement = transaction
+        .prepare("SELECT actor_id, action_id FROM receipts WHERE state = ?1")
+        .map_err(unavailable)?;
+    let rows = statement
+        .query_map(params![state.as_str()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(unavailable)?;
+    let mut found = Vec::new();
+    for row in rows {
+        let (actor, action) = row.map_err(unavailable)?;
+        found.push((parse_actor(actor)?, parse_action(&action)?));
+    }
+    Ok(found)
 }
 
 fn parse_state(text: &str) -> Result<ReceiptState> {

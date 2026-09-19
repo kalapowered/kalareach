@@ -506,6 +506,133 @@ fn a_restarted_session_reads_its_generation_back_and_keeps_refusing_what_it_refu
     assert!(restarted.privacy().accepts_result(generation));
 }
 
+#[test]
+fn content_that_settles_while_privacy_is_on_is_taken_when_privacy_is_turned_off() {
+    // Privacy mode is prospective: an action admitted after it was enabled settles later, and the
+    // content its receipt carries is content this host was asked not to keep. Waiting for a
+    // maintenance tick would leave it there for anybody who turned privacy mode off first.
+    let (_temp, mut session) = session_on_disk();
+    session.enable_privacy(&mut []).expect("enables");
+    {
+        let journal = session.journal_mut().expect("a journal");
+        journal.accept(&submission(3)).expect("an action");
+        journal
+            .mark_dispatching(
+                actor(),
+                kr_worker::journal::action_id_from([3; 16]),
+                kr_ipc::now_ms(),
+            )
+            .expect("marks");
+        journal
+            .settle(
+                actor(),
+                kr_worker::journal::action_id_from([3; 16]),
+                kr_protocol::receipt::ReceiptState::Applied,
+                Some(b"what the action answered"),
+                None,
+                kr_ipc::now_ms(),
+            )
+            .expect("settles");
+        assert!(
+            journal
+                .read_result(&actor(), kr_worker::journal::action_id_from([3; 16]))
+                .expect("reads")
+                .is_some(),
+            "it is there until something takes it"
+        );
+    }
+    session.disable_privacy().expect("disables");
+    let journal = session.journal_mut().expect("a journal");
+    assert!(
+        journal
+            .read_result(&actor(), kr_worker::journal::action_id_from([3; 16]))
+            .expect("reads")
+            .is_none(),
+        "the private interval's content is taken before privacy mode ends"
+    );
+    assert!(
+        journal
+            .read_intent(&actor(), kr_worker::journal::action_id_from([3; 16]))
+            .expect("reads")
+            .is_none()
+    );
+}
+
+#[test]
+fn a_cleanup_that_could_not_remove_the_output_is_not_settled_by_a_redaction_that_worked() {
+    // Two obligations, cleared by different work. A spool this host could not empty is content
+    // privacy mode was asked to remove and has not, and a redaction that succeeded says nothing
+    // about it.
+    let (temp, mut session) = session_on_disk();
+    let session_id = session.summary().session_id;
+    for _ in 0..4 {
+        session.ingest_output(&[b'x'; 4096]);
+    }
+    // A directory of that name blocks the boundary file, so the spool cannot be emptied.
+    let spool = temp.environment().session_spool(session_id);
+    std::fs::create_dir(spool.join("boundary")).expect("blocks the boundary file");
+
+    session.enable_privacy(&mut []).expect("enables");
+    assert!(
+        session.privacy_cleanup_failure().is_some(),
+        "the removal that could not finish is owed"
+    );
+    assert!(!session.reconcile_privacy(&[]).is_complete());
+    // A maintenance pass whose redaction succeeds does not settle the other obligation.
+    session.collect_expired();
+    assert!(
+        !session.reconcile_privacy(&[]).is_complete(),
+        "the output is still there, so the cleanup is not complete"
+    );
+
+    // Once the obstruction is gone the retry finishes it, and only then is it complete.
+    std::fs::remove_dir(spool.join("boundary")).expect("unblocks it");
+    session.collect_expired();
+    assert!(session.reconcile_privacy(&[]).is_complete());
+    assert_eq!(session.retained_output_bytes(), 0);
+}
+
+#[test]
+fn a_session_whose_privacy_state_cannot_be_read_retains_nothing_and_owes_its_cleanup() {
+    // Not knowing whether privacy mode is on is not a reason to keep output, and it is not a
+    // reason to call the cleanup done either.
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    // A journal path that cannot be opened: a directory stands where the file belongs.
+    let journal = environment.journal_database(session_id);
+    std::fs::create_dir_all(&journal).expect("blocks the journal");
+    let config = SessionConfig {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id: environment.environment_id(),
+        display_number: DisplayNumber::new(1),
+        shell: ShellCommand {
+            program: "/bin/sh".to_owned(),
+            arguments: vec!["-c".to_owned(), "sleep 30".to_owned()],
+            cwd: "/".to_owned(),
+            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+        },
+        shell_mode: ShellMode::NativeCompat,
+        worker_profile: WorkerProfile::HeadlessUser,
+        desktop: DesktopBinding::none(),
+        dimensions: Dimensions::new(80, 24),
+        journal_path: Some(journal),
+        spool_directory: Some(environment.session_spool(session_id)),
+        send_queue_bytes: 1024 * 1024,
+        resident_bytes: 64 * 1024,
+    };
+    let mut session = Session::open(config).expect("opens the session");
+    session.ingest_output(&[b'x'; 4096]);
+    assert_eq!(
+        session.retained_output_bytes(),
+        0,
+        "a host that cannot say whether privacy mode is on does not retain"
+    );
+    assert!(!session.reconcile_privacy(&[]).is_complete());
+    assert!(session.privacy_cleanup_failure().is_some());
+}
+
 // ---------------------------------------------------------------------------------------------
 // The contract itself
 // ---------------------------------------------------------------------------------------------

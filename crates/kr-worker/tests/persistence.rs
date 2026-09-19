@@ -489,7 +489,7 @@ fn every_transition_leaves_one_outbox_row_in_this_journals_own_order() {
 }
 
 #[test]
-fn a_consumer_that_dies_before_it_records_its_cursor_applies_each_event_once() {
+fn a_page_asked_for_again_before_its_cursor_is_recorded_is_applied_once() {
     // KR-REQ-24.20, second half: fan-out is at-least-once and idempotent. The durable half is the
     // consumer's cursor, which bounds what a redelivery replays; the in-process half is the
     // de-duplication window, which covers the interval between applying a record and recording
@@ -592,8 +592,10 @@ fn collecting_receipts_never_takes_an_event_a_consumer_still_owes() {
 #[tokio::test]
 async fn no_terminal_body_and_no_provider_key_reaches_the_control_log() {
     // KR-REQ-24.21. The check is a search of the journal's own bytes after a session has produced
-    // output carrying a recognisable provider key, and after every commit point a session reaches
-    // has been driven: none of the terminal's body is in the durable control record.
+    // output carrying a recognisable provider key, and after the acceptance and dispatch commit
+    // points have been driven: none of the terminal's body is in the durable control record. The
+    // key and the command line are supplied as output rather than typed, because output is the
+    // path section 24 names and the one this suite can drive without an application to type at.
     const SECRET: &str = "sk-provider-key-4d2f8a1b";
     const TYPED: &str = "export ANTHROPIC_API_KEY=sk-provider-key-4d2f8a1b";
     let host = host().await;
@@ -620,9 +622,9 @@ async fn no_terminal_body_and_no_provider_key_reaches_the_control_log() {
             .record_host_event(&effect, TimestampMs::new(1_500))
             .expect("records the host event");
     }
-    // The acceptance and dispatch commit points as well, so the search covers the mutation path
-    // and not only the output one. The checkpoint moves the write-ahead log into the file, so
-    // what is searched is everything this session has written rather than what has been merged.
+    // The acceptance and dispatch commit points, so the search covers the mutation path as well
+    // as the output one. The checkpoint moves the write-ahead log into the file, so what is
+    // searched is everything this session has written rather than what has been merged.
     {
         let mut session = host.runtime.session();
         let journal = session.journal_mut().expect("a journal");

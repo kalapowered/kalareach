@@ -1119,7 +1119,10 @@ A read of a closed session asks the same question first. A session this daemon h
 refused with the endpoint to ask; so is one whose registry record names a process the kernel still
 describes, because a worker this daemon failed to verify at startup is absent from its directory
 and not absent from the machine. What ownership does not yet have is a token the read methods
-require, so it is a rule this daemon keeps rather than one the store enforces.
+require or a lock that spans one recovery, so it is a rule this daemon keeps rather than one the
+store enforces, and two reconciliations of one session inside one daemon are not kept apart.
+Removing the endpoint is also best effort: a descriptor or a socket this host could not unlink
+leaves the fence reported as taken with one of its two halves undone.
 
 **A reader cannot create a worker.** Every read the archive serves is a read of what is already on
 disk. A history request never starts an execution, and a retried create is answered from the
@@ -1190,7 +1193,11 @@ described here as though they were done.
 
 A cleanup that could not finish is not a cleanup that finished. A redaction the store refused and
 a spool file this host could not unlink are both content privacy mode was asked to remove and has
-not, so both keep the reconciliation open until the next maintenance pass clears them.
+not, and they are kept apart: each is retried on the host's own maintenance tick and cleared only
+by its own success, so a redaction that works does not settle a spool that did not empty. A
+session reopened under privacy mode, or one whose privacy state this host could not read, owes
+both, because an enabling that was interrupted leaves content behind and nothing on disk says
+whether it did.
 
 What stays is named rather than quietly retained: the receipt journal's operation metadata, the
 minimal local authority this host holds, the envelope of an action that has not settled, live

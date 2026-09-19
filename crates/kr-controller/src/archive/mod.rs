@@ -149,6 +149,7 @@ impl Archive {
     /// * a summary or a closure survived, which is a session this host remembers;
     /// * a receipt survived, which is the same thing said by a different store;
     /// * retained output survived, which is a session whose history is still being kept;
+    /// * this host could not read something, including a spool it cannot tell an empty one from;
     /// * something could not be read, because declining to delete is the answer that cannot lose
     ///   a file and an unreadable record is not evidence that retention has ended.
     ///
@@ -713,6 +714,17 @@ impl ArchiveService {
     fn read_history_into(&self, session_id: SessionId, archive: &mut Archive) {
         let directory = self.paths.session_spool(session_id);
         if !directory.exists() {
+            // A session this host has some other record of once retained output, and its spool is
+            // not there: this host cannot tell an empty spool from a lost one, so it says the
+            // range is missing rather than reporting an archive with nothing missing. A session
+            // it has no record of at all is a different thing - there is nothing it has lost,
+            // because there was never anything of it here.
+            if archive.summary.is_some() || archive.closure.is_some() || archive.receipts > 0 {
+                archive.incompleteness.push(Incompleteness::HistoryLost {
+                    from_cursor: 0,
+                    to_cursor: 0,
+                });
+            }
             return;
         }
         let Ok(history) = kr_worker::history::OutputHistory::read_spool(

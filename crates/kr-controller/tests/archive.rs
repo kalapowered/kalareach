@@ -109,7 +109,16 @@ fn a_closed_session_is_served_from_what_it_left_behind() {
         ClosureReason::CloseRequested
     );
     assert_eq!(read.receipts, 1);
-    assert!(read.is_complete(), "{:?}", read.incompleteness);
+    // This session produced no output, so it has no spool, and this host cannot tell a spool that
+    // never existed from one that is gone: it says the range is missing rather than reporting an
+    // archive with nothing missing.
+    assert_eq!(
+        read.incompleteness,
+        vec![Incompleteness::HistoryLost {
+            from_cursor: 0,
+            to_cursor: 0
+        }]
+    );
 
     // And the receipt itself, with no worker anywhere. It was admitted and never dispatched, and
     // recovery has not run, so what it says is what the worker left: section 9's rules are run
@@ -429,6 +438,7 @@ fn taking_ownership_creates_no_worker_and_no_store() {
 // KR-REQ-07.65, 07.66: the closure receipt and what a crash fences
 // ---------------------------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn a_crash_stops_nothing_on_the_strength_of_an_identifier_the_kernel_may_have_reused() {
     // KR-REQ-07.66's cleanup half. A worker's descendants join the group it led, and once the

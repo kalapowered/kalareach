@@ -2489,10 +2489,15 @@ impl WorkerService {
         //
         // The two named exceptions pass: section 7's authorised stop and section 11's raw
         // terminal input, which does not travel this path at all.
-        let work = if stopping {
-            crate::persistence::fault::WorkClass::AuthorisedStop
-        } else {
-            crate::persistence::fault::WorkClass::RichMutation
+        // Section 7 names two exceptions and this path carries both. `session.close` is the
+        // authorised stop. `input.interrupt` is the other half of "raw terminal input and
+        // interruption remain available under the live input lease": the raw bytes travel as a
+        // read, and the interrupt travels here, so fencing it would take away the one way a
+        // person has of stopping a running command on a host whose store has failed.
+        let work = match method {
+            Method::SessionClose => crate::persistence::fault::WorkClass::AuthorisedStop,
+            Method::InputInterrupt => crate::persistence::fault::WorkClass::NativeTerminal,
+            _ => crate::persistence::fault::WorkClass::RichMutation,
         };
         let posture = session.durability_posture();
         if !posture.admits(work) {
