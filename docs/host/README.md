@@ -736,7 +736,7 @@ adopting, `workspace.manage` for creating and removing a working copy. The four 
 right of their own, so a grant that covers the environment reads the whole repository and workspace
 surface.
 
-Two limits of that, stated rather than implied:
+Three limits of that, stated rather than implied:
 
 * **A destination is a path the request names.** A creation carries the absolute parent directory
   it wants, and this host resolves it once with its own filesystem authority. The grant is
@@ -766,9 +766,11 @@ because the retained record answered first.
 
 What neither covers is the service's own preparation. Resolving a destination and taking the
 store's lock happen after the second answer, and a clone or a materialisation runs behind them, so
-a revocation that completes in there reaches an action this host had already admitted. Section 9
-lets such an action finish under the deadline it was admitted with; narrowing the window further
-means asking inside the service's own transaction, which the service would have to offer.
+a revocation or an expiry that completes in there reaches an action that then begins. Section 9
+asks for authority and expiry to be revalidated immediately before the effect and says that durable
+acceptance does not preserve expired authority, so this is a gap rather than something the section
+allows. Closing it means asking inside the service's own transaction, which the service would have
+to offer.
 
 ## What the host owes the transport
 

@@ -1,11 +1,14 @@
 //! The project and workspace methods over the network path.
 //!
-//! Requirement rows closed here: KR-REQ-23.42 and KR-REQ-23.43 for the paired-device ingress. The
-//! registry admits a device to all ten methods; until now the network dispatcher refused the reads
-//! as unsupported and sent the mutations to the worker proxy, which wants a session a project
-//! mutation does not name. What these suites demonstrate is that the two doors now answer alike:
-//! every method runs over both, the results of the reads are identical, the refusals the daemon
-//! decides are identical, and the grant is what a device is additionally held to.
+//! What these demonstrate, towards KR-REQ-23.42 and KR-REQ-23.43 for the paired-device ingress.
+//! The registry admits a device to all ten methods; until now the network dispatcher refused the
+//! reads as unsupported and sent the mutations to the worker proxy, which wants a session a
+//! project mutation does not name. These show that the two doors now answer alike: every method
+//! runs over both, the results of the reads are identical, the refusals the daemon decides are
+//! identical, and the grant is what a device is additionally held to. What they do not show is the
+//! rest of those rows: the destination and source authority sections 14 and 23 ask for, which this
+//! host does not yet establish, and recovery through `action.read`, which is refused for an action
+//! this host owns.
 //!
 //! No worker is started here. A project acts on a repository rather than on a session, so the
 //! daemon answers all ten itself; the repositories are real ones built with installed Git in a

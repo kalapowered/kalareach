@@ -840,8 +840,8 @@ impl RemoteConnection {
             }
             // The project and workspace mutations. Like a create, they are the daemon's own
             // effect: no session owns them, so they go to the project service rather than to a
-            // worker proxy, and the admission travels with them so the service asks about it
-            // again where its own waiting ends.
+            // worker proxy, and the admission travels with them so the service can ask about it
+            // again after the waiting it does of its own.
             _ if crate::project::ProjectModule::serves(entry.method) => {
                 // A project mutation claims its action identity the way every other mutation
                 // does, with this host named as the owner of what it produces. Storage that

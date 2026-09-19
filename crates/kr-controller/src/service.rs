@@ -2191,12 +2191,27 @@ impl Controller {
                 });
             }
         };
+        // The authority revision this mutation is admitted under, read here rather than inside the
+        // task below. The network ingress reads it when it checks the registration, before
+        // anything it then waits for, and the two doors have to agree: a revocation of somebody
+        // else's device advances the revision while a task is being scheduled, and a mutation that
+        // picked the revision up afterwards would be admitted under an authority the other door's
+        // mutation is refused under. Only the project path uses it; every other effect still reads
+        // it where its own transaction does.
+        let admitted = self.admitted_revision(connection_id).ok();
         let request_id = mutation.request_id;
         let controller = Arc::clone(self);
         let actor_id = actor_id.clone();
         let effect = tokio::spawn(async move {
             controller
-                .write_method(&actor_id, &mutation, method, connection_id, accepted)
+                .write_method(
+                    &actor_id,
+                    &mutation,
+                    method,
+                    connection_id,
+                    accepted,
+                    admitted,
+                )
                 .await
         });
         effect.await.unwrap_or_else(|_| {
@@ -2249,7 +2264,8 @@ impl Controller {
     /// lock held across the answer for the reason [`Self::check_admission`] states, and again
     /// inside the service's own work through [`Self::check_registration`], which is the last thing
     /// this daemon does before the action is performed. What neither covers is the service's own
-    /// preparation, which happens after both.
+    /// preparation, which happens after both; the comment on the second answer says what that
+    /// leaves.
     ///
     /// # Errors
     ///
@@ -2286,10 +2302,12 @@ impl Controller {
         // own result while a first admission does not begin under authority that has gone.
         //
         // What neither answer covers is the service's own preparation: resolving a destination and
-        // taking the store's lock both happen inside the call below, after this. A revocation that
-        // completes in there reaches an action this host had already admitted, which section 9
-        // lets finish under the deadline it was admitted with; narrowing that window further means
-        // asking inside the service's own transaction, which the service would have to offer.
+        // taking the store's lock both happen inside the call below, after this. Section 9 asks
+        // for authority and expiry to be revalidated *immediately before* the effect, and says
+        // outright that durable acceptance does not preserve expired authority, so an action that
+        // begins in that window is a gap rather than something the section allows. Closing it
+        // means asking inside the service's own transaction, which the service would have to
+        // offer; `docs/host/README.md` states the gap.
         let controller = Arc::clone(self);
         let admission = move || {
             controller
@@ -2338,6 +2356,7 @@ impl Controller {
         method: Method,
         connection_id: ConnectionId,
         accepted: Option<AcceptedDeadline>,
+        admitted: Option<AuthorityRevision>,
     ) -> ControlFrame {
         if crate::transfer::TransferModule::serves(method) {
             // The stored subject is read first, because reading it waits: for a blocking thread
@@ -2382,15 +2401,13 @@ impl Controller {
             return self.transfer.write_frame(actor_id, mutation, method).await;
         }
         if crate::project::ProjectModule::serves(method) {
-            let admitted_revision = match self.admitted_revision(connection_id) {
-                Ok(revision) => revision,
-                Err(error) => {
-                    return error_reply(
-                        mutation.request_id,
-                        ErrorCode::PermissionDenied,
-                        error.to_string(),
-                    );
-                }
+            let Some(admitted_revision) = admitted else {
+                return error_reply(
+                    mutation.request_id,
+                    ErrorCode::PermissionDenied,
+                    "the authority this connection was admitted under has been withdrawn; open a \
+                     new connection",
+                );
             };
             let carried = crate::authority::AdmittedMutation {
                 connection_id,
