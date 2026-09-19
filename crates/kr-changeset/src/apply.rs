@@ -2202,17 +2202,23 @@ fn clean_preflight(order: &ApplyOrder<'_>, limitations: &[String]) -> DiffApplyR
     }
 }
 
-/// Settles every apply an earlier daemon left undecided.
+/// Settles every apply an earlier daemon left undecided, **before this one serves anything**.
 ///
 /// An apply with no outcome is one this host did not finish. It is settled as
 /// [`ApplyOutcomeClass::InterruptedApply`] from the progress rows: a path the journal says was
 /// written is a path this host confirmed, and a path still `planned` is one whose state this host
 /// did not establish. Neither is turned into a success.
 ///
+/// The name says when: an undecided apply and an apply that is running at this moment look exactly
+/// the same in the journal, because what tells them apart is a daemon that is alive and the
+/// journal does not record liveness. So this runs once, while nothing can be running, which is
+/// what the daemon does when it opens the service. Calling it beside a live apply would settle
+/// that apply as interrupted while it was still going.
+///
 /// # Errors
 ///
 /// Returns [`ChangeSetError::StoreUnavailable`] when the journal cannot be read or written.
-pub fn recover(service: &ChangeSetService) -> Result<crate::service::Recovery> {
+pub fn recover_before_serving(service: &ChangeSetService) -> Result<crate::service::Recovery> {
     let mut recovery = crate::service::Recovery::default();
     let undecided = service.locked()?.undecided_applies()?;
     for row in undecided {

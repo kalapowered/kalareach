@@ -637,12 +637,14 @@ which is a mechanism the workflow service owns rather than this one.
 The grant and the rules decide before anything is opened, in this order, and a path any of them
 removes is never opened at all:
 
-1. A repository's own administrative data, by name and by where this repository actually keeps it.
-   `.git` in any component is refused whatever its case, and so is the directory this repository
-   resolves its own data to, which a `.git` file can point at under any name inside the same tree.
-   Git reports an untracked nested repository as one directory, and descending into it would reach
-   its configuration, which holds its remotes and can hold a credential, and its object database,
-   which holds every version of every file in it.
+1. A repository's own administrative data, by name and by where a repository actually keeps it.
+   `.git` in any component is refused whatever its case; so is the directory **this** repository
+   resolves its own data to, which a `.git` file can point at under any name inside the same tree;
+   and so is the same directory of any repository nested in the tree, resolved from that
+   repository's own `.git` as the walk meets it. Git reports an untracked nested repository as one
+   directory, and descending into it would reach its configuration, which holds its remotes and can
+   hold a credential, and its object database, which holds every version of every file in it. The
+   nested repository's **content** is captured; only its own data is not.
 2. This host's own secret rules: `.env` and its variants, a private key by name or by suffix, a
    credential or authentication file, and everything under `.ssh`, `.gnupg` or `.aws`. No wire field
    turns them off, and the version records that they were applied.
@@ -664,8 +666,9 @@ Recording a result re-reads the materialisation and says what it establishes:
   still the object this host wrote, of the same length, last written at the same instant — and the
   result attests that version;
 * it holds something else — the result attests **no version at all**, and this host records a
-  **derived version** with its own identity beside it, which is what the directory held when the
-  result was recorded rather than what the run read. A run that changed a file, tested the change
+  **derived version** with its own identity beside it, held against deletion for as long as the
+  result is, which is what the directory held when the result was recorded rather than what the
+  run read. A run that changed a file, tested the change
   and put the file back leaves a directory that reads as modified and a reading no command ever
   used, so naming that reading as the tested version would be a claim this host cannot make;
 * it holds something this host cannot represent, cannot read, or would not have captured in the
@@ -695,37 +698,44 @@ work is the one a caller gets by asking for it plainly.
 
 An apply carries **operations**, not only content: a path the version holds is installed, and a
 path the version's working tree deleted is taken away. A deletion travels with the object its base
-revision held, so a revert puts the file back rather than refusing for want of anything to restore,
-and a version whose only change is a deletion reads as that change rather than as an empty diff. A
+revision held, its mode, and this host's own copy of that content, so a revert puts the file back
+without depending on the destination's repository still holding the object, and a version whose
+only change is a deletion reads as that change rather than as an empty diff. What the base held has
+to be file content: a deleted link or submodule is a revert this host refuses rather than writing
+out as a regular file. A
 request that names no paths carries every one of them, and one that names paths carries exactly
 those.
 
 A direct apply to `shared_existing` cannot be chosen until the request carries back the limitations
-this host returns for it, and a preflight is how a caller obtains them: it writes nothing and needs
-no acknowledgement. What a direct apply then does, in order: the preflight, which compares every
+this host returns for it, and a preflight is how a caller obtains them: it needs no acknowledgement
+and it writes nothing at all, in this store or any other. What a direct apply then does, in order: the preflight, which compares every
 affected path with what the request expects and answers `DRAFT_CONFLICT` with **nothing written
 anywhere** if they differ; the claim on the action, taken here rather than earlier so that a refused
 preflight leaves nothing durable behind; an immutable capture of the destination as it stands; the content staged
-in a private directory and read back against its digest; `planned` recorded for every operation
-before any of them is attempted; then, per operation, a temporary created exclusively **in the
-destination's own directory** and written with the validated bytes, the destination's permissions
-put on it, the destination rechecked against that same directory handle as the last thing before
-the rename, the rename, and the destination read back twice and compared with what was meant to land: once
-through the directory this host published into, and once by resolving the whole path again from the
-working tree, so a parent somebody moved aside cannot be reported as a success about the path the
-request named. The read-back compares the permissions as well as the content, because the same bytes
-under different protection are not the file this host published. Finally an immutable capture of the
-destination as it now stands.
+in a private directory and read back against its digest; the apply's header and a `planned` row for
+**every** operation written in one transaction, before any of them is attempted; then, per
+operation, a temporary created exclusively **in the destination's own directory** and written with
+the validated bytes, the destination's permissions put on it, the destination rechecked against
+that same directory handle as the last thing before the rename, the staged name confirmed to still
+be the file this host created, the rename, and the destination read back twice: once through the
+directory this host published into, against the content and the permissions it set, and once by
+resolving the whole path again from the working tree and comparing the object it reaches with the
+one this host renamed into place. A parent somebody moved aside is therefore never reported as a
+success about the path the request named. Finally an immutable capture of the destination as it
+now stands.
 
 Nothing is removed to make room. A staging name that is already taken is a path this host reports
 and leaves exactly as it is.
 
-Permissions are the destination's own, put on the staged copy before the rename, so a file that was
-executable stays executable and one that was not does not become one. A destination whose
-permissions this host cannot read is a path it does not replace. What it carries is the platform's
-mode bits; an access-control list beside them is not carried, and a path that has one is replaced
-with its mode bits alone. Content is written byte for byte, so a line ending is whatever the version
-holds.
+Permissions are the destination's own, put on the staged copy through the handle this host created
+it with, before the rename, so a file that was executable stays executable and one that was not
+does not become one. A destination whose permissions this host cannot read is a path it does not
+replace. What it carries is the platform's mode bits. An access-control list beside them it does
+**not** carry, and a destination that has one is a path it refuses rather than replaces, so the
+protection is never lost quietly: that is the answer on macOS and on Linux, where a list is read
+and a minimal one, which says no more than the mode bits, is not treated as one. On a platform
+whose lists this host does not read, only the mode bits are carried. Content is written byte for
+byte, so a line ending is whatever the version holds.
 
 An apply comes to one of five classes. **A preflight conflict is an error, not a result**:
 `diff.apply` and `diff.revert` return `DRAFT_CONFLICT`, and a preflight that finds the destination
@@ -760,11 +770,12 @@ A version is not deleted while anything names it: a materialisation that has not
 review acknowledgement or any other evidence, a later version derived from it, a recorded result, an
 apply that names it on either side, or a pin the project service holds against the workspace. The
 counting and the removal are one transaction inside the change-set store, and a materialisation, a
-result, a derived version and an apply are each written under a check, in the same transaction, that
-every version they name is still there — so a holder recorded while a deletion is deciding is either
-counted or refused, and never left pointing at something that is gone. The project service's pin lives in another store and is checked first; a
-pin recorded between that check and the transaction is not covered, and that is written down rather
-than hidden.
+result with both the version it attests and the reading it carries beside it, a derived version and
+an apply with every version it names on either side are each written under a check, in the same
+transaction, that those versions are still there — so a holder recorded while a deletion is
+deciding is either counted or refused, and never left pointing at something that is gone. The
+project service's pin lives in another store and is checked first; a pin recorded between that
+check and the transaction is not covered, and that is written down rather than hidden.
 
 ### Storage layout
 

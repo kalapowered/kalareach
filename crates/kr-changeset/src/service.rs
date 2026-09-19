@@ -912,13 +912,15 @@ impl ChangeSetService {
             .record_action(actor_id, action_id, method, payload_digest, outcome)
     }
 
-    /// Resolves whatever an earlier daemon left unfinished.
+    /// Resolves whatever an earlier daemon left unfinished, **before this one serves anything**.
+    ///
+    /// See [`crate::apply::recover_before_serving`] for why the moment is part of the contract.
     ///
     /// # Errors
     ///
     /// Returns [`ChangeSetError::StoreUnavailable`] when the journal cannot be read or written.
-    pub fn recover(&self) -> Result<Recovery> {
-        crate::apply::recover(self)
+    pub fn recover_before_serving(&self) -> Result<Recovery> {
+        crate::apply::recover_before_serving(self)
     }
 
     /// Returns everything that still holds one version.

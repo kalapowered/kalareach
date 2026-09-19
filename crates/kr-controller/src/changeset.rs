@@ -75,7 +75,7 @@ impl ChangeSetModule {
             let service = ChangeSetService::open(&paths, project)?;
             // An apply an earlier daemon died inside is settled before anything is served, so a
             // caller never reads an apply that is open for ever.
-            service.recover()?;
+            service.recover_before_serving()?;
             Ok::<_, kr_changeset::ChangeSetError>(service)
         })
         .await

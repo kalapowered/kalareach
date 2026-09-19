@@ -508,7 +508,7 @@ fn a_crash_after_one_file_never_yields_an_atomic_success_receipt() {
         Nullable(None),
         "an apply nothing decided has no class"
     );
-    let recovery = replacement.recover().expect("recovery runs");
+    let recovery = replacement.recover_before_serving().expect("recovery runs");
     assert_eq!(recovery.applies_settled, 1);
 
     let settled = apply::read_apply(&replacement, action).expect("the apply is recorded");
