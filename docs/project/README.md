@@ -638,13 +638,13 @@ The grant and the rules decide before anything is opened, in this order, and a p
 removes is never opened at all:
 
 1. A repository's own administrative data, and any other repository's whole tree. `.git` in any
-   component is refused whatever its case; so is the directory **this** repository resolves its own
-   data to, which a `.git` file can point at under any name inside the same tree; and a directory
-   that **holds** a `.git` entry is another repository, which this host does not read inside at
-   all. A `.git` file points a repository's data anywhere it can reach, under any name and by any
-   spelling, so the tree is what is refused rather than a location guessed from it. What is inside
-   would otherwise be that repository's configuration, which holds its remotes and can hold a
-   credential, and its object database, which holds every version of every file in it.
+   component is refused whatever its case, and so is the directory **this** repository resolves its
+   own data to. Every directory the capture's own readings name is then asked whether it holds a
+   `.git`: one that does is another repository, whose tree this host does not read inside at all,
+   and whose `.git` **file** is read for where that repository keeps its data, which is refused
+   wherever inside the working tree it lands, beside the tree or above it. What is inside would
+   otherwise be that repository's configuration, which holds its remotes and can hold a credential,
+   and its object database, which holds every version of every file in it.
 2. This host's own secret rules: `.env` and its variants, a private key by name or by suffix, a
    credential or authentication file, and everything under `.ssh`, `.gnupg` or `.aws`. No wire field
    turns them off, and the version records that they were applied.
@@ -740,8 +740,9 @@ protection is never lost quietly. That is the answer on macOS, which keeps a lis
 bits, and on Linux, where the question is whether the file carries the extended attribute a list
 lives in: a file whose protection is its mode bits alone carries none. A directory can also put a list on every file made
 inside it, so the copy this host stages is asked as well: on Linux that inherited list is taken off
-it before the mode is set, and on macOS a copy that has one ends the operation and the destination
-is left exactly as it was. On a platform whose lists this host does not read, only the mode bits
+it, through the copy's own descriptor, before the mode is set, and on macOS, where a list is
+readable only through a name, a copy that has one ends the operation and the destination is left
+exactly as it was. On a platform whose lists this host does not read, only the mode bits
 are carried. **Preserving** a destination's own list is not implemented at all: a destination that
 has one is refused. Content is written byte for
 byte, so a line ending is whatever the version holds.
