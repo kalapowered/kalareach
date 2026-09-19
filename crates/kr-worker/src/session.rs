@@ -231,6 +231,14 @@ pub struct Session {
     >,
     /// Commands a reader installed after their transaction had been revoked.
     late_installations: Vec<kr_protocol::root::ShellLaunchResult>,
+    /// The worker-owned backends this session established, by the generation each is bound to.
+    ///
+    /// Bounded by the same rule as the blocks: one per accepted line, released when that line's
+    /// command ends, when the bridge goes and when the session closes.
+    command_backends: std::collections::BTreeMap<
+        kr_protocol::root::PromptGeneration,
+        kr_protocol::root::CommandBackend,
+    >,
     /// The command blocks the private hooks have reported, oldest first.
     ///
     /// Bounded: a session that runs for a week must not grow a record of every command it ever
@@ -516,6 +524,7 @@ impl Session {
             takeover_receipt: None,
             launches: BTreeMap::new(),
             late_installations: Vec::new(),
+            command_backends: std::collections::BTreeMap::new(),
             command_blocks: std::collections::VecDeque::new(),
             interrupt_failed: None,
             held_input_bytes: 0,
@@ -659,6 +668,16 @@ impl Session {
     pub fn apply_fence_effects(&mut self, effects: crate::fence::Effects) -> FenceOutcome {
         use crate::fence::Step;
 
+        // A bridge that has gone has ended every command it was reporting on, and nothing it
+        // reported afterwards would be this integration's word. The backends go with it.
+        if self
+            .fence
+            .as_ref()
+            .is_some_and(|driver| !driver.phase().reports_ready())
+        {
+            self.command_backends.clear();
+        }
+
         self.held_input_bytes = self
             .held_input_bytes
             .saturating_add(effects.held_added)
@@ -745,6 +764,11 @@ impl Session {
             }
             crate::fence::CommandHook::Block(block) => {
                 let prompt_generation = block.prompt_generation;
+                // A block that reports a status is a command that has ended, and a command that
+                // has ended has no backend to reach this session with any more.
+                if block.finished() {
+                    self.release_command_backend(prompt_generation);
+                }
                 self.record_command_block(*block);
                 EventOutcome::CommandBlockRecorded(kr_protocol::root::RootCommandBlockResult {
                     prompt_generation,
@@ -756,16 +780,32 @@ impl Session {
 
     /// Decides what one interactive invocation resolves to, and establishes its backend first.
     ///
-    /// Section 12's order is the point. The worker-owned backend exists before this answer is
-    /// sent, so it is there before the program the answer names is started, and there is no route
-    /// by which a program already running acquires one afterwards: this hook is the only place a
-    /// backend is made.
+    /// Section 12's order is the point. The worker-owned backend is bound to this session and this
+    /// prompt generation, and it exists before this answer is sent, so it is there before the
+    /// program the answer names is started. There is no route by which a program already running
+    /// acquires one: this hook is the only place a binding is made, a second resolve for the same
+    /// generation is answered with the binding that already exists, and a generation that has
+    /// moved on has none. An invocation the session cannot establish a backend for runs exactly as
+    /// it was typed, with no flags added: an agent started with the integration's flags and no
+    /// gateway behind them is worse off than one started without them.
     fn resolve_invocation(
         &mut self,
         params: &kr_protocol::root::RootCommandResolveParams,
     ) -> kr_protocol::root::RootCommandResolveResult {
-        use kr_shell_integration::host::command::{InvocationContext, resolve};
+        use kr_protocol::root::CommandBypassReason;
+        use kr_shell_integration::host::command::{InvocationContext, Resolution, resolve};
 
+        if !self.state.accepts_input() {
+            // Nothing new is started inside a session that is closing or closed. The machine's own
+            // fence is gone by then and the phase it left behind says nothing about that, and a
+            // session that is still being created has no accepted line to run a command from.
+            return Resolution::Bypassed {
+                command: params.argv.first().cloned().unwrap_or_default(),
+                arguments: params.argv.clone(),
+                reason: CommandBypassReason::SessionClosing,
+            }
+            .to_answer(None);
+        }
         let context = InvocationContext {
             // The shell asking is this session's own registered root integration, and a session
             // that never claimed a managed editor never had one to ask through.
@@ -781,33 +821,79 @@ impl Session {
             context,
             &params.argv,
         );
-        let backend = resolution
-            .establishes_backend()
-            .then(|| self.establish_command_backend());
-        resolution.to_answer(backend)
+        if !resolution.establishes_backend() {
+            return resolution.to_answer(None);
+        }
+        match self.establish_command_backend(params.prompt_generation) {
+            Some(backend) => resolution.to_answer(Some(backend)),
+            None => Resolution::Bypassed {
+                command: params.argv.first().cloned().unwrap_or_default(),
+                arguments: params.argv.clone(),
+                reason: CommandBypassReason::BackendUnavailable,
+            }
+            .to_answer(None),
+        }
     }
 
     /// Establishes the worker-owned backend one integrated invocation runs behind.
     ///
-    /// It is this session's own private endpoint and the variable that names the session on it.
-    /// Both belong to the worker: the endpoint is owner-only, and the session identifier is a
-    /// candidate rather than an authority, which is what lets the host validate a child process's
-    /// local peer and its session binding before it accepts anything quoted from there.
-    fn establish_command_backend(&self) -> kr_protocol::root::CommandBackend {
-        let mut environment = vec![kr_protocol::session::EnvironmentVariable {
-            name: crate::environment::SESSION_VARIABLE.to_owned(),
-            value: self.config.session_id.to_string(),
-        }];
-        if let Some(endpoint) = self.config.worker_endpoint.as_ref() {
-            environment.push(kr_protocol::session::EnvironmentVariable {
-                name: crate::environment::WORKER_ENDPOINT_VARIABLE.to_owned(),
-                value: endpoint.clone(),
-            });
+    /// It is this session's own private endpoint, bound to one prompt generation and recorded as
+    /// the session's own. Both halves belong to the worker: the endpoint is owner-only, and the
+    /// session identifier is a candidate rather than an authority, which is what lets the host
+    /// validate a child process's local peer and its session binding before it accepts anything
+    /// quoted from there.
+    ///
+    /// `None` when this session has no endpoint to offer, which is a session opened without a
+    /// listener of its own.
+    fn establish_command_backend(
+        &mut self,
+        prompt_generation: kr_protocol::root::PromptGeneration,
+    ) -> Option<kr_protocol::root::CommandBackend> {
+        if let Some(existing) = self.command_backends.get(&prompt_generation) {
+            return Some(existing.clone());
         }
-        kr_protocol::root::CommandBackend {
+        let endpoint = self.config.worker_endpoint.clone()?;
+        let backend = kr_protocol::root::CommandBackend {
             session_id: self.config.session_id,
-            environment,
-        }
+            prompt_generation,
+            environment: vec![
+                kr_protocol::session::EnvironmentVariable {
+                    name: crate::environment::SESSION_VARIABLE.to_owned(),
+                    value: self.config.session_id.to_string(),
+                },
+                kr_protocol::session::EnvironmentVariable {
+                    name: crate::environment::WORKER_ENDPOINT_VARIABLE.to_owned(),
+                    value: endpoint,
+                },
+            ],
+        };
+        // Recorded before the answer goes out, so the binding is this session's own fact rather
+        // than something the answer asserts.
+        self.command_backends
+            .insert(prompt_generation, backend.clone());
+        Some(backend)
+    }
+
+    /// Releases the backend bound to one prompt generation.
+    ///
+    /// A command that has ended has nothing left to reach the session with, and a bridge that has
+    /// gone has ended every command it was reporting on.
+    fn release_command_backend(&mut self, prompt_generation: kr_protocol::root::PromptGeneration) {
+        self.command_backends.remove(&prompt_generation);
+    }
+
+    /// Releases every backend this session established.
+    pub fn release_command_backends(&mut self) {
+        self.command_backends.clear();
+    }
+
+    /// Gives up the endpoint this session offers a worker-owned backend on.
+    ///
+    /// A session with none establishes no backend, so an integrated invocation is answered as a
+    /// bypass rather than with flags nothing is listening behind.
+    pub fn forget_worker_endpoint(&mut self) {
+        self.config.worker_endpoint = None;
+        self.command_backends.clear();
     }
 
     /// Records one command block, keeping the most recent [`Self::RETAINED_COMMAND_BLOCKS`].
@@ -1482,14 +1568,14 @@ impl Session {
     /// Section 7 gives `kr detach` no identifier inside its own context, and section 23's editor
     /// fence is what makes that context a fact rather than a guess: the root integration records
     /// which attachment's input, under which epoch, the accepted line came from, and a command
-    /// running from that line detaches its own terminal. The recorded origin therefore wins, and
-    /// it is never whichever client holds the input lease by the time the command runs.
+    /// running from that line detaches its own terminal. The recorded origin is the whole answer,
+    /// and it is never whichever client holds the input lease by the time the command runs.
     ///
-    /// A managed session whose fence says the origin was mixed or could not be verified is
-    /// refused: there is a real answer and this host cannot name it. A session with no recorded
-    /// origin at all — no managed editor, or nothing accepted yet — falls back to its sole
-    /// terminal attachment, which is the only attachment a detach could mean, and refuses as soon
-    /// as there is more than one.
+    /// Everything else is refused. A mixed or unverifiable context has a real answer this host
+    /// cannot name; a session with no recorded origin at all is one the caller is outside, and
+    /// section 7 requires an explicit selector there. One remaining terminal is not proof that it
+    /// is the one the command came from: an outside caller would otherwise disconnect somebody
+    /// else's window by naming the session alone.
     ///
     /// # Errors
     ///
@@ -1497,61 +1583,53 @@ impl Session {
     pub fn detach_origin(&self) -> Result<AttachmentId> {
         use kr_shell_integration::contract::fence::{AmbiguityReason, DetachTarget};
 
-        if let Some(driver) = self.fence.as_ref() {
-            match driver.detach_target() {
-                DetachTarget::Attachment(attachment_id)
-                    if self.attachments.get(attachment_id).is_some() =>
-                {
-                    return Ok(attachment_id);
-                }
-                // The origin has already left. Nothing is owed to an attachment that has gone, and
-                // guessing a survivor would detach a window nobody asked about.
-                DetachTarget::Attachment(_) => {
-                    return Err(WorkerError::AmbiguousDetach {
-                        detail: "the attachment the root editor accepted this line from has \
-                                 already left, so name the one to detach with --attachment"
-                            .to_owned(),
-                    });
-                }
-                DetachTarget::Ambiguous(AmbiguityReason::MixedContext) => {
-                    return Err(WorkerError::AmbiguousDetach {
-                        detail: "the accepted line's input came from more than one attachment or \
-                                 epoch, so name the one to detach with --attachment"
-                            .to_owned(),
-                    });
-                }
-                DetachTarget::Ambiguous(AmbiguityReason::Unverifiable) => {
-                    return Err(WorkerError::AmbiguousDetach {
-                        detail: "there was no valid fence when this line was accepted, so its \
-                                 originating attachment cannot be established; name one with \
-                                 --attachment"
-                            .to_owned(),
-                    });
-                }
-                // Nothing has been accepted through a fenced context yet, so there is no origin to
-                // prefer and the sole-attachment rule below is the whole answer.
-                DetachTarget::Ambiguous(AmbiguityReason::NoAcceptedCommand) => {}
-            }
-        }
-        let terminals: Vec<AttachmentId> = self
-            .attachments
-            .summaries()
-            .into_iter()
-            .filter(|summary| summary.mode == kr_protocol::attachment::AttachMode::Terminal)
-            .map(|summary| summary.attachment_id)
-            .collect();
-        match terminals.as_slice() {
-            [only] => Ok(*only),
-            [] => Err(WorkerError::AmbiguousDetach {
-                detail: "this session has no terminal attachment to detach".to_owned(),
-            }),
-            many => Err(WorkerError::AmbiguousDetach {
+        let named = "name the one to detach with --attachment";
+        let Some(driver) = self.fence.as_ref() else {
+            return Err(WorkerError::AmbiguousDetach {
                 detail: format!(
-                    "this session has {} terminal attachments and no recorded origin; name one \
-                     with --attachment",
-                    many.len()
+                    "this session has no managed root editor, so it records no originating \
+                     attachment; {named}"
+                ),
+            });
+        };
+        match driver.detach_target() {
+            DetachTarget::Attachment(attachment_id)
+                if self.attachments.get(attachment_id).is_some() =>
+            {
+                Ok(attachment_id)
+            }
+            // The origin has already left. Nothing is owed to an attachment that has gone, and
+            // guessing a survivor would detach a window nobody asked about.
+            DetachTarget::Attachment(_) => Err(WorkerError::AmbiguousDetach {
+                detail: format!(
+                    "the attachment the root editor accepted this line from has already left; \
+                     {named}"
                 ),
             }),
+            DetachTarget::Ambiguous(AmbiguityReason::MixedContext) => {
+                Err(WorkerError::AmbiguousDetach {
+                    detail: format!(
+                        "the accepted line's input came from more than one attachment or epoch; \
+                         {named}"
+                    ),
+                })
+            }
+            DetachTarget::Ambiguous(AmbiguityReason::Unverifiable) => {
+                Err(WorkerError::AmbiguousDetach {
+                    detail: format!(
+                        "there was no valid fence when this line was accepted, so its originating \
+                         attachment cannot be established; {named}"
+                    ),
+                })
+            }
+            DetachTarget::Ambiguous(AmbiguityReason::NoAcceptedCommand) => {
+                Err(WorkerError::AmbiguousDetach {
+                    detail: format!(
+                        "this session's root editor has accepted no line, so there is no \
+                         originating attachment; {named}"
+                    ),
+                })
+            }
         }
     }
 
@@ -3486,6 +3564,9 @@ impl Session {
                     let effects = driver.session_closing();
                     let _ = self.apply_fence_effects(effects);
                 }
+                // The backends this session established go with it: a command that outlives the
+                // shell has nothing left to reach.
+                self.release_command_backends();
                 CloseAcceptance {
                     state: SessionState::Closing,
                     durability: self.durability(),

@@ -929,6 +929,14 @@ pub enum CommandBypassReason {
     UnmanagedShell,
     /// The invocation is a script rather than an interactive command.
     NotInteractive,
+    /// No worker-owned backend could be established, so the invocation runs as it was typed.
+    ///
+    /// Section 12 requires the backend to exist before the program does. A host that cannot
+    /// establish one does not add the integration flags either: an agent started with them and no
+    /// gateway behind them is worse than one started without them.
+    BackendUnavailable,
+    /// The session is closing, so nothing new is started inside it.
+    SessionClosing,
 }
 
 impl CommandBypassReason {
@@ -941,6 +949,8 @@ impl CommandBypassReason {
             Self::AbsolutePath => "absolute_path",
             Self::UnmanagedShell => "unmanaged_shell",
             Self::NotInteractive => "not_interactive",
+            Self::BackendUnavailable => "backend_unavailable",
+            Self::SessionClosing => "session_closing",
         }
     }
 }
@@ -956,6 +966,13 @@ impl CommandBypassReason {
 pub struct CommandBackend {
     /// The session the backend belongs to.
     pub session_id: SessionId,
+    /// The prompt generation it is bound to.
+    ///
+    /// One backend per accepted line. A second resolve for the same generation is answered with
+    /// the binding that already exists rather than with another one, and a generation that has
+    /// moved on has no binding at all: there is no route by which a program that is already
+    /// running acquires one.
+    pub prompt_generation: PromptGeneration,
     /// The variables the shell exports for this one invocation.
     ///
     /// They name this session and the worker's own private endpoint. A bypassed invocation is
@@ -972,6 +989,8 @@ pub struct CommandBackend {
 pub struct RootCommandResolveParams {
     /// The session.
     pub session_id: SessionId,
+    /// The prompt generation the line this invocation came from was accepted at.
+    pub prompt_generation: PromptGeneration,
     /// The invocation, split by the shell: the command name first, then its arguments.
     pub argv: Vec<String>,
     /// Whether this is an interactive invocation rather than a line of a script.

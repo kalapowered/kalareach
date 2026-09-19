@@ -1041,7 +1041,13 @@ export type FenceId = string
  * bypassed execution, with only verified observation and the terminal's own capabilities.
  */
 export type CommandBypassReason =
-  'not_integrated' | 'disabled' | 'absolute_path' | 'unmanaged_shell' | 'not_interactive'
+  | 'not_integrated'
+  | 'disabled'
+  | 'absolute_path'
+  | 'unmanaged_shell'
+  | 'not_interactive'
+  | 'backend_unavailable'
+  | 'session_closing'
 /**
  * What the worker tells the bridge about the fence.
  *
@@ -12763,6 +12769,10 @@ export interface RootCommandResolveParams {
    */
   interactive: boolean
   /**
+   * The prompt generation the line this invocation came from was accepted at.
+   */
+  prompt_generation: string
+  /**
    * One KalaReach terminal session.
    */
   session_id: string
@@ -12804,6 +12814,15 @@ export interface CommandBackend {
    * given none of them, which is what keeps its execution the one the person asked for.
    */
   environment: EnvironmentVariable[]
+  /**
+   * The prompt generation it is bound to.
+   *
+   * One backend per accepted line. A second resolve for the same generation is answered with
+   * the binding that already exists rather than with another one, and a generation that has
+   * moved on has no binding at all: there is no route by which a program that is already
+   * running acquires one.
+   */
+  prompt_generation: string
   /**
    * One KalaReach terminal session.
    */

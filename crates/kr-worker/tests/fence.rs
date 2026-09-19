@@ -358,11 +358,22 @@ async fn resolve_over(
     argv: &[&str],
     interactive: bool,
 ) -> kr_protocol::root::RootCommandResolveResult {
+    resolve_at(wired, PromptGeneration::new(1), argv, interactive).await
+}
+
+/// Asks the worker what one invocation resolves to, at one prompt generation.
+async fn resolve_at(
+    wired: &mut Wired,
+    prompt_generation: PromptGeneration,
+    argv: &[&str],
+    interactive: bool,
+) -> kr_protocol::root::RootCommandResolveResult {
     wired
         .bridge
         .send_event(BridgeEvent::CommandResolve(
             kr_protocol::root::RootCommandResolveParams {
                 session_id: wired.session_id,
+                prompt_generation,
                 argv: argv.iter().map(|word| (*word).to_owned()).collect(),
                 interactive,
             },
@@ -425,6 +436,14 @@ async fn wired_profiled(
     let environment_id = temp.environment_id();
     let mut config = configuration(&temp, mode);
     config.launch_profile = launch_profile;
+    // The endpoint this session answers on, which is what a worker-owned backend is. It is bound
+    // below, before anything reaches it.
+    config.worker_endpoint = Some(
+        environment
+            .worker_endpoint(DisplayNumber::new(1))
+            .expect("an endpoint")
+            .as_text(),
+    );
     let session_id = config.session_id;
     let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
     let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
@@ -1144,6 +1163,102 @@ fn installed_package() -> Option<kr_shell_integration::host::package::ShellPacka
 // KR-REQ-12.07, KR-REQ-25.05: the command hooks the private integration reports through.
 // --------------------------------------------------------------------------------------------
 
+/// KR-REQ-07.17: the bridge server compares the declaration against the package it launched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_bridge_that_declares_another_build_is_refused_on_the_real_endpoint() {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let config = configuration(&temp, ShellMode::Managed);
+    let session_id = config.session_id;
+    let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+    let host_endpoint = HostEndpoint::open_for_session(
+        environment.runtime_root(),
+        environment.runtime_dir(),
+        session_id,
+    )
+    .expect("binds the bridge");
+    let address = host_endpoint.address().clone();
+    let secret = host_endpoint.secret().clone();
+
+    let mut session = Session::open(config).expect("opens the session");
+    session.launch().expect("launches the shell");
+    session.install_fence(FenceDriver::new(
+        session_id,
+        LeaseView::unheld(InputLeaseEpoch::new(0)),
+        Arc::new(SystemContinuousClock::new()),
+    ));
+    let runtime = Arc::new(
+        SessionRuntime::start(
+            session,
+            std::sync::Arc::new(kr_ipc::clock::SystemSharedClock),
+        )
+        .expect("starts the runtime"),
+    );
+
+    // The reference bridge declares /bin/cat; this session launched a different build of the same
+    // shell, with the same editor ABI and the same integration version.
+    let declared = reference();
+    let expectation = WorkerExpectation {
+        session_id,
+        root_process: process.clone(),
+        supported_editor_abis: vec!["zle-5.9".to_owned()],
+        supported_integration_versions: vec!["1".to_owned()],
+        launched_package: Some(
+            kr_shell_integration::contract::transport::PackageDeclaration {
+                kind: ShellKind::Zsh,
+                executable: "/opt/kalareach/shells/zsh/another-build/bin/zsh".to_owned(),
+                upstream_version: "5.9".to_owned(),
+                editor_abi: "zle-5.9".to_owned(),
+                integration_version: "1".to_owned(),
+                patches: Vec::new(),
+                modules: Vec::new(),
+            },
+        ),
+        already_registered: false,
+        gesture: EofGesture::default(),
+    };
+    let bridge_task = tokio::spawn(
+        kr_worker::fence::bridge::BridgeServer::new(
+            Arc::clone(&runtime),
+            host_endpoint,
+            expectation,
+        )
+        .serve(),
+    );
+
+    let hello =
+        qualified_hello(&declared, session_id, &address, process, &secret).expect("a hello");
+    let (_bridge, outcome) = tokio::time::timeout(SOON, ScriptedBridge::connect(&address, &hello))
+        .await
+        .expect("the worker answered")
+        .expect("connects");
+    match outcome {
+        HandshakeOutcome::Refused(refusal) => {
+            assert_eq!(
+                refusal.reason,
+                kr_shell_integration::contract::qualification::QualificationReason::PackageMismatch
+            );
+            assert_eq!(refusal.error.code, ErrorCode::PermissionDenied);
+        }
+        HandshakeOutcome::Accepted(_) => {
+            panic!("a declaration of another build is not this session's package")
+        }
+    }
+    assert!(
+        runtime
+            .session()
+            .fence()
+            .expect("a driver")
+            .phase()
+            .shell()
+            .is_none(),
+        "and nothing is registered"
+    );
+    runtime.close(ClosureReason::CloseRequested).1.release();
+    let _ = tokio::time::timeout(Duration::from_secs(30), runtime.wait_closed()).await;
+    bridge_task.abort();
+}
+
 /// KR-REQ-12.07: an enabled integration adds its flags and the backend exists before the command.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_enabled_integration_adds_its_flags_and_hands_back_a_backend() {
@@ -1175,6 +1290,7 @@ async fn an_enabled_integration_adds_its_flags_and_hands_back_a_backend() {
     assert!(resolved.bypass.0.is_none());
     let backend = resolved.backend.0.expect("a worker-owned backend");
     assert_eq!(backend.session_id, wired.session_id);
+    assert_eq!(backend.prompt_generation, PromptGeneration::new(1));
     assert!(
         backend
             .environment
@@ -1182,6 +1298,64 @@ async fn an_enabled_integration_adds_its_flags_and_hands_back_a_backend() {
             .any(|variable| variable.name == "KR_SESSION"),
         "the backend names the session the gateway belongs to"
     );
+    assert!(
+        backend
+            .environment
+            .iter()
+            .any(|variable| variable.name == "KR_WORKER_ENDPOINT"),
+        "and the endpoint it reaches this session on"
+    );
+
+    // The same line asked twice is one binding, not two: nothing here makes a second gateway for
+    // a program that is already running.
+    let again = resolve_at(&mut wired, PromptGeneration::new(1), &["codex"], true).await;
+    assert_eq!(again.backend.0.expect("the same binding"), backend);
+
+    // A session that is closing starts nothing new, whatever its integration last reported.
+    wired
+        .runtime
+        .session()
+        .begin_close(ClosureReason::CloseRequested);
+    let refused = resolve_at(&mut wired, PromptGeneration::new(2), &["codex"], true).await;
+    assert_eq!(
+        refused.bypass.0,
+        Some(kr_protocol::root::CommandBypassReason::SessionClosing)
+    );
+    assert!(refused.backend.0.is_none());
+    assert_eq!(refused.arguments, vec!["codex".to_owned()]);
+    wired.close().await;
+}
+
+/// KR-REQ-12.07: an integration the host cannot put a backend behind adds no flags.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_integration_with_no_backend_behind_it_runs_the_invocation_as_typed() {
+    let mut wired = wired_profiled(
+        ShellMode::Managed,
+        true,
+        kr_protocol::session::LaunchProfile {
+            command_integrations: vec![kr_protocol::session::CommandIntegration {
+                command: "codex".to_owned(),
+                flags: vec!["--kr-gateway".to_owned()],
+                enabled: true,
+            }],
+            ..kr_protocol::session::LaunchProfile::default()
+        },
+    )
+    .await;
+    // A session with no endpoint of its own has nothing to put behind an integrated invocation.
+    wired.runtime.session().forget_worker_endpoint();
+    let resolved = resolve_over(&mut wired, &["codex"], true).await;
+    assert_eq!(
+        resolved.bypass.0,
+        Some(kr_protocol::root::CommandBypassReason::BackendUnavailable)
+    );
+    assert_eq!(
+        resolved.arguments,
+        vec!["codex".to_owned()],
+        "an agent started with the flags and no gateway behind them is worse off than one without"
+    );
+    assert!(resolved.added.is_empty());
+    assert!(resolved.backend.0.is_none());
     wired.close().await;
 }
 
@@ -1562,6 +1736,23 @@ async fn a_detach_that_names_nothing_is_refused_when_the_origin_was_mixed() {
         .expect("connects");
     let holder = holder_over(&mut client, &wired).await;
     let _ = holder;
+
+    // Before any line has been accepted there is no origin, and one remaining terminal is not
+    // proof that it is the one a command would have come from.
+    let refused = client
+        .mutate(
+            Method::SessionDetach,
+            ActionId::new(kr_ipc::new_uuid()),
+            wired.target(),
+            &kr_protocol::attachment::SessionDetachParams {
+                attachment_id: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("a session that has accepted no line names no originating attachment");
+    assert_eq!(refused.code, ErrorCode::AmbiguousAttachment);
+
     let fence = fenced(&mut wired, 1, 1).await;
     wired
         .bridge

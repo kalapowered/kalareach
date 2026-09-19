@@ -321,7 +321,12 @@ pub struct Controller {
     release: String,
     /// Where this host's qualified shell packages are, when it keeps them somewhere of its own.
     shell_packages: Option<PathBuf>,
-    terminal: Box<dyn crate::supervision::TerminalPresenter>,
+    terminal: Arc<dyn crate::supervision::TerminalPresenter>,
+    /// What came of each session's local presentation, for a create token asked twice.
+    ///
+    /// A replayed create must not open a second window, and it must not claim the first one
+    /// opened. Bounded by the sessions this host has: an entry goes when its worker is retired.
+    presentations: Mutex<std::collections::HashMap<SessionId, Option<ProtocolError>>>,
     started_at_ms: TimestampMs,
     /// The desktop this host has, as last read, and the capability revision that reading is
     /// evidence for.
@@ -528,7 +533,8 @@ impl Controller {
             release: setup.release,
             started_at_ms,
             shell_packages: setup.shell_packages,
-            terminal: setup.terminal,
+            terminal: Arc::from(setup.terminal),
+            presentations: Mutex::new(std::collections::HashMap::new()),
             desktop: Mutex::new(DesktopReading {
                 context: crate::desktop::current(boot.clone()),
                 revision: recorded_revision.unwrap_or_else(|| CapabilityRevision::new(0)),
@@ -2090,14 +2096,11 @@ impl Controller {
                 "this reservation has no recorded create request, so nothing can be launched from it",
             )
         })?;
-        let create: SessionCreateParams =
-            kr_cbor::from_canonical_slice(recorded, &kr_cbor::Limits::DEFAULT).map_err(
-                |error| {
-                    ControllerError::registry(format!(
-                        "the recorded create request cannot be read: {error}"
-                    ))
-                },
-            )?;
+        let create = recorded_create(recorded).map_err(|error| {
+            ControllerError::registry(format!(
+                "the recorded create request cannot be read: {error}"
+            ))
+        })?;
 
         // The package this worker will launch is resolved here, by the daemon, against the
         // package root the daemon is configured with. The worker is told which directory to read
@@ -2167,17 +2170,19 @@ impl Controller {
         // The profile is the one the create request recorded, not a default: it decides what a
         // logout does to this session, and a record that said otherwise would promise the wrong
         // lifetime.
-        let profile = reservation
-            .create_intent
-            .as_deref()
-            .and_then(|recorded| {
-                kr_cbor::from_canonical_slice::<SessionCreateParams>(
-                    recorded,
-                    &kr_cbor::Limits::DEFAULT,
-                )
-                .ok()
-            })
-            .map_or(WorkerProfile::HeadlessUser, |create| create.worker_profile);
+        let recorded = reservation.create_intent.as_deref().ok_or_else(|| {
+            ControllerError::rendezvous(
+                "this reservation has no recorded create request, so the session it would publish \
+                 has no recorded execution context",
+            )
+        })?;
+        let profile = recorded_create(recorded)
+            .map_err(|error| {
+                ControllerError::registry(format!(
+                    "the recorded create request cannot be read: {error}"
+                ))
+            })?
+            .worker_profile;
         let record = WorkerRecord {
             session_id: reservation.session_id,
             display_number: reservation.display_number,
@@ -4696,7 +4701,7 @@ impl Controller {
         // host that cannot open one answers with the session it made and the reason. Nothing here
         // creates a second session, and a repeated create token never reaches this line, so a
         // retry cannot open a second window either.
-        let presentation_error = self.present(&create, reservation.session_id);
+        let presentation_error = self.present(&create, reservation.session_id).await;
         encode(&SessionCreateResult {
             session: summary,
             endpoint: Nullable::some(ready.endpoint),
@@ -4713,11 +4718,11 @@ impl Controller {
     /// the session's own identifier and environment, never on a display number: two environments
     /// can each have a session one, and a window opened on the number would attach to whichever
     /// the command happened to resolve.
-    fn present(
+    async fn present(
         &self,
         create: &SessionCreateParams,
         session_id: SessionId,
-    ) -> Option<kr_protocol::error::ProtocolError> {
+    ) -> Option<ProtocolError> {
         if create.presentation != kr_protocol::session::Presentation::Terminal {
             return None;
         }
@@ -4728,10 +4733,56 @@ impl Controller {
             "--environment".to_owned(),
             create.environment_id.to_string(),
         ];
-        self.terminal
-            .present(create.terminal.0.as_deref(), &command)
-            .err()
-            .map(|unavailable| unavailable.to_protocol_error())
+        let terminal = Arc::clone(&self.terminal);
+        let requested = create.terminal.0.clone();
+        // Opening a window starts a process and waits a bounded moment on it, which is work for a
+        // thread that may block rather than for the runtime this daemon serves every other client
+        // on.
+        let outcome = tokio::task::spawn_blocking(move || {
+            terminal.present(requested.as_deref(), &command).err()
+        })
+        .await
+        .unwrap_or_else(|error| {
+            Some(
+                kr_shell_integration::host::terminal::TerminalUnavailable::CouldNotOpen {
+                    application: "the selected terminal".to_owned(),
+                    detail: error.to_string(),
+                },
+            )
+        })
+        .map(|unavailable| unavailable.to_protocol_error());
+        // Retained so a create token asked twice is answered with what happened rather than with
+        // a second window or a claim that the first one opened.
+        self.presentations
+            .lock()
+            .await
+            .insert(session_id, outcome.clone());
+        outcome
+    }
+
+    /// Returns what a replayed create says about its session's presentation.
+    ///
+    /// The outcome this host retained, where it has one. Where it has none the create was admitted
+    /// by a daemon that has since been replaced, and whether a window opened is not something this
+    /// one can establish: it says so rather than opening a second one or claiming the first.
+    async fn replayed_presentation(
+        &self,
+        create: Option<&SessionCreateParams>,
+        session_id: SessionId,
+    ) -> Option<ProtocolError> {
+        if create.is_none_or(|create| {
+            create.presentation != kr_protocol::session::Presentation::Terminal
+        }) {
+            return None;
+        }
+        match self.presentations.lock().await.get(&session_id) {
+            Some(outcome) => outcome.clone(),
+            None => Some(ProtocolError::new(
+                ErrorCode::OutcomeUnknown,
+                "this host did not admit the create this token replays, so whether its terminal \
+                 window opened is not something it can say",
+            )),
+        }
     }
 
     /// Returns the client executable a terminal window runs.
@@ -4850,13 +4901,22 @@ impl Controller {
             .await
             .get(reservation.session_id)
             .cloned();
+        // What the first attempt asked for, which is what says whether a window was ever part of
+        // this create. A record this build cannot read says nothing about a presentation.
+        let requested = reservation
+            .create_intent
+            .as_deref()
+            .and_then(|recorded| recorded_create(recorded).ok());
         if let Some(worker) = worker {
             let summary = self.read_from_worker(&worker).await?.session;
             return encode(&SessionCreateResult {
                 session: summary,
                 endpoint: Nullable::some(worker.endpoint.as_text()),
                 deduplicated: true,
-                presentation_error: Nullable::null(),
+                presentation_error: Nullable(
+                    self.replayed_presentation(requested.as_ref(), reservation.session_id)
+                        .await,
+                ),
             });
         }
         let registry = self.registry.lock().await;
@@ -4870,8 +4930,10 @@ impl Controller {
                 // A closed session has no endpoint to attach to, which the reply says rather than
                 // handing back a path that leads nowhere.
                 endpoint: Nullable::null(),
-                deduplicated: true,
+                // A closed session has no window either way, so there is no presentation to
+                // report on: what the caller is owed here is the closure record.
                 presentation_error: Nullable::null(),
+                deduplicated: true,
             }),
             None => Err(ControllerError::supervision(format!(
                 "this create token is already recorded as {} and its worker is not available",
@@ -5544,6 +5606,9 @@ impl Controller {
         // asked about, still counted as work outstanding, and still answered for.
         self.directory.lock().await.remove(record.session_id);
         self.connections.lock().await.remove(&record.session_id);
+        // A closed session has no window to report on, and a create token that replays one is
+        // answered from the closure record.
+        self.presentations.lock().await.remove(&record.session_id);
         // The barrier is told before the record is gone. A worker that has ended satisfies the
         // barrier, and the barrier keeps a participant it has ever heard of: without this, a
         // retired worker would stay pending for every later revocation, because nothing would be
@@ -5776,6 +5841,70 @@ pub struct ControllerSetup {
     /// somewhere else, so the presentation is its work. A host that opens nothing says so with
     /// [`NoTerminal`](crate::supervision::NoTerminal).
     pub terminal: Box<dyn crate::supervision::TerminalPresenter>,
+}
+
+/// Reads the create request a reservation recorded.
+///
+/// A reservation outlives the request that made it: its row is written before the worker starts
+/// and is still there while the session is live, so a daemon that was replaced part-way through an
+/// upgrade reads rows an earlier build wrote. A row recorded before this build's launch profile and
+/// terminal selection existed is read through [`RecordedCreate`] and given the defaults those two
+/// fields have, which is exactly what that session was created with.
+///
+/// Remove `RecordedCreate` and this fallback once no reservation recorded before the launch
+/// profile existed can still be in a registry: every environment that upgraded across it has to
+/// have closed the sessions it had open at the time, which one full restart does.
+///
+/// # Errors
+///
+/// Returns the decoding failure when the record is neither shape.
+fn recorded_create(recorded: &[u8]) -> std::result::Result<SessionCreateParams, String> {
+    match kr_cbor::from_canonical_slice::<SessionCreateParams>(recorded, &kr_cbor::Limits::DEFAULT)
+    {
+        Ok(create) => Ok(create),
+        Err(error) => match kr_cbor::from_canonical_slice::<RecordedCreate>(
+            recorded,
+            &kr_cbor::Limits::DEFAULT,
+        ) {
+            Ok(legacy) => Ok(legacy.into()),
+            // The row is neither shape, so it is reported as the record this build cannot read
+            // rather than as a legacy row.
+            Err(_) => Err(error.to_string()),
+        },
+    }
+}
+
+/// A create request as a build before the launch profile recorded it.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordedCreate {
+    environment_id: EnvironmentId,
+    presentation: kr_protocol::session::Presentation,
+    shell: Nullable<String>,
+    shell_mode: kr_protocol::session::ShellMode,
+    cwd: Nullable<String>,
+    dimensions: Nullable<kr_protocol::session::Dimensions>,
+    worker_profile: WorkerProfile,
+    environment_snapshot: Vec<kr_protocol::session::EnvironmentVariable>,
+    palette: Nullable<kr_protocol::session::PaletteRequest>,
+}
+
+impl From<RecordedCreate> for SessionCreateParams {
+    fn from(recorded: RecordedCreate) -> Self {
+        Self {
+            environment_id: recorded.environment_id,
+            presentation: recorded.presentation,
+            shell: recorded.shell,
+            shell_mode: recorded.shell_mode,
+            cwd: recorded.cwd,
+            dimensions: recorded.dimensions,
+            worker_profile: recorded.worker_profile,
+            environment_snapshot: recorded.environment_snapshot,
+            palette: recorded.palette,
+            launch_profile: kr_protocol::session::LaunchProfile::default(),
+            terminal: Nullable::null(),
+        }
+    }
 }
 
 fn closed_summary(
@@ -6146,6 +6275,42 @@ mod a_create_that_launches_nothing {
         fn describe(&self) -> String {
             "a supervisor that records every launch and starts nothing".to_owned()
         }
+    }
+
+    /// A reservation recorded before the launch profile existed still names its session's context.
+    #[test]
+    fn a_create_request_recorded_by_an_earlier_build_is_read_with_the_defaults() {
+        use kr_protocol::session::{LaunchProfile, Presentation, ShellMode};
+
+        let environment_id =
+            kr_protocol::ids::EnvironmentId::new(kr_protocol::scalars::Uuid::from_bytes([3; 16]));
+        let legacy = super::RecordedCreate {
+            environment_id,
+            presentation: Presentation::Terminal,
+            shell: Nullable::some("zsh".to_owned()),
+            shell_mode: ShellMode::Managed,
+            cwd: Nullable::some("/work".to_owned()),
+            dimensions: Nullable::null(),
+            worker_profile: kr_protocol::identity::WorkerProfile::DesktopBound,
+            environment_snapshot: Vec::new(),
+            palette: Nullable::null(),
+        };
+        let recorded = kr_cbor::to_canonical_vec(&legacy).expect("encodes");
+        let read =
+            super::recorded_create(&recorded).expect("an earlier build's record still reads");
+        assert_eq!(
+            read.worker_profile,
+            kr_protocol::identity::WorkerProfile::DesktopBound,
+            "the execution context is the one that was recorded, never a substituted default"
+        );
+        assert_eq!(read.presentation, Presentation::Terminal);
+        assert_eq!(read.launch_profile, LaunchProfile::default());
+        assert!(read.terminal.0.is_none());
+
+        // This build's own shape reads as itself, and a record that is neither is refused.
+        let current = kr_cbor::to_canonical_vec(&create_params(environment_id)).expect("encodes");
+        assert!(super::recorded_create(&current).is_ok());
+        assert!(super::recorded_create(b"not a record").is_err());
     }
 
     fn create_params(environment_id: kr_protocol::ids::EnvironmentId) -> SessionCreateParams {

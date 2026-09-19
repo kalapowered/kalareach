@@ -149,7 +149,11 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
             shell_packages: None,
             // The daemon is this host's local presenter: a session created here or on a paired
             // device can ask for a local tab, and the daemon is the only party that can open one.
-            terminal: Box::new(kr_controller::supervision::InstalledTerminals),
+            terminal: Box::new(
+                kr_controller::supervision::InstalledTerminals::in_environment(
+                    environment.state_dir().to_path_buf(),
+                ),
+            ),
         })
         .await?;
 

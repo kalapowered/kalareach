@@ -95,6 +95,50 @@ impl TerminalUnavailable {
     }
 }
 
+/// The file an environment's saved terminal preference is kept in, inside its state directory.
+pub const PREFERENCE_FILE: &str = "terminal.json";
+
+/// The key the preference is written under.
+pub const PREFERENCE_KEY: &str = "terminal";
+
+/// The longest preference file this host reads.
+///
+/// The document holds one identifier. A file larger than this is not one of ours, and reading it
+/// would be reading something else.
+pub const PREFERENCE_MAX_LEN: u64 = 4_096;
+
+/// Returns the terminal an environment's saved preference names.
+///
+/// Anything this build does not recognise reads as no preference: a document it cannot parse, a
+/// key it does not know, a value that is not a string. A file this build cannot read is not a
+/// choice, and detection decides instead.
+#[must_use]
+pub fn parse_preference(contents: &[u8]) -> Option<String> {
+    let document = serde_json::from_slice::<serde_json::Value>(contents).ok()?;
+    let chosen = document.get(PREFERENCE_KEY)?.as_str()?.trim();
+    (!chosen.is_empty()).then(|| chosen.to_owned())
+}
+
+/// Returns the document that records one terminal preference.
+#[must_use]
+pub fn preference_document(id: &str) -> String {
+    serde_json::json!({ PREFERENCE_KEY: id }).to_string()
+}
+
+/// Reads the terminal preference saved in an environment's state directory.
+///
+/// No file, an unreadable one, a file longer than [`PREFERENCE_MAX_LEN`] and a document this build
+/// does not understand all read as no preference.
+#[must_use]
+pub fn saved_preference(state_dir: &std::path::Path) -> Option<String> {
+    let file = state_dir.join(PREFERENCE_FILE);
+    let length = std::fs::metadata(&file).ok()?.len();
+    if length > PREFERENCE_MAX_LEN {
+        return None;
+    }
+    parse_preference(&std::fs::read(&file).ok()?)
+}
+
 /// Chooses the terminal a presented session opens in.
 ///
 /// The order is the specification's, and it is a preference order rather than a fallback chain in
@@ -141,11 +185,23 @@ pub fn select(
         .ok_or(TerminalUnavailable::NoneAvailable)
 }
 
+/// How long a launcher is given to say it could not open a window.
+///
+/// A window opens by a process this host starts and does not wait for, so what a bounded wait
+/// establishes is the failure rather than the success: a launcher that has already exited with a
+/// status means no window appeared, and one still running means it accepted the request. The bound
+/// is short because the answer belongs to the create reply that is waiting for it.
+#[cfg(not(target_vendor = "apple"))]
+const LAUNCH_ACKNOWLEDGEMENT: std::time::Duration = std::time::Duration::from_millis(750);
+
 /// Opens the chosen terminal application on a command.
 ///
 /// The command is an argument vector, never a command line: nothing here is assembled by
 /// interpolating text, and the one platform whose launcher re-parses what it is given quotes every
 /// word of it before handing it over.
+///
+/// This blocks: it starts a process and waits a bounded moment for a launcher that refuses. Call
+/// it off an asynchronous runtime's own thread.
 ///
 /// # Errors
 ///
@@ -153,23 +209,33 @@ pub fn select(
 /// appeared.
 #[cfg(target_vendor = "apple")]
 pub fn open(selection: &Selection, command: &[String]) -> Result<(), TerminalUnavailable> {
-    // `do script` hands its text to a shell, so every word of it is quoted here. The identifiers
-    // are the host's own and the path is an executable's, but quoting a path that happens to
-    // contain a space is not optional and neither is doing it in one place.
+    // Each application's own scripting command. iTerm2 makes a window from a profile and runs the
+    // command in it; Terminal takes `do script`. Neither is a substitute for the other, and the
+    // selection above already decided which one this is.
+    //
+    // Both hand their text to a shell, so every word of it is quoted here. The identifiers are the
+    // host's own and the path is an executable's, but quoting a path that happens to contain a
+    // space is not optional and neither is doing it in one place.
     let line = command
         .iter()
         .map(|word| shell_quoted(word))
         .collect::<Vec<_>>()
         .join(" ");
-    let application = match selection.application.id.as_str() {
-        "iterm2" => "iTerm",
-        _ => "Terminal",
+    let quoted = line.replace('\\', "\\\\").replace('"', "\\\"");
+    let script = match selection.application.id.as_str() {
+        "iterm2" => format!(
+            "tell application \"iTerm\"\n\
+             \tactivate\n\
+             \tcreate window with default profile command \"{quoted}\"\n\
+             end tell"
+        ),
+        _ => format!(
+            "tell application \"Terminal\"\n\
+             \tactivate\n\
+             \tdo script \"{quoted}\"\n\
+             end tell"
+        ),
     };
-    let script = format!(
-        "tell application \"{application}\" to activate\n\
-         tell application \"{application}\" to do script \"{}\"",
-        line.replace('\\', "\\\\").replace('"', "\\\"")
-    );
     let started = std::process::Command::new("/usr/bin/osascript")
         .arg("-e")
         .arg(&script)
@@ -197,7 +263,46 @@ fn shell_quoted(word: &str) -> String {
     format!("'{}'", word.replace('\'', "'\\''"))
 }
 
+/// Waits a bounded moment for a launcher that refuses the request.
+///
+/// A launcher that opens a window goes on running, so this returns as soon as the bound passes. A
+/// launcher that cannot — no display, a refused connection to the session bus — exits with a
+/// status within that bound, and that status is the failure the caller reports.
+#[cfg(not(target_vendor = "apple"))]
+fn acknowledged(
+    mut child: std::process::Child,
+    application: &str,
+) -> Result<(), TerminalUnavailable> {
+    let deadline = std::time::Instant::now() + LAUNCH_ACKNOWLEDGEMENT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(TerminalUnavailable::CouldNotOpen {
+                    application: application.to_owned(),
+                    detail: format!("the launcher ended with {status}"),
+                });
+            }
+            // Still running, which is what a window that opened looks like.
+            Ok(None) => {}
+            Err(error) => {
+                return Err(TerminalUnavailable::CouldNotOpen {
+                    application: application.to_owned(),
+                    detail: error.to_string(),
+                });
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
 /// Opens the chosen terminal application on a command.
+///
+/// This blocks: it starts a process and waits a bounded moment for a launcher that refuses. Call
+/// it off an asynchronous runtime's own thread.
 ///
 /// # Errors
 ///
@@ -213,19 +318,24 @@ pub fn open(selection: &Selection, command: &[String]) -> Result<(), TerminalUna
     };
     let mut arguments = vec![separator.to_owned()];
     arguments.extend_from_slice(command);
-    std::process::Command::new(&selection.application.id)
+    let child = std::process::Command::new(&selection.application.id)
         .args(&arguments)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map(|_| ())
         .map_err(|error| TerminalUnavailable::CouldNotOpen {
             application: selection.application.name.clone(),
             detail: error.to_string(),
-        })
+        })?;
+    // Starting is not opening: an installed terminal with no display to open on starts and then
+    // exits, and the create reply would otherwise say a window appeared.
+    acknowledged(child, &selection.application.name)
 }
 
 /// Opens the chosen terminal application on a command.
+///
+/// This blocks: it starts a process and waits a bounded moment for a launcher that refuses. Call
+/// it off an asynchronous runtime's own thread.
 ///
 /// # Errors
 ///
@@ -240,15 +350,15 @@ pub fn open(selection: &Selection, command: &[String]) -> Result<(), TerminalUna
     let mut process = std::process::Command::new(program);
     process.args(prefix);
     process.args(command);
-    process
+    let child = process
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
-        .map(|_| ())
         .map_err(|error| TerminalUnavailable::CouldNotOpen {
             application: selection.application.name.clone(),
             detail: error.to_string(),
-        })
+        })?;
+    acknowledged(child, &selection.application.name)
 }
 
 /// Returns the terminals this host has, in the platform's own preference order.
@@ -387,6 +497,21 @@ mod tests {
         let chosen = select(None, Some("kitty"), &applications()).expect("chosen");
         assert_eq!(chosen.source, Source::Detected);
         assert_eq!(chosen.application.id, "iterm2");
+    }
+
+    /// KR-REQ-07.31: the saved preference is a document, and only a document this build reads.
+    #[test]
+    fn a_saved_preference_is_read_from_its_own_document() {
+        assert_eq!(
+            parse_preference(preference_document("iterm2").as_bytes()).as_deref(),
+            Some("iterm2")
+        );
+        // Anything this build does not recognise is the absence of a choice, and detection
+        // decides instead.
+        assert_eq!(parse_preference(b"not a document"), None);
+        assert_eq!(parse_preference(br#"{"terminal": ""}"#), None);
+        assert_eq!(parse_preference(br#"{"terminal": 7}"#), None);
+        assert_eq!(parse_preference(br#"{"something": "iterm2"}"#), None);
     }
 
     #[test]

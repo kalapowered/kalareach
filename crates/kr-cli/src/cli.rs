@@ -111,6 +111,20 @@ pub struct HostArguments {
 pub enum HostCommand {
     /// Show or change whether this host keeps itself awake for work it has admitted.
     Power(PowerArguments),
+    /// Show the terminal applications this host has, and which one a new window opens in.
+    Terminal(TerminalArguments),
+}
+
+/// `kr host terminal`.
+#[derive(Debug, Args)]
+pub struct TerminalArguments {
+    /// The application to prefer, by its identifier. Without it, what this host has and what it
+    /// prefers are shown and nothing changes.
+    #[arg(long)]
+    pub set: Option<String>,
+    /// Go back to letting this host choose for itself.
+    #[arg(long, conflicts_with = "set")]
+    pub clear: bool,
 }
 
 /// `kr host power`.
@@ -604,7 +618,9 @@ mod tests {
         let Command::Host(arguments) = parsed.command else {
             panic!("host");
         };
-        let HostCommand::Power(power) = arguments.command;
+        let HostCommand::Power(power) = arguments.command else {
+            panic!("power");
+        };
         assert!(power.set.is_none(), "showing the setting changes nothing");
 
         let parsed =
@@ -612,8 +628,38 @@ mod tests {
         let Command::Host(arguments) = parsed.command else {
             panic!("host");
         };
-        let HostCommand::Power(power) = arguments.command;
+        let HostCommand::Power(power) = arguments.command else {
+            panic!("power");
+        };
         assert_eq!(power.set.as_deref(), Some("mains_only"));
+    }
+
+    /// KR-REQ-07.31: the saved preference is the middle step of the selection order.
+    #[test]
+    fn the_terminal_preference_is_shown_set_and_cleared() {
+        let parsed = Cli::try_parse_from(["kr", "host", "terminal"]).expect("parses");
+        let Command::Host(arguments) = parsed.command else {
+            panic!("host");
+        };
+        let HostCommand::Terminal(terminal) = arguments.command else {
+            panic!("terminal");
+        };
+        assert!(terminal.set.is_none() && !terminal.clear);
+
+        let parsed =
+            Cli::try_parse_from(["kr", "host", "terminal", "--set", "iterm2"]).expect("parses");
+        let Command::Host(arguments) = parsed.command else {
+            panic!("host");
+        };
+        let HostCommand::Terminal(terminal) = arguments.command else {
+            panic!("terminal");
+        };
+        assert_eq!(terminal.set.as_deref(), Some("iterm2"));
+
+        assert!(
+            Cli::try_parse_from(["kr", "host", "terminal", "--set", "iterm2", "--clear"]).is_err(),
+            "naming one and clearing it are not one request"
+        );
     }
 
     #[test]

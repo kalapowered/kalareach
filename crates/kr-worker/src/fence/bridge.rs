@@ -80,7 +80,6 @@ impl BridgeServer {
                     .is_some_and(|driver| driver.phase().shell().is_some())
             };
             let expectation = WorkerExpectation {
-                launched_package: None,
                 already_registered: already,
                 ..self.expectation.clone()
             };

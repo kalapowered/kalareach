@@ -30,15 +30,11 @@ use kr_protocol::hello::PROTOCOL_VERSION;
 use kr_protocol::ids::{BuildId, EnvironmentId, SessionEpoch, SessionId};
 use kr_protocol::local::{LocalClientKind, LocalHello};
 use kr_protocol::scalars::Uuid;
-use kr_protocol::session::{
-    ClosureReason, DisplayNumber, Presentation, SessionCreateParams, ShellMode,
-};
+use kr_protocol::session::{ClosureReason, DisplayNumber, SessionCreateParams, ShellMode};
 use kr_protocol::worker::{ReservationId, WorkerLaunchSpec, WorkerReady};
 use kr_shell_integration::host::HostError;
 use kr_shell_integration::host::endpoint::HostEndpoint;
-use kr_shell_integration::host::package::{
-    PackageFault, PackageSet, ShellPackage, StartupMode, default_package_root,
-};
+use kr_shell_integration::host::package::{PackageFault, ShellPackage, StartupMode};
 use kr_worker::environment::{ExecutionContext, build as build_environment};
 use kr_worker::history::DEFAULT_RESIDENT_BYTES;
 use kr_worker::output::DEFAULT_SEND_QUEUE_BYTES;
@@ -413,14 +409,16 @@ fn managed_package(specification: &WorkerLaunchSpec) -> Result<Option<ShellPacka
     // the package it was admitted against: a worker whose own environment names a different root
     // would otherwise resolve a second time and could launch a different build, or a different
     // shell entirely.
-    if let Some(directory) = specification.shell_package.as_ref() {
-        return ShellPackage::read(std::path::Path::new(directory)).map(Some);
-    }
-    let installed = PackageSet::installed(&default_package_root())?;
-    installed
-        .select(specification.create.shell.0.as_deref())
-        .cloned()
-        .map(Some)
+    let directory =
+        specification
+            .shell_package
+            .as_ref()
+            .ok_or_else(|| PackageFault::Unreadable {
+                path: String::new(),
+                detail: "this managed launch names no shell package, so there is nothing to launch"
+                    .to_owned(),
+            })?;
+    ShellPackage::read(std::path::Path::new(directory)).map(Some)
 }
 
 /// Binds this session's root-integration endpoint inside its own owner-only directory.
@@ -510,7 +508,7 @@ fn session_config(
             // startup files that shell reads is the session's own decision, so the profile decides
             // it and the package answers for that mode.
             arguments: package.map_or_else(
-                || interactive_arguments(&shell_path, create.presentation),
+                || interactive_arguments(&shell_path, startup_mode(&create.launch_profile)),
                 |package| package.arguments(startup_mode(&create.launch_profile)),
             ),
             program: shell_path,
@@ -552,20 +550,37 @@ const fn startup_mode(profile: &kr_protocol::session::LaunchProfile) -> StartupM
 /// The arguments belong to the shell, not to the platform. A PowerShell given `-l -i` would treat
 /// them as a script path and a parameter and fail; a Bourne-family shell given `-NoLogo` would do
 /// the same in reverse.
-fn interactive_arguments(shell_path: &str, _presentation: Presentation) -> Vec<String> {
+fn interactive_arguments(shell_path: &str, mode: StartupMode) -> Vec<String> {
     let name = std::path::Path::new(shell_path)
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or(shell_path)
         .to_ascii_lowercase();
     let name = name.strip_suffix(".exe").unwrap_or(&name);
+    let login = mode == StartupMode::Login;
     match name {
-        "fish" => vec!["--interactive".to_owned()],
+        "fish" => {
+            let mut arguments = Vec::new();
+            if login {
+                arguments.push("--login".to_owned());
+            }
+            arguments.push("--interactive".to_owned());
+            arguments
+        }
+        // PowerShell reads its profile whichever way it starts, and has no login form to ask for.
         "pwsh" | "powershell" => vec!["-NoLogo".to_owned(), "-NoExit".to_owned()],
         "cmd" => vec!["/K".to_owned()],
         // A login shell reads the profile that sets the user's own path and prompt, which is what
-        // makes the first prompt look like the one they get anywhere else.
-        _ => vec!["-l".to_owned(), "-i".to_owned()],
+        // makes the first prompt look like the one they get anywhere else. Whether it does is the
+        // session's profile to decide, exactly as it is for a packaged shell.
+        _ => {
+            let mut arguments = Vec::new();
+            if login {
+                arguments.push("-l".to_owned());
+            }
+            arguments.push("-i".to_owned());
+            arguments
+        }
     }
 }
 
@@ -644,6 +659,36 @@ mod tests {
         assert_eq!(
             startup_mode(&profile(ShellStartup::Login)),
             StartupMode::Login
+        );
+    }
+
+    /// KR-REQ-23.38: a stock shell reads the startup files the profile asks for, like a packaged
+    /// one.
+    #[test]
+    fn a_stock_shell_takes_the_profiles_startup_as_well() {
+        use super::interactive_arguments;
+
+        assert_eq!(
+            interactive_arguments("/bin/zsh", StartupMode::Interactive),
+            vec!["-i".to_owned()]
+        );
+        assert_eq!(
+            interactive_arguments("/bin/zsh", StartupMode::Login),
+            vec!["-l".to_owned(), "-i".to_owned()]
+        );
+        assert_eq!(
+            interactive_arguments("/usr/local/bin/fish", StartupMode::Interactive),
+            vec!["--interactive".to_owned()]
+        );
+        assert_eq!(
+            interactive_arguments("/usr/local/bin/fish", StartupMode::Login),
+            vec!["--login".to_owned(), "--interactive".to_owned()]
+        );
+        // The arguments belong to the shell: PowerShell has no login form to ask for and would
+        // read a login flag as a script path.
+        assert_eq!(
+            interactive_arguments("pwsh.exe", StartupMode::Login),
+            vec!["-NoLogo".to_owned(), "-NoExit".to_owned()]
         );
     }
 }

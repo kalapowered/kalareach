@@ -954,11 +954,13 @@ impl RemoteConnection {
         }
     }
 
-    /// Narrows a session listing to what this device's grant admits.
+    /// Narrows an answer to what this device's grant admits.
     ///
-    /// A request that names a session is already checked against the selector. A listing names
-    /// none, so the selector has nothing to check and the narrowing has to happen to the answer:
-    /// the registry's own words for this method are "the sessions this actor may observe".
+    /// Two things need it. A listing names no session, so the selector has nothing to check and
+    /// the narrowing has to happen to the answer: the registry's own words for this method are
+    /// "the sessions this actor may observe". And a session read carries the last command block,
+    /// which is session content rather than metadata — a command line and the directory it ran in
+    /// — so the grant's history lower bound decides whether this device sees it.
     fn narrow(&self, answer: ControlFrame) -> ControlFrame {
         let ControlFrame::Response(Response {
             request_id,
@@ -968,12 +970,7 @@ impl RemoteConnection {
             return answer;
         };
         let Ok(listed) = value.to_typed::<SessionListResult>() else {
-            // Not a listing: `session.read` names its session and was checked against the
-            // selector, so its result passes through as it is.
-            return ControlFrame::Response(Response {
-                request_id,
-                outcome: Outcome::Ok(value),
-            });
+            return self.narrow_read(request_id, value);
         };
         let selector = &self.device.grant.session_selector;
         let narrowed = SessionListResult {
@@ -988,6 +985,43 @@ impl RemoteConnection {
                 request_id,
                 outcome: Outcome::Ok(value),
             }),
+            Err(error) => failure(
+                request_id,
+                ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),
+            ),
+        }
+    }
+
+    /// Removes from a session read the content this device's grant does not reach.
+    ///
+    /// The command block the private hooks reported is a command line and a working directory,
+    /// which is what the person typed and where it ran. A grant whose history lower bound is after
+    /// the command started, or which retains no history at all, does not see it; the rest of the
+    /// read is metadata and passes through. Anything that is not a session read passes through
+    /// too: it named its session and was already checked against the selector.
+    fn narrow_read(&self, request_id: RequestId, value: ParamsValue) -> ControlFrame {
+        let passed = |value| {
+            ControlFrame::Response(Response {
+                request_id,
+                outcome: Outcome::Ok(value),
+            })
+        };
+        let Ok(read) = value.to_typed::<kr_protocol::session::SessionReadResult>() else {
+            return passed(value);
+        };
+        let bound = self.device.grant.history.lower_bound_ms.0;
+        let admitted = read.last_command_block.as_ref().is_some_and(|block| {
+            bound.is_some_and(|bound| block.started_at_ms.get() >= bound.get())
+        });
+        if admitted {
+            return passed(value);
+        }
+        let narrowed = kr_protocol::session::SessionReadResult {
+            last_command_block: kr_protocol::scalars::Nullable::null(),
+            ..read
+        };
+        match ParamsValue::from_typed(&narrowed) {
+            Ok(value) => passed(value),
             Err(error) => failure(
                 request_id,
                 ProtocolError::new(ErrorCode::InvalidArgument, error.to_string()),

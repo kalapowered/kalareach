@@ -18,6 +18,7 @@ worker directly for what a session owns.
 | `kr agent-tools --stdio` | — | Run the contact tools for the agent that launched this process |
 | `kr doctor` | — | Read-only diagnostics |
 | `kr host power` | — | Show or change whether this host stays awake for work it has admitted |
+| `kr host terminal` | — | Show the terminal applications this host has, and which one a new window opens in |
 
 `--help`, `--version` and `--json` work everywhere. A literal `--` ends option parsing. Neither
 shell commands nor paths are assembled by interpolating text.
@@ -40,10 +41,13 @@ Without a terminal and without a flag the command stops and asks for one, rather
 
 `--terminal` opens the window through the control daemon, which is the only party on the host that
 can open one for a session created somewhere else: a paired device asking for a local tab takes the
-same path. Choosing a terminal and creating a session are separate steps, so a host that cannot
-open a window still has the session. The command then exits with `TERMINAL_UNAVAILABLE` and the
-reason, and the session is there to attach to; running `kr new` again would make a second session
-rather than a second attempt at the window.
+same path. The daemon chooses in the order section 7 fixes: the application `--terminal-app` names,
+then the environment's saved preference, then what it detects. Choosing a terminal and creating a
+session are separate steps, so a host that cannot open a window still has the session. The command
+then exits with `TERMINAL_UNAVAILABLE` and the reason, and the session is there to attach to;
+running `kr new` again would make a second session rather than a second attempt at the window. A
+create token asked twice is answered with what became of the first attempt, and never opens a
+second window.
 
 Two flags decide the session's launch profile, which is fixed when the session is created and read
 back by `kr status`:
@@ -382,6 +386,17 @@ link slow enough to lose the terminator fails that attach rather than continuing
 still deliver a late reply. And SSH's own escape character stays SSH's: `~.` closes the connection
 before the attachment sees it, exactly as it does inside any other full-screen application.
 
+## `kr host terminal`
+
+`kr host terminal` prints the terminal applications this host has, in the order it would choose
+between them, and which one it prefers. `--set <id>` saves a preference for this environment, and
+`--clear` removes it and lets the host choose again. A `--set` that names an application this host
+does not have is `TERMINAL_UNAVAILABLE` and changes nothing.
+
+The preference is the middle step of the order a `terminal` presentation uses: `kr new
+--terminal-app` wins over it, and detection decides when neither says anything. A preference that
+names something no longer installed is not an error, because nobody asked for it just now.
+
 ## `kr detach`
 
 `kr detach` removes one attachment and leaves the session running. Run inside a managed root shell
@@ -391,11 +406,12 @@ editor fence at the moment the line is accepted. That record is what the detach 
 so the terminal that gets removed is the one the person is sitting at, never whichever client
 happens to hold the input lease by the time the command runs.
 
-When the recorded origin is a line whose input came from more than one attachment or epoch, or
-there was no valid fence to establish it, the command returns `AMBIGUOUS_ATTACHMENT` and names no
-attachment. Pass `--attachment <id>` to say which one. A session with no recorded origin at all —
-a `native_compat` session, or a managed one before its first accepted line — resolves to its sole
-terminal attachment and returns `AMBIGUOUS_ATTACHMENT` when it has more than one.
+Everything else returns `AMBIGUOUS_ATTACHMENT` and names no attachment: a line whose input came
+from more than one attachment or epoch, a line accepted without a valid fence, an origin whose
+terminal has already left, a session whose root editor has accepted nothing yet, and a
+`native_compat` session, which records no origin at all. Pass `--attachment <id>` to say which one.
+One remaining terminal is not proof that it is the one the command came from, so it is not treated
+as one: outside a session's own context an explicit selector is required.
 
 ## `kr question`
 

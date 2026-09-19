@@ -39,6 +39,25 @@ struct Hosted {
     runtime: Arc<SessionRuntime>,
     _service: Arc<WorkerService>,
 }
+/// Returns the one terminal attachment a hosted session has.
+///
+/// `kr detach` outside a session's own context names the attachment it is ending: a session with
+/// no managed root editor records no originating attachment, and one remaining terminal is not
+/// proof that it is the one a command would have come from.
+fn sole_attachment(runtime: &Arc<SessionRuntime>) -> String {
+    let attachments = runtime.session().attachments();
+    let terminals: Vec<&kr_protocol::attachment::AttachmentSummary> = attachments
+        .iter()
+        .filter(|summary| summary.mode == kr_protocol::attachment::AttachMode::Terminal)
+        .collect();
+    assert_eq!(
+        terminals.len(),
+        1,
+        "this session has one terminal attachment to name"
+    );
+    terminals[0].attachment_id.to_string()
+}
+
 /// A directory of files a session's application waits on, so this test decides when it acts.
 ///
 /// An application on a clock races the attachment: what it writes before the attachment exists is
@@ -1179,11 +1198,12 @@ async fn detaching_from_another_window_ends_the_attachment_and_restores_its_term
     );
     answered(queries);
 
-    // A second command, in another window, ends this attachment. It names no attachment, so the
-    // session is asked which one it has.
+    // A second command, in another window, ends this attachment. Outside the attachment's own
+    // context an explicit selector is required, so it names the one it is ending.
     let session = hosted.session_id.to_string();
+    let attachment = sole_attachment(&hosted.runtime);
     let detach = std::process::Command::new(kr())
-        .args(["detach", &session])
+        .args(["detach", &session, "--attachment", &attachment])
         // Never this test's own directory: the build tree can be on a removable volume, and
         // nothing this suite starts is given a working directory there.
         .current_dir(hosted.temp.root())
@@ -1315,8 +1335,9 @@ async fn an_application_that_empties_the_keyboard_stack_takes_nothing_of_the_ter
     );
 
     let session = hosted.session_id.to_string();
+    let attachment = sole_attachment(&hosted.runtime);
     let detach = std::process::Command::new(kr())
-        .args(["detach", &session])
+        .args(["detach", &session, "--attachment", &attachment])
         // Never this test's own directory: the build tree can be on a removable volume, and
         // nothing this suite starts is given a working directory there.
         .current_dir(hosted.temp.root())
@@ -1844,8 +1865,14 @@ async fn a_nested_attach_is_an_ordinary_application_to_the_outer_session() {
     // An orderly inner detach, from outside. The inner command ends, its status says a detach is
     // not a failure, and the outer attachment is untouched by the cleanup of an attachment that
     // was never holding this terminal.
+    let inner_attachment = sole_attachment(&inner);
     let detach = std::process::Command::new(kr())
-        .args(["detach", &inner_display.get().to_string()])
+        .args([
+            "detach",
+            &inner_display.get().to_string(),
+            "--attachment",
+            &inner_attachment,
+        ])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env(

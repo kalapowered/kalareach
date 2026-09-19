@@ -418,7 +418,7 @@ async fn run(cli: Cli) -> Result<Completion> {
             // The environment the session was found in, which is not always the one this
             // installation opens by default. Reading one environment's session and another's
             // power setting would describe a machine the session is not on.
-            let (summary, host) = match find(&paths, &selector, wanted) {
+            let (read, host) = match find(&paths, &selector, wanted) {
                 Ok((known, descriptor)) => {
                     let summary = match read_session(&descriptor).await {
                         Ok(summary) => summary,
@@ -450,8 +450,9 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 Err(_) => None,
             };
+            let summary = &read.session;
             if cli.json {
-                let mut document = report::session(&summary);
+                let mut document = report::session(summary);
                 if let Some(object) = document.as_object_mut() {
                     object.insert(
                         "power".to_owned(),
@@ -459,11 +460,20 @@ async fn run(cli: Cli) -> Result<Completion> {
                             .as_ref()
                             .map_or(serde_json::Value::Null, report::power),
                     );
+                    object.insert(
+                        "launch_profile".to_owned(),
+                        read.launch_profile
+                            .as_ref()
+                            .map_or(serde_json::Value::Null, launch_profile_document),
+                    );
                 }
                 print_json(&document);
             } else {
-                println!("{}", report::session_line(&summary));
-                println!("{}", report::desktop_line(&summary));
+                println!("{}", report::session_line(summary));
+                println!("{}", report::desktop_line(summary));
+                if let Some(profile) = read.launch_profile.as_ref() {
+                    println!("{}", launch_profile_line(profile));
+                }
                 if let Some(power) = power.as_ref() {
                     println!("{}", power.describe());
                 }
@@ -601,6 +611,70 @@ async fn run(cli: Cli) -> Result<Completion> {
                 }
                 Ok(Completion::Done)
             }
+            HostCommand::Terminal(terminal) => {
+                let environment = kr_cli::resolve::select(&paths, None)?;
+                let file = environment
+                    .paths
+                    .state_dir()
+                    .join(kr_shell_integration::host::terminal::PREFERENCE_FILE);
+                let available = kr_shell_integration::host::terminal::detect();
+                if terminal.clear {
+                    // Removing the file is the whole of it: with no preference, detection decides.
+                    match std::fs::remove_file(&file) {
+                        Ok(()) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(error) => {
+                            return Err(CliError::Other(format!(
+                                "could not remove {}: {error}",
+                                file.display()
+                            )));
+                        }
+                    }
+                } else if let Some(chosen) = terminal.set.as_deref() {
+                    if !available.iter().any(|application| application.id == chosen) {
+                        return Err(CliError::TerminalUnavailable(format!(
+                            "{chosen} is not installed on this host; it has {}",
+                            describe_terminals(&available)
+                        )));
+                    }
+                    kr_ipc::paths::write_owner_only_file(
+                        &file,
+                        kr_shell_integration::host::terminal::preference_document(chosen)
+                            .as_bytes(),
+                    )
+                    .map_err(CliError::Ipc)?;
+                }
+                let preferred = kr_shell_integration::host::terminal::saved_preference(
+                    environment.paths.state_dir(),
+                );
+                if cli.json {
+                    print_json(&serde_json::json!({
+                        "ok": true,
+                        "environment_id": environment.environment_id.to_string(),
+                        "preferred": preferred,
+                        "available": available
+                            .iter()
+                            .map(|application| serde_json::json!({
+                                "id": application.id,
+                                "name": application.name,
+                                "detail": application.detail,
+                            }))
+                            .collect::<Vec<_>>(),
+                    }));
+                } else if available.is_empty() {
+                    println!("no terminal application this host can open was found");
+                } else {
+                    println!("available: {}", describe_terminals(&available));
+                    match preferred {
+                        Some(preferred) => println!("preferred: {preferred}"),
+                        None => println!(
+                            "preferred: none, so a new window opens in {}",
+                            available[0].id
+                        ),
+                    }
+                }
+                Ok(Completion::Done)
+            }
         },
         Command::Account(arguments) => match arguments.command {
             AccountCommand::Token(token) => match token {
@@ -704,6 +778,58 @@ fn shell_selector(arguments: &ShellArguments) -> Option<&str> {
     }
 }
 
+/// Renders a session's launch profile as a line.
+fn launch_profile_line(profile: &kr_protocol::session::LaunchProfile) -> String {
+    let integrations: Vec<String> = profile
+        .command_integrations
+        .iter()
+        .filter(|integration| integration.enabled)
+        .map(|integration| integration.command.clone())
+        .collect();
+    let integrated = if integrations.is_empty() {
+        "no command integration".to_owned()
+    } else {
+        format!("command integration for {}", integrations.join(", "))
+    };
+    format!(
+        "launch: {} startup, {}, {integrated}",
+        profile.startup.as_str(),
+        if profile.fenced_launch {
+            "fenced launch"
+        } else {
+            "no fenced launch"
+        }
+    )
+}
+
+/// Renders a session's launch profile as a document.
+fn launch_profile_document(profile: &kr_protocol::session::LaunchProfile) -> serde_json::Value {
+    serde_json::json!({
+        "startup": profile.startup.as_str(),
+        "fenced_launch": profile.fenced_launch,
+        "command_integrations": profile
+            .command_integrations
+            .iter()
+            .map(|integration| serde_json::json!({
+                "command": integration.command,
+                "flags": integration.flags,
+                "enabled": integration.enabled,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Names the terminal applications this host has, in the order it would choose them.
+fn describe_terminals(
+    available: &[kr_shell_integration::host::terminal::TerminalApplication],
+) -> String {
+    available
+        .iter()
+        .map(|application| application.id.clone())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Presents a session that has just been created.
 ///
 /// A failure here never creates a second session: the session exists, and what could not be done
@@ -790,16 +916,16 @@ async fn resolve_closed(
 async fn read_from_controller(
     client: &mut kr_ipc::client::LocalClient,
     session_id: SessionId,
-) -> Result<kr_protocol::session::SessionSummary> {
+) -> Result<SessionReadResult> {
     let outcome = client
         .request(Method::SessionRead, &SessionReadParams { session_id })
         .await?;
-    Ok(typed::<SessionReadResult>(outcome)?.session)
+    typed::<SessionReadResult>(outcome)
 }
 
 async fn read_session(
     descriptor: &kr_protocol::worker::WorkerDescriptor,
-) -> Result<kr_protocol::session::SessionSummary> {
+) -> Result<SessionReadResult> {
     let mut client = open_worker(descriptor, build_id()).await?;
     let outcome = client
         .request(
@@ -809,7 +935,7 @@ async fn read_session(
             },
         )
         .await?;
-    Ok(typed::<SessionReadResult>(outcome)?.session)
+    typed::<SessionReadResult>(outcome)
 }
 
 fn session_selector(named: Option<&str>) -> Result<SessionSelector> {

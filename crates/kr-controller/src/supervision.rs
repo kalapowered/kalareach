@@ -804,8 +804,19 @@ pub trait TerminalPresenter: Send + Sync + std::fmt::Debug {
 }
 
 /// The terminal applications installed on this host.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct InstalledTerminals;
+#[derive(Debug, Clone)]
+pub struct InstalledTerminals {
+    /// The environment's state directory, where its saved terminal preference is kept.
+    state_dir: PathBuf,
+}
+
+impl InstalledTerminals {
+    /// Returns a presenter that reads one environment's saved preference.
+    #[must_use]
+    pub const fn in_environment(state_dir: PathBuf) -> Self {
+        Self { state_dir }
+    }
+}
 
 impl TerminalPresenter for InstalledTerminals {
     fn present(
@@ -813,11 +824,12 @@ impl TerminalPresenter for InstalledTerminals {
         requested: Option<&str>,
         command: &[String],
     ) -> std::result::Result<Selection, TerminalUnavailable> {
-        // The order section 7 fixes: what the request named, then the saved preference, then what
-        // is detected. This host keeps no saved terminal preference, so the middle step has
-        // nothing to offer and detection decides where the request named nothing.
+        // The order section 7 fixes: what the request named, then this environment's saved
+        // preference, then what is detected. A preference that names something no longer installed
+        // is not an error, because nobody asked for it just now; a request that does is.
         let available = terminal::detect();
-        let selection = terminal::select(requested, None, &available)?;
+        let preference = terminal::saved_preference(&self.state_dir);
+        let selection = terminal::select(requested, preference.as_deref(), &available)?;
         terminal::open(&selection, command)?;
         Ok(selection)
     }
