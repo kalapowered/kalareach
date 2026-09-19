@@ -106,15 +106,31 @@ pub const IMPORTER: &str = "an explicit versioned import of a store this build c
 /// lost a table would come back as a journal with an empty one and the loss would never be
 /// reported. This is what a store of each version really had, so a store that records a version
 /// and is missing one of these has lost it rather than never having had it.
+///
+/// For an older version this is what the *first* build recording it created, because a version
+/// covered several builds and a later one added tables the earlier stores never had: requiring
+/// those would report a loss where there was none. For the current version it is the whole
+/// schema, because one build writes it.
 #[must_use]
 pub fn tables_at(version: i64) -> &'static [&'static str] {
     match version {
         // `927ecc84`, the first build of this schema: the receipt table and nothing else.
         1 => &["schema_version", "receipts"],
-        2 => &["schema_version", "receipts", "session", "host_events"],
+        // `87e61430`, the first build recording 2.
+        2 => &[
+            "schema_version",
+            "receipts",
+            "results",
+            "receipt_events",
+            "closure",
+        ],
+        // `469ee5d8`, the first build recording 3.
         3 => &[
             "schema_version",
             "receipts",
+            "results",
+            "receipt_events",
+            "closure",
             "session",
             "host_events",
             "observations",
@@ -127,6 +143,9 @@ pub fn tables_at(version: i64) -> &'static [&'static str] {
         4 => &[
             "schema_version",
             "receipts",
+            "results",
+            "receipt_events",
+            "closure",
             "session",
             "host_events",
             "observations",
@@ -142,6 +161,9 @@ pub fn tables_at(version: i64) -> &'static [&'static str] {
         _ => &[
             "schema_version",
             "receipts",
+            "results",
+            "receipt_events",
+            "closure",
             "session",
             "host_events",
             "observations",

@@ -1015,6 +1015,54 @@ fn a_database_a_newer_build_wrote_is_refused_rather_than_read() {
 }
 
 #[test]
+fn a_store_that_has_lost_any_table_of_its_own_version_is_refused_rather_than_refilled() {
+    // KR-REQ-24.30 and the incomplete archive of 24.21. Migration creates what is absent, so a
+    // store that lost a table would come back with an empty one and the loss would never be
+    // reported. Every table the current schema holds is checked, one at a time, because the one
+    // that is missed is the one whose loss goes unseen: a lost `results` or `receipt_events`
+    // loses outcomes and event history exactly as a lost `receipts` loses receipts.
+    let path = journal_path("lost-table");
+    {
+        let journal = Journal::open(&path).expect("a current store");
+        drop(journal);
+    }
+    let all = migration::tables_at(migration::CURRENT);
+    assert!(
+        all.contains(&"results") && all.contains(&"receipt_events") && all.contains(&"closure"),
+        "the current version's list is the whole schema: {all:?}"
+    );
+    let original = std::fs::read(&path).expect("reads the store");
+    for table in all {
+        if *table == "schema_version" {
+            // Its loss is a store with no version at all, which the version probe reports.
+            continue;
+        }
+        std::fs::write(&path, &original).expect("puts the store back");
+        let connection = rusqlite::Connection::open(&path).expect("opens");
+        connection
+            .execute_batch(&format!("DROP TABLE {table};"))
+            .expect("drops one table");
+        drop(connection);
+        let error = Journal::open_existing(&path)
+            .expect_err("a store missing one of its own tables is not opened");
+        assert!(
+            error.to_string().contains(table),
+            "the refusal names what is lost: {error}"
+        );
+        let connection = rusqlite::Connection::open(&path).expect("reopens");
+        let present: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                rusqlite::params![table],
+                |row| row.get(0),
+            )
+            .expect("reads the schema");
+        assert_eq!(present, 0, "{table} was not recreated empty");
+    }
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
 fn a_database_older_than_the_ladder_names_the_importer_rather_than_restoring_in_part() {
     let error = migration::plan(0).expect_err("version 0 is not migratable");
     assert_eq!(
@@ -1502,6 +1550,29 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
         .expect_err("a full store fences rich work");
     assert_eq!(refused.code, ErrorCode::StorageUnavailable);
 
+    // Section 7's other exception, through the same admission path the refusal above took: the
+    // interrupt is the one way a person has of stopping a running command on a host whose store
+    // has failed, so a full journal must not take it away. This is a mutation, so it passes the
+    // posture check, the duplicate-suppression read and the outstanding read, each of which the
+    // full store can refuse.
+    let interrupted: kr_protocol::input::InputLeaseResult = client
+        .mutate(
+            Method::InputInterrupt,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::input::InputInterruptParams {
+                session_id: host.session_id,
+                attachment_id: attachment.attachment.attachment_id,
+                epoch: lease.lease.epoch,
+                action: kr_protocol::input::InterruptAction::NativeInterrupt,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("a full store does not take the interrupt away");
+    assert_eq!(interrupted.lease.epoch, lease.lease.epoch);
+
     // And nothing can replay it: the store holds no record of the action at all, so there is no
     // dispatch marker for a recovery to turn into an uncertain outcome.
     {
@@ -1520,6 +1591,106 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
                 .admits(WorkClass::NativeTerminal)
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_that_cannot_be_read_still_takes_the_interrupt_and_the_close() {
+    // KR-ACC-028 and section 7's two exceptions, against a store that fails its *reads* rather
+    // than its writes. Admission asks the journal twice before anything is dispatched, for the
+    // action that may supersede this one and for how many the caller already has outstanding.
+    // Those reads protect a new rich action. An authorised stop and a native interrupt are
+    // neither, so a store that cannot answer them must not take away the one way a person has of
+    // stopping a running command, nor the way they end the session.
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let attachment: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("attaches");
+    let lease: kr_protocol::input::InputAcquireResult = client
+        .mutate(
+            Method::InputAcquire,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::input::InputAcquireParams {
+                session_id: host.session_id,
+                attachment_id: attachment.attachment.attachment_id,
+                expected_epoch: Nullable::null(),
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("acquires the lease");
+
+    // The receipt table goes, which is what both admission reads read. This is the shape of a
+    // store whose file a person or another program has damaged under a running host.
+    {
+        let connection = rusqlite::Connection::open(&host.journal_path).expect("opens the store");
+        connection
+            .execute_batch("DROP TABLE receipts;")
+            .expect("takes the receipt table away");
+    }
+
+    // Rich work is refused, because the reads that protect it cannot answer.
+    let refused = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("reaches the worker")
+        .expect_err("a store that cannot be read fences rich work");
+    assert_eq!(refused.code, ErrorCode::StorageUnavailable);
+
+    // The interrupt passes the same gates.
+    let interrupted: kr_protocol::input::InputLeaseResult = client
+        .mutate(
+            Method::InputInterrupt,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::input::InputInterruptParams {
+                session_id: host.session_id,
+                attachment_id: attachment.attachment.attachment_id,
+                epoch: lease.lease.epoch,
+                action: kr_protocol::input::InterruptAction::NativeInterrupt,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("an unreadable store does not take the interrupt away");
+    assert_eq!(interrupted.lease.epoch, lease.lease.epoch);
+
+    // And so does the authorised stop, whose receipt is what it loses rather than its effect.
+    let closed: kr_protocol::session::SessionCloseResult = client
+        .mutate(
+            Method::SessionClose,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::session::SessionCloseParams {
+                session_id: host.session_id,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .map(|value| value.to_typed().expect("decodes"))
+        .expect("an unreadable store does not take the stop away");
+    assert_eq!(
+        closed.durability,
+        kr_protocol::session::Durability::Volatile,
+        "the close says what it lost rather than claiming a receipt it could not write"
+    );
+    assert_eq!(closed.session_id, host.session_id);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
