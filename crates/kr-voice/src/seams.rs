@@ -146,7 +146,9 @@ pub trait ContextSource: Send + Sync + fmt::Debug {
 /// intersects at decision time; it keeps no authority of its own and holds no second store.
 ///
 /// These calls are synchronous because the host's grant store is: a decision that took a future
-/// would be a decision a subject could move underneath.
+/// would be a decision a subject could move underneath. Each takes the moment the decision is
+/// being taken at, so the store and the coordinator read one clock rather than two: a record is
+/// live only when it is redeemed, unrevoked and unexpired **at that moment**.
 pub trait VoiceAuthority: Send + Sync + fmt::Debug {
     /// Returns the ordinary grant this device holds for `session_id`, when it holds one.
     ///
@@ -157,6 +159,7 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
         &self,
         device_id: DeviceId,
         session_id: Option<SessionId>,
+        now_ms: u64,
     ) -> Result<Option<Grant>>;
 
     /// Returns the live grant with this identity, when it is live.
@@ -164,7 +167,7 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
     /// # Errors
     ///
     /// Returns an error when the store cannot be read.
-    fn grant(&self, grant_id: GrantId) -> Result<Option<Grant>>;
+    fn grant(&self, grant_id: GrantId, now_ms: u64) -> Result<Option<Grant>>;
 
     /// Returns this device's standing voice grant, when it has one.
     ///
@@ -175,7 +178,7 @@ pub trait VoiceAuthority: Send + Sync + fmt::Debug {
     /// # Errors
     ///
     /// Returns an error when the store cannot be read.
-    fn standing_voice_grant(&self, device_id: DeviceId) -> Result<Option<Grant>>;
+    fn standing_voice_grant(&self, device_id: DeviceId, now_ms: u64) -> Result<Option<Grant>>;
 
     /// Writes a grant the coordinator planned.
     ///

@@ -301,6 +301,11 @@
           "const": "host.manage",
           "description": "Change host configuration: devices, catalogues, plugins and installation state.",
           "type": "string"
+        },
+        {
+          "const": "voice.use",
+          "description": "Hold a voice session on this host, delegate through it and read its selected context.",
+          "type": "string"
         }
       ]
     },

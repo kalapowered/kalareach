@@ -133,6 +133,7 @@ impl VoiceAuthority for Authority {
         &self,
         device_id: DeviceId,
         session_id: Option<SessionId>,
+        _now_ms: u64,
     ) -> kr_voice::Result<Option<Grant>> {
         let held = self.device_grant.lock().expect("the device grant").clone();
         Ok(held.filter(|grant| {
@@ -141,7 +142,7 @@ impl VoiceAuthority for Authority {
         }))
     }
 
-    fn grant(&self, grant_id: GrantId) -> kr_voice::Result<Option<Grant>> {
+    fn grant(&self, grant_id: GrantId, _now_ms: u64) -> kr_voice::Result<Option<Grant>> {
         let store = self.store.lock().expect("the store");
         if store.revoked.contains(&grant_id) {
             return Ok(None);
@@ -153,7 +154,11 @@ impl VoiceAuthority for Authority {
             .cloned())
     }
 
-    fn standing_voice_grant(&self, device_id: DeviceId) -> kr_voice::Result<Option<Grant>> {
+    fn standing_voice_grant(
+        &self,
+        device_id: DeviceId,
+        _now_ms: u64,
+    ) -> kr_voice::Result<Option<Grant>> {
         let store = self.store.lock().expect("the store");
         Ok(store
             .grants
@@ -315,6 +320,9 @@ impl ActionSubmitter for Submitter {
 #[derive(Clone, Debug)]
 enum Answer {
     Started,
+    /// The answer an earlier attempt already produced, which the service repeats rather than
+    /// starting a second metered call.
+    Replayed,
     CreationUnknown,
     Capacity,
 }
@@ -389,6 +397,10 @@ impl ManagedVoiceService for ManagedFake {
         Box::pin(async move {
             Ok(match answer {
                 Answer::Started => VoiceStart::Started(Box::new(running_call("managed"))),
+                Answer::Replayed => VoiceStart::Started(Box::new(VoiceSession {
+                    replayed: true,
+                    ..running_call("managed")
+                })),
                 Answer::CreationUnknown => VoiceStart::CreationUnknown {
                     attempt_id: Some("attempt-unknown".to_owned()),
                     message: "The provider may hold a session for that attempt.".to_owned(),
@@ -762,6 +774,67 @@ async fn an_unknown_creation_is_a_state_and_leaves_no_grant() {
         fixture.broker.offers().len(),
         1,
         "an unknown creation is never retried"
+    );
+}
+
+/// KR-REQ-15.01 and 15.14: a replayed answer is the call this account already holds, so no second
+/// grant is written for it and the call is not left unbound.
+#[tokio::test]
+async fn a_replayed_answer_does_not_become_a_second_grant() {
+    let fixture = fixture();
+    started(&fixture, None).await;
+    *fixture.broker.answer.lock().expect("the answer") = Answer::Replayed;
+
+    let result = fixture
+        .coordinator
+        .start(
+            device(PHONE),
+            &start_params(),
+            AuthorityRevision::new(1),
+            10_100,
+        )
+        .await
+        .expect("an answer");
+    assert!(
+        matches!(result.outcome, VoiceStartOutcome::Unavailable { .. }),
+        "{:?}",
+        result.outcome
+    );
+    assert_eq!(
+        fixture.coordinator.live_sessions(),
+        1,
+        "the call this device already holds is the only one"
+    );
+    assert_eq!(
+        fixture.broker.closed(),
+        vec!["call-managed".to_owned()],
+        "the call the host could not bind is closed rather than left running"
+    );
+}
+
+/// KR-REQ-15.21: replacing a standing voice grant withdraws the one it replaces, so two scopes
+/// never stand at once.
+#[tokio::test]
+async fn a_replaced_standing_grant_is_withdrawn_with_the_calls_under_it() {
+    let fixture = fixture();
+    let first = fixture
+        .coordinator
+        .grant(&grant_params(None), AuthorityRevision::new(1), 10_000)
+        .expect("a standing voice grant")
+        .grant_id;
+    let second = fixture
+        .coordinator
+        .grant(
+            &grant_params(Some(&[VoiceAction::Navigate])),
+            AuthorityRevision::new(1),
+            10_100,
+        )
+        .expect("a narrower standing voice grant")
+        .grant_id;
+    assert_ne!(first, second);
+    assert!(
+        fixture.authority.is_revoked(first),
+        "the grant this one replaces is withdrawn"
     );
 }
 

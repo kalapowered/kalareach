@@ -47,14 +47,18 @@ impl GrantAuthority {
     }
 
     /// The live records this device holds.
-    fn live_records(&self, device_id: DeviceId) -> kr_voice::Result<Vec<GrantRecord>> {
+    ///
+    /// Live means every one of the three: redeemed, not revoked, and not expired. Expiry is read
+    /// from the grant at the moment of the question rather than when the record was written, so a
+    /// grant that ran out during a call stops authorising the next request in it.
+    fn live_records(&self, device_id: DeviceId, now_ms: u64) -> kr_voice::Result<Vec<GrantRecord>> {
         Ok(self
             .sharing
             .grants()
             .records_for_device(device_id)
             .map_err(store)?
             .into_iter()
-            .filter(|record| record.revoked_at_ms.is_none() && record.is_active())
+            .filter(|record| record.state(now_ms) == kr_protocol::sharing::GrantState::Active)
             .collect())
     }
 }
@@ -72,12 +76,13 @@ impl VoiceAuthority for GrantAuthority {
         &self,
         device_id: DeviceId,
         session_id: Option<SessionId>,
+        now_ms: u64,
     ) -> kr_voice::Result<Option<Grant>> {
         // The device's ordinary grant: the widest live one it holds that is not a voice grant.
         // A voice grant narrows this one rather than standing beside it, so the intersection the
         // coordinator takes is against the authority the device already had.
         Ok(self
-            .live_records(device_id)?
+            .live_records(device_id, now_ms)?
             .into_iter()
             .map(|record| record.grant)
             .filter(|grant| !grant.permits(ActionRight::VoiceUse))
@@ -85,19 +90,23 @@ impl VoiceAuthority for GrantAuthority {
             .max_by_key(|grant| grant.actions.len()))
     }
 
-    fn grant(&self, grant_id: GrantId) -> kr_voice::Result<Option<Grant>> {
+    fn grant(&self, grant_id: GrantId, now_ms: u64) -> kr_voice::Result<Option<Grant>> {
         Ok(self
             .sharing
             .grants()
             .record(grant_id)
             .map_err(store)?
-            .filter(|record| record.revoked_at_ms.is_none() && record.is_active())
+            .filter(|record| record.state(now_ms) == kr_protocol::sharing::GrantState::Active)
             .map(|record| record.grant))
     }
 
-    fn standing_voice_grant(&self, device_id: DeviceId) -> kr_voice::Result<Option<Grant>> {
+    fn standing_voice_grant(
+        &self,
+        device_id: DeviceId,
+        now_ms: u64,
+    ) -> kr_voice::Result<Option<Grant>> {
         Ok(self
-            .live_records(device_id)?
+            .live_records(device_id, now_ms)?
             .into_iter()
             .map(|record| record.grant)
             .rfind(|grant| {

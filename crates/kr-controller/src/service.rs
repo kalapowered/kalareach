@@ -2235,10 +2235,10 @@ impl Controller {
             Arc::clone(&self.devices),
             self.sharing.host_device_id(),
         ));
-        // No managed provider is configured here. Reaching a managed service needs an HTTP
-        // exchange, which `kr-client` deliberately leaves to the embedder, and this repository
-        // carries no implementation of one yet. An embedder that has one attaches it with
-        // `VoiceModule::with_provider`.
+        // Reaching a managed service needs an HTTP exchange, which the client library leaves to
+        // the embedder: a desktop build, a mobile build and a test each reach the network
+        // differently. An embedder attaches its own with `VoiceModule::with_provider`, and a host
+        // with none brokers no managed call.
         let provider = None;
         let module = crate::voice::VoiceModule::new(
             Arc::new(crate::voice::ControllerFacts::new(self.me.clone())),
@@ -2297,8 +2297,9 @@ impl Controller {
             });
         let item = |text: String| kr_voice::seams::ContextItem::new(text, observed_at_ms);
         Ok(crate::voice::SessionSnapshot {
-            // The session's own description is the shell it runs and where it runs it until a
-            // generated description exists; both are facts this daemon already holds.
+            // The session's own description is the shell it runs and where it runs it. Both are
+            // facts this daemon holds itself, so the description never rests on something it would
+            // have to ask a worker for.
             description: Some(item(format!(
                 "session {} running {}",
                 summary.display_number, summary.shell_path

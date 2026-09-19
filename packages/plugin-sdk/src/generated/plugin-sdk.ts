@@ -227,6 +227,7 @@ export type Predicate1 =
         | 'session.share'
         | 'automation.manage'
         | 'host.manage'
+        | 'voice.use'
     }
   | {
       op: 'binding'
@@ -340,6 +341,7 @@ export type Predicate =
         | 'session.share'
         | 'automation.manage'
         | 'host.manage'
+        | 'voice.use'
     }
   | {
       op: 'binding'
@@ -1753,6 +1755,7 @@ export interface Control {
           | 'session.share'
           | 'automation.manage'
           | 'host.manage'
+          | 'voice.use'
       }
     | {
         op: 'binding'
@@ -1909,6 +1912,7 @@ export interface Control {
           | 'session.share'
           | 'automation.manage'
           | 'host.manage'
+          | 'voice.use'
       }
     | {
         op: 'binding'
@@ -2051,6 +2055,7 @@ export interface Control1 {
           | 'session.share'
           | 'automation.manage'
           | 'host.manage'
+          | 'voice.use'
       }
     | {
         op: 'binding'
@@ -2207,6 +2212,7 @@ export interface Control1 {
           | 'session.share'
           | 'automation.manage'
           | 'host.manage'
+          | 'voice.use'
       }
     | {
         op: 'binding'
@@ -2337,6 +2343,7 @@ export interface Control2 {
           | 'session.share'
           | 'automation.manage'
           | 'host.manage'
+          | 'voice.use'
       }
     | {
         op: 'binding'
@@ -2493,6 +2500,7 @@ export interface Control2 {
           | 'session.share'
           | 'automation.manage'
           | 'host.manage'
+          | 'voice.use'
       }
     | {
         op: 'binding'
@@ -2623,6 +2631,7 @@ export interface Control3 {
           | 'session.share'
           | 'automation.manage'
           | 'host.manage'
+          | 'voice.use'
       }
     | {
         op: 'binding'
@@ -2779,6 +2788,7 @@ export interface Control3 {
           | 'session.share'
           | 'automation.manage'
           | 'host.manage'
+          | 'voice.use'
       }
     | {
         op: 'binding'

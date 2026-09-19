@@ -189,10 +189,9 @@ impl Coordinator {
         authority_revision: kr_protocol::ids::AuthorityRevision,
         now_ms: u64,
     ) -> Result<VoiceGrantResult> {
-        let _ = now_ms;
         let device_grant = self
             .authority
-            .device_grant(params.device_id, None)?
+            .device_grant(params.device_id, None, now_ms)?
             .ok_or_else(|| {
                 VoiceError::refused(
                     VoiceRefusal::OutsideDeviceGrant,
@@ -211,16 +210,20 @@ impl Coordinator {
                 authority_revision,
             },
         )?;
-        let written = self.authority.issue(&planned.plan)?;
-
-        // Withdrawing or narrowing a standing grant ends the calls running under it. The registry
-        // is cleared here so nothing can act under a voice session whose grant has moved.
-        {
+        // The one this replaces goes first. A second standing grant beside the first would leave
+        // the old scope authorising calls nobody can see in the new statement, and the store's
+        // cascade is what ends the calls running under it.
+        let replaced = self
+            .authority
+            .standing_voice_grant(params.device_id, now_ms)?;
+        if let Some(replaced) = replaced.as_ref() {
+            self.authority.revoke(replaced.grant_id, now_ms)?;
             let mut state = self.state.lock().expect("the coordinator's state");
-            for ended in state.sessions.stop_under(written.grant_id) {
+            for ended in state.sessions.stop_under(replaced.grant_id) {
                 state.ledger.forget_session(ended.voice_session_id);
             }
         }
+        let written = self.authority.issue(&planned.plan)?;
 
         Ok(VoiceGrantResult {
             grant_id: written.grant_id,
@@ -264,7 +267,7 @@ impl Coordinator {
         };
         let device_grant = self
             .authority
-            .device_grant(device_id, None)?
+            .device_grant(device_id, None, now_ms)?
             .ok_or_else(|| {
                 VoiceError::refused(
                     VoiceRefusal::OutsideDeviceGrant,
@@ -273,7 +276,7 @@ impl Coordinator {
             })?;
         let standing = self
             .authority
-            .standing_voice_grant(device_id)?
+            .standing_voice_grant(device_id, now_ms)?
             .ok_or_else(|| {
                 VoiceError::refused(
                     VoiceRefusal::OutsideVoiceGrant,
@@ -340,13 +343,62 @@ impl Coordinator {
             VoiceStart::Started(session) => session,
         };
 
-        let written = self.authority.issue(&planned.plan)?;
-        let voice_session_id = VoiceSessionId::new(new_identity()?);
+        if session.replayed {
+            // The service answered with the call an earlier attempt already produced. Issuing a
+            // second grant for it would leave two pieces of authority over one call, and stopping
+            // either would leave the other standing. The caller is told to use the call it has.
+            self.close_unbound(&provider, &session.call_id).await;
+            return Ok(VoiceStartResult {
+                outcome: VoiceStartOutcome::Unavailable {
+                    reason: "session_in_progress".to_owned(),
+                    message: "A managed call for this account is already running. Use the call \
+                              this device already holds, or stop it first."
+                        .to_owned(),
+                    alternatives: vec![
+                        "Stop the call this device already holds and start a new one.".to_owned(),
+                    ],
+                },
+            });
+        }
+
+        // Everything after this can fail, and a failure leaves a metered call running that no
+        // grant covers. The call is closed on the way out rather than left for the deadline.
+        let written = match self.authority.issue(&planned.plan) {
+            Ok(written) => written,
+            Err(error) => {
+                self.close_unbound(&provider, &session.call_id).await;
+                return Err(error);
+            }
+        };
+        let voice_session_id = match new_identity() {
+            Ok(identity) => VoiceSessionId::new(identity),
+            Err(error) => {
+                let _ = self.authority.revoke(written.grant_id, now_ms);
+                self.close_unbound(&provider, &session.call_id).await;
+                return Err(error);
+            }
+        };
         let session_ids = if planned.plan.session_ids.is_empty() {
+            // An empty list is not "every session there will ever be": it is the sessions the
+            // device's own grant covers, which is what the voice grant narrows. A grant that
+            // covers every session gives a voice session that reaches every session, and both are
+            // decided again on each request.
             self.sessions_of(&device_grant)
         } else {
             planned.plan.session_ids.clone()
         };
+        if session_ids.is_empty()
+            && !matches!(
+                device_grant.session_selector,
+                kr_protocol::grant::SessionSelector::Any
+            )
+        {
+            self.close_unbound(&provider, &session.call_id).await;
+            return Err(VoiceError::refused(
+                VoiceRefusal::OutsideDeviceGrant,
+                "this device's grant covers no session, so a voice session would reach none",
+            ));
+        }
         let mut state = self.state.lock().expect("the coordinator's state");
         state.sessions.start(NewVoiceSession {
             voice_session_id,
@@ -385,6 +437,15 @@ impl Coordinator {
                 }),
             },
         })
+    }
+
+    /// Ends a call this host could not bind to a voice session.
+    ///
+    /// Told, not waited on, and a service that cannot be reached is not an error the caller sees:
+    /// the caller's own answer is already decided, and the service's deadline closes the call in
+    /// any case. Nothing here retries creation.
+    async fn close_unbound(&self, provider: &Arc<dyn ManagedVoiceService>, call_id: &str) {
+        let _ = provider.close(call_id).await;
     }
 
     /// The sessions a grant covers, when the grant names them.
@@ -469,7 +530,6 @@ impl Coordinator {
         params: &kr_protocol::voice::VoiceContextParams,
         now_ms: u64,
     ) -> Result<kr_protocol::voice::VoiceContextResult> {
-        let _ = now_ms;
         let (voice_grant_id, reaches) = {
             let state = self.state.lock().expect("the coordinator's state");
             let record = state
@@ -483,10 +543,10 @@ impl Coordinator {
                 "this voice session does not reach that session",
             ));
         }
-        let voice_grant = self.live_voice_grant(voice_grant_id)?;
+        let voice_grant = self.live_voice_grant(voice_grant_id, now_ms)?;
         let device_grant = self
             .authority
-            .device_grant(device_id, Some(params.session_id))?
+            .device_grant(device_id, Some(params.session_id), now_ms)?
             .ok_or_else(|| {
                 VoiceError::refused(
                     VoiceRefusal::OutsideDeviceGrant,
@@ -500,10 +560,12 @@ impl Coordinator {
             ));
         }
 
-        // The device's own grant, and the only scope this selection uses.
+        // The narrower of the two, which is what "intersected" means for history as well as for
+        // rights. A device grant that later gained older history must not widen a voice grant that
+        // was written against the narrower bound.
         let request = ContextRequest {
             session_id: params.session_id,
-            grant: device_grant,
+            grant: narrower_history(&device_grant, &voice_grant),
             selected: params.selected.clone(),
         };
         let gathered = self.context.gather(&request).await?;
@@ -776,10 +838,10 @@ impl Coordinator {
                 "this host has no effect that does that, so no grant can carry it",
             ));
         }
-        let voice_grant = self.live_voice_grant(voice_grant_id)?;
+        let voice_grant = self.live_voice_grant(voice_grant_id, now_ms)?;
         let device_grant = self
             .authority
-            .device_grant(device_id, params.session_id.0)?
+            .device_grant(device_id, params.session_id.0, now_ms)?
             .ok_or_else(|| {
                 VoiceError::refused(
                     VoiceRefusal::OutsideDeviceGrant,
@@ -824,17 +886,29 @@ impl Coordinator {
         })
     }
 
-    /// The live grant behind one voice session.
+    /// The live grant behind one voice session, at the moment of the decision.
+    ///
+    /// Revoked and expired are both checked here, and expiry is checked against the clock the
+    /// request carries rather than against what was true when the grant was written: a call that
+    /// outlived its own deadline must stop authorising the request after it.
     fn live_voice_grant(
         &self,
         grant_id: kr_protocol::ids::GrantId,
+        now_ms: u64,
     ) -> Result<kr_protocol::grant::Grant> {
-        self.authority.grant(grant_id)?.ok_or_else(|| {
+        let grant = self.authority.grant(grant_id, now_ms)?.ok_or_else(|| {
             VoiceError::refused(
                 VoiceRefusal::OutsideVoiceGrant,
                 "this voice session's grant has been revoked",
             )
-        })
+        })?;
+        if !grant.expiry.is_valid_at(now_ms) {
+            return Err(VoiceError::refused(
+                VoiceRefusal::OutsideVoiceGrant,
+                "this voice session's grant has run out",
+            ));
+        }
+        Ok(grant)
     }
 
     /// The sentence carried with every delegation this host accepts.
@@ -842,6 +916,28 @@ impl Coordinator {
     pub const fn delegation_note() -> &'static str {
         VOICE_DELEGATION_NOTE
     }
+}
+
+/// The device's grant with the narrower of the two history scopes.
+///
+/// Rights are intersected where each action is decided; history is intersected here, because the
+/// selection is built from one scope and that scope has to be the narrower one. The lower bound
+/// takes the later of the two, and a scope with no retained history at all wins outright.
+fn narrower_history(
+    device_grant: &kr_protocol::grant::Grant,
+    voice_grant: &kr_protocol::grant::Grant,
+) -> kr_protocol::grant::Grant {
+    let mut narrowed = device_grant.clone();
+    let device_bound = device_grant.history.lower_bound_ms.0.map(TimestampMs::get);
+    let voice_bound = voice_grant.history.lower_bound_ms.0.map(TimestampMs::get);
+    narrowed.history.lower_bound_ms = match (device_bound, voice_bound) {
+        (Some(device), Some(voice)) => Nullable::some(TimestampMs::new(device.max(voice))),
+        // Either scope seeing no retained history means the selection sees none.
+        _ => Nullable::null(),
+    };
+    narrowed.history.include_live_screen =
+        device_grant.history.include_live_screen && voice_grant.history.include_live_screen;
+    narrowed
 }
 
 /// How far a provider's offset may fall outside this host's reading of the call's length.

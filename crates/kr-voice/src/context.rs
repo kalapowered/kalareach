@@ -220,24 +220,28 @@ impl SecretPatterns {
     }
 
     fn strip_assignment_line(&self, line: &str, replaced: &mut u32) -> String {
-        let lower = line.to_lowercase();
+        // Offsets are found in the line itself, matched case-insensitively character by character.
+        // Searching a lower-cased copy and slicing the original with its offsets is wrong: case
+        // folding changes byte lengths for some characters, so an offset from the copy can land
+        // inside a character of the original and the slice panics.
         let mut best: Option<(usize, usize)> = None;
         for name in &self.assignment_names {
-            let mut from = 0usize;
-            while let Some(found) = lower[from..].find(name.as_str()) {
-                let start = from + found;
-                let after = start + name.len();
+            for (start, _) in line.char_indices() {
+                let Some(after) = matches_name(line, start, name) else {
+                    continue;
+                };
                 // The name has to stand on its own, so `tokens` does not match `token`.
-                let before_ok = start == 0
-                    || !lower[..start]
-                        .chars()
-                        .next_back()
-                        .is_some_and(is_name_character);
-                let separator = lower[after..]
+                if line[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(is_name_character)
+                {
+                    continue;
+                }
+                let separator = line[after..]
                     .char_indices()
                     .find(|(_, character)| !character.is_whitespace());
-                if before_ok
-                    && let Some((offset, character)) = separator
+                if let Some((offset, character)) = separator
                     && matches!(character, '=' | ':')
                 {
                     let value_from = after + offset + character.len_utf8();
@@ -245,7 +249,6 @@ impl SecretPatterns {
                         best = Some((start, value_from));
                     }
                 }
-                from = after;
             }
         }
         match best {
@@ -269,6 +272,23 @@ impl SecretPatterns {
             None => line.to_owned(),
         }
     }
+}
+
+/// Whether `name` appears at `start` in `line`, ignoring case, and where it ends.
+///
+/// Compared character by character against the line's own characters, so every offset this returns
+/// is an offset into the line rather than into a converted copy of it.
+fn matches_name(line: &str, start: usize, name: &str) -> Option<usize> {
+    let mut wanted = name.chars();
+    let mut end = start;
+    for held in line[start..].chars() {
+        let Some(wanted) = wanted.next() else { break };
+        if !held.to_lowercase().eq(wanted.to_lowercase()) {
+            return None;
+        }
+        end += held.len_utf8();
+    }
+    wanted.next().is_none().then_some(end)
 }
 
 fn is_credential_character(character: char) -> bool {
@@ -708,6 +728,26 @@ mod tests {
         let (text, replaced) = patterns.strip("tokens: 42\n");
         assert_eq!(text, "tokens: 42\n");
         assert_eq!(replaced, 0);
+    }
+
+    #[test]
+    fn text_whose_case_folding_changes_its_length_is_stripped_rather_than_breaking() {
+        // `İ` lower-cases to two characters, so an offset taken from a lower-cased copy would land
+        // inside the following character. Every one of these has to come back, replaced or not.
+        let patterns = SecretPatterns::default();
+        for line in [
+            "İ token=é\n",
+            "TOKEN: héllo-wörld\n",
+            "ﬁle token = value\n",
+            "İİİ nothing here\n",
+            "Token=İ\n",
+        ] {
+            let (text, _) = patterns.strip(line);
+            assert!(!text.is_empty(), "{line}");
+        }
+        let (text, replaced) = patterns.strip("İ token=é\n");
+        assert!(text.contains(REDACTION), "{text}");
+        assert_eq!(replaced, 1);
     }
 
     #[test]

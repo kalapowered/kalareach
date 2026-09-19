@@ -60,9 +60,9 @@ impl SessionFacts for ControllerFacts {
         _session_id: SessionId,
         _approval_request_id: &'a ApprovalRequestId,
     ) -> VoiceFuture<'a, Option<Digest256>> {
-        // This daemon holds no approval requests: they belong to the worker's agent binding, which
-        // it does not dispatch. Answering "none" is what refuses every approval decision by voice
-        // until that path exists, which is the safe answer rather than a convenient one.
+        // This daemon holds no approval requests: they belong to the worker's agent binding,
+        // which it does not dispatch. Answering "none" refuses the decision, which is the safe
+        // answer: a coordinator that invented the details would be verifying them against itself.
         Box::pin(async move { Ok(None) })
     }
 }

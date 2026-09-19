@@ -88,7 +88,11 @@ impl VoiceModule {
         runtime_root: &std::path::Path,
     ) -> Option<Arc<dyn ManagedVoiceService>> {
         let origin = origin?;
-        let tokens = Arc::new(kr_voice::broker::AccountTokenFile::under(runtime_root));
+        // Bound to the origin this host is configured to reach, so a token issued for another
+        // service is refused before a request carries it.
+        let tokens = Arc::new(
+            kr_voice::broker::AccountTokenFile::under(runtime_root).for_origin(origin.clone()),
+        );
         ManagedVoiceBroker::new(origin, http, tokens)
             .ok()
             .map(|broker| Arc::new(broker) as Arc<dyn ManagedVoiceService>)

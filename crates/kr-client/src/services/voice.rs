@@ -1204,22 +1204,34 @@ impl StoredAccountToken {
 /// Read each time rather than held: the operator replaces an expired token by importing a new one,
 /// and a host that read the file once at startup would keep presenting the old one until it was
 /// restarted.
+///
+/// The origin is part of it. A token is a bearer credential for one service, so this reader
+/// refuses to hand one over for an origin it was not issued for: a configuration that named a
+/// different service would otherwise disclose the credential to it.
 #[derive(Clone, Debug)]
 pub struct AccountTokenFile {
     path: std::path::PathBuf,
+    origin: Option<String>,
 }
 
 impl AccountTokenFile {
-    /// Reads the token from this path.
+    /// Reads the token from this path, for any origin it names.
     #[must_use]
     pub fn at(path: std::path::PathBuf) -> Self {
-        Self { path }
+        Self { path, origin: None }
     }
 
     /// Reads the token from the ordinary place under a runtime root.
     #[must_use]
     pub fn under(runtime_root: &std::path::Path) -> Self {
         Self::at(account_token_path(runtime_root))
+    }
+
+    /// Binds this reader to one origin, which the stored token has to name.
+    #[must_use]
+    pub fn for_origin(mut self, origin: impl Into<String>) -> Self {
+        self.origin = Some(origin.into());
+        self
     }
 
     /// The file this reads.
@@ -1259,6 +1271,20 @@ impl AccountTokenFile {
 impl AccountTokenSource for AccountTokenFile {
     fn token(&self) -> Result<AccountToken> {
         let stored = self.stored()?;
+        if let Some(origin) = self.origin.as_deref()
+            && stored.origin != origin
+        {
+            // Refused before the request is built, so the token never reaches a service it was not
+            // issued for. The refusal names the origins and never the token.
+            return Err(ClientError::Host(ProtocolError::new(
+                ErrorCode::HostNotConfigured,
+                format!(
+                    "the imported account token belongs to {} and this host is configured to \
+                     reach {origin}",
+                    stored.origin
+                ),
+            )));
+        }
         if !stored.carries(VOICE_SCOPE) {
             return Err(ClientError::Host(ProtocolError::new(
                 ErrorCode::PermissionDenied,
@@ -1436,6 +1462,36 @@ mod tests {
             let error = StoredAccountToken::read(bad).expect_err("refused");
             assert!(!error.to_string().contains("a-secret-value"), "{error}");
         }
+    }
+
+    #[test]
+    fn a_token_is_not_handed_to_an_origin_it_was_not_issued_for() {
+        let directory = std::env::temp_dir().join(format!("kr-token-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).expect("a directory on the internal disk");
+        let path = account_token_path(&directory);
+        let stored = StoredAccountToken::read(
+            br#"{"origin":"https://reach.example","accessToken":"a-secret-value",
+                 "scopes":["voice"]}"#,
+        )
+        .expect("a token document");
+        kr_ipc::paths::write_owner_only_file(&path, &stored.write().expect("bytes"))
+            .expect("the stored token");
+
+        let error = AccountTokenFile::at(path.clone())
+            .for_origin("https://elsewhere.example")
+            .token()
+            .expect_err("a token is not sent to another service");
+        assert!(!error.to_string().contains("a-secret-value"), "{error}");
+        assert!(error.to_string().contains("elsewhere.example"));
+
+        assert!(
+            AccountTokenFile::at(path.clone())
+                .for_origin("https://reach.example")
+                .token()
+                .is_ok()
+        );
+        std::fs::remove_file(&path).expect("the stored token is removed");
+        std::fs::remove_dir(&directory).expect("the directory is removed");
     }
 
     #[test]

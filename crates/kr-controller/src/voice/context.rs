@@ -114,16 +114,33 @@ impl ContextSource for FilteredContext {
             let filter = HistoryFilter::new(scope_of(&request.grant));
             let mut withheld = snapshot.unavailable.clone();
 
-            let selected: Vec<SelectedItem> = snapshot
-                .selected
-                .into_iter()
-                .filter_map(|entry| {
-                    admit_one(&filter, Some(entry.item), &mut withheld).map(|item| SelectedItem {
+            // Selecting a class is a person saying they want it, not authority to read it. File
+            // contents and attachment bytes need the grant's own file right on top of the history
+            // bound, which is the filter's `admit_attachment_bytes` question rather than its
+            // timestamp one.
+            let mut selected: Vec<SelectedItem> = Vec::new();
+            for entry in snapshot.selected {
+                let needs_file_right = matches!(
+                    entry.class,
+                    kr_protocol::voice::VoiceContextClass::FileContents
+                        | kr_protocol::voice::VoiceContextClass::AttachmentBytes
+                );
+                if needs_file_right
+                    && let Err(reason) = filter.admit_attachment_bytes(entry.item.produced_at_ms)
+                {
+                    withheld.push(WithheldRun {
+                        reason: format!("{}: {reason}", entry.class),
+                        count: 1,
+                    });
+                    continue;
+                }
+                if let Some(item) = admit_one(&filter, Some(entry.item), &mut withheld) {
+                    selected.push(SelectedItem {
                         class: entry.class,
                         item,
-                    })
-                })
-                .collect();
+                    });
+                }
+            }
 
             Ok(GatheredContext {
                 session_description: admit_one(&filter, snapshot.description, &mut withheld),
