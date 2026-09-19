@@ -444,15 +444,23 @@ fn check_error_payload(error: &serde_json::Value, field: &str) -> Result<()> {
             "{field} is not an object, so it reports no failure"
         ))
     })?;
-    // JSON-RPC §5.1 asks for an integer, and not for one that fits a signed 64-bit word: a code
-    // above that range is still an integer. What is not accepted is a code parsed as a floating
-    // number, because parsing has already rounded it: 1.00000000000000001 arrives as 1.0 and
-    // 1e-400 as 0.0, so a fractional code would be admitted as a whole one. A conforming upstream
-    // writes an integer, and this host does not guess at what a rounded one meant.
+    // JSON-RPC §5.1 asks for an integer value. It does not ask for one that fits a signed 64-bit
+    // word, and it does not fix a spelling: -32601, -32601.0 and -3.2601e4 are one integer, and a
+    // code above the signed range is still one. All of those are accepted, because refusing a
+    // real answer leaves its resource pending for ever, which is worse than reporting the value
+    // this host read.
+    //
+    // What this cannot do is tell a value that needed more precision than a double from the value
+    // it became: 1.00000000000000001 arrives as 1.0. Telling them apart needs lossless number
+    // parsing, which is a dependency feature rather than a check; the handoff records it.
     let integral = object
         .get("code")
         .and_then(serde_json::Value::as_number)
-        .is_some_and(|code| code.is_i64() || code.is_u64());
+        .is_some_and(|code| {
+            code.is_i64()
+                || code.is_u64()
+                || code.as_f64().is_some_and(|value| value.fract() == 0.0)
+        });
     if !integral {
         return Err(BrokerError::invalid(format!(
             "{field} carries no integer code, so it reports no failure"
