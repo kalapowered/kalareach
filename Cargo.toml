@@ -57,7 +57,9 @@ iroh-relay = { version = "=1.2.0", default-features = false }
 keyring = "=4.2.0"
 kr-cbor = { path = "crates/kr-cbor", version = "=0.1.0" }
 kr-cli = { path = "crates/kr-cli", version = "=0.1.0" }
-kr-client = { path = "crates/kr-client", version = "=0.1.0" }
+# The shared native client. Its local-terminal path is a feature rather than a default here, so a
+# member says whether it has a terminal to paint; the desktop and host crates turn it on.
+kr-client = { path = "crates/kr-client", version = "=0.1.0", default-features = false }
 kr-controller = { path = "crates/kr-controller", version = "=0.1.0" }
 kr-crypto = { path = "crates/kr-crypto", version = "=0.1.0" }
 kr-ipc = { path = "crates/kr-ipc", version = "=0.1.0" }

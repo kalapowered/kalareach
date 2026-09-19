@@ -108,9 +108,13 @@ export function TopBar({
       </span>
       <h1>{title}</h1>
       <span className="m-topbar-side">{action}</span>
-      <p className="m-connection">
+      <p className="m-connection" title={connection.reason ?? undefined}>
         <span className={`status-dot${connection.connected ? '' : ' offline'}`} aria-hidden="true" />
-        {connection.connected ? 'In contact with this host' : (connection.reason ?? 'Not in contact')}
+        <span>
+          {connection.connected
+            ? 'In contact with this host'
+            : (connection.reason ?? 'Not in contact')}
+        </span>
       </p>
     </header>
   )

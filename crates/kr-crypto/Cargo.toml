@@ -26,6 +26,14 @@ subtle.workspace = true
 thiserror.workspace = true
 zeroize.workspace = true
 
+# The Apple mobile systems. `keyring`'s default backend set turns on the Apple keychain store
+# without its protected-data mode, and that store refuses to build for iOS without it: an item
+# there is readable only after the device has been unlocked once, which is the only accessibility
+# class a key on a phone should have. The feature is named here rather than in whatever happens to
+# link this crate, because it is this crate's keychain backend and this crate's decision.
+[target.'cfg(all(target_vendor = "apple", not(target_os = "macos")))'.dependencies]
+apple-native-keyring-store = { version = "=1.0.2", features = ["protected"] }
+
 [dependencies.serde]
 workspace = true
 

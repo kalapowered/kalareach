@@ -17,13 +17,27 @@ kr-ipc.workspace = true
 # renders what packages produce, so the contract it renders against is the package contract's.
 kr-plugin-sdk.workspace = true
 kr-protocol.workspace = true
-kr-term.workspace = true
+# Only the projected screen needs it, and only a client with a local terminal to paint has one.
+kr-term = { workspace = true, optional = true }
 kr-transport.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+
+[features]
+# Everything a client with a terminal on the same machine needs, which is everything.
+default = ["terminal"]
+# The projected screen and the pinned Unicode width model it measures runs with.
+#
+# It is a feature rather than always present because the width model is measured by a terminal
+# state library whose own dependency does not build for Apple's mobile systems, and because a
+# phone has no local terminal to paint: it reads a host's projection as protocol values and draws
+# them itself. A mobile client therefore takes this library without this feature, and everything
+# else in it -- sessions, cursors, drafts, controls, the encoder, transports and uploads -- is the
+# same code on every platform.
+terminal = ["dep:kr-term"]
 
 [dev-dependencies]
 iroh = { workspace = true, features = ["test-utils"] }

@@ -32,16 +32,35 @@ targets:
     sources:
       - path: ../../../native/ios/NotificationService
       - path: ../../../native/ios/Shared
+    # The description is written here rather than kept as a file beside the Swift, because the
+    # project generator rewrites whatever path this names and would silently replace a hand-written
+    # one with its own defaults -- which is how an extension ends up with no extension point and a
+    # version its application does not share.
     info:
-      path: ../../../native/ios/NotificationService/Info.plist
+      path: KalaReachNotificationService/Info.plist
+      properties:
+        CFBundleDisplayName: KalaReach Notifications
+        CFBundlePackageType: XPC!
+        # An extension's version has to be its application's, or the system refuses to install it.
+        CFBundleShortVersionString: 0.1.0
+        CFBundleVersion: "0.1.0"
+        KRSharedKeychainGroup: $(AppIdentifierPrefix)to.kala.reach.companion.shared
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+    # The one thing this extension is entitled to: the access group holding the limited preview
+    # key. It is deliberately not the application's own group, so the device authorisation key,
+    # which lives there, is out of this process's reach entirely. Written here for the same reason
+    # the description above is: the generator owns this file and rewrites whatever it names.
     entitlements:
-      path: ../../../native/ios/NotificationService/KalaReachNotificationService.entitlements
+      path: KalaReachNotificationService/KalaReachNotificationService.entitlements
+      properties:
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)to.kala.reach.companion.shared
     settings:
       base:
         PRODUCT_NAME: KalaReachNotificationService
         PRODUCT_BUNDLE_IDENTIFIER: to.kala.reach.companion.notifications
-        INFOPLIST_FILE: ../../../native/ios/NotificationService/Info.plist
-        CODE_SIGN_ENTITLEMENTS: ../../../native/ios/NotificationService/KalaReachNotificationService.entitlements
         SKIP_INSTALL: true
 
   # The native decisions, built and run without the application, so the four cases the
@@ -106,10 +125,22 @@ targets:
           Choose a photo or a video to attach it to a session on one of your hosts.
         NSMicrophoneUsageDescription:
           Speak to a session on one of your hosts.
+        # The keychain group the extension shares with this application, with the team prefix the
+        # build resolves. Swift does not expand build variables inside a string literal, so the
+        # one place the expanded value exists is the description the build writes.
+        KRSharedKeychainGroup: $(AppIdentifierPrefix)to.kala.reach.companion.shared
         UIBackgroundModes:
           - remote-notification
+    # Remote notifications, and the two keychain groups this application writes to. The shared
+    # group holds one limited key that the notification extension reads; the application's own
+    # group holds everything the extension must never see.
     entitlements:
-      path: ../../../native/ios/App/companion-tauri_iOS.entitlements
+      path: companion-tauri_iOS/companion-tauri_iOS.entitlements
+      properties:
+        aps-environment: development
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)to.kala.reach.companion.shared
+          - $(AppIdentifierPrefix)to.kala.reach.companion
     scheme:
       environmentVariables:
         RUST_BACKTRACE: full
@@ -130,6 +161,9 @@ targets:
       - target: KalaReachNotificationService
       - sdk: AVFoundation.framework
       - sdk: UserNotifications.framework
+      # The shared client reads this device's own network interfaces to decide how it can reach a
+      # host. On this platform that reader is System Configuration, which the application links.
+      - sdk: SystemConfiguration.framework
       - sdk: CoreGraphics.framework
       - sdk: Metal.framework
       - sdk: MetalKit.framework

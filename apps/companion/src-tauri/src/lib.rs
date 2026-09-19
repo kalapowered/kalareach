@@ -47,9 +47,8 @@ pub use state::AppState;
 /// Panics when the window cannot be created, which is not a condition the application can
 /// continue past.
 ///
-/// iOS and Android do not run a binary of their own: the system starts the process and calls into
-/// this library, so the same function that opens the desktop window is the mobile entry point.
-#[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// iOS and Android do not run a binary of their own: the system starts the process and calls
+/// into this library. [`mobile`] is where that call arrives.
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
@@ -66,6 +65,29 @@ pub fn run() {
         })
         .run(tauri::generate_context!())
         .expect("the companion window could not be created");
+}
+
+/// The entry point the phone's own runtime calls.
+///
+/// A desktop build runs a binary whose `main` calls [`run`]. iOS and Android start the process
+/// themselves and call a C entry point instead, which the framework's macro writes beside the
+/// function it is put on. That generated item carries no documentation of its own and there is
+/// nowhere to put any, so the rule is relaxed for this module and for nothing else.
+#[cfg(mobile)]
+pub mod mobile {
+    #![allow(
+        missing_docs,
+        reason = "the platform's entry point is written by the framework's macro"
+    )]
+
+    /// Starts the application on a phone.
+    ///
+    /// The same `run` the desktop window uses. There is no second application here: a phone and a
+    /// desktop differ in how the process begins, and in nothing after that.
+    #[tauri::mobile_entry_point]
+    pub fn start() {
+        super::run();
+    }
 }
 
 /// Records what the platform drops on this window, and tells the interface about it.

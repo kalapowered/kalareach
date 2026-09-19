@@ -6,18 +6,27 @@
 //!
 //! | Platform | Boot identity | Process start identity |
 //! | --- | --- | --- |
-//! | Linux | `/proc/sys/kernel/random/boot_id` | `/proc/<pid>/stat` field 22 |
+//! | Linux, Android | `/proc/sys/kernel/random/boot_id` | `/proc/<pid>/stat` field 22 |
 //! | macOS | `kern.bootsessionuuid` | `proc_pidinfo(PROC_PIDTBSDINFO)` |
 //! | Windows | the recorded boot time | the process creation time in whole seconds |
+//! | iOS and the other Apple mobile systems | refused by name | refused by name |
+//!
+//! Android is Linux and reads the same two files. The Apple mobile systems are the one case where
+//! the facility is not there at all: an application runs in a sandbox that cannot enumerate
+//! processes, cannot read another process's start time, and cannot read the boot session
+//! identifier. Every call there refuses and says so, because a host that is handed a stub is a
+//! host that believes something nobody established.
 //!
 //! The Windows values come from `sysinfo`, which reports the boot time as the wall clock minus the
 //! uptime and the creation time in whole seconds. Both are coarser than the kernel's own values;
 //! the Windows qualification pass narrows them, and a Windows worker's per-session Job Object
 //! carries the ownership a recycled identifier could otherwise confuse.
 
-use kr_protocol::identity::{
-    BootIdentity, BootIdentitySource, ProcessStartIdentity, ProcessStartSource,
-};
+use kr_protocol::identity::{BootIdentity, ProcessStartIdentity, ProcessStartSource};
+// Only a platform that produces a boot identity names where it came from. The Apple mobile
+// systems refuse instead, so on those targets nothing here has a source to name.
+#[cfg(not(all(target_vendor = "apple", not(target_os = "macos"))))]
+use kr_protocol::identity::BootIdentitySource;
 use kr_protocol::ids::BootEpoch;
 
 use crate::error::{IpcError, Result};
@@ -225,7 +234,10 @@ fn unavailable(what: &'static str, detail: impl Into<String>) -> IpcError {
     }
 }
 
-#[cfg(target_os = "linux")]
+// Android is Linux underneath: the same `/proc` entries, in the same format, with the same
+// meaning. It is named beside it rather than left to fall through, because a target with no
+// platform module at all is a target that does not compile.
+#[cfg(any(target_os = "linux", target_os = "android"))]
 mod platform {
     use super::{
         BootIdentity, BootIdentitySource, ProcessStartIdentity, ProcessStartSource, Result,
@@ -665,6 +677,79 @@ mod platform {
     }
 }
 
+/// The Apple systems that are not macOS: iOS, iPadOS and their siblings.
+///
+/// Every function here refuses and names what is missing. That is not a gap waiting to be filled:
+/// an application on these systems runs in a sandbox with no way to enumerate processes, no way to
+/// read another process's start time, and no access to the boot session identifier. A stub that
+/// answered would be the worst possible outcome, because every caller in this repository uses
+/// these answers to decide whether a process it recorded is still the one it recorded.
+///
+/// Nothing on these systems runs a host. The module exists so the client library that a phone
+/// links compiles, and so that anything which did ask would be told, by name, that the answer is
+/// not available rather than handed one that was invented.
+#[cfg(all(target_vendor = "apple", not(target_os = "macos")))]
+mod platform {
+    use super::{BootIdentity, ProcessStartIdentity, ProcessStartSource, Result, unavailable};
+
+    /// What every refusal in this module says, after the name of what was asked for.
+    const SANDBOXED: &str =
+        "this Apple system sandboxes an application away from process and boot identity; there is \
+         no host on this device to identify";
+
+    pub(super) fn boot_identity() -> Result<BootIdentity> {
+        Err(unavailable("boot identity", SANDBOXED))
+    }
+
+    pub(super) fn process_start_identity(pid: u32) -> Result<ProcessStartIdentity> {
+        Err(unavailable(
+            "process start identity",
+            format!("pid {pid}: {SANDBOXED}"),
+        ))
+    }
+
+    pub(super) fn processes_in_group(group: u32) -> Result<Vec<u32>> {
+        Err(unavailable("process group", format!("group {group}: {SANDBOXED}")))
+    }
+
+    pub(super) fn processes_on_terminal(terminal: u32) -> Result<Vec<u32>> {
+        Err(unavailable(
+            "controlling terminal",
+            format!("terminal {terminal}: {SANDBOXED}"),
+        ))
+    }
+
+    pub(super) fn controlling_terminal(pid: u32) -> Result<Option<u32>> {
+        Err(unavailable(
+            "controlling terminal",
+            format!("pid {pid}: {SANDBOXED}"),
+        ))
+    }
+
+    /// Where a start value would come from if this system produced one.
+    ///
+    /// It never does. The constant exists because [`super::ended_process_identity`] names the
+    /// source beside the reserved "nobody read this" value, and the Darwin kernel underneath is
+    /// the source such a reading would have come from.
+    pub(super) const START_IDENTITY_SOURCE: ProcessStartSource =
+        ProcessStartSource::MacosProcBsdInfo;
+
+    /// Unreachable: nothing here ever produces an identity that could match a recorded one.
+    pub(super) const fn liveness(_pid: u32, _start_value: u64) -> super::ProcessState {
+        super::ProcessState::Unknown {
+            detail: String::new(),
+        }
+    }
+
+    /// Whether a failure means the process is gone. It never does here: nothing was ever read.
+    ///
+    /// Answering true would turn "this system will not tell me" into "the process has ended",
+    /// which is the one conversion section 9 forbids.
+    pub(super) const fn is_absent(_error: &crate::error::IpcError) -> bool {
+        false
+    }
+}
+
 #[cfg(windows)]
 mod platform {
     use super::{
@@ -765,14 +850,14 @@ mod tests {
     /// Waits until a child has ended without collecting its status, using the platform's own view
     /// of it rather than the reading under test.
     ///
-    /// On Linux the state character of `/proc/<pid>/stat` becomes `Z`; on macOS the kernel stops
-    /// describing the process, which `libproc` reports as "No such process". Collecting the status
-    /// is what would remove the case, so nothing here does.
+    /// On Linux and Android the state character of `/proc/<pid>/stat` becomes `Z`; on macOS the
+    /// kernel stops describing the process, which `libproc` reports as "No such process".
+    /// Collecting the status is what would remove the case, so nothing here does.
     #[cfg(unix)]
     fn wait_until_it_has_ended(pid: u32) {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             let ended = std::fs::read_to_string(format!("/proc/{pid}/stat"))
                 .ok()
                 .and_then(|text| {
@@ -780,7 +865,7 @@ mod tests {
                     tail.split_whitespace().next()?.chars().next()
                 })
                 .is_some_and(|state| state == 'Z');
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "android")))]
             let ended = process_start_identity(pid).is_err();
             if ended {
                 return;
@@ -814,14 +899,14 @@ mod tests {
 
         let named = started_process_identity(pid).expect("the host names what it started");
         assert_eq!(named.pid.get(), u64::from(pid));
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         assert_ne!(
             named.start_value.get(),
             START_VALUE_UNREAD,
             "this platform still describes a process whose status nobody has collected, so the \
              reading is the kernel's own"
         );
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "android")))]
         assert_eq!(
             named.start_value.get(),
             START_VALUE_UNREAD,

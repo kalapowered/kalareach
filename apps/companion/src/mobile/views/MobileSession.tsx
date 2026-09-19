@@ -31,6 +31,7 @@ import {
   sent,
   settled,
   stateOfReceipt,
+  unresolved,
   wasRefused,
   failed
 } from '../../model/receipts'
@@ -238,11 +239,17 @@ export function MobileSession({
     [port, say, sessionId]
   )
 
-  const banner = reconnectBanner(
-    connected,
-    lifecycle.state.submissions.filter((submission) => isForSession(submission.localId, sessionId))
+  const mine = lifecycle.state.submissions.filter((submission) =>
+    isForSession(submission.localId, sessionId)
   )
-  const blocked = notSubmittableBecause(draft)
+  const banner = reconnectBanner(connected, mine)
+  // A submission whose outcome nobody knows is the one case where sending again could run the
+  // same thing twice. Until a receipt settles it, this session sends nothing more.
+  const waiting = unresolved(mine)
+  const blocked =
+    waiting.length > 0
+      ? `${waiting.length === 1 ? 'One action has' : `${waiting.length} actions have`} no confirmed outcome yet. Sending again could run it twice.`
+      : notSubmittableBecause(draft)
 
   return (
     <div className="m-session">
@@ -258,6 +265,13 @@ export function MobileSession({
           />
         ) : null}
         {banner ? <Banner tone={banner.tone} title={banner.title} detail={banner.detail} /> : null}
+        {lifecycle.durable ? null : (
+          <Banner
+            tone="warning"
+            title="This device will not keep what you write"
+            detail="Storage refused it. The draft is here and you can still send it; it will not survive the application being closed."
+          />
+        )}
         <Segmented
           label="Session view"
           value={pane}
@@ -421,7 +435,7 @@ export function MobileSession({
         <div className="m-composer-actions">
           <Button
             tone="primary"
-            disabled={!submittable(draft) || busy}
+            disabled={!submittable(draft) || busy || waiting.length > 0}
             style={{ minBlockSize: target }}
             onClick={() => {
               send(draft.text)

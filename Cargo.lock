@@ -4073,6 +4073,7 @@ dependencies = [
 name = "kr-crypto"
 version = "0.1.0"
 dependencies = [
+ "apple-native-keyring-store",
  "hex",
  "hkdf 0.13.0",
  "hmac 0.13.0",

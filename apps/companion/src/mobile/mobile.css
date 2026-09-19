@@ -87,10 +87,25 @@
 .m-connection {
   grid-column: 1 / -1;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: var(--gap-2);
   font-size: 0.8125rem;
+  line-height: 1.4;
   color: var(--muted);
+}
+
+/*
+ * A host's own words about why there is no connection can be a sentence or a path. Two lines is
+ * the most a title bar can give it before the bar stops being a bar; the whole of it stays on the
+ * element, so a screen reader and a long press still get all of it.
+ */
+.m-connection > span:last-child {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  overflow: hidden;
+  overflow-wrap: anywhere;
 }
 
 .m-main {

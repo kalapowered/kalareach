@@ -19,7 +19,7 @@ path = "src/bin/kr-attach-guard.rs"
 [dependencies]
 clap.workspace = true
 kr-cbor.workspace = true
-kr-client.workspace = true
+kr-client = { workspace = true, features = ["terminal"] }
 kr-ipc.workspace = true
 kr-protocol.workspace = true
 kr-shell-integration.workspace = true

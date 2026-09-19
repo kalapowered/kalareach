@@ -39,7 +39,7 @@ exacl.workspace = true
 [dev-dependencies]
 iroh-relay = { workspace = true, features = ["server", "test-utils"] }
 kr-cbor.workspace = true
-kr-client.workspace = true
+kr-client = { workspace = true, features = ["terminal"] }
 kr-crypto.workspace = true
 kr-ipc = { workspace = true, features = ["testing"] }
 kr-transfer.workspace = true

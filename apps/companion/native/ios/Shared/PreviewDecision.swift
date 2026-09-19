@@ -89,6 +89,8 @@ struct PreviewDecider {
         } catch PreviewKeyUnavailable.lockedBeforeFirstUnlock {
             return .generic(.lockedBeforeFirstUnlock)
         } catch {
+            // Including a build that states no shared group: there is no key to be had, which is
+            // the same answer to the person and a different one to whoever configures the build.
             return .generic(.keyUnavailable)
         }
 

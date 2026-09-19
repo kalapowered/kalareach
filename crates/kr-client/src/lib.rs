@@ -45,6 +45,11 @@ pub mod drafts;
 pub mod encoder;
 pub mod error;
 pub mod ipc;
+/// The projected screen a client paints, and the pinned Unicode width model it measures with.
+///
+/// Present when the `terminal` feature is on, which is the default. A client on a system with no
+/// local terminal takes this library without it; nothing else in the library changes.
+#[cfg(feature = "terminal")]
 pub mod projection;
 pub mod reconnect;
 pub mod retry;

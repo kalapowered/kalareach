@@ -22,12 +22,12 @@ tauri-build = { workspace = true, features = [] }
 
 [dependencies]
 kr-cbor.workspace = true
-# The shared native client: sessions, cursors, projection, drafts, controls and the upload path.
+# The shared native client: sessions, cursors, drafts, controls and the upload path. The projected
+# screen it can also paint is a desktop window's; see the target table below.
 kr-client.workspace = true
 # Where the host on this machine keeps its runtime directory and its controller endpoint.
 kr-ipc.workspace = true
 kr-protocol.workspace = true
-kr-term.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -38,6 +38,14 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 ureq.workspace = true
+
+# The three desktop targets. A desktop window paints a local terminal view; a phone has no local
+# terminal, and reads a host's projection as protocol values and draws them itself, so the mobile
+# builds take the shared client without the part that measures a screen with a terminal state
+# library.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
+kr-client = { workspace = true, features = ["terminal"] }
+kr-term.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # The platform user-verification ceremony section 10 asks for on an unlocked owner device.

@@ -24,9 +24,10 @@ enum StoredKeyPurpose: String {
 
 /// Writes and removes keys the application owns.
 struct SecureKeys {
-    let accessGroup: String
+    /// The group the extension shares, or nil when this build states none.
+    let accessGroup: String?
 
-    init(accessGroup: String = PreviewKeyLocation.shared.accessGroup) {
+    init(accessGroup: String? = PreviewKeyLocation.shared.accessGroup) {
         self.accessGroup = accessGroup
     }
 
@@ -45,6 +46,11 @@ struct SecureKeys {
         // Only the preview key is shared with the extension. The authorisation key stays in the
         // application's own keychain, where an extension cannot reach it at all.
         if purpose == .notificationPreview {
+            guard let accessGroup else {
+                // Writing it into this process's own group would put a key where the extension
+                // cannot read it, and the person would see generic alerts with no explanation.
+                return errSecMissingEntitlement
+            }
             item[kSecAttrAccessGroup as String] = accessGroup
         }
         SecItemDelete(item as CFDictionary)
@@ -58,7 +64,7 @@ struct SecureKeys {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: purpose.rawValue,
         ]
-        if purpose == .notificationPreview {
+        if purpose == .notificationPreview, let accessGroup {
             query[kSecAttrAccessGroup as String] = accessGroup
         }
         return SecItemDelete(query as CFDictionary)

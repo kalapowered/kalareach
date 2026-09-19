@@ -20,12 +20,14 @@
 		2649DEFDEEC785F1D317F0E7 /* SharedClientPreviewOpener.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2FBC109CA076DAECFD6A7BA /* SharedClientPreviewOpener.swift */; };
 		4885115428043D10878AD99B /* PreviewDecisionTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 706D722741B57C9A76DDE572 /* PreviewDecisionTests.swift */; };
 		4E93831717B567BEBE15595F /* SigningGate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E49D3EC99878D20FEB66A165 /* SigningGate.swift */; };
+		557BCD21D6575EA5F9F5943B /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = BED7978EB7718B27C0AC5311 /* SystemConfiguration.framework */; };
 		5D27A11CFB87F37C191F9A5F /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 343C7C2C560F586215BF9C3F /* UIKit.framework */; };
 		5E149929F729886E49F1C45D /* KalaReachNotificationService.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = E1E868E93CDD5B82672A098F /* KalaReachNotificationService.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		70CE80D39ED8CF570A2B5323 /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 3121E24E1630B06FCF24ECAF /* QuartzCore.framework */; };
 		7999A20AD4AAB5D34E7ABE73 /* SharedClientPreviewOpener.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2FBC109CA076DAECFD6A7BA /* SharedClientPreviewOpener.swift */; };
 		865E8AD7457D4A8EC288015A /* AVFoundation.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 5AAECC7799B8A609EB72D33A /* AVFoundation.framework */; };
 		8C8D5305283EBB3006AE42A4 /* PushRegistration.swift in Sources */ = {isa = PBXBuildFile; fileRef = 529A8B9ADD788615F4718EB0 /* PushRegistration.swift */; };
+		8CE20AA17B4AA21E1A84B19E /* libapp.a in Resources */ = {isa = PBXBuildFile; fileRef = D2F94BCB7283BE2B071B831A /* libapp.a */; };
 		94997D5DBE6F90518D2BE6DD /* ShareSurface.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9BF8072943115F58C78CD7C9 /* ShareSurface.swift */; };
 		9611CBDD46D19D11C8953D90 /* AudioSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */; };
 		9F96FAB734A2805527D6C967 /* PreviewKeyStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */; };
@@ -83,7 +85,6 @@
 		2F00C93CA5C2053EBDAFC692 /* AudioSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AudioSession.swift; sourceTree = "<group>"; };
 		3121E24E1630B06FCF24ECAF /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
 		343C7C2C560F586215BF9C3F /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
-		38E5231699C860EAF27439F4 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
 		3CC3E46F612EC707E33F9F70 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		412BDBEDD8769295934D66CB /* export.rs */ = {isa = PBXFileReference; path = export.rs; sourceTree = "<group>"; };
 		44742EC6AF3996B2AFF2B07C /* connection.rs */ = {isa = PBXFileReference; path = connection.rs; sourceTree = "<group>"; };
@@ -106,9 +107,11 @@
 		A9011D4AFA5E6579D9C0375B /* transfers.rs */ = {isa = PBXFileReference; path = transfers.rs; sourceTree = "<group>"; };
 		B2DF4188C16A66634654971D /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
 		BC81452583E1A11378351821 /* SecureKeys.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SecureKeys.swift; sourceTree = "<group>"; };
+		BED7978EB7718B27C0AC5311 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
 		C15A1EF36EA93C10648831F5 /* PreviewKeyStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewKeyStore.swift; sourceTree = "<group>"; };
 		C64D4F0C05D1651BEE197024 /* target.rs */ = {isa = PBXFileReference; path = target.rs; sourceTree = "<group>"; };
 		C8E0CA9FEDBBA8EFF556A6DD /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
+		D2F94BCB7283BE2B071B831A /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		D806D2225CDFB68693658DC5 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
 		DA7F7F5739685BC591FB8A2D /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
 		DDE37B0958E4AC5AF8580121 /* PreviewEnvelope.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreviewEnvelope.swift; sourceTree = "<group>"; };
@@ -118,7 +121,6 @@
 		E8C92E50E96FEA4B90C404F3 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
 		EFCAE40843BC63A27D3A8FF8 /* pairing.rs */ = {isa = PBXFileReference; path = pairing.rs; sourceTree = "<group>"; };
 		F2FBC109CA076DAECFD6A7BA /* SharedClientPreviewOpener.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SharedClientPreviewOpener.swift; sourceTree = "<group>"; };
-		FA1ED7F1EC44C683626C13E6 /* KalaReachNotificationService.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = KalaReachNotificationService.entitlements; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -129,6 +131,7 @@
 				F683A3B4BC275D0384F922CF /* libapp.a in Frameworks */,
 				865E8AD7457D4A8EC288015A /* AVFoundation.framework in Frameworks */,
 				F4984261D3997326A7756045 /* UserNotifications.framework in Frameworks */,
+				557BCD21D6575EA5F9F5943B /* SystemConfiguration.framework in Frameworks */,
 				0EDC15DCA7A4E554312092F4 /* CoreGraphics.framework in Frameworks */,
 				1AABAD0361650C489DA8812E /* Metal.framework in Frameworks */,
 				AA8AFDF8D79B4556939EC269 /* MetalKit.framework in Frameworks */,
@@ -188,6 +191,7 @@
 		8C72BD05AE26F57E26052278 /* Externals */ = {
 			isa = PBXGroup;
 			children = (
+				A38267FFFD67559C69CE0DEC /* arm64 */,
 			);
 			path = Externals;
 			sourceTree = "<group>";
@@ -213,15 +217,29 @@
 			path = ../../src;
 			sourceTree = "<group>";
 		};
+		97E3E5595AC5957A565FFB1B /* debug */ = {
+			isa = PBXGroup;
+			children = (
+				D2F94BCB7283BE2B071B831A /* libapp.a */,
+			);
+			path = debug;
+			sourceTree = "<group>";
+		};
 		9D3A5870D6FBA6CDB99C2560 /* NotificationService */ = {
 			isa = PBXGroup;
 			children = (
-				38E5231699C860EAF27439F4 /* Info.plist */,
-				FA1ED7F1EC44C683626C13E6 /* KalaReachNotificationService.entitlements */,
 				C8E0CA9FEDBBA8EFF556A6DD /* NotificationService.swift */,
 			);
 			name = NotificationService;
 			path = ../../../native/ios/NotificationService;
+			sourceTree = "<group>";
+		};
+		A38267FFFD67559C69CE0DEC /* arm64 */ = {
+			isa = PBXGroup;
+			children = (
+				97E3E5595AC5957A565FFB1B /* debug */,
+			);
+			path = arm64;
 			sourceTree = "<group>";
 		};
 		A8267576D0426DF97270ACD4 /* companion-tauri_iOS */ = {
@@ -288,6 +306,7 @@
 				860B01BDA0495D0568077001 /* MetalKit.framework */,
 				3121E24E1630B06FCF24ECAF /* QuartzCore.framework */,
 				21EFF08FF9DFE8027EAA8B8F /* Security.framework */,
+				BED7978EB7718B27C0AC5311 /* SystemConfiguration.framework */,
 				343C7C2C560F586215BF9C3F /* UIKit.framework */,
 				019E652DB2C27D9CDAB07505 /* UserNotifications.framework */,
 				B2DF4188C16A66634654971D /* WebKit.framework */,
@@ -295,18 +314,11 @@
 			name = Frameworks;
 			sourceTree = "<group>";
 		};
-		"TEMP_9531DF7C-5FF0-42A2-A425-73DF67FAB6AC" /* x86_64 */ = {
+		"TEMP_42D3DF53-7B1C-4A4B-BA72-538DD4F56879" /* x86_64 */ = {
 			isa = PBXGroup;
 			children = (
 			);
 			path = x86_64;
-			sourceTree = "<group>";
-		};
-		"TEMP_AADF47A5-8660-40A3-BC2A-382A349439A0" /* arm64 */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			path = arm64;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -408,6 +420,7 @@
 				1128549C68FB9201F70F942C /* Assets.xcassets in Resources */,
 				A8E17259F8663586A25787F6 /* LaunchScreen.storyboard in Resources */,
 				1A05E5428BA1AFDCFB0F6367 /* assets in Resources */,
+				8CE20AA17B4AA21E1A84B19E /* libapp.a in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -498,8 +511,8 @@
 		0B172CCE49B18988F3404D39 /* debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = ../../../native/ios/NotificationService/KalaReachNotificationService.entitlements;
-				INFOPLIST_FILE = ../../../native/ios/NotificationService/Info.plist;
+				CODE_SIGN_ENTITLEMENTS = KalaReachNotificationService/KalaReachNotificationService.entitlements;
+				INFOPLIST_FILE = KalaReachNotificationService/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -521,7 +534,7 @@
 					arm64,
 				);
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = "../../../native/ios/App/companion-tauri_iOS.entitlements";
+				CODE_SIGN_ENTITLEMENTS = "companion-tauri_iOS/companion-tauri_iOS.entitlements";
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				ENABLE_BITCODE = NO;
 				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
@@ -569,7 +582,7 @@
 					arm64,
 				);
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
-				CODE_SIGN_ENTITLEMENTS = "../../../native/ios/App/companion-tauri_iOS.entitlements";
+				CODE_SIGN_ENTITLEMENTS = "companion-tauri_iOS/companion-tauri_iOS.entitlements";
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				ENABLE_BITCODE = NO;
 				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
@@ -612,8 +625,8 @@
 		B541E7FCB1D838EF89ED1E5A /* release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				CODE_SIGN_ENTITLEMENTS = ../../../native/ios/NotificationService/KalaReachNotificationService.entitlements;
-				INFOPLIST_FILE = ../../../native/ios/NotificationService/Info.plist;
+				CODE_SIGN_ENTITLEMENTS = KalaReachNotificationService/KalaReachNotificationService.entitlements;
+				INFOPLIST_FILE = KalaReachNotificationService/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",

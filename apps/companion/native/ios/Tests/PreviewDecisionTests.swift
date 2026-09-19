@@ -111,6 +111,17 @@ final class PreviewDecisionTests: XCTestCase {
         XCTAssertEqual(decision, .generic(.decryptionFailed))
     }
 
+    func testABuildThatStatesNoSharedGroupHasNoKeyToFind() throws {
+        // The group carries a team prefix only the build knows. A build that did not state one
+        // must not search its own default group and report the device as having no key.
+        let unstated = Bundle(for: PreviewDecisionTests.self)
+        XCTAssertNil(PreviewKeyLocation.resolvedGroup(bundle: unstated))
+
+        let decision = decider(keys: FailingKeys(.groupNotConfigured))
+            .decide(userInfo: payload(), nowMilliseconds: now)
+        XCTAssertEqual(decision, .generic(.keyUnavailable))
+    }
+
     func testTheRoutingIsReadExactlyAsTheProtocolDeclaresIt() throws {
         let envelope = try PreviewEnvelope.parse(userInfo: payload())
         XCTAssertEqual(envelope.routing.envelopeID, "e-1")

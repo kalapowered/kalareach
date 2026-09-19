@@ -52,13 +52,20 @@ export interface Lifecycle {
   readonly resume: (resumption: Resumption) => void
   /** Dismisses the banner without changing anything it described. */
   readonly acknowledge: () => void
+  /**
+   * True when this device refused to keep what was written.
+   *
+   * The draft is still here and still editable; what it will not do is survive the application
+   * being taken away. A person deserves to know that before they rely on it.
+   */
+  readonly durable: boolean
 }
 
 /** Holds the durable state across a suspension, a termination, a network change and a restart. */
 export function useLifecycle(storage?: Storage | null): Lifecycle {
   // One store per run, created once. A store built during render would be a new store on every
   // render, and the records the last one held would go with it.
-  const [durable] = useState<DurableStore>(() =>
+  const [store] = useState<DurableStore>(() =>
     storage === undefined
       ? deviceStore(typeof localStorage === 'undefined' ? null : localStorage)
       : storage === null
@@ -67,27 +74,28 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
   )
 
   const [resumption, setResumption] = useState<Resumption>(() =>
-    durable.read(RUN_MARKER) === null ? 'cold_start' : 'restarted'
+    store.read(RUN_MARKER) === null ? 'cold_start' : 'restarted'
   )
   const [state, setState] = useState<DurableState>(() => {
-    const restored = restore(durable)
+    const restored = restore(store)
     return restored.drafts.length === 0 && restored.submissions.length === 0
       ? EMPTY_DURABLE_STATE
       : restored
   })
   const [dismissed, setDismissed] = useState(false)
+  const [durable, setDurable] = useState(true)
 
   // The marker says a run has started here. A later run finding it knows there was one before,
   // which is all it can know: nothing on a phone is told that it is about to be terminated.
   useEffect(() => {
-    durable.write(RUN_MARKER, '1')
-  }, [durable])
+    store.write(RUN_MARKER, '1')
+  }, [store])
 
   // Every change is written as it happens, because a phone is not obliged to tell an application
   // it is about to be terminated. These two are a second chance rather than the only one.
   useEffect(() => {
     const write = () => {
-      persist(durable, state)
+      setDurable(persist(store, state))
     }
     const hidden = () => {
       if (document.visibilityState === 'hidden') write()
@@ -98,15 +106,15 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
       window.removeEventListener('pagehide', write)
       document.removeEventListener('visibilitychange', hidden)
     }
-  }, [durable, state])
+  }, [store, state])
 
   const resume = useCallback(
     (next: Resumption) => {
       setResumption(next)
       setDismissed(false)
-      setState((current) => onResume(next, current, durable))
+      setState((current) => onResume(next, current, store))
     },
-    [durable]
+    [store]
   )
 
   useEffect(() => {
@@ -132,22 +140,22 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
         const next = { ...current, drafts: change(current.drafts) }
         // Written straight away rather than on the way out as well: a draft a person typed one
         // keystroke before the system reclaimed the process is a draft that has to be there.
-        persist(durable, next)
+        setDurable(persist(store, next))
         return next
       })
     },
-    [durable]
+    [store]
   )
 
   const setSubmissions = useCallback(
     (change: (submissions: readonly Submission[]) => readonly Submission[]) => {
       setState((current) => {
         const next = { ...current, submissions: change(current.submissions) }
-        persist(durable, next)
+        setDurable(persist(store, next))
         return next
       })
     },
-    [durable]
+    [store]
   )
 
   const banner = dismissed ? null : recoveryBanner(resumption, summarise(state))
@@ -161,7 +169,8 @@ export function useLifecycle(storage?: Storage | null): Lifecycle {
     resume,
     acknowledge: () => {
       setDismissed(true)
-    }
+    },
+    durable
   }
 }
 

@@ -21,6 +21,13 @@ import { ask } from '../model/call'
 import { count, emptyMessage, filter, locationOf, order, type InboxFilter } from '../model/inbox'
 import { minimumTarget, type Surface } from '../platform'
 
+/** A host's own words, ended so the sentence after them reads as a second sentence. */
+function sentence(text: string): string {
+  const trimmed = text.trim()
+  if (trimmed.length === 0) return ''
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`
+}
+
 const FILTERS: readonly { readonly id: InboxFilter; readonly label: string }[] = [
   { id: 'all', label: 'Everything' },
   { id: 'pending_decision', label: 'Waiting for you' },
@@ -109,7 +116,7 @@ export function Inbox({
         <Banner
           tone="warning"
           title="The inbox could not be read"
-          detail={`${error} Anything running on your hosts is unaffected.`}
+          detail={`${sentence(error)} Anything running on your hosts is unaffected.`}
         />
       ) : null}
 

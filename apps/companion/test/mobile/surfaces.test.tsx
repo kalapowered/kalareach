@@ -309,3 +309,66 @@ function fakeStorage(): Storage {
     }
   }
 }
+
+describe('what a build must not let happen twice (KR-ACC-012)', () => {
+  it('will not send again while an action has no confirmed outcome', async () => {
+    const person = userEvent.setup()
+    const { port } = fakeHost()
+    // The one answer that means nobody knows: the request left this device and the host never
+    // said what became of it. A refusal is terminal and a receipt is an outcome; this is neither.
+    const uncertain = {
+      ...port,
+      composerSubmit: () =>
+        Promise.reject({
+          code: 'OUTCOME_UNKNOWN',
+          message: 'The host did not say what became of it.',
+          user_action: 'ask'
+        })
+    }
+    render(
+      <AppProvider port={uncertain}>
+        <MobileApp surface="ios" storage={null} />
+      </AppProvider>
+    )
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await person.type(await screen.findByLabelText('Message this session'), 'run the migration')
+    await person.click(screen.getByRole('button', { name: 'Send' }))
+
+    await waitFor(() => {
+      expect(screen.getByText(/no confirmed outcome yet/)).toBeInTheDocument()
+    })
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    expect(screen.getByText(/Sending again could run it twice/)).toBeInTheDocument()
+    // And what was written is still there: an uncertain outcome is not a reason to lose it.
+    expect(screen.getByLabelText('Message this session')).toHaveValue('run the migration')
+  })
+
+  it('says so when the device refuses to keep what was written', async () => {
+    const person = userEvent.setup()
+    const refusing = {
+      getItem: () => null,
+      setItem: () => {
+        throw new Error('quota')
+      },
+      removeItem: () => undefined,
+      key: () => null,
+      clear: () => undefined,
+      length: 0
+    } as unknown as Storage
+    const { port } = fakeHost()
+    render(
+      <AppProvider port={port}>
+        <MobileApp surface="ios" storage={refusing} />
+      </AppProvider>
+    )
+    await person.click(await screen.findByRole('button', { name: /^Sessions/ }))
+    await person.click(await screen.findByRole('button', { name: /Session 1/ }))
+    await person.type(await screen.findByLabelText('Message this session'), 'a')
+    await waitFor(() => {
+      expect(screen.getByText('This device will not keep what you write')).toBeInTheDocument()
+    })
+    // It is a warning about durability, not about the draft: the text is still there.
+    expect(screen.getByLabelText('Message this session')).toHaveValue('a')
+  })
+})
