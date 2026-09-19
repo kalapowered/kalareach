@@ -230,17 +230,20 @@ struct ExecutionPermit {
 
 /// Permission to carry one agent mutation to its upstream, and everything it was admitted against.
 ///
-/// Only the broker's own admissions make one, under its own lock, in
-/// one operation with the checks. A caller holding one is therefore a caller whose complete
-/// invocation was valid against the state the broker had at a single moment: a fence, a
-/// suspension, a turn change or a capability invalidation cannot land between the check and the
-/// transmission, because there is nothing between them.
+/// Only the broker's own admissions make one, under its own lock, in one operation with the
+/// checks. A caller holding one is therefore a caller whose complete invocation was valid against
+/// the state the broker had at a single moment: a fence, a suspension, a turn change or a
+/// capability invalidation cannot land *inside* that moment. What can land after it is what the
+/// resource's own reservation answers: the admission holds the one transmission the resource has,
+/// so a change that arrives later cannot turn this answer into a second one. An invocation whose
+/// component returns a plan afterwards is a separate matter, and `validate_effect` rechecks the
+/// present for it.
 ///
 /// It carries the transport rather than naming it, so the submission does not have to go back to
 /// the broker to find one, which is what lets a caller release its own locks before it transmits.
 ///
-/// What it holds is an [`ExecutionPermit`], taken once. Everything else on it is a fact a caller
-/// may read and none of it is authority.
+/// What it holds is one execution permit, taken once. Everything else on it is a fact a caller may
+/// read and none of it is authority.
 #[derive(Debug)]
 pub struct MutationAdmission {
     permit: std::sync::Mutex<Option<ExecutionPermit>>,
@@ -706,13 +709,14 @@ impl Broker {
         self.dispatch_mutation(&admitted, now)
     }
 
-    /// Admits `agent.approval.respond`: the mutation, the resource, the claim and the marker, in
-    /// one operation under the broker's lock.
+    /// Admits `agent.approval.respond`: the mutation, the resource, the claim and the resource's
+    /// one transmission, in one operation under the broker's lock.
     ///
-    /// This is the encode, recheck, claim and dispatch transaction as a method sees it, and the
-    /// whole of it happens here so that nothing the checks read can move before the marker. The
-    /// admission carries the answer the core prepared from the connection's own table, so the
-    /// bytes that go are the bytes that were admitted.
+    /// This is the encode, recheck and claim transaction as a method sees it, and the whole of it
+    /// happens here so that nothing the checks read can move between them. What comes back holds
+    /// the answer the core prepared from the connection's own table, so the bytes that go are the
+    /// bytes that were admitted. The durable marker is not written here: `record_approval` writes
+    /// it immediately before the bytes, under the permit this admission carries.
     ///
     /// # Errors
     ///
@@ -1186,10 +1190,11 @@ impl Broker {
                     params.action
                 ))
             })?;
-        // Arguments that name a member twice are refused rather than resolved, for the reason a
-        // native frame that does is: the parse keeps the last one, another participant in the
-        // same protocol may keep the first, and what this host hashed would not be what the
-        // upstream acted on.
+        // Arguments whose top-level object names a member twice are refused rather than resolved,
+        // for the reason a native frame that does is: the parse keeps the last one, another
+        // participant in the same protocol may keep the first, and what this host hashed would
+        // not be what the upstream acted on. The check is top-level, as the frame reader's is; a
+        // nested repetition is normalised into the one form this host transmits.
         if let serde_json::Value::Object(members) = &arguments
             && crate::broker::gateway::count_member_names(params.parameters.as_slice())?
                 != members.len()

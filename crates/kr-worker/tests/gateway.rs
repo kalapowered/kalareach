@@ -237,7 +237,8 @@ impl UpstreamDispatch for RecordingUpstream {
 #[derive(Debug, Default)]
 struct StoppingUpstream;
 
-const STOPPED: &str = "the host stops after the marker and before the outcome is recorded";
+const STOPPED: &str =
+    "this test stops the host here, after the marker and before the outcome is recorded";
 
 impl UpstreamDispatch for StoppingUpstream {
     fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
@@ -295,12 +296,9 @@ fn answer_and_stop(
         GatewayConnectionId::new(1),
         std::sync::Arc::new(StoppingUpstream),
     );
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         let _ = answer(broker, resource_id, "allow", now);
     }));
-    std::panic::set_hook(previous);
     let payload = stopped.expect_err("the host stopped where the transport stops it");
     assert_eq!(
         payload.downcast_ref::<String>().map(String::as_str),

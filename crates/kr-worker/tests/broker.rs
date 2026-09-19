@@ -312,7 +312,8 @@ impl UpstreamDispatch for RecordingUpstream {
 #[derive(Debug, Default)]
 struct StoppingUpstream;
 
-const STOPPED: &str = "the host stops after the marker and before the outcome is recorded";
+const STOPPED: &str =
+    "this test stops the host here, after the marker and before the outcome is recorded";
 
 impl UpstreamDispatch for StoppingUpstream {
     fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
@@ -337,10 +338,7 @@ fn stop_the_host_at_the_bytes(broker: &Broker) {
 
 /// Runs one step that transmits over that transport, and checks the host stopped in it.
 fn stopping(step: impl FnOnce()) {
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
     let stopped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(step));
-    std::panic::set_hook(previous);
     let payload = stopped.expect_err("the host stopped where the transport stops it");
     assert_eq!(
         payload.downcast_ref::<String>().map(String::as_str),

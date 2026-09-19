@@ -1921,8 +1921,18 @@ fn kr_req_12_06_a_transport_that_cannot_carry_an_answer_gives_the_resource_back(
 
 /// KR-REQ-11.35 and KR-REQ-11.28: a plan that arrives while rich work is fenced is refused, and
 /// nothing carries it.
+///
+/// Both halves of the fence are here. `native_only_volatile` is the storage failure itself, and
+/// `recovering` is the spell after the gap has been committed and before the upstreams have said
+/// what they still hold; rich work is not back until the second one ends either.
 #[test]
 fn kr_req_11_35_a_fence_refuses_a_plan_that_arrives_after_it() {
+    for recovered in [false, true] {
+        a_fence_refuses_a_plan_that_arrives_after_it(recovered);
+    }
+}
+
+fn a_fence_refuses_a_plan_that_arrives_after_it(recovered: bool) {
     let upstream = std::sync::Arc::new(RecordingUpstream::default());
     let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
     broker
@@ -1957,6 +1967,14 @@ fn kr_req_11_35_a_fence_refuses_a_plan_that_arrives_after_it() {
     broker
         .enter_volatile("the journal could not be written", TimestampMs::new(3))
         .expect("the fence comes down");
+    if recovered {
+        // Storage came back and the gap was committed. Rich work is still fenced: the upstreams
+        // have not said what they still hold, so an answer or an effect could be a second one.
+        broker
+            .recover(TimestampMs::new(4))
+            .expect("the gap is committed");
+        assert_eq!(broker.mode(), kr_protocol::gateway::GatewayMode::Recovering);
+    }
     let refusal = broker
         .validate_effect(
             &admitted,
@@ -1972,7 +1990,7 @@ fn kr_req_11_35_a_fence_refuses_a_plan_that_arrives_after_it() {
     assert_eq!(refusal.code(), ErrorCode::UpstreamUnavailable);
     assert!(
         broker
-            .record_plugin_action(&admitted, TimestampMs::new(4))
+            .record_plugin_action(&admitted, TimestampMs::new(5))
             .is_err(),
         "and nothing carries a plan this host did not validate"
     );
@@ -2035,16 +2053,62 @@ fn offered(broker: &Broker, id: &str, at: u64) -> kr_protocol::gateway::PendingR
         .expect("interpreted")
 }
 
-/// KR-REQ-11.27: two callers reach one admission at the same moment, and one answer goes.
+/// A transport that stops inside `submit` until it is let go, so a test can hold one answer open.
+#[derive(Debug)]
+struct GatedUpstream {
+    inside: std::sync::mpsc::SyncSender<()>,
+    go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+    submitted: std::sync::Mutex<Vec<UpstreamRequest>>,
+}
+
+impl UpstreamDispatch for GatedUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+        self.inside.send(()).expect("the test is watching");
+        self.go
+            .lock()
+            .expect("the gate is not poisoned")
+            .recv()
+            .expect("the test lets it go");
+        self.submitted
+            .lock()
+            .expect("the record is not poisoned")
+            .push(request.clone());
+        Ok(UpstreamOutcome {
+            upstream_request_id: Some(UpstreamRequestId::new("upstream-1").expect("valid")),
+            turn_id: request.turn_id.clone(),
+            provenance: ActionProvenance::UpstreamTypedRpc,
+        })
+    }
+}
+
+/// KR-REQ-11.27: a second caller runs while the first one's answer is still going, and loses.
 ///
-/// The exclusion is not "the second caller arrives later and finds the resource settled": both
-/// callers are inside the same admission at once, and what separates them is the permit, which
-/// only one of them can take. The loser transmits nothing, and it does not record the winner's
-/// answer as uncertain.
+/// The exclusion is not "the second caller arrives after the resource has settled". The winner is
+/// held inside `submit`, with the marker committed and the bytes not yet acknowledged, and the
+/// loser runs the whole of `record_approval` in that window. It transmits nothing, and it leaves
+/// the resource exactly as the winner left it rather than recording the winner's answer as
+/// uncertain.
 #[test]
-fn kr_req_11_27_two_callers_on_one_admission_at_once_transmit_once() {
-    let upstream = std::sync::Arc::new(RecordingUpstream::default());
-    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+fn kr_req_11_27_a_second_caller_inside_the_first_ones_transmission_settles_nothing() {
+    let (entered, inside) = std::sync::mpsc::sync_channel(1);
+    let (release, go) = std::sync::mpsc::sync_channel(1);
+    let upstream = std::sync::Arc::new(GatedUpstream {
+        inside: entered,
+        go: std::sync::Mutex::new(go),
+        submitted: std::sync::Mutex::new(Vec::new()),
+    });
+    let broker = agent_broker();
+    broker
+        .bind_dispatch(instance(), std::sync::Arc::clone(&upstream) as _)
+        .expect("the transport is bound");
+    broker.bind_connection_dispatch(
+        GatewayConnectionId::new(1),
+        std::sync::Arc::clone(&upstream) as _,
+    );
     let resource = offered(&broker, "11", 2);
     let admitted = broker
         .admit_approval(
@@ -2058,36 +2122,41 @@ fn kr_req_11_27_two_callers_on_one_admission_at_once_transmit_once() {
         )
         .expect("the answer is admitted once");
 
-    let start = std::sync::Barrier::new(2);
-    let (first, second) = std::thread::scope(|scope| {
-        let one = scope.spawn(|| {
-            start.wait();
-            broker.record_approval(&admitted, TimestampMs::new(5))
-        });
-        let two = scope.spawn(|| {
-            start.wait();
-            broker.record_approval(&admitted, TimestampMs::new(5))
-        });
-        (
-            one.join().expect("the thread finished"),
-            two.join().expect("the thread finished"),
-        )
+    let (winner, refused, during) = std::thread::scope(|scope| {
+        let one = scope.spawn(|| broker.record_approval(&admitted, TimestampMs::new(5)));
+        // The winner is inside its transmission now: the marker is in and nothing has confirmed
+        // the bytes. This is the window the loser used to be able to settle.
+        inside.recv().expect("the winner reached its transport");
+        let refused = broker
+            .record_approval(&admitted, TimestampMs::new(5))
+            .expect_err("one admission carries one answer");
+        let during = broker
+            .pending(resource.resource_id)
+            .expect("retained")
+            .state;
+        release.send(()).expect("the winner is let go");
+        (one.join().expect("the thread finished"), refused, during)
     });
 
-    let refused = match (first, second) {
-        (Ok(applied), Err(refused)) | (Err(refused), Ok(applied)) => {
-            assert_eq!(applied.state, PendingState::Resolved);
-            refused
-        }
-        (Ok(_), Ok(_)) => panic!("one admission carries one answer"),
-        (Err(one), Err(two)) => panic!("one of the two answers goes: {one:?} and {two:?}"),
-    };
     assert!(
         matches!(refused, BrokerError::AlreadyTransmitted),
-        "the loser is told the answer has gone, not that the resource is uncertain: {refused:?}"
+        "the loser is told the answer has gone: {refused:?}"
     );
     assert_eq!(
-        upstream.submitted().len(),
+        during,
+        PendingState::Claimed,
+        "and it left the resource as the winner had it, rather than making it uncertain"
+    );
+    assert_eq!(
+        winner.expect("the winner's answer is applied").state,
+        PendingState::Resolved
+    );
+    assert_eq!(
+        upstream
+            .submitted
+            .lock()
+            .expect("the record is not poisoned")
+            .len(),
         1,
         "one answer reached the upstream"
     );
@@ -2286,6 +2355,144 @@ fn kr_req_11_27_the_native_and_rich_answers_race_and_one_of_them_writes() {
             recorded.state,
             PendingState::Resolved,
             "attempt {attempt}: one resolution, whichever writer made it"
+        );
+    }
+}
+
+/// A draft store that stops inside the resolution a plan validation performs, until it is let go.
+///
+/// Validation resolves the draft outside every lock, which is the window a registration or a grant
+/// change can land in. This is what opens that window on purpose.
+#[derive(Debug)]
+struct PausingDrafts {
+    draft_id: kr_protocol::ids::DraftId,
+    calls: std::sync::atomic::AtomicU64,
+    inside: std::sync::mpsc::SyncSender<()>,
+    go: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+}
+
+impl kr_worker::broker::DraftResolver for PausingDrafts {
+    fn resolve(
+        &self,
+        draft_id: &kr_protocol::ids::DraftId,
+    ) -> Result<kr_worker::broker::DraftSnapshot, BrokerError> {
+        if draft_id != &self.draft_id {
+            return Err(BrokerError::PreconditionFailed {
+                detail: format!("no draft {draft_id}"),
+            });
+        }
+        // The first call is the admission's. The second is the one inside plan validation, and
+        // that is the one this stops.
+        if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+            self.inside.send(()).expect("the test is watching");
+            self.go
+                .lock()
+                .expect("the gate is not poisoned")
+                .recv()
+                .expect("the test lets it go");
+        }
+        Ok(kr_worker::broker::DraftSnapshot {
+            draft_id: *draft_id,
+            revision: kr_protocol::scalars::U64::new(1),
+        })
+    }
+}
+
+/// The attachment action this suite's draft tests register.
+fn attachment_action(capability: Option<CapabilityId>) -> RegisteredAction {
+    RegisteredAction {
+        name: ActionName::new("draft.attach").expect("valid"),
+        grant: BrokerGrant::UpstreamAction,
+        effect: EffectClass::Write,
+        capability,
+        needs_draft: true,
+        operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
+    }
+}
+
+/// KR-REQ-23.30 and KR-REQ-11.28: authority that moves while a plan is being validated refuses it.
+///
+/// Validation reads the draft outside every lock, because the draft store is not the broker's. The
+/// window that opens is real, and what closes it is that the declaration and the invocation's own
+/// authority are read again inside the final transaction. Here the change lands *inside* that
+/// window rather than before validation starts.
+#[test]
+fn kr_req_23_30_authority_that_moves_inside_plan_validation_refuses_the_plan() {
+    for change in ["the declaration", "the grant"] {
+        let (entered, inside) = std::sync::mpsc::sync_channel(1);
+        let (release, go) = std::sync::mpsc::sync_channel(1);
+        let upstream = std::sync::Arc::new(RecordingUpstream::default());
+        let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+        let draft_id = kr_protocol::ids::DraftId::new(Uuid::from_bytes([4; 16]));
+        broker.bind_drafts(std::sync::Arc::new(PausingDrafts {
+            draft_id,
+            calls: std::sync::atomic::AtomicU64::new(0),
+            inside: entered,
+            go: std::sync::Mutex::new(go),
+        }));
+        broker
+            .register_actions(
+                binding(),
+                [attachment_action(Some(capability("agent.prompt")))],
+            )
+            .expect("the action is registered");
+        let admitted = broker
+            .admit_plugin_action(
+                &caller(),
+                binding(),
+                &PluginActionInvokeParams {
+                    target: target(1),
+                    plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+                    action: ActionName::new("draft.attach").expect("valid"),
+                    draft_id: Nullable::some(draft_id),
+                    parameters: Bytes::from(b"{}".to_vec()),
+                },
+                TimestampMs::new(4),
+            )
+            .expect("the invocation is admitted");
+        let effect = kr_protocol::broker::PreparedEffect {
+            action: ActionName::new("draft.attach").expect("valid"),
+            class: EffectClass::Write,
+            operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
+            draft_id: Nullable::some(draft_id),
+            argument_hash: arguments_digest(),
+        };
+
+        let refusal = std::thread::scope(|scope| {
+            let validating = scope.spawn(|| broker.validate_effect(&admitted, &effect));
+            // Validation is inside the draft store now, holding no broker lock. The authority it
+            // was admitted under moves here, which is the whole of the window.
+            inside.recv().expect("validation reached the draft store");
+            if change == "the declaration" {
+                broker
+                    .register_actions(binding(), [attachment_action(None)])
+                    .expect("the package re-registers the action");
+            } else {
+                broker
+                    .withdraw_grant(binding(), BrokerGrant::UpstreamAction)
+                    .expect("the grant is withdrawn");
+            }
+            release.send(()).expect("validation is let go");
+            validating.join().expect("the thread finished")
+        })
+        .expect_err("{change} moved while the component was preparing its plan");
+
+        assert!(
+            matches!(
+                refusal.code(),
+                ErrorCode::DraftConflict | ErrorCode::PermissionDenied
+            ),
+            "{change}: {refusal:?}"
+        );
+        assert!(
+            broker
+                .record_plugin_action(&admitted, TimestampMs::new(6))
+                .is_err(),
+            "{change}: an invocation with no validated plan has nothing to transmit"
+        );
+        assert!(
+            upstream.submitted().is_empty(),
+            "{change}: nothing went for an invocation whose authority had moved"
         );
     }
 }

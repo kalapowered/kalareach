@@ -268,11 +268,12 @@ pub enum InstanceEnding {
     AttachmentClosed,
 }
 
-/// Permission to write one answer to the upstream, once.
+/// One resource's single transmission, reserved, with the answer that will go.
 ///
-/// It exists only as the return value of [`Broker::admit_dispatch`], which commits the durable
-/// marker before it hands one out, so a caller holding this is a caller whose answer the ledger
-/// already says may have gone.
+/// It is made only inside [`Broker::admit_approval`], which takes the claim and the reservation
+/// together, so a caller holding one holds the resource's only remaining way to be answered. The
+/// durable marker follows it rather than accompanying it: `record_approval` writes the marker
+/// immediately before the bytes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DispatchAdmission {
     /// The resource being answered, as it stands.
@@ -1049,8 +1050,8 @@ impl Broker {
     /// Admits the native client's own answer to be forwarded, exclusively.
     ///
     /// This is what makes a native answer win during encoding. The admission is taken **before**
-    /// the bytes go, so it is the same one admission a rich answer takes at
-    /// [`Broker::admit_dispatch`]: whichever writer reaches it first may transmit, and the other
+    /// the bytes go, and it is the same one admission a rich answer takes at
+    /// [`Broker::admit_approval`]: whichever writer reaches it first may transmit, and the other
     /// is refused rather than recorded as a competing answer afterwards. A rich answer that
     /// reaches its recheck after this is told the resolved state.
     ///
@@ -2397,7 +2398,11 @@ impl Broker {
 }
 
 impl BrokerState {
-    /// Takes the claim on one pending resource. See [`Broker::claim`].
+    /// Takes the claim on one pending resource.
+    ///
+    /// The recheck covers everything that could have changed while the answer was being encoded:
+    /// the resource's own state, its deadline, the instance it belongs to, the generation that
+    /// produced it, and whether the decoder that interpreted it may still encode an answer.
     fn claim_in(
         &mut self,
         resource_id: PendingResourceId,
@@ -2423,8 +2428,14 @@ impl BrokerState {
         self.arbitration.commit(transition)
     }
 
-    /// Admits one answer to dispatch, and commits the marker before it goes. See
-    /// [`Broker::admit_dispatch`].
+    /// Reserves one claimed resource's single transmission, and prepares the answer that will go.
+    ///
+    /// This is the last gate before an answer becomes transmissible, and it is one operation
+    /// because everything it checks can change between the claim and the dispatch. Under the lock
+    /// it rechecks that rich work is admitted at all, that the resource is still answerable by
+    /// this claim, that the decision is one the upstream actually offered, and that no answer has
+    /// been admitted already. The durable marker is not written here: it goes in immediately
+    /// before the bytes, in [`Broker::commit_dispatch`].
     fn admit_dispatch_in(&mut self, claim: &Claim, option_id: &str) -> Result<DispatchAdmission> {
         // Fenced rich work is fenced here too. Without this a claim taken before the journal
         // faulted could dispatch inside the gap, with no durable marker to stop a second answer.

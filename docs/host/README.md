@@ -3264,9 +3264,10 @@ computes their digest itself and compares it with the token's and the plan's, be
 component supplied says only that the component can write a hash. The arguments are read once at
 admission and written back in the one form this host will transmit, so the digest covers the bytes
 that go; an encoding this host cannot put on the wire is refused there rather than replaced when
-the frame is built. Arguments that name a member twice are refused for the reason a native frame
-that does is: the parse keeps the last one, another reader of the same bytes may keep the first,
-and what this host hashed would not be what the upstream acted on. The invocation's own authority is asked again when the plan arrives, because
+the frame is built. Arguments whose top-level object names a member twice are refused for the
+reason a native frame that does is: the parse keeps the last one, another reader of the same bytes
+may keep the first, and what this host hashed would not be what the upstream acted on. Nested
+objects are normalised rather than refused, as a native frame's are. The invocation's own authority is asked again when the plan arrives, because
 the token was spent to invite the work and is not proof by the time the work comes back. What
 transmits is the plan that was validated: the operation it prepares travels in the frame, carried
 in the permit rather than attested by a flag beside it. The draft store itself — whose the draft is

@@ -254,6 +254,10 @@ fn record_capabilities(broker: &Broker) {
 
 /// A broker with one instance, one pinned table and one authenticated native connection.
 fn broker() -> Arc<Broker> {
+    broker_with_rich(rich())
+}
+
+fn broker_with_rich(rich: RichMethodTable) -> Arc<Broker> {
     let broker = Broker::open(None, session()).expect("the broker opens");
     broker
         .register_instance(instance(), IntegrationMode::Gateway, None, Some(managed()))
@@ -271,7 +275,7 @@ fn broker() -> Arc<Broker> {
         )
         .expect("the binding is recorded");
     broker
-        .pin_table(instance(), table(), rich())
+        .pin_table(instance(), table(), rich)
         .expect("the installed tables are pinned");
     broker
         .open_native_connection(
@@ -756,4 +760,87 @@ async fn kr_req_12_08_each_operation_encodes_as_the_method_its_table_names_with_
     drop(upstream_reader);
     drained.abort();
     other_drain.abort();
+}
+
+/// KR-REQ-11.33 and KR-REQ-12.08: an approval answer is the frame the core prepared, so it needs
+/// no rich method of its own.
+///
+/// The rich table names a method per operation and the core sends nothing it cannot name. An
+/// answer is the exception and it is the exception for a reason: it is not encoded from the rich
+/// table at all, it is the frame `prepare_response` built from the connection's declarative table.
+/// This upstream's rich table names no `ApprovalRespond` method, and the answer still goes, in the
+/// member the declarative table names.
+#[tokio::test]
+async fn kr_req_11_33_an_answer_needs_no_rich_method_of_its_own() {
+    let mut narrowed = rich();
+    narrowed
+        .entries
+        .retain(|entry| entry.operation.as_ref() != Some(&RichOperation::ApprovalRespond));
+    let broker = broker_with_rich(narrowed);
+    let (link, upstream, client, drained) = link_over_sockets(&broker).await;
+    let mut client_reader = tokio::io::BufReader::new(client);
+    let mut upstream_reader = tokio::io::BufReader::new(upstream);
+
+    let carried = link
+        .from_upstream(
+            br#"{"id":11,"method":"session/request_permission","params":{}}"#,
+            TimestampMs::new(2),
+        )
+        .expect("the request is carried");
+    let kr_worker::broker::Carried::UpstreamRequest { resource_id, .. } = carried else {
+        panic!("a request is what this was");
+    };
+    let resource_id = resource_id.expect("it expects a response");
+    let _ = next_line(&mut client_reader).await;
+    broker
+        .interpret(
+            binding(),
+            resource_id,
+            projection(),
+            None,
+            TimestampMs::new(3),
+        )
+        .expect("the interpretation is accepted");
+    let dispatch = link.dispatch().expect("the link carries operations");
+    broker.bind_connection_dispatch(GatewayConnectionId::new(1), dispatch);
+
+    let answered = broker
+        .agent_approval_respond(
+            &kr_worker::broker::Caller {
+                actor_id: ActorId::new("device-1").expect("valid"),
+                grant_id: None,
+            },
+            &kr_protocol::agent::AgentApprovalRespondParams {
+                target: target(),
+                resource_id,
+                option_id: "allow".to_owned(),
+            },
+            TimestampMs::new(4),
+        )
+        .expect("a table with no answer method still answers its own requests")
+        .0;
+    assert_eq!(answered.state, PendingState::Resolved);
+    let answer: serde_json::Value =
+        serde_json::from_str(next_line(&mut upstream_reader).await.trim()).expect("readable");
+    assert_eq!(answer["id"], serde_json::json!(11));
+    assert_eq!(answer["result"]["behavior"], serde_json::json!("allow"));
+
+    // The operations that *are* encoded from the rich table are refused when it names no method
+    // for them, which is what makes the answer's exemption an exemption rather than a gap.
+    let refusal = broker
+        .admit_rich(
+            GatewayConnectionId::new(1),
+            &method("session/answer"),
+            kr_protocol::ids::UpstreamRequestId::new("12").expect("valid"),
+        )
+        .expect_err("this table names no such method");
+    assert_eq!(
+        refusal.code(),
+        kr_protocol::error::ErrorCode::UnsupportedCapability
+    );
+
+    drop(link);
+    drop(client_reader);
+    drop(upstream_reader);
+    drained.abort();
 }
