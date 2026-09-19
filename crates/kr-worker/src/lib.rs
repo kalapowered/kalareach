@@ -19,6 +19,7 @@
 //! | [`journal`] | The private receipt journal: acceptance, dispatch markers, de-duplication and retention |
 //! | [`lifecycle`] | What a live session is watched for: the root shell's exit, its desktop, and what it owns |
 //! | [`output`] | Fan-out with bounded per-attachment queues and explicit resynchronisation |
+//! | [`persistence`] | The durability contract: commit points, per-store declarations, the journal-fault seam, the outbox, retention and migrations |
 //! | [`ownership`] | Which processes a session owns, and how much of that the host can account for |
 //! | [`projection`] | The canonical grid, the filtered stream and the presentation a terminal is served |
 //! | [`render`] | Turning a side-effect-free restoration into terminal bytes |
@@ -45,6 +46,7 @@ pub mod journal;
 pub mod lifecycle;
 pub mod output;
 pub mod ownership;
+pub mod persistence;
 pub mod projection;
 pub mod pty;
 pub mod questions;

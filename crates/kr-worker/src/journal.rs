@@ -32,7 +32,10 @@ use crate::error::{Result, WorkerError};
 pub const RETENTION_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 
 /// The schema version this build reads.
-pub const SCHEMA_VERSION: i64 = 3;
+///
+/// It is [`crate::persistence::migration::CURRENT`], stated here because this is the store the
+/// ladder brings forward and a reader of the journal should not have to go looking.
+pub const SCHEMA_VERSION: i64 = crate::persistence::migration::CURRENT;
 
 /// How often a live journal prunes records past the retention period.
 ///
@@ -175,6 +178,13 @@ pub struct ReceiptEvent {
 pub struct Journal {
     connection: Connection,
     pruned_at_ms: u64,
+    /// The condition this journal publishes, and what reads it decides.
+    ///
+    /// Section 24 makes a worker whose durable store has stopped answering refuse new durable
+    /// mutations before dispatch while the terminal stays usable, so the condition has to be
+    /// readable by everything that decides whether to start work. It is shared rather than
+    /// returned, because a consumer needs to be woken when it changes as well as to ask now.
+    health: std::sync::Arc<crate::persistence::fault::JournalHealth>,
     /// The boot this journal is being written in, recorded once.
     ///
     /// A record from another boot cannot have a live freshness window, because the windows a host
@@ -233,6 +243,7 @@ impl Journal {
         let journal = Self {
             connection,
             pruned_at_ms: 0,
+            health: crate::persistence::fault::JournalHealth::shared(),
             boot: kr_ipc::identity::boot_identity()
                 .ok()
                 .map(|boot| boot.value.as_slice().to_vec()),
@@ -252,12 +263,12 @@ impl Journal {
     fn migrate(&self) -> Result<()> {
         self.connection
             .execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);")
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let recorded: Option<i64> = self
             .connection
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .optional()
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         match recorded {
             None => {
                 self.create_current_schema()?;
@@ -266,28 +277,31 @@ impl Journal {
                         "INSERT INTO schema_version (version) VALUES (?1)",
                         params![SCHEMA_VERSION],
                     )
-                    .map_err(unavailable)?;
+                    .map_err(|error| faulted(&self.health, error))?;
             }
-            Some(version) if version == SCHEMA_VERSION => {
+            Some(version) => {
+                // The ladder decides which steps exist and in what order, and it refuses both
+                // directions this build must not read: a store a newer build wrote, and one older
+                // than the ladder starts from, which names the importer instead of being restored
+                // in part.
+                let steps = crate::persistence::migration::plan(version)
+                    .map_err(|error| unavailable_detail_owned(error.to_string()))?;
+                for step in steps {
+                    match (step.from, step.to) {
+                        (1, 2) => self.migrate_1_to_2()?,
+                        (2, 3) => self.migrate_2_to_3()?,
+                        (3, 4) => self.migrate_3_to_4()?,
+                        _ => {
+                            return Err(unavailable_detail_owned(format!(
+                                "no migration is implemented from schema version {} to {}",
+                                step.from, step.to
+                            )));
+                        }
+                    }
+                }
                 // Every object of the current schema is created if it is absent, which is what
                 // makes reopening a journal this build wrote cheap and idempotent.
                 self.create_current_schema()?;
-            }
-            Some(1) => {
-                self.migrate_1_to_2()?;
-                self.migrate_2_to_3()?;
-                self.create_current_schema()?;
-            }
-            Some(2) => {
-                self.migrate_2_to_3()?;
-                self.create_current_schema()?;
-            }
-            Some(version) => {
-                // Migrations are forward-only and this build reads one schema. A journal written
-                // by a later build is refused rather than read as though it were this one.
-                return Err(unavailable_detail_owned(format!(
-                    "this journal is at schema version {version}; this build reads {SCHEMA_VERSION}"
-                )));
             }
         }
         Ok(())
@@ -394,10 +408,86 @@ impl Journal {
                  CREATE TABLE IF NOT EXISTS fence_forgotten (
                      id              INTEGER PRIMARY KEY CHECK (id = 1),
                      before_revision INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS outbox (
+                     cursor           INTEGER PRIMARY KEY AUTOINCREMENT,
+                     event_id         BLOB    NOT NULL UNIQUE,
+                     stream           TEXT    NOT NULL,
+                     source           TEXT    NOT NULL,
+                     actor_id         TEXT,
+                     action_id        BLOB,
+                     subject_revision INTEGER NOT NULL,
+                     causal_root      BLOB,
+                     causal_parent    BLOB,
+                     content          TEXT    NOT NULL,
+                     detail           TEXT    NOT NULL,
+                     recorded_at_ms   INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS outbox_stream ON outbox (stream, cursor);
+                 CREATE TABLE IF NOT EXISTS outbox_cursors (
+                     consumer  TEXT PRIMARY KEY,
+                     cursor    INTEGER NOT NULL,
+                     delivered INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS journal_gaps (
+                     sequence        INTEGER PRIMARY KEY AUTOINCREMENT,
+                     kind            TEXT    NOT NULL,
+                     detail          TEXT    NOT NULL,
+                     faulted_at_ms   INTEGER NOT NULL,
+                     recovered_at_ms INTEGER NOT NULL,
+                     durable_through INTEGER NOT NULL,
+                     resumed_at      INTEGER NOT NULL
                  );",
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         self.add_delivery_generation()?;
+        Ok(())
+    }
+
+    /// Adds the outbox, its consumer cursors and the record of lost durability.
+    ///
+    /// One transaction, like every other step: a migration that failed part way would leave a
+    /// store at a version describing neither the shape before it nor the shape after.
+    fn migrate_3_to_4(&self) -> Result<()> {
+        self.connection
+            .execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE IF NOT EXISTS outbox (
+                     cursor           INTEGER PRIMARY KEY AUTOINCREMENT,
+                     event_id         BLOB    NOT NULL UNIQUE,
+                     stream           TEXT    NOT NULL,
+                     source           TEXT    NOT NULL,
+                     actor_id         TEXT,
+                     action_id        BLOB,
+                     subject_revision INTEGER NOT NULL,
+                     causal_root      BLOB,
+                     causal_parent    BLOB,
+                     content          TEXT    NOT NULL,
+                     detail           TEXT    NOT NULL,
+                     recorded_at_ms   INTEGER NOT NULL
+                 );
+                 CREATE INDEX IF NOT EXISTS outbox_stream ON outbox (stream, cursor);
+                 CREATE TABLE IF NOT EXISTS outbox_cursors (
+                     consumer  TEXT PRIMARY KEY,
+                     cursor    INTEGER NOT NULL,
+                     delivered INTEGER NOT NULL
+                 );
+                 CREATE TABLE IF NOT EXISTS journal_gaps (
+                     sequence        INTEGER PRIMARY KEY AUTOINCREMENT,
+                     kind            TEXT    NOT NULL,
+                     detail          TEXT    NOT NULL,
+                     faulted_at_ms   INTEGER NOT NULL,
+                     recovered_at_ms INTEGER NOT NULL,
+                     durable_through INTEGER NOT NULL,
+                     resumed_at      INTEGER NOT NULL
+                 );
+                 UPDATE schema_version SET version = 4;
+                 COMMIT;",
+            )
+            .map_err(|error| {
+                let _ = self.connection.execute_batch("ROLLBACK;");
+                faulted(&self.health, error)
+            })?;
         Ok(())
     }
 
@@ -412,13 +502,13 @@ impl Journal {
         let mut statement = self
             .connection
             .prepare("SELECT name FROM pragma_table_info('fence_delivery')")
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let columns = statement
             .query_map([], |row| row.get::<_, String>(0))
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let mut present = false;
         for column in columns {
-            if column.map_err(unavailable)? == "generation" {
+            if column.map_err(|error| faulted(&self.health, error))? == "generation" {
                 present = true;
             }
         }
@@ -430,7 +520,7 @@ impl Journal {
             .execute_batch(
                 "ALTER TABLE fence_delivery ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;",
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -503,13 +593,13 @@ impl Journal {
                      before_revision INTEGER NOT NULL
                  );",
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let backfilled = self.backfill_subjects();
         let finish = match backfilled {
             Ok(()) => self
                 .connection
                 .execute_batch("UPDATE schema_version SET version = 3;\n COMMIT;")
-                .map_err(unavailable),
+                .map_err(|error| faulted(&self.health, error)),
             // The whole migration goes back rather than leaving a half-derived column behind a
             // version number that claims this build wrote it.
             Err(error) => {
@@ -529,7 +619,7 @@ impl Journal {
                 .prepare(
                     "SELECT actor_id, action_id, intent FROM receipts WHERE intent IS NOT NULL",
                 )
-                .map_err(unavailable)?;
+                .map_err(|error| faulted(&self.health, error))?;
             statement
                 .query_map([], |row| {
                     Ok((
@@ -538,9 +628,9 @@ impl Journal {
                         row.get::<_, Vec<u8>>(2)?,
                     ))
                 })
-                .map_err(unavailable)?
+                .map_err(|error| faulted(&self.health, error))?
                 .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(unavailable)?
+                .map_err(|error| faulted(&self.health, error))?
         };
         for (actor_id, action_id, intent) in rows {
             // A record this build cannot read is left alone. An intent that decodes but whose
@@ -560,7 +650,7 @@ impl Journal {
                      WHERE actor_id = ?1 AND action_id = ?2",
                     params![actor_id, action_id, subject.as_bytes().as_slice()],
                 )
-                .map_err(unavailable)?;
+                .map_err(|error| faulted(&self.health, error))?;
         }
         Ok(())
     }
@@ -584,7 +674,7 @@ impl Journal {
                  UPDATE schema_version SET version = 2;
                  COMMIT;",
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -617,7 +707,7 @@ impl Journal {
                     i64::try_from(now_ms.get()).unwrap_or(i64::MAX)
                 ],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -633,7 +723,7 @@ impl Journal {
                 "SELECT kind, detail, output_cursor, recorded_at_ms FROM host_events
                  ORDER BY sequence",
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let rows = statement
             .query_map([], |row| {
                 Ok(HostEvent {
@@ -645,9 +735,9 @@ impl Journal {
                     ),
                 })
             })
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(unavailable)
+            .map_err(|error| faulted(&self.health, error))
     }
 
     /// Commits an intent, or returns the retained receipt for an exact duplicate.
@@ -682,7 +772,10 @@ impl Journal {
             error: Nullable::null(),
             updated_at_ms: submission.now_ms,
         };
-        let transaction = self.connection.transaction().map_err(unavailable)?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| faulted(&self.health, error))?;
         transaction
             .execute(
                 "INSERT INTO receipts (actor_id, action_id, method, method_version, revision,
@@ -709,9 +802,11 @@ impl Journal {
                     i64::try_from(submission.now_ms.get()).unwrap_or(i64::MAX),
                 ],
             )
-            .map_err(unavailable)?;
-        append_event(&transaction, &receipt)?;
-        transaction.commit().map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
+        append_event(&self.health, &transaction, &receipt)?;
+        transaction
+            .commit()
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(Admission {
             receipt,
             deduplicated: false,
@@ -734,7 +829,7 @@ impl Journal {
                 |row| row.get::<_, Option<Vec<u8>>>(0),
             )
             .optional()
-            .map_err(unavailable)?
+            .map_err(|error| faulted(&self.health, error))?
             .flatten())
     }
 
@@ -799,7 +894,10 @@ impl Journal {
         receipt.error = Nullable(error);
         receipt.updated_at_ms = now_ms;
 
-        let transaction = self.connection.transaction().map_err(unavailable)?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| faulted(&self.health, error))?;
         if let Some(result) = result {
             transaction
                 .execute(
@@ -811,7 +909,7 @@ impl Journal {
                         result
                     ],
                 )
-                .map_err(unavailable)?;
+                .map_err(|error| faulted(&self.health, error))?;
         }
         transaction
             .execute(
@@ -832,21 +930,11 @@ impl Journal {
                     i64::try_from(receipt.updated_at_ms.get()).unwrap_or(i64::MAX),
                 ],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
+        append_event_at(&self.health, &transaction, &receipt, now_ms)?;
         transaction
-            .execute(
-                "INSERT INTO receipt_events (actor_id, action_id, revision, state, recorded_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    receipt.actor_id.as_str(),
-                    receipt.action_id.get().as_bytes().as_slice(),
-                    i64::try_from(receipt.revision.get()).unwrap_or(i64::MAX),
-                    receipt.state.as_str(),
-                    i64::try_from(now_ms.get()).unwrap_or(i64::MAX),
-                ],
-            )
-            .map_err(unavailable)?;
-        transaction.commit().map_err(unavailable)?;
+            .commit()
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(receipt)
     }
 
@@ -865,7 +953,7 @@ impl Journal {
                 "SELECT sequence, actor_id, action_id, revision, state, recorded_at_ms
                  FROM receipt_events WHERE sequence > ?1 ORDER BY sequence LIMIT ?2",
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let rows = statement
             .query_map(
                 params![
@@ -883,10 +971,11 @@ impl Journal {
                     ))
                 },
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let mut events = Vec::new();
         for row in rows {
-            let (sequence, actor, action, revision, state, recorded) = row.map_err(unavailable)?;
+            let (sequence, actor, action, revision, state, recorded) =
+                row.map_err(|error| faulted(&self.health, error))?;
             let action = <[u8; 16]>::try_from(action.as_slice())
                 .map_err(|_| unavailable_detail("a stored action identifier is not 16 bytes"))?;
             events.push(ReceiptEvent {
@@ -903,7 +992,11 @@ impl Journal {
     }
 }
 
-fn write_state(transaction: &rusqlite::Transaction<'_>, receipt: &Receipt) -> Result<()> {
+fn write_state(
+    health: &crate::persistence::fault::JournalHealth,
+    transaction: &rusqlite::Transaction<'_>,
+    receipt: &Receipt,
+) -> Result<()> {
     transaction
         .execute(
             "UPDATE receipts SET revision = ?3, state = ?4, reason = ?5, error_code = ?6,
@@ -923,11 +1016,31 @@ fn write_state(transaction: &rusqlite::Transaction<'_>, receipt: &Receipt) -> Re
                 i64::try_from(receipt.updated_at_ms.get()).unwrap_or(i64::MAX),
             ],
         )
-        .map_err(unavailable)?;
+        .map_err(|error| faulted(health, error))?;
     Ok(())
 }
 
-fn append_event(transaction: &rusqlite::Transaction<'_>, receipt: &Receipt) -> Result<()> {
+fn append_event(
+    health: &crate::persistence::fault::JournalHealth,
+    transaction: &rusqlite::Transaction<'_>,
+    receipt: &Receipt,
+) -> Result<()> {
+    append_event_at(health, transaction, receipt, receipt.updated_at_ms)
+}
+
+/// Writes the transition's event record and its outbox row, inside the caller's transaction.
+///
+/// Section 24 asks an authoritative producer to commit the state transition and a small event
+/// record in **the same local transaction**, and this is that record. The two rows go together
+/// because they answer different readers - a subscriber pages `receipt_events` by sequence, and a
+/// consumer with a cursor of its own takes the outbox - and because a crash between them would
+/// leave a consumer that never hears about a state this host is already serving.
+fn append_event_at(
+    health: &crate::persistence::fault::JournalHealth,
+    transaction: &rusqlite::Transaction<'_>,
+    receipt: &Receipt,
+    recorded_at_ms: TimestampMs,
+) -> Result<()> {
     transaction
         .execute(
             "INSERT INTO receipt_events (actor_id, action_id, revision, state, recorded_at_ms)
@@ -937,10 +1050,33 @@ fn append_event(transaction: &rusqlite::Transaction<'_>, receipt: &Receipt) -> R
                 receipt.action_id.get().as_bytes().as_slice(),
                 i64::try_from(receipt.revision.get()).unwrap_or(i64::MAX),
                 receipt.state.as_str(),
-                i64::try_from(receipt.updated_at_ms.get()).unwrap_or(i64::MAX),
+                i64::try_from(recorded_at_ms.get()).unwrap_or(i64::MAX),
             ],
         )
-        .map_err(unavailable)?;
+        .map_err(|error| faulted(health, error))?;
+    // The event's own sequence is what a recovery gap is measured from, so the mark moves here,
+    // inside the transaction that made it true, rather than when the caller gets its answer.
+    let sequence = u64::try_from(transaction.last_insert_rowid()).unwrap_or(0);
+    transaction
+        .execute(
+            "INSERT INTO outbox (
+                 event_id, stream, source, actor_id, action_id, subject_revision,
+                 causal_root, causal_parent, content, detail, recorded_at_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, NULL, ?7, ?8, ?9)",
+            params![
+                kr_ipc::new_uuid().as_bytes().as_slice(),
+                kr_protocol::recovery::EventStream::Receipts.as_str(),
+                crate::persistence::outbox::Subsystem::Receipts.as_str(),
+                receipt.actor_id.as_str(),
+                receipt.action_id.get().as_bytes().as_slice(),
+                i64::try_from(receipt.revision.get()).unwrap_or(i64::MAX),
+                "metadata",
+                receipt.state.as_str(),
+                i64::try_from(recorded_at_ms.get()).unwrap_or(i64::MAX),
+            ],
+        )
+        .map_err(|error| faulted(health, error))?;
+    health.note_durable_through(sequence);
     Ok(())
 }
 
@@ -1040,11 +1176,15 @@ impl Journal {
         })?;
         receipt.error = Nullable(error);
         receipt.updated_at_ms = now_ms;
-        let transaction = self.connection.transaction().map_err(unavailable)?;
-        write_state(&transaction, &receipt)?;
-        append_event(&transaction, &receipt)?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| faulted(&self.health, error))?;
+        write_state(&self.health, &transaction, &receipt)?;
+        append_event(&self.health, &transaction, &receipt)?;
         let named = match fenced_for {
             Some(revocation) => name_evidence(
+                &self.health,
                 &transaction,
                 revocation,
                 "rejected",
@@ -1055,7 +1195,9 @@ impl Journal {
             )?,
             None => false,
         };
-        transaction.commit().map_err(unavailable)?;
+        transaction
+            .commit()
+            .map_err(|error| faulted(&self.health, error))?;
         Ok((receipt, named))
     }
 
@@ -1184,6 +1326,7 @@ impl Journal {
         action: &PossiblyExecutedAction,
     ) -> Result<bool> {
         name_evidence(
+            &self.health,
             &self.connection,
             revision,
             "possibly_executed",
@@ -1214,7 +1357,7 @@ impl Journal {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(boundary
             .and_then(|held| u64::try_from(held).ok())
             .unwrap_or(0))
@@ -1228,7 +1371,7 @@ impl Journal {
                  ON CONFLICT (id) DO UPDATE SET since_sequence = excluded.since_sequence",
                 params![i64::try_from(reached).unwrap_or(i64::MAX)],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -1264,7 +1407,7 @@ impl Journal {
                      GROUP BY e.revision
                      ORDER BY e.revision",
                 )
-                .map_err(unavailable)?;
+                .map_err(|error| faulted(&self.health, error))?;
             let rows = statement
                 .query_map(params![holder], |row| {
                     Ok((
@@ -1273,9 +1416,10 @@ impl Journal {
                         row.get::<_, i64>(2)?,
                     ))
                 })
-                .map_err(unavailable)?;
+                .map_err(|error| faulted(&self.health, error))?;
             for row in rows {
-                let (held_revision, named, delivered) = row.map_err(unavailable)?;
+                let (held_revision, named, delivered) =
+                    row.map_err(|error| faulted(&self.health, error))?;
                 held.push((
                     held_revision,
                     u64::try_from(named).unwrap_or(0),
@@ -1323,7 +1467,7 @@ impl Journal {
                 "DELETE FROM fence_evidence WHERE revision = ?1",
                 params![revision],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -1352,7 +1496,7 @@ impl Journal {
                          generation = excluded.generation",
                 params![revision, generation],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -1363,7 +1507,7 @@ impl Journal {
                 "DELETE FROM fence_delivery WHERE revision = ?1",
                 params![revision],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -1390,12 +1534,12 @@ impl Journal {
                        AND revision NOT IN (SELECT DISTINCT revision FROM fence_evidence)
                      ORDER BY revision",
                 )
-                .map_err(unavailable)?;
+                .map_err(|error| faulted(&self.health, error))?;
             let rows = statement
                 .query_map(params![generation], |row| row.get::<_, i64>(0))
-                .map_err(unavailable)?;
+                .map_err(|error| faulted(&self.health, error))?;
             for row in rows {
-                missing.push(row.map_err(unavailable)?);
+                missing.push(row.map_err(|error| faulted(&self.health, error))?);
             }
         }
         // Everything else is either still named here or completely taken by the controller asking
@@ -1407,7 +1551,7 @@ impl Journal {
                    AND revision NOT IN (SELECT DISTINCT revision FROM fence_evidence)",
                 params![generation],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         while missing.len() > MAX_HELD_REVOCATIONS {
             let oldest = missing.remove(0);
             // The boundary first. A failure between these two leaves a count this journal can
@@ -1429,7 +1573,7 @@ impl Journal {
                      SET before_revision = MAX(fence_forgotten.before_revision, excluded.before_revision)",
                 params![revision],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -1452,7 +1596,7 @@ impl Journal {
                 params![revision],
                 |row| row.get(0),
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         if held > 0 {
             return Ok(true);
         }
@@ -1463,7 +1607,7 @@ impl Journal {
                 params![revision],
                 |row| row.get(0),
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         if counted > 0 {
             return Ok(true);
         }
@@ -1475,7 +1619,7 @@ impl Journal {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(forgotten.is_none_or(|before| revision > before))
     }
 
@@ -1525,7 +1669,7 @@ impl Journal {
                     i64::try_from(generation).unwrap_or(i64::MAX)
                 ],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -1553,7 +1697,7 @@ impl Journal {
                 params![revision],
                 |row| row.get(0),
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let held = u64::try_from(held).unwrap_or(0);
         let from = from.min(held);
         let page_size = u64::try_from(kr_protocol::action::MAX_NAMED_FENCED_ACTIONS).unwrap_or(256);
@@ -1570,7 +1714,7 @@ impl Journal {
                  ORDER BY position
                  LIMIT ?2 OFFSET ?3",
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let rows = statement
             .query_map(
                 params![
@@ -1588,9 +1732,10 @@ impl Journal {
                     ))
                 },
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         for row in rows {
-            let (kind, actor, action, method, state) = row.map_err(unavailable)?;
+            let (kind, actor, action, method, state) =
+                row.map_err(|error| faulted(&self.health, error))?;
             let actor_id = parse_actor(actor)?;
             let action_id = parse_action(&action)?;
             if kind == "rejected" {
@@ -1637,7 +1782,7 @@ impl Journal {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let Some((named, delivered)) = counts else {
             return Ok(0);
         };
@@ -1685,14 +1830,17 @@ impl Journal {
         };
         let mut found = Vec::new();
         for state in states {
-            let mut statement = self.connection.prepare(query).map_err(unavailable)?;
+            let mut statement = self
+                .connection
+                .prepare(query)
+                .map_err(|error| faulted(&self.health, error))?;
             let rows = statement
                 .query_map(params![state.as_str(), since], |row| {
                     Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
                 })
-                .map_err(unavailable)?;
+                .map_err(|error| faulted(&self.health, error))?;
             for row in rows {
-                let (actor, action) = row.map_err(unavailable)?;
+                let (actor, action) = row.map_err(|error| faulted(&self.health, error))?;
                 found.push((parse_actor(actor)?, parse_action(&action)?));
             }
         }
@@ -1712,7 +1860,7 @@ impl Journal {
                 [],
                 |row| row.get(0),
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(u64::try_from(sequence).unwrap_or(0))
     }
 
@@ -1736,7 +1884,7 @@ impl Journal {
                 ],
                 |row| row.get(0),
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(usize::try_from(count).unwrap_or(usize::MAX))
     }
 
@@ -1768,7 +1916,7 @@ impl Journal {
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .optional()
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         row.map(|(action, revision)| {
             Ok((
                 parse_action(&action)?,
@@ -1794,15 +1942,17 @@ impl Journal {
         let mut statement = self
             .connection
             .prepare("SELECT actor_id FROM receipts WHERE action_id = ?1 ORDER BY actor_id")
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let rows = statement
             .query_map(params![action_id.get().as_bytes().as_slice()], |row| {
                 row.get::<_, String>(0)
             })
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let mut actors = Vec::new();
         for row in rows {
-            actors.push(parse_actor(row.map_err(unavailable)?)?);
+            actors.push(parse_actor(
+                row.map_err(|error| faulted(&self.health, error))?,
+            )?);
         }
         if actors.len() > 1 {
             return Err(WorkerError::InvalidArgument(format!(
@@ -1844,7 +1994,10 @@ impl Journal {
                 ))
             })?;
         let effect = crate::action::observation::effect(observation, receipt.state);
-        let transaction = self.connection.transaction().map_err(unavailable)?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| faulted(&self.health, error))?;
         transaction
             .execute(
                 "INSERT INTO observations (actor_id, action_id, provenance, subject,
@@ -1867,7 +2020,7 @@ impl Journal {
                     i64::try_from(observation.observed_at_ms.get()).unwrap_or(i64::MAX),
                 ],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let mut receipt = receipt;
         if let Some(state) = effect.reconciliation() {
             // The observation and the reconciliation are one commit. A crash between them would
@@ -1877,10 +2030,12 @@ impl Journal {
                 WorkerError::InvalidArgument(format!("receipt transition refused: {error}"))
             })?;
             receipt.updated_at_ms = observation.observed_at_ms;
-            write_state(&transaction, &receipt)?;
-            append_event(&transaction, &receipt)?;
+            write_state(&self.health, &transaction, &receipt)?;
+            append_event(&self.health, &transaction, &receipt)?;
         }
-        transaction.commit().map_err(unavailable)?;
+        transaction
+            .commit()
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(receipt)
     }
 
@@ -1901,7 +2056,7 @@ impl Journal {
                         observed_at_ms
                  FROM observations WHERE actor_id = ?1 AND action_id = ?2 ORDER BY sequence",
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let rows = statement
             .query_map(
                 params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
@@ -1916,11 +2071,11 @@ impl Journal {
                     ))
                 },
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         let mut observations = Vec::new();
         for row in rows {
             let (provenance, subject, revision, cursor, claimed, observed) =
-                row.map_err(unavailable)?;
+                row.map_err(|error| faulted(&self.health, error))?;
             observations.push(ActionObservation {
                 action_id,
                 provenance: parse_provenance(&provenance)?,
@@ -1966,7 +2121,7 @@ impl Journal {
                 },
             )
             .optional()
-            .map_err(unavailable)?
+            .map_err(|error| faulted(&self.health, error))?
             .map(|raw| raw.into_receipt(actor_id, action_id))
             .transpose()
     }
@@ -1995,7 +2150,7 @@ impl Journal {
                     ReceiptState::Dispatching.as_str(),
                 ],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(changed)
     }
 
@@ -2067,22 +2222,36 @@ impl Journal {
              WHERE r.created_at_ms < ?1
                AND (r.created_boot IS NULL OR ?2 IS NULL OR r.created_boot <> ?2
                     OR r.created_continuous_ms IS NULL OR r.created_continuous_ms < ?3)";
-        let transaction = self.connection.transaction().map_err(unavailable)?;
+        let transaction = self
+            .connection
+            .transaction()
+            .map_err(|error| faulted(&self.health, error))?;
+        // The outbox rows of a receipt that is being forgotten go with it, and the consumer
+        // cursors stay: a cursor past a record that no longer exists still says correctly that
+        // the consumer has nothing to take, and resetting it would replay the whole journal.
+        transaction
+            .execute(
+                &format!("DELETE FROM outbox WHERE (actor_id, action_id) IN ({SELECT})"),
+                params![cutoff, boot, continuous_floor],
+            )
+            .map_err(|error| faulted(&self.health, error))?;
         for table in ["results", "receipt_events", "observations"] {
             transaction
                 .execute(
                     &format!("DELETE FROM {table} WHERE (actor_id, action_id) IN ({SELECT})"),
                     params![cutoff, boot, continuous_floor],
                 )
-                .map_err(unavailable)?;
+                .map_err(|error| faulted(&self.health, error))?;
         }
         let removed = transaction
             .execute(
                 &format!("DELETE FROM receipts WHERE (actor_id, action_id) IN ({SELECT})"),
                 params![cutoff, boot, continuous_floor],
             )
-            .map_err(unavailable)?;
-        transaction.commit().map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
+        transaction
+            .commit()
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(removed)
     }
 
@@ -2123,7 +2292,7 @@ impl Journal {
                 |row| row.get::<_, Vec<u8>>(0),
             )
             .optional()
-            .map_err(unavailable)
+            .map_err(|error| faulted(&self.health, error))
     }
 
     /// Opens a journal for reading only.
@@ -2153,8 +2322,255 @@ impl Journal {
         Ok(Self {
             connection,
             pruned_at_ms: 0,
+            health: crate::persistence::fault::JournalHealth::shared(),
             boot: None,
         })
+    }
+
+    /// Returns the condition this journal publishes.
+    ///
+    /// The handle is shared, so a consumer keeps it after the session's lock is released and is
+    /// woken when the condition changes. It is the seam a volatile-native mode reads: while the
+    /// condition is faulted, rich work is fenced and native terminal traffic continues.
+    #[must_use]
+    pub fn health(&self) -> &std::sync::Arc<crate::persistence::fault::JournalHealth> {
+        &self.health
+    }
+
+    /// Tries to leave a fault, and writes down the interval it covered.
+    ///
+    /// The order is the contract. The gap is committed **first**, and the condition is cleared
+    /// only once that commit has succeeded: a recovery whose gap could not be written is not a
+    /// recovery, because the record would then read as continuous over an interval this host
+    /// knows it did not write. A probe that fails leaves the fault exactly where it was.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the store is still failing.
+    pub fn recover(
+        &mut self,
+        now_ms: TimestampMs,
+    ) -> Result<Option<crate::persistence::fault::RecoveryGap>> {
+        let Some(fault) = self.health.condition().fault().cloned() else {
+            return Ok(None);
+        };
+        let resumed_at = self.event_high_water()?;
+        let gap = crate::persistence::fault::RecoveryGap {
+            kind: fault.kind,
+            detail: fault.detail.clone(),
+            faulted_at_ms: fault.observed_at_ms,
+            recovered_at_ms: now_ms,
+            durable_through: fault.durable_through,
+            resumed_at,
+        };
+        self.connection
+            .execute(
+                "INSERT INTO journal_gaps (
+                     kind, detail, faulted_at_ms, recovered_at_ms, durable_through, resumed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    gap.kind.as_str(),
+                    gap.detail.as_str(),
+                    i64::try_from(gap.faulted_at_ms.get()).unwrap_or(i64::MAX),
+                    i64::try_from(gap.recovered_at_ms.get()).unwrap_or(i64::MAX),
+                    i64::try_from(gap.durable_through).unwrap_or(i64::MAX),
+                    i64::try_from(gap.resumed_at).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        self.health.note_recovered();
+        Ok(Some(gap))
+    }
+
+    /// Returns every interval durable writing was unavailable, oldest first.
+    ///
+    /// A reader of this journal sees them beside what it holds, so a run of receipts across one
+    /// of these intervals is read as incomplete rather than as a quiet stretch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn recovery_gaps(&self) -> Result<Vec<crate::persistence::fault::RecoveryGap>> {
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT kind, detail, faulted_at_ms, recovered_at_ms, durable_through, resumed_at
+                 FROM journal_gaps ORDER BY sequence",
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(|error| faulted(&self.health, error))?;
+        let mut gaps = Vec::new();
+        for row in rows {
+            let (kind, detail, faulted_at, recovered_at, durable_through, resumed_at) =
+                row.map_err(unavailable)?;
+            gaps.push(crate::persistence::fault::RecoveryGap {
+                kind: crate::persistence::fault::FaultKind::from_str(&kind).ok_or_else(|| {
+                    unavailable_detail("a stored fault kind is not one this build writes")
+                })?,
+                detail,
+                faulted_at_ms: TimestampMs::new(u64::try_from(faulted_at).unwrap_or(0)),
+                recovered_at_ms: TimestampMs::new(u64::try_from(recovered_at).unwrap_or(0)),
+                durable_through: u64::try_from(durable_through).unwrap_or(0),
+                resumed_at: u64::try_from(resumed_at).unwrap_or(0),
+            });
+        }
+        Ok(gaps)
+    }
+
+    /// Returns one page of the outbox after a cursor.
+    ///
+    /// Delivery is at-least-once: this read takes nothing and moves nothing, so a consumer that
+    /// dies before it records its cursor is handed the same page again. The immutable event
+    /// identifier is what lets it apply each record once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn outbox_after(
+        &self,
+        cursor: u64,
+        limit: u64,
+    ) -> Result<Vec<crate::persistence::outbox::OutboxRecord>> {
+        use crate::persistence::outbox::{OutboxEvent, OutboxRecord, Subsystem};
+
+        let mut statement = self
+            .connection
+            .prepare(
+                "SELECT cursor, event_id, stream, source, actor_id, action_id, subject_revision,
+                        content, detail, recorded_at_ms
+                 FROM outbox WHERE cursor > ?1 ORDER BY cursor LIMIT ?2",
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        let rows = statement
+            .query_map(
+                params![
+                    i64::try_from(cursor).unwrap_or(i64::MAX),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<Vec<u8>>>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                    ))
+                },
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        let mut records = Vec::new();
+        for row in rows {
+            let (
+                cursor,
+                event_id,
+                stream,
+                source,
+                actor_id,
+                action_id,
+                subject_revision,
+                content,
+                detail,
+                recorded_at_ms,
+            ) = row.map_err(unavailable)?;
+            records.push(OutboxRecord {
+                cursor: u64::try_from(cursor).unwrap_or(0),
+                event: OutboxEvent {
+                    event_id: uuid_from(&event_id)?,
+                    stream: parse_stream(&stream)?,
+                    source: Subsystem::from_str(&source).ok_or_else(|| {
+                        unavailable_detail("a stored subsystem is not one this build writes")
+                    })?,
+                    actor_id: actor_id
+                        .map(|actor| {
+                            ActorId::new(actor)
+                                .map_err(|_| unavailable_detail("a stored actor is not valid"))
+                        })
+                        .transpose()?,
+                    action_id: action_id
+                        .map(|bytes| uuid_from(&bytes).map(ActionId::new))
+                        .transpose()?,
+                    subject_revision: u64::try_from(subject_revision).unwrap_or(0),
+                    causal_root: None,
+                    causal_parent: None,
+                    content: parse_content_class(&content)?,
+                    detail,
+                    recorded_at_ms: TimestampMs::new(u64::try_from(recorded_at_ms).unwrap_or(0)),
+                },
+            });
+        }
+        Ok(records)
+    }
+
+    /// Returns where one consumer has got to.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn outbox_cursor(
+        &self,
+        consumer: &str,
+    ) -> Result<crate::persistence::outbox::OutboxCursor> {
+        let row: Option<(i64, i64)> = self
+            .connection
+            .query_row(
+                "SELECT cursor, delivered FROM outbox_cursors WHERE consumer = ?1",
+                params![consumer],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(|error| faulted(&self.health, error))?;
+        let (cursor, delivered) = row.unwrap_or((0, 0));
+        Ok(crate::persistence::outbox::OutboxCursor {
+            consumer: consumer.to_owned(),
+            cursor: u64::try_from(cursor).unwrap_or(0),
+            delivered: u64::try_from(delivered).unwrap_or(0),
+        })
+    }
+
+    /// Records that a consumer has taken everything up to a cursor.
+    ///
+    /// A cursor never goes backwards: a consumer that replays an older page and then records what
+    /// it took would otherwise hand itself every record between twice.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
+    pub fn note_outbox_consumed(
+        &mut self,
+        consumer: &str,
+        cursor: u64,
+        applied: u64,
+    ) -> Result<()> {
+        self.connection
+            .execute(
+                "INSERT INTO outbox_cursors (consumer, cursor, delivered) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (consumer) DO UPDATE SET
+                     cursor = MAX(outbox_cursors.cursor, excluded.cursor),
+                     delivered = outbox_cursors.delivered + excluded.delivered",
+                params![
+                    consumer,
+                    i64::try_from(cursor).unwrap_or(i64::MAX),
+                    i64::try_from(applied).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|error| faulted(&self.health, error))?;
+        Ok(())
     }
 
     /// Writes down what the host's time contract has to survive a restart.
@@ -2174,7 +2590,7 @@ impl Journal {
                  ON CONFLICT (id) DO UPDATE SET state = excluded.state",
                 params![encoded],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -2193,7 +2609,7 @@ impl Journal {
                 row.get(0)
             })
             .optional()
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         encoded
             .map(|bytes| {
                 kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
@@ -2219,7 +2635,7 @@ impl Journal {
                  ON CONFLICT (session_id) DO UPDATE SET summary = excluded.summary",
                 params![summary.session_id.get().as_bytes().as_slice(), encoded],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -2240,7 +2656,7 @@ impl Journal {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         encoded
             .map(|bytes| {
                 kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
@@ -2263,7 +2679,7 @@ impl Journal {
                  ON CONFLICT (session_id) DO UPDATE SET record = excluded.record",
                 params![record.session_id.get().as_bytes().as_slice(), encoded],
             )
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(())
     }
 
@@ -2284,7 +2700,7 @@ impl Journal {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         encoded
             .map(|bytes| {
                 kr_cbor::from_canonical_slice(&bytes, &kr_cbor::Limits::DEFAULT)
@@ -2302,7 +2718,7 @@ impl Journal {
         let count: i64 = self
             .connection
             .query_row("SELECT COUNT(*) FROM receipts", [], |row| row.get(0))
-            .map_err(unavailable)?;
+            .map_err(|error| faulted(&self.health, error))?;
         Ok(u64::try_from(count).unwrap_or(0))
     }
 
@@ -2372,6 +2788,7 @@ impl RawReceipt {
 /// It takes the connection rather than the journal so a caller can put it in a transaction with
 /// whatever made the name true.
 fn name_evidence(
+    health: &crate::persistence::fault::JournalHealth,
     connection: &Connection,
     revision: u64,
     kind: &str,
@@ -2399,7 +2816,7 @@ fn name_evidence(
                 state
             ],
         )
-        .map_err(unavailable)?;
+        .map_err(|error| faulted(health, error))?;
     Ok(changed > 0)
 }
 
@@ -2478,6 +2895,54 @@ pub const fn request_id(value: u64) -> RequestId {
 #[must_use]
 pub const fn action_id_from(bytes: [u8; 16]) -> ActionId {
     ActionId::new(Uuid::from_bytes(bytes))
+}
+
+/// Turns one storage failure into a refusal, and reports it to the health seam.
+///
+/// Every durable path in this file goes through here, which is what makes the seam's condition a
+/// fact about the store rather than a summary somebody remembered to update.
+fn faulted(
+    health: &crate::persistence::fault::JournalHealth,
+    error: rusqlite::Error,
+) -> WorkerError {
+    health.observe(&error, kr_ipc::now_ms().get());
+    WorkerError::JournalUnavailable {
+        detail: error.to_string(),
+    }
+}
+
+/// Turns one storage failure into a refusal without a seam to report it to.
+///
+/// Used where the failure is a decoding failure rather than the store refusing to answer: what a
+/// stored row means is this build's business, and a value it cannot read is not the store saying
+/// it has stopped working.
+fn uuid_from(bytes: &[u8]) -> Result<Uuid> {
+    let raw: [u8; 16] = bytes
+        .try_into()
+        .map_err(|_| unavailable_detail("a stored identifier is not sixteen bytes"))?;
+    Ok(Uuid::from_bytes(raw))
+}
+
+fn parse_stream(value: &str) -> Result<kr_protocol::recovery::EventStream> {
+    kr_protocol::recovery::EventStream::ALL
+        .iter()
+        .copied()
+        .find(|stream| stream.as_str() == value)
+        .ok_or_else(|| unavailable_detail("a stored stream is not one this build writes"))
+}
+
+fn parse_content_class(value: &str) -> Result<crate::persistence::stores::ContentClass> {
+    use crate::persistence::stores::ContentClass;
+
+    match value {
+        "metadata" => Ok(ContentClass::Metadata),
+        "terminal" => Ok(ContentClass::TerminalContent),
+        "authored" => Ok(ContentClass::AuthoredContent),
+        "secret" => Ok(ContentClass::Secret),
+        _ => Err(unavailable_detail(
+            "a stored content class is not one this build writes",
+        )),
+    }
 }
 
 fn unavailable(error: rusqlite::Error) -> WorkerError {
