@@ -45,6 +45,7 @@ struct Host {
     session_id: SessionId,
     endpoint: kr_ipc::paths::Endpoint,
     environment_id: kr_protocol::ids::EnvironmentId,
+    journal_path: std::path::PathBuf,
 }
 
 fn build() -> BuildId {
@@ -131,6 +132,7 @@ async fn host() -> Host {
         resident_bytes: 64 * 1024,
     };
     let journal_path = config.journal_path.clone().expect("the harness journals");
+    let journal_path_for_tests = journal_path.clone();
     if let Some(parent) = journal_path.parent() {
         std::fs::create_dir_all(parent).expect("the journal directory");
     }
@@ -167,6 +169,7 @@ async fn host() -> Host {
         session_id,
         endpoint,
         environment_id,
+        journal_path: journal_path_for_tests,
     }
 }
 
@@ -385,5 +388,93 @@ async fn kr_req_12_04_an_admitted_operation_leaves_the_session_boundary_before_i
         upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
         2,
         "both prompts reached the upstream"
+    );
+}
+
+/// A transport that makes the receipt journal unwritable while the operation is being admitted.
+///
+/// It takes the journal's own write lock from a second connection, which is what a journal that
+/// has stopped accepting writes looks like from inside this host: the admission has been taken and
+/// the dispatch marker cannot be committed.
+#[derive(Debug)]
+struct JournalHoldingUpstream {
+    journal: std::path::PathBuf,
+    held: std::sync::Mutex<Option<rusqlite::Connection>>,
+    carried: std::sync::atomic::AtomicUsize,
+}
+
+impl JournalHoldingUpstream {
+    fn release(&self) {
+        drop(
+            self.held
+                .lock()
+                .expect("the lock record is not poisoned")
+                .take(),
+        );
+    }
+}
+
+impl UpstreamDispatch for JournalHoldingUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        let connection = rusqlite::Connection::open(&self.journal).expect("the journal opens");
+        connection
+            .execute_batch("BEGIN IMMEDIATE;")
+            .expect("the write lock is taken");
+        *self.held.lock().expect("the lock record is not poisoned") = Some(connection);
+        Ok(())
+    }
+
+    fn submit(&self, request: &UpstreamRequest) -> Result<UpstreamOutcome, BrokerError> {
+        self.carried
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(UpstreamOutcome {
+            upstream_request_id: None,
+            turn_id: request.turn_id.clone(),
+            provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+        })
+    }
+}
+
+/// KR-REQ-09 and KR-REQ-12.06: a dispatch marker this host could not write leaves nothing
+/// executable behind it.
+///
+/// The admission is taken before the marker, so the window this closes is the one between them.
+/// The journal stops accepting writes inside it: the marker fails, the admission is given up, and
+/// nothing reaches the upstream. What the caller is told is a storage failure, and the receipt does
+/// not say the prompt was applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_12_06_a_marker_that_could_not_be_written_leaves_nothing_to_transmit() {
+    let host = host().await;
+    let upstream = Arc::new(JournalHoldingUpstream {
+        journal: host.journal_path.clone(),
+        held: std::sync::Mutex::new(None),
+        carried: std::sync::atomic::AtomicUsize::new(0),
+    });
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    let mut client = cli(&host).await;
+    let mutation = prompt_mutation(&client, &host, 14);
+    let action_id = mutation.action_id;
+
+    let outcome = send(&mut client, mutation).await;
+    let Outcome::Error(error) = outcome else {
+        panic!("a marker that could not be written is not an applied prompt: {outcome:?}");
+    };
+    assert_eq!(error.code, ErrorCode::StorageUnavailable);
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the admission was given up, so nothing carried the operation"
+    );
+
+    // Storage comes back, and what the receipt says is that the prompt did not go.
+    upstream.release();
+    let receipt = receipt(&mut client, action_id).await;
+    assert_ne!(
+        receipt.state,
+        ReceiptState::Applied,
+        "an operation that never left this host is not one that was applied"
     );
 }

@@ -3992,17 +3992,18 @@ impl WorkerService {
         // history rule narrows a *grant*; there is none to narrow, so it reads the whole retained
         // history, exactly as a local attachment is drawn the whole screen.
         //
-        // A forwarded caller does act under a grant, and what narrows it is the shared host-side
-        // history filter, which is not this task's. Until that filter is here, a forwarded read is
-        // refused rather than answered with more than the grant may cover: an unrestricted answer
-        // to a device is the failure this refusal exists to avoid.
+        // A forwarded caller does act under a grant, and section 10 narrows a grant's history in
+        // one place: the shared host-side filter. The retained agent history is not one of the
+        // surfaces that filter admits, so a forwarded read is refused rather than answered with
+        // more than the grant may cover; an unrestricted answer to a device is the failure this
+        // refusal exists to avoid.
         if caller.is_remote() {
             return Err(WorkerError::Broker(
                 crate::broker::BrokerError::UnsupportedCapability {
                     detail:
-                        "a forwarded agent snapshot needs the shared host-side history filter, \
-                             which this build does not have; the terminal and the local reads are \
-                             unaffected"
+                        "a forwarded agent snapshot is narrowed by the shared host-side history \
+                             filter, and the retained agent history is not one of the surfaces \
+                             that filter admits; the terminal and the local reads are unaffected"
                             .to_owned(),
                 },
             ));

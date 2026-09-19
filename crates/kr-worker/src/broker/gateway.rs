@@ -705,7 +705,7 @@ fn read_frame(bytes: &[u8]) -> Result<serde_json::Map<String, serde_json::Value>
 }
 
 /// Counts the top-level member names in one JSON object's bytes, repetitions included.
-fn count_member_names(bytes: &[u8]) -> Result<usize> {
+pub(crate) fn count_member_names(bytes: &[u8]) -> Result<usize> {
     let mut deserialiser = serde_json::Deserializer::from_slice(bytes);
     serde::Deserialize::deserialize(&mut deserialiser)
         .map(|counted: MemberNames| counted.0)

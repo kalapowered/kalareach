@@ -3010,9 +3010,10 @@ grant, is not disabled by a component fault, the instance is not suspended, the 
 in force, and the capability the action needs is still usable at the revision the caller read it
 at.
 
-What is not here yet is the hand-over to a component: the runtime that invokes `prepare_action` is
-the plugin host's, and giving it the token is the work that joins the two. Until that lands, the
-broker issues and spends the token around the operation it dispatches itself.
+The hand-over to a component belongs to the plugin host, which owns the runtime that invokes
+`prepare_action`. The broker issues and spends the token around the operation it dispatches itself,
+and a `plugin.action.invoke` that would cross into that runtime is refused before the dispatch
+marker rather than carried.
 
 ### Capability evidence
 
@@ -3202,11 +3203,12 @@ were answered at, and a snapshot says how many entries the history filter withhe
 range the reader asked for had been evicted. A gap is reported, never filled: nothing reconstructs an
 unobserved pending approval from a transcript or a screen.
 
-An agent snapshot does not yet go through the shared host-side history filter. A local caller reads
-the whole retained history, because its authority is the operating-system identity the listener
-authenticated and there is no grant to narrow — the same rule that draws a local attachment the
-whole screen. A *forwarded* read is refused rather than answered, because answering it without the
-filter would give a device more than its grant covers.
+A local caller reads the whole retained agent history, because its authority is the
+operating-system identity the listener authenticated and there is no grant to narrow — the same
+rule that draws a local attachment the whole screen. A *forwarded* read is refused rather than
+answered. Section 10 narrows a grant's history in one place, the shared host-side filter, and the
+broker's retained agent history is not one of the surfaces that filter admits, so answering a
+forwarded read would give a device more than its grant covers.
 
 The five agent mutations each carry the binding revision they were prepared against. A revision
 behind the one in force is `STALE_SESSION`; a draft that moved is `DRAFT_CONFLICT`. A steer or a
@@ -3262,7 +3264,9 @@ computes their digest itself and compares it with the token's and the plan's, be
 component supplied says only that the component can write a hash. The arguments are read once at
 admission and written back in the one form this host will transmit, so the digest covers the bytes
 that go; an encoding this host cannot put on the wire is refused there rather than replaced when
-the frame is built. The invocation's own authority is asked again when the plan arrives, because
+the frame is built. Arguments that name a member twice are refused for the reason a native frame
+that does is: the parse keeps the last one, another reader of the same bytes may keep the first,
+and what this host hashed would not be what the upstream acted on. The invocation's own authority is asked again when the plan arrives, because
 the token was spent to invite the work and is not proof by the time the work comes back. What
 transmits is the plan that was validated: the operation it prepares travels in the frame, carried
 in the permit rather than attested by a flag beside it. The draft store itself — whose the draft is

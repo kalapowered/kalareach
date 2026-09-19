@@ -1978,3 +1978,314 @@ fn kr_req_11_35_a_fence_refuses_a_plan_that_arrives_after_it() {
     );
     assert!(upstream.submitted().is_empty());
 }
+
+/// A draft store whose draft moves between one read and the next.
+#[derive(Debug)]
+struct MovingDrafts {
+    draft_id: kr_protocol::ids::DraftId,
+    revision: std::sync::atomic::AtomicU64,
+}
+
+impl MovingDrafts {
+    fn moved(&self) {
+        self.revision
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl kr_worker::broker::DraftResolver for MovingDrafts {
+    fn resolve(
+        &self,
+        draft_id: &kr_protocol::ids::DraftId,
+    ) -> Result<kr_worker::broker::DraftSnapshot, BrokerError> {
+        if draft_id == &self.draft_id {
+            Ok(kr_worker::broker::DraftSnapshot {
+                draft_id: *draft_id,
+                revision: kr_protocol::scalars::U64::new(
+                    self.revision.load(std::sync::atomic::Ordering::SeqCst),
+                ),
+            })
+        } else {
+            Err(BrokerError::PreconditionFailed {
+                detail: format!("no draft {draft_id}"),
+            })
+        }
+    }
+}
+
+/// Forwards one request and interprets it, the way a live gateway does.
+fn offered(broker: &Broker, id: &str, at: u64) -> kr_protocol::gateway::PendingResource {
+    let opaque = broker
+        .forward_native(
+            GatewayConnectionId::new(1),
+            format!(r#"{{"id":{id},"method":"session/request_permission"}}"#).as_bytes(),
+            TimestampMs::new(at),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response");
+    broker
+        .interpret(
+            binding(),
+            opaque.resource_id,
+            projection(),
+            None,
+            TimestampMs::new(at + 1),
+        )
+        .expect("interpreted")
+}
+
+/// KR-REQ-11.27: two callers reach one admission at the same moment, and one answer goes.
+///
+/// The exclusion is not "the second caller arrives later and finds the resource settled": both
+/// callers are inside the same admission at once, and what separates them is the permit, which
+/// only one of them can take. The loser transmits nothing, and it does not record the winner's
+/// answer as uncertain.
+#[test]
+fn kr_req_11_27_two_callers_on_one_admission_at_once_transmit_once() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    let resource = offered(&broker, "11", 2);
+    let admitted = broker
+        .admit_approval(
+            &caller(),
+            &AgentApprovalRespondParams {
+                target: target(1),
+                resource_id: resource.resource_id,
+                option_id: "allow".to_owned(),
+            },
+            TimestampMs::new(4),
+        )
+        .expect("the answer is admitted once");
+
+    let start = std::sync::Barrier::new(2);
+    let (first, second) = std::thread::scope(|scope| {
+        let one = scope.spawn(|| {
+            start.wait();
+            broker.record_approval(&admitted, TimestampMs::new(5))
+        });
+        let two = scope.spawn(|| {
+            start.wait();
+            broker.record_approval(&admitted, TimestampMs::new(5))
+        });
+        (
+            one.join().expect("the thread finished"),
+            two.join().expect("the thread finished"),
+        )
+    });
+
+    let refused = match (first, second) {
+        (Ok(applied), Err(refused)) | (Err(refused), Ok(applied)) => {
+            assert_eq!(applied.state, PendingState::Resolved);
+            refused
+        }
+        (Ok(_), Ok(_)) => panic!("one admission carries one answer"),
+        (Err(one), Err(two)) => panic!("one of the two answers goes: {one:?} and {two:?}"),
+    };
+    assert!(
+        matches!(refused, BrokerError::AlreadyTransmitted),
+        "the loser is told the answer has gone, not that the resource is uncertain: {refused:?}"
+    );
+    assert_eq!(
+        upstream.submitted().len(),
+        1,
+        "one answer reached the upstream"
+    );
+    assert_eq!(
+        broker
+            .recorded(resource.resource_id)
+            .expect("readable")
+            .expect("retained")
+            .state,
+        PendingState::Resolved,
+        "and the winner's resolution is what stands"
+    );
+}
+
+/// KR-REQ-23.30: a draft that moves while a component prepares its plan leaves nothing to carry.
+///
+/// The invocation binds to the revision the draft stood at when it was admitted. A plan prepared
+/// against that revision is not a plan against what the draft holds now, and the difference is
+/// `DRAFT_CONFLICT` rather than an operation on a draft nobody admitted.
+#[test]
+fn kr_req_23_30_a_draft_that_moved_while_the_plan_was_prepared_transmits_nothing() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    let draft_id = kr_protocol::ids::DraftId::new(Uuid::from_bytes([4; 16]));
+    let drafts = std::sync::Arc::new(MovingDrafts {
+        draft_id,
+        revision: std::sync::atomic::AtomicU64::new(1),
+    });
+    broker.bind_drafts(std::sync::Arc::clone(&drafts) as _);
+    broker
+        .register_actions(
+            binding(),
+            [RegisteredAction {
+                name: ActionName::new("draft.attach").expect("valid"),
+                grant: BrokerGrant::UpstreamAction,
+                effect: EffectClass::Write,
+                capability: Some(capability("agent.prompt")),
+                needs_draft: true,
+                operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
+            }],
+        )
+        .expect("the action is registered");
+    let params = PluginActionInvokeParams {
+        target: target(1),
+        plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+        action: ActionName::new("draft.attach").expect("valid"),
+        draft_id: Nullable::some(draft_id),
+        parameters: Bytes::from(b"{}".to_vec()),
+    };
+    let effect = kr_protocol::broker::PreparedEffect {
+        action: ActionName::new("draft.attach").expect("valid"),
+        class: EffectClass::Write,
+        operation: kr_protocol::broker::PreparedOperation::UpstreamAttachment,
+        draft_id: Nullable::some(draft_id),
+        argument_hash: arguments_digest(),
+    };
+
+    let admitted = broker
+        .admit_plugin_action(&caller(), binding(), &params, TimestampMs::new(4))
+        .expect("the invocation is admitted against the draft as it stands");
+    // The person edits the draft while the component is preparing its plan.
+    drafts.moved();
+    let refusal = broker
+        .validate_effect(&admitted, &effect)
+        .expect_err("the plan was prepared against a draft that has moved");
+    assert_eq!(refusal.code(), ErrorCode::DraftConflict);
+    assert!(
+        broker
+            .record_plugin_action(&admitted, TimestampMs::new(5))
+            .is_err(),
+        "and an invocation with no validated plan has nothing to transmit"
+    );
+    assert!(
+        upstream.submitted().is_empty(),
+        "no frame went for a draft nobody admitted"
+    );
+}
+
+/// KR-REQ-11.28: arguments that name a member twice are refused before anything is marked.
+///
+/// The parse keeps the last member and another reader of the same bytes may keep the first, so
+/// what this host hashed would not be what the upstream acted on. The refusal is at admission,
+/// where it is a rejection rather than an outcome nobody can establish.
+#[test]
+fn kr_req_11_28_arguments_that_name_a_member_twice_are_refused_before_the_marker() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    broker
+        .register_actions(
+            binding(),
+            [RegisteredAction {
+                name: ActionName::new("prompt.submit").expect("valid"),
+                grant: BrokerGrant::UpstreamAction,
+                effect: EffectClass::Write,
+                capability: Some(capability("agent.prompt")),
+                needs_draft: false,
+                operation: kr_protocol::broker::PreparedOperation::UpstreamSubmit,
+            }],
+        )
+        .expect("the action is registered");
+    let invoke = |parameters: &[u8]| {
+        broker.admit_plugin_action(
+            &caller(),
+            binding(),
+            &PluginActionInvokeParams {
+                target: target(1),
+                plugin_id: PluginId::new("kalareach.codex").expect("valid"),
+                action: ActionName::new("prompt.submit").expect("valid"),
+                draft_id: Nullable::null(),
+                parameters: Bytes::from(parameters.to_vec()),
+            },
+            TimestampMs::new(4),
+        )
+    };
+
+    let refusal = invoke(br#"{"text":"first","text":"second"}"#)
+        .expect_err("two members of one name are two readings of the same bytes");
+    assert_eq!(refusal.code(), ErrorCode::InvalidArgument);
+    assert!(
+        upstream.submitted().is_empty(),
+        "nothing went for arguments this host would not carry"
+    );
+    invoke(br#"{"text":"first"}"#).expect("one member of each name is carried");
+}
+
+/// KR-REQ-11.27 and KR-REQ-11.33: the two answer paths race for one resource and one wins.
+///
+/// The rich answer and the person's own answer in the terminal are started at the same moment.
+/// Whichever takes the resource's one transmission admission is the one that writes; the other
+/// writes nothing, and the resource carries one resolution either way.
+#[test]
+fn kr_req_11_27_the_native_and_rich_answers_race_and_one_of_them_writes() {
+    for attempt in 0..16u64 {
+        let upstream = std::sync::Arc::new(RecordingUpstream::default());
+        let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+        let resource = offered(&broker, "11", 2);
+        let carried = std::sync::Mutex::new(Vec::new());
+        let start = std::sync::Barrier::new(2);
+
+        let (rich, native) = std::thread::scope(|scope| {
+            let one = scope.spawn(|| {
+                start.wait();
+                broker.agent_approval_respond(
+                    &caller(),
+                    &AgentApprovalRespondParams {
+                        target: target(1),
+                        resource_id: resource.resource_id,
+                        option_id: "allow".to_owned(),
+                    },
+                    TimestampMs::new(4),
+                )
+            });
+            let two = scope.spawn(|| {
+                start.wait();
+                broker.native_answer_through(
+                    GatewayConnectionId::new(1),
+                    br#"{"id":11,"result":{"outcome":"allow"}}"#,
+                    TimestampMs::new(4),
+                    |bytes| {
+                        carried
+                            .lock()
+                            .expect("the record is not poisoned")
+                            .push(bytes.to_vec());
+                        Ok(())
+                    },
+                )
+            });
+            (
+                one.join().expect("the thread finished"),
+                two.join().expect("the thread finished"),
+            )
+        });
+
+        let native_frames = carried.lock().expect("the record is not poisoned").len();
+        let rich_frames = upstream.submitted().len();
+        assert_eq!(
+            usize::from(rich.is_ok()) + usize::from(native.is_ok()),
+            1,
+            "attempt {attempt}: one of the two answers takes the admission"
+        );
+        assert_eq!(
+            rich_frames + native_frames,
+            1,
+            "attempt {attempt}: exactly one answer reached the upstream"
+        );
+        assert_eq!(
+            usize::from(rich.is_ok()),
+            rich_frames,
+            "attempt {attempt}: the loser wrote nothing"
+        );
+        let recorded = broker
+            .recorded(resource.resource_id)
+            .expect("readable")
+            .expect("retained");
+        assert_eq!(
+            recorded.state,
+            PendingState::Resolved,
+            "attempt {attempt}: one resolution, whichever writer made it"
+        );
+    }
+}

@@ -1186,6 +1186,20 @@ impl Broker {
                     params.action
                 ))
             })?;
+        // Arguments that name a member twice are refused rather than resolved, for the reason a
+        // native frame that does is: the parse keeps the last one, another participant in the
+        // same protocol may keep the first, and what this host hashed would not be what the
+        // upstream acted on.
+        if let serde_json::Value::Object(members) = &arguments
+            && crate::broker::gateway::count_member_names(params.parameters.as_slice())?
+                != members.len()
+        {
+            return Err(BrokerError::invalid(format!(
+                "{}'s parameters name a member more than once, and two readers of them could \
+                 disagree",
+                params.action
+            )));
+        }
         serde_json::to_vec(&arguments).map_err(|error| {
             BrokerError::invalid(format!(
                 "{}'s parameters will not encode: {error}",

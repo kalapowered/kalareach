@@ -331,6 +331,13 @@ fn answer(
 fn gateway_recording(
     path: Option<&std::path::Path>,
 ) -> (Broker, std::sync::Arc<RecordingUpstream>) {
+    gateway_tabled(path, table())
+}
+
+fn gateway_tabled(
+    path: Option<&std::path::Path>,
+    declarative: DeclarativeTable,
+) -> (Broker, std::sync::Arc<RecordingUpstream>) {
     let broker = Broker::open(path, session()).expect("the broker opens");
     broker
         .register_instance(
@@ -353,7 +360,7 @@ fn gateway_recording(
         )
         .expect("the binding is recorded");
     broker
-        .pin_table(instance(2), table(), rich())
+        .pin_table(instance(2), declarative, rich())
         .expect("the installed tables are pinned");
     broker
         .open_native_connection(
@@ -1716,4 +1723,91 @@ fn kr_req_11_26_a_restoration_checks_every_resource_the_connection_retained() {
         }
     }
     panic!("both read orders should have occurred: {stale_first} and {stale_second}");
+}
+
+/// KR-REQ-11.33 and KR-REQ-12.08: a table that declares no answer member answers nothing.
+///
+/// The decision goes in the member the connector's own table names. A table that names none
+/// describes no way to answer its requests, and saying so at admission is what keeps the refusal
+/// in front of the claim and the marker rather than behind them.
+#[test]
+fn kr_req_11_33_a_table_that_names_no_answer_member_refuses_before_anything_is_marked() {
+    // An installation whose table says nothing about where a decision goes.
+    let mut silent = table();
+    for entry in &mut silent.entries {
+        entry.approval_option_field = Nullable::null();
+    }
+    silent.digest = silent.canonical_digest().expect("encodable");
+    let (broker, upstream) = gateway_tabled(None, silent);
+    let resource = approval(&broker, "1", 2).expect("the interpretation is accepted");
+
+    let refusal = answer(&broker, resource.resource_id, "allow", 4)
+        .expect_err("this table describes no way to answer its own requests");
+    assert_eq!(refusal.code(), ErrorCode::UnsupportedCapability);
+    assert!(
+        upstream.submitted().is_empty(),
+        "nothing was written for an answer this host cannot encode"
+    );
+    assert_eq!(
+        broker
+            .pending(resource.resource_id)
+            .expect("recorded")
+            .state,
+        PendingState::Pending,
+        "and the resource is left as it was found, with its reservation given back"
+    );
+}
+
+/// KR-REQ-11.27: a reconnect gives back a reservation nothing was sent under.
+///
+/// The two halves of reconciliation are the difference the marker makes. A resource this host had
+/// reserved but not marked is answerable again once the upstream says it still holds the request;
+/// one it had marked is uncertain for ever.
+#[test]
+fn kr_req_11_27_a_reconnect_gives_back_a_reservation_nothing_was_sent_under() {
+    let (broker, upstream) = gateway_recording(None);
+    let reserved = approval(&broker, "1", 2).expect("the interpretation is accepted");
+    let admitted =
+        reserve(&broker, reserved.resource_id, "allow", 4).expect("its transmission is reserved");
+    assert_eq!(
+        broker
+            .pending(reserved.resource_id)
+            .expect("recorded")
+            .state,
+        PendingState::Claimed
+    );
+
+    let reconciliation = broker
+        .reconcile(
+            ReconcileScope {
+                application_instance_id: instance(2),
+                connection: GatewayConnectionId::new(1),
+            },
+            &[Broker::downstream(
+                GatewayConnectionId::new(1),
+                UpstreamRequestId::new("1").expect("valid"),
+            )],
+            TimestampMs::new(6),
+        )
+        .expect("the reconnect reconciles");
+    assert_eq!(reconciliation.released, vec![reserved.resource_id]);
+    assert!(reconciliation.uncertain.is_empty());
+    assert_eq!(
+        broker
+            .pending(reserved.resource_id)
+            .expect("recorded")
+            .state,
+        PendingState::Pending,
+        "nothing was sent under that reservation, so the resource is answerable again"
+    );
+
+    // The admission that held it settles nothing afterwards, and a fresh answer goes.
+    assert!(
+        broker
+            .record_approval(&admitted, TimestampMs::new(7))
+            .is_err()
+    );
+    let applied = answer(&broker, reserved.resource_id, "allow", 8).expect("it is answerable");
+    assert_eq!(applied.state, PendingState::Resolved);
+    assert_eq!(upstream.submitted().len(), 1, "one answer went in the end");
 }
