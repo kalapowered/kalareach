@@ -429,13 +429,27 @@ impl Controller {
         // The grants and the invitations live in the daemon's own registry database, beside the
         // devices that hold them, so an authority object and the device it was issued to are in
         // one file and one backup.
-        let sharing = Arc::new(crate::sharing::SharingService::new(
-            crate::grants::GrantDirectory::open(setup.paths.registry_database())?,
-            crate::sharing::InvitationLedger::open(setup.paths.registry_database())?,
-        ));
         // This host's own device identity is derived from its environment, the same way the
         // network half derives it, so the feed speaks for the same host across restarts.
         let host_device_id = kr_protocol::ids::DeviceId::new(setup.environment_id.get());
+        let sharing = Arc::new(crate::sharing::SharingService::new(
+            crate::grants::GrantDirectory::open(setup.paths.registry_database())?,
+            crate::sharing::InvitationLedger::open(setup.paths.registry_database())?,
+            host_device_id,
+        ));
+        // The policy and the feed are read back from the store rather than rebuilt empty. A host
+        // that came back unrestricted after every restart would be the same failure as one that
+        // accepted a restored old policy, by a different route.
+        let policy = match sharing.grants().stored_policy()? {
+            Some(stored) => crate::grants::HostPolicy::restore(&stored, authority_revision),
+            None => crate::grants::HostPolicy::personal(authority_revision),
+        };
+        sharing.grants().store_policy(&policy.snapshot())?;
+        let feed = match sharing.grants().stored_feed()? {
+            Some(stored) => crate::grants::AuthorityFeed::restore(&stored),
+            None => crate::grants::AuthorityFeed::new(host_device_id, authority_revision),
+        };
+        sharing.grants().store_feed(&feed.snapshot())?;
         let devices = Arc::new(net::devices::DeviceDirectory::open(
             setup.paths.registry_database(),
         )?);
@@ -464,11 +478,8 @@ impl Controller {
             project,
             sharing,
             devices,
-            policy: std::sync::Mutex::new(crate::grants::HostPolicy::personal(authority_revision)),
-            feed: std::sync::Mutex::new(crate::grants::AuthorityFeed::new(
-                host_device_id,
-                authority_revision,
-            )),
+            policy: std::sync::Mutex::new(policy),
+            feed: std::sync::Mutex::new(feed),
             agent_tools: tokio::sync::Mutex::new(()),
             worker_program,
             build_id: setup.build_id,
@@ -1158,6 +1169,10 @@ impl Controller {
     /// revocation is complete for a worker once that worker has acknowledged the revision and
     /// fenced the undispatched actions it affects, or once it is confirmed ended.
     ///
+    /// A revocation that withdrew nothing — the grant and its subtree were already revoked —
+    /// advances no revision. Advancing one would fence every live connection on the host for a
+    /// retry that changed nothing.
+    ///
     /// # Errors
     ///
     /// Returns an error when the grant store or the registry cannot be read or written.
@@ -1165,23 +1180,21 @@ impl Controller {
         &self,
         grant_id: kr_protocol::ids::GrantId,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
-        let revocation = self.sharing.revoke(grant_id, kr_ipc::now_ms().get())?;
-        let barrier = self.revoke_authority().await?;
-        self.policy()
-            .advance_authority_revision(barrier.authority_revision);
-        Ok(kr_protocol::sharing::RevocationResult {
-            authority_revision: barrier.authority_revision,
-            revoked_grants: revocation.revoked.iter().copied().collect(),
-            barrier,
-        })
+        let now_ms = self.settled_now_ms();
+        let revocation = self.sharing.revoke(grant_id, now_ms)?;
+        self.complete_revocation(revocation.revoked.iter().copied().collect())
+            .await
     }
 
     /// Revokes every grant one device holds, then revokes the device itself.
     ///
-    /// The grants go first for the same reason as above. The device's own revocation is the
-    /// network half's, because it is the half that withdraws the registration and closes the
-    /// connection's write boundary; when this host is not on a network there is nothing to
-    /// withdraw, and advancing the revision is the whole of it.
+    /// The grants go first for the same reason as above. What this does **not** do is withdraw
+    /// that one device's network registration selectively: that is `net::Network::revoke_device`,
+    /// which owns the in-memory registrations, and this daemon reaches it through the network
+    /// entry point rather than from here. What happens instead is the daemon-wide fence, which is
+    /// stricter rather than weaker: every registration is withdrawn and re-admitted at the
+    /// revision now in force, and the revoked device's record is already marked so it cannot be
+    /// re-admitted at all.
     ///
     /// # Errors
     ///
@@ -1190,22 +1203,76 @@ impl Controller {
         &self,
         device_id: kr_protocol::ids::DeviceId,
     ) -> Result<kr_protocol::sharing::RevocationResult> {
-        let revocation = self
-            .sharing
-            .grants()
-            .revoke_device(device_id, kr_ipc::now_ms().get())?;
+        let now_ms = self.settled_now_ms();
+        let revocation = self.sharing.grants().revoke_device(device_id, now_ms)?;
         // The device record is marked revoked before the revision advances, so nothing can be
         // authorised against it in between. The directory is a view on this daemon's own registry
-        // database, which is where the network half keeps it too.
-        self.devices.revoke(device_id, kr_ipc::now_ms())?;
+        // database, which is the file the network half keeps its device records in.
+        let withdrawn = self.devices.revoke(device_id, TimestampMs::new(now_ms))?;
+        if !withdrawn && revocation.revoked.is_empty() {
+            // Nothing was withdrawn: no live grant and no live device record. Advancing the
+            // revision would fence the whole host for a retry that changed nothing.
+            // The guard is taken and released before the announcement, because an announcement
+            // waits on every worker and a lock held across that wait is a lock held for seconds.
+            let authority_revision = self.policy().authority_revision();
+            let barrier = self.announce_authority_revision().await?;
+            return Ok(kr_protocol::sharing::RevocationResult {
+                authority_revision,
+                revoked_grants: kr_protocol::scalars::CanonicalSet::from_iter([]),
+                barrier,
+            });
+        }
+        self.complete_revocation(revocation.revoked.iter().copied().collect())
+            .await
+    }
+
+    /// Advances the revision, fences what was admitted under it, and reports the barrier.
+    ///
+    /// Shared by both revocation paths so the order cannot drift between them.
+    async fn complete_revocation(
+        &self,
+        revoked_grants: kr_protocol::scalars::CanonicalSet<kr_protocol::ids::GrantId>,
+    ) -> Result<kr_protocol::sharing::RevocationResult> {
+        if revoked_grants.is_empty() {
+            // Idempotent: the work was already done, so the answer is the revision in force and
+            // the barrier as it stands, with nothing newly withdrawn.
+            let barrier = self.announce_authority_revision().await?;
+            return Ok(kr_protocol::sharing::RevocationResult {
+                authority_revision: barrier.authority_revision,
+                revoked_grants,
+                barrier,
+            });
+        }
         let barrier = self.revoke_authority().await?;
-        self.policy()
-            .advance_authority_revision(barrier.authority_revision);
+        {
+            let mut policy = self.policy();
+            policy.advance_authority_revision(barrier.authority_revision);
+            self.sharing.grants().store_policy(&policy.snapshot())?;
+        }
+        {
+            // The feed numbers its entries from the same sequence the registry does, so a feed
+            // entry cannot later claim a revision a local revocation has already used.
+            let mut feed = self.authority_feed();
+            feed.note_revision(barrier.authority_revision);
+            self.sharing.grants().store_feed(&feed.snapshot())?;
+        }
         Ok(kr_protocol::sharing::RevocationResult {
             authority_revision: barrier.authority_revision,
-            revoked_grants: revocation.revoked.iter().copied().collect(),
+            revoked_grants,
             barrier,
         })
+    }
+
+    /// The reading this daemon decides expiry from.
+    ///
+    /// The later of this machine's clock and the highest reading this host has already decided
+    /// from, and the floor rises with it. A clock wound back past a deadline therefore does not
+    /// revive a grant this host has already refused.
+    fn settled_now_ms(&self) -> u64 {
+        let now_ms = kr_ipc::now_ms().get();
+        let mut policy = self.policy();
+        policy.observe_utc(now_ms);
+        policy.settled_now(now_ms)
     }
 
     /// Returns which workers have not yet acknowledged the environment's authority revision.
@@ -1241,6 +1308,15 @@ impl Controller {
             return self
                 .retained_installation(actor_id, mutation, connection_id)
                 .await;
+        }
+        // An authority change is exactly the effect a retry must not repeat: two `grant.revoke`
+        // calls under one action identifier would otherwise advance the revision twice and fence
+        // the host twice for one withdrawal.
+        if matches!(
+            method,
+            Method::GrantCreate | Method::GrantRevoke | Method::DeviceRevoke
+        ) {
+            return self.retained_authority_change(actor_id, mutation);
         }
         if method != Method::SessionCreate {
             return None;
@@ -2035,10 +2111,6 @@ impl Controller {
                 }
                 let _: kr_protocol::sharing::DeviceRevokeParams = parse(&mutation.params)?;
             }
-            Method::DevicePreviewKeyUpdate => {
-                let _: kr_protocol::sharing::DevicePreviewKeyUpdateParams =
-                    parse(&mutation.params)?;
-            }
             _ if crate::transfer::TransferModule::serves(method) => {
                 crate::transfer::TransferModule::check_subject(method, mutation)?;
             }
@@ -2633,20 +2705,63 @@ impl Controller {
                 self.agent_tools_change(actor_id, mutation, method, connection_id, accepted)
                     .await
             }
-            Method::GrantCreate => self.grant_create(mutation, carried).await,
-            Method::GrantRevoke => self.grant_revoke(mutation, carried).await,
-            Method::DeviceRevoke => self.device_revoke(mutation, carried).await,
-            Method::DevicePreviewKeyUpdate => Err(ControllerError::PermissionDenied {
-                detail: "a device rotates its own notification-preview key through its paired \
-                         proof, which a local caller does not hold"
-                    .to_owned(),
-            }),
+            Method::GrantCreate | Method::GrantRevoke | Method::DeviceRevoke => {
+                self.authority_change(actor_id, mutation, method, carried)
+                    .await
+            }
             _ => Err(ControllerError::InvalidArgument(format!(
                 "{} is not a mutation this daemon serves",
                 method.as_str()
             ))),
         };
         respond(mutation.request_id, outcome)
+    }
+
+    /// Answers an authority change this host has already performed for this caller.
+    ///
+    /// The de-duplication key is the actor and the action together, and the payload digest decides
+    /// whether it is the same action or a reused identifier. A reused identifier carrying different
+    /// parameters is an `ID_CONFLICT`, not a second withdrawal of authority.
+    fn retained_authority_change(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+    ) -> Option<ControlFrame> {
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id).ok()?;
+        match self
+            .sharing
+            .grants()
+            .retained_result(actor_id, mutation.action_id, &digest)
+        {
+            Ok(Some(result)) => {
+                let value = kr_cbor::decode(&result, &kr_cbor::Limits::DEFAULT).ok()?;
+                Some(ControlFrame::Response(Response {
+                    request_id: mutation.request_id,
+                    outcome: Outcome::Ok(ParamsValue::new(value)),
+                }))
+            }
+            Ok(None) => None,
+            Err(error) => Some(respond(mutation.request_id, Err(error))),
+        }
+    }
+
+    /// Records what an authority change produced, so a retry is answered rather than repeated.
+    fn retain_authority_change(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        result: &ParamsValue,
+    ) -> Result<()> {
+        let digest = kr_protocol::digest::mutation_digest(mutation, actor_id)
+            .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
+        let encoded = kr_cbor::encode(result.as_value());
+        self.sharing.grants().retain_result(
+            actor_id,
+            mutation.action_id,
+            &digest,
+            &encoded,
+            kr_ipc::now_ms().get(),
+        )
     }
 
     /// Lists the grants this host's owner may see.
@@ -2700,6 +2815,33 @@ impl Controller {
         })
     }
 
+    /// Performs one authority change and records its result for a retry.
+    async fn authority_change(
+        &self,
+        actor_id: &ActorId,
+        mutation: &MutationRequest,
+        method: Method,
+        carried: crate::authority::AdmittedMutation,
+    ) -> Result<ParamsValue> {
+        let result = match method {
+            Method::GrantCreate => self.grant_create(mutation, carried).await?,
+            Method::GrantRevoke => self.grant_revoke(mutation, carried).await?,
+            Method::DeviceRevoke => self.device_revoke(mutation, carried).await?,
+            _ => {
+                return Err(ControllerError::InvalidArgument(format!(
+                    "{} is not an authority change this daemon serves",
+                    method.as_str()
+                )));
+            }
+        };
+        // The record is written after the effect, so a retry that arrives before it is recorded
+        // repeats the effect rather than skipping it. For these three that is safe: a repeated
+        // revocation withdraws nothing and advances nothing, and a repeated create is refused by
+        // the identity its parameters already carry.
+        self.retain_authority_change(actor_id, mutation, &result)?;
+        Ok(result)
+    }
+
     /// Shares a session: compiles the role, previews it, and writes the grant and its invitation.
     async fn grant_create(
         &self,
@@ -2725,9 +2867,16 @@ impl Controller {
                     .to_owned(),
             ));
         }
+        // The identities are derived from the action the caller named, not minted fresh. A retry
+        // therefore asks for the same grant and the same invitation, and finds the ones it already
+        // created rather than making a second pair.
+        let action = mutation.action_id.get();
         let request = crate::sharing::ShareRequest {
-            invitation_id: kr_protocol::ids::InvitationId::new(kr_ipc::new_uuid()),
-            grant_id: kr_protocol::ids::GrantId::new(kr_ipc::new_uuid()),
+            invitation_id: kr_protocol::ids::InvitationId::new(Self::derived_identity(
+                action,
+                b"invitation",
+            )),
+            grant_id: kr_protocol::ids::GrantId::new(Self::derived_identity(action, b"grant")),
             environment_id: self.paths.environment_id(),
             session_id: params.session_id,
             issuer_device_id: self.host_device_id(),
@@ -2779,6 +2928,21 @@ impl Controller {
             self.check_admission(&registry, &carried)?;
         }
         encode(&self.revoke_device_authority(params.device_id).await?)
+    }
+
+    /// One identity derived from an action identifier and a purpose.
+    ///
+    /// Two identities from one action have to differ, and both have to be the same on a retry, so
+    /// they are the digest of the action and a purpose label rather than anything freshly random.
+    fn derived_identity(
+        action: kr_protocol::scalars::Uuid,
+        purpose: &[u8],
+    ) -> kr_protocol::scalars::Uuid {
+        let digest =
+            kr_cbor::sha256(&[b"kr-sharing/1".as_slice(), purpose, action.as_bytes()].concat());
+        let mut bytes = [0_u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        kr_protocol::scalars::Uuid::from_bytes(bytes)
     }
 
     /// This host's own device identity, derived from its environment.

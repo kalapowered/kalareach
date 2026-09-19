@@ -407,7 +407,12 @@ fn a_named_question_is_permitted_and_previewed_although_it_predates_the_cutoff()
     let other_approval = approval_id("another-request");
 
     let filter = HistoryFilter::new(ViewerScope::from_grant(&grant(
-        scope(Some(CUTOFF_MS), false, &[named], &[approval.clone()]),
+        scope(
+            Some(CUTOFF_MS),
+            false,
+            &[named],
+            std::slice::from_ref(&approval),
+        ),
         &[ActionRight::SessionView],
     )));
 

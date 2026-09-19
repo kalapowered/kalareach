@@ -1167,8 +1167,14 @@ worker holds the public half and rotation is a procedure that closes them all.
 A grant is the authority a request is decided against. It names its issuer and its recipient, the
 authority revision it was issued under, the environments and sessions it covers, the actions it
 permits, how far back it may see, when it stops and which organisation membership it requires.
-`crates/kr-controller/src/grants/` holds the store, and `grants::decide` is the intersection the
-host takes **on every request**, in this order:
+
+Two paths reach a grant. A paired device's session request is decided at the network boundary,
+against the grant its pairing recorded and the session and environment that grant covers. The
+sharing and device method groups, and every authority question this daemon answers about a grant it
+issued, are decided by `grants::decide` in `crates/kr-controller/src/grants/`. The two share the
+method registry's required-rights column, so neither invents a right the other does not ask for.
+
+`grants::decide` takes the intersection in this order:
 
 1. The method has to be in the registry and reachable from the caller's ingress class. An unlisted
    name is denied whatever the caller holds.
@@ -1187,6 +1193,15 @@ always the one an authorisation check happens to read.
 **Expiry does not downgrade.** A grant whose deadline has passed refuses the request. It does not
 quietly keep serving reads, because continued reads still need valid authority and a narrower grant
 is something the person chooses.
+
+**A grant's issuing revision is provenance, not a deadline.** Somebody else's revocation advancing
+the host's revision does not invalidate an untouched grant; what stops a grant is revocation or
+expiry. A grant claiming a revision this host has never issued is refused, because nothing here
+could have issued it.
+
+**Expiry is decided from a clock that does not go backwards.** The host keeps the highest reading it
+has decided from and uses the later of that and the current clock, so winding the clock back past a
+deadline does not revive a grant the host has already refused.
 
 **Delegation narrows.** A child grant can never reach further than its parent in rights, resources,
 history or lifetime, and it can never drop an organisation requirement its parent carries. The rule
@@ -1218,6 +1233,10 @@ attachment action or a workflow is the *intersection* of what the actor holds an
 intermediary declares. A view-only invitation calling a plugin that declares `terminal.input`
 obtains no terminal input.
 
+**Delegating needs the parent and the right to pass it on.** An issuer has to hold the grant it
+delegates from — naming one is not holding one — and that grant has to carry `session.share`.
+Only this host's own device issues a grant that delegates from nothing.
+
 ### Revocation
 
 `Controller::revoke_grant` and `Controller::revoke_device_authority` run in the order a revocation
@@ -1236,6 +1255,15 @@ A revocation is complete for a worker once that worker has acknowledged the revi
 undispatched actions it affects, or once it is confirmed ended. Anything else is `pending`, and the
 answer says which worker and why. Already dispatched effects and content already copied cannot be
 undone.
+
+A revocation that withdrew nothing advances no revision. Retrying one is answered from the result
+the host recorded for that action rather than performed again, so a retry cannot fence the host a
+second time for one withdrawal, and an action identifier reused with different parameters is a
+conflict rather than a second revocation.
+
+The fence this daemon takes is host-wide: every registration is withdrawn and the connections that
+kept their authority are re-admitted at the revision now in force. Withdrawing one device's
+registration on its own belongs to the network half, which owns those registrations.
 
 ### The remote authority feed
 
@@ -1264,17 +1292,28 @@ affected remote work, and polls every 30 seconds while online.
   grant stays account-free and usable without an authority-feed dependency. An owner who chooses a
   bound gets that bound, measured from the last successful synchronisation, with the stale status
   and the last sync visible beside it.
-* **Revalidation after wake and reboot.** Expiry is decided from the clock, so waking re-decides it.
-  A policy document restored from a backup names an older revision and is refused: the host keeps
-  the highest revision it has ever accepted, and that floor only rises. A signature proves who wrote
-  a policy, not that the policy is the current one.
+* **Revalidation after wake and reboot.** The policy, its restrictions, its enrolments and both
+  floors are read back from the environment's authority store when the daemon starts, so a restart
+  does not return an unrestricted host. Membership leases are not: a lease lasts at most fifteen
+  minutes, and a restarted host holds none until the service gives it one. A policy document naming
+  a revision at or below the floor is refused, and the floor only rises. A signature proves who
+  wrote a policy, not that the policy is the current one.
+
+  The floors live in the same store as the grants they protect, so restoring that store wholesale
+  takes them back with it. That is a recovery event rather than a policy document, and the remedy is
+  the remote feed, whose revisions this host accepts but never issues on another host's behalf.
 
 ### The shared history filter
 
-One filter enforces a grant's history lower bound, in `crates/kr-worker/src/history_filter/`, and
-nine surfaces share it: event pages, terminal and semantic snapshots, loaded conversations,
-attachment references, exports, summaries, changed-since-last-visit and voice context. A surface
-that built its own would be the one place a bound was forgotten.
+`crates/kr-worker/src/history_filter/` is where a grant's history lower bound is enforced. It is one
+filter with nine named surfaces — event pages, terminal and semantic snapshots, loaded
+conversations, attachment references, exports, summaries, changed-since-last-visit and voice context
+— and one decision behind all of them, so a surface cannot be served by a rule of its own. The
+surface list is closed: content that is not one of them is not filtered here, it is not filtered
+anywhere, and adding a surface means adding it to that list.
+
+The worker asks the filter how much of the screen a forwarded caller may be drawn, and installs the
+projection it answers with.
 
 Content is admitted by **when it was produced**, never by when it was read, re-read or summarised,
 so a summary generated now from an hour-old conversation is an hour-old conversation. Derived data

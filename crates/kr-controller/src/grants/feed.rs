@@ -37,6 +37,8 @@ use kr_protocol::pairing::{AuthorityRevisionRecord, RevocationRequest};
 use kr_protocol::scalars::{Nullable, TimestampMs};
 use kr_protocol::sharing::AuthorityFeedStatus;
 
+use super::durable::{StoredFeed, StoredRevocation};
+
 /// How often a host polls the feed while it is online, in milliseconds.
 pub const FEED_POLL_INTERVAL_MS: u64 = 30_000;
 
@@ -51,6 +53,13 @@ pub struct RetainedRevocation {
     pub applied_at_ms: u64,
     /// The enrolled hosts that have acknowledged it.
     pub acknowledged_by: BTreeSet<DeviceId>,
+    /// True once every enrolled host had acknowledged it.
+    ///
+    /// A settled record is kept rather than deleted. Its revision is what the device list reports
+    /// as a host's last acknowledgement, and its identity is what stops the same request being
+    /// applied a second time under a new revision. Deleting it would make a republished request
+    /// look new and a settled acknowledgement look like one that never happened.
+    pub settled: bool,
 }
 
 impl RetainedRevocation {
@@ -82,7 +91,7 @@ pub enum FeedRefusal {
 pub struct AuthorityFeed {
     host_device_id: DeviceId,
     accepted: AuthorityRevision,
-    retained: BTreeMap<RevocationRequestId, RetainedRevocation>,
+    records: BTreeMap<RevocationRequestId, RetainedRevocation>,
     enrolled: BTreeSet<DeviceId>,
     last_synchronised_at_ms: Option<u64>,
     stale: bool,
@@ -101,7 +110,7 @@ impl AuthorityFeed {
         Self {
             host_device_id,
             accepted,
-            retained: BTreeMap::new(),
+            records: BTreeMap::new(),
             enrolled: BTreeSet::new(),
             last_synchronised_at_ms: None,
             stale: true,
@@ -127,13 +136,16 @@ impl AuthorityFeed {
     /// open settle once it is gone.
     pub fn remove_enrolled(&mut self, device_id: DeviceId) {
         self.enrolled.remove(&device_id);
-        for record in self.retained.values_mut() {
-            record.acknowledged_by.remove(&device_id);
+        let enrolled = self.enrolled.clone();
+        for record in self.records.values_mut() {
+            // The acknowledgement it did make is kept: it is a fact about a host that was enrolled
+            // at the time, and the record's job now is only to stop owing delivery to a host that
+            // no longer exists.
+            record.settled = enrolled.is_subset(&record.acknowledged_by);
         }
-        self.collect();
     }
 
-    /// The next revision this host would issue.
+    /// The next revision this host would issue, when nothing else allocates one.
     ///
     /// Only this host issues one, and it always follows the one it holds. A request carries no
     /// revision, so there is nothing a device can say that reaches this number.
@@ -142,40 +154,69 @@ impl AuthorityFeed {
         AuthorityRevision::new(self.accepted.get().saturating_add(1))
     }
 
-    /// Applies a validated revocation request and returns the revision this host issued for it.
+    /// Applies a validated revocation request under the revision the host allocated for it.
+    ///
+    /// The revision is the **daemon's**, taken from the registry that also numbers local
+    /// revocations. One allocator or two is not a detail: two would let a feed entry and a local
+    /// revocation claim the same number, and every host downstream orders by that number.
     ///
     /// The signature and the owner authority behind `request` are checked before this is called;
-    /// what is checked here is the ordering and the identity of the host it is addressed to.
+    /// what is checked here is the ordering, the host it is addressed to, and whether this exact
+    /// request has already been applied.
     ///
     /// # Errors
     ///
-    /// Returns [`FeedRefusal::AnotherHost`] when the request is addressed elsewhere, and
-    /// [`FeedRefusal::AlreadyApplied`] when this request has already been applied.
+    /// Returns [`FeedRefusal::AnotherHost`] when the request is addressed elsewhere,
+    /// [`FeedRefusal::OutOfOrder`] when the allocated revision does not follow the accepted one,
+    /// and [`FeedRefusal::AlreadyApplied`] when a **different** request carries an identity this
+    /// host has already applied.
     pub fn apply(
         &mut self,
         request: RevocationRequest,
+        revision: AuthorityRevision,
         now_ms: u64,
     ) -> std::result::Result<AuthorityRevision, FeedRefusal> {
         if request.host_device_id != self.host_device_id {
             return Err(FeedRefusal::AnotherHost);
         }
-        if let Some(held) = self.retained.get(&request.request_id) {
-            // Idempotent: a republished request is the same revocation, and issuing a second
-            // revision for it would make one owner's action look like two.
-            return Ok(held.authority_revision);
+        if let Some(held) = self.records.get(&request.request_id) {
+            // Idempotent, but only for the same request. A republished request is the same
+            // revocation and keeps its revision; a different request wearing that identity is
+            // refused rather than quietly answered with somebody else's result.
+            if held.request == request {
+                return Ok(held.authority_revision);
+            }
+            return Err(FeedRefusal::AlreadyApplied);
         }
-        let revision = self.next_revision();
+        if revision.get() <= self.accepted.get() {
+            return Err(FeedRefusal::OutOfOrder {
+                accepted: self.accepted,
+                offered: revision,
+            });
+        }
         self.accepted = revision;
-        self.retained.insert(
+        self.records.insert(
             request.request_id,
             RetainedRevocation {
                 request,
                 authority_revision: revision,
                 applied_at_ms: now_ms,
                 acknowledged_by: BTreeSet::new(),
+                settled: false,
             },
         );
         Ok(revision)
+    }
+
+    /// Records that this host allocated a revision for a revocation of its own.
+    ///
+    /// A local revocation is not a feed entry, but it does consume a revision, and the feed has to
+    /// know: otherwise `apply` would allocate a number the registry has already used and the
+    /// device list would report a revision older than the one in force.
+    pub const fn note_revision(&mut self, revision: AuthorityRevision) {
+        if revision.get() > self.accepted.get() {
+            self.accepted = revision;
+        }
     }
 
     /// Accepts an authority revision record this host issued earlier and is now reading back.
@@ -203,30 +244,41 @@ impl AuthorityFeed {
 
     /// Records one enrolled host's acknowledgement of one revocation record.
     ///
-    /// Returns whether the record is now settled and has been collected.
+    /// Returns whether every enrolled host has now acknowledged it. The record is kept either way:
+    /// what changes when it settles is that this host stops owing its delivery, not that it
+    /// forgets the revocation happened.
     pub fn acknowledge(&mut self, request_id: RevocationRequestId, device_id: DeviceId) -> bool {
         let enrolled = self.enrolled.clone();
-        let Some(record) = self.retained.get_mut(&request_id) else {
+        let Some(record) = self.records.get_mut(&request_id) else {
             return false;
         };
         record.acknowledged_by.insert(device_id);
-        let settled = record.is_settled(&enrolled);
-        if settled {
-            self.retained.remove(&request_id);
-        }
-        settled
+        record.settled = enrolled.is_subset(&record.acknowledged_by);
+        record.settled
     }
 
-    /// The revocation records this host is still retaining.
+    /// The revocation records this host is still owed acknowledgements for.
     #[must_use]
     pub fn retained(&self) -> Vec<&RetainedRevocation> {
-        self.retained.values().collect()
+        self.records
+            .values()
+            .filter(|record| !record.settled)
+            .collect()
+    }
+
+    /// Every revocation record this host has applied, settled or not.
+    #[must_use]
+    pub fn applied(&self) -> Vec<&RetainedRevocation> {
+        self.records.values().collect()
     }
 
     /// The last acknowledgement one enrolled host made, as the device list shows it.
+    ///
+    /// Read across every applied record, settled included, because a settled record is exactly the
+    /// one a host acknowledged and forgetting it would report that host as never having answered.
     #[must_use]
     pub fn last_acknowledgement(&self, device_id: DeviceId) -> Option<AuthorityRevision> {
-        self.retained
+        self.records
             .values()
             .filter(|record| record.acknowledged_by.contains(&device_id))
             .map(|record| record.authority_revision)
@@ -280,13 +332,61 @@ impl AuthorityFeed {
             accepted_revision: self.accepted,
             last_synchronised_at_ms: Nullable(self.last_synchronised_at_ms.map(TimestampMs::new)),
             stale: self.stale,
-            unacknowledged_records: u32::try_from(self.retained.len()).unwrap_or(u32::MAX),
+            unacknowledged_records: u32::try_from(self.retained().len()).unwrap_or(u32::MAX),
         }
     }
 
-    fn collect(&mut self) {
-        let enrolled = self.enrolled.clone();
-        self.retained
-            .retain(|_, record| !record.is_settled(&enrolled));
+    /// This feed, as it is written down.
+    #[must_use]
+    pub fn snapshot(&self) -> StoredFeed {
+        StoredFeed {
+            host_device_id: self.host_device_id,
+            accepted: self.accepted,
+            enrolled: self.enrolled.iter().copied().collect(),
+            records: self
+                .records
+                .values()
+                .map(|record| StoredRevocation {
+                    request: record.request.clone(),
+                    authority_revision: record.authority_revision,
+                    applied_at_ms: TimestampMs::new(record.applied_at_ms),
+                    acknowledged_by: record.acknowledged_by.iter().copied().collect(),
+                    settled: record.settled,
+                })
+                .collect(),
+            last_synchronised_at_ms: Nullable(self.last_synchronised_at_ms.map(TimestampMs::new)),
+        }
+    }
+
+    /// Rebuilds a feed from what was written down.
+    ///
+    /// A restarted host owes a synchronisation and its status is stale, whatever it last recorded:
+    /// what it knew before it stopped is not evidence about the feed now.
+    #[must_use]
+    pub fn restore(stored: &StoredFeed) -> Self {
+        Self {
+            host_device_id: stored.host_device_id,
+            accepted: stored.accepted,
+            records: stored
+                .records
+                .iter()
+                .map(|record| {
+                    (
+                        record.request.request_id,
+                        RetainedRevocation {
+                            request: record.request.clone(),
+                            authority_revision: record.authority_revision,
+                            applied_at_ms: record.applied_at_ms.get(),
+                            acknowledged_by: record.acknowledged_by.iter().copied().collect(),
+                            settled: record.settled,
+                        },
+                    )
+                })
+                .collect(),
+            enrolled: stored.enrolled.iter().copied().collect(),
+            last_synchronised_at_ms: stored.last_synchronised_at_ms.as_ref().map(|at| at.get()),
+            stale: true,
+            owes_synchronisation: true,
+        }
     }
 }

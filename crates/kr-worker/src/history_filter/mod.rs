@@ -343,6 +343,27 @@ impl ViewerScope {
         }
     }
 
+    /// The scope a caller forwarded from the control daemon has at this worker.
+    ///
+    /// A worker does not hold the grant the daemon checked; what it knows is that the caller
+    /// reached it through the daemon rather than being the local owner. Section 10's live-screen
+    /// exception is the most such a caller ever reaches here, so that is what this scope is: the
+    /// visible screen, the events that follow it, and no retained history at all. A caller whose
+    /// grant reaches further is still served no more than this by this worker, because the worker
+    /// has nothing to check the further reach against.
+    #[must_use]
+    pub fn forwarded() -> Self {
+        Self {
+            lower_bound_ms: None,
+            include_live_screen: true,
+            named_questions: BTreeSet::new(),
+            named_approvals: BTreeSet::new(),
+            session_view: true,
+            files_read: false,
+            unrestricted: false,
+        }
+    }
+
     /// The scope a grant gives its holder.
     ///
     /// The one place a grant becomes a scope. Everything the filter decides comes from here.

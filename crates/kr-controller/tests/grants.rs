@@ -103,6 +103,10 @@ fn record(grant: Grant) -> GrantRecord {
     }
 }
 
+fn account() -> AccountId {
+    AccountId::new("3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90").expect("an account identifier")
+}
+
 fn request(method: Method, now_ms: u64) -> AccessRequest {
     AccessRequest {
         method,
@@ -111,6 +115,7 @@ fn request(method: Method, now_ms: u64) -> AccessRequest {
         session_id: Some(session_id(0xa0)),
         claims_geometry: false,
         own_subject: None,
+        recipient_account: Some(account()),
         now_ms,
     }
 }
@@ -121,11 +126,26 @@ fn lease(
     expires_at_ms: u64,
     maximum: &[ActionRight],
 ) -> MembershipLease {
+    lease_for(
+        account(),
+        organisation_id,
+        key_revision,
+        expires_at_ms,
+        maximum,
+    )
+}
+
+fn lease_for(
+    account_id: AccountId,
+    organisation_id: OrganisationId,
+    key_revision: PolicyKeyRevision,
+    expires_at_ms: u64,
+    maximum: &[ActionRight],
+) -> MembershipLease {
     MembershipLease {
         payload: MembershipLeasePayload {
             organisation_id,
-            account_id: AccountId::new("3c9f2b7a-5d18-4a62-9c07-1f5b8e2d4a90")
-                .expect("an account identifier"),
+            account_id,
             role: TeamRole::Controller,
             maximum_grants: maximum.iter().copied().collect(),
             issued_at_ms: TimestampMs::new(0),
@@ -197,14 +217,16 @@ fn the_host_intersects_the_grant_with_policy_on_every_request() {
         ..held.clone()
     };
     let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
-    policy.enrol(organisation_id, key_revision, false);
+    policy.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
     // The organisation's maximum for this role does not include terminal input.
-    policy.install_lease(lease(
-        organisation_id,
-        key_revision,
-        10_000,
-        &[ActionRight::SessionView],
-    ));
+    policy
+        .install_lease(lease(
+            organisation_id,
+            key_revision,
+            10_000,
+            &[ActionRight::SessionView],
+        ))
+        .expect("the lease is inside every rule section 17 states");
 
     // The same grant, decided twice: once on its own, once against the organisation's maximum.
     let permitted = decide(
@@ -399,6 +421,72 @@ fn a_method_is_decided_from_the_registry_table_and_never_from_a_capability() {
     for right in ActionRight::ALL {
         assert_eq!(ActionRight::from_wire(right.as_str()), Some(*right));
     }
+}
+
+/// A decision that could not answer every requirement says which ones it left.
+#[test]
+fn a_permitted_decision_names_the_requirements_it_could_not_answer() {
+    let owner = grant(
+        1,
+        None,
+        &[ActionRight::SessionView, ActionRight::HostManage],
+        GrantExpiry::Never,
+    );
+    let stored = record(owner.clone());
+    let policy = HostPolicy::personal(AuthorityRevision::new(1));
+
+    // `session.read` needs one right and nothing the subject has to resolve.
+    let plain = decide(
+        &owner,
+        &stored,
+        &policy,
+        request(Method::SessionRead, 1_000),
+    )
+    .expect("permitted");
+    assert!(
+        plain.is_complete(),
+        "nothing is owed: {:?}",
+        plain.unresolved
+    );
+
+    // `action.read` needs the subject's own answer as well, and says so rather than letting a
+    // caller read `Ok` as the whole answer.
+    let receipt = decide(&owner, &stored, &policy, request(Method::ActionRead, 1_000))
+        .expect("permitted so far");
+    assert!(
+        !receipt.is_complete(),
+        "an authority the subject resolves is still owed"
+    );
+    assert!(
+        receipt
+            .unresolved
+            .contains(&kr_protocol::authority::RequiredAuthority::ResourceOwner),
+        "and it is named: {:?}",
+        receipt.unresolved
+    );
+
+    // A receipt for a host effect names no session, so present view authority over it is the
+    // actor's read scope over the environment rather than `session.view`.
+    let host_scope = AccessRequest {
+        session_id: None,
+        ..request(Method::ActionRead, 1_000)
+    };
+    let no_view = grant(2, None, &[ActionRight::HostManage], GrantExpiry::Never);
+    decide(&no_view, &record(no_view.clone()), &policy, host_scope)
+        .expect("a host effect's receipt is not a session read");
+
+    // The same method for a session subject does need it.
+    assert_eq!(
+        decide(
+            &no_view,
+            &record(no_view.clone()),
+            &policy,
+            request(Method::ActionRead, 1_000)
+        ),
+        Err(Refusal::MissingRight {
+            right: ActionRight::SessionView
+        })
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -620,13 +708,15 @@ fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport()
     let stored = record(held.clone());
 
     let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
-    policy.enrol(organisation_id, key_revision, false);
-    policy.install_lease(lease(
-        organisation_id,
-        key_revision,
-        10_000,
-        &[ActionRight::SessionView, ActionRight::TerminalInput],
-    ));
+    policy.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
+    policy
+        .install_lease(lease(
+            organisation_id,
+            key_revision,
+            10_000,
+            &[ActionRight::SessionView, ActionRight::TerminalInput],
+        ))
+        .expect("the lease is inside every rule section 17 states");
 
     // Nothing about the transport changes between these two. Only the clock does.
     decide(&held, &stored, &policy, request(Method::SessionRead, 9_999)).expect("inside the lease");
@@ -653,13 +743,19 @@ fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport()
     // A lease signed under a policy-signing revision this host has not pinned is refused whatever
     // the clock says.
     let mut mismatched = HostPolicy::personal(AuthorityRevision::new(1));
-    mismatched.enrol(organisation_id, key_revision, false);
-    mismatched.install_lease(lease(
-        organisation_id,
-        PolicyKeyRevision::new(5),
-        10_000,
-        &[ActionRight::SessionView],
-    ));
+    mismatched.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
+    assert_eq!(
+        mismatched.install_lease(lease(
+            organisation_id,
+            PolicyKeyRevision::new(5),
+            10_000,
+            &[ActionRight::SessionView],
+        )),
+        Err(kr_controller::grants::LeaseRefused::WrongKeyRevision),
+        "a lease signed under a key revision this host has not pinned is not installed at all"
+    );
+    // Because it was never installed, the decision finds no lease at all. That is the stronger
+    // outcome: a host does not hold a lease it could not have accepted.
     assert_eq!(
         decide(
             &held,
@@ -668,7 +764,7 @@ fn an_expired_membership_blocks_organisation_mediated_work_on_a_live_transport()
             request(Method::SessionRead, 1_000)
         ),
         Err(Refusal::MembershipUnusable {
-            refusal: MembershipRefusal::WrongAuthority
+            refusal: MembershipRefusal::NoLease
         })
     );
 }
@@ -686,13 +782,15 @@ fn personal_access_survives_an_organisation_outage_unless_the_host_is_exclusivel
     let stored = record(personal.clone());
 
     let mut ordinary = HostPolicy::personal(AuthorityRevision::new(1));
-    ordinary.enrol(organisation_id, key_revision, false);
-    ordinary.install_lease(lease(
-        organisation_id,
-        key_revision,
-        10_000,
-        &[ActionRight::SessionView],
-    ));
+    ordinary.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
+    ordinary
+        .install_lease(lease(
+            organisation_id,
+            key_revision,
+            10_000,
+            &[ActionRight::SessionView],
+        ))
+        .expect("the lease is installed");
     decide(
         &personal,
         &stored,
@@ -702,13 +800,16 @@ fn personal_access_survives_an_organisation_outage_unless_the_host_is_exclusivel
     .expect("a personal grant is untouched by an organisation outage");
 
     let mut exclusive = HostPolicy::personal(AuthorityRevision::new(1));
-    exclusive.enrol(organisation_id, key_revision, true);
-    exclusive.install_lease(lease(
-        organisation_id,
-        key_revision,
-        10_000,
-        &[ActionRight::SessionView],
-    ));
+    exclusive.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
+    exclusive.set_exclusively_managed(true);
+    exclusive
+        .install_lease(lease(
+            organisation_id,
+            key_revision,
+            10_000,
+            &[ActionRight::SessionView],
+        ))
+        .expect("the lease is installed");
     assert!(exclusive.is_exclusively_managed());
     assert_eq!(
         decide(
@@ -802,24 +903,294 @@ fn expiry_is_revalidated_after_a_wake_and_a_restored_old_policy_cannot_revive_au
     assert!(policy.accept_policy(AuthorityRevision::new(8)));
     assert_eq!(policy.authority_revision(), AuthorityRevision::new(8));
 
-    // A grant issued under a revision this host has replaced decides nothing, which is what stops
-    // a restored grant from coming back with a restored policy.
-    let stale = Grant {
+    // A grant issued under an older revision still decides. Somebody else's revocation advancing
+    // the host's revision is not a reason to stop honouring an untouched grant, and treating it as
+    // one would make every revocation a host-wide expiry.
+    let older = Grant {
         authority_revision: AuthorityRevision::new(2),
         expiry: GrantExpiry::Never,
         ..held
     };
+    decide(
+        &older,
+        &record(older.clone()),
+        &policy,
+        request(Method::SessionRead, 1_000),
+    )
+    .expect("an untouched grant survives somebody else's revocation");
+
+    // A grant claiming a revision this host has never issued is refused: nothing here could have
+    // issued it.
+    let invented = Grant {
+        authority_revision: AuthorityRevision::new(99),
+        ..older
+    };
     assert_eq!(
         decide(
-            &stale,
-            &record(stale.clone()),
+            &invented,
+            &record(invented.clone()),
             &policy,
             request(Method::SessionRead, 1_000)
         ),
-        Err(Refusal::StaleAuthority {
-            grant_revision: AuthorityRevision::new(2),
+        Err(Refusal::UnissuedAuthority {
+            grant_revision: AuthorityRevision::new(99),
             current_revision: AuthorityRevision::new(8)
         })
+    );
+}
+
+/// A clock wound back past a deadline does not revive a grant the host has already refused.
+#[test]
+fn a_clock_that_goes_backwards_does_not_revive_an_expiry_the_host_already_decided() {
+    let held = grant(
+        1,
+        None,
+        &[ActionRight::SessionView],
+        GrantExpiry::At {
+            expires_at_ms: TimestampMs::new(5_000),
+        },
+    );
+    let stored = record(held.clone());
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+
+    // The host decides at 6,000 and refuses: the deadline has passed.
+    policy.observe_utc(6_000);
+    assert_eq!(
+        decide(&held, &stored, &policy, request(Method::SessionRead, 6_000)),
+        Err(Refusal::Expired {
+            expired_at_ms: 5_000
+        })
+    );
+
+    // The clock is wound back to before the deadline. The floor is what decides, so the answer does
+    // not change.
+    assert_eq!(policy.settled_now(4_000), 6_000);
+    assert_eq!(
+        decide(&held, &stored, &policy, request(Method::SessionRead, 4_000)),
+        Err(Refusal::Expired {
+            expired_at_ms: 5_000
+        }),
+        "an expiry already decided is not re-opened by a smaller reading"
+    );
+    assert_eq!(
+        policy.utc_floor_ms(),
+        6_000,
+        "and the floor never went down"
+    );
+}
+
+/// The stored policy is what a restarted host comes back with.
+#[test]
+fn a_restart_restores_the_restrictions_rather_than_an_unrestricted_host() {
+    let directory = GrantDirectory::in_memory().expect("a grant store");
+    let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
+
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(3));
+    policy.set_exclusively_managed(true);
+    policy.enrol(
+        organisation_id,
+        PolicyKeyRevision::new(4),
+        AuthorityRevision::new(4),
+    );
+    policy.set_offline_validity(Some(OfflineValidityPolicy {
+        maximum_offline_ms: kr_protocol::scalars::DurationMs::new(60_000),
+        last_synchronised_at_ms: Nullable::some(TimestampMs::new(100_000)),
+    }));
+    policy.observe_utc(500_000);
+    policy.advance_authority_revision(AuthorityRevision::new(9));
+    directory
+        .store_policy(&policy.snapshot())
+        .expect("the policy is written down");
+
+    // A restart reads it back. The registry's own revision is lower, and the floor does not move
+    // down to meet it.
+    let stored = directory
+        .stored_policy()
+        .expect("readable")
+        .expect("present");
+    let mut restored = HostPolicy::restore(&stored, AuthorityRevision::new(3));
+    assert!(
+        restored.is_exclusively_managed(),
+        "a restart is not an amnesty"
+    );
+    assert!(restored.offline_validity().is_some());
+    assert!(restored.enrolment(organisation_id).is_some());
+    assert_eq!(restored.accepted_floor(), AuthorityRevision::new(9));
+    assert_eq!(restored.utc_floor_ms(), 500_000);
+    assert!(
+        !restored.accept_policy(AuthorityRevision::new(5)),
+        "and a restored old policy still cannot revive authority"
+    );
+
+    // The lease is deliberately not restored: a fifteen-minute deadline the organisation may have
+    // withdrawn is not a thing to bring back.
+    assert!(
+        restored
+            .enrolment(organisation_id)
+            .expect("enrolled")
+            .leases
+            .is_empty()
+    );
+}
+
+/// One member's lease does not answer for another member.
+#[test]
+fn one_members_lease_does_not_sustain_another_members_access() {
+    let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
+    let key_revision = PolicyKeyRevision::new(4);
+    let held = Grant {
+        organisation: Nullable::some(OrganisationRequirement {
+            organisation_id,
+            policy_revision: AuthorityRevision::new(4),
+        }),
+        ..grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    let stored = record(held.clone());
+
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    policy.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
+    // A lease for somebody else entirely.
+    policy
+        .install_lease(lease_for(
+            AccountId::new("8f14e45f-ea1e-4b9e-9f3a-0a3a9b0d2f61").expect("an account"),
+            organisation_id,
+            key_revision,
+            10_000,
+            &[ActionRight::SessionView],
+        ))
+        .expect("the lease is installed");
+
+    assert_eq!(
+        decide(&held, &stored, &policy, request(Method::SessionRead, 1_000)),
+        Err(Refusal::MembershipUnusable {
+            refusal: MembershipRefusal::NoLease
+        }),
+        "a valid member's lease does not answer for a disabled one"
+    );
+
+    // With this recipient's own lease it decides, and dropping that one lease stops it again
+    // without touching anybody else's.
+    policy
+        .install_lease(lease(
+            organisation_id,
+            key_revision,
+            10_000,
+            &[ActionRight::SessionView],
+        ))
+        .expect("the lease is installed");
+    decide(&held, &stored, &policy, request(Method::SessionRead, 1_000))
+        .expect("this member's own lease answers");
+    policy.drop_lease(organisation_id, &account());
+    assert_eq!(
+        decide(&held, &stored, &policy, request(Method::SessionRead, 1_000)),
+        Err(Refusal::MembershipUnusable {
+            refusal: MembershipRefusal::NoLease
+        })
+    );
+
+    // And a host that cannot name the account refuses rather than picking a lease.
+    let unattributed = AccessRequest {
+        recipient_account: None,
+        ..request(Method::SessionRead, 1_000)
+    };
+    assert_eq!(
+        decide(&held, &stored, &policy, unattributed),
+        Err(Refusal::MembershipUnattributed)
+    );
+}
+
+/// A grant answering to a policy revision this host has not pinned is refused.
+#[test]
+fn a_grant_naming_another_policy_revision_is_refused() {
+    let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
+    let key_revision = PolicyKeyRevision::new(4);
+    let held = Grant {
+        organisation: Nullable::some(OrganisationRequirement {
+            organisation_id,
+            policy_revision: AuthorityRevision::new(3),
+        }),
+        ..grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never)
+    };
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    policy.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
+    policy
+        .install_lease(lease(
+            organisation_id,
+            key_revision,
+            10_000,
+            &[ActionRight::SessionView],
+        ))
+        .expect("the lease is installed");
+    assert_eq!(
+        decide(
+            &held,
+            &record(held.clone()),
+            &policy,
+            request(Method::SessionRead, 1_000)
+        ),
+        Err(Refusal::MembershipUnusable {
+            refusal: MembershipRefusal::WrongAuthority
+        })
+    );
+}
+
+/// Enrolling in a second organisation does not undo the exclusive-management restriction.
+#[test]
+fn a_second_enrolment_does_not_undo_exclusive_management() {
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+    policy.set_exclusively_managed(true);
+    policy.enrol(
+        OrganisationId::new(Uuid::from_bytes([0x21; 16])),
+        PolicyKeyRevision::new(4),
+        AuthorityRevision::new(4),
+    );
+    policy.enrol(
+        OrganisationId::new(Uuid::from_bytes([0x22; 16])),
+        PolicyKeyRevision::new(5),
+        AuthorityRevision::new(5),
+    );
+    assert!(policy.is_exclusively_managed());
+}
+
+/// A lease outside section 17's own rules is not installed at all.
+#[test]
+fn a_lease_outside_its_own_rules_is_refused_before_it_is_stored() {
+    use kr_controller::grants::LeaseRefused;
+
+    let organisation_id = OrganisationId::new(Uuid::from_bytes([0x21; 16]));
+    let key_revision = PolicyKeyRevision::new(4);
+    let mut policy = HostPolicy::personal(AuthorityRevision::new(1));
+
+    assert_eq!(
+        policy.install_lease(lease(
+            organisation_id,
+            key_revision,
+            10_000,
+            &[ActionRight::SessionView]
+        )),
+        Err(LeaseRefused::NotEnrolled)
+    );
+
+    policy.enrol(organisation_id, key_revision, AuthorityRevision::new(4));
+    // Longer than the fifteen minutes section 17 permits.
+    assert_eq!(
+        policy.install_lease(lease(
+            organisation_id,
+            key_revision,
+            HostPolicy::maximum_lease_lifetime_ms() + 1,
+            &[ActionRight::SessionView]
+        )),
+        Err(LeaseRefused::TooLong)
+    );
+    // More than the role's own ceiling.
+    assert_eq!(
+        policy.install_lease(lease(
+            organisation_id,
+            key_revision,
+            10_000,
+            ActionRight::ALL
+        )),
+        Err(LeaseRefused::AboveRoleCeiling)
     );
 }
 
@@ -850,23 +1221,47 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
         signature: Signature64::from_bytes([0; 64]),
     };
 
-    // The request carries no revision at all. The host numbers it, and the number follows its own.
+    // The request carries no revision at all. The host allocates the number, from the same
+    // sequence its own revocations use.
     let issued = feed
-        .apply(published(1), 2_000)
+        .apply(published(1), feed.next_revision(), 2_000)
         .expect("the host issues one");
     assert_eq!(issued, AuthorityRevision::new(4));
     assert_eq!(feed.accepted_revision(), AuthorityRevision::new(4));
 
     // A republished request is the same revocation, not a second one.
-    assert_eq!(feed.apply(published(1), 2_100).expect("idempotent"), issued);
+    assert_eq!(
+        feed.apply(published(1), feed.next_revision(), 2_100)
+            .expect("idempotent"),
+        issued
+    );
     assert_eq!(feed.accepted_revision(), AuthorityRevision::new(4));
+
+    // A different request wearing an identity this host has already applied is refused rather
+    // than answered with somebody else's revision.
+    let impostor = RevocationRequest {
+        issuer_device_id: device_id(0xbe),
+        ..published(1)
+    };
+    assert_eq!(
+        feed.apply(impostor, feed.next_revision(), 2_150),
+        Err(FeedRefusal::AlreadyApplied)
+    );
 
     // A request addressed to another host is refused.
     let elsewhere = RevocationRequest {
         host_device_id: device_id(0xee),
         ..published(2)
     };
-    assert_eq!(feed.apply(elsewhere, 2_200), Err(FeedRefusal::AnotherHost));
+    assert_eq!(
+        feed.apply(elsewhere, feed.next_revision(), 2_200),
+        Err(FeedRefusal::AnotherHost)
+    );
+
+    // A local revocation consumes a revision too, and the feed is told, so the next feed entry
+    // cannot claim a number the registry has already used.
+    feed.note_revision(AuthorityRevision::new(7));
+    assert_eq!(feed.next_revision(), AuthorityRevision::new(8));
 
     // Retained until every enrolled host has acknowledged it.
     feed.enrol(device_id(0xd0));
@@ -881,7 +1276,25 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
         "the device list shows each host's last acknowledgement"
     );
     assert!(feed.acknowledge(request_id, device_id(0xd1)));
-    assert!(feed.retained().is_empty());
+    assert!(
+        feed.retained().is_empty(),
+        "a settled record is no longer owed to anybody"
+    );
+
+    // Settling is not forgetting. The acknowledgement history survives it, and so does the
+    // identity that stops the request being applied a second time.
+    assert_eq!(feed.applied().len(), 1);
+    assert_eq!(
+        feed.last_acknowledgement(device_id(0xd1)),
+        Some(AuthorityRevision::new(4)),
+        "a settled record is still what that host acknowledged"
+    );
+    assert_eq!(
+        feed.apply(published(1), feed.next_revision(), 3_000)
+            .expect("still idempotent"),
+        issued,
+        "a republished request after settlement does not take a second revision"
+    );
 
     // Reconnecting owes a synchronisation again, and an unreachable feed is stale rather than
     // silently current.
@@ -891,8 +1304,25 @@ fn only_the_host_issues_ordered_revisions_and_records_are_retained_until_acknowl
     assert_eq!(feed.next_poll_due_ms(), Some(33_000));
     feed.unreachable();
     assert!(feed.status().stale);
+    assert!(
+        !feed.synchronisation_owed(),
+        "an unreachable feed is not a reason to stop serving work this host is authorised for"
+    );
     feed.reconnected();
     assert!(feed.synchronisation_owed());
+
+    // What is written down comes back, and a restarted host owes a synchronisation whatever it
+    // last recorded.
+    let stored = feed.snapshot();
+    let restored = AuthorityFeed::restore(&stored);
+    assert_eq!(restored.accepted_revision(), feed.accepted_revision());
+    assert_eq!(restored.applied().len(), 1);
+    assert_eq!(
+        restored.last_acknowledgement(device_id(0xd0)),
+        Some(AuthorityRevision::new(4))
+    );
+    assert!(restored.synchronisation_owed());
+    assert!(restored.status().stale);
 }
 
 #[test]
@@ -978,11 +1408,10 @@ async fn daemon() -> (kr_ipc::testing::TempHost, Arc<Controller>) {
 }
 
 #[tokio::test]
-async fn a_local_revocation_advances_the_revision_fences_the_leases_and_reports_per_worker() {
+async fn a_local_revocation_advances_the_revision_and_answers_through_the_barrier() {
     let (_temp, controller) = daemon().await;
     let before = controller.policy().authority_revision();
 
-    let recipient = device_id(0xf1);
     let held = grant(
         1,
         None,
@@ -994,7 +1423,6 @@ async fn a_local_revocation_advances_the_revision_fences_the_leases_and_reports_
         .grants()
         .issue(&record(held.clone()))
         .expect("the grant is written");
-    let _ = recipient;
 
     let result = tokio::time::timeout(
         Duration::from_secs(20),
@@ -1013,13 +1441,15 @@ async fn a_local_revocation_advances_the_revision_fences_the_leases_and_reports_
         result.barrier.authority_revision, result.authority_revision,
         "the barrier reports the revision the revocation advanced to"
     );
-    // This daemon has no workers, so the barrier is complete with nothing pending. What matters is
-    // that the answer carries the per-worker report rather than only the revision.
+    // This daemon has no workers, so there is nothing for the barrier to be pending on. What this
+    // establishes is the daemon's half: the revision moved, the answer carries the per-worker
+    // report rather than only the revision, and the policy every later request is decided against
+    // moved with it. The worker half — a paused worker reporting `pending`, and what its fence
+    // rejected — is `crates/kr-controller/tests/barrier.rs`, against a real worker.
     assert!(result.barrier.workers.is_empty());
     assert_eq!(
         controller.policy().authority_revision(),
         result.authority_revision,
-        "the policy every later request intersects against moved with it"
     );
 
     // The grant decides nothing afterwards.
@@ -1040,6 +1470,64 @@ async fn a_local_revocation_advances_the_revision_fences_the_leases_and_reports_
             grant_id: held.grant_id
         })
     );
+
+    // And the revision survives a restart of the policy, because it was written down.
+    let restored = HostPolicy::restore(
+        &controller
+            .sharing()
+            .grants()
+            .stored_policy()
+            .expect("readable")
+            .expect("present"),
+        before,
+    );
+    assert_eq!(restored.accepted_floor(), result.authority_revision);
+}
+
+/// Revoking the same grant twice withdraws nothing the second time, and fences nothing.
+#[tokio::test]
+async fn a_repeated_revocation_withdraws_nothing_and_advances_nothing() {
+    let (_temp, controller) = daemon().await;
+    let held = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
+    controller
+        .sharing()
+        .grants()
+        .issue(&record(held.clone()))
+        .expect("written");
+
+    let first = tokio::time::timeout(
+        Duration::from_secs(20),
+        controller.revoke_grant(held.grant_id),
+    )
+    .await
+    .expect("completes")
+    .expect("succeeds");
+    assert!(!first.revoked_grants.is_empty());
+
+    let second = tokio::time::timeout(
+        Duration::from_secs(20),
+        controller.revoke_grant(held.grant_id),
+    )
+    .await
+    .expect("completes")
+    .expect("succeeds");
+    assert!(
+        second.revoked_grants.is_empty(),
+        "the second call withdrew nothing"
+    );
+    assert_eq!(
+        second.authority_revision, first.authority_revision,
+        "so it advanced no revision, and fenced nobody"
+    );
+
+    // The record of the first revocation is untouched: its moment and its ancestor stand.
+    let stored = controller
+        .sharing()
+        .grants()
+        .record(held.grant_id)
+        .expect("readable")
+        .expect("present");
+    assert!(stored.revoked_at_ms.is_some());
 }
 
 #[tokio::test]
@@ -1048,10 +1536,7 @@ async fn a_device_revocation_takes_every_grant_that_device_held() {
     let recipient = device_id(0xf1);
 
     let first = grant(1, None, &[ActionRight::SessionView], GrantExpiry::Never);
-    let second = Grant {
-        grant_id: grant_id(2),
-        ..grant(2, None, &[ActionRight::FilesRead], GrantExpiry::Never)
-    };
+    let second = grant(2, None, &[ActionRight::FilesRead], GrantExpiry::Never);
     let delegated = Grant {
         grant_id: grant_id(3),
         parent_grant_id: Nullable::some(first.grant_id),
@@ -1084,4 +1569,72 @@ async fn a_device_revocation_takes_every_grant_that_device_held() {
         result.barrier.authority_revision, result.authority_revision,
         "the device method group completes through the dispatch barrier"
     );
+
+    // A second revocation of the same device withdraws nothing and advances nothing.
+    let again = tokio::time::timeout(
+        Duration::from_secs(20),
+        controller.revoke_device_authority(recipient),
+    )
+    .await
+    .expect("completes")
+    .expect("succeeds");
+    assert!(again.revoked_grants.is_empty());
+    assert_eq!(again.authority_revision, result.authority_revision);
+}
+
+/// A grant written while a revocation is reading its subtree does not escape the cascade.
+#[test]
+fn a_child_cannot_be_written_while_its_parent_is_being_revoked() {
+    use std::sync::Arc;
+
+    let directory = Arc::new(GrantDirectory::in_memory().expect("a grant store"));
+    let parent = grant(
+        1,
+        None,
+        &[ActionRight::SessionView, ActionRight::FilesRead],
+        GrantExpiry::Never,
+    );
+    directory
+        .issue(&record(parent.clone()))
+        .expect("the parent");
+
+    // Two threads: one revoking the parent, one delegating from it. Whichever order the store
+    // settles them in, the outcome has to be consistent — either the child was written and the
+    // cascade took it, or the child was refused because its parent had gone.
+    let child = Grant {
+        grant_id: grant_id(2),
+        parent_grant_id: Nullable::some(parent.grant_id),
+        actions: [ActionRight::SessionView].into_iter().collect(),
+        ..parent.clone()
+    };
+    let revoking = {
+        let directory = Arc::clone(&directory);
+        let parent_id = parent.grant_id;
+        std::thread::spawn(move || directory.revoke(parent_id, 4_000))
+    };
+    let issuing = {
+        let directory = Arc::clone(&directory);
+        let child = child.clone();
+        std::thread::spawn(move || directory.issue(&record(child)))
+    };
+    let revocation = revoking.join().expect("the revoking thread finishes");
+    let issued = issuing.join().expect("the issuing thread finishes");
+    revocation.expect("the revocation succeeds");
+
+    match directory.record(child.grant_id).expect("readable") {
+        Some(written) => {
+            assert!(
+                issued.is_ok(),
+                "a child that is in the store was written successfully"
+            );
+            assert!(
+                written.revoked_at_ms.is_some(),
+                "a child written before the cascade ran is revoked with its parent"
+            );
+        }
+        None => assert!(
+            issued.is_err(),
+            "a child that is not in the store was refused"
+        ),
+    }
 }

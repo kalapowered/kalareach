@@ -32,7 +32,7 @@ use kr_protocol::ids::{
 };
 use kr_protocol::method::Method;
 use kr_protocol::rights::ActionRight;
-use kr_protocol::scalars::{CanonicalSet, Nullable, TimestampMs, Uuid};
+use kr_protocol::scalars::{CanonicalSet, Uuid};
 use kr_protocol::sharing::{AuthorityNotice, RoleSelection, SessionRole};
 
 // ---------------------------------------------------------------------------------------------
@@ -92,6 +92,7 @@ fn request(method: Method, now_ms: u64) -> AccessRequest {
         session_id: Some(session_id(0xa0)),
         claims_geometry: false,
         own_subject: None,
+        recipient_account: None,
         now_ms,
     }
 }
@@ -112,7 +113,7 @@ fn stored(grant: &Grant) -> GrantRecord {
 
 #[test]
 fn each_role_compiles_to_explicit_actions_and_the_host_decides_from_those() {
-    let service = SharingService::in_memory().expect("a sharing service");
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     let policy = HostPolicy::personal(AuthorityRevision::new(1));
 
     let viewer = service
@@ -174,7 +175,7 @@ fn each_role_compiles_to_explicit_actions_and_the_host_decides_from_those() {
 
 #[test]
 fn only_controller_and_owner_answer_questions_without_an_explicit_option() {
-    let service = SharingService::in_memory().expect("a sharing service");
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     for (byte, role) in [(1_u8, SessionRole::Viewer), (2, SessionRole::Reviewer)] {
         let plain = service
             .share(&ShareRequest {
@@ -241,7 +242,7 @@ fn only_controller_and_owner_answer_questions_without_an_explicit_option() {
 
 #[test]
 fn an_issuer_that_accepted_different_consequences_does_not_get_the_grant() {
-    let service = SharingService::in_memory().expect("a sharing service");
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     // A surface that showed a controller invitation without the account-access notice.
     let softened = ShareRequest {
         accepted_notices: CanonicalSet::from_iter([AuthorityNotice::AgentPermissions]),
@@ -270,7 +271,7 @@ fn an_issuer_that_accepted_different_consequences_does_not_get_the_grant() {
 
 #[test]
 fn an_invitation_is_single_use_and_expires() {
-    let service = SharingService::in_memory().expect("a sharing service");
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     let issued = service
         .share(&share(SessionRole::Viewer, 1))
         .expect("issued");
@@ -318,7 +319,7 @@ fn an_invitation_is_single_use_and_expires() {
 fn the_issuer_sees_what_is_being_shared_and_no_historical_attachment_keys() {
     use kr_protocol::sharing::LiveScreenPreview;
 
-    let service = SharingService::in_memory().expect("a sharing service");
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     let selection = RoleSelection {
         include_live_screen: true,
         ..RoleSelection::plain(SessionRole::Viewer)
@@ -385,7 +386,7 @@ fn the_issuer_sees_what_is_being_shared_and_no_historical_attachment_keys() {
 
 #[test]
 fn an_invitation_is_scoped_to_the_session_it_shares() {
-    let service = SharingService::in_memory().expect("a sharing service");
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     let issued = service
         .share(&share(SessionRole::Viewer, 1))
         .expect("issued");
@@ -409,68 +410,111 @@ fn an_invitation_is_scoped_to_the_session_it_shares() {
 
 #[test]
 fn a_delegation_narrows_what_the_issuer_holds() {
-    let service = SharingService::in_memory().expect("a sharing service");
-    let reviewer = service
-        .share(&share(SessionRole::Reviewer, 1))
-        .expect("a reviewer");
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
+    // Only an owner carries `session.share`, so only an owner can pass anything on. A reviewer
+    // holding `files.read` does not thereby hold the authority to give it to somebody else.
+    let owner = service
+        .share(&share(SessionRole::Owner, 1))
+        .expect("an owner");
 
-    // The reviewer delegates a viewer's grant to a third device: narrower, and accepted.
+    // The owner delegates a viewer's grant to a third device: narrower, and accepted.
     let narrower = service
         .share(&ShareRequest {
             invitation_id: invitation_id(2),
             grant_id: grant_id(2),
             issuer_device_id: device_id(0xf1),
             recipient_device_id: device_id(0xf2),
-            parent_grant_id: Some(reviewer.grant.grant_id),
+            parent_grant_id: Some(owner.grant.grant_id),
             ..share(SessionRole::Viewer, 2)
         })
         .expect("a narrower delegation");
     assert_eq!(
         narrower.grant.parent_grant_id.as_ref(),
-        Some(&reviewer.grant.grant_id),
+        Some(&owner.grant.grant_id),
         "a delegated grant names its parent"
     );
 
-    // The reviewer tries to delegate a controller's grant, which it does not hold.
-    let selection = RoleSelection::plain(SessionRole::Controller);
+    // The viewer it just created tries to pass its own view on. It holds no `session.share`, so
+    // it cannot, however narrow the thing it is offering.
     let error = service
         .share(&ShareRequest {
             invitation_id: invitation_id(3),
             grant_id: grant_id(3),
-            issuer_device_id: device_id(0xf1),
+            issuer_device_id: device_id(0xf2),
             recipient_device_id: device_id(0xf3),
-            parent_grant_id: Some(reviewer.grant.grant_id),
-            accepted_notices: AuthorityNotice::for_actions(&selection.actions()),
-            selection,
-            ..share(SessionRole::Controller, 3)
+            parent_grant_id: Some(narrower.grant.grant_id),
+            ..share(SessionRole::Viewer, 3)
         })
-        .expect_err("a reviewer cannot make somebody a controller");
-    // The refusal names one of the rights the reviewer does not hold, so a person reading it
-    // learns what was asked for rather than only that something was.
-    let detail = error.to_string();
-    let named = ActionRight::ALL
-        .iter()
-        .find(|right| detail.contains(right.as_str()))
-        .unwrap_or_else(|| panic!("the refusal names a right: {detail}"));
+        .expect_err("holding a right is not authority to pass it on");
     assert!(
-        !reviewer.grant.permits(*named),
-        "the refusal names a right the reviewer actually holds: {detail}"
-    );
-    assert!(
-        SessionRole::Controller.default_actions().contains(named),
-        "and one the controller invitation asked for: {detail}"
+        error.to_string().contains("session.share"),
+        "unexpected refusal: {error}"
     );
 
-    // Revoking the reviewer takes the delegation with it.
+    // A device that merely *names* the owner's grant cannot delegate from it either.
+    let error = service
+        .share(&ShareRequest {
+            invitation_id: invitation_id(4),
+            grant_id: grant_id(4),
+            issuer_device_id: device_id(0xbb),
+            recipient_device_id: device_id(0xbc),
+            parent_grant_id: Some(owner.grant.grant_id),
+            ..share(SessionRole::Viewer, 4)
+        })
+        .expect_err("naming a grant is not holding one");
+    assert!(
+        error.to_string().contains("belongs to another device"),
+        "unexpected refusal: {error}"
+    );
+
+    // And nobody but this host issues a grant that delegates from nothing.
+    let error = service
+        .share(&ShareRequest {
+            invitation_id: invitation_id(5),
+            grant_id: grant_id(5),
+            issuer_device_id: device_id(0xbb),
+            recipient_device_id: device_id(0xbc),
+            parent_grant_id: None,
+            ..share(SessionRole::Viewer, 5)
+        })
+        .expect_err("a device cannot write authority out of nothing");
+    assert!(
+        error.to_string().contains("only this host"),
+        "unexpected refusal: {error}"
+    );
+
+    // The owner tries to delegate more than it holds: a grant with a right its own does not carry.
+    let beyond = RoleSelection {
+        include_live_screen: true,
+        ..RoleSelection::plain(SessionRole::Viewer)
+    };
+    let error = service
+        .share(&ShareRequest {
+            invitation_id: invitation_id(6),
+            grant_id: grant_id(6),
+            issuer_device_id: device_id(0xf1),
+            recipient_device_id: device_id(0xf4),
+            parent_grant_id: Some(owner.grant.grant_id),
+            accepted_notices: AuthorityNotice::for_actions(&beyond.actions()),
+            selection: beyond,
+            ..share(SessionRole::Viewer, 6)
+        })
+        .expect_err("the parent's history scope does not include the live screen");
+    assert!(
+        error.to_string().contains("history"),
+        "unexpected refusal: {error}"
+    );
+
+    // Revoking the owner takes the delegation with it.
     let revocation = service
-        .revoke(reviewer.grant.grant_id, NOW + 10)
+        .revoke(owner.grant.grant_id, NOW + 10)
         .expect("revoked");
     assert!(revocation.revoked.contains(&narrower.grant.grant_id));
 }
 
 #[test]
 fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
-    let service = SharingService::in_memory().expect("a sharing service");
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     let owner = service
         .share(&share(SessionRole::Owner, 1))
         .expect("an owner");
@@ -540,7 +584,7 @@ fn transfer_of_control_hands_over_only_what_the_transferring_grant_carries() {
 
 #[test]
 fn a_view_only_invitation_obtains_no_input_through_a_plugin_an_attachment_action_or_a_workflow() {
-    let service = SharingService::in_memory().expect("a sharing service");
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
     let viewer = service
         .share(&share(SessionRole::Viewer, 1))
         .expect("a viewer");
@@ -612,7 +656,7 @@ fn a_view_only_invitation_obtains_no_input_through_a_plugin_an_attachment_action
 
 #[test]
 fn sharing_checks_parent_rights_expiry_and_owner_confirmation() {
-    let service = SharingService::in_memory().expect("a sharing service");
+    let service = SharingService::in_memory(device_id(0xf0)).expect("a sharing service");
 
     // Parent rights: a delegation from a grant this host does not hold is refused.
     let error = service
@@ -639,9 +683,8 @@ fn sharing_checks_parent_rights_expiry_and_owner_confirmation() {
     );
 
     // Owner confirmation: a persistent enlargement needs it, a bounded invitation does not.
-    let held: CanonicalSet<ActionRight> = [ActionRight::SessionView].into_iter().collect();
     assert!(
-        !requires_owner_confirmation(&issued.grant, &CanonicalSet::from_iter([])),
+        !requires_owner_confirmation(&issued.grant, &[]),
         "a bounded invitation is not a persistent enlargement, however wide"
     );
     let persistent = Grant {
@@ -652,24 +695,46 @@ fn sharing_checks_parent_rights_expiry_and_owner_confirmation() {
         ..issued.grant.clone()
     };
     assert!(
-        requires_owner_confirmation(&persistent, &held),
-        "a persistent grant that adds a right the device does not hold is an enlargement"
+        requires_owner_confirmation(&persistent, std::slice::from_ref(&issued.grant)),
+        "a persistent grant the device's existing grants do not cover is an enlargement"
     );
     assert!(
-        !requires_owner_confirmation(&persistent, &persistent.actions),
+        !requires_owner_confirmation(&persistent, std::slice::from_ref(&persistent)),
         "re-issuing what a device already holds enlarges nothing"
+    );
+    // The case comparing action names alone would miss: the same actions, permanently, over every
+    // session rather than the one the existing grant covers.
+    let everywhere = Grant {
+        session_selector: SessionSelector::Any,
+        expiry: GrantExpiry::Never,
+        ..issued.grant.clone()
+    };
+    assert!(
+        requires_owner_confirmation(&everywhere, std::slice::from_ref(&issued.grant)),
+        "a permanent grant over every session is an enlargement of a bounded one over one session"
     );
 
     // Listing: the issuer sees what it issued and everything delegated from it, and nothing else.
+    // A grant this host issued to an owner, which that owner then delegates onward. The second
+    // grant's issuer is the owner's device, not this host, so it is not in this host's own list.
+    let owner = service
+        .share(&ShareRequest {
+            invitation_id: invitation_id(5),
+            grant_id: grant_id(5),
+            recipient_device_id: device_id(0xaa),
+            ..share(SessionRole::Owner, 5)
+        })
+        .expect("an owner");
     let other_issuer = service
         .share(&ShareRequest {
             invitation_id: invitation_id(4),
             grant_id: grant_id(4),
             issuer_device_id: device_id(0xaa),
             recipient_device_id: device_id(0xab),
+            parent_grant_id: Some(owner.grant.grant_id),
             ..share(SessionRole::Viewer, 4)
         })
-        .expect("another issuer's grant");
+        .expect("the owner's own delegation");
     let listed = service
         .list_for_issuer(device_id(0xf0), None, false, NOW)
         .expect("a list");
@@ -680,8 +745,8 @@ fn sharing_checks_parent_rights_expiry_and_owner_confirmation() {
         .collect();
     assert!(ids.contains(&issued.grant.grant_id));
     assert!(
-        !ids.contains(&other_issuer.grant.grant_id),
-        "holding a right a grant contains is not authority over the grant"
+        ids.contains(&other_issuer.grant.grant_id),
+        "a delegation of something this host issued is still inside this host's own reach"
     );
 }
 
@@ -742,7 +807,7 @@ async fn revoking_a_shared_grant_completes_through_the_dispatch_barrier() {
             environment_id,
             issuer_device_id: host_device_id,
             authority_revision: controller.policy().authority_revision(),
-            ..share(SessionRole::Controller, 1)
+            ..share(SessionRole::Owner, 1)
         })
         .expect("the host shares a session");
 

@@ -26,14 +26,16 @@
 
 use std::collections::BTreeMap;
 
-use kr_protocol::account::MembershipLease;
+use kr_protocol::account::{MEMBERSHIP_LEASE_MAX_LIFETIME_MS, MembershipLease};
+use kr_protocol::actor::ActorIngress;
 use kr_protocol::grant::Grant;
-use kr_protocol::ids::{AuthorityRevision, OrganisationId, PolicyKeyRevision};
+use kr_protocol::ids::{AccountId, AuthorityRevision, OrganisationId, PolicyKeyRevision};
 use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::CanonicalSet;
 use kr_protocol::sharing::{MembershipRefusal, OfflineValidityPolicy};
 
-use super::Refusal;
+use super::durable::{StoredEnrolment, StoredPolicy};
+use super::{AccessRequest, Refusal};
 
 /// What the intersection of one grant with this host's policy produced.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,12 +48,31 @@ pub struct PolicyIntersection {
 
 /// One organisation this host has opted into.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Enrolment {
+pub struct Enrolment {
     /// The policy-signing key revision this host has pinned. A lease signed under another one is
     /// refused, which is what pinning the policy-signing authority means.
-    pinned_revision: PolicyKeyRevision,
-    /// The lease this host currently holds, when it holds one.
-    lease: Option<MembershipLease>,
+    pub pinned_key_revision: PolicyKeyRevision,
+    /// The organisation policy revision this host has pinned. A grant that names a different one
+    /// is answering to a policy this host has not accepted.
+    pub pinned_policy_revision: AuthorityRevision,
+    /// The leases this host currently holds, one per member account.
+    ///
+    /// Per account rather than per organisation, because section 17 disables a member
+    /// individually: one valid member's lease must not sustain a disabled member's access.
+    pub leases: BTreeMap<AccountId, MembershipLease>,
+}
+
+/// Why a lease this host was offered was not installed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LeaseRefused {
+    /// This host is not enrolled in that organisation.
+    NotEnrolled,
+    /// The lease was signed under a policy-signing key revision this host has not pinned.
+    WrongKeyRevision,
+    /// The lease lasts longer than the 15 minutes section 17 permits.
+    TooLong,
+    /// The lease grants more than its own role's ceiling.
+    AboveRoleCeiling,
 }
 
 /// This host's policy.
@@ -66,10 +87,20 @@ pub struct HostPolicy {
     enrolments: BTreeMap<OrganisationId, Enrolment>,
     /// True when this host was enrolled as exclusively organisation-managed, so personal local
     /// owner access stops with the organisation's.
+    ///
+    /// Its own restriction rather than a side effect of enrolling, because it is a host-level
+    /// decision: enrolling in a second organisation must not undo it.
     exclusively_managed: bool,
     offline: Option<OfflineValidityPolicy>,
     /// When the host last woke or started, in UTC milliseconds.
     revalidated_at_ms: u64,
+    /// The highest UTC reading this host has decided anything from.
+    ///
+    /// Expiry is decided from the later of this and the clock. Without it, a clock wound back past
+    /// a deadline would revive a grant this host has already refused: section 24 asks for expiry to
+    /// be revalidated after a wake, and a revalidation that trusts a smaller number than the last
+    /// one is not a revalidation.
+    utc_floor_ms: u64,
 }
 
 impl HostPolicy {
@@ -83,7 +114,35 @@ impl HostPolicy {
             exclusively_managed: false,
             offline: None,
             revalidated_at_ms: 0,
+            utc_floor_ms: 0,
         }
+    }
+
+    /// The reading this host decides expiry from: the later of `now_ms` and its own floor.
+    #[must_use]
+    pub const fn settled_now(&self, now_ms: u64) -> u64 {
+        if now_ms > self.utc_floor_ms {
+            now_ms
+        } else {
+            self.utc_floor_ms
+        }
+    }
+
+    /// Raises the floor to a reading this host has decided from.
+    ///
+    /// Only ever forward. A reading below the floor is a clock that went backwards, and section 9
+    /// already says what a host does about that; what this guarantees is that it does not become a
+    /// second chance for something already expired.
+    pub const fn observe_utc(&mut self, now_ms: u64) {
+        if now_ms > self.utc_floor_ms {
+            self.utc_floor_ms = now_ms;
+        }
+    }
+
+    /// The highest UTC reading this host has decided from.
+    #[must_use]
+    pub const fn utc_floor_ms(&self) -> u64 {
+        self.utc_floor_ms
     }
 
     /// The authority revision in force.
@@ -126,48 +185,152 @@ impl HostPolicy {
         true
     }
 
-    /// Enrols this host in an organisation and pins its policy-signing revision.
+    /// Enrols this host in an organisation and pins the authority it will answer to.
+    ///
+    /// Enrolling says nothing about whether this host is exclusively organisation-managed. That is
+    /// [`Self::set_exclusively_managed`], because it is a decision about the *host* and a second
+    /// enrolment must not be able to undo it.
     pub fn enrol(
         &mut self,
         organisation_id: OrganisationId,
-        pinned_revision: PolicyKeyRevision,
-        exclusively_managed: bool,
+        pinned_key_revision: PolicyKeyRevision,
+        pinned_policy_revision: AuthorityRevision,
     ) {
-        self.enrolments.insert(
-            organisation_id,
-            Enrolment {
-                pinned_revision,
-                lease: None,
-            },
-        );
+        self.enrolments
+            .entry(organisation_id)
+            .and_modify(|enrolment| {
+                enrolment.pinned_key_revision = pinned_key_revision;
+                enrolment.pinned_policy_revision = pinned_policy_revision;
+            })
+            .or_insert_with(|| Enrolment {
+                pinned_key_revision,
+                pinned_policy_revision,
+                leases: BTreeMap::new(),
+            });
+    }
+
+    /// The enrolment this host holds for an organisation.
+    #[must_use]
+    pub fn enrolment(&self, organisation_id: OrganisationId) -> Option<&Enrolment> {
+        self.enrolments.get(&organisation_id)
+    }
+
+    /// Installs a signed membership lease for one member account.
+    ///
+    /// The signature is verified where the lease arrives from the policy service. What is checked
+    /// here is everything section 17 states about a lease's *contents*, because a host that stored
+    /// whatever it was handed would be enforcing the sender's arithmetic: the organisation it is
+    /// enrolled in, the key revision it pinned, the 15-minute maximum lifetime, and the role's own
+    /// ceiling.
+    ///
+    /// # Errors
+    ///
+    /// Returns which of those it failed.
+    pub fn install_lease(
+        &mut self,
+        lease: MembershipLease,
+    ) -> std::result::Result<(), LeaseRefused> {
+        let organisation_id = lease.payload.organisation_id;
+        let Some(enrolment) = self.enrolments.get_mut(&organisation_id) else {
+            return Err(LeaseRefused::NotEnrolled);
+        };
+        if lease.payload.key_revision != enrolment.pinned_key_revision {
+            return Err(LeaseRefused::WrongKeyRevision);
+        }
+        if !lease.payload.lifetime_within_maximum() {
+            return Err(LeaseRefused::TooLong);
+        }
+        if !lease.payload.grants_within_role() {
+            return Err(LeaseRefused::AboveRoleCeiling);
+        }
+        enrolment
+            .leases
+            .insert(lease.payload.account_id.clone(), lease);
+        Ok(())
+    }
+
+    /// Drops the lease this host holds for one member account.
+    ///
+    /// A disabled SCIM member loses new leases immediately, and this is how the host stops using
+    /// the one it already had for that member without touching anybody else's.
+    pub fn drop_lease(&mut self, organisation_id: OrganisationId, account_id: &AccountId) {
+        if let Some(enrolment) = self.enrolments.get_mut(&organisation_id) {
+            enrolment.leases.remove(account_id);
+        }
+    }
+
+    /// Records that this host is, or is no longer, exclusively organisation-managed.
+    pub const fn set_exclusively_managed(&mut self, exclusively_managed: bool) {
         self.exclusively_managed = exclusively_managed;
     }
 
-    /// Records the signed membership lease this host currently holds.
-    ///
-    /// The signature itself is checked where the lease arrives; what is kept here is the lease and
-    /// the revision it was signed under, both of which are read again on every request.
-    pub fn install_lease(&mut self, lease: MembershipLease) {
-        let organisation_id = lease.payload.organisation_id;
-        if let Some(enrolment) = self.enrolments.get_mut(&organisation_id) {
-            enrolment.lease = Some(lease);
-        }
-    }
-
-    /// Drops the lease this host holds for an organisation.
-    ///
-    /// A disabled member loses new leases immediately, and this is how the host stops using the
-    /// one it already had.
-    pub fn drop_lease(&mut self, organisation_id: OrganisationId) {
-        if let Some(enrolment) = self.enrolments.get_mut(&organisation_id) {
-            enrolment.lease = None;
-        }
-    }
-
-    /// Returns true when this host was enrolled as exclusively organisation-managed.
+    /// Returns true when this host is exclusively organisation-managed.
     #[must_use]
     pub const fn is_exclusively_managed(&self) -> bool {
         self.exclusively_managed
+    }
+
+    /// The longest a lease this host will install may last.
+    #[must_use]
+    pub const fn maximum_lease_lifetime_ms() -> u64 {
+        MEMBERSHIP_LEASE_MAX_LIFETIME_MS
+    }
+
+    /// This policy, as it is written down.
+    ///
+    /// The leases are deliberately not in it. A lease lasts at most fifteen minutes and is
+    /// refreshed every five; restoring one across a restart would be restoring a deadline the
+    /// organisation may have withdrawn in the meantime.
+    #[must_use]
+    pub fn snapshot(&self) -> StoredPolicy {
+        StoredPolicy {
+            accepted_floor: self.accepted_floor,
+            utc_floor_ms: kr_protocol::scalars::TimestampMs::new(self.utc_floor_ms),
+            exclusively_managed: self.exclusively_managed,
+            offline: kr_protocol::scalars::Nullable(self.offline),
+            enrolments: self
+                .enrolments
+                .iter()
+                .map(|(organisation_id, enrolment)| StoredEnrolment {
+                    organisation_id: *organisation_id,
+                    pinned_key_revision: enrolment.pinned_key_revision,
+                    pinned_policy_revision: enrolment.pinned_policy_revision,
+                })
+                .collect(),
+        }
+    }
+
+    /// Rebuilds a policy from what was written down, at the revision now in force.
+    ///
+    /// The floor is the higher of what was stored and what the registry holds, so neither half can
+    /// take the other back: a restored policy file cannot lower the revision the daemon has
+    /// reached, and a registry read cannot lower the floor the policy recorded.
+    #[must_use]
+    pub fn restore(stored: &StoredPolicy, authority_revision: AuthorityRevision) -> Self {
+        let floor =
+            AuthorityRevision::new(stored.accepted_floor.get().max(authority_revision.get()));
+        Self {
+            authority_revision: floor,
+            accepted_floor: floor,
+            enrolments: stored
+                .enrolments
+                .iter()
+                .map(|enrolment| {
+                    (
+                        enrolment.organisation_id,
+                        Enrolment {
+                            pinned_key_revision: enrolment.pinned_key_revision,
+                            pinned_policy_revision: enrolment.pinned_policy_revision,
+                            leases: BTreeMap::new(),
+                        },
+                    )
+                })
+                .collect(),
+            exclusively_managed: stored.exclusively_managed,
+            offline: stored.offline.0,
+            revalidated_at_ms: 0,
+            utc_floor_ms: stored.utc_floor_ms.get(),
+        }
     }
 
     /// Chooses a bounded offline-validity policy for personal remote access.
@@ -205,14 +368,16 @@ impl HostPolicy {
         self.revalidated_at_ms
     }
 
-    /// Intersects one grant with this policy.
+    /// Intersects one grant with this policy for one request.
     ///
     /// # Errors
     ///
-    /// Returns the rule that refused: an unusable organisation lease, or a lapsed offline bound.
+    /// Returns the rule that refused: an organisation lease this host cannot use, a grant whose
+    /// recipient this host cannot attribute to a member, or a lapsed offline bound.
     pub fn intersect(
         &self,
         grant: &Grant,
+        request: &AccessRequest,
         now_ms: u64,
     ) -> std::result::Result<PolicyIntersection, Refusal> {
         match grant.organisation.as_ref() {
@@ -222,14 +387,25 @@ impl HostPolicy {
                         refusal: MembershipRefusal::NoLease,
                     });
                 };
-                let Some(lease) = enrolment.lease.as_ref() else {
+                // The grant names the policy revision it answers to. A grant issued under a policy
+                // this host has since replaced is not this host's to honour.
+                if requirement.policy_revision != enrolment.pinned_policy_revision {
+                    return Err(Refusal::MembershipUnusable {
+                        refusal: MembershipRefusal::WrongAuthority,
+                    });
+                }
+                // Whose lease answers for this grant. Without the account, one valid member's
+                // lease would sustain a disabled member's access, which is the whole of what
+                // section 17's per-member disablement is for.
+                let Some(account_id) = request.recipient_account.as_ref() else {
+                    return Err(Refusal::MembershipUnattributed);
+                };
+                let Some(lease) = enrolment.leases.get(account_id) else {
                     return Err(Refusal::MembershipUnusable {
                         refusal: MembershipRefusal::NoLease,
                     });
                 };
-                if lease.payload.organisation_id != requirement.organisation_id
-                    || lease.payload.key_revision != enrolment.pinned_revision
-                {
+                if lease.payload.key_revision != enrolment.pinned_key_revision {
                     return Err(Refusal::MembershipUnusable {
                         refusal: MembershipRefusal::WrongAuthority,
                     });
@@ -253,14 +429,19 @@ impl HostPolicy {
             }
             None => {
                 // Personal authority. It continues through an organisation outage, unless this
-                // host was explicitly enrolled as exclusively organisation-managed, in which case
-                // there is no personal path left to continue on.
+                // host is exclusively organisation-managed, in which case there is no personal
+                // path left to continue on.
                 if self.exclusively_managed
                     && let Some(refusal) = self.first_unusable_lease(now_ms)
                 {
                     return Err(Refusal::MembershipUnusable { refusal });
                 }
-                if let Some(offline) = self.offline.as_ref()
+                // The bounded offline policy is for *remote* personal access. Section 10 puts it
+                // there in so many words, and a person at the keyboard of their own machine is not
+                // the case it is about: refusing them because a cloud feed is unreachable would be
+                // the cloud dependency the default is written to avoid.
+                if request.ingress != ActorIngress::LocalIpc
+                    && let Some(offline) = self.offline.as_ref()
                     && !offline.is_inside_bound(now_ms)
                 {
                     return Err(Refusal::OfflineValidityLapsed {
@@ -278,14 +459,22 @@ impl HostPolicy {
         }
     }
 
+    /// The first reason a lease this host holds is unusable, for the exclusively-managed path.
+    ///
+    /// An enrolment with no lease at all is as unusable as an expired one: a host that is
+    /// exclusively organisation-managed and holds nothing has nothing to work under.
     fn first_unusable_lease(&self, now_ms: u64) -> Option<MembershipRefusal> {
         for enrolment in self.enrolments.values() {
-            match enrolment.lease.as_ref() {
-                None => return Some(MembershipRefusal::NoLease),
-                Some(lease) if !lease.payload.is_valid_at(now_ms) => {
+            if enrolment.leases.is_empty() {
+                return Some(MembershipRefusal::NoLease);
+            }
+            for lease in enrolment.leases.values() {
+                if lease.payload.key_revision != enrolment.pinned_key_revision {
+                    return Some(MembershipRefusal::WrongAuthority);
+                }
+                if !lease.payload.is_valid_at(now_ms) {
                     return Some(MembershipRefusal::LeaseExpired);
                 }
-                Some(_) => {}
             }
         }
         None

@@ -3419,7 +3419,13 @@ impl WorkerService {
                 // device no retained content beyond it.
                 let result = session.attach(&params, granted, attachment_id)?;
                 if caller.is_remote() {
-                    session.narrow_content(attachment_id, crate::render::Scope::LiveScreen);
+                    // The one filter decides how much of the screen a caller is drawn. A forwarded
+                    // caller's scope is section 10's live-screen exception, and asking the filter
+                    // rather than naming the scope here is what keeps that decision in one place.
+                    let filter = crate::history_filter::HistoryFilter::new(
+                        crate::history_filter::ViewerScope::forwarded(),
+                    );
+                    session.narrow_content(attachment_id, filter.screen_scope());
                     self.remote_attachments
                         .lock()
                         .expect("the remote attachment set is not poisoned")

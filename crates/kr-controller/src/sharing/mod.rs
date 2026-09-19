@@ -89,15 +89,25 @@ pub struct ShareRequest {
 pub struct SharingService {
     grants: GrantDirectory,
     invitations: InvitationLedger,
+    /// This host's own device identity.
+    ///
+    /// The one issuer that may write a grant without delegating from one. Everything else has to
+    /// name a parent it holds, which is what stops a device issuing authority out of nothing.
+    host_device_id: DeviceId,
 }
 
 impl SharingService {
     /// Builds a service over an open grant directory and invitation ledger.
     #[must_use]
-    pub const fn new(grants: GrantDirectory, invitations: InvitationLedger) -> Self {
+    pub const fn new(
+        grants: GrantDirectory,
+        invitations: InvitationLedger,
+        host_device_id: DeviceId,
+    ) -> Self {
         Self {
             grants,
             invitations,
+            host_device_id,
         }
     }
 
@@ -106,11 +116,18 @@ impl SharingService {
     /// # Errors
     ///
     /// Returns an error when either store cannot be created.
-    pub fn in_memory() -> Result<Self> {
+    pub fn in_memory(host_device_id: DeviceId) -> Result<Self> {
         Ok(Self::new(
             GrantDirectory::in_memory()?,
             InvitationLedger::in_memory()?,
+            host_device_id,
         ))
+    }
+
+    /// This host's own device identity.
+    #[must_use]
+    pub const fn host_device_id(&self) -> DeviceId {
+        self.host_device_id
     }
 
     /// The grant directory.
@@ -219,24 +236,59 @@ impl SharingService {
             organisation: Nullable::null(),
         };
 
-        if let Some(parent_grant_id) = request.parent_grant_id {
-            let parent = self.grants.record(parent_grant_id)?.ok_or_else(|| {
-                ControllerError::PermissionDenied {
-                    detail: "this host holds no such parent grant".to_owned(),
+        match request.parent_grant_id {
+            Some(parent_grant_id) => {
+                let parent = self.grants.record(parent_grant_id)?.ok_or_else(|| {
+                    ControllerError::PermissionDenied {
+                        detail: "this host holds no such parent grant".to_owned(),
+                    }
+                })?;
+                // The issuer has to *hold* the parent. Naming one is not holding one: without this
+                // check any device that learned a grant identifier could delegate from somebody
+                // else's authority, and the structural narrowing check below would happily agree.
+                if parent.grant.recipient_device_id != request.issuer_device_id {
+                    return Err(ControllerError::PermissionDenied {
+                        detail: "that grant belongs to another device, so this one cannot \
+                                 delegate from it"
+                            .to_owned(),
+                    });
                 }
-            })?;
-            if parent.revoked_at_ms.is_some() {
-                return Err(ControllerError::PermissionDenied {
-                    detail: "the grant this one delegates from has been revoked".to_owned(),
-                });
+                if parent.revoked_at_ms.is_some() {
+                    return Err(ControllerError::PermissionDenied {
+                        detail: "the grant this one delegates from has been revoked".to_owned(),
+                    });
+                }
+                if !parent.grant.expiry.is_valid_at(request.now_ms) {
+                    return Err(ControllerError::PermissionDenied {
+                        detail: "the grant this one delegates from has expired".to_owned(),
+                    });
+                }
+                // Sharing is its own right. Holding the rights a grant contains is not authority
+                // to hand them on, which is what section 23 means by "current issuer/delegation
+                // authority" being separate from the grant's contents.
+                if !parent.grant.permits(ActionRight::SessionShare) {
+                    return Err(ControllerError::PermissionDenied {
+                        detail: "delegating a grant needs session.share".to_owned(),
+                    });
+                }
+                // A delegation inherits its parent's organisation requirement. Dropping it would
+                // be a way to turn an organisation-scoped grant into a personal one.
+                grant.organisation = parent.grant.organisation;
+                roles::check_delegation(&grant, &parent.grant)?;
             }
-            // A delegation inherits its parent's organisation requirement. Dropping it would be a
-            // way to turn an organisation-scoped grant into a personal one.
-            grant.organisation = parent.grant.organisation;
-            roles::check_delegation(&grant, &parent.grant)?;
+            // No parent. Only this host's own device issues from its own authority; anything else
+            // would be a device writing a grant nothing authorised.
+            None => {
+                if request.issuer_device_id != self.host_device_id {
+                    return Err(ControllerError::PermissionDenied {
+                        detail: "only this host issues a grant that delegates from nothing"
+                            .to_owned(),
+                    });
+                }
+            }
         }
 
-        let held = self.rights_held_by(request.recipient_device_id, request.now_ms)?;
+        let held = self.grants_held_by(request.recipient_device_id, request.now_ms)?;
         if requires_owner_confirmation(&grant, &held) && !request.owner_confirmed {
             return Err(ControllerError::PermissionDenied {
                 detail: "a persistent enlargement of a device's authority needs the owner's \
@@ -245,6 +297,22 @@ impl SharingService {
             });
         }
 
+        // A retry that reaches here before its receipt was recorded finds the grant it already
+        // wrote, rather than writing a second one or being refused. That only works because the
+        // caller derives the identities from the action, which is why the daemon does.
+        if let Some(existing) = self.grants.record(grant.grant_id)?
+            && existing.grant == grant
+        {
+            let kept = self
+                .invitations
+                .record(preview.invitation_id)?
+                .map(|record| record.preview);
+            return Ok(GrantCreateResult {
+                preview: kept.unwrap_or(preview),
+                grant,
+                authority_revision: request.authority_revision,
+            });
+        }
         self.grants.issue(&GrantRecord {
             grant: grant.clone(),
             session_id: Some(request.session_id),
@@ -326,6 +394,23 @@ impl SharingService {
         Ok(GrantListResult { grants })
     }
 
+    /// Every live grant one device currently holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the store cannot be read.
+    pub fn grants_held_by(&self, device_id: DeviceId, now_ms: u64) -> Result<Vec<Grant>> {
+        Ok(self
+            .grants
+            .records_for_device(device_id)?
+            .into_iter()
+            .filter(|record| {
+                record.revoked_at_ms.is_none() && record.grant.expiry.is_valid_at(now_ms)
+            })
+            .map(|record| record.grant)
+            .collect())
+    }
+
     /// Every right one device currently holds, across its live grants.
     ///
     /// # Errors
@@ -337,11 +422,8 @@ impl SharingService {
         now_ms: u64,
     ) -> Result<CanonicalSet<ActionRight>> {
         let mut held: CanonicalSet<ActionRight> = CanonicalSet::from_iter([]);
-        for record in self.grants.records_for_device(device_id)? {
-            if record.revoked_at_ms.is_some() || !record.grant.expiry.is_valid_at(now_ms) {
-                continue;
-            }
-            for right in &record.grant.actions {
+        for grant in self.grants_held_by(device_id, now_ms)? {
+            for right in &grant.actions {
                 held.insert(*right);
             }
         }
@@ -354,18 +436,32 @@ impl SharingService {
 /// Both halves of section 23's phrase, in order:
 ///
 /// * **Persistent.** It never expires. A bounded invitation, however wide, ends on its own.
-/// * **Enlargement.** It carries at least one right the recipient does not already hold. Re-issuing
-///   what a device already has adds nothing to enlarge.
+/// * **Enlargement.** No live grant the recipient already holds covers it. "Covers" is the
+///   delegation rule read the other way round: an existing grant covers the new one when the new
+///   one would be a valid narrowing of it. Comparing action *names* alone would miss the case that
+///   matters most, where a device with a one-hour view of one session is handed a permanent view of
+///   every session and nothing asks the owner.
 #[must_use]
-pub fn requires_owner_confirmation(
-    grant: &Grant,
-    already_held: &CanonicalSet<ActionRight>,
-) -> bool {
+pub fn requires_owner_confirmation(grant: &Grant, already_held: &[Grant]) -> bool {
     if grant.expiry != GrantExpiry::Never {
         return false;
     }
-    grant
-        .actions
-        .iter()
-        .any(|right| !already_held.contains(right))
+    !already_held.iter().any(|held| covers(held, grant))
+}
+
+/// Whether `held` already reaches everything `proposed` would, so issuing it enlarges nothing.
+///
+/// [`Grant::narrows`] answers this for a real parent-child pair, and it also checks the parent
+/// link, which is not the question here: two grants issued side by side can still make one
+/// redundant. So the comparison is the rest of that rule, applied between the two.
+fn covers(held: &Grant, proposed: &Grant) -> bool {
+    held.recipient_device_id == proposed.recipient_device_id
+        && proposed.actions.is_subset(&held.actions)
+        && proposed
+            .environment_selector
+            .narrows(&held.environment_selector)
+        && proposed.session_selector.narrows(&held.session_selector)
+        && proposed.history.narrows(&held.history)
+        && proposed.expiry.narrows(held.expiry)
+        && (held.organisation.0.is_none() || proposed.organisation == held.organisation)
 }

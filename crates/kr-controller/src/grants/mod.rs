@@ -20,6 +20,8 @@
 //! * **The feed.** [`feed`] is this host's half of the remote authority feed: the ordered
 //!   revisions only this host issues, the revocation records it retains until every enrolled host
 //!   has acknowledged them, and the synchronisation it owes before it serves remote work again.
+//! * **What survives a restart.** [`durable`] is the shape of the policy and the feed on disk, and
+//!   the limit that persistence does not remove.
 //!
 //! # What this module will not do
 //!
@@ -31,6 +33,7 @@
 //!   quietly serve a read instead, because "continued reads still require valid authority" and a
 //!   narrower grant is something the person has to choose.
 
+pub mod durable;
 pub mod feed;
 pub mod policy;
 pub mod store;
@@ -45,13 +48,14 @@ use kr_protocol::rights::ActionRight;
 use kr_protocol::scalars::CanonicalSet;
 use kr_protocol::sharing::MembershipRefusal;
 
+pub use durable::{StoredFeed, StoredPolicy};
 pub use feed::{AuthorityFeed, FeedRefusal, RetainedRevocation};
-pub use policy::{HostPolicy, PolicyIntersection};
+pub use policy::{HostPolicy, LeaseRefused, PolicyIntersection};
 pub use store::{GrantDirectory, GrantRecord, GrantRevocation};
 pub use vocabulary::{rights_for, unconditional_rights_for};
 
 /// One request, as the intersection sees it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AccessRequest {
     /// The method being called.
     pub method: Method,
@@ -63,6 +67,12 @@ pub struct AccessRequest {
     pub session_id: Option<SessionId>,
     /// Whether the request claims or adds a geometry claim.
     pub claims_geometry: bool,
+    /// The account the grant's recipient is bound to, when the host has resolved one.
+    ///
+    /// Needed only for a grant that requires organisation membership: it decides whose lease
+    /// answers for the request. Absent, such a grant is refused rather than answered by somebody
+    /// else's lease.
+    pub recipient_account: Option<kr_protocol::ids::AccountId>,
     /// Whether the subject belongs to the verified actor itself, when the host has resolved it.
     ///
     /// `None` means the host has not resolved the subject here, which is the ordinary case at the
@@ -70,6 +80,10 @@ pub struct AccessRequest {
     /// which answers them inside its own dispatch barrier where the subject cannot move.
     pub own_subject: Option<bool>,
     /// The host's current time, in UTC milliseconds.
+    ///
+    /// Never used directly: [`decide`] takes the later of this and the highest reading this host
+    /// has already observed, so winding the clock back does not revive an expiry this host has
+    /// already decided against.
     pub now_ms: u64,
 }
 
@@ -102,13 +116,21 @@ pub enum Refusal {
         /// When it expired, in UTC milliseconds.
         expired_at_ms: u64,
     },
-    /// The grant was issued under an authority revision this host has replaced.
-    StaleAuthority {
-        /// What the grant carries.
+    /// The grant claims an authority revision this host has not issued.
+    ///
+    /// An *older* revision is not a refusal. Section 10 makes the issuing revision provenance: a
+    /// grant records the revision it was issued under, and what stops it being used is revocation
+    /// or expiry, not somebody else's revocation advancing the number. A revision the host has
+    /// never reached is different: nothing could have issued it here.
+    UnissuedAuthority {
+        /// What the grant claims.
         grant_revision: AuthorityRevision,
-        /// What the host holds now.
+        /// The highest revision this host has issued.
         current_revision: AuthorityRevision,
     },
+    /// The grant requires an organisation membership and this host cannot name the account its
+    /// recipient is bound to, so it cannot tell whose lease would answer for it.
+    MembershipUnattributed,
     /// The grant does not cover this environment.
     EnvironmentOutsideGrant,
     /// The grant does not cover this session.
@@ -144,9 +166,11 @@ impl Refusal {
                 "the grant this one was delegated from has been revoked".to_owned()
             }
             Self::Expired { .. } => "this grant has expired".to_owned(),
-            Self::StaleAuthority { .. } => {
-                "this grant was issued under an authority revision this host has replaced"
-                    .to_owned()
+            Self::UnissuedAuthority { .. } => {
+                "this grant claims an authority revision this host has not issued".to_owned()
+            }
+            Self::MembershipUnattributed => {
+                "this host cannot tell which member's lease would answer for this grant".to_owned()
             }
             Self::EnvironmentOutsideGrant => {
                 "this grant does not cover this environment".to_owned()
@@ -190,6 +214,11 @@ impl Refusal {
 }
 
 /// What a permitted request carries away from the intersection.
+///
+/// "Permitted" here means *this host's authority store has no objection*. It is not the whole
+/// answer for a method whose requirements include a basis a grant cannot express, and
+/// [`Self::unresolved`] says so out loud rather than leaving a caller to assume otherwise: a
+/// caller that ignores it and acts is acting on a check nobody made.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Permitted {
     /// The rights the grant and the host policy both allow, which is the intersection itself.
@@ -199,6 +228,21 @@ pub struct Permitted {
     pub rights: CanonicalSet<ActionRight>,
     /// The revision the decision was taken under.
     pub authority_revision: AuthorityRevision,
+    /// The requirements this decision could not answer, for the subject to answer.
+    ///
+    /// Resource ownership, a pairing transcript, a service credential, a local caller's token and
+    /// the issuer's delegation authority over a named grant are each resolved where the subject
+    /// cannot move underneath the answer. A request whose only requirement is one of these leaves
+    /// here permitted and unanswered.
+    pub unresolved: Vec<RequiredAuthority>,
+}
+
+impl Permitted {
+    /// Returns true when every requirement of the method was answered here.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.unresolved.is_empty()
+    }
 }
 
 /// Intersects one grant with the host's current policy for one request.
@@ -241,21 +285,26 @@ pub fn decide(
             },
         });
     }
-    if !grant.expiry.is_valid_at(request.now_ms) {
+    // The later of the clock and the highest reading this host has already observed. A rollback
+    // must not revive an expiry this host has already decided against, and section 24 asks for
+    // expiry to be revalidated after a wake rather than re-derived from whatever the clock now
+    // says.
+    let now_ms = policy.settled_now(request.now_ms);
+    if !grant.expiry.is_valid_at(now_ms) {
         let expired_at_ms = match grant.expiry {
-            kr_protocol::grant::GrantExpiry::Never => request.now_ms,
+            kr_protocol::grant::GrantExpiry::Never => now_ms,
             kr_protocol::grant::GrantExpiry::At { expires_at_ms } => expires_at_ms.get(),
         };
         return Err(Refusal::Expired { expired_at_ms });
     }
-    if grant.authority_revision.get() < policy.authority_revision().get() {
-        return Err(Refusal::StaleAuthority {
+    if grant.authority_revision.get() > policy.authority_revision().get() {
+        return Err(Refusal::UnissuedAuthority {
             grant_revision: grant.authority_revision,
             current_revision: policy.authority_revision(),
         });
     }
 
-    let intersection = policy.intersect(grant, request.now_ms)?;
+    let intersection = policy.intersect(grant, &request, now_ms)?;
 
     if !grant.environment_selector.admits(request.environment_id) {
         return Err(Refusal::EnvironmentOutsideGrant);
@@ -266,8 +315,19 @@ pub fn decide(
         return Err(Refusal::SessionOutsideGrant);
     }
 
+    let mut unresolved: Vec<RequiredAuthority> = Vec::new();
     for required in entry.required_rights {
-        if !condition_holds(required.when, request) {
+        if !condition_holds(required.when, &request) {
+            // A conditional requirement the host cannot decide is not skipped quietly: the subject
+            // decides it, and the answer says so.
+            if matches!(
+                required.when,
+                RightCondition::OwnSubject | RightCondition::OtherActor
+            ) && request.own_subject.is_none()
+                && !unresolved.contains(&required.authority)
+            {
+                unresolved.push(required.authority);
+            }
             continue;
         }
         match required.authority {
@@ -276,26 +336,41 @@ pub fn decide(
                     return Err(Refusal::MissingRight { right });
                 }
             }
-            // Current read authority over the subject the host resolves. For a session subject
+            // Current read authority over the subject the host resolves. For a **session** subject
             // that is `session.view` at the session's current scope, which is what a grant can
-            // answer. The rest belongs to the subject.
-            RequiredAuthority::PresentViewAuthority
-                if !intersection.rights.contains(&ActionRight::SessionView) =>
-            {
-                return Err(Refusal::MissingRight {
-                    right: ActionRight::SessionView,
-                });
+            // answer. A host or environment subject resolves against the actor's read scope over
+            // that environment, which the selectors above have already decided, so demanding
+            // `session.view` for it would refuse a receipt for a host effect to the owner who
+            // caused it.
+            RequiredAuthority::PresentViewAuthority => {
+                if request.session_id.is_some()
+                    && !intersection.rights.contains(&ActionRight::SessionView)
+                {
+                    return Err(Refusal::MissingRight {
+                        right: ActionRight::SessionView,
+                    });
+                }
+                if !unresolved.contains(&required.authority) {
+                    unresolved.push(required.authority);
+                }
             }
             // A basis a grant does not express: a pairing transcript, a service credential, a
-            // local caller's token, ownership of a named resource. The subject resolves each of
-            // them where the subject cannot move underneath the answer.
-            _ => {}
+            // local caller's token, ownership of a named resource, delegation authority over a
+            // named grant. The subject resolves each of them where the subject cannot move
+            // underneath the answer, and each is named here so a caller knows the answer is
+            // still owed.
+            other => {
+                if !unresolved.contains(&other) {
+                    unresolved.push(other);
+                }
+            }
         }
     }
 
     Ok(Permitted {
         rights: intersection.rights,
         authority_revision: policy.authority_revision(),
+        unresolved,
     })
 }
 
@@ -306,18 +381,12 @@ pub fn decide(
 /// alternatives: treating both as holding would demand the authority for somebody else's subject
 /// from a caller acting on its own. When the host has resolved the subject the pair is answered
 /// here; when it has not, they are left to the subject, which is the only place that knows.
-const fn condition_holds(when: RightCondition, request: AccessRequest) -> bool {
+fn condition_holds(when: RightCondition, request: &AccessRequest) -> bool {
     match when {
         RightCondition::Always => true,
         RightCondition::GeometryClaim => request.claims_geometry,
-        RightCondition::OwnSubject => match request.own_subject {
-            Some(own) => own,
-            None => false,
-        },
-        RightCondition::OtherActor => match request.own_subject {
-            Some(own) => !own,
-            None => false,
-        },
+        RightCondition::OwnSubject => request.own_subject.unwrap_or(false),
+        RightCondition::OtherActor => request.own_subject.is_some_and(|own| !own),
         // Whether the caller is the pairing candidate or the issuing owner is the pairing
         // surface's own question, answered from the transcript rather than from a grant.
         RightCondition::CandidateEndpoint | RightCondition::IssuingOwner => false,
