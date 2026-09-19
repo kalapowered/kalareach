@@ -94,10 +94,14 @@ const MARKER_COMMAND: &str = "printf 'kala%s-ran\n' reach\n";
 /// client that has applied nothing but the *first* chunk of a stream holds position zero honestly.
 /// So something is produced, waited for and applied before the position that travels is taken: the
 /// first command's bytes are then behind the second command's chunk, and the cursor the client
-/// carries is a resume rather than a restart. Which shell the host has decides nothing here. On
-/// macOS `/bin/sh` is bash and prints a startup diagnostic before a device ever subscribes; on
-/// Linux it is dash, which with an empty `PS1` prints nothing at all and leaves the subscription
-/// at zero.
+/// carries is a resume rather than a restart.
+///
+/// What this replaced was an accident of the host. On the machine this suite was written on,
+/// `/bin/sh` printed a diagnostic of its own before any device subscribed, so the subscription
+/// opened above zero and every later chunk began above zero with it; on the build box the same
+/// `/bin/sh` printed nothing, the subscription opened at zero, and the one chunk that carried the
+/// marker began there too. Whatever a host's shell says at startup, the position below is now one
+/// this test put there.
 const SECOND_MARKER: &str = "kalareach-again";
 
 /// The command that produces it.
@@ -1010,10 +1014,11 @@ async fn observe(
         // The event's own cursor, never a position derived from how many bytes it carried. One
         // event type carries two things: a span of the stream, whose cursor is where its bytes
         // begin, and a rendering of the canonical screen, whose cursor is the state it describes.
-        // Adding a length is right for the first and claims a position the session never produced
-        // for the second, so neither is added here. The start cursor is a position this consumer
-        // has certainly reached, and a resume from it is served the chunk again rather than served
-        // nothing - which is the safe direction for a terminal to be wrong in.
+        // A length added to the first would be right and added to the second would claim a
+        // position the session never produced, so this test adds it to neither and holds the
+        // start of the last chunk it applied. That is a position it has certainly reached, and
+        // what a reconnect from it is given is the screen as it stands at the host's cursor, not
+        // those bytes over again.
         session
             .applied_content(&output_stream(), event.cursor)
             .await;
@@ -1165,7 +1170,7 @@ async fn a_paired_device_attaches_subscribes_types_and_resumes_from_its_cursor()
     assert!(seen.contains(MARKER));
 
     // A second command, waited for like the first, on the lease the first one took. It is what
-    // puts the first command's bytes behind the position the client carries below, whatever the
+    // puts the first command's bytes behind the position the client carries below, whatever this
     // host's shell printed before any of this started.
     let mut events = session.events();
     session

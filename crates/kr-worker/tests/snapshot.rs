@@ -52,20 +52,62 @@ struct Host {
     session_id: SessionId,
     environment_id: kr_protocol::ids::EnvironmentId,
     endpoint: kr_ipc::paths::Endpoint,
+    /// What the session recorded about the shell it started, so this fixture can stop that one
+    /// process and no other.
+    shell: Option<kr_protocol::identity::ProcessStartIdentity>,
 }
 
 impl Host {
-    /// Ends the session and waits until it has finished closing.
+    /// Closes the session the way a request does, and waits for it to finish closing.
     ///
-    /// A test whose application stops by itself does not need this. One whose application does not
-    /// does: the shell a session owns is not a child of the test binary, so it outlives the binary
-    /// that started it and goes on competing for the machine with whatever runs next.
+    /// A test whose application stops by itself does not need this. One whose application prints
+    /// until something stops it does, and this is the ordinary way to stop it: a close, the grace
+    /// period, the forced stop and the drain. The wait is bounded so a closure that never finishes
+    /// fails this test rather than holding the binary.
     async fn end(&self) {
         self.runtime
             .close(kr_protocol::session::ClosureReason::CloseRequested)
             .1
             .release();
-        self.runtime.wait_closed().await;
+        tokio::time::timeout(Duration::from_secs(30), self.runtime.wait_closed())
+            .await
+            .expect("the session finishes closing");
+    }
+}
+
+impl Drop for Host {
+    /// Stops the shell this fixture started, however the test ended.
+    ///
+    /// Exiting does not stop it. A shell a session owns runs in a terminal of its own, and a test
+    /// binary that ends - because it finished, or because an assertion failed part of the way
+    /// through - leaves it running and reparented. Most of these applications end by themselves
+    /// soon afterwards; one prints until something stops it. So the process is stopped here, by
+    /// the identity this session recorded when it started it: the kernel is asked what holds that
+    /// number now, and nothing is signalled unless the answer is still the same process.
+    fn drop(&mut self) {
+        let Some(started) = self.shell.as_ref() else {
+            return;
+        };
+        let Ok(pid) = u32::try_from(started.pid.get()) else {
+            return;
+        };
+        let Ok(now) = kr_ipc::identity::started_process_identity(pid) else {
+            return;
+        };
+        if !now.matches(started) {
+            return;
+        }
+        // The group first, because the application's own children are in it, and then the process
+        // itself for a platform that gave it no group of its own. Neither answer is acted on: a
+        // shell that has already gone between the reading above and this line is not an error.
+        for named in [format!("-{pid}"), pid.to_string()] {
+            let _ = std::process::Command::new("kill")
+                .arg("-KILL")
+                .arg(named)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status();
+        }
     }
 }
 
@@ -140,6 +182,7 @@ async fn host_with(
             .expect("the palette is chosen before the session produces anything");
     }
     session.launch().expect("launches the shell");
+    let shell = session.root_identity();
     let runtime = Arc::new(
         SessionRuntime::start(
             session,
@@ -176,6 +219,7 @@ async fn host_with(
         session_id,
         environment_id,
         endpoint,
+        shell,
     }
 }
 
@@ -1433,7 +1477,27 @@ async fn a_slow_projected_client_is_resynchronised_and_the_session_carries_on() 
         "the session is holding this subscriber's place rather than waiting for it"
     );
     let at_overflow = host.runtime.session().output_cursor();
-    let after = collect(&mut quick.client, Duration::from_secs(3)).await;
+    // The client that is still reading is given until it has something to show or has been told
+    // to resynchronise itself. One window of collection is a second race beside the first: on a
+    // busy machine the window can pass between two of the deliveries it is there to catch.
+    let mut after = Vec::new();
+    {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            after.extend(collect(&mut quick.client, Duration::from_secs(3)).await);
+            if after
+                .iter()
+                .any(|event| matches!(event, Event::Delta(_) | Event::Rows(_) | Event::Snapshot(_)))
+                || host
+                    .runtime
+                    .session()
+                    .is_resynchronising(quick.attachment_id)
+                || std::time::Instant::now() >= deadline
+            {
+                break;
+            }
+        }
+    }
     // That the cursor moves is the assertion; how long it takes to move is the machine's business.
     // A window measured in seconds would be a second race beside the first one.
     let afterwards = {
