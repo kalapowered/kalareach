@@ -91,7 +91,11 @@ impl ServiceHttp for Recorder {
         &'a self,
         url: &'a str,
         body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
     ) -> kr_client::services::ServiceFuture<'a, ServiceHttpAnswer> {
+        // A signed relay request carries its credential in the body, so it sends no headers of
+        // its own. Recorded rather than ignored, so the assertion below is about what was sent.
+        assert!(headers.is_empty(), "a relay request sends no extra headers");
         self.sent
             .lock()
             .expect("what was sent")

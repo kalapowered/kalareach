@@ -6,14 +6,16 @@
 //! storage, relay bandwidth and operation, and a fork can point these traits at its own
 //! infrastructure without changing anything else in the client.
 //!
-//! The traits and one null implementation live here, and [`relay`] holds the one managed
-//! implementation this crate carries: the relay-lease client, because a lease is the one managed
-//! resource a client cannot do without and still use a relay at all. A self-hosted deployment
-//! supplies its own, and a client with no managed service configured is a complete client: direct
-//! connections, local sessions, plugins, local descriptions and user-operated alternatives need
-//! none of these.
+//! The traits and one null implementation live here, and two modules hold the managed
+//! implementations this crate carries. [`relay`] is the relay-lease client, because a lease is the
+//! one managed resource a client cannot do without and still use a relay at all. [`voice`] is the
+//! voice broker, because a managed call is created by one request whose exact shape both the host
+//! and the companion have to agree on. A self-hosted deployment supplies its own, and a client
+//! with no managed service configured is a complete client: direct connections, local sessions,
+//! plugins, local descriptions and user-operated alternatives need none of these.
 
 pub mod relay;
+pub mod voice;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -28,6 +30,11 @@ pub use relay::{
     RelayLeaseEnding, RelayLeaseGrant, RelayLeaseRefusal, RelayWarning, ServiceHttp,
     ServiceHttpAnswer, ServiceSigner,
 };
+pub use voice::{
+    AccountToken, AccountTokenSource, ManagedVoiceBroker, ManagedVoiceService, VoiceClosure,
+    VoiceCommand, VoiceContextFrame, VoiceControlEvent, VoiceRefusal, VoiceRefusalReason,
+    VoiceSession, VoiceSessionRequest, VoiceStart,
+};
 
 /// A boxed future, so every service client stays usable behind a trait object.
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>;
@@ -37,9 +44,26 @@ pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 
 pub struct AccountSession {
     /// The opaque access token. It authorises managed resources only: a host still requires device
     /// pairing and its own grant.
-    pub access_token: String,
+    ///
+    /// Held so it cannot reach a log by accident: the token is not in this structure's
+    /// [`std::fmt::Debug`] rendering.
+    pub access_token: AccountToken,
     /// How many seconds the access token lasts.
     pub expires_in_seconds: u64,
+    /// The scopes the token was issued with.
+    ///
+    /// Each managed resource names its own, and a route refuses a token issued without it. A
+    /// client that held a session with no record of its scopes would discover what it may do by
+    /// being refused, which is an expensive way to read a field the token already carries.
+    pub scopes: Vec<String>,
+}
+
+impl AccountSession {
+    /// Returns true when this session carries `scope`.
+    #[must_use]
+    pub fn carries(&self, scope: &str) -> bool {
+        self.scopes.iter().any(|held| held == scope)
+    }
 }
 
 /// Which way a relay lease permits traffic to flow.
@@ -223,18 +247,6 @@ pub trait SyncBackupService: Send + Sync + std::fmt::Debug {
     fn fetch<'a>(&'a self, collection: &'a str) -> ServiceFuture<'a, (u64, Vec<u8>)>;
 }
 
-/// Where managed inference is brokered.
-///
-/// The broker sells provider usage. A client using its own provider credential does not go through
-/// it at all.
-pub trait ManagedInferenceService: Send + Sync + std::fmt::Debug {
-    /// Requests a brokered session for a provider profile.
-    fn open_session<'a>(&'a self, profile: &'a str) -> ServiceFuture<'a, String>;
-
-    /// Ends a brokered session.
-    fn close_session<'a>(&'a self, session: &'a str) -> ServiceFuture<'a, ()>;
-}
-
 /// One managed service a client may hold an implementation of.
 ///
 /// The set is closed, and it is section 17's: account login, relay leases, push, encrypted sync and
@@ -328,8 +340,8 @@ pub struct ServiceClients {
     pub push: Option<std::sync::Arc<dyn PushService>>,
     /// Encrypted sync and backup.
     pub sync_backup: Option<std::sync::Arc<dyn SyncBackupService>>,
-    /// Managed inference.
-    pub managed_inference: Option<std::sync::Arc<dyn ManagedInferenceService>>,
+    /// Managed inference: the voice broker, which is what this product meters inference through.
+    pub managed_inference: Option<std::sync::Arc<dyn ManagedVoiceService>>,
 }
 
 impl ServiceClients {
@@ -452,12 +464,15 @@ impl SyncBackupService for NullService {
     }
 }
 
-impl ManagedInferenceService for NullService {
-    fn open_session<'a>(&'a self, _profile: &'a str) -> ServiceFuture<'a, String> {
+impl ManagedVoiceService for NullService {
+    fn start<'a>(
+        &'a self,
+        _request: &'a voice::VoiceSessionRequest,
+    ) -> ServiceFuture<'a, voice::VoiceStart> {
         unconfigured(ManagedService::ManagedInference.as_str())
     }
 
-    fn close_session<'a>(&'a self, _session: &'a str) -> ServiceFuture<'a, ()> {
+    fn close<'a>(&'a self, _call_id: &'a str) -> ServiceFuture<'a, voice::VoiceClosure> {
         unconfigured(ManagedService::ManagedInference.as_str())
     }
 }

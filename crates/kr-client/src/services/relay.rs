@@ -83,16 +83,25 @@ pub const RELAY_LEASE_REVOKE_PATH: &str = "/api/relay/lease/revoke";
 ///   refusal carries is what names the reason and the delay;
 /// - bound what is read, and treat a body that exceeds that bound as an error rather than a
 ///   truncated answer: half an envelope is not a refusal. A relay lease answer is a few kilobytes;
+/// - send every header it is given and keep none of them: a header can carry a credential, and a
+///   client library that logged its own requests would be the thing that leaked it;
 /// - never retry. Asking again for a pair that already holds a lease revises that lease, and a
 ///   request that was delivered and not answered may have issued one, so whether to ask again is
 ///   the caller's decision. An exchange that failed after the request left is an error; this client
 ///   reports an answer it cannot read as an unknown outcome for the same reason.
 pub trait ServiceHttp: Send + Sync + std::fmt::Debug {
     /// Posts a JSON body and returns what came back.
+    ///
+    /// `headers` are the request headers beside `content-type`, lower-cased, in the order this
+    /// client built them. A signed managed-service request carries none, because its credential is
+    /// inside the body; a request authorised by an account token carries that token's
+    /// `authorization` header, and an implementation sends the values it is given without
+    /// recording them.
     fn post_json<'a>(
         &'a self,
         url: &'a str,
         body: &'a [u8],
+        headers: &'a [(&'a str, &'a str)],
     ) -> ServiceFuture<'a, ServiceHttpAnswer>;
 }
 
@@ -553,7 +562,7 @@ impl ManagedRelayLeaseService {
         let request = serde_json::to_vec(&SignedRelayRequest { body, signature })
             .map_err(|error| malformed(format!("a request could not be written: {error}")))?;
         let url = format!("{}{path}", self.origin.as_str());
-        let answer = self.http.post_json(&url, &request).await?;
+        let answer = self.http.post_json(&url, &request, &[]).await?;
 
         data_of(&answer)
     }
