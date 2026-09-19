@@ -457,6 +457,13 @@ fn read_manifest(
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PackageSet {
     packages: Vec<ShellPackage>,
+    /// The shells whose installed record this host cannot read, with what is wrong with each.
+    ///
+    /// One shell's broken record says nothing about another's. It is kept here and reported when
+    /// that shell is asked for, rather than refusing the whole installation: a machine whose
+    /// PowerShell package names a binary outside itself still has a Zsh package that is exactly
+    /// what it says it is.
+    faults: std::collections::BTreeMap<ShellKind, PackageFault>,
 }
 
 impl PackageSet {
@@ -471,17 +478,36 @@ impl PackageSet {
     /// package that cannot say what it is must not be launched as though it could.
     pub fn discover(root: &Path) -> Result<Self, PackageFault> {
         let mut packages = Vec::new();
+        let mut faults = std::collections::BTreeMap::new();
         for kind in ShellKind::ALL {
             let directory = root.join(kind.as_str());
-            for candidate in manifest_candidates(&directory)? {
-                match read_manifest(&candidate, Some(*kind), &directory)? {
-                    Some(package) => packages.push(package),
-                    None => continue,
+            let candidates = match manifest_candidates(&directory) {
+                Ok(candidates) => candidates,
+                Err(fault) => {
+                    faults.insert(*kind, fault);
+                    continue;
+                }
+            };
+            for candidate in candidates {
+                match read_manifest(&candidate, Some(*kind), &directory) {
+                    Ok(Some(package)) => packages.push(package),
+                    Ok(None) => continue,
+                    // A record that cannot say what it is must not be launched as though it
+                    // could. What it must not do either is take the other shells with it.
+                    Err(fault) => {
+                        faults.insert(*kind, fault);
+                    }
                 }
                 break;
             }
         }
-        Ok(Self { packages })
+        Ok(Self { packages, faults })
+    }
+
+    /// Returns what is wrong with one shell's installed record, when this host cannot read it.
+    #[must_use]
+    pub fn fault(&self, kind: ShellKind) -> Option<&PackageFault> {
+        self.faults.get(&kind)
     }
 
     /// Reads the packages this installation is configured with.
@@ -541,6 +567,11 @@ impl PackageSet {
                     .ok_or_else(|| PackageFault::Unqualified {
                         requested: requested.to_owned(),
                     })?;
+                // A request that names a shell whose record this host cannot read is told what is
+                // wrong with that record rather than that the shell is unqualified.
+                if let Some(fault) = self.faults.get(&kind) {
+                    return Err(fault.clone());
+                }
                 self.get(kind).ok_or_else(|| PackageFault::Unqualified {
                     requested: requested.to_owned(),
                 })?
@@ -787,6 +818,50 @@ mod tests {
         .expect("writes the record");
     }
 
+    /// KR-REQ-07.19: one shell's unreadable record does not refuse the shells beside it.
+    #[test]
+    fn a_record_this_host_cannot_read_refuses_its_own_shell_and_no_other() {
+        let root = tempfile::tempdir().expect("a directory");
+        install(root.path(), ShellKind::Zsh, true);
+        // A PowerShell package whose record names a binary outside itself: an installation can
+        // hold one, and a session asking for Zsh is not about it.
+        let powershell = root.path().join("powershell").join("identity-1");
+        std::fs::create_dir_all(&powershell).expect("creates the package");
+        std::fs::write(
+            powershell.join(MANIFEST_BASENAME),
+            r#"{"identity":"identity-1",
+               "shell":{"kind":"powershell","executable":"/opt/elsewhere/bin/pwsh",
+                        "upstream_version":"7.4","editor_abi":"psreadline-2.3",
+                        "integration_version":"1","patches":[],"modules":[]},
+               "startup_entry":{"file":"startup/entry"}}"#,
+        )
+        .expect("writes the record");
+        std::fs::write(
+            root.path().join("powershell").join(CURRENT_BASENAME),
+            "identity-1",
+        )
+        .expect("names the identity");
+
+        let set = PackageSet::discover(root.path()).expect("reads what it can");
+        assert_eq!(
+            set.packages().len(),
+            1,
+            "the readable package is still an installation this host has"
+        );
+        assert_eq!(
+            set.select(Some("zsh")).expect("qualified").kind(),
+            ShellKind::Zsh
+        );
+        // And the shell whose record is wrong is refused with what is wrong with it.
+        let fault = set.select(Some("pwsh")).expect_err("refused");
+        assert!(
+            fault.to_string().contains("outside the package"),
+            "the refusal says what is wrong with that record: {fault}"
+        );
+        assert!(set.fault(ShellKind::PowerShell).is_some());
+        assert!(set.fault(ShellKind::Zsh).is_none());
+    }
+
     #[test]
     fn the_installation_launches_the_identity_its_pointer_names() {
         // A build keeps every identity it ever produced, so the pointer is the only thing that says
@@ -811,13 +886,27 @@ mod tests {
         // A pointer that names nothing there is a broken installation, not a reason to pick
         // another build.
         std::fs::write(root.path().join("zsh/current"), "gone").expect("names a missing one");
-        let fault = PackageSet::discover(root.path()).expect_err("refused");
+        let refused = PackageSet::discover(root.path()).expect("reads what it can");
+        let fault = refused
+            .fault(ShellKind::Zsh)
+            .expect("this shell's record is refused");
         assert!(matches!(fault, PackageFault::Unreadable { .. }), "{fault}");
+        assert!(
+            refused.select(Some("zsh")).is_err(),
+            "and so is a request for it"
+        );
 
         // And two identities with nothing naming one of them is not a choice this host may make.
         std::fs::remove_file(root.path().join("zsh/current")).expect("removes the pointer");
-        let fault = PackageSet::discover(root.path()).expect_err("refused");
+        let refused = PackageSet::discover(root.path()).expect("reads what it can");
+        let fault = refused
+            .fault(ShellKind::Zsh)
+            .expect("this shell's record is refused");
         assert!(matches!(fault, PackageFault::Unreadable { .. }), "{fault}");
+        assert!(
+            refused.select(Some("zsh")).is_err(),
+            "and so is a request for it"
+        );
     }
 
     #[cfg(unix)]
@@ -894,7 +983,10 @@ mod tests {
             )
             .expect("writes the record");
             std::fs::write(stray.path().join("zsh/current"), "identity-1").expect("names one");
-            match PackageSet::discover(stray.path()) {
+            match PackageSet::discover(stray.path())
+                .expect("reads what it can")
+                .select(Some("zsh"))
+            {
                 Err(PackageFault::Unreadable { .. }) => {}
                 other => panic!("{} was admitted: {other:?}", stray_path.display()),
             }
@@ -994,8 +1086,15 @@ mod tests {
         )
         .expect("writes the record");
         std::fs::write(root.path().join("zsh/current"), "identity-1").expect("names one");
-        let fault = PackageSet::discover(root.path()).expect_err("refused");
+        let refused = PackageSet::discover(root.path()).expect("reads what it can");
+        let fault = refused
+            .fault(ShellKind::Zsh)
+            .expect("this shell's record is refused");
         assert!(matches!(fault, PackageFault::Unreadable { .. }), "{fault}");
+        assert!(
+            refused.select(Some("zsh")).is_err(),
+            "and so is a request for it"
+        );
     }
 
     #[test]
@@ -1124,7 +1223,14 @@ mod tests {
             serde_json::to_string(&manifest(ShellKind::Bash)).expect("encodes"),
         )
         .expect("writes the manifest");
-        let fault = PackageSet::discover(root.path()).expect_err("refused");
+        let refused = PackageSet::discover(root.path()).expect("reads what it can");
+        let fault = refused
+            .fault(ShellKind::Zsh)
+            .expect("this shell's record is refused");
         assert!(matches!(fault, PackageFault::Unreadable { .. }), "{fault}");
+        assert!(
+            refused.select(Some("zsh")).is_err(),
+            "and so is a request for it"
+        );
     }
 }

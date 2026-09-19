@@ -136,6 +136,12 @@ refused before its declaration is read at all:
 | `module_tree_unsupported` | `SHELL_INTEGRATION_UNSUPPORTED` | A module in the tree was built against a different editor ABI |
 | `package_mismatch` | `PERMISSION_DENIED` | The declaration describes a different build from the package this session launched |
 
+An installation is read shell by shell. A record this host cannot read — one that names paths
+outside its own package, one whose pointer names an identity that is not there, one missing a field
+— refuses that shell by name and says what is wrong with it. The shells beside it are unaffected: a
+machine whose PowerShell package is broken still has a Zsh package that is exactly what it says it
+is, and a managed create naming Zsh still starts.
+
 A refusal is a named qualification error, never a false ready state and never a quietly reduced
 contract. Loading ordinary startup files is not evidence that a native module matches the packaged
 reader, which is why the module tree carries each module's ABI.
