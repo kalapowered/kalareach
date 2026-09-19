@@ -80,8 +80,9 @@ test.describe('the bundle the desktop window loads', () => {
     // The host is not there, and the window says so in its own words.
     await expect(page.getByText('no host on this machine').first()).toBeVisible()
 
-    // Moving between screens mounts and unmounts views, which is where a subscription is taken out
-    // and given back. A bridge that only survives startup would fail here.
+    // A second screen renders for the first time here, and the first one renders again. The
+    // subscription is the shell's and outlives both, so this is not a test of releasing one: it is
+    // the shipped entry being asked for something other than the screen it opens on.
     const sessions = page.getByRole('button', { name: 'Sessions' })
     await sessions.click()
     await expect(sessions).toHaveAttribute('aria-current', 'page')
