@@ -2875,6 +2875,17 @@
       "additionalProperties": false,
       "description": "One path of a captured tree.",
       "properties": {
+        "base_mode": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The Git file mode the base revision records for this path, when it has one.\n\nIt travels with the path because a change that removes the path later has to say what was\nremoved: restoring a committed executable as a plain file, or a link's target as a regular\nfile, would put back something the base never held."
+        },
         "base_object_id": {
           "anyOf": [
             {
@@ -2928,7 +2939,8 @@
         "origin",
         "class",
         "change",
-        "base_object_id"
+        "base_object_id",
+        "base_mode"
       ],
       "type": "object"
     },

@@ -115,6 +115,12 @@ pub struct ResultRow {
     pub tested_source: TestedSource,
     /// The version it attests, when it attests one.
     pub tested_version: Option<(ChangeSetId, ChangeSetVersion)>,
+    /// The version recorded from what the materialisation held, when it held something else.
+    ///
+    /// It is not what the result attests. It is the reading the result carries beside itself, and
+    /// it is named here so retention accounts for it: a result that points at a version is a
+    /// result that must not outlive it.
+    pub derived_output_version: Option<(ChangeSetId, ChangeSetVersion)>,
     /// The record a caller receives, as canonical bytes.
     pub record: Vec<u8>,
     /// When it was recorded.
@@ -326,6 +332,8 @@ impl Store {
                      tested_source         TEXT NOT NULL,
                      tested_change_set_id  BLOB,
                      tested_version        INTEGER,
+                     derived_change_set_id BLOB,
+                     derived_version       INTEGER,
                      record                BLOB NOT NULL,
                      recorded_at_ms        INTEGER NOT NULL
                  );
@@ -705,7 +713,8 @@ impl Store {
                 "SELECT COUNT(*) FROM results r
                    JOIN materialisations m ON m.materialisation_id = r.materialisation_id
                   WHERE (m.change_set_id = ?1 AND m.version = ?2)
-                     OR (r.tested_change_set_id = ?1 AND r.tested_version = ?2)",
+                     OR (r.tested_change_set_id = ?1 AND r.tested_version = ?2)
+                     OR (r.derived_change_set_id = ?1 AND r.derived_version = ?2)",
                 "recorded result(s)",
             ),
             (
@@ -1018,23 +1027,31 @@ impl Store {
             .transaction()
             .map_err(ChangeSetError::store)?;
         Self::require_version(&transaction, row.input_change_set_id, row.input_version)?;
-        if let Some((change_set_id, version)) = row.tested_version
-            && (change_set_id, version) != (row.input_change_set_id, row.input_version)
+        for named in [row.tested_version, row.derived_output_version]
+            .into_iter()
+            .flatten()
         {
-            Self::require_version(&transaction, change_set_id, version)?;
+            if named != (row.input_change_set_id, row.input_version) {
+                Self::require_version(&transaction, named.0, named.1)?;
+            }
         }
         transaction
             .execute(
                 "INSERT INTO results
                    (result_id, materialisation_id, tested_source, tested_change_set_id,
-                    tested_version, record, recorded_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    tested_version, derived_change_set_id, derived_version, record,
+                    recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
                 params![
                     uuid_bytes(kr_ipc::new_uuid()),
                     uuid_bytes(row.materialisation_id.get()),
                     tested_text(row.tested_source),
                     row.tested_version.map(|(set, _)| uuid_bytes(set.get())),
                     row.tested_version.map(|(_, version)| version.get() as i64),
+                    row.derived_output_version
+                        .map(|(set, _)| uuid_bytes(set.get())),
+                    row.derived_output_version
+                        .map(|(_, version)| version.get() as i64),
                     row.record,
                     row.recorded_at_ms.get() as i64,
                 ],
@@ -1045,10 +1062,13 @@ impl Store {
         // Both are written here, in the same transaction as the result itself: an indeterminate
         // result is exactly what a person has to see before the version it ran against goes.
         let mut named = vec![(row.input_change_set_id, row.input_version)];
-        if let Some((set, version)) = row.tested_version
-            && (set, version) != (row.input_change_set_id, row.input_version)
+        for other in [row.tested_version, row.derived_output_version]
+            .into_iter()
+            .flatten()
         {
-            named.push((set, version));
+            if !named.contains(&other) {
+                named.push(other);
+            }
         }
         for (set, version) in named {
             transaction
@@ -1086,7 +1106,8 @@ impl Store {
             .connection
             .prepare(
                 "SELECT r.materialisation_id, r.tested_source, r.tested_change_set_id,
-                        r.tested_version, r.record, r.recorded_at_ms
+                        r.tested_version, r.record, r.recorded_at_ms,
+                        r.derived_change_set_id, r.derived_version
                    FROM results r
                    JOIN materialisations m ON m.materialisation_id = r.materialisation_id
                   WHERE m.change_set_id = ?1 AND m.version = ?2
@@ -1099,6 +1120,8 @@ impl Store {
                 |row| {
                     let set: Option<Vec<u8>> = row.get(2)?;
                     let number: Option<i64> = row.get(3)?;
+                    let derived_set: Option<Vec<u8>> = row.get(6)?;
+                    let derived_number: Option<i64> = row.get(7)?;
                     Ok(ResultRow {
                         materialisation_id: MaterialisationId::new(uuid_column(row, 0)?),
                         input_change_set_id: change_set_id,
@@ -1106,6 +1129,7 @@ impl Store {
                         tested_source: tested_of(&row.get::<_, String>(1)?)
                             .ok_or_else(|| unknown(1, "a tested-source class"))?,
                         tested_version: pair(set, number)?,
+                        derived_output_version: pair(derived_set, derived_number)?,
                         record: row.get(4)?,
                         recorded_at_ms: TimestampMs::new(row.get::<_, i64>(5)? as u64),
                     })

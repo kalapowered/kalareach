@@ -228,6 +228,12 @@ pub struct CapturedPath {
     pub change: ChangeKind,
     /// The Git object the base revision holds for this path, when it has one.
     pub base_object_id: Nullable<String>,
+    /// The Git file mode the base revision records for this path, when it has one.
+    ///
+    /// It travels with the path because a change that removes the path later has to say what was
+    /// removed: restoring a committed executable as a plain file, or a link's target as a regular
+    /// file, would put back something the base never held.
+    pub base_mode: Nullable<String>,
 }
 
 /// Why one path is not in a captured tree.

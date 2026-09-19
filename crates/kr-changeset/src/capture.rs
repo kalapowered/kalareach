@@ -62,7 +62,7 @@ use kr_protocol::changeset::{
 use kr_protocol::project::{
     ChangeKind, ContentClass, InclusionChoice, InclusionClass, InclusionPolicy,
 };
-use kr_protocol::scalars::{Nullable, U64};
+use kr_protocol::scalars::{Digest256, Nullable, U64};
 use kr_transfer::{ObjectPolicy, RelativeName};
 
 use crate::error::{ChangeSetError, Result};
@@ -121,7 +121,7 @@ impl<'a> std::ops::Deref for Scope<'a> {
 /// `100644` and `100755` are file content. `120000` is a symbolic link, whose object holds the
 /// target rather than content, and `160000` is a submodule. Writing either out as a regular file
 /// would make a materialisation a different tree, so both are named and left out.
-const REGULAR_MODES: &[&str] = &["100644", "100755"];
+pub(crate) const REGULAR_MODES: &[&str] = &["100644", "100755"];
 
 /// What the capture is asked to read.
 #[derive(Clone, Copy, Debug)]
@@ -707,6 +707,7 @@ enum Plan {
         class: PathClass,
         change: ChangeKind,
         base_object_id: Option<String>,
+        base_mode: Option<String>,
         index_mode: Option<String>,
     },
     /// Read it from this immutable Git object.
@@ -785,6 +786,7 @@ fn plan(reading: &Reading, request: Scope<'_>) -> BTreeMap<String, Plan> {
                     class: PathClass::Tracked,
                     change: ChangeKind::Present,
                     base_object_id: base.as_ref().map(|(_, object_id)| object_id.clone()),
+                    base_mode: base.as_ref().map(|(mode, _)| mode.clone()),
                     index_mode: index.map(|entry| entry.mode.clone()),
                 },
             );
@@ -837,6 +839,7 @@ fn plan(reading: &Reading, request: Scope<'_>) -> BTreeMap<String, Plan> {
                 class,
                 change: entry.change,
                 base_object_id: None,
+                base_mode: None,
                 index_mode: None,
             },
         );
@@ -898,10 +901,14 @@ fn plan_difference(
             base_mode,
         };
     }
+    let (base_mode, base_object_id) = base.map_or((None, None), |(mode, object_id)| {
+        (Some(mode), Some(object_id))
+    });
     Plan::WorkingTree {
         class: PathClass::DirtyFile,
         change: status.map_or(ChangeKind::Present, |entry| entry.change),
-        base_object_id: base.map(|(_, object_id)| object_id),
+        base_object_id,
+        base_mode,
         index_mode: index.map(|entry| entry.mode.clone()),
     }
 }
@@ -923,18 +930,38 @@ fn plan_recreated(
         return unsupported_submodule();
     }
     if choice_for(request.policy, class) == InclusionChoice::Exclude {
-        return Plan::Exclude {
-            reason: ExclusionReason::Policy,
-            detail: format!(
-                "the policy excludes {}, which is what this path became when it left the index",
-                class.as_str()
-            ),
+        // Excluding the change does not take the path away: the base still holds it, and what a
+        // capture without uncommitted work holds for it is the commit's own content. Only a path
+        // the base never held at all is absent.
+        return match base {
+            Some((mode, object_id)) => {
+                if REGULAR_MODES.contains(&mode.as_str()) {
+                    Plan::GitObject {
+                        class: PathClass::Tracked,
+                        object_id,
+                        mode,
+                    }
+                } else {
+                    unsupported_mode(&mode)
+                }
+            }
+            None => Plan::Exclude {
+                reason: ExclusionReason::Policy,
+                detail: format!(
+                    "the policy excludes {}, and the base revision does not hold this path",
+                    class.as_str()
+                ),
+            },
         };
     }
+    let (base_mode, base_object_id) = base.map_or((None, None), |(mode, object_id)| {
+        (Some(mode), Some(object_id))
+    });
     Plan::WorkingTree {
         class,
         change: entry.change,
-        base_object_id: base.map(|(_, object_id)| object_id),
+        base_object_id,
+        base_mode,
         index_mode: None,
     }
 }
@@ -986,6 +1013,31 @@ fn unsupported_mode(mode: &str) -> Plan {
             kr_project::git::redact(mode)
         ),
     }
+}
+
+/// Stores what the base revision held for one deleted path, so a revert can put it back.
+///
+/// Only file content is stored. A link's object holds a target and a submodule's is not content at
+/// all: writing either out as a regular file would restore the wrong kind of object, so neither
+/// carries content and the revert that meets one refuses instead.
+fn store_base_content(
+    profile: &RestrictedProfile,
+    repository: &OpenedRepository,
+    store: &ObjectStore,
+    budget: &mut Budget,
+    base_object_id: Option<&str>,
+    base_mode: Option<&str>,
+) -> Result<Option<Digest256>> {
+    let (Some(object_id), Some(mode)) = (base_object_id, base_mode) else {
+        return Ok(None);
+    };
+    if !REGULAR_MODES.contains(&mode) {
+        return Ok(None);
+    }
+    budget.objects = budget.objects.saturating_sub(1);
+    let bytes = read_object(profile, repository, object_id)?;
+    budget.charge(bytes.len() as u64)?;
+    store.put(&bytes).map(Some)
 }
 
 /// Returns true when one path is this repository's own administrative data.
@@ -1097,11 +1149,22 @@ fn read_content(
             Plan::Deleted {
                 base_object_id,
                 base_mode,
-            } => manifest.deletions.push(crate::version::DeletedPath {
-                path: path.clone(),
-                base_object_id: base_object_id.clone(),
-                base_mode: base_mode.clone(),
-            }),
+            } => {
+                let content_digest = store_base_content(
+                    profile,
+                    repository,
+                    store,
+                    &mut budget,
+                    base_object_id.as_deref(),
+                    base_mode.as_deref(),
+                )?;
+                manifest.deletions.push(crate::version::DeletedPath {
+                    path: path.clone(),
+                    base_object_id: base_object_id.clone(),
+                    base_mode: base_mode.clone(),
+                    content_digest,
+                });
+            }
             Plan::GitObject {
                 class,
                 object_id,
@@ -1132,21 +1195,34 @@ fn read_content(
                     class: *class,
                     change: ChangeKind::Present,
                     base_object_id: Nullable(Some(object_id.clone())),
+                    base_mode: Nullable(Some(mode.clone())),
                 });
             }
             Plan::WorkingTree {
                 class,
                 change,
                 base_object_id,
+                base_mode,
                 index_mode,
             } => match read_working_tree(repository, path)? {
                 // The status said the path was there and it is not any more. That is a deletion
                 // the working tree holds, recorded with whatever the base has for it.
-                WorkingRead::Gone => manifest.deletions.push(crate::version::DeletedPath {
-                    path: path.clone(),
-                    base_object_id: base_object_id.clone(),
-                    base_mode: None,
-                }),
+                WorkingRead::Gone => {
+                    let content_digest = store_base_content(
+                        profile,
+                        repository,
+                        store,
+                        &mut budget,
+                        base_object_id.as_deref(),
+                        base_mode.as_deref(),
+                    )?;
+                    manifest.deletions.push(crate::version::DeletedPath {
+                        path: path.clone(),
+                        base_object_id: base_object_id.clone(),
+                        base_mode: base_mode.clone(),
+                        content_digest,
+                    });
+                }
                 WorkingRead::Unsupported(detail) => manifest.exclusions.push(Exclusion {
                     path: path.clone(),
                     reason: ExclusionReason::Unsupported,
@@ -1178,6 +1254,7 @@ fn read_content(
                         class: *class,
                         change: *change,
                         base_object_id: Nullable(base_object_id.clone()),
+                        base_mode: Nullable(base_mode.clone()),
                     });
                 }
             },
@@ -1633,6 +1710,7 @@ fn descend(
             origin: ContentOrigin::GitObject,
             class: PathClass::Tracked,
             change: ChangeKind::Present,
+            base_mode: Nullable(Some(entry.mode.clone())),
             base_object_id: Nullable(Some(entry.object_id)),
         });
     }

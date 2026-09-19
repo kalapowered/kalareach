@@ -305,31 +305,55 @@ impl ChangeSetService {
                 // repository inside the working tree satisfies the containment rule whatever its
                 // name, so a second one put there under another name would pass it. What this
                 // host itself found is therefore kept, and every later read is against that.
+                // **Nothing is recorded here**: opening a repository is the first thing a
+                // read-only preflight does, and a preflight writes nothing at all. The first
+                // observation is written by the capture that follows, through
+                // [`Self::remember_repository`].
                 let found = opened.identity().git_dir.to_string();
-                let store = self.locked()?;
-                match store.clone_repository(resolved.summary.workspace_id)? {
-                    Some(first) if first != found => {
-                        return Err(kr_project::ProjectError::IdentityChanged {
-                            detail: format!(
-                                "this workspace is an independent clone of the repository \
-                                 {first}, and the tree at its recorded path now belongs to the \
-                                 repository {found}; a recorded identity is the object rather \
-                                 than the path"
-                            )
-                            .into(),
-                        }
-                        .into());
+                if let Some(first) = self
+                    .locked()?
+                    .clone_repository(resolved.summary.workspace_id)?
+                    && first != found
+                {
+                    return Err(kr_project::ProjectError::IdentityChanged {
+                        detail: format!(
+                            "this workspace is an independent clone of the repository {first}, \
+                             and the tree at its recorded path now belongs to the repository \
+                             {found}; a recorded identity is the object rather than the path"
+                        )
+                        .into(),
                     }
-                    Some(_) => {}
-                    None => store.record_clone_repository(
-                        resolved.summary.workspace_id,
-                        &found,
-                        kr_ipc::now_ms(),
-                    )?,
+                    .into());
                 }
             }
         }
         Ok(opened)
+    }
+
+    /// Records what repository this host found behind one independent clone, the first time.
+    ///
+    /// Only a caller that is already writing calls this. An independent clone is its own
+    /// repository and the project service records no identity for it, so the first thing this
+    /// host captures from one is also what fixes which repository that workspace is. A shared
+    /// workspace needs none of it: the project service's own record is what that one is compared
+    /// with.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the store returns for the write.
+    fn remember_repository(
+        &self,
+        resolved: &ResolvedWorkspace,
+        repository: &OpenedRepository,
+    ) -> Result<()> {
+        if resolved.git_dir.is_some() {
+            return Ok(());
+        }
+        self.locked()?.record_clone_repository(
+            resolved.summary.workspace_id,
+            &repository.identity().git_dir.to_string(),
+            kr_ipc::now_ms(),
+        )
     }
 
     /// Returns true when nothing this host knows of holds one workspace.
@@ -358,6 +382,9 @@ impl ChangeSetService {
     pub fn capture(&self, order: &CaptureOrder<'_>) -> Result<(ChangeSetVersionRecord, bool)> {
         let resolved = self.resolve(order.workspace_id)?;
         let repository = self.open_repository(&resolved)?;
+        // A capture writes, so this is where the first observation of an independent clone's own
+        // repository is fixed. Every later open is compared against it.
+        self.remember_repository(&resolved, &repository)?;
         let workspace_id = order.workspace_id;
         let quiet = || self.nothing_holds(workspace_id);
         let captured = capture(

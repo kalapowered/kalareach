@@ -3755,6 +3755,14 @@ export interface ChangeSetVersionRecord {
  */
 export interface CapturedPath {
   /**
+   * The Git file mode the base revision records for this path, when it has one.
+   *
+   * It travels with the path because a change that removes the path later has to say what was
+   * removed: restoring a committed executable as a plain file, or a link's target as a regular
+   * file, would put back something the base never held.
+   */
+  base_mode: string | null
+  /**
    * The Git object the base revision holds for this path, when it has one.
    */
   base_object_id: string | null

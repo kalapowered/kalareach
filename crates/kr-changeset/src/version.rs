@@ -60,6 +60,15 @@ pub struct DeletedPath {
     pub base_object_id: Option<String>,
     /// The mode the base revision records for it.
     pub base_mode: Option<String>,
+    /// This host's own copy of what the base held, when the base held file content.
+    ///
+    /// A version is what it says it is wherever it is taken: reading the deleted file back out of
+    /// the repository it came from would make a revert at another destination depend on that
+    /// repository still holding the object, and on the object meaning the same thing there. So
+    /// the content travels in the version's own store, and a base whose mode is not file content
+    /// carries none, which is what makes a revert of it refuse rather than write the wrong kind
+    /// of object.
+    pub content_digest: Option<Digest256>,
 }
 
 impl Manifest {
@@ -277,7 +286,8 @@ pub fn identity_digest(subject: &Subject<'_>, manifest: &Manifest) -> Digest256 
             .text(content_name(entry.content))
             .text(origin_name(entry.origin))
             .text(entry.class.as_str())
-            .text(change_name(entry.change));
+            .text(change_name(entry.change))
+            .text(entry.base_mode.0.as_deref().unwrap_or(""));
     }
     absorb.number(manifest.exclusions.len() as u64);
     for exclusion in &manifest.exclusions {
@@ -285,7 +295,16 @@ pub fn identity_digest(subject: &Subject<'_>, manifest: &Manifest) -> Digest256 
     }
     absorb.number(manifest.deletions.len() as u64);
     for deleted in &manifest.deletions {
-        absorb.text(&deleted.path);
+        // What the deletion restores is part of what the version is: two versions that delete the
+        // same path from different base content are not the same version.
+        absorb
+            .text(&deleted.path)
+            .text(deleted.base_object_id.as_deref().unwrap_or(""))
+            .text(deleted.base_mode.as_deref().unwrap_or(""));
+        match deleted.content_digest {
+            Some(digest) => absorb.bytes(digest.as_bytes()),
+            None => absorb.bytes(&[]),
+        };
     }
     absorb.finish()
 }
@@ -354,6 +373,7 @@ mod tests {
             class: PathClass::DirtyFile,
             change: ChangeKind::Present,
             base_object_id: Nullable(None),
+            base_mode: Nullable(None),
         }
     }
 

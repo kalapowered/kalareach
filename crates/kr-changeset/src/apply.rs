@@ -1122,17 +1122,44 @@ fn operation_for(
                         .to_owned(),
                 ));
             };
-            let Some(object_id) = deleted.base_object_id.as_ref() else {
+            if deleted.base_object_id.is_none() {
                 return Ok(Operation::Refuse(
                     "the base revision does not hold this path, so putting it back would mean \
                      removing a file, and this host does not remove a file to revert a change"
                         .to_owned(),
                 ));
+            }
+            // What the base holds has to be file content. A link's object holds a target and a
+            // submodule's is not content at all, so writing either out as a regular file would
+            // put back something the base never held.
+            let Some(mode) = deleted
+                .base_mode
+                .as_deref()
+                .filter(|mode| crate::capture::REGULAR_MODES.contains(mode))
+            else {
+                return Ok(Operation::Refuse(
+                    "what the base revision holds for this path is not file content, so this \
+                     host does not write it out as a regular file"
+                        .to_owned(),
+                ));
             };
-            let bytes = read_object(service.project().profile(), repository, object_id)?;
+            // This host's own copy first: a version says what it is wherever it is applied, and
+            // the repository at the destination may not hold the object at all. Where the version
+            // carries none, the destination's repository is the one place left to read it from.
+            let bytes = match deleted.content_digest {
+                Some(digest) => service.objects().get(digest)?,
+                None => {
+                    let object_id = deleted
+                        .base_object_id
+                        .as_deref()
+                        .unwrap_or_default()
+                        .to_owned();
+                    read_object(service.project().profile(), repository, &object_id)?
+                }
+            };
             Ok(Operation::Install {
                 bytes,
-                executable: deleted.base_mode.as_deref() == Some("100755"),
+                executable: mode == "100755",
             })
         }
         Some(entry) => {
@@ -1703,7 +1730,13 @@ fn published_with(_directory: &AuthorisedDirectory, _name: &RelativeName, _mode:
 }
 
 /// Returns true when one destination file carries protection beyond its mode bits.
-#[cfg(target_os = "macos")]
+///
+/// The two platforms answer differently because their lists are different things. An Apple
+/// platform keeps an access-control list beside the mode bits, so any list at all is protection a
+/// replacement would lose. A POSIX list includes the mode bits themselves: every file has the
+/// three base entries, and only a named entry or a mask beyond them is protection the mode bits
+/// do not already carry.
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn has_extended_access_control(
     _file: &kr_transfer::AuthorisedFile,
     destination: &AuthorisedDirectory,
@@ -1714,18 +1747,50 @@ fn has_extended_access_control(
     // the operation, and a name that answers otherwise is still replaced through the handle.
     let path = destination.host_path(leaf);
     match exacl::getfacl(&path, None) {
-        Ok(entries) => Ok(!entries.is_empty()),
+        Ok(entries) => Ok(beyond_mode_bits(&entries)),
         // A file whose list this host could not read is one whose protection it cannot say it can
         // carry across.
         Err(_) => Ok(true),
     }
 }
 
+/// Returns true when an access-control list says more than the mode bits do.
+#[cfg(target_os = "macos")]
+fn beyond_mode_bits(entries: &[exacl::AclEntry]) -> bool {
+    !entries.is_empty()
+}
+
+/// Returns true when a POSIX access-control list says more than the mode bits do.
+///
+/// A minimal list is exactly the owner, the owning group and everybody else, each unnamed, and
+/// says precisely what the mode bits say. Anything else, a named user, a named group or a mask,
+/// is protection that carrying the mode bits across would drop.
+#[cfg(target_os = "linux")]
+fn beyond_mode_bits(entries: &[exacl::AclEntry]) -> bool {
+    use exacl::AclEntryKind;
+    if entries.len() != 3 {
+        return true;
+    }
+    let mut kinds = [false; 3];
+    for entry in entries {
+        if !entry.name.is_empty() || !entry.allow {
+            return true;
+        }
+        match entry.kind {
+            AclEntryKind::User => kinds[0] = true,
+            AclEntryKind::Group => kinds[1] = true,
+            AclEntryKind::Other => kinds[2] = true,
+            _ => return true,
+        }
+    }
+    !kinds.iter().all(|held| *held)
+}
+
 /// Returns false: this platform's extended access control is not read here.
 ///
 /// The mode bits are carried and anything beside them is not. A host that needs more refuses the
-/// replacement the way the Apple platform does, which is work for the platform task.
-#[cfg(all(unix, not(target_os = "macos")))]
+/// replacement the way the platforms above do, which is work for the platform task.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
 fn has_extended_access_control(
     _file: &kr_transfer::AuthorisedFile,
     _destination: &AuthorisedDirectory,
@@ -1829,11 +1894,36 @@ fn overlay(
                     .find(|held| held.path == requested.path)
                     .cloned();
                 proposed.paths.retain(|held| held.path != requested.path);
-                proposed.deletions.push(crate::version::DeletedPath {
+                let base_object_id = held.as_ref().and_then(|held| held.base_object_id.0.clone());
+                let base_mode = held.as_ref().and_then(|held| held.base_mode.0.clone());
+                // What a revert of this proposal would put back, kept in this host's own store so
+                // it does not depend on the destination's repository still holding the object.
+                let content_digest = match (base_object_id.as_deref(), base_mode.as_deref()) {
+                    (Some(object_id), Some(mode))
+                        if crate::capture::REGULAR_MODES.contains(&mode) =>
+                    {
+                        let bytes =
+                            read_object(service.project().profile(), repository, object_id)?;
+                        Some(service.objects().put(&bytes)?)
+                    }
+                    _ => None,
+                };
+                let deleted = crate::version::DeletedPath {
                     path: requested.path.clone(),
-                    base_object_id: held.and_then(|held| held.base_object_id.0),
-                    base_mode: None,
-                });
+                    base_object_id,
+                    base_mode,
+                    content_digest,
+                };
+                // One deletion per path. A path the destination's own base already recorded as
+                // deleted is not deleted twice by a change that also removes it.
+                match proposed
+                    .deletions
+                    .iter_mut()
+                    .find(|existing| existing.path == requested.path)
+                {
+                    Some(existing) => *existing = deleted,
+                    None => proposed.deletions.push(deleted),
+                }
                 continue;
             }
             // A refusal leaves the proposal exactly as the destination has it, and says so, so a
@@ -1863,9 +1953,22 @@ fn overlay(
             .find(|deleted| deleted.path == requested.path)
             .cloned();
         let base_object_id = existing.as_ref().map_or_else(
-            || Nullable(deleted.and_then(|deleted| deleted.base_object_id)),
+            || Nullable(deleted.as_ref().and_then(|d| d.base_object_id.clone())),
             |held| held.base_object_id.clone(),
         );
+        let base_mode = existing.as_ref().map_or_else(
+            || Nullable(deleted.as_ref().and_then(|d| d.base_mode.clone())),
+            |held| held.base_mode.clone(),
+        );
+        // Whether the proposal's content is the base revision's own content, asked of the base
+        // rather than of what the destination happens to hold now. A change that puts a path back
+        // to exactly what the commit has is not a dirty file: it is a tracked file again.
+        let matches_base = match base_object_id.0.as_deref() {
+            Some(object_id) => read_object(service.project().profile(), repository, object_id)
+                .map(|base| digest_of(&base) == digest)
+                .unwrap_or(false),
+            None => false,
+        };
         let replacement = CapturedPath {
             path: requested.path.clone(),
             content_digest: digest,
@@ -1877,8 +1980,11 @@ fn overlay(
             content: crate::capture::classify_content(&bytes),
             origin: ContentOrigin::WorkingTree,
             class: match existing.as_ref() {
+                // The base revision's own content: whatever the destination held a moment ago,
+                // the path now matches the commit, which is what tracked means.
+                _ if matches_base => PathClass::Tracked,
                 // Content the destination already holds changes nothing about the path, including
-                // which class it is in: an unmodified tracked file stays tracked.
+                // which class it is in.
                 Some(held) if held.content_digest == digest => held.class,
                 Some(held) if held.class == PathClass::Tracked => PathClass::DirtyFile,
                 Some(held) => held.class,
@@ -1889,6 +1995,7 @@ fn overlay(
             },
             change: ChangeKind::Present,
             base_object_id,
+            base_mode,
         };
         // A path the proposal's own base recorded as deleted is no longer deleted once this
         // change puts content there.
@@ -2024,7 +2131,13 @@ pub fn recover(service: &ChangeSetService) -> Result<crate::service::Recovery> {
     // between the two leaves exactly that, and a repeat of the action would otherwise be told
     // nothing is known about it while the journal holds the whole outcome. The apply decides the
     // answer; this only carries it to the caller.
-    for action_id in service.locked()?.applies_with_open_claims()? {
+    // Read into a list first: holding the store while this reads each apply back would be the
+    // same lock twice, and a recovery that cannot finish is a daemon that cannot start.
+    let unanswered = {
+        let store = service.locked()?;
+        store.applies_with_open_claims()?
+    };
+    for action_id in unanswered {
         let answer = read_apply(service, action_id)?;
         let Nullable(Some(outcome)) = answer.outcome else {
             continue;

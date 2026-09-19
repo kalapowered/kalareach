@@ -84,24 +84,20 @@ pub fn materialise(
         .subdirectory(&RelativeName::parse(MATERIALISATIONS_DIRECTORY)?)?;
     let directory_name = materialisation_id.to_string();
     let name = RelativeName::parse(&directory_name)?;
-    let directory = parent.create_subdirectory(&name)?;
-    // The name is an identifier this host generated a moment ago, and creating a directory that is
-    // already there opens it rather than failing, so emptiness is what establishes that this is
-    // the directory this host just made. Something already at the name is refused rather than
-    // adopted, which is what keeps a later release from emptying somebody else's directory.
-    if directory
-        .handle()
-        .entries()
-        .map_err(ChangeSetError::storage)?
-        .next()
-        .is_some()
-    {
-        return Err(ChangeSetError::StorageUnavailable {
-            detail: "something is already at the name this host would have made a materialisation \
-                     at, so it made none"
-                .into(),
-        });
-    }
+    // Made, not opened. Creating a directory is exclusive on every platform this runs on: it
+    // fails when the name is taken, whatever is at it. That is what establishes that the
+    // directory a release later empties is the one this host made, rather than something that
+    // happened to be at the name and looked empty at the moment it was checked.
+    parent.handle().create_dir(name.as_str()).map_err(|error| {
+        ChangeSetError::StorageUnavailable {
+            detail: format!(
+                "this host makes a materialisation's directory rather than adopting one, and it \
+                 could not make this one: {error}"
+            )
+            .into(),
+        }
+    })?;
+    let directory = parent.subdirectory(&name)?;
     let identity = directory.identity();
     let created_at_ms = kr_ipc::now_ms();
     let mut held = MaterialisationRecord {
@@ -599,6 +595,7 @@ fn walk(
             },
             change: ChangeKind::Present,
             base_object_id: previous.map_or(Nullable(None), |entry| entry.base_object_id.clone()),
+            base_mode: previous.map_or(Nullable(None), |entry| entry.base_mode.clone()),
             path,
         });
     }
@@ -616,7 +613,12 @@ fn walk(
                 found.deletions.push(crate::version::DeletedPath {
                     path: entry.path.clone(),
                     base_object_id: entry.base_object_id.0.clone(),
-                    base_mode: None,
+                    base_mode: entry.base_mode.0.clone(),
+                    // This host reads a directory here, not a repository, so it has nothing to
+                    // read the base object out of. The object identifier and its mode travel with
+                    // the deletion, and a revert of this derived version reads the object from
+                    // the destination's own repository or refuses.
+                    content_digest: None,
                 });
             }
         }
@@ -770,6 +772,8 @@ pub fn record_result(
         input_version: input_version.version,
         tested_source,
         tested_version: tested_version
+            .map(|reference| (reference.change_set_id, reference.version)),
+        derived_output_version: derived
             .map(|reference| (reference.change_set_id, reference.version)),
         record: encode_stored(&result)?,
         recorded_at_ms: result.recorded_at_ms,
