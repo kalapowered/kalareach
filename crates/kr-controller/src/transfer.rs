@@ -499,8 +499,7 @@ impl TransferModule {
         .await
     }
 
-    /// Expires everything whose retention has run out, under the registry's own view of its
-    /// sessions.
+    /// Expires everything whose retention has run out, under the archive's view of its sessions.
     ///
     /// # Errors
     ///
@@ -513,8 +512,10 @@ impl TransferModule {
         let owner = Arc::clone(controller);
         let service = Arc::clone(&self.service);
         blocking(move || {
+            // The archive is the authority on what a session keeps. The sweep still asks one
+            // question through one interface; what changed is which store answers it.
             let retention = owner
-                .session_retention()
+                .archive_retention()
                 .map_err(|error| error.to_protocol_error())?;
             service.sweep(&retention).map_err(Into::into)
         })

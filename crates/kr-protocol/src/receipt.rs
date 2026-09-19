@@ -296,6 +296,17 @@ pub struct ReceiptResponse {
 pub struct ActionReadParams {
     /// The action to read.
     pub action_id: ActionId,
+    /// The session whose receipts hold it, when it belongs to one.
+    ///
+    /// A worker serves the receipts of the one session it owns, so a request that reaches a
+    /// worker needs no session. The environment archive serves every closed session's, so a
+    /// request that reaches the daemon says which one. A receipt for a host effect resolves
+    /// against the host scope instead and names none.
+    ///
+    /// It is absent from the wire when it is absent, so a request built before the archive
+    /// existed is byte for byte what it was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<crate::ids::SessionId>,
 }
 
 /// A retained receipt and the result it produced.

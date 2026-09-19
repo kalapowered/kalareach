@@ -24,6 +24,10 @@ export type RejectionReason =
  */
 export type U64 = string
 /**
+ * One KalaReach terminal session.
+ */
+export type SessionId = string
+/**
  * An opaque KR-CBOR-1 value. Its shape is defined by the method's own closed schema. The JSON rendering is diagnostic: byte strings and integers appear as strings and cannot be told apart from text.
  */
 export type ParamsValue = unknown
@@ -39,10 +43,6 @@ export type GrantId = string
  * The host's ordered authority revision. Only the host issues its own revisions.
  */
 export type AuthorityRevision = string
-/**
- * One KalaReach terminal session.
- */
-export type SessionId = string
 /**
  * One foreground application within a terminal session.
  */
@@ -408,7 +408,7 @@ export type EventStream = 'session_state' | 'output' | 'attachments' | 'input_le
  * Why a range of output is no longer retained.
  */
 export type HistoryGapCause =
-  'retention' | 'host_capacity' | 'session_capacity' | 'spool_unavailable'
+  'retention' | 'host_capacity' | 'session_capacity' | 'spool_unavailable' | 'archive_incomplete'
 /**
  * An upstream approval request identifier. Opaque to KalaReach.
  */
@@ -1661,6 +1661,18 @@ export interface ActionReadParams {
    * The action to read.
    */
   action_id: string
+  /**
+   * The session whose receipts hold it, when it belongs to one.
+   *
+   * A worker serves the receipts of the one session it owns, so a request that reaches a
+   * worker needs no session. The environment archive serves every closed session's, so a
+   * request that reaches the daemon says which one. A receipt for a host effect resolves
+   * against the host scope instead and names none.
+   *
+   * It is absent from the wire when it is absent, so a request built before the archive
+   * existed is byte for byte what it was.
+   */
+  session_id?: SessionId | null
 }
 /**
  * A retained receipt and the result it produced.

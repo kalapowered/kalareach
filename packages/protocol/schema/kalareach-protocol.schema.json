@@ -147,6 +147,17 @@
         "action_id": {
           "$ref": "#/$defs/ActionId",
           "description": "The action to read."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session whose receipts hold it, when it belongs to one.\n\nA worker serves the receipts of the one session it owns, so a request that reaches a\nworker needs no session. The environment archive serves every closed session's, so a\nrequest that reaches the daemon says which one. A receipt for a host effect resolves\nagainst the host scope instead and names none.\n\nIt is absent from the wire when it is absent, so a request built before the archive\nexisted is byte for byte what it was."
         }
       },
       "required": [
@@ -7461,6 +7472,11 @@
         {
           "const": "spool_unavailable",
           "description": "The spool could not be written, so only the resident window is retained.",
+          "type": "string"
+        },
+        {
+          "const": "archive_incomplete",
+          "description": "The archive holds no record of this range.\n\nA session whose journal or spool was lost produces an explicit incomplete archive rather\nthan an empty success, and this is what a reader of its history is told: the range is not\naccounted for, which is a different answer from \"nothing happened\".",
           "type": "string"
         }
       ]

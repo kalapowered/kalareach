@@ -1228,6 +1228,9 @@ impl RemoteConnection {
             method_version: Method::ActionRead.entry().version,
             params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
                 action_id: mutation.action_id,
+                // This request goes to the worker that owns the session, which serves the
+                // receipts of the one session it has. Naming it would say nothing more.
+                session_id: None,
             })
             .map_err(|error| {
                 RouteRefusal::Conflict(ProtocolError::new(

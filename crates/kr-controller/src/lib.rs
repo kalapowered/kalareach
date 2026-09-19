@@ -12,6 +12,7 @@
 //! | Module | What it owns |
 //! | --- | --- |
 //! | [`agent_tools`] | Installing the contact skill for an agent, and undoing exactly what it wrote |
+//! | [`archive`] | Closed and crashed sessions: their history, final receipts and retained references, served with no worker |
 //! | [`authority`] | The dispatch lease, the revocation barrier and the generation both are bound to |
 //! | [`desktop`] | Which profile a session gets, what logout does to it, and the host power setting |
 //! | [`registry`] | Reservations, display-number allocation, worker records and closure tombstones |
@@ -26,6 +27,7 @@
 //! | [`error`] | The failures above, each mapped to one stable protocol error code |
 
 pub mod agent_tools;
+pub mod archive;
 pub mod authority;
 pub mod desktop;
 pub mod directory;

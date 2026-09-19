@@ -1010,6 +1010,7 @@ async fn a_replacement_identifier_after_an_uncertain_result_is_rejected_until_it
             method_version: MethodVersion::V1,
             params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
                 action_id: action(50),
+                session_id: None,
             })
             .expect("encodes"),
         },
@@ -1751,8 +1752,11 @@ async fn a_retained_receipt_is_read_after_its_window_is_gone_without_redispatch(
             request_id: RequestId::new(5),
             method: Method::ActionRead.into(),
             method_version: MethodVersion::V1,
-            params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams { action_id })
-                .expect("encodes"),
+            params: ParamsValue::from_typed(&kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            })
+            .expect("encodes"),
         },
     )
     .await;

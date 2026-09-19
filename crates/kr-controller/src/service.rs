@@ -2814,6 +2814,11 @@ impl Controller {
             Method::HostDoctor => self.host_doctor().await,
             Method::SessionList => self.session_list(&request.params).await,
             Method::SessionRead => self.session_read(&request.params).await,
+            // A closed or crashed session's history and receipts are the archive's, and it serves
+            // them with no worker. A live session's are its worker's, and this daemon says which
+            // endpoint to ask rather than reading another process's journal behind its back.
+            Method::HistoryPage => self.archive_history_page(&request.params).await,
+            Method::ActionRead => self.archive_action_read(actor_id, &request.params).await,
             Method::AgentToolsStatus => self.agent_tools_status(&request.params),
             Method::GrantList => self.grant_list(&request.params),
             Method::DeviceList => self.device_list(&request.params).await,
@@ -4550,26 +4555,31 @@ impl Controller {
     ///
     /// Returns an error when the registry cannot be read or written.
     pub async fn reconcile(&self, session_id: SessionId) -> Result<Option<ClosureRecord>> {
-        let row = {
+        let record = {
             let registry = self.registry.lock().await;
             registry
                 .workers()?
                 .into_iter()
                 .find(|record| record.session_id == session_id)
         };
-        let Some(row) = row else {
+        let Some(record) = record else {
             return Ok(None);
         };
-        let identity = row.process_identity;
-        match kr_ipc::identity::process_state(&identity) {
-            kr_ipc::identity::ProcessState::Ended => {
-                let reason = self.why_a_worker_is_gone(session_id, row.profile);
-                self.record_final(session_id, reason, &identity)
-                    .await
-                    .map(Some)
-            }
-            _ => Ok(None),
+        // The archive takes exclusive recovery ownership, and only on its own terms: the kernel is
+        // asked whether the recorded process is the process that was recorded, and the worker's
+        // endpoint is removed only once it has answered that it ended. A query the platform
+        // declines is not death, and leaves the session alone. Nothing here creates a worker.
+        if self
+            .archive()
+            .take_ownership(session_id, record.display_number, &record.process_identity)
+            .is_err()
+        {
+            return Ok(None);
         }
+        let reason = self.why_a_worker_is_gone(session_id, record.profile);
+        self.record_final(session_id, reason, &record.process_identity)
+            .await
+            .map(Some)
     }
 
     /// Returns the reason a worker that is confirmed gone ended, where this host can establish
@@ -4685,6 +4695,57 @@ impl Controller {
         };
         self.write_closure(&record).await?;
         Ok(record)
+    }
+
+    /// Serves one page of a closed session's retained output.
+    ///
+    /// KR-ACC-029: a history request never creates a worker. A session whose worker is alive is
+    /// refused here with the endpoint to ask, because that worker owns its own spool and reading
+    /// it from outside would be a second reader of a store that is still being written.
+    async fn archive_history_page(self: &Arc<Self>, params: &ParamsValue) -> Result<ParamsValue> {
+        let params: kr_protocol::recovery::HistoryPageParams = parse(params)?;
+        self.refuse_if_live(params.session_id).await?;
+        let page = self.archive().history_page(
+            params.session_id,
+            params.from_cursor.get(),
+            params.max_bytes.get(),
+        )?;
+        encode(&page)
+    }
+
+    /// Serves one retained receipt of a closed session.
+    async fn archive_action_read(
+        self: &Arc<Self>,
+        actor_id: &ActorId,
+        params: &ParamsValue,
+    ) -> Result<ParamsValue> {
+        let params: kr_protocol::receipt::ActionReadParams = parse(params)?;
+        let Some(session_id) = params.session_id else {
+            return Err(ControllerError::InvalidArgument(
+                "a receipt this daemon serves belongs to a session, which this request does not                  name"
+                    .to_owned(),
+            ));
+        };
+        self.refuse_if_live(session_id).await?;
+        let read = self
+            .archive()
+            .receipt(session_id, actor_id, params.action_id)?;
+        encode(&read)
+    }
+
+    /// Refuses a read of a session whose worker is alive, naming the endpoint that owns it.
+    ///
+    /// The archive serves what a worker has left behind. While the worker is there, the worker is
+    /// the authority: two readers of one journal would be two answers about one action.
+    async fn refuse_if_live(self: &Arc<Self>, session_id: SessionId) -> Result<()> {
+        let worker = self.directory.lock().await.get(session_id).cloned();
+        match worker {
+            Some(worker) => Err(ControllerError::InvalidArgument(format!(
+                "session {session_id} has a live worker; ask it at {}",
+                worker.endpoint.as_text()
+            ))),
+            None => Ok(()),
+        }
     }
 
     /// Reads the closure a worker wrote for itself, when one survived it.

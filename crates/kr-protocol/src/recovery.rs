@@ -123,6 +123,12 @@ pub enum HistoryGapCause {
     SessionCapacity,
     /// The spool could not be written, so only the resident window is retained.
     SpoolUnavailable,
+    /// The archive holds no record of this range.
+    ///
+    /// A session whose journal or spool was lost produces an explicit incomplete archive rather
+    /// than an empty success, and this is what a reader of its history is told: the range is not
+    /// accounted for, which is a different answer from "nothing happened".
+    ArchiveIncomplete,
 }
 
 impl HistoryGapCause {
@@ -134,6 +140,7 @@ impl HistoryGapCause {
             Self::HostCapacity => "host_capacity",
             Self::SessionCapacity => "session_capacity",
             Self::SpoolUnavailable => "spool_unavailable",
+            Self::ArchiveIncomplete => "archive_incomplete",
         }
     }
 }
