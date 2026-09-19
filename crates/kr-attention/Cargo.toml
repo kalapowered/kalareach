@@ -1,0 +1,22 @@
+[package]
+name = "kr-attention"
+description = "The KalaReach attention engine: the rule set, quiet hours and escalation, review and visit acknowledgements, and the environment feature store they are rebuilt from"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+kr-protocol.workspace = true
+# The feature store is a small table of its own beside the session journal: per-actor
+# acknowledgement revisions, consumed event cursors and the items rebuilt from them.
+rusqlite = { workspace = true, features = ["bundled"] }
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

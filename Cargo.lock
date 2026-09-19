@@ -3981,6 +3981,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kr-attention"
+version = "0.1.0"
+dependencies = [
+ "kr-protocol",
+ "rusqlite",
+ "tempfile",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "kr-cbor"
 version = "0.1.0"
 dependencies = [

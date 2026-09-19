@@ -35,7 +35,7 @@ use core::str::FromStr;
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::ids::{ActorId, AgentTurnId, ChangeSetId, ChangeSetVersion, SessionId};
+use crate::ids::{ActorId, AgentTurnId, ChangeSetId, SessionId};
 use crate::recovery::HistoryGap;
 use crate::scalars::{Nullable, TimestampMs, U64};
 
@@ -404,9 +404,10 @@ impl QuietHours {
 
 /// What a review acknowledgement is attached to.
 ///
-/// Section 14 binds an acknowledgement to a version. Both subjects carry one: a turn carries the
-/// turn identifier the agent gave it, and a repository revision carries the change set and the
-/// exact version of it that was read.
+/// A subject names what is being reviewed and nothing about which version of it. The version
+/// travels beside the subject, in [`ReviewState::current_version`] and
+/// [`ReviewAcknowledgeParams::version`], because a subject keeps one identity while its versions
+/// move: that is what lets a new change reopen review work an older version had closed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReviewSubject {
@@ -417,12 +418,12 @@ pub enum ReviewSubject {
         /// The turn.
         turn_id: AgentTurnId,
     },
-    /// One captured change set at one exact version.
+    /// One captured change set.
     ChangeSet {
+        /// The session the change set was captured in.
+        session_id: SessionId,
         /// The change set.
         change_set_id: ChangeSetId,
-        /// The version that was read.
-        version: ChangeSetVersion,
     },
 }
 
@@ -782,8 +783,8 @@ mod tests {
     #[test]
     fn the_review_subject_round_trips_through_its_json_form() {
         let subject = ReviewSubject::ChangeSet {
+            session_id: SessionId::new(crate::scalars::Uuid::from_bytes([2; 16])),
             change_set_id: ChangeSetId::new(crate::scalars::Uuid::from_bytes([7; 16])),
-            version: ChangeSetVersion::new(3),
         };
         let json = serde_json::to_string(&subject).expect("a review subject encodes");
         assert!(json.contains("\"kind\":\"change_set\""));
