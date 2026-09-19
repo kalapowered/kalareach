@@ -369,6 +369,11 @@ impl OwnedProcesses {
     /// Returns what survived the closure, in the form the record carries.
     #[must_use]
     pub fn surviving_resources(&self) -> Vec<SurvivingResource> {
+        // The boundary is asked here rather than only in `coverage`, because a closure record is
+        // built by reading the resources first and the coverage after it: a reason this query is
+        // the only one to produce would otherwise be written after the receipt had copied them,
+        // and the receipt would say incomplete without saying why.
+        let _ = self.boundary_is_empty();
         let mut resources: Vec<SurvivingResource> = self
             .unestablished()
             .into_iter()
@@ -651,6 +656,25 @@ mod tests {
             .contains("can leave")
         );
         assert!(OwnershipBoundary::JobObject { root: 7 }.is_complete_boundary());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_receipt_built_in_the_order_a_closure_builds_one_carries_every_reason() {
+        // A closure reads the surviving resources and then the coverage. A reason that only the
+        // boundary query produces has to be in the receipt anyway, so it is asked in both places.
+        let owned = OwnedProcesses::establish(
+            OwnershipBoundary::JobObject { root: 0xFFFF_FFF1 },
+            identity(u64::from(u32::MAX) + 1),
+        );
+        let resources = owned.surviving_resources();
+        assert_eq!(owned.coverage(), OwnershipCoverage::Incomplete);
+        assert!(
+            resources
+                .iter()
+                .any(|resource| resource.kind == "unestablished"),
+            "the reason is in the resources the receipt was built from"
+        );
     }
 
     #[test]

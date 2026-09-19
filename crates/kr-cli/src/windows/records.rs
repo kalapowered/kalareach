@@ -267,6 +267,17 @@ impl RecordReader {
                 }
                 continue;
             }
+            // A control code the console itself produced for a key held with Control. The
+            // console has already done the translation an application expects - Ctrl and Return
+            // is a line feed, Ctrl and A is 0x01 - and replacing it with the key's own sequence
+            // would send a different key.
+            if let Some(byte) = console_control(key) {
+                flush_text(&mut units, &mut out);
+                for _ in 0..key.repeat.max(1) {
+                    out.push(byte);
+                }
+                continue;
+            }
             // Plain text: no modifier the encoder would spell differently, and a character that
             // is not a control code. Anything else is a key rather than text.
             if let Some(character) = plain_text(key) {
@@ -374,6 +385,31 @@ fn flush_text(units: &mut Vec<u16>, out: &mut Vec<u8>) {
     }
     out.extend_from_slice(String::from_utf16_lossy(units).as_bytes());
     units.clear();
+}
+
+/// Returns the control code the console produced for a key held with Control.
+///
+/// A console translates Control and a key into the control code an application expects, and that
+/// translation is the answer: Ctrl and Return is a line feed rather than the carriage return the
+/// Return key alone produces, and Ctrl and A is 0x01. Only a record that has Control held is read
+/// this way, so Shift and Tab - which also carries a control character - is still the key it is.
+///
+/// Ctrl and Space is the one key the console reports with no character at all, and the code it
+/// stands for is the one a byte cannot otherwise carry.
+fn console_control(record: &KeyRecord) -> Option<u8> {
+    let control = record.control_keys
+        & (control_keys::LEFT_CTRL_PRESSED | control_keys::RIGHT_CTRL_PRESSED)
+        != 0;
+    if !control || record.is_alt_graph() {
+        return None;
+    }
+    if record.unicode == 0 {
+        // The space bar, whose control code is zero and which the console therefore cannot report
+        // as a character.
+        return (record.virtual_key == 0x20).then_some(0);
+    }
+    (record.unicode <= 0x1F || record.unicode == 0x7F)
+        .then(|| u8::try_from(record.unicode).unwrap_or(0))
 }
 
 /// Returns the character a record produced when nothing about it needs the encoder.
@@ -600,6 +636,39 @@ mod tests {
             repeat: 1,
         };
         assert_eq!(reader.legacy_input(&[alt_graph]), b"@");
+    }
+
+    #[test]
+    fn a_control_code_the_console_produced_is_what_is_sent() {
+        let mut reader = encoder();
+        // Ctrl and Return: the console reports a line feed, and a client that sent the Return
+        // key's own sequence would send a carriage return, which is a different key.
+        let ctrl_enter = KeyRecord {
+            virtual_key: 0x0D,
+            scan_code: 0x1C,
+            unicode: 0x0A,
+            key_down: true,
+            control_keys: control_keys::LEFT_CTRL_PRESSED,
+            repeat: 1,
+        };
+        assert_eq!(reader.legacy_input(&[ctrl_enter]), b"\n");
+        // Return on its own is the carriage return it has always been.
+        let enter = KeyRecord {
+            unicode: 0x0D,
+            control_keys: 0,
+            ..ctrl_enter
+        };
+        assert_eq!(reader.legacy_input(&[enter]), b"\r");
+        // Ctrl and Space is the one the console reports with no character at all.
+        let ctrl_space = KeyRecord {
+            virtual_key: 0x20,
+            scan_code: 0x39,
+            unicode: 0,
+            key_down: true,
+            control_keys: control_keys::LEFT_CTRL_PRESSED,
+            repeat: 1,
+        };
+        assert_eq!(reader.legacy_input(&[ctrl_space]), b"\0");
     }
 
     #[test]
