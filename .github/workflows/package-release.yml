@@ -26,6 +26,14 @@ jobs:
     name: pack and publish
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    # One tag is one release, and the refusal below cannot see a run that has not created its draft
+    # yet. Two runs for the same tag would both pass it, and the second would be refused its create
+    # and leave the first holding a draft nobody was expecting. So runs for one tag are serialised
+    # here, and a run that has already begun is never cancelled for a later one: it is the run that
+    # holds the draft, and the later one is the duplicate.
+    concurrency:
+      group: package-release-${{ github.ref }}
+      cancel-in-progress: false
     permissions:
       contents: write
     steps:
@@ -170,27 +178,56 @@ jobs:
               "$(sha256sum "$file" | cut -d' ' -f1)"
           done | sort >"$RUNNER_TEMP/packed-assets"
 
-          gh api "repos/$GITHUB_REPOSITORY/releases/$release" \
-            --jq '.assets[] | "\(.name) \(.size) \(.digest)"' | sort >"$RUNNER_TEMP/stored-assets"
-
-          if ! diff "$RUNNER_TEMP/packed-assets" "$RUNNER_TEMP/stored-assets"; then
-            echo 'The release holds something other than what was packed; it stays a draft.' >&2
-            echo 'A digest of null is GitHub reporting none for that asset, which leaves nothing' >&2
-            echo 'to compare and is equally a reason not to publish it.' >&2
-            echo 'Delete the draft and run this workflow again for the same tag.' >&2
-            exit 1
-          fi
+          # Reading a release moments after writing to it can reach a copy that has not caught up,
+          # so every read below is attempted a few times before its answer is believed. Each one is
+          # a read: repeating it changes nothing, and an answer that is simply wrong is still wrong
+          # on the last attempt.
+          attempt=1
+          while :; do
+            if gh api "repos/$GITHUB_REPOSITORY/releases/$release" \
+                 --jq '.assets[] | "\(.name) \(.size) \(.digest)"' \
+                 | sort >"$RUNNER_TEMP/stored-assets" \
+               && cmp -s "$RUNNER_TEMP/packed-assets" "$RUNNER_TEMP/stored-assets"; then
+              break
+            fi
+            if [ "$attempt" -ge 5 ]; then
+              echo 'The release holds something other than what was packed; it stays a draft.' >&2
+              diff "$RUNNER_TEMP/packed-assets" "$RUNNER_TEMP/stored-assets" >&2 || true
+              echo 'A digest of null is GitHub reporting none for that asset, which leaves nothing' >&2
+              echo 'to compare and is equally a reason not to publish it.' >&2
+              echo 'Delete the draft and run this workflow again for the same tag.' >&2
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            sleep 3
+          done
 
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release" \
             -F draft=false --jq '.html_url'
 
           # What a consumer pins is a URL and a digest, so the release behind them has to be one
           # nobody can point somewhere else. That is the repository's immutable-releases setting,
-          # which this token cannot read directly but which every published release reports.
-          immutable="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-            --jq '.immutable')"
+          # which this token cannot read directly but which every published release reports. The
+          # question is asked of the tag rather than of the identifier, because the tag is what a
+          # consumer resolves, and the answer has to name the release this run published: a tag
+          # answering for some other release is the one case the identifier alone would not show.
+          attempt=1
+          while :; do
+            published="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+              --jq '"\(.id) \(.immutable)"' 2>/dev/null || echo '')"
+            if [ "${published%% *}" = "$release" ]; then
+              break
+            fi
+            if [ "$attempt" -ge 5 ]; then
+              echo "$GITHUB_REF_NAME does not resolve to the release this run published." >&2
+              echo "It published release $release; the tag answers: ${published:-nothing}" >&2
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            sleep 3
+          done
 
-          if [ "$immutable" != "true" ]; then
+          if [ "${published#* }" != "true" ]; then
             echo "$GITHUB_REF_NAME was published as a release whose assets can be replaced." >&2
             echo 'Turn on immutable releases for this repository, then release the next commit.' >&2
             exit 1
@@ -206,9 +243,31 @@ jobs:
           mkdir -p "$served"
 
           # GitHub's own record of where each asset is served, rather than a URL built here: it
-          # percent-encodes parts of a tag, and what a consumer pins has to be what resolves.
-          gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
-            --jq '.assets[] | "\(.name) \(.browser_download_url)"' >"$RUNNER_TEMP/served-assets"
+          # percent-encodes parts of a tag, and what a consumer pins has to be what resolves. Asked
+          # of the tag for the same reason, and attempted a few times, because a read that follows
+          # a write can reach a copy that has not caught up and answer with part of the set.
+          cut -d' ' -f1 <"$RUNNER_TEMP/packed-assets" | sort >"$RUNNER_TEMP/packed-names"
+
+          attempt=1
+          while :; do
+            if gh api "repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+                 --jq '.assets[] | "\(.name) \(.browser_download_url)"' \
+                 >"$RUNNER_TEMP/served-assets" \
+               && cut -d' ' -f1 <"$RUNNER_TEMP/served-assets" | sort \
+                 | cmp -s - "$RUNNER_TEMP/packed-names"; then
+              break
+            fi
+            if [ "$attempt" -ge 5 ]; then
+              echo "$GITHUB_REF_NAME does not serve what this run packed." >&2
+              echo 'Packed:' >&2
+              cat "$RUNNER_TEMP/packed-names" >&2
+              echo 'Served:' >&2
+              cut -d' ' -f1 <"$RUNNER_TEMP/served-assets" >&2 || true
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            sleep 3
+          done
 
           while read -r name url; do
             curl --fail --silent --show-error --location \
@@ -233,6 +292,29 @@ jobs:
             cat "$RUNNER_TEMP/notes-tail.md"
           } >"$RUNNER_TEMP/notes.md"
 
-          gh release edit "$GITHUB_REF_NAME" --notes-file "$RUNNER_TEMP/notes.md"
+          # By the identifier the creation returned, because `gh release edit` resolves a tag
+          # first and this is a write to one known release rather than a question about the tag.
+          release="$(cut -d' ' -f1 <"$RUNNER_TEMP/draft")"
+
+          case "$release" in
+            '' | *[!0-9]*)
+              echo 'The release this run published is not named in the record it kept:' >&2
+              cat "$RUNNER_TEMP/draft" >&2
+              exit 1
+              ;;
+          esac
+
+          attempt=1
+          until gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$release" \
+            --field "body=@$RUNNER_TEMP/notes.md" --silent; do
+            if [ "$attempt" -ge 5 ]; then
+              echo "Writing the served URLs into the notes of release $release failed." >&2
+              echo 'The release is published and carries what was packed; its notes are still the' >&2
+              echo 'text the draft was created with. Edit them by hand, or re-run this step.' >&2
+              exit 1
+            fi
+            attempt=$((attempt + 1))
+            sleep 3
+          done
 
           cat "$RUNNER_TEMP/notes.md" >>"$GITHUB_STEP_SUMMARY"

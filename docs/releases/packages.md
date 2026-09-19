@@ -45,9 +45,17 @@ the version before it.
 with `scripts/release-packages.sh`, refuses to go on if that tag already has a release or a draft,
 creates a draft, attaches the archives and `SHA512SUMS` to the draft that creation returned, and
 publishes it only once GitHub's record of every asset, down to the sha256 GitHub computed over the
-bytes it stored, matches what was packed. Publication then confirms that the release cannot be
-replaced, and the last step fetches each asset back from the URL GitHub serves it at, holds it to
-the packed sha512, and writes those URLs into the notes.
+bytes it stored, matches what was packed. Publication then confirms that the tag resolves to the
+release it just published and that the release cannot be replaced, and the last step fetches each
+asset back from the URL GitHub serves it at, holds it to the packed sha512, and writes those URLs
+into the notes.
+
+One tag is one run: a second push of the same tag waits for the first to finish rather than running
+beside it, and a run already under way is never cancelled for a later one. Reading a release moments
+after writing to it can reach a copy of GitHub's records that has not caught up, so each of those
+reads is attempted up to five times, three seconds apart, before its answer is taken as the
+release's state. Repeating them changes nothing: they are reads, and an answer that is wrong rather
+than late is still wrong on the last attempt.
 
 The script is what makes the release that commit's output rather than a working tree's:
 
