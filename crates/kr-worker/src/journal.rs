@@ -2327,6 +2327,110 @@ impl Journal {
         })
     }
 
+    /// Returns the schema version this store records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn schema_version(&self) -> Result<i64> {
+        self.connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .map_err(|error| faulted(&self.health, error))
+    }
+
+    /// Returns the names of every table this store holds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn table_names(&self) -> Result<Vec<String>> {
+        let mut statement = self
+            .connection
+            .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+            .map_err(|error| faulted(&self.health, error))?;
+        let rows = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| faulted(&self.health, error))?;
+        let mut names = Vec::new();
+        for row in rows {
+            names.push(row.map_err(unavailable)?);
+        }
+        Ok(names)
+    }
+
+    /// Returns one of the store's own settings, as text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn pragma_string(&self, name: &str) -> Result<String> {
+        self.connection
+            .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+            .map_err(|error| faulted(&self.health, error))
+    }
+
+    /// Returns one of the store's own settings, as a number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
+    pub fn pragma_i64(&self, name: &str) -> Result<i64> {
+        self.connection
+            .query_row(&format!("PRAGMA {name}"), [], |row| row.get(0))
+            .map_err(|error| faulted(&self.health, error))
+    }
+
+    /// Returns how many rows this connection has written since it was opened.
+    ///
+    /// What it is for is the opposite question: whether a path that must never write durably has
+    /// written anything at all. It is the store's own count, so nothing about it depends on
+    /// timing.
+    #[must_use]
+    pub fn total_changes(&self) -> u64 {
+        self.connection.total_changes()
+    }
+
+    /// Stops this store growing past the size it is now.
+    ///
+    /// A store that cannot grow answers `SQLITE_FULL` for the write that needs another page,
+    /// which is the same answer a device with no space left gives. It is how a host proves what
+    /// it does when its durable store is full without filling a disk to find out.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the setting cannot be applied.
+    pub fn cap_at_current_size(&self) -> Result<()> {
+        let pages: i64 = self
+            .connection
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .map_err(|error| faulted(&self.health, error))?;
+        self.connection
+            .pragma_update(None, "max_page_count", pages)
+            .map_err(|error| faulted(&self.health, error))
+    }
+
+    /// Lets this store grow again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the setting cannot be applied.
+    pub fn release_size_cap(&self) -> Result<()> {
+        self.connection
+            .pragma_update(None, "max_page_count", i64::MAX)
+            .map_err(|error| faulted(&self.health, error))
+    }
+
+    /// Moves the write-ahead log into the database file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when the checkpoint fails.
+    pub fn checkpoint(&self) -> Result<()> {
+        self.connection
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|error| faulted(&self.health, error))
+    }
+
     /// Returns the condition this journal publishes.
     ///
     /// The handle is shared, so a consumer keeps it after the session's lock is released and is

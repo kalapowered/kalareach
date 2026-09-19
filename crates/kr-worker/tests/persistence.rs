@@ -1,0 +1,929 @@
+//! Section 24 at the worker: the durability contract, the outbox, retention, the journal-fault
+//! seam, local state and forward-only migration.
+//!
+//! Every test here names the row it closes. Where the contract is about the *store* the test
+//! drives the journal directly, because that is where the durability order lives. Where it is
+//! about what a caller is told, the test goes through the real endpoint, the real handshake and
+//! the real signatures, because a rule that only holds when called directly is not a rule.
+//!
+//! The journal and every runtime path a test opens live on the internal disk, under the temporary
+//! host this harness creates. Nothing here reaches the workspace, and nothing here touches the
+//! operating system's credential store.
+
+use std::sync::Arc;
+
+use kr_ipc::client::LocalClient;
+use kr_ipc::endpoint::Listener;
+use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
+use kr_protocol::envelope::ActionTarget;
+use kr_protocol::error::ErrorCode;
+use kr_protocol::hello::PROTOCOL_VERSION;
+use kr_protocol::identity::{DesktopBinding, WorkerProfile};
+use kr_protocol::ids::{ActionId, ActorId, BuildId, ControllerGeneration, SessionEpoch, SessionId};
+use kr_protocol::local::LocalClientKind;
+use kr_protocol::method::{Method, MethodVersion};
+use kr_protocol::receipt::ReceiptState;
+use kr_protocol::recovery::HistoryGapCause;
+use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
+use kr_protocol::session::{Dimensions, DisplayNumber, Durability, ShellMode};
+use kr_worker::journal::{Journal, RETENTION_MS, Submission};
+use kr_worker::persistence::contract::{
+    CommitGroup, CommitPoint, FlushPolicy, WriteKind, flush_policy,
+};
+use kr_worker::persistence::fault::{FaultKind, WorkClass};
+use kr_worker::persistence::migration::{self, MigrationError};
+use kr_worker::persistence::outbox::Fanout;
+use kr_worker::persistence::retention::{OutputRetention, RetentionLimit};
+use kr_worker::persistence::stores;
+use kr_worker::pty::ShellCommand;
+use kr_worker::runtime::SessionRuntime;
+use kr_worker::service::{ServiceBinding, WorkerService};
+use kr_worker::session::{Session, SessionConfig};
+
+// ---------------------------------------------------------------------------------------------
+// The harness
+// ---------------------------------------------------------------------------------------------
+
+struct Host {
+    _temp: kr_ipc::testing::TempHost,
+    runtime: Arc<SessionRuntime>,
+    session_id: SessionId,
+    journal_path: std::path::PathBuf,
+    endpoint: kr_ipc::paths::Endpoint,
+    environment_id: kr_protocol::ids::EnvironmentId,
+}
+
+fn build() -> BuildId {
+    BuildId::new("kr-test/0").expect("a build identifier")
+}
+
+/// Starts a worker whose journal already holds whatever `prepare` writes into it.
+async fn host_prepared(prepare: impl FnOnce(&std::path::Path)) -> Host {
+    let temp = kr_ipc::testing::TempHost::create();
+    let environment = temp.environment();
+    let environment_id = temp.environment_id();
+    let session_id = SessionId::new(kr_ipc::new_uuid());
+    let boot = kr_ipc::identity::boot_identity().expect("a boot identity");
+    let process = kr_ipc::identity::current_process_start_identity().expect("a process identity");
+    let identity = Arc::new(
+        WorkerIdentity::generate(
+            session_id,
+            SessionEpoch::V1,
+            boot.clone(),
+            process,
+            PROTOCOL_VERSION,
+        )
+        .expect("a session key"),
+    );
+    // The T-002g seam: the daemon's keys live in a file store under this temporary environment's
+    // own secrets directory, so nothing test-driven reaches the operating system's credential
+    // store.
+    let store =
+        kr_crypto::store::open_store_in(&environment.secrets_dir()).expect("a secret store");
+    let controller = Arc::new(
+        ControllerIdentity::initialise(store.store.as_ref(), environment_id)
+            .expect("a controller identity"),
+    );
+    let journal_path = environment.journal_database(session_id);
+    if let Some(parent) = journal_path.parent() {
+        std::fs::create_dir_all(parent).expect("the journal directory");
+    }
+    prepare(&journal_path);
+    let config = session_config(&environment, session_id);
+    let mut session = Session::open(config).expect("opens the session");
+    session.launch().expect("launches the shell");
+    let runtime = Arc::new(
+        SessionRuntime::start(session, Arc::new(kr_ipc::clock::SystemSharedClock))
+            .expect("starts the runtime"),
+    );
+    let endpoint = environment
+        .worker_endpoint(DisplayNumber::new(1))
+        .expect("an endpoint");
+    let listener = Listener::bind(&endpoint).expect("binds the endpoint");
+    let service = Arc::new(
+        WorkerService::new(
+            Arc::clone(&runtime),
+            identity,
+            endpoint.clone(),
+            ServiceBinding {
+                environment_id,
+                boot_identity: boot,
+                controller_public_key: *controller.public_key(),
+                controller_generation: ControllerGeneration::new(1),
+                journal_path: Some(journal_path.clone()),
+                build_id: build(),
+            },
+        )
+        .expect("a worker service"),
+    );
+    tokio::spawn(Arc::clone(&service).serve(listener));
+    Host {
+        _temp: temp,
+        runtime,
+        session_id,
+        journal_path,
+        endpoint,
+        environment_id,
+    }
+}
+
+async fn host() -> Host {
+    host_prepared(|_| {}).await
+}
+
+fn session_config(
+    environment: &kr_ipc::paths::EnvironmentPaths,
+    session_id: SessionId,
+) -> SessionConfig {
+    SessionConfig {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id: environment.environment_id(),
+        display_number: DisplayNumber::new(1),
+        shell: ShellCommand {
+            program: "/bin/sh".to_owned(),
+            arguments: vec!["-c".to_owned(), "sleep 30".to_owned()],
+            cwd: "/".to_owned(),
+            environment: vec![("PATH".to_owned(), "/usr/bin:/bin".to_owned())],
+        },
+        shell_mode: ShellMode::NativeCompat,
+        worker_profile: WorkerProfile::HeadlessUser,
+        desktop: DesktopBinding::none(),
+        dimensions: Dimensions::new(80, 24),
+        journal_path: Some(environment.journal_database(session_id)),
+        spool_directory: Some(environment.session_spool(session_id)),
+        send_queue_bytes: 1024 * 1024,
+        resident_bytes: 64 * 1024,
+    }
+}
+
+async fn cli(host: &Host) -> LocalClient {
+    LocalClient::connect(&host.endpoint, LocalClientKind::Cli, build())
+        .await
+        .expect("connects")
+}
+
+fn target(host: &Host) -> ActionTarget {
+    ActionTarget {
+        environment_id: host.environment_id,
+        session_id: Nullable::some(host.session_id),
+        session_epoch: Nullable::some(SessionEpoch::V1),
+        application_instance_id: Nullable::null(),
+        agent_binding_revision: Nullable::null(),
+    }
+}
+
+async fn close(client: &mut LocalClient, host: &Host) -> kr_protocol::session::SessionCloseResult {
+    let outcome = client
+        .mutate(
+            Method::SessionClose,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(host),
+            &kr_protocol::session::SessionCloseParams {
+                session_id: host.session_id,
+            },
+        )
+        .await
+        .expect("the call reaches the worker");
+    outcome
+        .map(|value| value.to_typed().expect("decodes"))
+        .unwrap_or_else(|error| panic!("the authorised stop was refused: {error}"))
+}
+
+fn actor() -> ActorId {
+    ActorId::new("test:persistence").expect("an actor")
+}
+
+fn attach_params(session_id: SessionId) -> kr_protocol::attachment::SessionAttachParams {
+    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+    requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    kr_protocol::attachment::SessionAttachParams {
+        session_id,
+        mode: kr_protocol::attachment::AttachMode::Terminal,
+        claim_geometry: false,
+        dimensions: Nullable::some(Dimensions::new(80, 24)),
+        terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+        requested,
+    }
+}
+
+fn submission(action: u8, digest: u8) -> Submission {
+    Submission {
+        actor_id: actor(),
+        action_id: kr_worker::journal::action_id_from([action; 16]),
+        method: Method::AgentApprovalRespond.into(),
+        method_version: MethodVersion::V1,
+        payload_digest: Digest256::from_bytes([digest; 32]),
+        subject_digest: Digest256::from_bytes([digest; 32]),
+        intent: vec![0xa0],
+        accepted_deadline_ms: Some(TimestampMs::new(kr_ipc::now_ms().get() + 120_000)),
+        now_ms: kr_ipc::now_ms(),
+    }
+}
+
+/// Stops the journal growing and then fills the space it has left, so the next durable write is
+/// refused by the store itself rather than by anything this test arranged.
+///
+/// It returns the refusal the store gave, so a caller can say what kind it was.
+fn fill_the_store(journal: &mut Journal) -> kr_worker::WorkerError {
+    journal.cap_at_current_size().expect("caps the store");
+    let mut action = 100_u8;
+    loop {
+        match journal.accept(&submission(action, action)) {
+            Ok(_) => {
+                action = action
+                    .checked_add(1)
+                    .expect("the bounded store never filled");
+            }
+            Err(error) => return error,
+        }
+    }
+}
+
+/// A journal path on the internal disk, named so two tests never share one.
+fn journal_path(name: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!("kr-persist-{name}-{}", kr_ipc::new_uuid()));
+    std::fs::create_dir_all(&directory).expect("the journal directory");
+    directory.join("journal.sqlite3")
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-24.02, 24.03: the commit order, and what never waits for a flush
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_store_is_write_ahead_logged_with_full_synchronisation() {
+    // KR-REQ-24.02. Section 24 permits WAL plus full durability and forbids weakening it to meet
+    // a latency number, so the settings are asserted rather than assumed.
+    let path = journal_path("pragmas");
+    let journal = Journal::open(&path).expect("opens");
+    let mode = journal.pragma_string("journal_mode").expect("the mode");
+    assert_eq!(mode.to_lowercase(), "wal");
+    let synchronous = journal.pragma_i64("synchronous").expect("the setting");
+    assert_eq!(synchronous, 2, "2 is FULL");
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn the_intent_is_on_disk_before_the_caller_could_have_been_answered() {
+    // KR-REQ-24.02, first half: acceptance is committed before the acknowledgement. The proof is
+    // that a *different* connection to the same file sees the row while the accepting journal is
+    // still open, which is only true if the transaction committed rather than being buffered.
+    let path = journal_path("accept-durable");
+    let mut journal = Journal::open(&path).expect("opens");
+    journal.accept(&submission(1, 1)).expect("accepts");
+    let reader = Journal::open_read_only(&path).expect("opens read-only");
+    let receipt = reader
+        .read(actor(), kr_worker::journal::action_id_from([1; 16]))
+        .expect("reads")
+        .expect("the intent is already on disk");
+    assert_eq!(receipt.state, ReceiptState::Accepted);
+    drop(reader);
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn the_dispatch_marker_is_on_disk_before_the_effect_could_have_left() {
+    // KR-REQ-24.02, second half: the marker is committed before dispatch, which is what makes a
+    // lost outcome recoverable rather than repeatable.
+    let path = journal_path("marker-durable");
+    let mut journal = Journal::open(&path).expect("opens");
+    journal.accept(&submission(2, 2)).expect("accepts");
+    journal
+        .mark_dispatching(
+            actor(),
+            kr_worker::journal::action_id_from([2; 16]),
+            TimestampMs::new(1_100),
+        )
+        .expect("marks");
+    let reader = Journal::open_read_only(&path).expect("opens read-only");
+    let receipt = reader
+        .read(actor(), kr_worker::journal::action_id_from([2; 16]))
+        .expect("reads")
+        .expect("the marker is already on disk");
+    assert_eq!(receipt.state, ReceiptState::Dispatching);
+    drop(reader);
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[tokio::test]
+async fn keystrokes_and_output_bytes_write_nothing_durable_at_all() {
+    // KR-REQ-24.03, first half. The live parser is in worker memory and the retained output is a
+    // bounded indexed spool, so a session that types and produces output leaves the durable store
+    // exactly as it found it. The count is the store's own, so nothing here depends on timing.
+    let host = host().await;
+    let before = host
+        .runtime
+        .session()
+        .journal()
+        .expect("a journal")
+        .total_changes();
+    {
+        let mut session = host.runtime.session();
+        for _ in 0..64 {
+            session.ingest_output(b"hello world\r\n");
+        }
+    }
+    let after = host
+        .runtime
+        .session()
+        .journal()
+        .expect("a journal")
+        .total_changes();
+    assert_eq!(
+        before, after,
+        "output must not write a durable row, let alone flush one"
+    );
+}
+
+#[test]
+fn no_commit_point_shares_a_flush_and_the_writes_that_may_are_named() {
+    // KR-REQ-24.03, second half: grouped commits share a flush without moving the dispatch
+    // boundary ahead of durability, which means a commit point is never grouped.
+    for point in CommitPoint::ALL {
+        assert_eq!(
+            flush_policy(WriteKind::Commit(*point)),
+            FlushPolicy::Immediate
+        );
+    }
+    assert_eq!(flush_policy(WriteKind::Keystroke), FlushPolicy::NotDurable);
+    assert_eq!(flush_policy(WriteKind::OutputByte), FlushPolicy::NotDurable);
+    assert_eq!(
+        flush_policy(WriteKind::PromptTelemetry),
+        FlushPolicy::Grouped
+    );
+    let mut group: CommitGroup<u8> = CommitGroup::new();
+    for value in 0..16 {
+        group.push(value);
+    }
+    assert_eq!(group.take().len(), 16);
+    assert_eq!(group.flushes(), 1, "sixteen writes shared one flush");
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-24.20, 24.21: the outbox, its fan-out, and what never reaches the control log
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_state_transition_and_its_event_are_one_transaction() {
+    // KR-REQ-24.20, first half. Each transition leaves exactly one outbox row, and the row is
+    // visible to a second connection the moment the transition is, which is what "same local
+    // transaction" means in practice.
+    let path = journal_path("outbox-transaction");
+    let mut journal = Journal::open(&path).expect("opens");
+    journal.accept(&submission(3, 3)).expect("accepts");
+    let reader = Journal::open_read_only(&path).expect("opens read-only");
+    let after_accept = reader.outbox_after(0, 64).expect("reads the outbox");
+    assert_eq!(after_accept.len(), 1);
+    assert_eq!(after_accept[0].event.detail, "accepted");
+    assert_eq!(
+        after_accept[0].event.actor_id.as_ref().map(ActorId::as_str),
+        Some("test:persistence")
+    );
+
+    journal
+        .mark_dispatching(
+            actor(),
+            kr_worker::journal::action_id_from([3; 16]),
+            TimestampMs::new(1_100),
+        )
+        .expect("marks");
+    journal
+        .settle(
+            actor(),
+            kr_worker::journal::action_id_from([3; 16]),
+            ReceiptState::Applied,
+            Some(b"result"),
+            None,
+            TimestampMs::new(1_200),
+        )
+        .expect("settles");
+    let records = reader.outbox_after(0, 64).expect("reads the outbox");
+    let states: Vec<&str> = records
+        .iter()
+        .map(|record| record.event.detail.as_str())
+        .collect();
+    assert_eq!(states, vec!["accepted", "dispatching", "applied"]);
+    // The cursor orders this journal's own events and nothing else.
+    let cursors: Vec<u64> = records.iter().map(|record| record.cursor).collect();
+    assert!(cursors.windows(2).all(|pair| pair[0] < pair[1]));
+    drop(reader);
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn a_consumer_that_dies_before_it_records_its_cursor_applies_each_event_once() {
+    // KR-REQ-24.20, second half: fan-out is at-least-once and idempotent. The journal hands the
+    // same page back, and the immutable event identifier is what makes applying it twice a
+    // decision rather than an accident.
+    let path = journal_path("outbox-fanout");
+    let mut journal = Journal::open(&path).expect("opens");
+    for action in 1..=3 {
+        journal
+            .accept(&submission(action, action))
+            .expect("accepts");
+    }
+    let mut consumer = Fanout::new();
+    let cursor = journal.outbox_cursor("attention").expect("a cursor");
+    assert_eq!(cursor.cursor, 0);
+    let page = journal.outbox_after(cursor.cursor, 64).expect("a page");
+    assert_eq!(consumer.accept(&page).len(), 3);
+    // It dies here, before `note_outbox_consumed`, so it is handed the same page again.
+    let again = journal.outbox_after(0, 64).expect("a page");
+    assert!(consumer.accept(&again).is_empty());
+    assert_eq!(consumer.applied(), 3);
+    assert_eq!(consumer.suppressed(), 3);
+
+    let last = page.last().expect("a record").cursor;
+    journal
+        .note_outbox_consumed("attention", last, 3)
+        .expect("records the cursor");
+    let recorded = journal.outbox_cursor("attention").expect("a cursor");
+    assert_eq!(recorded.cursor, last);
+    assert_eq!(recorded.delivered, 3);
+    assert!(
+        journal
+            .outbox_after(recorded.cursor, 64)
+            .expect("a page")
+            .is_empty()
+    );
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[tokio::test]
+async fn no_keystroke_and_no_provider_key_reaches_the_control_log() {
+    // KR-REQ-24.21. The check is a grep of the journal's own bytes after a session has typed a
+    // recognisable secret and produced recognisable output: nothing the terminal carried is in
+    // the durable control record, whatever path it took to get there.
+    const SECRET: &str = "sk-provider-key-4d2f8a1b";
+    const TYPED: &str = "export ANTHROPIC_API_KEY=sk-provider-key-4d2f8a1b";
+    let host = host().await;
+    {
+        let mut session = host.runtime.session();
+        session.ingest_output(TYPED.as_bytes());
+        session.ingest_output(b"\r\n");
+        // And a host event, which is the one thing an application can put into the journal: with
+        // nothing holding the input lease, a notification becomes a durable record of its own.
+        let effect = kr_term::sideeffect::SideEffect {
+            kind: kr_term::sideeffect::SideEffectKind::Notification {
+                title: Some("a notification title".to_owned()),
+                body: "a notification body".to_owned(),
+                id: None,
+                urgency: kr_term::sideeffect::NotificationUrgency::Normal,
+                display: kr_term::sideeffect::NotificationDisplay::Always,
+            },
+            destination: kr_term::sideeffect::SideEffectDestination::HostEvent,
+            at: 0,
+        };
+        session
+            .journal_mut()
+            .expect("a journal")
+            .record_host_event(&effect, TimestampMs::new(1_500))
+            .expect("records the host event");
+    }
+    // Every commit point this session can reach, so the search covers what a running host writes.
+    {
+        let mut session = host.runtime.session();
+        let journal = session.journal_mut().expect("a journal");
+        journal.accept(&submission(9, 9)).expect("accepts");
+        journal
+            .mark_dispatching(
+                actor(),
+                kr_worker::journal::action_id_from([9; 16]),
+                TimestampMs::new(2_000),
+            )
+            .expect("marks");
+        journal.checkpoint().expect("checkpoints the log");
+    }
+    let bytes = std::fs::read(&host.journal_path).expect("reads the journal");
+    assert!(
+        !contains(&bytes, SECRET.as_bytes()),
+        "a provider key reached the durable control log"
+    );
+    assert!(
+        !contains(&bytes, TYPED.as_bytes()),
+        "a keystroke line reached the durable control log"
+    );
+    // What the journal does keep is the application's own notice, which section 25 retains and
+    // which this store declares as exactly that rather than as metadata.
+    assert!(contains(&bytes, b"a notification body"));
+    assert_eq!(
+        stores::store("host_events").expect("a declaration").content,
+        stores::ContentClass::ApplicationNotice
+    );
+}
+
+fn contains(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-24.22, 24.23: the per-store declaration, and a full store before dispatch
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn every_store_declares_its_durability_retention_cleanup_and_reconciliation() {
+    // KR-REQ-24.22, first half. Every table the journal creates is declared, and every
+    // declaration is one a reader can act on rather than a name.
+    let path = journal_path("store-declarations");
+    let journal = Journal::open(&path).expect("opens");
+    let tables = journal.table_names().expect("reads the schema");
+    for table in &tables {
+        if table == "schema_version" || table.starts_with("sqlite_") {
+            continue;
+        }
+        assert!(
+            stores::store(table).is_some(),
+            "{table} is a store with no declaration"
+        );
+    }
+    for store in stores::STORES {
+        assert!(!store.holds.is_empty(), "{} says nothing", store.name);
+    }
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn authority_and_dispatch_data_is_never_evicted_under_a_history_cap() {
+    // KR-REQ-24.22, second half, and KR-REQ-20.21's "history pressure cannot silently delete a
+    // live dispatch barrier or deduplication record".
+    for name in ["receipts", "outbox", "fence_evidence", "host_time"] {
+        let store = stores::store(name).expect("a declaration");
+        assert!(!store.evictable_under_history_cap);
+    }
+    let evictable: Vec<&str> = stores::evictable_under_history_cap()
+        .map(|store| store.name)
+        .collect();
+    assert_eq!(
+        evictable,
+        vec!["host_events", "output spool", "resident history"]
+    );
+}
+
+#[tokio::test]
+async fn a_full_durable_store_refuses_a_new_mutation_before_anything_is_dispatched() {
+    // KR-REQ-24.23. The store is made full for real, with the page bound SQLite enforces itself,
+    // so what refuses the mutation is the store rather than a flag this test set.
+    let host = host().await;
+    {
+        let mut session = host.runtime.session();
+        let refusal = fill_the_store(session.journal_mut().expect("a journal"));
+        assert!(refusal.to_string().contains("full"), "{refusal}");
+    }
+    let mut client = cli(&host).await;
+    // A mutation that is not an authorised stop. A geometry resize is a write this worker serves
+    // and it needs a durable receipt, so a full store refuses it before anything is dispatched.
+    let outcome = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("the call reaches the worker");
+    let failure = outcome.expect_err("a full store refuses the mutation");
+    assert_eq!(failure.code, ErrorCode::StorageUnavailable);
+    // And the seam says why, classified from the store's own result code.
+    let condition = host.runtime.session().health().condition();
+    assert_eq!(
+        condition.fault().map(|fault| fault.kind),
+        Some(FaultKind::Full)
+    );
+    assert!(
+        !host
+            .runtime
+            .session()
+            .durability_posture()
+            .admits(WorkClass::RichMutation)
+    );
+}
+
+#[tokio::test]
+async fn a_full_store_still_admits_the_authorised_stop_and_says_its_durability_is_volatile() {
+    // KR-REQ-24.23's exceptions, which are exactly two and are stated in sections 7 and 11 rather
+    // than invented here. This is the section 7 one.
+    let host = host().await;
+    {
+        let mut session = host.runtime.session();
+        let refusal = fill_the_store(session.journal_mut().expect("a journal"));
+        assert!(refusal.to_string().contains("full"), "{refusal}");
+    }
+    let mut client = cli(&host).await;
+    let result = close(&mut client, &host).await;
+    assert_eq!(result.durability, Durability::Volatile);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The journal-fault and recovery seam
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_fault_fences_rich_work_and_recovery_writes_the_interval_down_before_it_clears() {
+    let path = journal_path("fault-and-recovery");
+    let mut journal = Journal::open(&path).expect("opens");
+    journal.accept(&submission(5, 5)).expect("accepts");
+    assert!(journal.health().condition().is_healthy());
+
+    let failure = fill_the_store(&mut journal);
+    assert!(failure.to_string().contains("full"), "{failure}");
+    let condition = journal.health().condition();
+    let fault = condition.fault().expect("the seam holds the fault");
+    assert_eq!(fault.kind, FaultKind::Full);
+    assert!(
+        fault.durable_through > 0,
+        "the mark is the last sequence this host really wrote"
+    );
+    let posture = journal.health().posture();
+    assert!(!posture.admits(WorkClass::RichMutation));
+    assert!(posture.admits(WorkClass::AuthorisedStop));
+    assert!(posture.admits(WorkClass::NativeTerminal));
+
+    // The gap is committed before the condition is cleared. A store that refuses the gap is a
+    // store this host may not call recovered, because the record would then read as continuous
+    // over an interval it knows it did not write.
+    journal.release_size_cap().expect("releases the cap");
+    rusqlite::Connection::open(&path)
+        .expect("the same database")
+        .execute_batch(
+            "CREATE TRIGGER refuse_gap BEFORE INSERT ON journal_gaps
+             BEGIN SELECT RAISE(ABORT, 'this store refused the gap'); END;",
+        )
+        .expect("the store will refuse the gap");
+    assert!(journal.recover(TimestampMs::new(9_000)).is_err());
+    assert!(!journal.health().condition().is_healthy());
+    assert!(journal.recovery_gaps().expect("reads the gaps").is_empty());
+
+    rusqlite::Connection::open(&path)
+        .expect("the same database")
+        .execute_batch("DROP TRIGGER refuse_gap;")
+        .expect("the store will take the gap now");
+    let gap = journal
+        .recover(TimestampMs::new(9_100))
+        .expect("recovers")
+        .expect("a fault was open");
+    assert_eq!(gap.kind, FaultKind::Full);
+    assert_eq!(gap.recovered_at_ms.get(), 9_100);
+    assert!(journal.health().condition().is_healthy());
+    let recorded = journal.recovery_gaps().expect("reads the gaps");
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(recorded[0].durable_through, gap.durable_through);
+    // A second recovery has nothing to record.
+    assert!(
+        journal
+            .recover(TimestampMs::new(9_200))
+            .expect("recovers")
+            .is_none()
+    );
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn a_recovery_gap_survives_reopening_the_journal() {
+    let path = journal_path("gap-survives");
+    {
+        let mut journal = Journal::open(&path).expect("opens");
+        fill_the_store(&mut journal);
+        journal.release_size_cap().expect("releases the cap");
+        journal.recover(TimestampMs::new(5_000)).expect("recovers");
+    }
+    let journal = Journal::open(&path).expect("reopens");
+    let gaps = journal.recovery_gaps().expect("reads the gaps");
+    assert_eq!(gaps.len(), 1);
+    assert_eq!(gaps[0].kind, FaultKind::Full);
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-24.30: forward-only migration, one current schema, an explicit importer
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_database_an_earlier_build_wrote_is_brought_forward_and_keeps_its_rows() {
+    // KR-REQ-24.30. The fixture is a version 1 journal with one receipt, written by hand exactly
+    // as the first build of this schema wrote it, and the migration has to reach it through every
+    // step of the ladder without losing it.
+    let path = journal_path("migration-fixture");
+    write_version_one_fixture(&path);
+    let journal = Journal::open(&path).expect("migrates and opens");
+    assert_eq!(
+        journal.schema_version().expect("a version"),
+        migration::CURRENT
+    );
+    let receipt = journal
+        .read(actor(), kr_worker::journal::action_id_from([7; 16]))
+        .expect("reads")
+        .expect("the earlier build's receipt survived");
+    assert_eq!(receipt.state, ReceiptState::Accepted);
+    // Every object of the current schema is there afterwards, including the ones the last step
+    // added.
+    let tables = journal.table_names().expect("reads the schema");
+    for expected in ["outbox", "outbox_cursors", "journal_gaps"] {
+        assert!(tables.iter().any(|name| name == expected), "{expected}");
+    }
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn a_database_a_newer_build_wrote_is_refused_rather_than_read() {
+    let path = journal_path("migration-future");
+    write_version_one_fixture(&path);
+    let connection = rusqlite::Connection::open(&path).expect("opens");
+    connection
+        .execute(
+            "UPDATE schema_version SET version = ?1",
+            rusqlite::params![migration::CURRENT + 1],
+        )
+        .expect("records a newer version");
+    drop(connection);
+    let error = Journal::open(&path).expect_err("a newer store is refused");
+    assert!(error.to_string().contains("newer store is not read"));
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn a_database_older_than_the_ladder_names_the_importer_rather_than_restoring_in_part() {
+    let error = migration::plan(0).expect_err("version 0 is not migratable");
+    assert_eq!(
+        error,
+        MigrationError::Unsupported {
+            found: 0,
+            oldest: migration::OLDEST_MIGRATABLE,
+            importer: migration::IMPORTER,
+        }
+    );
+}
+
+#[test]
+fn there_is_one_current_schema_and_no_second_reader_of_an_older_one() {
+    // KR-REQ-24.30's "code reads one current schema after migration; do not maintain permanent
+    // dual readers". The ladder is contiguous and every step ends at the one version this build
+    // reads, so there is nowhere for a second reader to live.
+    assert_eq!(kr_worker::journal::SCHEMA_VERSION, migration::CURRENT);
+    let steps = migration::plan(migration::OLDEST_MIGRATABLE).expect("a plan");
+    assert_eq!(steps.last().expect("a last step").to, migration::CURRENT);
+    assert!(
+        migration::plan(migration::CURRENT)
+            .expect("a plan")
+            .is_empty()
+    );
+}
+
+/// Writes the journal an earlier build of this schema wrote: version 1, with one receipt.
+fn write_version_one_fixture(path: &std::path::Path) {
+    let connection = rusqlite::Connection::open(path).expect("creates the fixture");
+    connection
+        .execute_batch(
+            "CREATE TABLE schema_version (version INTEGER NOT NULL);
+             INSERT INTO schema_version (version) VALUES (1);
+             CREATE TABLE receipts (
+                 actor_id             TEXT    NOT NULL,
+                 action_id            BLOB    NOT NULL,
+                 method               TEXT    NOT NULL,
+                 method_version       INTEGER NOT NULL,
+                 revision             INTEGER NOT NULL,
+                 state                TEXT    NOT NULL,
+                 reason               TEXT,
+                 payload_digest       BLOB    NOT NULL,
+                 accepted_deadline_ms INTEGER,
+                 error_code           TEXT,
+                 error_message        TEXT,
+                 created_at_ms        INTEGER NOT NULL,
+                 updated_at_ms        INTEGER NOT NULL,
+                 PRIMARY KEY (actor_id, action_id)
+             );
+             CREATE TABLE results (
+                 actor_id  TEXT NOT NULL,
+                 action_id BLOB NOT NULL,
+                 result    BLOB NOT NULL,
+                 PRIMARY KEY (actor_id, action_id)
+             );
+             CREATE TABLE receipt_events (
+                 sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
+                 actor_id       TEXT    NOT NULL,
+                 action_id      BLOB    NOT NULL,
+                 revision       INTEGER NOT NULL,
+                 state          TEXT    NOT NULL,
+                 recorded_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE closure (
+                 session_id BLOB PRIMARY KEY,
+                 record     BLOB NOT NULL
+             );",
+        )
+        .expect("the version 1 schema");
+    connection
+        .execute(
+            "INSERT INTO receipts (
+                 actor_id, action_id, method, method_version, revision, state,
+                 payload_digest, accepted_deadline_ms, created_at_ms, updated_at_ms
+             ) VALUES (?1, ?2, ?3, 1, 1, 'accepted', ?4, 10000, 1000, 1000)",
+            rusqlite::params![
+                "test:persistence",
+                Uuid::from_bytes([7; 16]).as_bytes().as_slice(),
+                Method::SessionClose.as_str(),
+                [7_u8; 32].as_slice(),
+            ],
+        )
+        .expect("the earlier build's receipt");
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-20.20, 20.21: seven days, the two caps, and the gap cursors eviction leaves
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_retention_figures_are_the_ones_section_twenty_states() {
+    // KR-REQ-20.20.
+    let retention = OutputRetention::DEFAULT;
+    assert_eq!(retention.max_age.as_secs(), 7 * 24 * 60 * 60);
+    assert_eq!(retention.host_cap_bytes, 1024 * 1024 * 1024);
+    assert_eq!(retention.session_cap_bytes, 128 * 1024 * 1024);
+    // KR-REQ-20.21's separate budget: receipts are a period, not a byte cap.
+    assert_eq!(RETENTION_MS, 30 * 24 * 60 * 60 * 1000);
+    assert_eq!(stores::RECEIPT_RETENTION.as_millis() as u64, RETENTION_MS);
+}
+
+#[tokio::test]
+async fn a_live_session_applies_output_retention_and_leaves_a_gap_a_reader_is_told_about() {
+    // KR-REQ-20.20 and 20.21 through the session, rather than through the history alone: the
+    // maintenance path is what a running host uses, and the gap it leaves carries the bound.
+    let host = host().await;
+    let evicted = {
+        let mut session = host.runtime.session();
+        for _ in 0..32 {
+            session.ingest_output(&[b'x'; 8192]);
+        }
+        let before = session.retained_output_bytes();
+        assert!(before > 0);
+        // A session cap this session is already over, with the host figure taken from the spool.
+        session.apply_output_retention(
+            OutputRetention::new(
+                std::time::Duration::from_secs(7 * 24 * 60 * 60),
+                1024 * 1024 * 1024,
+                1024,
+            ),
+            before,
+            kr_ipc::now_ms(),
+        )
+    };
+    assert!(!evicted.is_empty(), "the session cap took something");
+    assert_eq!(evicted[0].limit, RetentionLimit::SessionCap);
+    let session = host.runtime.session();
+    assert_eq!(
+        session.history_gap_cause(0),
+        Some(HistoryGapCause::SessionCapacity)
+    );
+    let page = session.history_page(0, 4096).expect("a page");
+    let gap = page.gap.0.expect("the evicted range is reported");
+    assert_eq!(gap.from_cursor.get(), 0);
+    assert!(gap.to_cursor.get() > 0);
+}
+
+// ---------------------------------------------------------------------------------------------
+// KR-REQ-24.26: owner-only local state
+// ---------------------------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_state_directories_this_host_creates_are_owner_only() {
+    // KR-REQ-24.26 on this machine. The headless Linux limitation is documented in
+    // docs/host/README.md and is about key storage rather than about these directories.
+    let host = host().await;
+    let mut directory = host.journal_path.parent().expect("a parent").to_path_buf();
+    // Every directory from the journal up to the environment's state root is owner-only.
+    for _ in 0..3 {
+        assert_owner_only(&directory);
+        let Some(parent) = directory.parent() else {
+            break;
+        };
+        directory = parent.to_path_buf();
+    }
+}
+
+#[cfg(unix)]
+fn assert_owner_only(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let mode = std::fs::metadata(path)
+        .expect("the directory exists")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_eq!(mode, 0o700, "{} is {mode:o}", path.display());
+}
+
+#[cfg(not(unix))]
+fn assert_owner_only(path: &std::path::Path) {
+    assert!(std::fs::metadata(path).is_ok(), "{}", path.display());
+}

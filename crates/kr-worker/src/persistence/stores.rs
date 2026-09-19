@@ -56,6 +56,12 @@ pub enum ContentClass {
     TerminalContent,
     /// Text a person wrote or an agent asked for.
     AuthoredContent,
+    /// An untrusted notice an application asked the terminal to deliver.
+    ///
+    /// Section 25 keeps these: an OSC 9, 99 or 777 notification with nothing holding the input
+    /// lease becomes a durable host event rather than something shown to whoever is watching. It
+    /// is kept apart from the terminal's own body, which section 24 forbids copying here.
+    ApplicationNotice,
     /// Key material.
     Secret,
 }
@@ -246,11 +252,33 @@ pub static STORES: &[StoreDescriptor] = &[
         served_by_archive: true,
     },
     StoreDescriptor {
+        name: "fence_delivery",
+        holds: "how many of a revocation's names the controller generation asking now has taken",
+        durability: Durability::CrashDurable,
+        retention: Retention::UntilSubjectGone,
+        content: ContentClass::Metadata,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
+        name: "fence_forgotten",
+        holds: "the revision below which this journal can no longer count a revocation's names",
+        durability: Durability::CrashDurable,
+        retention: Retention::UntilSubjectGone,
+        content: ContentClass::Metadata,
+        cleanup: Cleanup::WorkerMaintenance,
+        reconciliation: Reconciliation::ReadBack,
+        evictable_under_history_cap: false,
+        served_by_archive: false,
+    },
+    StoreDescriptor {
         name: "host_events",
-        holds: "a side effect that had no attachment to go to, with no content a person did not ask to keep",
+        holds: "an application notice that had no attachment to go to, and where in the stream it happened",
         durability: Durability::GroupedCommit,
         retention: Retention::SessionLifetime,
-        content: ContentClass::Metadata,
+        content: ContentClass::ApplicationNotice,
         cleanup: Cleanup::ArchiveService,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: true,
@@ -326,6 +354,8 @@ mod tests {
             "observations",
             "fence_evidence",
             "fence_state",
+            "fence_delivery",
+            "fence_forgotten",
             "host_time",
             "closure",
             "journal_gaps",
@@ -356,6 +386,11 @@ mod tests {
                 // The transfer service holds files a person chose to send, under its own store.
                 continue;
             }
+            if store.content == ContentClass::TerminalContent {
+                // The spool and the resident window are the retained output itself. What section
+                // 24 forbids is copying that into the control log, which is the assertion below.
+                continue;
+            }
             assert_ne!(
                 store.content,
                 ContentClass::Secret,
@@ -366,6 +401,12 @@ mod tests {
                 store.content,
                 ContentClass::AuthoredContent,
                 "{} must not hold authored content",
+                store.name
+            );
+            assert_ne!(
+                store.content,
+                ContentClass::TerminalContent,
+                "{} must not hold the terminal's own body",
                 store.name
             );
         }

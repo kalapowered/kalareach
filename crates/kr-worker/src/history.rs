@@ -494,17 +494,18 @@ impl Spool {
         segment.len
     }
 
-    /// Removes the oldest segments that are entirely past the retention period.
+    /// Removes the segments that are entirely past the retention period.
     ///
-    /// The segment being written is never dropped: a session whose whole spool is old still has
-    /// somewhere for its next byte to go.
+    /// Retention runs between appends rather than inside one, so it may take every segment: the
+    /// next append starts a new one, and what stays readable meanwhile is the resident window.
+    /// The eviction the capacity bound does inside an append keeps its own guard, because there
+    /// the newest segment is the one being written to.
     fn drop_older_than(&mut self, expires_before: u64) -> u64 {
         let mut dropped = 0;
-        while self.segments.len() > 1
-            && self
-                .segments
-                .front()
-                .is_some_and(|segment| segment.written_at_ms < expires_before)
+        while self
+            .segments
+            .front()
+            .is_some_and(|segment| segment.written_at_ms < expires_before)
         {
             dropped += self.drop_oldest();
         }
@@ -514,7 +515,7 @@ impl Spool {
     /// Removes the oldest segments until at least `bytes` have gone.
     fn drop_at_least(&mut self, bytes: u64) -> u64 {
         let mut dropped = 0;
-        while dropped < bytes && self.segments.len() > 1 {
+        while dropped < bytes && !self.segments.is_empty() {
             dropped += self.drop_oldest();
         }
         dropped
