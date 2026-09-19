@@ -90,16 +90,19 @@ pub enum FlushPolicy {
 
 /// Returns what one kind of write is allowed to wait for.
 ///
-/// This is the policy section 24 states, held where it can be read and tested. It is not
-/// instrumentation of the store: nothing consults it on the write path, because the store's own
-/// durability settings are what carry a transaction. Section 24 permits safe grouped commits to
-/// share a flush, and what this names is which writes may not be grouped with work nobody is
-/// waiting on. `Grouped` is a permission rather than a description: a write this allows to share
-/// a flush may still be committed on its own, which is what this build does.
+/// This is **this build's policy**, held where it can be read and tested, not a restatement of
+/// section 24. The section names the three commit points that must be durable before something
+/// else happens and forbids a per-keystroke or per-byte fsync; it permits safe grouped commits to
+/// share a flush and does not forbid grouping the commit points with each other. Committing each
+/// on its own is a choice made here.
+///
+/// It is not instrumentation of the store either: nothing consults it on the write path, because
+/// the store's own durability settings are what carry a transaction. `Grouped` is a permission
+/// rather than a description - a write this allows to share a flush may still be committed alone.
 #[must_use]
 pub const fn flush_policy(write: WriteKind) -> FlushPolicy {
     match write {
-        // A commit point is what something else is waiting on, so it is never grouped.
+        // A commit point is what something else is waiting on, so this build does not group it.
         WriteKind::Commit(_) => FlushPolicy::Immediate,
         // Section 24 names these three as the ones that must never wait for an fsync. Keystrokes
         // and output bytes are not written to the journal at all: the live parser is in worker

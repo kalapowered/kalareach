@@ -3073,8 +3073,12 @@ impl Session {
     /// Removes the content one action's receipt carries, where it settles.
     ///
     /// Privacy mode is prospective, and an action admitted under it settles later. Taking its
-    /// content here rather than on the next maintenance pass is what stops a crash in between
-    /// leaving it for the archive to serve. A failure becomes cleanup this session still owes.
+    /// content here rather than waiting for the next maintenance pass narrows the window in which
+    /// it is on the disk. It does not close it: this is a second transaction after the one that
+    /// wrote the outcome, so a crash between the two leaves the content for the archive to serve,
+    /// and the asynchronous launch settlement and the early rejection path do not reach here at
+    /// all. Closing that needs the content policy inside the journal transition itself, which is
+    /// this task's handoff residual 17. A failure becomes cleanup this session still owes.
     pub fn redact_settled_action(
         &mut self,
         actor_id: &kr_protocol::ids::ActorId,

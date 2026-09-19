@@ -999,13 +999,15 @@ again. Only the retained output and the host events an attachment never saw are 
 
 ### What waits for a flush, and what never does
 
-Three commit points are named by section 24 and never grouped: the intent before the
-acknowledgement, the dispatch marker before the effect, and the outcome with its receipt revision,
-its event and its outbox record. They are not the only writes a caller waits for. Turning privacy
-mode on waits for the generation to be recorded, and a closure waits for its own record, because
-in both cases the answer would otherwise claim something the store had not yet taken. What section
-24 names is which writes may not *share* a flush with work nobody is waiting on; this build
-commits the others in transactions of their own, which is its own choice and not a requirement.
+Section 24 names three commit points that must be durable before something else happens: the
+intent before the acknowledgement, the dispatch marker before the effect, and the outcome with its
+receipt revision, its event and its outbox record. It permits safe grouped commits to share a
+flush; it does not forbid grouping these with each other. **This build commits each of them on its
+own**, which is its own policy rather than something the section requires.
+
+They are not the only writes a caller waits for, either. Turning privacy mode on waits for the
+generation to be recorded, and a closure waits for its own record, because in both cases the
+answer would otherwise claim something the store had not yet taken.
 Section 24 forbids a per-keystroke, per-output-byte or ordinary prompt and command telemetry
 event from waiting for an fsync, and this host goes further with the first two: a keystroke and an
 output byte write no durable row at all. The live parser is in worker memory and the retained
@@ -1084,13 +1086,20 @@ maintenance tick, from a reading of the environment's whole spool directory, so 
 writing at once can take the host past it until the next tick. Neither bound is a reservation and
 neither is enforced ahead of the write.
 
-Eviction is never quiet. A retention pass records the cursor range it took and the bound that took
+Eviction is not quiet. A retention pass records the cursor range it took and the bound that took
 it, and a reader asking for a cursor inside that range is told both: `history.page` returns the
-range as a gap with a cause. The spool's own capacity is the exception: when an append rotates
-past the session cap the oldest segment goes with it, and that drop carries no recorded cause, so
-the range reads as a gap without one until a retention pass records the bound it was over. A spool that has evicted everything writes down where its output got to
-before it deletes what supports that, so a session reopened over an empty directory continues its
-cursor and reports the range that went rather than starting again at nought.
+range as a gap with a cause. The spool's own capacity is the exception: when an append rotates past
+the session cap the oldest segment goes with it, and that drop carries no recorded cause, so the
+range reads as a gap without one until a retention pass records the bound it was over. A spool that
+has evicted everything writes down where its output got to before it deletes what supports that, so
+a session reopened over an empty directory continues its cursor and reports the range that went
+rather than starting again at nought.
+
+What a page cannot yet report is a hole *inside* the retained range. The reader asks which segment
+covers the cursor it was given; a middle segment that has gone leaves that cursor covered by
+nothing, and the page comes back empty rather than as a gap. Segment continuity is not checked,
+and the archive's own completeness check reads the oldest cursor and the boundary rather than what
+is between them. This task's handoff carries it as residual 21.
 
 Removing output because it is old is expiry-based collection, so section 9's rule applies: a host
 that cannot prove its wall clock does not do it. The caps still apply, because they are about
@@ -1233,6 +1242,32 @@ privacy mode acceptable the moment privacy mode ended.
 A session reopened with privacy mode on does not start retaining again, and one whose privacy
 state this host could not read does not either: not knowing whether privacy mode is on is not a
 reason to keep output.
+
+### What privacy mode does not reach yet
+
+Stated here rather than left to be discovered, because the gap between what a mode is called and
+what it removes is exactly the thing a person cannot check for themselves.
+
+* **Nothing in this build turns it on.** The generation, the contract and the two adapters over
+  the spool and the journal are here and tested; no method or command reaches them, and the
+  transfer preview, description inference, sync and backup subsystems are recorded stubs rather
+  than services. Until a caller exists, privacy mode is a contract this host can keep, not a
+  setting a person has.
+* **The canonical grid keeps its scrollback.** Retention stops at the spool and the resident
+  window; the projection's own history is not reached, because removing rows from it while keeping
+  the live screen needs an interface the task that owns the projection has to provide.
+* **Application notices keep their content.** A notification's title and body are written to the
+  host-event store, and privacy cleanup removes neither the rows already there nor later ones.
+* **Content that settles is taken in a second step.** An action admitted under privacy mode has
+  its receipt content removed where it settles, which is after the transaction that wrote the
+  outcome; a crash between the two leaves it, and two settlement paths do not reach that step at
+  all.
+* **The archive does not enforce any of this.** A session read after its worker has gone is served
+  from the store as it stands: the archive neither finishes an unfinished cleanup nor holds a read
+  while one is owed.
+
+Each of these is carried as a numbered residual in this task's handoff, with the next step and who
+owns it.
 
 ## What an idle session wakes for
 
