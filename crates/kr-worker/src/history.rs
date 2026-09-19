@@ -30,6 +30,28 @@ use crate::error::{Result, WorkerError};
 /// The resident history cache of one session, in bytes.
 pub const DEFAULT_RESIDENT_BYTES: usize = 8 * 1024 * 1024;
 
+/// One interval of the resident window, and when its output arrived.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ResidentMark {
+    /// The cursor this interval starts at.
+    cursor: u64,
+    /// When the interval began, which is what bounds how long it may go on for.
+    started_at_ms: u64,
+    /// When the newest byte in it arrived, which is what expiry reads.
+    last_at_ms: u64,
+}
+
+/// What discarding a session's retained output took, and what it could not.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Discarded {
+    /// Bytes of retained output that went.
+    pub bytes: u64,
+    /// Spool segments that went.
+    pub segments: u64,
+    /// Why some of it is still there, when some of it is.
+    pub left_behind: Option<String>,
+}
+
 /// How coarse the resident window's own record of when its output arrived is.
 ///
 /// One mark per minute bounds the record at a few entries for a window of any size, and bounds
@@ -100,15 +122,16 @@ pub struct OutputHistory {
     /// The resident window's own record of when its output arrived, oldest first.
     ///
     /// The window is what a session serves when its spool has nothing left, so section 20's seven
-    /// days has to reach it as well, and bytes carry no timestamps. Each entry is the cursor one
-    /// interval starts at and the instant of the *newest* byte in it, so every byte in
-    /// `[marks[i].0, marks[i + 1].0)` was written at or before `marks[i].1`. Reading the newest
-    /// rather than the oldest is what makes the answer safe: a range is removed only when this
-    /// host can say every byte in it had expired.
+    /// days has to reach it as well, and bytes carry no timestamps. Each entry is one interval:
+    /// the cursor it starts at, the instant it started and the instant of its *newest* byte. Every
+    /// byte in it was written at or before that newest instant, and reading the newest rather
+    /// than the oldest is what makes the answer safe: a range is removed only when this host can
+    /// say every byte in it had expired.
     ///
-    /// A new interval starts when [`RESIDENT_MARK_MS`] has passed, which keeps the record to a
-    /// handful of entries and keeps what is retained past the deadline to about that long.
-    resident_marks: VecDeque<(u64, u64)>,
+    /// A new interval starts once [`RESIDENT_MARK_MS`] has passed *since the interval began*,
+    /// not since its last byte. Measuring from the last byte would let one byte a minute extend
+    /// one interval for a week, and the whole of it would then be held by the newest byte in it.
+    resident_marks: VecDeque<ResidentMark>,
     /// Whether output is being retained at all.
     ///
     /// Privacy mode disables content-history retention prospectively, which is this: what arrives
@@ -238,11 +261,15 @@ impl OutputHistory {
         self.next_cursor += bytes.len() as u64;
         let now_ms = kr_ipc::now_ms().get();
         match self.resident_marks.back_mut() {
-            // Still inside the current interval: the newest byte in it is this one.
-            Some((_, last_at)) if now_ms.saturating_sub(*last_at) < RESIDENT_MARK_MS => {
-                *last_at = now_ms;
+            // Still inside the current interval, measured from when the interval began.
+            Some(mark) if now_ms.saturating_sub(mark.started_at_ms) < RESIDENT_MARK_MS => {
+                mark.last_at_ms = now_ms;
             }
-            _ => self.resident_marks.push_back((start, now_ms)),
+            _ => self.resident_marks.push_back(ResidentMark {
+                cursor: start,
+                started_at_ms: now_ms,
+                last_at_ms: now_ms,
+            }),
         }
         while self.resident.len() > self.resident_capacity {
             let excess = self.resident.len() - self.resident_capacity;
@@ -261,14 +288,14 @@ impl OutputHistory {
         while self
             .resident_marks
             .get(1)
-            .is_some_and(|(cursor, _)| *cursor <= self.resident_start)
+            .is_some_and(|mark| mark.cursor <= self.resident_start)
         {
             self.resident_marks.pop_front();
         }
-        if let Some((cursor, _)) = self.resident_marks.front_mut()
-            && *cursor < self.resident_start
+        if let Some(mark) = self.resident_marks.front_mut()
+            && mark.cursor < self.resident_start
         {
-            *cursor = self.resident_start;
+            mark.cursor = self.resident_start;
         }
     }
 
@@ -288,7 +315,7 @@ impl OutputHistory {
         self.spool
             .as_ref()
             .and_then(Spool::oldest_written_at_ms)
-            .or_else(|| self.resident_marks.front().map(|(_, last_at)| *last_at))
+            .or_else(|| self.resident_marks.front().map(|mark| mark.last_at_ms))
             .map(TimestampMs::new)
     }
 
@@ -324,26 +351,54 @@ impl OutputHistory {
     ///
     /// This is logical cleanup. The files are unlinked and the window is dropped; nothing here
     /// claims the bytes are unrecoverable from the device they were on.
-    pub fn discard_retained(&mut self) -> (u64, u64) {
+    pub fn discard_retained(&mut self) -> Discarded {
         let resident = self.resident.len() as u64;
         self.resident.clear();
         self.resident_marks.clear();
         self.resident_start = self.next_cursor;
-        let mut bytes = resident;
-        let mut segments = 0;
-        if let Some(spool) = self.spool.as_mut()
-            && spool.record_boundary()
-        {
-            while !spool.segments.is_empty() {
-                let went = spool.drop_oldest();
-                if went == 0 {
-                    break;
-                }
-                bytes += went;
-                segments += 1;
-            }
+        let mut discarded = Discarded {
+            bytes: resident,
+            segments: 0,
+            left_behind: None,
+        };
+        let Some(spool) = self.spool.as_mut() else {
+            return discarded;
+        };
+        if !spool.record_boundary() {
+            discarded.left_behind = Some(
+                "this session's spool boundary could not be written, so its retained output \
+                      was left where it was"
+                    .to_owned(),
+            );
+            return discarded;
         }
-        (bytes, segments)
+        while !spool.segments.is_empty() {
+            let went = spool.drop_oldest();
+            if went == 0 {
+                // A segment this host could not unlink is content it was asked to remove and has
+                // not. It stays in the accounting and the failure is reported rather than the
+                // removal being called complete over a file a reader can still be served.
+                discarded.left_behind = Some(format!(
+                    "{} of this session's spool segments could not be removed",
+                    spool.segments.len()
+                ));
+                break;
+            }
+            discarded.bytes += went;
+            discarded.segments += 1;
+        }
+        discarded
+    }
+
+    /// Returns whether this session recorded where its output got to and cannot read it back.
+    ///
+    /// A host in that condition does not know what it is missing, which is a different answer
+    /// from knowing that it is missing nothing.
+    #[must_use]
+    pub fn boundary_unreadable(&self) -> bool {
+        self.spool
+            .as_ref()
+            .is_some_and(|spool| spool.unreadable_boundary)
     }
 
     /// Returns what retention has taken from this session, oldest first.
@@ -461,8 +516,8 @@ impl OutputHistory {
         let expired_to = self
             .resident_marks
             .iter()
-            .find(|(_, last_at)| *last_at >= expires_before)
-            .map_or(self.next_cursor, |(cursor, _)| *cursor);
+            .find(|mark| mark.last_at_ms >= expires_before)
+            .map_or(self.next_cursor, |mark| mark.cursor);
         {
             let to = expired_to;
             let excess =
@@ -522,6 +577,24 @@ impl OutputHistory {
     pub fn page(&self, from_cursor: u64, max_bytes: u64) -> Result<HistoryPageResult> {
         let oldest = self.oldest_retained_cursor();
         let limit = max_bytes.clamp(1, MAX_HISTORY_PAGE_BYTES);
+        if self.boundary_unreadable() {
+            // This host recorded where its output got to and cannot read it back, so it does not
+            // know what it is missing. A page that reported no gap would be saying there is
+            // nothing before this, which is the one thing it cannot say.
+            let bytes = self.read_range(oldest.max(from_cursor), limit)?;
+            let start = oldest.max(from_cursor);
+            return Ok(HistoryPageResult {
+                from_cursor: U64::new(start),
+                next_cursor: U64::new(start + bytes.len() as u64),
+                bytes: Bytes::new(bytes),
+                oldest_retained_cursor: U64::new(oldest),
+                gap: Nullable::some(HistoryGap {
+                    from_cursor: U64::new(0),
+                    to_cursor: U64::new(oldest),
+                    cause: Some(HistoryGapCause::SpoolUnavailable),
+                }),
+            });
+        }
         let (start, gap) = if from_cursor < oldest {
             (
                 oldest,

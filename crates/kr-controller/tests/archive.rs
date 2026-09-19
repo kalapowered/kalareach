@@ -429,127 +429,60 @@ fn taking_ownership_creates_no_worker_and_no_store() {
 // KR-REQ-07.65, 07.66: the closure receipt and what a crash fences
 // ---------------------------------------------------------------------------------------------
 
-#[cfg(unix)]
 #[test]
-fn a_crash_fences_the_workers_own_boundary_and_never_claims_more() {
-    // KR-REQ-07.66. What is still running after a worker crash is whatever the worker's own
-    // boundary still holds, and on a Unix host that boundary is the process group it led. Every
-    // member is checked against the kernel's own answer before anything is stopped, and the
-    // coverage never claims that every application was discovered.
+fn a_crash_stops_nothing_on_the_strength_of_an_identifier_the_kernel_may_have_reused() {
+    // KR-REQ-07.66's cleanup half. A worker's descendants join the group it led, and once the
+    // worker has gone the kernel is free to give its number to an unrelated process whose group
+    // would answer to it. This host therefore stops nothing from a dead identifier, and says so:
+    // the boundary is one it has none of, and the coverage is incomplete.
     let (_temp, archive) = host();
     let session_id = session();
 
-    // A process group of this test's own making, standing in for the boundary a worker leads.
-    // The leader writes the group down and then exits, which is the shape a crashed worker leaves
-    // behind: the leader is gone and what it started is still in its group. `setsid` is what a
-    // worker does and is what this uses where the platform ships it; job control is the fallback,
-    // and a shell that gives neither a group of its own is a shell this test says so about rather
-    // than one it asserts against this daemon's own group.
-    let marker = std::env::temp_dir().join(format!("kr-fence-{}", kr_ipc::new_uuid()));
-    let inner = format!(
-        "/bin/sh -c 'sleep 30 & ps -o pgid= -p $$ > {0}'",
-        marker.display()
-    );
-    let script = if std::path::Path::new("/usr/bin/setsid").exists() {
-        format!("exec /usr/bin/setsid {inner}")
-    } else {
-        format!("set -m; {inner} & wait")
-    };
-    let mut leader = std::process::Command::new("/bin/sh")
+    // A process this test started, which stands in for whatever a crashed session left behind.
+    let mut child = std::process::Command::new("/bin/sh")
         .arg("-c")
-        .arg(&script)
+        .arg("sleep 5")
         .spawn()
-        .expect("starts a group leader");
-    let mut group = None;
-    for _ in 0..100 {
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        if let Ok(text) = std::fs::read_to_string(&marker)
-            && let Ok(found) = text.trim().parse::<u32>()
-        {
-            group = Some(found);
-            break;
-        }
-    }
-    let group = group.expect("the group leader recorded its own group");
-    std::fs::remove_file(&marker).ok();
-    if Some(group) == this_process_group() {
-        // This shell put the job in this test's own group, so there is no separate boundary to
-        // fence. The archive refuses to touch its own group, which is the behaviour the other
-        // test covers; asserting against it here would be asserting that this host stops itself.
-        let _ = leader.wait();
-        eprintln!("skipped: this shell gives a background job no process group of its own");
-        return;
-    }
+        .expect("starts a child");
+    let owned = kr_ipc::identity::process_start_identity(child.id()).expect("its identity");
 
+    let ended = kr_ipc::identity::ended_process_identity(1);
     let ownership = archive
-        .take_ownership(
-            session_id,
-            DisplayNumber::new(1),
-            &kr_ipc::identity::ended_process_identity(group),
-        )
+        .take_ownership(session_id, DisplayNumber::new(1), &ended)
         .expect("ownership");
     let mut record = closure(session_id, ClosureReason::WorkerCrash);
+    record.terminated = vec![TerminatedProcess {
+        identity: ended.clone(),
+        name: Nullable::some("the session's worker".to_owned()),
+        forced: false,
+    }];
     record.surviving = vec![SurvivingResource {
         kind: "browser".to_owned(),
         detail: "an explicitly brokered window".to_owned(),
     }];
+
     let fenced = archive.fence_owned(&ownership, &record);
     assert_eq!(fenced.session_id, session_id);
     assert_eq!(
         fenced.boundary,
-        kr_controller::archive::CleanupBoundary::ProcessGroup(group)
+        kr_controller::archive::CleanupBoundary::None
     );
+    assert!(fenced.stopped.is_empty(), "nothing is stopped by inference");
+    assert_eq!(fenced.already_gone, 1, "the worker had already ended");
     assert!(
-        !fenced.stopped.is_empty(),
-        "what the dead leader left in its group was terminated: {fenced:?}"
+        fenced.unaccounted > 0,
+        "a boundary this host has none of is something it cannot account for"
     );
     assert_eq!(fenced.surviving.len(), 1, "what survives is reported");
-    assert_eq!(
-        fenced.coverage,
-        OwnershipCoverage::Incomplete,
-        "a process group is not a complete boundary and never claims to be"
-    );
-    // Nothing outside that group was touched: this test's own process is still running.
-    assert!(
-        matches!(
-            kr_ipc::identity::process_state(
-                &kr_ipc::identity::current_process_start_identity().expect("an identity")
-            ),
-            kr_ipc::identity::ProcessState::Running
-        ),
-        "the fence stayed inside the session's own boundary"
-    );
-    let _ = leader.wait();
-}
-
-/// Returns this test process's own process group.
-#[cfg(unix)]
-fn this_process_group() -> Option<u32> {
-    std::process::Command::new("/bin/ps")
-        .args(["-o", "pgid=", "-p"])
-        .arg(std::process::id().to_string())
-        .output()
-        .ok()
-        .and_then(|output| {
-            String::from_utf8_lossy(&output.stdout)
-                .trim()
-                .parse::<u32>()
-                .ok()
-        })
-}
-
-#[test]
-fn a_boundary_this_host_cannot_enumerate_leaves_the_coverage_incomplete() {
-    let (_temp, archive) = host();
-    let session_id = session();
-    // A process identifier nothing holds: there is no group to enumerate.
-    let ended = kr_ipc::identity::ended_process_identity(u32::MAX - 7);
-    let ownership = archive
-        .take_ownership(session_id, DisplayNumber::new(1), &ended)
-        .expect("ownership");
-    let fenced = archive.fence_owned(&ownership, &closure(session_id, ClosureReason::WorkerCrash));
-    assert!(fenced.stopped.is_empty());
     assert_eq!(fenced.coverage, OwnershipCoverage::Incomplete);
+
+    // And the process this test started is untouched, because nothing went looking for it.
+    assert!(matches!(
+        kr_ipc::identity::process_state(&owned),
+        kr_ipc::identity::ProcessState::Running
+    ));
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[test]

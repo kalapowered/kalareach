@@ -147,6 +147,7 @@ impl Archive {
     /// session at all. Three answers are *yes* and they are all the same kind of answer:
     ///
     /// * a summary or a closure survived, which is a session this host remembers;
+    /// * a receipt survived, which is the same thing said by a different store;
     /// * retained output survived, which is a session whose history is still being kept;
     /// * something could not be read, because declining to delete is the answer that cannot lose
     ///   a file and an unreadable record is not evidence that retention has ended.
@@ -158,6 +159,7 @@ impl Archive {
     pub fn retains_submissions(&self) -> bool {
         self.summary.is_some()
             || self.closure.is_some()
+            || self.receipts > 0
             || self.next_cursor > 0
             || self.incompleteness.iter().any(|reason| {
                 matches!(
@@ -168,15 +170,16 @@ impl Archive {
     }
 }
 
-/// The boundary a crashed session's remaining processes were cleaned by.
+/// The boundary a crashed session's remaining processes are cleaned by.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CleanupBoundary {
-    /// The worker's own process group, which its descendants join.
+    /// The transient unit or Job the supervisor started this worker in.
     ///
-    /// It is not a complete boundary: a process that calls `setsid` leaves it, which is why a
-    /// host built on it never claims complete coverage.
-    ProcessGroup(u32),
-    /// No boundary this host could enumerate.
+    /// This is the boundary section 7 names, and it is the only one that cannot name something
+    /// else: it is derived from the reservation rather than from a process identifier the kernel
+    /// may since have reused. No supervisor in this build stops one yet.
+    SupervisedUnit(String),
+    /// No boundary this host can work from.
     None,
 }
 
@@ -196,7 +199,10 @@ pub struct Fenced {
     pub session_id: SessionId,
     /// The boundary this pass was able to enumerate.
     pub boundary: CleanupBoundary,
-    /// The processes this pass terminated. The signal reached each of them.
+    /// The processes this pass terminated.
+    ///
+    /// Empty until this host records a boundary it can stop: nothing is terminated on the
+    /// strength of an identifier the kernel may have reused.
     pub stopped: Vec<ProcessStartIdentity>,
     /// How many recorded processes had already ended.
     pub already_gone: u64,
@@ -206,52 +212,6 @@ pub struct Fenced {
     pub surviving: Vec<kr_protocol::session::SurvivingResource>,
     /// Whether every owned process was accounted for.
     pub coverage: kr_protocol::session::OwnershipCoverage,
-}
-
-/// Terminates one recorded process, and says whether the signal reached it.
-///
-/// What this reports is delivery rather than death. A process terminated a moment ago is still
-/// described by the kernel until whoever started it collects its status, so asking again
-/// immediately would read a process that has certainly been ended as one that has not. Section 7
-/// gives closure a grace period and then forces what is left; this is the forcing, and the next
-/// pass is what observes the result.
-#[cfg(unix)]
-fn stop(identity: &ProcessStartIdentity) -> bool {
-    let Ok(pid) = i32::try_from(identity.pid.get()) else {
-        return false;
-    };
-    // The identity has already been matched against the kernel's own answer, so this is the
-    // process that was recorded rather than whatever holds its number now.
-    let Some(pid) = rustix::process::Pid::from_raw(pid) else {
-        return false;
-    };
-    rustix::process::kill_process(pid, rustix::process::Signal::KILL).is_ok()
-}
-
-/// Returns this process's own process group, where the platform has one.
-#[cfg(unix)]
-fn own_process_group() -> Option<u32> {
-    Some(
-        rustix::process::getpgrp()
-            .as_raw_nonzero()
-            .get()
-            .unsigned_abs(),
-    )
-}
-
-/// Returns this process's own process group, where the platform has one.
-#[cfg(not(unix))]
-const fn own_process_group() -> Option<u32> {
-    None
-}
-
-/// Terminates one recorded process, and says whether the signal reached it.
-#[cfg(not(unix))]
-fn stop(_identity: &ProcessStartIdentity) -> bool {
-    // A crashed worker's Job Object is closed with the handle it held, which terminates what it
-    // contained. What the archive would have to stop by identity is what left that Job, and a
-    // process outside it is not one this host owns.
-    false
 }
 
 /// Exclusive recovery ownership of one session's stores.
@@ -395,82 +355,71 @@ impl ArchiveService {
         fenced
     }
 
-    /// Fences whatever a crashed session still owns.
+    /// Reports what a crashed session still owns, and what this host can do about it.
     ///
     /// Section 7: after a worker crash the controller fences its endpoints, uses the cgroup or
     /// Job or the recorded identities for cleanup, and records any incomplete coverage. The
-    /// endpoint is fenced by [`Self::take_ownership`]; this is the second half.
+    /// endpoint is fenced by [`Self::take_ownership`]. This is the second half, and what it
+    /// reports today is that the second half has no boundary to work from.
     ///
-    /// **The boundary is what is cleaned, not the closure's list.** A closure record's
-    /// `terminated` list is what a session already stopped; a crashed worker never wrote one, and
-    /// the synthetic record the controller writes names the worker alone. What is still running
-    /// is whatever the worker's own boundary still holds, and on a Unix host that boundary is the
-    /// worker's process group: the worker is sessionised, so it leads a group its descendants
-    /// join, and a process that left that group with `setsid` is exactly what the
-    /// ownership-coverage flag exists to be honest about.
+    /// **Nothing is inferred from a dead identifier.** A worker's descendants join the group it
+    /// led, and after the worker has gone the kernel is free to give its number to an unrelated
+    /// process, whose group would then answer to that number. Enumerating it and stopping what it
+    /// held would be stopping somebody else's processes on the strength of a coincidence. The
+    /// root shell also starts a session of its own, so its jobs need not be in the worker's group
+    /// even while the worker lives.
     ///
-    /// Two guards. Nothing is stopped whose recorded start value does not match what the kernel
-    /// describes now, because the kernel reuses identifiers. And a group that is this daemon's
-    /// own is never touched, which cannot arise from a worker the service manager started and is
-    /// refused rather than relied on.
+    /// What would work is the boundary the platform itself keeps: the transient unit or Job the
+    /// supervisor started this worker in, which is named from the reservation and cannot name
+    /// anything else. This host does not record or stop one yet, so the coverage this returns is
+    /// incomplete and says why. The next step is in this task's handoff.
     #[must_use]
     pub fn fence_owned(&self, ownership: &RecoveryOwnership, closure: &ClosureRecord) -> Fenced {
-        let mut fenced = Fenced {
+        Fenced {
             session_id: ownership.session_id,
             boundary: CleanupBoundary::None,
             stopped: Vec::new(),
-            already_gone: 0,
-            unaccounted: 0,
+            // What the session recorded as already stopped, confirmed against the kernel rather
+            // than taken on trust: the identifier may since have been reused.
+            already_gone: closure
+                .terminated
+                .iter()
+                .filter(|terminated| {
+                    matches!(
+                        kr_ipc::identity::process_state(&terminated.identity),
+                        kr_ipc::identity::ProcessState::Ended
+                    )
+                })
+                .count() as u64,
+            // The boundary itself: this host has none to work from, and that is one thing it
+            // cannot account for.
+            unaccounted: 1,
             surviving: closure.surviving.clone(),
+            // Section 7 forbids claiming that every application a worker may have started was
+            // discovered, and a host with no boundary to clean by is further from that than most.
             coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
-        };
-        let Ok(leader) = u32::try_from(ownership.ended.pid.get()) else {
-            return fenced;
-        };
-        if own_process_group() == Some(leader) {
-            // This daemon's own group. Nothing a worker the service manager started can be in it,
-            // and stopping it would stop this host.
-            fenced.unaccounted += 1;
-            return fenced;
         }
-        match kr_ipc::identity::processes_in_group(leader) {
-            Ok(members) => {
-                fenced.boundary = CleanupBoundary::ProcessGroup(leader);
-                for pid in members {
-                    if pid == leader {
-                        // The worker itself, whose death is what let this run at all.
-                        fenced.already_gone += 1;
-                        continue;
-                    }
-                    let Ok(identity) = kr_ipc::identity::process_start_identity(pid) else {
-                        fenced.unaccounted += 1;
-                        continue;
-                    };
-                    match kr_ipc::identity::process_state(&identity) {
-                        kr_ipc::identity::ProcessState::Ended => fenced.already_gone += 1,
-                        kr_ipc::identity::ProcessState::Running => {
-                            if stop(&identity) {
-                                fenced.stopped.push(identity);
-                            } else {
-                                fenced.unaccounted += 1;
-                            }
-                        }
-                        kr_ipc::identity::ProcessState::Unknown { .. } => fenced.unaccounted += 1,
-                    }
-                }
-            }
-            // A platform that will not enumerate the boundary is one this host cannot account
-            // for. It says so rather than reporting a clean sweep of nothing.
-            Err(_) => fenced.unaccounted += 1,
-        }
-        // Section 7 forbids claiming that every application a worker may have started was
-        // discovered. A process group is not a complete boundary - `setsid` leaves it - so this
-        // never reports complete coverage on its own, and a surviving resource is the user's.
-        fenced.coverage = kr_protocol::session::OwnershipCoverage::Incomplete;
-        fenced
     }
 
-    /// Recovers a crashed session's journal, under ownership, without creating one.
+    /// Returns what a closure records when this host had no chance to fence anything.
+    ///
+    /// A reconciliation that finds a worker already gone without taking ownership still writes a
+    /// closure, and this is what it carries: nothing stopped, nothing accounted for, coverage
+    /// incomplete.
+    #[must_use]
+    pub const fn nothing_fenced(session_id: SessionId) -> Fenced {
+        Fenced {
+            session_id,
+            boundary: CleanupBoundary::None,
+            stopped: Vec::new(),
+            already_gone: 0,
+            unaccounted: 1,
+            surviving: Vec::new(),
+            coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+        }
+    }
+
+    /// Recovers a crashed session's journal, under ownership, without creating one.    /// Recovers a crashed session's journal, under ownership, without creating one.
     ///
     /// Section 9's two recovery rules are the worker's, and a worker that crashed never ran them.
     /// The archive runs them once instead: a dispatch marker with no authoritative outcome
@@ -491,7 +440,10 @@ impl ArchiveService {
         if !path.exists() {
             return Ok(Recovered::default());
         }
-        let mut journal = Journal::open(&path)
+        // The opener that creates nothing. A journal that went between the look and the open, or
+        // a file that is not one this build wrote, is reported rather than replaced with an empty
+        // store that would read as a session which kept nothing.
+        let mut journal = Journal::open_existing(&path)
             .map_err(|error| ControllerError::InvalidArgument(error.to_string()))?;
         let now = kr_ipc::now_ms();
         let unknown = journal
@@ -706,19 +658,41 @@ impl ArchiveService {
     ///
     /// The sweep needs the union of what the registry knows and what is on disk, because a
     /// session the registry has finished with still keeps what was submitted to it while its
-    /// archive is there. A directory this host cannot read contributes nothing, which errs
-    /// towards the registry's answer rather than towards deleting a payload.
-    #[must_use]
-    pub fn sessions_on_disk(&self) -> Vec<SessionId> {
+    /// archive is there.
+    ///
+    /// A scan this host could not complete is an error rather than a shorter list. The sweep
+    /// reads a session's absence as expiry and removes its payload, so a directory that could not
+    /// be read must stop the sweep rather than quietly shrink its answer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ControllerError::InvalidArgument`] when a directory this host owns cannot be
+    /// read. A directory that is simply not there is not an error: a host with no journals yet
+    /// has no sessions on disk.
+    pub fn sessions_on_disk(&self) -> Result<Vec<SessionId>> {
         let mut found = std::collections::BTreeSet::new();
         for (directory, prefix, suffix) in [
             (self.paths.journals_dir(), "session-", ".sqlite"),
             (self.paths.spool_dir(), "", ".log"),
         ] {
-            let Ok(entries) = std::fs::read_dir(&directory) else {
-                continue;
+            let entries = match std::fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(ControllerError::InvalidArgument(format!(
+                        "{} could not be read, so this host cannot say which sessions it holds: \
+                         {error}",
+                        directory.display()
+                    )));
+                }
             };
-            for entry in entries.flatten() {
+            for entry in entries {
+                let entry = entry.map_err(|error| {
+                    ControllerError::InvalidArgument(format!(
+                        "{} could not be read to the end: {error}",
+                        directory.display()
+                    ))
+                })?;
                 let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
                     continue;
                 };
@@ -733,7 +707,7 @@ impl ArchiveService {
                 }
             }
         }
-        found.into_iter().collect()
+        Ok(found.into_iter().collect())
     }
 
     fn read_history_into(&self, session_id: SessionId, archive: &mut Archive) {
@@ -755,6 +729,17 @@ impl ArchiveService {
         };
         archive.oldest_retained_cursor = history.oldest_retained_cursor();
         archive.next_cursor = history.next_cursor();
+        if history.boundary_unreadable() {
+            // This session recorded where its output got to and this host cannot read it back, so
+            // the range it is missing is not a range this host can name.
+            archive
+                .incompleteness
+                .push(Incompleteness::JournalUnreadable {
+                    detail: "this session's spool recorded where its output got to and it cannot \
+                             be read back"
+                        .to_owned(),
+                });
+        }
         if archive.oldest_retained_cursor > 0 {
             archive.incompleteness.push(Incompleteness::HistoryLost {
                 from_cursor: 0,
@@ -817,7 +802,7 @@ impl crate::service::Controller {
         // Then the sessions only the archive knows about, which are the ones the registry has
         // finished with. Asking the archive about each is what makes this the union rather than
         // the registry's answer with a different name on it.
-        for session_id in archive.sessions_on_disk() {
+        for session_id in archive.sessions_on_disk()? {
             if candidates.contains(&session_id) {
                 continue;
             }

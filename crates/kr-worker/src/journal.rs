@@ -227,6 +227,37 @@ impl Journal {
         Self::prepare(connection)
     }
 
+    /// Opens a journal that already exists, for reading and writing, creating nothing.
+    ///
+    /// The archive recovers a crashed session's journal, and a recovery that created one would
+    /// replace the evidence that a journal was lost with a confident empty store. Existence is
+    /// not enough on its own, because a file can go between the look and the open, so the open
+    /// itself refuses to create: `SQLITE_OPEN_CREATE` is not among the flags.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::JournalUnavailable`] when there is no journal there, or when the
+    /// one that is there cannot be opened or migrated.
+    pub fn open_existing(path: impl AsRef<std::path::Path>) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            path.as_ref(),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(unavailable)?;
+        // A file that is there and holds no schema version is not a journal this build wrote.
+        // Migrating it would create one over whatever it is.
+        let recorded: Option<i64> = connection
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .optional()
+            .map_err(unavailable)?;
+        if recorded.is_none() {
+            return Err(unavailable_detail(
+                "this file is not a journal this build wrote, so it is not recovered from",
+            ));
+        }
+        Self::prepare(connection)
+    }
+
     /// Opens a journal that exists only for the life of this process.
     ///
     /// # Errors
@@ -2191,22 +2222,93 @@ impl Journal {
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the write fails.
     pub fn resolve_unfinished_dispatches(&mut self, now_ms: TimestampMs) -> Result<usize> {
-        let changed = self
+        self.recover_states(
+            ReceiptState::Dispatching,
+            ReceiptState::Unknown,
+            ErrorCode::OutcomeUnknown,
+            "the worker restarted after the dispatch marker and before an authoritative outcome",
+            None,
+            now_ms,
+        )
+    }
+
+    /// Moves every receipt in one state to another, with its event and its outbox row.
+    ///
+    /// Recovery is a state transition like any other, so it commits what a transition commits: a
+    /// consumer reading the outbox would otherwise keep the state before the restart for ever,
+    /// and a subscriber paging the event record would never see it change.
+    fn recover_states(
+        &mut self,
+        from: ReceiptState,
+        to: ReceiptState,
+        code: ErrorCode,
+        detail: &str,
+        reason: Option<RejectionReason>,
+        now_ms: TimestampMs,
+    ) -> Result<usize> {
+        let moving = self.identities_in(&[from])?;
+        if moving.is_empty() {
+            return Ok(0);
+        }
+        let transaction = self
             .connection
+            .transaction()
+            .map_err(|error| faulted(&self.health, error))?;
+        transaction
             .execute(
                 "UPDATE receipts SET state = ?1, revision = revision + 1, updated_at_ms = ?2,
-                        error_code = ?3, error_message = ?4
-                 WHERE state = ?5",
+                        error_code = ?3, error_message = ?4, reason = ?5
+                 WHERE state = ?6",
                 params![
-                    ReceiptState::Unknown.as_str(),
+                    to.as_str(),
                     i64::try_from(now_ms.get()).unwrap_or(i64::MAX),
-                    ErrorCode::OutcomeUnknown.as_str(),
-                    "the worker restarted after the dispatch marker and before an authoritative outcome",
-                    ReceiptState::Dispatching.as_str(),
+                    code.as_str(),
+                    detail,
+                    reason.map(|reason| reason.as_str()),
+                    from.as_str(),
                 ],
             )
             .map_err(|error| faulted(&self.health, error))?;
-        Ok(changed)
+        let mut sequence = 0;
+        for (actor_id, action_id) in &moving {
+            let revision: i64 = transaction
+                .query_row(
+                    "SELECT revision FROM receipts WHERE actor_id = ?1 AND action_id = ?2",
+                    params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| faulted(&self.health, error))?;
+            // What the event and the outbox row carry is the identity, the revision and the
+            // state. The method is read back with the revision, because a receipt's own method is
+            // what a consumer of the outbox is told the event is about.
+            let method: String = transaction
+                .query_row(
+                    "SELECT method FROM receipts WHERE actor_id = ?1 AND action_id = ?2",
+                    params![actor_id.as_str(), action_id.get().as_bytes().as_slice()],
+                    |row| row.get(0),
+                )
+                .map_err(|error| faulted(&self.health, error))?;
+            let receipt = Receipt {
+                actor_id: actor_id.clone(),
+                action_id: *action_id,
+                method: MethodName::new(method)
+                    .map_err(|_| unavailable_detail("a stored method name is not valid"))?,
+                method_version: MethodVersion::V1,
+                revision: U64::new(u64::try_from(revision).unwrap_or(0)),
+                state: to,
+                reason: Nullable(reason),
+                payload_digest: Digest256::from_bytes([0; 32]),
+                accepted_deadline_ms: Nullable::null(),
+                error: Nullable(Some(ProtocolError::new(code, detail.to_owned()))),
+                updated_at_ms: now_ms,
+            };
+            sequence = append_event_at(&self.health, &transaction, &receipt, now_ms)?;
+        }
+        transaction
+            .commit()
+            .map_err(|error| faulted(&self.health, error))?;
+        self.health.note_durable_through(sequence);
+        Ok(moving.len())
     }
 
     /// Rejects every intent this journal accepted and never dispatched.
@@ -2382,13 +2484,18 @@ impl Journal {
                 "this journal is at schema version {recorded}; this build reads {SCHEMA_VERSION}"
             )));
         }
-        Ok(Self {
+        let journal = Self {
             connection,
             pruned_at_ms: 0,
             semantic_corruption: std::sync::atomic::AtomicBool::new(false),
             health: crate::persistence::fault::JournalHealth::shared(),
             boot: None,
-        })
+        };
+        // The same mark the writable opener starts from. A reader that faulted would otherwise
+        // report a gap reaching back to the beginning of the session.
+        let allocated = journal.allocated_event_sequence()?;
+        journal.health.note_durable_through(allocated);
+        Ok(journal)
     }
 
     /// Returns the highest event sequence this journal has ever written.
@@ -2678,12 +2785,18 @@ impl Journal {
         // by any check, and nothing here repairs it, so the fault it caused stays: that is
         // section 24's explicit incomplete archive rather than a store calling itself recovered
         // while a reader still cannot read it.
-        if fault.kind == crate::persistence::fault::FaultKind::Corrupt
-            && (self
-                .semantic_corruption
-                .load(std::sync::atomic::Ordering::Relaxed)
-                || !self.pages_are_sound()?)
+        //
+        // The flag is read whatever kind the *first* fault was, because the first fault is what
+        // the interval is measured from and a later decode failure does not replace it: a store
+        // that filled up and then returned a row nothing can read is still a store nothing can
+        // read.
+        if self
+            .semantic_corruption
+            .load(std::sync::atomic::Ordering::Relaxed)
         {
+            return Ok(None);
+        }
+        if fault.kind == crate::persistence::fault::FaultKind::Corrupt && !self.pages_are_sound()? {
             return Ok(None);
         }
         let resumed_at = self.allocated_event_sequence()?;

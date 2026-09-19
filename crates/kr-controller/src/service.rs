@@ -649,6 +649,8 @@ impl Controller {
                 reservation.session_id,
                 ClosureReason::WorkerCrash,
                 &identity,
+                &crate::archive::ArchiveService::nothing_fenced(reservation.session_id),
+                true,
             )
             .await?;
         }
@@ -4528,7 +4530,15 @@ impl Controller {
             };
             match kr_ipc::identity::process_state(&identity) {
                 kr_ipc::identity::ProcessState::Ended => {
-                    let _ = self.record_final(session_id, reason, &identity).await;
+                    let _ = self
+                        .record_final(
+                            session_id,
+                            reason,
+                            &identity,
+                            &crate::archive::ArchiveService::nothing_fenced(session_id),
+                            true,
+                        )
+                        .await;
                     // The closure this watcher was waiting on has finished, so what it was
                     // counted as is over. Whoever asked for it is not waiting for this.
                     self.review_power_soon();
@@ -4580,23 +4590,33 @@ impl Controller {
         // authoritative outcome becomes `unknown`, and an accepted intent with no marker is
         // rejected. A failure is not a reason to leave the session open, so it is recorded in the
         // closure's own durability rather than stopping the closure.
-        let recovered = archive.recover_journal(&ownership).is_ok();
+        let recovered = archive.recover_journal(&ownership);
         let reason = self.why_a_worker_is_gone(session_id, record.profile);
+        // Section 7's second half, before the session identity is released: whatever the session
+        // still owns is fenced, and what this host cannot account for is recorded. A closure
+        // written before that would be a closure a crash between the two could not lead back to.
+        let reported = ClosureRecord {
+            session_id,
+            session_epoch: SessionEpoch::V1,
+            reason,
+            root_exit_code: Nullable::null(),
+            root_signal: Nullable::null(),
+            terminated: Vec::new(),
+            surviving: Vec::new(),
+            ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
+            durability: kr_protocol::session::Durability::Durable,
+            closed_at_ms: kr_ipc::now_ms(),
+        };
+        let fenced = archive.fence_owned(&ownership, &reported);
         let closure = self
-            .record_final(session_id, reason, &record.process_identity)
+            .record_final(
+                session_id,
+                reason,
+                &record.process_identity,
+                &fenced,
+                recovered.is_ok(),
+            )
             .await?;
-        // Section 7's second half: the supervisor terminates or fences any remaining owned
-        // processes before the session identity is released. The boundary is the worker's own,
-        // and what it cannot account for is what the coverage flag says.
-        let fenced = archive.fence_owned(&ownership, &closure);
-        if !recovered || fenced.unaccounted > 0 {
-            // Recorded where a reader will see it rather than only in a log: a closure this host
-            // could not fully account for is one whose coverage is incomplete.
-            debug_assert_eq!(
-                closure.ownership_coverage,
-                kr_protocol::session::OwnershipCoverage::Incomplete
-            );
-        }
         Ok(Some(closure))
     }
 
@@ -4678,6 +4698,8 @@ impl Controller {
         session_id: SessionId,
         reason: ClosureReason,
         identity: &kr_protocol::identity::ProcessStartIdentity,
+        fenced: &crate::archive::Fenced,
+        recovered: bool,
     ) -> Result<ClosureRecord> {
         let _finalising = self.finalising.lock().await;
         if let Some(existing) = self.registry.lock().await.closure(session_id)? {
@@ -4693,22 +4715,37 @@ impl Controller {
         }
         // Nothing authoritative survived. What is written instead says so: the coverage is
         // incomplete and the root's result is absent rather than invented.
+        let mut terminated = vec![kr_protocol::session::TerminatedProcess {
+            identity: identity.clone(),
+            name: Nullable::some("the session's worker".to_owned()),
+            forced: false,
+        }];
+        // Whatever the fence did reach, recorded where a later reader is served it rather than
+        // only where this daemon can see it.
+        terminated.extend(fenced.stopped.iter().map(|identity| {
+            kr_protocol::session::TerminatedProcess {
+                identity: identity.clone(),
+                name: Nullable::some("a process this session still owned".to_owned()),
+                forced: true,
+            }
+        }));
         let record = ClosureRecord {
             session_id,
             session_epoch: SessionEpoch::V1,
             reason,
             root_exit_code: Nullable::null(),
             root_signal: Nullable::null(),
-            terminated: vec![kr_protocol::session::TerminatedProcess {
-                identity: identity.clone(),
-                name: Nullable::some("the session's worker".to_owned()),
-                forced: false,
-            }],
-            surviving: Vec::new(),
+            terminated,
+            surviving: fenced.surviving.clone(),
             // The controller confirmed the worker process ended. It does not claim to have
-            // discovered every application that worker may have started.
+            // discovered every application that worker may have started, and a recovery or a
+            // fence that could not finish is another thing it cannot account for.
             ownership_coverage: kr_protocol::session::OwnershipCoverage::Incomplete,
-            durability: kr_protocol::session::Durability::Durable,
+            durability: if recovered {
+                kr_protocol::session::Durability::Durable
+            } else {
+                kr_protocol::session::Durability::Volatile
+            },
             closed_at_ms: kr_ipc::now_ms(),
         };
         self.write_closure(&record).await?;
@@ -4756,13 +4793,37 @@ impl Controller {
     /// The archive serves what a worker has left behind. While the worker is there, the worker is
     /// the authority: two readers of one journal would be two answers about one action.
     async fn refuse_if_live(self: &Arc<Self>, session_id: SessionId) -> Result<()> {
-        let worker = self.directory.lock().await.get(session_id).cloned();
-        match worker {
-            Some(worker) => Err(ControllerError::InvalidArgument(format!(
+        if let Some(worker) = self.directory.lock().await.get(session_id).cloned() {
+            return Err(ControllerError::InvalidArgument(format!(
                 "session {session_id} has a live worker; ask it at {}",
                 worker.endpoint.as_text()
-            ))),
-            None => Ok(()),
+            )));
+        }
+        // The directory is what this daemon has *verified*, and a worker it could not verify at
+        // startup is absent from it while still running. So the registry's own record is asked
+        // as well, and the kernel decides: a recorded process that is still the process that was
+        // recorded is a live worker whose journal is not this archive's to read.
+        let recorded = self
+            .registry
+            .lock()
+            .await
+            .workers()?
+            .into_iter()
+            .find(|record| record.session_id == session_id);
+        match recorded {
+            Some(record)
+                if !matches!(
+                    kr_ipc::identity::process_state(&record.process_identity),
+                    kr_ipc::identity::ProcessState::Ended
+                ) =>
+            {
+                Err(ControllerError::InvalidArgument(format!(
+                    "session {session_id} has a worker this daemon has not confirmed ended; its \
+                     endpoint is {}",
+                    record.endpoint
+                )))
+            }
+            _ => Ok(()),
         }
     }
 

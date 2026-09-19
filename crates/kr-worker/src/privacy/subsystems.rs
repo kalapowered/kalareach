@@ -26,6 +26,7 @@ use crate::privacy::{
 pub struct RetainedHistory<'a> {
     history: &'a mut crate::history::OutputHistory,
     fenced: bool,
+    failure: Option<String>,
 }
 
 impl<'a> RetainedHistory<'a> {
@@ -35,6 +36,7 @@ impl<'a> RetainedHistory<'a> {
         Self {
             history,
             fenced: false,
+            failure: None,
         }
     }
 
@@ -42,6 +44,12 @@ impl<'a> RetainedHistory<'a> {
     #[must_use]
     pub const fn is_fenced(&self) -> bool {
         self.fenced
+    }
+
+    /// Returns why the removal could not finish, when it could not.
+    #[must_use]
+    pub fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
     }
 }
 
@@ -67,12 +75,20 @@ impl PrivacySubsystem for RetainedHistory<'_> {
     }
 
     fn remove_retained(&mut self, _generation: PrivacyGeneration) -> Removed {
-        let (bytes, records) = self.history.discard_retained();
-        Removed { bytes, records }
+        let discarded = self.history.discard_retained();
+        if let Some(left) = discarded.left_behind {
+            // Content privacy mode was asked to remove and has not. Saying so is what stops the
+            // cleanup reporting complete over output a reader can still page.
+            self.failure = Some(left);
+        }
+        Removed {
+            bytes: discarded.bytes,
+            records: discarded.segments,
+        }
     }
 
     fn outstanding(&self) -> u64 {
-        0
+        u64::from(self.failure.is_some())
     }
 }
 

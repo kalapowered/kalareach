@@ -399,11 +399,17 @@ impl PrivacyMode {
 
     /// Turns privacy mode off.
     ///
-    /// Retention starts again from this moment. It does not reconstruct what was omitted while
-    /// privacy mode was on, and nothing here pretends it could: the generation stays where it is,
-    /// so a late result from the private interval is still refused.
+    /// Retention starts again from this moment, and it starts under a generation of its own.
+    /// Leaving the generation where it was would leave every result admitted during the private
+    /// interval acceptable the moment privacy mode was turned off, which is the one thing the
+    /// generation exists to prevent: the boundary is what work was admitted on either side of,
+    /// and turning privacy mode off is a boundary as much as turning it on is.
+    ///
+    /// It reconstructs nothing that was omitted while privacy mode was on.
     pub const fn disable(&mut self, now_ms: TimestampMs) -> Resumed {
         self.enabled = false;
+        self.generation = self.generation.next();
+        self.enabled_at_ms = None;
         Resumed {
             generation: self.generation,
             retention_resumes_at_ms: now_ms,
@@ -414,7 +420,10 @@ impl PrivacyMode {
 /// What turning privacy mode off did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Resumed {
-    /// The generation still in force, which a late result is still refused against.
+    /// The generation retention resumes under.
+    ///
+    /// It is a new one, so a result admitted during the private interval is refused after privacy
+    /// mode is turned off exactly as it was during it.
     pub generation: PrivacyGeneration,
     /// The instant retention starts again from. Nothing before it is reconstructed.
     pub retention_resumes_at_ms: TimestampMs,
@@ -520,13 +529,15 @@ mod tests {
     }
 
     #[test]
-    fn disabling_starts_retention_again_and_reconstructs_nothing() {
+    fn disabling_opens_a_boundary_of_its_own_and_reconstructs_nothing() {
         let mut mode = PrivacyMode::new();
         mode.open_generation(TimestampMs::new(1_000));
         let resumed = mode.disable(TimestampMs::new(5_000));
         assert!(!mode.is_enabled());
         assert_eq!(resumed.retention_resumes_at_ms.get(), 5_000);
-        assert_eq!(resumed.generation, PrivacyGeneration::new(1));
+        assert_eq!(resumed.generation, PrivacyGeneration::new(2));
+        assert!(!mode.accepts_result(PrivacyGeneration::new(1)));
         assert!(!mode.accepts_result(PrivacyGeneration::INITIAL));
+        assert!(mode.accepts_result(resumed.generation));
     }
 }

@@ -159,6 +159,12 @@ pub struct Session {
     history: OutputHistory,
     hub: OutputHub,
     journal: Option<Journal>,
+    /// Why this session's own privacy cleanup could not finish, when it could not.
+    ///
+    /// Reconciliation is not complete while it is set: a redaction the store refused and a spool
+    /// file this host could not unlink are both content privacy mode was asked to remove and has
+    /// not. It is cleared by the retry on the host's own maintenance tick.
+    privacy_cleanup: Option<String>,
     /// Privacy mode's durable state: the generation, and whether it is on.
     ///
     /// It is read back from the journal when the session opens, because the generation is what
@@ -319,7 +325,7 @@ impl Session {
         crate::attachments::admit(config.dimensions)?;
         let pty = Pty::open(config.dimensions)?;
         let engine = crate::projection::TerminalEngine::new(config.dimensions)?;
-        let history = match config.spool_directory.as_ref() {
+        let mut history = match config.spool_directory.as_ref() {
             Some(directory) => {
                 OutputHistory::with_spool(config.resident_bytes, directory, SpoolLayout::DEFAULT)?
             }
@@ -418,19 +424,32 @@ impl Session {
                 health
             }
         };
-        // Privacy mode's own state, read back before anything is served. A session that could
-        // not read it is a session that does not know which generation is in force, and the
-        // conservative reading of that is the one this host has never opened: nothing produced
-        // under an older generation is accepted, because none is in force.
-        let privacy = journal
-            .as_ref()
-            .and_then(|journal| journal.read_privacy().ok().flatten())
-            .map_or_else(crate::privacy::PrivacyMode::new, |(generation, enabled)| {
+        // Privacy mode's own state, read back before anything is served. Three answers, and the
+        // difference between them decides what this session does next.
+        //
+        // * A row says which generation is in force and whether privacy mode is on.
+        // * No row is a host that has never enabled it.
+        // * A read that *failed* is a host that does not know, and the safe reading of not
+        //   knowing is that privacy mode may be on: retention stays off until something can say
+        //   otherwise, because retaining under a privacy mode this host cannot see would be the
+        //   one mistake privacy mode exists to prevent.
+        let recorded = journal.as_ref().map(|journal| journal.read_privacy());
+        let (privacy, unresolved) = match recorded {
+            Some(Ok(Some((generation, enabled)))) => (
                 crate::privacy::PrivacyMode::restored(
                     crate::privacy::PrivacyGeneration::new(generation),
                     enabled,
-                )
-            });
+                ),
+                false,
+            ),
+            Some(Err(_)) => (crate::privacy::PrivacyMode::new(), true),
+            Some(Ok(None)) | None => (crate::privacy::PrivacyMode::new(), false),
+        };
+        // The fence is part of the state, not something the enabling leaves behind in memory: a
+        // session reopened with privacy mode on must not start retaining again.
+        if privacy.is_enabled() || unresolved {
+            history.stop_retaining();
+        }
         Ok(Self {
             attachments: AttachmentTable::new(config.dimensions),
             state: SessionState::Creating,
@@ -443,6 +462,7 @@ impl Session {
             hub: OutputHub::new(),
             journal,
             privacy,
+            privacy_cleanup: None,
             health,
             time,
             closure: None,
@@ -2860,6 +2880,21 @@ impl Session {
     /// session - a caller that took the lock again to record it would be waiting for the lock it
     /// was already holding.
     pub fn collect_expired(&mut self) -> usize {
+        // Privacy mode is prospective as well as retrospective. An action admitted after it was
+        // enabled settles later, and the content its receipt carries is content this host was
+        // asked not to keep, so the redaction runs on the same cadence rather than only once. It
+        // is also where a redaction that failed at the enabling is retried.
+        if self.privacy.is_enabled() {
+            let redacted = self
+                .journal
+                .as_mut()
+                .map(crate::journal::Journal::redact_settled_content);
+            match redacted {
+                Some(Ok(_)) => self.privacy_cleanup = None,
+                Some(Err(error)) => self.privacy_cleanup = Some(error.to_string()),
+                None => {}
+            }
+        }
         let permitted = self.time.may_collect_expired();
         let collected = match self.journal.as_mut() {
             Some(journal) => journal.prune_if_due(kr_ipc::now_ms(), permitted),
@@ -2924,19 +2959,45 @@ impl Session {
         for subsystem in extra.iter_mut() {
             subsystems.push(&mut **subsystem);
         }
-        Ok(privacy.apply(&mut subsystems, now))
+        let enabling = privacy.apply(&mut subsystems, now);
+        // What this session's own two could not finish, kept where reconciliation reads it.
+        let failure = history
+            .failure()
+            .map(str::to_owned)
+            .or_else(|| receipts.failure().map(str::to_owned));
+        self.privacy_cleanup = failure;
+        Ok(enabling)
     }
 
     /// Asks whether privacy mode's cleanup has finished.
     ///
-    /// The session's own two subsystems have nothing outstanding once `enable_privacy` returns,
-    /// because what they do is local and synchronous. The work that can still be in flight is the
-    /// caller's, which is why the caller's subsystems are what this is given.
+    /// Two halves, and completion needs both. The session's own cleanup is local and synchronous,
+    /// so it is finished when `enable_privacy` returns - unless it *failed*, and a failure is
+    /// cleanup this host still owes rather than something the return hid. The other half is the
+    /// caller's subsystems, whose work can still be in flight.
     #[must_use]
     pub fn reconcile_privacy(
+        &self,
         extra: &[&dyn crate::privacy::PrivacySubsystem],
     ) -> crate::privacy::Completion {
-        crate::privacy::PrivacyMode::reconcile(extra)
+        let mut outstanding = match crate::privacy::PrivacyMode::reconcile(extra) {
+            crate::privacy::Completion::Complete => Vec::new(),
+            crate::privacy::Completion::Reconciling { outstanding } => outstanding,
+        };
+        if self.privacy_cleanup.is_some() {
+            outstanding.push(("session", 1));
+        }
+        if outstanding.is_empty() {
+            crate::privacy::Completion::Complete
+        } else {
+            crate::privacy::Completion::Reconciling { outstanding }
+        }
+    }
+
+    /// Returns why this session's own privacy cleanup could not finish, when it could not.
+    #[must_use]
+    pub fn privacy_cleanup_failure(&self) -> Option<&str> {
+        self.privacy_cleanup.as_deref()
     }
 
     /// Turns privacy mode off, and starts retention again from this moment.
@@ -2951,6 +3012,8 @@ impl Session {
         let now = kr_ipc::now_ms();
         let mut privacy = self.privacy;
         let resumed = privacy.disable(now);
+        // Recorded before retention starts again, for the reason enabling records first: a
+        // boundary this host could not write down is one a restart cannot see.
         if let Some(journal) = self.journal.as_mut() {
             journal.record_privacy(resumed.generation.get(), false, now)?;
         }

@@ -313,9 +313,8 @@ fn privacy_is_enabled_with_upload_notification_and_inference_work_in_flight() {
     assert_eq!(cancelled["backup"], 2);
     assert_eq!(cancelled["transfer_previews"], 3);
 
-    let Completion::Reconciling { outstanding } =
-        Session::reconcile_privacy(&[&previews, &descriptions, &sync, &backup])
-    else {
+    let seams: [&dyn PrivacySubsystem; 4] = [&previews, &descriptions, &sync, &backup];
+    let Completion::Reconciling { outstanding } = session.reconcile_privacy(&seams) else {
         panic!("cleanup cannot be complete while work is in flight");
     };
     let names: Vec<&str> = outstanding.iter().map(|(name, _)| *name).collect();
@@ -331,9 +330,12 @@ fn privacy_is_enabled_with_upload_notification_and_inference_work_in_flight() {
     descriptions.note_reconciled();
     descriptions.note_reconciled();
     sync.note_reconciled();
-    assert!(!Session::reconcile_privacy(&[&previews, &descriptions, &sync, &backup]).is_complete());
+    let seams: [&dyn PrivacySubsystem; 4] = [&previews, &descriptions, &sync, &backup];
+    assert!(!session.reconcile_privacy(&seams).is_complete());
     backup.note_reconciled();
-    assert!(Session::reconcile_privacy(&[&previews, &descriptions, &sync, &backup]).is_complete());
+    let seams: [&dyn PrivacySubsystem; 4] = [&previews, &descriptions, &sync, &backup];
+    assert!(session.reconcile_privacy(&seams).is_complete());
+    assert!(session.privacy_cleanup_failure().is_none());
 }
 
 #[test]
@@ -448,11 +450,18 @@ fn disabling_privacy_starts_retention_again_and_still_refuses_the_private_interv
         page.gap.is_present(),
         "what was omitted while privacy mode was on is a gap rather than reconstructed"
     );
-    assert_eq!(resumed.generation, PrivacyGeneration::new(1));
+    // Turning privacy mode off opens a boundary of its own, so the private interval's own
+    // generation is refused afterwards as well as during it.
+    assert_eq!(resumed.generation, PrivacyGeneration::new(2));
+    assert!(
+        !session.privacy().accepts_result(PrivacyGeneration::new(1)),
+        "a result admitted during the private interval is still refused"
+    );
     assert!(
         !session.privacy().accepts_result(PrivacyGeneration::INITIAL),
-        "a result from before the private interval is still refused"
+        "and so is one from before it"
     );
+    assert!(session.privacy().accepts_result(resumed.generation));
 }
 
 #[test]

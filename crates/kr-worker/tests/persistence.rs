@@ -1296,13 +1296,19 @@ fn a_boundary_this_host_cannot_read_is_reported_rather_than_guessed_at() {
         kr_worker::history::OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 1 << 20))
             .expect("a spool");
     history.append(&[b'x'; 16]);
+    // A host that recorded where its output got to and cannot read it back does not know what it
+    // is missing, so every page says so rather than reporting the silence as completeness.
     let page = history.page(0, 64).expect("a page");
     assert_eq!(
         page.gap.0.and_then(|gap| gap.cause),
-        None,
-        "nothing is missing yet"
+        Some(HistoryGapCause::SpoolUnavailable),
+        "this host cannot say what came before what it holds"
     );
-    // Once something is missing, the reason is the one this host can actually say.
+    assert!(
+        !page.bytes.is_empty(),
+        "what it does hold is still served, a page at a time"
+    );
+    // And after an eviction the answer is the same one, for the same reason.
     let taken = history.apply_retention(
         OutputRetention::new(std::time::Duration::from_secs(7 * 24 * 60 * 60), 1 << 30, 0),
         16,
@@ -1497,8 +1503,8 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
     {
         let mut session = host.runtime.session();
         let journal = session.journal_mut().expect("a journal");
-        let caller =
-            ActorId::new(format!("os:{}", kr_ipc::paths::current_uid())).expect("the local caller");
+        let caller = ActorId::new(format!("local:{}", kr_ipc::paths::current_uid()))
+            .expect("the local caller");
         assert!(
             journal.read(caller, action_id).expect("reads").is_none(),
             "a fenced mutation leaves nothing to replay"

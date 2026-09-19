@@ -1072,9 +1072,12 @@ reserved capacity, so a session well inside its own 128 MiB is still evicted whe
 1 GiB. "The first applicable limit" names which bound is doing the work, which is what a person
 looking at a gap is told; it does not mean checking one instead of the others.
 
-The session cap is the spool's own capacity, so the append path keeps it continuously. The host
-bound is applied on the worker's maintenance tick, from a reading of the environment's whole spool
-directory; what that leaves is stated in this task's handoff rather than hidden.
+The session cap is the spool's own capacity, so the append path keeps it close: the eviction runs
+after the write rather than before it, so one large append is over the bound until that eviction,
+and a segment this host could not unlink stays. The host bound is applied on the worker's
+maintenance tick, from a reading of the environment's whole spool directory, so two sessions
+writing at once can take the host past it until the next tick. Neither bound is a reservation and
+neither is enforced ahead of the write.
 
 Eviction is never quiet. Every pass records the cursor range it took and the bound that took it,
 and a reader asking for a cursor inside that range is told both: `history.page` returns the range
@@ -1085,9 +1088,15 @@ cursor and reports the range that went rather than starting again at nought.
 Removing output because it is old is expiry-based collection, so section 9's rule applies: a host
 that cannot prove its wall clock does not do it. The caps still apply, because they are about
 bytes rather than about time. The seven-day line is approached from the safe side: a spool segment
-goes only when its newest byte is past the deadline, and the resident window advances only to a
-mark whose own instant is past it, so what is kept past the deadline is bounded by the segment
-rotation interval and the resident mark interval rather than removed early.
+goes only when its newest byte is past the deadline, and the resident window advances only to an
+interval whose newest byte is past it. Both a segment and a resident interval are bounded in how
+long they go on for - an hour and a minute - so what is kept past the deadline is bounded by that
+rather than removed early.
+
+An eviction publishes the boundary before it deletes what supports it, and a boundary this host
+could not write stops the eviction rather than losing the record of where the output reached. A
+boundary that is written and cannot be read back is a host that does not know what it is missing,
+and every page it serves says so.
 
 Receipts are not part of any of this. Section 20 gives them a separately budgeted store and 30
 days, so history pressure cannot delete a live dispatch barrier or a de-duplication record.
@@ -1106,6 +1115,12 @@ a daemon that fenced before it asked would delete a working session's socket on 
 out that it was working. A query the platform declines is not death either, and the archive leaves
 the session alone.
 
+A read of a closed session asks the same question first. A session this daemon has verified is
+refused with the endpoint to ask; so is one whose registry record names a process the kernel still
+describes, because a worker this daemon failed to verify at startup is absent from its directory
+and not absent from the machine. What ownership does not yet have is a token the read methods
+require, so it is a rule this daemon keeps rather than one the store enforces.
+
 **A reader cannot create a worker.** Every read the archive serves is a read of what is already on
 disk. A history request never starts an execution, and a retried create is answered from the
 reservation the first one made.
@@ -1120,17 +1135,20 @@ different answers and a reader is owed the second one.
 **A worker crash closes the session.** The controller takes recovery ownership, runs section 9's
 two recovery rules over the journal the worker left - a dispatch marker with no authoritative
 outcome becomes `unknown` and is never dispatched again, and an accepted intent with no marker is
-rejected - and then records the closure. The closure record carries the terminated process
-identities, the resources known to survive, and an ownership-coverage flag that never claims every
-application was discovered.
+rejected - then asks what is still owned, and only then records the closure. The closure record
+carries the terminated process identities, whatever the fence reached, the resources known to
+survive, and an ownership-coverage flag that never claims every application was discovered.
+Nothing is rebuilt from terminal history.
 
-The archive then fences what the worker's own boundary still holds. On a Unix host that boundary
-is the process group the worker led: it is sessionised, so its descendants join its group, and a
-process that left with `setsid` is exactly what the coverage flag exists to be honest about. Every
-member is checked against the kernel's own answer before anything is stopped, because the kernel
-reuses identifiers; one that has already gone is counted as gone, and one the platform declines to
-describe leaves the coverage incomplete. This host's own process group is never touched. Nothing
-is rebuilt from terminal history.
+**What the fence reaches today is nothing, and it says so.** A worker's descendants join the
+process group it led, and once the worker has gone the kernel is free to give its number to an
+unrelated process whose group would answer to it; the root shell also starts a session of its own,
+so its jobs need not be in the worker's group even while the worker lives. Stopping what such a
+group held would be stopping somebody else's processes on the strength of a coincidence. The
+boundary that would work is the one the platform keeps - the transient unit or Job the supervisor
+started the worker in, named from the reservation and unable to name anything else - and this host
+does not stop one yet. So the coverage is incomplete and the record says which part of it this
+host could not account for.
 
 The transfer service's one retention question is answered here. Section 14 gives a submitted
 attachment its session's retention rather than the seven-day unused window, and the archive is
@@ -1163,7 +1181,16 @@ output goes, the spool with it, and the content a settled receipt carries - the 
 the caller sent and the result the action produced - is taken out of the journal while the
 receipt's own metadata stays. A receipt that has *not* settled keeps its envelope, because
 recovery reads it and a retry of an action this host may already have performed is answered from
-it.
+it; when it settles later, the host's own maintenance takes its content then.
+
+Two stores privacy mode does not reach yet. The canonical grid keeps its own scrollback, which a
+client can still page through, and there is no semantic-history cache or generated-title store in
+the worker at all. Both are named in this task's handoff with the task that owns them rather than
+described here as though they were done.
+
+A cleanup that could not finish is not a cleanup that finished. A redaction the store refused and
+a spool file this host could not unlink are both content privacy mode was asked to remove and has
+not, so both keep the reconciliation open until the next maintenance pass clears them.
 
 What stays is named rather than quietly retained: the receipt journal's operation metadata, the
 minimal local authority this host holds, the envelope of an action that has not settled, live
@@ -1180,8 +1207,14 @@ holds can be recalled. Local deletion is logical cleanup of this host's own reco
 claim of physical secure erase: the files are unlinked and the rows are cleared, and nothing here
 says the bytes are unrecoverable from the device they were on.
 
-Turning privacy mode off starts retention again from that moment. It reconstructs nothing, and the
-generation does not go back, so a late result from the private interval is still refused.
+Turning privacy mode off starts retention again from that moment, under a generation of its own.
+It reconstructs nothing, and the new generation is what keeps the private interval's own results
+refused afterwards: leaving the generation where it was would make every answer admitted during
+privacy mode acceptable the moment privacy mode ended.
+
+A session reopened with privacy mode on does not start retaining again, and one whose privacy
+state this host could not read does not either: not knowing whether privacy mode is on is not a
+reason to keep output.
 
 ## What an idle session wakes for
 
