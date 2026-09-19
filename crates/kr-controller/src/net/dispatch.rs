@@ -716,16 +716,23 @@ impl RemoteConnection {
             Ok(accepted) => accepted,
             Err(error) => return failure(mutation.request_id, error),
         };
-        // The last check this connection's own turn makes before the effect is admitted. Nothing
-        // between here and the dispatch awaits, so this task is not descheduled in between; that
-        // is not the same as nothing being able to revoke, because a revocation runs on a task of
-        // its own and this check releases the connection table before it returns. What actually
-        // stops a revoked action is where section 9 puts it: every dispatch revalidates current
-        // authority and expiry in the worker's serial path immediately before it acts, durable
-        // acceptance preserves neither, and the daemon's own effects ask again inside their own
-        // transaction. This check is what keeps an already-withdrawn connection from getting that
-        // far. What this host reports meanwhile is the revocation as pending for that worker until
-        // it acknowledges the revision.
+        // The last check this connection's own turn makes before the effect is admitted. It
+        // guarantees nothing about what happens next: it releases the connection table before it
+        // returns, a revocation runs on a task of its own, and the arms below wait — for a link to
+        // a worker, for a dispatch lease, for a blocking thread. What stops a revoked action is
+        // where each subject puts it.
+        //
+        // For a mutation a worker performs, section 9's own rule: every dispatch revalidates
+        // current authority and expiry in the worker's serial path immediately before it acts, and
+        // durable acceptance preserves neither. For a create or a project mutation, which this
+        // host performs itself, the admission it carries is asked about again inside the daemon —
+        // at the transition that lets a create launch, and in the project service's own work
+        // before the action. The project service's own preparation is still behind that second
+        // answer, which `Controller::project_mutation` records as the gap it is.
+        //
+        // What this check does is keep an already-withdrawn connection from getting that far.
+        // What this host reports meanwhile is the revocation as pending for a worker until it
+        // acknowledges the revision.
         if let Err(error) = self.authorised().await {
             return failure(mutation.request_id, error);
         }
