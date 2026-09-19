@@ -156,6 +156,9 @@ fn translate(error: kr_attention::Error) -> WorkerError {
                 "this session no longer holds {key}, so a page cannot continue after it"
             ),
         },
+        kr_attention::Error::StoreHeld { path } => WorkerError::JournalUnavailable {
+            detail: format!("another owner holds this session's attention store at {path}"),
+        },
         kr_attention::Error::TooManyActors { bound } => WorkerError::QuotaExceeded {
             detail: format!(
                 "this session's attention store holds {bound} actors, which is its bound"
@@ -174,8 +177,9 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::JournalUnavailable`] when the store cannot be opened, read back, or
-    /// written.
+    /// Returns [`WorkerError::JournalUnavailable`] when the store cannot be opened, read back or
+    /// written, and when another live owner already holds it: one session's worker is the one
+    /// owner of its own store, because every write replaces the whole of it.
     pub fn open(journal_path: Option<&Path>, time: &TimeContract) -> Result<Self> {
         let engine = Engine::beside(journal_path, reading(time)).map_err(translate)?;
         Ok(Self {

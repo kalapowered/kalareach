@@ -1358,6 +1358,14 @@ replay restores it: the acknowledgements, the per-actor revisions, the visits an
 the quiet-hours window and the identities already given to announcements are records in their own
 right, and the store is where they live.
 
+One session's worker is the one owner of its own attention store, for as long as it is running.
+Every write replaces the whole state and is made from the copy its owner is holding, so two owners
+would each replace the other's work with a picture of the world that predates it. Opening the store
+claims an exclusive lock on a file of its own beside it, before it reads anything, and holds it
+until the store is let go; anything else that opens that file is told it is held rather than handed
+a state it would not be allowed to write back. The lock is on a file of its own, so the receipts
+and the question ledger, which share the store's file, keep writing throughout.
+
 Every mutating call writes the new state before it publishes the decision. A write that fails
 leaves the engine where it was, so the same event can be offered again and produces the same
 answer.

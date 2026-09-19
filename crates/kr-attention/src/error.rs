@@ -31,6 +31,12 @@ pub enum Error {
         /// The key the page named.
         key: String,
     },
+    /// Another live owner already holds this feature store.
+    #[error("another owner holds the attention feature store at {path}")]
+    StoreHeld {
+        /// The store that is held.
+        path: String,
+    },
     /// The feature store could not be read or written.
     #[error("the attention feature store is unavailable ({kind}): {detail}")]
     StoreUnavailable {

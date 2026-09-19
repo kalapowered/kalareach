@@ -48,6 +48,16 @@
 //! moments: a clock this host trusts is still a clock somebody can set forward, and two readings
 //! it vouches for are not two readings on one scale.
 //!
+//! # One owner
+//!
+//! Every write here replaces the whole state, and it is made from the copy its owner has been
+//! holding, so two owners of one store would each replace the other's work with a picture of the
+//! world that predates it. There is one owner instead: opening a store on a path claims an
+//! exclusive lock on a file of its own beside it, holds it until the store is dropped, and refuses
+//! a second opener with [`Error::StoreHeld`] rather than letting it read a state it may not write.
+//! The lock is on a file of its own so the receipt journal and the question ledger, which share
+//! this store's file, keep writing through their own transactions throughout.
+//!
 //! # What a stored value may not do
 //!
 //! It may not come back as a different value. Every integer is written and read without clamping,
@@ -81,7 +91,7 @@ use crate::visit::{Omitted, Visit};
 /// by - so a row written under a different derivation would be read under a name that does not
 /// describe it, which is worse than not reading it at all. Every row also has to carry the anchor
 /// each of its intervals is measured from, and a row that predates those columns carries none.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// How long a write waits for another holder of the same file before it is refused.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -135,6 +145,63 @@ pub struct StoredState {
 #[derive(Debug)]
 pub struct Store {
     connection: Connection,
+    /// What says this process is the one owner of this store, for as long as it is held.
+    ///
+    /// `None` for a store that lives only in memory, because nothing else can reach one.
+    _ownership: Option<Ownership>,
+}
+
+/// The claim one process makes on one feature store.
+///
+/// A whole-state write replaces everything, and it is made from the copy its owner has been
+/// holding, so two owners of one store would each replace the other's work with a picture of the
+/// world that predates it. There is one owner instead. The claim is an exclusive lock on a file of
+/// its own beside the store, held from before the state is read until this value is dropped, and
+/// released by the operating system if the process ends without dropping it. It is a file of its
+/// own so that the receipt journal and the question ledger, which share the store's file, keep
+/// writing through their own transactions throughout.
+#[derive(Debug)]
+struct Ownership {
+    _claim: Connection,
+}
+
+/// How long a second owner waits for the first to let go before it is told the store is held.
+///
+/// Short, because it is not a queue: the answer to a store somebody else owns is to say so.
+pub const OWNERSHIP_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// The name of the file a store's ownership is claimed on, beside the store itself.
+pub const OWNERSHIP_SUFFIX: &str = "-attention-owner";
+
+impl Ownership {
+    /// Claims the one ownership of the store at `path`, or says who has it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::StoreHeld`] when another live owner holds it, and
+    /// [`Error::StoreUnavailable`] when the claim itself cannot be made.
+    fn claim(path: &Path) -> Result<Self> {
+        let mut name = path.as_os_str().to_os_string();
+        name.push(OWNERSHIP_SUFFIX);
+        let claim = Connection::open(std::path::PathBuf::from(name))?;
+        claim.busy_timeout(OWNERSHIP_TIMEOUT)?;
+        // The transaction is never committed. It holds the file's write lock until this
+        // connection closes, which is this value's drop or this process ending.
+        match claim.execute_batch("BEGIN EXCLUSIVE") {
+            Ok(()) => Ok(Self { _claim: claim }),
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if matches!(
+                    error.code,
+                    rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+                ) =>
+            {
+                Err(Error::StoreHeld {
+                    path: path.display().to_string(),
+                })
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
 }
 
 const SCHEMA: &str = "
@@ -343,8 +410,12 @@ impl Store {
     /// created, and [`Error::StoreUnreadable`] when the file records a schema this build does not
     /// know.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        // Claimed before the file is opened, let alone read: an owner that read first and claimed
+        // afterwards would already be holding a copy of the world it might not be allowed to write.
+        let ownership = Ownership::claim(path)?;
         let connection = Connection::open(path)?;
-        Self::prepare(connection)
+        Self::prepare(connection, Some(ownership))
     }
 
     /// Opens the store inside the worker's private journal, or in memory when there is none.
@@ -371,10 +442,10 @@ impl Store {
     /// Returns [`Error::StoreUnavailable`] when the schema cannot be created.
     pub fn in_memory() -> Result<Self> {
         let connection = Connection::open_in_memory()?;
-        Self::prepare(connection)
+        Self::prepare(connection, None)
     }
 
-    fn prepare(connection: Connection) -> Result<Self> {
+    fn prepare(connection: Connection, ownership: Option<Ownership>) -> Result<Self> {
         // The store shares its file with the receipt journal and the question ledger, so a write
         // can find another of them holding it. The wait is bounded: past it the caller is told the
         // store is unavailable rather than left blocked.
@@ -405,7 +476,10 @@ impl Store {
             }
         }
         connection.execute_batch(SCHEMA)?;
-        Ok(Self { connection })
+        Ok(Self {
+            connection,
+            _ownership: ownership,
+        })
     }
 
     /// Reads the whole stored state back.

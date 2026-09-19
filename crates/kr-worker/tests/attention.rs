@@ -953,7 +953,7 @@ async fn a_value_the_store_could_not_write_down_as_it_was_given_is_refused_befor
 // ---------------------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn the_state_lives_in_the_session_s_journal_and_comes_back_from_it() {
+async fn the_state_lives_in_the_session_s_journal_and_the_running_worker_is_its_one_owner() {
     let host = host().await;
     let mut client = cli(&host).await;
     let window = window(&client);
@@ -979,16 +979,36 @@ async fn the_state_lives_in_the_session_s_journal_and_comes_back_from_it() {
     .await);
     let actor = acknowledged.actor_id;
 
-    // What a restarted worker would read: the same file, opened again.
+    // A whole-state write replaces everything and is made from the copy its owner holds, so this
+    // session's worker is the one owner of the store in its journal for as long as it is running.
+    // Anything else that opens that file is told so rather than being handed a state it would not
+    // be allowed to write back.
     let reading = kr_worker::attention::reading(host.service.runtime().session().time());
-    let restored = kr_attention::Attention::beside(Some(&host.journal_path), reading)
-        .expect("the feature store reopens");
-    let items = restored.inbox(&actor, true, kr_attention::Content::Whole);
+    let refused = kr_attention::Attention::beside(Some(&host.journal_path), reading);
+    assert!(
+        matches!(refused, Err(kr_attention::Error::StoreHeld { .. })),
+        "the running worker holds its own store: {refused:?}"
+    );
+
+    // What it holds is what the journal keeps: the item, the acknowledgement this endpoint made,
+    // and the cursor that makes a replay idempotent. `kr-attention` proves the reopen itself, with
+    // no second owner alive to be refused.
+    let held = host.service.attention();
+    let items = held
+        .read(
+            &actor,
+            &read_params(&host),
+            host.service.runtime().session().time(),
+            kr_attention::Content::Whole,
+        )
+        .expect("the inbox is served")
+        .items;
     assert_eq!(items.len(), 1, "the item is where the journal kept it");
     assert_eq!(items[0].key, key);
     assert!(items[0].acknowledged, "and so is the acknowledgement");
     assert_eq!(
-        restored.engine().consumed(AttentionSource::Receipts),
+        held.consumed(AttentionSource::Receipts)
+            .expect("the engine answers"),
         Some(1),
         "and the consumed cursor, so a replay is still idempotent"
     );

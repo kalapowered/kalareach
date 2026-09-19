@@ -3735,9 +3735,10 @@ fn an_open_that_reads_an_older_state_does_not_replace_what_was_committed_meanwhi
     held.acknowledge(&who, std::slice::from_ref(&key), reading(1_000))
         .expect("the store records the acknowledgement");
     assert_eq!(held.revision(&who), 1);
+    drop(held);
 
-    // Another opens the same file afterwards. Its own opening write must not put back the state
-    // that stood before the acknowledgement.
+    // The next owner opens the same file. Its own opening write must not put back the state that
+    // stood before the acknowledgement.
     let second = Attention::open(&path, reading(2_000)).expect("the store reopens");
     assert_eq!(
         second.revision(&who),
@@ -3745,9 +3746,45 @@ fn an_open_that_reads_an_older_state_does_not_replace_what_was_committed_meanwhi
         "the acknowledgement another owner committed is still there"
     );
     assert!(
-        second
-            .inbox(&who, false, Content::Whole)
-            .is_empty(),
+        second.inbox(&who, false, Content::Whole).is_empty(),
         "and it still means what it meant"
     );
+}
+
+#[test]
+fn a_second_owner_of_one_store_is_refused_before_it_reads_anything() {
+    // A whole-state write replaces everything and is made from the copy its owner holds, so two
+    // owners would each replace the other's work with a picture of the world that predates it.
+    // The second is refused at the door, before it can read a state it would not be allowed to
+    // write, and what the first owner commits is there for whoever opens after it.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let who = actor("device:phone");
+    let mut held = Attention::open(&path, reading(0)).expect("the feature store opens");
+    held.apply(&approval(1, 1_000, "req-1"), reading(0))
+        .expect("the store records the decision");
+    let key = held.key_for(AttentionRule::PendingApproval, "req-1");
+
+    // The race review 15 describes starts here: a second owner tries to read the state before the
+    // first one's next write lands. It never gets that far.
+    let refused = Attention::open(&path, reading(1_000));
+    assert!(
+        matches!(refused, Err(kr_attention::Error::StoreHeld { .. })),
+        "a second owner is told the store is held: {refused:?}"
+    );
+
+    // The first owner's work goes in while the second is still shut out.
+    held.acknowledge(&who, std::slice::from_ref(&key), reading(2_000))
+        .expect("the store records the acknowledgement");
+    let refused = Attention::open(&path, reading(3_000));
+    assert!(matches!(
+        refused,
+        Err(kr_attention::Error::StoreHeld { .. })
+    ));
+
+    // Once the first owner lets go, the next one opens and finds everything it committed.
+    drop(held);
+    let next = Attention::open(&path, reading(4_000)).expect("the store reopens");
+    assert_eq!(next.revision(&who), 1);
+    assert!(next.inbox(&who, false, Content::Whole).is_empty());
 }
