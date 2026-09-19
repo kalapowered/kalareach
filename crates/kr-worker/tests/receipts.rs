@@ -19,8 +19,9 @@ use kr_ipc::client::LocalClient;
 use kr_ipc::endpoint::Listener;
 use kr_ipc::verify::{ControllerIdentity, WorkerIdentity};
 use kr_protocol::action::{
-    ActionObservation, MAX_TRUSTED_UNCERTAINTY_US, MAX_WALL_CLOCK_ROLLBACK_MS,
+    ActionObservation, HostTimeState, MAX_TRUSTED_UNCERTAINTY_US, MAX_WALL_CLOCK_ROLLBACK_MS,
     ObservationProvenance, ObservedResult, RetrustEvidence, TimeSyncSource, TimeSyncStatus,
+    WallClockTrust,
 };
 use kr_protocol::envelope::{
     ActionTarget, ControlFrame, MutationRequest, Outcome, ParamsValue, Request,
@@ -3391,6 +3392,35 @@ fn record_from_an_earlier_run(path: &std::path::Path, action: u8) {
         .expect("the record reads as an earlier run's");
 }
 
+/// Writes down that this host's owner confirmed its wall clock.
+///
+/// Retention is expiry-based collection, and the host time contract stops that while the wall clock
+/// cannot be proved. Whether *this machine's* clock is provable is not what a collection test is
+/// about, and it differs by machine: a macOS host disciplined by `timed` qualifies, while a Linux
+/// continuous-integration runner reports `ntp_adjtime(2)` with neither a discipline flag nor an
+/// unsynchronised one - a clock somebody set that nothing claims to be keeping - which this
+/// contract reads as unproved however small the kernel's error bound happens to be. A test that
+/// inherited that from the machine would pass on one and fail on the other while the code under it
+/// behaved identically.
+///
+/// So a collection test says what it needs instead: a host whose owner confirmed its clock, which
+/// is the route section 9 leaves open to a host with no configured time authority. It is written
+/// into the journal rather than asked for afterwards because the first maintenance tick runs the
+/// moment the host comes up, and it survives every later observation precisely because the
+/// confirmation is the owner's.
+fn owner_confirmed_clock(path: &std::path::Path) {
+    let mut journal = Journal::open(path).expect("a journal");
+    journal
+        .record_host_time(&HostTimeState {
+            checkpoint: Nullable::null(),
+            trust: WallClockTrust::Trusted,
+            owner_confirmed: true,
+            proven: Nullable::null(),
+            tombstones: Vec::new(),
+        })
+        .expect("the owner's confirmation is written down");
+}
+
 /// What this host's time contract says about its wall clock, for a message that has to explain a
 /// collection that did not run.
 fn clock_state(session: &Session) -> String {
@@ -3423,7 +3453,11 @@ async fn within(timeout: std::time::Duration, mut condition: impl FnMut() -> boo
 async fn a_live_host_collects_records_past_the_retention_period_on_its_own() {
     // Nothing in this test asks the host to collect anything. The record is there before the
     // session opens, and what removes it is the host's own maintenance while it serves.
-    let host = host_prepared(|path| record_from_an_earlier_run(path, 40)).await;
+    let host = host_prepared(|path| {
+        record_from_an_earlier_run(path, 40);
+        owner_confirmed_clock(path);
+    })
+    .await;
     let gone = within(std::time::Duration::from_secs(10), || {
         host.service
             .runtime()
@@ -4187,6 +4221,7 @@ fn a_collection_that_fails_is_recorded_and_the_session_keeps_serving() {
     let path = environment.journal_database(session_id);
     std::fs::create_dir_all(path.parent().expect("a parent")).expect("the journal directory");
     record_from_an_earlier_run(&path, 60);
+    owner_confirmed_clock(&path);
     // The store refuses the write the collection has to make. A trigger is how a test arranges
     // that deterministically; what it stands for is a full disk or a store that cannot be written.
     let refuse = "CREATE TRIGGER refuse_collection BEFORE DELETE ON receipts
