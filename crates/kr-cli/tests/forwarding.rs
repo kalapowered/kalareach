@@ -30,6 +30,10 @@ use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
+mod support;
+
+use support::{command_binaries, kr};
+
 /// A root program that echoes its input and nothing else.
 const ECHOES_ITS_INPUT: &str = "stty raw -echo; printf 'kr-ready.'; exec cat";
 
@@ -39,51 +43,6 @@ struct Hosted {
     display: DisplayNumber,
     runtime: Arc<SessionRuntime>,
     _service: Arc<WorkerService>,
-}
-/// The command binaries, on the internal disk.
-///
-/// The build directory is on the external volume this workspace lives on, and a process a test
-/// launches is its own privacy identity to the operating system: a binary run from there makes
-/// macOS ask whether it may read that volume, and the launch waits on the answer. Nothing a test
-/// waits for arrives while that is on screen. So the binaries are copied once per test process to a
-/// directory the operating system does not guard, and every test launches them from there. Both are
-/// copied together and keep their names, because `kr` looks for its restoration guard beside
-/// itself.
-fn command_binaries() -> &'static std::path::Path {
-    static COPIED: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
-    COPIED.get_or_init(|| {
-        let root = std::env::temp_dir().join(format!(
-            "kalareach-command-tests-{}-{}",
-            env!("CARGO_CRATE_NAME"),
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&root).expect("a directory for the command binaries");
-        for source in [
-            std::path::Path::new(env!("CARGO_BIN_EXE_kr")),
-            std::path::Path::new(env!("CARGO_BIN_EXE_kr-attach-guard")),
-        ] {
-            let name = source.file_name().expect("the binary has a name");
-            let destination = root.join(name);
-            std::fs::copy(source, &destination).expect("copies a command binary");
-            // Run it once, here, where nothing is being timed. The operating system checks a binary
-            // it has not seen before on its first run and remembers it afterwards, and that check
-            // takes seconds where the run itself takes milliseconds. A test that paid it inside a
-            // wait would be measuring the check.
-            let _ = std::process::Command::new(&destination)
-                .arg("--version")
-                .current_dir(&root)
-                .stdin(std::process::Stdio::null())
-                .stdout(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .status();
-        }
-        root
-    })
-}
-
-/// The `kr` this test launches.
-fn kr() -> std::path::PathBuf {
-    command_binaries().join("kr")
 }
 /// A directory of files a session's application waits on, so this test decides when it acts.
 ///
