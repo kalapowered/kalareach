@@ -1276,7 +1276,7 @@ impl Controller {
         // Every write this makes happens while the registry guard is held, and the guard goes
         // before the fence, which takes it again. The block is what drops it: nothing this holds
         // may be alive across the await below.
-        let revocation = {
+        let (revocation, lapsed, owes_fence) = {
             let registry = match carried {
                 Some(carried) => {
                     let registry = self.registry.lock().await;
@@ -1301,34 +1301,57 @@ impl Controller {
             // could delete the row another caller was relying on. Reading the record first is what
             // keeps a repeat from fencing the host again, and two callers racing the first
             // revocation both fence, which is the harmless direction.
-            if revocation.revoked.is_empty() {
-                // Nothing is withdrawn yet, so the admission still decides whether this happens at
-                // all, and it is checked once more: the transaction above waited for the grant
-                // store's lock, and a device that holds its grant in its pairing record has no
-                // grant row there, which makes the device record below its whole withdrawal.
-                //
-                // Where the transaction *did* withdraw something, the opposite is true. That is
-                // committed, and a deadline that passes afterwards is no reason to stop half way:
-                // grants withdrawn and a device record still live is the dangerous state, and a
-                // revocation takes authority away rather than granting any, so finishing it is
-                // always the safe direction. Nothing below returns early for a lapsed admission,
-                // which is what keeps a committed withdrawal fenced.
+            //
+            // Whether the admission still decides anything from here depends on what the
+            // transaction above did. If it withdrew something, that is committed, and a deadline
+            // passing afterwards is no reason to stop half way: grants withdrawn beside a device
+            // record still live is the dangerous state, and a revocation takes authority away
+            // rather than granting any, so finishing a late one is the safe direction. If it
+            // withdrew nothing — the paired device whose grant lives in its pairing record — then
+            // the record below is the whole withdrawal, nothing is committed, and each wait
+            // between here and it gets its own check.
+            let withdrew = !revocation.revoked.is_empty();
+            if !withdrew {
                 self.still_admitted(registry.as_deref(), carried)?;
             }
-            if self
+            let record_is_live = self
                 .devices
                 .record_for_device(device_id)?
-                .is_some_and(|record| record.revoked_at_ms.is_none())
-            {
+                .is_some_and(|record| record.revoked_at_ms.is_none());
+            if record_is_live {
+                if !withdrew {
+                    self.still_admitted(registry.as_deref(), carried)?;
+                }
                 self.sharing
                     .grants()
                     .owe_fence([kr_protocol::ids::GrantId::new(device_id.get())], now_ms)?;
             }
-            self.devices.revoke(device_id, TimestampMs::new(now_ms))?;
-            revocation
+            // The last wait before the record is marked was the debt. A refusal here withdraws
+            // nothing, but it leaves a fence owed, so it is answered *after* that fence rather
+            // than in place of it.
+            let lapsed = if withdrew {
+                None
+            } else {
+                self.still_admitted(registry.as_deref(), carried).err()
+            };
+            if lapsed.is_none() {
+                self.devices.revoke(device_id, TimestampMs::new(now_ms))?;
+            }
+            (revocation, lapsed, record_is_live)
         };
-        self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
-            .await
+        match lapsed {
+            // Nothing was withdrawn and nothing is owed, so there is nothing to finish.
+            Some(error) if !owes_fence => Err(error),
+            Some(error) => {
+                self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
+                    .await?;
+                Err(error)
+            }
+            None => {
+                self.complete_revocation(revocation.revoked.iter().copied().collect(), now_ms)
+                    .await
+            }
+        }
     }
 
     /// Transfers control of a session, then fences what the transfer took away.
@@ -1617,10 +1640,12 @@ impl Controller {
 
     /// The admission check a mutation's own effect repeats, when it is carrying an admission.
     ///
-    /// A withdrawal is several writes in several stores, and each waits for a lock of its own. The
-    /// check is cheap and the guard is already held, so it is repeated before each write rather
-    /// than made once and trusted afterwards. `None` on either side is the local owner's own path,
-    /// which carries no mutation window.
+    /// A withdrawal is several writes and not all of them are in one store, and each waits for a
+    /// lock of its own. The check is cheap and the guard is already held, so a caller repeats it
+    /// before each write **that can still be refused**: once authority has actually been
+    /// withdrawn, the rest of that withdrawal follows whatever the clock has done since, and its
+    /// caller stops asking. `None` on either side is the local owner's own path, which carries no
+    /// mutation window.
     fn still_admitted(
         &self,
         registry: Option<&Registry>,

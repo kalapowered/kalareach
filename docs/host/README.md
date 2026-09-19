@@ -495,11 +495,14 @@ nothing takes those two in the other order. The check itself is the same, and it
 grant store's transaction. `grant.create` checks once the parent is resolved and before the grant
 and its invitation are written. `grant.revoke` checks once the subtree it is about to withdraw has
 been read, which walks every grant this host holds. `device.revoke` withdraws the grants in that
-transaction and then marks the device's own record, which is a separate store: it checks again
-before that record only when the transaction withdrew nothing, because then the record is the whole
-withdrawal. Once something is withdrawn, the rest of a revocation follows whatever the clock has
-done since. A revocation takes authority away rather than granting any, and grants withdrawn beside
-a device record still live is the state worth avoiding.
+transaction and then marks the device's own record, which is a separate store. When the transaction
+withdrew nothing — the paired device whose grant lives in its pairing record — that record is
+the whole withdrawal, so the check is repeated before each wait between the two, and a refusal
+after the fence has been written down is answered once that fence has run rather than instead of
+it. When
+the transaction did withdraw something, the rest follows whatever the clock has done since: a
+revocation takes authority away rather than granting any, and grants withdrawn beside a device
+record still live is the state worth avoiding.
 
 An admission can carry **no deadline at all**, and that is not the same as one whose deadline has
 passed. A retry of an action this host may already hold has no freshness: section 9 keeps a receipt

@@ -465,7 +465,10 @@ impl GrantDirectory {
                     continue;
                 }
                 let grant_id = record.grant.grant_id;
-                let subtree: Vec<GrantRecord> = Self::subtree_to_revoke(connection, grant_id)?
+                // Collected into a boxed slice: filtering a vector in place keeps the capacity it
+                // was read with, and a chain of grants read once per grant would hold that
+                // capacity once per grant even with nothing left in it.
+                let subtree: Box<[GrantRecord]> = Self::subtree_to_revoke(connection, grant_id)?
                     .into_iter()
                     .filter(|record| claimed.insert(record.grant.grant_id))
                     .collect();
