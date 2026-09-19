@@ -106,6 +106,7 @@ pub use crate::broker::methods::{
 };
 pub use crate::broker::process::{
     BackendStop, BrokerTransport, Credential, ManagedProcess, SourceFrame, TransportHandle,
+    stop_backend,
 };
 pub use crate::broker::profiles::{ForegroundMark, LaunchIntent, ProfileStore, new_profile_id};
 pub use crate::broker::semantic::{GrantLowerBound, HistoryFilter, Replay, SemanticLog};

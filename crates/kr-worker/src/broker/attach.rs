@@ -229,7 +229,7 @@ impl NativeGateway {
             }
         };
         let mut upstream_reader = upstream_reader;
-        let (hello, credential) = self.hello(&mut upstream_reader).await?;
+        let (hello, credential, held) = self.hello(&mut upstream_reader).await?;
         // Anything a browser would have added disqualifies the connection before its credential is
         // even compared: section 12 serves no browser on this listener.
         reject_browser_origin(
@@ -284,10 +284,12 @@ impl NativeGateway {
             upstream_writer,
             client_reader,
             client_writer,
+            held,
         )
     }
 
     /// Starts one admitted connection's owner and the task that supervises it.
+    #[allow(clippy::too_many_arguments)]
     fn serve<UR, UW, CR, CW>(
         &self,
         connection: GatewayConnectionId,
@@ -296,6 +298,7 @@ impl NativeGateway {
         upstream_writer: UW,
         client_reader: CR,
         client_writer: CW,
+        held: Vec<u8>,
     ) -> Result<Attached>
     where
         UR: tokio::io::AsyncRead + Unpin + Send + 'static,
@@ -335,7 +338,7 @@ impl NativeGateway {
                     let client = Arc::clone(&owner);
                     async move {
                         tokio::select! {
-                            () = upstream.serve(upstream_reader, true) => (),
+                            () = upstream.serve_after(upstream_reader, true, held) => (),
                             () = client.serve(client_reader, false) => (),
                         }
                     }
@@ -391,7 +394,7 @@ impl NativeGateway {
     }
 
     /// Reads the one frame a bridge writes before it is authenticated.
-    async fn hello<R>(&self, reader: &mut R) -> Result<(Hello, Vec<u8>)>
+    async fn hello<R>(&self, reader: &mut R) -> Result<(Hello, Vec<u8>, Vec<u8>)>
     where
         R: tokio::io::AsyncRead + Unpin + Send,
     {
@@ -428,7 +431,7 @@ impl NativeGateway {
             ))
         })?;
         let credential = decode_credential(&frame.kr_hello.credential)?;
-        Ok((frame.kr_hello, credential))
+        Ok((frame.kr_hello, credential, buffer))
     }
 }
 

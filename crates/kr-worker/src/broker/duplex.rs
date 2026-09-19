@@ -1026,8 +1026,22 @@ impl Duplex {
     /// asked to stop, or when the end sends something this framing cannot be reading; a refusal of
     /// one frame does not end the connection, because one malformed or unanswerable frame is not a
     /// reason to take a working terminal away.
-    pub async fn serve<R: AsyncRead + Unpin>(self: &Arc<Self>, mut reader: R, upstream: bool) {
-        let mut buffer = Vec::new();
+    pub async fn serve<R: AsyncRead + Unpin>(self: &Arc<Self>, reader: R, upstream: bool) {
+        self.serve_after(reader, upstream, Vec::new()).await;
+    }
+
+    /// The same, continuing from bytes that were already read off this end.
+    ///
+    /// Authenticating a connection means reading its first frame, and one read can hand back more
+    /// than one frame. What was read and not used is given back here rather than dropped, so the
+    /// request a bridge wrote immediately after its hello is not lost.
+    pub async fn serve_after<R: AsyncRead + Unpin>(
+        self: &Arc<Self>,
+        mut reader: R,
+        upstream: bool,
+        held: Vec<u8>,
+    ) {
+        let mut buffer = held;
         let mut chunk = [0_u8; 8192];
         loop {
             loop {

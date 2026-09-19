@@ -984,3 +984,168 @@ async fn kr_req_11_27_an_approval_whose_marker_was_refused_leaves_the_resource_a
         "and answering it once is what ends it"
     );
 }
+
+/// A transport that takes the operation and does not say what came of it until it is let go.
+///
+/// This is what a real upstream looks like between the bytes leaving this host and the upstream
+/// answering: the operation is with it, and nothing about its outcome is known.
+#[derive(Debug)]
+struct WaitingUpstream {
+    release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    carried: std::sync::atomic::AtomicUsize,
+}
+
+impl UpstreamDispatch for WaitingUpstream {
+    fn admit(&self, _request: &UpstreamRequest) -> Result<(), BrokerError> {
+        Ok(())
+    }
+
+    fn submit(&self, request: &UpstreamRequest) -> Result<PendingTransmission, BrokerError> {
+        self.carried
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let waiting = self
+            .release
+            .lock()
+            .expect("the record is not poisoned")
+            .take();
+        let turn_id = request.turn_id.clone();
+        Ok(PendingTransmission::carried(async move {
+            if let Some(waiting) = waiting {
+                let _ = waiting.await;
+            }
+            Ok(UpstreamOutcome {
+                upstream_request_id: None,
+                turn_id,
+                provenance: kr_protocol::broker::ActionProvenance::UpstreamTypedRpc,
+            })
+        }))
+    }
+}
+
+/// KR-REQ-12.11 and KR-REQ-11.32: one connection goes on serving its client while that client's
+/// own mutation is still with the upstream.
+///
+/// Section 12 has the same socket carry this client's keystrokes, its interrupt and its keepalive.
+/// The prompt is admitted, the marker is committed and the operation is with the upstream, which
+/// has not answered. Everything else this connection asks for is answered while that is true, and
+/// the prompt's own answer arrives when the upstream speaks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kr_req_11_32_input_interrupt_and_keepalive_are_served_during_a_pending_mutation() {
+    let host = host().await;
+    let (release, waiting) = tokio::sync::oneshot::channel();
+    let upstream = Arc::new(WaitingUpstream {
+        release: std::sync::Mutex::new(Some(waiting)),
+        carried: std::sync::atomic::AtomicUsize::new(0),
+    });
+    register(
+        &host,
+        Some(Arc::clone(&upstream) as Arc<dyn UpstreamDispatch>),
+    );
+    let mut client = cli(&host).await;
+    let mutation = prompt_mutation(&client, &host, 21);
+    let action_id = mutation.action_id;
+
+    // The prompt goes, and nothing is read for it yet: it is with the upstream.
+    client
+        .writer()
+        .write_message(&ControlFrame::Mutation(Box::new(mutation)))
+        .await
+        .expect("writes the prompt");
+    // The transport has the operation before anything else is asked of this connection.
+    for _ in 0..200 {
+        if upstream.carried.load(std::sync::atomic::Ordering::SeqCst) == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        upstream.carried.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the prompt reached the transport"
+    );
+
+    // The same connection asks for the lease, interrupts and reads its own receipt, and every one
+    // of those is answered while the prompt is still outstanding.
+    let lease = MutationRequest {
+        request_id: RequestId::new(22),
+        method: Method::InputAcquire.into(),
+        method_version: MethodVersion::V1,
+        action_id: ActionId::new(kr_ipc::new_uuid()),
+        grant_id: Nullable::null(),
+        target: ActionTarget {
+            environment_id: host.environment_id,
+            session_id: Nullable::some(host.session_id),
+            session_epoch: Nullable::some(SessionEpoch::V1),
+            application_instance_id: Nullable::null(),
+            agent_binding_revision: Nullable::null(),
+        },
+        expected: ParamsValue::empty(),
+        action_window_id: client.action_window().action_window_id.clone(),
+        requested_ttl_ms: DurationMs::new(60_000),
+        params: ParamsValue::from_typed(&kr_protocol::input::InputAcquireParams {
+            session_id: host.session_id,
+            attachment_id: kr_protocol::ids::AttachmentId::new(kr_ipc::new_uuid()),
+            expected_epoch: Nullable::null(),
+        })
+        .expect("encodes"),
+    };
+    client
+        .writer()
+        .write_message(&ControlFrame::Mutation(Box::new(lease)))
+        .await
+        .expect("writes the lease request");
+
+    // The answers come back in the order this connection can produce them, and the one for the
+    // prompt is not among them until the upstream has spoken.
+    let mut lease_answered = false;
+    let mut prompt_answered = false;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !lease_answered {
+        let frame = tokio::time::timeout_at(deadline, client.recv())
+            .await
+            .expect("this connection keeps answering")
+            .expect("the worker answers");
+        match frame {
+            ControlFrame::Response(response) => {
+                if response.request_id == RequestId::new(22) {
+                    lease_answered = true;
+                } else if response.request_id == RequestId::new(21) {
+                    prompt_answered = true;
+                }
+            }
+            ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
+            other => panic!("the worker answered {other:?}"),
+        }
+    }
+    assert!(
+        !prompt_answered,
+        "the prompt is not answered before its upstream has said anything"
+    );
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        kr_protocol::receipt::ReceiptState::Dispatching,
+        "and its receipt says the operation is with the upstream"
+    );
+
+    // The upstream answers. The prompt's own response arrives on the same connection, and its
+    // receipt records the upstream's acknowledgement rather than the queue that took the bytes.
+    release.send(()).expect("the transport is let go");
+    let answered = loop {
+        match tokio::time::timeout_at(deadline, client.recv())
+            .await
+            .expect("the prompt is answered")
+            .expect("the worker answers")
+        {
+            ControlFrame::Response(response) if response.request_id == RequestId::new(21) => {
+                break response.outcome;
+            }
+            ControlFrame::Response(_) | ControlFrame::Notification(_) | ControlFrame::Event(_) => {}
+            other => panic!("the worker answered {other:?}"),
+        }
+    };
+    assert!(matches!(answered, Outcome::Ok(_)), "{answered:?}");
+    assert_eq!(
+        receipt(&mut client, action_id).await.state,
+        kr_protocol::receipt::ReceiptState::Applied
+    );
+}
