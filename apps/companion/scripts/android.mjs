@@ -62,25 +62,28 @@ function cargoTargetDirectory() {
 /**
  * The targets this invocation will build, which is all of them unless it names some.
  *
- * A target can be named in three ways -- `--target aarch64`, `--target=aarch64`, and several after
- * one `--target` -- and an option that read only the first would check one target and leave the
- * others' archives unexamined, which is the failure this whole file exists to prevent.
+ * A target can be named four ways: `--target aarch64`, `--target=aarch64`, `-t aarch64` and
+ * `-tarmv7`, with several names after one long option. Every one of them has to be read, because a
+ * target this misses is a target whose archive goes unexamined, which is the failure this whole
+ * file exists to prevent.
  */
 function requestedTargets(args) {
   const named = []
+  const take = (name) => {
+    const triple = ANDROID_TARGETS[name]
+    if (triple) named.push(triple)
+  }
   for (let index = 0; index < args.length; index += 1) {
     const argument = args[index]
-    const joined =
-      argument.startsWith('--target=') || argument.startsWith('-t=') ? argument.split('=')[1] : null
-    if (joined) {
-      const triple = ANDROID_TARGETS[joined]
-      if (triple) named.push(triple)
-      continue
-    }
-    if (argument !== '--target' && argument !== '-t') continue
-    for (let next = index + 1; next < args.length && !args[next].startsWith('-'); next += 1) {
-      const triple = ANDROID_TARGETS[args[next]]
-      if (triple) named.push(triple)
+    if (argument.startsWith('--target=')) {
+      take(argument.slice('--target='.length))
+    } else if (argument.startsWith('-t') && argument !== '-t') {
+      // `-t=aarch64` and `-taarch64` are the same option written two ways.
+      take(argument.slice(argument.startsWith('-t=') ? 3 : 2))
+    } else if (argument === '--target' || argument === '-t') {
+      for (let next = index + 1; next < args.length && !args[next].startsWith('-'); next += 1) {
+        take(args[next])
+      }
     }
   }
   return named.length > 0 ? [...new Set(named)] : Object.values(ANDROID_TARGETS)
