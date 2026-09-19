@@ -249,7 +249,6 @@ mod tests {
     use kr_transport::clock::{ContinuousClock, ManualClock, SystemContinuousClock};
 
     use crate::fence::FenceDriver;
-    use crate::pty::ShellCommand;
     use crate::session::{Session, SessionConfig};
 
     use super::*;
@@ -262,12 +261,7 @@ mod tests {
             session_epoch: SessionEpoch::V1,
             environment_id: host.environment_id(),
             display_number: DisplayNumber::new(1),
-            shell: ShellCommand {
-                program: "/bin/cat".to_owned(),
-                arguments: Vec::new(),
-                cwd: "/".to_owned(),
-                environment: Vec::new(),
-            },
+            shell: crate::testing::posix_script("exec cat"),
             shell_mode: ShellMode::Managed,
             worker_profile: WorkerProfile::HeadlessUser,
             desktop: DesktopBinding::none(),

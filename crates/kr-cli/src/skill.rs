@@ -349,10 +349,18 @@ mod tests {
 
     #[test]
     fn a_project_scope_resolves_the_directory_it_will_write_to() {
-        let params = parse("claude-code", "project", Some("/tmp/somewhere")).expect("parses");
+        // An absolute path is used as it stands. What counts as absolute is the platform's own
+        // answer: a Windows path that begins with a separator names the current drive's root and
+        // is resolved against it, so the test asks for a path this platform calls absolute.
+        let absolute = if cfg!(windows) {
+            "C:/somewhere"
+        } else {
+            "/tmp/somewhere"
+        };
+        let params = parse("claude-code", "project", Some(absolute)).expect("parses");
         assert_eq!(
             params.project_dir.as_ref().map(String::as_str),
-            Some("/tmp/somewhere")
+            Some(absolute)
         );
         let here = parse("claude-code", "project", None).expect("parses");
         assert!(here.project_dir.is_present());

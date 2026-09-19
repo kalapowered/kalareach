@@ -50,7 +50,6 @@ use kr_shell_integration::host::scripted::{
 };
 use kr_transport::clock::SystemContinuousClock;
 use kr_worker::fence::{FenceDriver, ReaderDiscards};
-use kr_worker::pty::ShellCommand;
 use kr_worker::runtime::SessionRuntime;
 use kr_worker::service::{ServiceBinding, WorkerService};
 use kr_worker::session::{Session, SessionConfig};
@@ -69,14 +68,9 @@ fn configuration(host: &kr_ipc::testing::TempHost, mode: ShellMode) -> SessionCo
         session_epoch: SessionEpoch::V1,
         environment_id: host.environment_id(),
         display_number: DisplayNumber::new(1),
-        shell: ShellCommand {
-            // A program that reads its input and says nothing, so what the session retains is what
-            // the host wrote rather than what a prompt drew.
-            program: "/bin/cat".to_owned(),
-            arguments: Vec::new(),
-            cwd: "/".to_owned(),
-            environment: vec![("TERM".to_owned(), "xterm-256color".to_owned())],
-        },
+        // A program that reads its input and says nothing, so what the session retains is what
+        // the host wrote rather than what a prompt drew.
+        shell: kr_worker::testing::posix_script("exec cat"),
         shell_mode: mode,
         worker_profile: WorkerProfile::HeadlessUser,
         desktop: DesktopBinding::none(),

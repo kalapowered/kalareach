@@ -74,7 +74,11 @@ impl Host {
         start_outside_the_workspace();
         let temp = kr_ipc::testing::TempHost::create();
         let environment_id = temp.environment_id();
-        let worker = temp.root().join("kr-worker");
+        let worker = temp.root().join(if cfg!(windows) {
+            "kr-worker.exe"
+        } else {
+            "kr-worker"
+        });
         std::fs::copy(env!("CARGO_BIN_EXE_kr-worker"), &worker).expect("copies the worker");
         Self {
             temp,

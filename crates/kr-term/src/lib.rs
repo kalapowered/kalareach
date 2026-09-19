@@ -96,6 +96,7 @@ pub mod span;
 pub mod terminfo;
 pub mod title;
 pub mod unicode;
+pub mod win32;
 
 pub use crate::class::SequenceClass;
 pub use crate::engine::{Engine, EngineConfig, FeedOutcome};

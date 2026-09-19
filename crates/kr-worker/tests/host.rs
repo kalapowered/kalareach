@@ -96,7 +96,11 @@ impl Host {
         // The worker is copied to the internal disk before it is started. The build tree may live
         // on a removable volume, and a launched process that reaches one prompts the person at the
         // machine for permission.
-        let worker = temp.root().join("kr-worker");
+        let worker = temp.root().join(if cfg!(windows) {
+            "kr-worker.exe"
+        } else {
+            "kr-worker"
+        });
         std::fs::copy(env!("CARGO_BIN_EXE_kr-worker"), &worker).expect("copies the worker");
         Self {
             temp,

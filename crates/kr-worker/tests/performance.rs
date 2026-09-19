@@ -61,7 +61,11 @@ async fn host() -> Host {
     // On the internal disk, because a process a service manager launches is its own identity to
     // the operating system and one that reaches a removable volume prompts the person at the
     // machine.
-    let worker = temp.root().join("kr-worker");
+    let worker = temp.root().join(if cfg!(windows) {
+        "kr-worker.exe"
+    } else {
+        "kr-worker"
+    });
     std::fs::copy(env!("CARGO_BIN_EXE_kr-worker"), &worker).expect("copies the worker");
     let secrets = environment.secrets_dir();
     let controller = Controller::start(ControllerSetup {

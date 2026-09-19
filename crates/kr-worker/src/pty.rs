@@ -660,18 +660,19 @@ mod tests {
 
     #[test]
     fn the_environment_is_replaced_rather_than_inherited() {
-        // The worker's own process has HOME set and the launch environment does not carry it,
-        // so a shell that sees it would be inheriting rather than being given its environment.
+        // The worker's own process has this set and the launch environment does not carry it, so
+        // a shell that sees it would be inheriting rather than being given its environment.
+        let inherited = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
         assert!(
-            std::env::var_os("HOME").is_some(),
-            "the test process has HOME"
+            std::env::var_os(inherited).is_some(),
+            "the test process has {inherited}"
         );
         let mut pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let mut reader = pty.reader().expect("a reader");
         let mut shell = pty
-            .launch(&crate::testing::posix_script(
-                "printf %s \"[${HOME:-absent}]\"",
-            ))
+            .launch(&crate::testing::posix_script(&format!(
+                "printf %s \"[${{{inherited}:-absent}}]\""
+            )))
             .expect("launches");
         let seen = read_until(&pty, &mut reader, b"[absent]");
         shell.wait().expect("waits");

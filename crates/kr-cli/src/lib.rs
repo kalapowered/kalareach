@@ -38,6 +38,7 @@ pub mod session;
 pub mod shell;
 pub mod skill;
 pub mod terminal;
+pub mod windows;
 
 pub use crate::error::{CliError, Result};
 
