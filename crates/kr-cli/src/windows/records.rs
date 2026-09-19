@@ -271,9 +271,15 @@ impl RecordReader {
             // console has already done the translation an application expects - Ctrl and Return
             // is a line feed, Ctrl and A is 0x01 - and replacing it with the key's own sequence
             // would send a different key.
-            if let Some(byte) = console_control(key) {
+            if let Some((byte, alt)) = console_control(key) {
                 flush_text(&mut units, &mut out);
                 for _ in 0..key.repeat.max(1) {
+                    // Alt in front of the control code rather than instead of it: that is how the
+                    // legacy encoding spells a chord with Alt in it, and dropping the prefix would
+                    // turn Alt, Ctrl and I into an ordinary tab.
+                    if alt {
+                        out.push(0x1B);
+                    }
                     out.push(byte);
                 }
                 continue;
@@ -387,29 +393,45 @@ fn flush_text(units: &mut Vec<u16>, out: &mut Vec<u8>) {
     units.clear();
 }
 
-/// Returns the control code the console produced for a key held with Control.
+/// Returns the control code the console produced for a key held with Control, and whether Alt was
+/// held with it.
 ///
 /// A console translates Control and a key into the control code an application expects, and that
 /// translation is the answer: Ctrl and Return is a line feed rather than the carriage return the
-/// Return key alone produces, and Ctrl and A is 0x01. Only a record that has Control held is read
-/// this way, so Shift and Tab - which also carries a control character - is still the key it is.
+/// Return key alone produces, and Ctrl and A is 0x01.
+///
+/// Three things are deliberately *not* read this way, because the console's character does not
+/// settle them:
+///
+/// * a record with no Control held. Shift and Tab carries a control character too, and it is the
+///   key it is rather than a tab;
+/// * a record with Shift held as well. Ctrl, Shift and Tab is a chord the legacy encoding has no
+///   spelling for, and sending a plain tab for it would be a different key;
+/// * AltGr, which is how a layout produces a character rather than a chord.
+///
+/// Alt held with Control **is** read this way, and reported, because the escape prefix an
+/// application expects goes in front of the same control code rather than instead of it.
 ///
 /// Ctrl and Space is the one key the console reports with no character at all, and the code it
 /// stands for is the one a byte cannot otherwise carry.
-fn console_control(record: &KeyRecord) -> Option<u8> {
+fn console_control(record: &KeyRecord) -> Option<(u8, bool)> {
     let control = record.control_keys
         & (control_keys::LEFT_CTRL_PRESSED | control_keys::RIGHT_CTRL_PRESSED)
         != 0;
-    if !control || record.is_alt_graph() {
+    let shift = record.control_keys & control_keys::SHIFT_PRESSED != 0;
+    if !control || shift || record.is_alt_graph() {
         return None;
     }
+    let alt = record.control_keys
+        & (control_keys::LEFT_ALT_PRESSED | control_keys::RIGHT_ALT_PRESSED)
+        != 0;
     if record.unicode == 0 {
         // The space bar, whose control code is zero and which the console therefore cannot report
         // as a character.
-        return (record.virtual_key == 0x20).then_some(0);
+        return (record.virtual_key == 0x20).then_some((0, alt));
     }
     (record.unicode <= 0x1F || record.unicode == 0x7F)
-        .then(|| u8::try_from(record.unicode).unwrap_or(0))
+        .then(|| (u8::try_from(record.unicode).unwrap_or(0), alt))
 }
 
 /// Returns the character a record produced when nothing about it needs the encoder.
@@ -669,6 +691,34 @@ mod tests {
             repeat: 1,
         };
         assert_eq!(reader.legacy_input(&[ctrl_space]), b"\0");
+    }
+
+    #[test]
+    fn a_control_chord_keeps_what_the_console_did_not_translate() {
+        let mut reader = encoder();
+        // Alt with Ctrl and I: the console translates the key to a tab, and the escape prefix Alt
+        // stands for goes in front of it rather than being lost.
+        let alt_ctrl_i = KeyRecord {
+            virtual_key: 0x49,
+            scan_code: 0x17,
+            unicode: 0x09,
+            key_down: true,
+            control_keys: control_keys::LEFT_CTRL_PRESSED | control_keys::LEFT_ALT_PRESSED,
+            repeat: 1,
+        };
+        assert_eq!(reader.legacy_input(&[alt_ctrl_i]), b"\x1b\t");
+
+        // Shift with Ctrl and Tab: the console reports a tab, and this encoding has no spelling
+        // for the chord. Sending a plain tab would be a different key, so nothing is sent.
+        let ctrl_shift_tab = KeyRecord {
+            virtual_key: 0x09,
+            scan_code: 0x0F,
+            unicode: 0x09,
+            key_down: true,
+            control_keys: control_keys::LEFT_CTRL_PRESSED | control_keys::SHIFT_PRESSED,
+            repeat: 1,
+        };
+        assert!(reader.legacy_input(&[ctrl_shift_tab]).is_empty());
     }
 
     #[test]

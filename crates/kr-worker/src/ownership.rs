@@ -106,6 +106,13 @@ pub struct OwnedProcesses {
     /// Behind a lock because the stop functions are given a shared reference, which is the shape
     /// the closure sequence calls them with.
     unestablished: std::sync::Mutex<Vec<String>>,
+    /// What asking the boundary whether it still holds anything produced, asked once.
+    ///
+    /// A closure reads the surviving resources and then the coverage, and both need this answer.
+    /// Asking twice would be two observations: the first could succeed and the second fail, and
+    /// the reason the second produced would be written after the receipt had copied the reasons.
+    /// So the boundary is asked once and the answer is kept.
+    boundary_empty: std::sync::Mutex<Option<bool>>,
 }
 
 #[derive(Clone, Debug)]
@@ -128,6 +135,7 @@ impl OwnedProcesses {
             root: root.clone(),
             seen: BTreeMap::new(),
             unestablished: std::sync::Mutex::new(Vec::new()),
+            boundary_empty: std::sync::Mutex::new(None),
         };
         owned.seen.insert(
             key(&root),
@@ -165,8 +173,25 @@ impl OwnedProcesses {
     /// started after the last look and was ended by the closure is one the record never held. So
     /// the boundary is asked, and one that will not answer is not one this closure may call
     /// complete.
-    #[cfg(windows)]
+    ///
+    /// Asked once. The answer, and any reason asking produced, are kept, so a closure that reads
+    /// the resources and then the coverage sees one observation rather than two that can disagree.
     fn boundary_is_empty(&self) -> bool {
+        let mut cached = self
+            .boundary_empty
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(answer) = *cached {
+            return answer;
+        }
+        let answer = self.ask_the_boundary();
+        *cached = Some(answer);
+        answer
+    }
+
+    /// Asks the boundary itself whether it is holding anything, recording why it could not say.
+    #[cfg(windows)]
+    fn ask_the_boundary(&self) -> bool {
         let OwnershipBoundary::JobObject { root } = self.boundary else {
             return true;
         };
@@ -198,12 +223,12 @@ impl OwnedProcesses {
         }
     }
 
-    /// Returns whether the boundary itself confirms it is holding nothing.
+    /// Asks the boundary itself whether it is holding anything.
     ///
     /// The boundaries this platform has are read through the processes they hold, which
     /// [`Self::surviving`] has already asked about.
     #[cfg(not(windows))]
-    const fn boundary_is_empty(&self) -> bool {
+    const fn ask_the_boundary(&self) -> bool {
         true
     }
 
@@ -656,6 +681,32 @@ mod tests {
             .contains("can leave")
         );
         assert!(OwnershipBoundary::JobObject { root: 7 }.is_complete_boundary());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn the_boundary_is_asked_once_however_many_times_the_answer_is_read() {
+        // A closure reads the surviving resources and then the coverage. Both need the boundary's
+        // answer, and two observations could disagree: a reason the second produced would be
+        // written after the receipt had copied them. One observation, kept.
+        let owned = OwnedProcesses::establish(
+            OwnershipBoundary::JobObject { root: 0xFFFF_FFF2 },
+            identity(u64::from(u32::MAX) + 1),
+        );
+        let resources = owned.surviving_resources();
+        let first = owned.unestablished();
+        assert_eq!(owned.coverage(), OwnershipCoverage::Incomplete);
+        assert_eq!(
+            owned.unestablished(),
+            first,
+            "reading the answer again produced no second reason"
+        );
+        assert!(
+            resources
+                .iter()
+                .any(|resource| resource.kind == "unestablished"),
+            "and the one reason was in the resources the receipt was built from"
+        );
     }
 
     #[cfg(windows)]
