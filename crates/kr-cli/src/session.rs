@@ -170,9 +170,28 @@ struct PasteWatch {
     partial: [usize; 2],
 }
 
+/// What one read did to a bracketed paste.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Pasting {
+    /// Whether a paste is open after it.
+    open: bool,
+    /// Whether a delimiter completed inside it.
+    ///
+    /// A read that carries one has a paste boundary inside it, and nothing may be taken out of
+    /// such a read: where the paste begins or ends within it is not something a rule about whole
+    /// reads can say.
+    touched: bool,
+}
+
 impl PasteWatch {
-    /// Reads one batch and answers whether a paste is open after it.
-    fn observe(&mut self, bytes: &[u8]) -> bool {
+    /// Whether a paste was open before the next read.
+    const fn is_open(&self) -> bool {
+        self.open
+    }
+
+    /// Reads one batch and answers what it did.
+    fn observe(&mut self, bytes: &[u8]) -> Pasting {
+        let mut touched = false;
         for byte in bytes {
             for (which, delimiter) in [PASTE_START, PASTE_END].into_iter().enumerate() {
                 let matched = self.partial[which];
@@ -180,6 +199,7 @@ impl PasteWatch {
                     self.partial[which] = matched + 1;
                     if self.partial[which] == delimiter.len() {
                         self.open = which == 0;
+                        touched = true;
                         self.partial = [0, 0];
                     }
                 } else {
@@ -188,7 +208,10 @@ impl PasteWatch {
                 }
             }
         }
-        self.open
+        Pasting {
+            open: self.open,
+            touched,
+        }
     }
 }
 
@@ -697,6 +720,10 @@ async fn drive(
     // moment a report it is part way through stops waiting for the rest of itself.
     let mut pointers = PointerReports::default();
     let mut pointer_deadline: Option<tokio::time::Instant> = None;
+    // Whether the last screen this terminal was given is above the live page. It is what this
+    // terminal is *displaying*, which a reset does not change: between a reset and the last page
+    // of the screen that follows it, the rows on the person's terminal are still the old ones.
+    let mut showing_history = false;
     let mut sequence = 0_u64;
     let mut outstanding: std::collections::BTreeMap<kr_protocol::ids::RequestId, Outstanding> =
         std::collections::BTreeMap::new();
@@ -827,6 +854,7 @@ async fn drive(
                             // half way through being told.
                             if let Some(above) = display.window_above_the_live_page() {
                                 parked = above;
+                                showing_history = above.is_some();
                             }
                             // The client's own choice, not the session's: a person who asked to
                             // follow the live screen is taken back to it the moment the session
@@ -866,6 +894,9 @@ async fn drive(
                                 // Like every other report that names a position: a size report
                                 // sent before this is answered carries what this asked for.
                                 requested.insert(request_id, None);
+                                // Going back to the live screen is a newer instruction than
+                                // anything the person had queued above it.
+                                queued = 0;
                             }
                             if !drawn.bytes.is_empty() {
                                 let mut handle = output.as_ref();
@@ -987,6 +1018,7 @@ async fn drive(
                                         return AttachOutcome::Disconnected;
                                     }
                                     outstanding.insert(request_id, Outstanding::Viewport);
+                                    requested.insert(request_id, params.position.0);
                                 }
                                 kr_protocol::envelope::Outcome::Error(_) => {}
                             },
@@ -1169,6 +1201,9 @@ async fn drive(
                             },
                         )),
                     };
+                    // Like every other report that names a position: one sent after this, before
+                    // this is answered, carries what this asked for.
+                    requested.insert(request_id, params.position.0);
                     (
                         send_geometry(
                             client,
@@ -1217,7 +1252,30 @@ async fn drive(
             }
             bytes = input.recv() => {
                 let Some(bytes) = bytes else {
-                    // The terminal's own input ended. Nothing is left to forward.
+                    // The terminal's own input ended. Whatever the classifier was part way
+                    // through is the person's, and it goes before the attachment does.
+                    let held = pointers.release();
+                    if !held.is_empty() {
+                        let Some(epoch) = epoch else {
+                            return AttachOutcome::Detached;
+                        };
+                        let request_id = kr_protocol::ids::RequestId::new(next_request);
+                        if !send_input(
+                            client,
+                            request_id,
+                            session_id,
+                            attachment_id,
+                            epoch,
+                            sequence,
+                            held,
+                        )
+                        .await
+                        {
+                            return AttachOutcome::DeliveryUncertain(
+                                "the connection ended while input was being sent".to_owned(),
+                            );
+                        }
+                    }
                     return AttachOutcome::Detached;
                 };
                 // The scroll-back keys first, where they are this terminal's at all. They move
@@ -1234,17 +1292,23 @@ async fn drive(
                 // session byte for byte, whatever it happens to contain. The delimiters are read
                 // whole, like everything else here, so a paste is open from the read that begins
                 // with one to the read that ends with the other.
+                let was_pasting = paste.is_open();
                 let pasting = paste.observe(&bytes);
-                // What this terminal is showing, which is what a pointer report would address.
-                let above_the_live_page =
-                    display.window_above_the_live_page().flatten().is_some();
+                // A read with a paste boundary inside it is forwarded whole: where the paste
+                // begins and ends within such a read is not something a rule about whole reads can
+                // say, and taking anything out of it could take it out of the paste.
+                let outside_a_paste = !was_pasting && !pasting.open && !pasting.touched;
                 // Every pointer report is this terminal's while it is showing history: a report
                 // names a cell of the live screen, and the rows the person is looking at are not
                 // on it. Section 8 answers that directly, that input outside the visible grid has
                 // no application effect, so they are taken here and the wheel among them moves the
                 // window. A report the read boundary cut in half waits for the rest of it rather
                 // than reaching the application as half of one.
-                let (bytes, wheel) = if above_the_live_page && !pasting {
+                //
+                // What it is showing is the last screen it was given, not the one it is being
+                // given: between a reset and the last page of the screen that follows it, this
+                // terminal is still displaying what it drew before.
+                let (bytes, wheel) = if showing_history && outside_a_paste {
                     let taken = pointers.take(&bytes);
                     pointer_deadline = taken
                         .holding
@@ -1265,9 +1329,12 @@ async fn drive(
                     input.extend_from_slice(&bytes);
                     (input, 0)
                 };
-                let mine = !pasting && display.holds_screen() && display.showing_history_buffer();
+                let mine = outside_a_paste && display.showing_history_buffer();
+                // A key is the whole read and nothing of it goes on; a wheel report was taken out
+                // of the read, and whatever else was in that read is still the session's.
+                let key = mine.then(|| scroll_keys(&bytes)).flatten();
                 if mine
-                    && let Some(steps) = scroll_keys(&bytes).or((wheel != 0).then_some(wheel))
+                    && let Some(steps) = key.or((wheel != 0).then_some(wheel))
                     && let Ok(size) = terminal.size()
                     && size.columns > 0
                     && size.rows > 0
@@ -1318,9 +1385,11 @@ async fn drive(
                         requested.insert(request_id, position);
                         }
                     }
-                    // The key was this terminal's, so nothing of it reaches the session, whether
-                    // or not the window had anywhere to go.
-                    continue;
+                    if key.is_some() {
+                        // The key was this terminal's, so nothing of that read reaches the
+                        // session, whether or not the window had anywhere to go.
+                        continue;
+                    }
                 }
                 if bytes.is_empty() {
                     continue;
@@ -1329,7 +1398,7 @@ async fn drive(
                 // follow the live screen is taken back to it by the first key they press, because
                 // what they type is answered there and not in what they were reading.
                 if follow_live
-                    && above_the_live_page
+                    && showing_history
                     && let Ok(size) = terminal.size()
                     && size.columns > 0
                     && size.rows > 0
@@ -1357,6 +1426,9 @@ async fn drive(
                     }
                     outstanding.insert(request_id, Outstanding::Scrollback);
                     requested.insert(request_id, None);
+                    // Going back to the live screen is a newer instruction than anything the
+                    // person had queued above it.
+                    queued = 0;
                 }
                 let Some(epoch) = epoch else {
                     // This terminal may not type. The bytes go nowhere, and the attachment goes on
@@ -1639,6 +1711,29 @@ mod tests {
         );
     }
 
+    /// A read with a paste boundary inside it is forwarded whole, reports and all.
+    #[test]
+    fn a_read_that_carries_a_paste_boundary_is_the_sessions() {
+        use super::PasteWatch;
+
+        let mut paste = PasteWatch::default();
+        let opened = paste.observe(b"\x1b[200~ab\x1b[<0;10;4Mcd");
+        assert!(opened.open, "the paste is open after it");
+        assert!(
+            opened.touched,
+            "and the read carried the boundary, so nothing may be taken out of it"
+        );
+        let closed = paste.observe(b"\x1b[201~");
+        assert!(!closed.open);
+        assert!(closed.touched);
+        let after = paste.observe(b"\x1b[<0;10;4M");
+        assert!(!after.open);
+        assert!(
+            !after.touched,
+            "and a read after the paste carries no boundary, so its report is this terminal's"
+        );
+    }
+
     /// Section 8: input outside the visible grid has no application effect.
     #[test]
     fn every_pointer_report_is_taken_while_the_window_shows_history() {
@@ -1739,16 +1834,19 @@ mod tests {
         use super::PasteWatch;
 
         let mut paste = PasteWatch::default();
-        assert!(!paste.observe(b"ls -l"), "an ordinary read opens nothing");
-        assert!(paste.observe(b"x\x1b[200~"), "a paste opening");
-        assert!(paste.observe(b"text"), "and it stays open");
-        assert!(!paste.observe(b"\x1b[201~x"), "until one closes it");
         assert!(
-            !paste.observe(b"\x1b[200~text\x1b[201~"),
+            !paste.observe(b"ls -l").open,
+            "an ordinary read opens nothing"
+        );
+        assert!(paste.observe(b"x\x1b[200~").open, "a paste opening");
+        assert!(paste.observe(b"text").open, "and it stays open");
+        assert!(!paste.observe(b"\x1b[201~x").open, "until one closes it");
+        assert!(
+            !paste.observe(b"\x1b[200~text\x1b[201~").open,
             "a whole paste in one read is closed at the end of it"
         );
         assert!(
-            paste.observe(b"\x1b[201~\x1b[200~more"),
+            paste.observe(b"\x1b[201~\x1b[200~more").open,
             "and one paste ending while another begins is open"
         );
     }
@@ -1759,19 +1857,25 @@ mod tests {
         use super::PasteWatch;
 
         let mut paste = PasteWatch::default();
-        assert!(!paste.observe(b"\x1b[20"), "half of a start delimiter");
-        assert!(paste.observe(b"0~"), "and the rest of it opens the paste");
+        assert!(!paste.observe(b"\x1b[20").open, "half of a start delimiter");
         assert!(
-            paste.observe(super::SCROLL_BACK_KEY),
+            paste.observe(b"0~").open,
+            "and the rest of it opens the paste"
+        );
+        assert!(
+            paste.observe(super::SCROLL_BACK_KEY).open,
             "a key inside it is pasted text and the paste stays open"
         );
         assert!(
-            paste.observe(b"\x1b[201"),
+            paste.observe(b"\x1b[201").open,
             "half of an end delimiter closes nothing yet"
         );
-        assert!(!paste.observe(b"~"), "and the rest of it closes the paste");
         assert!(
-            !paste.observe(super::SCROLL_BACK_KEY),
+            !paste.observe(b"~").open,
+            "and the rest of it closes the paste"
+        );
+        assert!(
+            !paste.observe(super::SCROLL_BACK_KEY).open,
             "so the key after it is a key again"
         );
     }
@@ -1782,13 +1886,16 @@ mod tests {
         use super::PasteWatch;
 
         let mut paste = PasteWatch::default();
-        assert!(!paste.observe(b"\x1b[2"), "the beginning of many things");
-        assert!(!paste.observe(b"J"), "which turned out to be an erase");
         assert!(
-            !paste.observe(b"\x1b[200"),
+            !paste.observe(b"\x1b[2").open,
+            "the beginning of many things"
+        );
+        assert!(!paste.observe(b"J").open, "which turned out to be an erase");
+        assert!(
+            !paste.observe(b"\x1b[200").open,
             "and a start delimiter that never finishes"
         );
-        assert!(!paste.observe(b"x"), "opens no paste either");
+        assert!(!paste.observe(b"x").open, "opens no paste either");
     }
 
     #[test]

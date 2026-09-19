@@ -139,11 +139,13 @@ window is the only way above its screen. They are also the application's while a
 program is running, because its buffer keeps no history and it has its own use for those keys; the
 window comes back to the live screen with the screen that program took.
 
-While the window is above the live page no pointer report reaches the application. It would address
+While this terminal is showing rows above the live page no pointer report reaches the application. It would address
 a cell of the live screen, and the rows the person is looking at are not on it; section 8 gives that
 case its answer, that input outside the visible grid has no application effect. Every report is
 taken, whether it arrives on its own, among other bytes, or in halves a read boundary cut it into,
-and the wheel among them moves the window. Typing goes to the application wherever the window is,
+and the wheel among them moves the window. Half of one waits a moment for the rest; if nothing
+comes it was not a report and it goes to the application, which is the one way a report split by a
+long pause reaches it. Inside a bracketed paste nothing is taken at all. Typing goes to the application wherever the window is,
 and with `--follow-live` the first key brings the window back to the live screen, because what a
 person types is answered there.
 
