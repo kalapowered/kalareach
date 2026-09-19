@@ -34,8 +34,7 @@ use kr_protocol::hostinfo::{
 use kr_protocol::identity::{BootIdentity, WorkerProfile};
 use kr_protocol::ids::{
     ActorId, AuthorityRevision, BootEpoch, BuildId, CapabilityRevision, ConnectionId,
-    ControllerGeneration,
-    EnvironmentId, RequestId, SessionEpoch, SessionId,
+    ControllerGeneration, EnvironmentId, RequestId, SessionEpoch, SessionId,
 };
 use kr_protocol::local::{LocalClientKind, LocalHelloAck, LocalPeer, LocalRole};
 use kr_protocol::method::Method;
