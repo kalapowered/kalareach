@@ -148,6 +148,12 @@ jobs:
     env:
       # The runner has one build cache and no reason to keep incremental artefacts between steps.
       CARGO_INCREMENTAL: "0"
+      # The vendored C library this workspace links ships no debug database, so the linker says so
+      # once per object file: several thousand lines of LNK4099 on every link that produces a
+      # binary, which is the bulk of this job's output and says nothing about this workspace.
+      # LNK4098, which reports two objects disagreeing about the C runtime, is deliberately *not*
+      # silenced: that one is worth reading.
+      RUSTFLAGS: "-Clink-arg=/IGNORE:4099"
       # Section 27 puts every test artefact in one platform-resolved directory. This runner's
       # temporary directory is where that is on Windows.
       KR_TEST_ARTIFACTS_DIR: C:\kr-test-artifacts
