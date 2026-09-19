@@ -4300,6 +4300,15 @@ export interface WorkerLaunchSpec {
    * One KalaReach terminal session.
    */
   session_id: string
+  /**
+   * The qualified shell package the controller resolved, as an absolute directory.
+   *
+   * Null for a create that launches no managed package. Where it is present the worker launches
+   * that package and no other: the daemon and the worker can be configured with different
+   * package roots, and a session must run the package its create was admitted against rather
+   * than whichever one the worker's own environment would have found.
+   */
+  shell_package: string | null
 }
 /**
  * The create request the controller admitted.

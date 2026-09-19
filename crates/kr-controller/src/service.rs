@@ -2097,12 +2097,26 @@ impl Controller {
                 },
             )?;
 
+        // The package this worker will launch is resolved here, by the daemon, against the
+        // package root the daemon is configured with. The worker is told which directory to read
+        // rather than left to find one in its own environment: the two can differ, and a session
+        // must run the package its create was admitted against.
+        let shell_package = if create.shell_mode == kr_protocol::session::ShellMode::Managed {
+            Nullable::some(
+                self.check_qualified_package(create.shell.0.as_deref())?
+                    .display()
+                    .to_string(),
+            )
+        } else {
+            Nullable::null()
+        };
         Ok(WorkerLaunchSpec {
             session_id: reservation.session_id,
             session_epoch: SessionEpoch::V1,
             environment_id: self.paths.environment_id(),
             display_number: reservation.display_number,
             create,
+            shell_package,
             controller_public_key: *self.identity.public_key(),
             controller_generation: self.generation,
             release: self.release.clone(),
@@ -4423,7 +4437,7 @@ impl Controller {
     /// `native_compat` top-level shell; it cannot claim the managed contract. The refusal names the
     /// shell rather than substituting another, and it happens before a reservation is recorded, so
     /// an unsupported request costs the caller an error rather than a session that closes itself.
-    fn check_qualified_package(&self, requested: Option<&str>) -> Result<()> {
+    fn check_qualified_package(&self, requested: Option<&str>) -> Result<PathBuf> {
         use kr_shell_integration::host::package::{PackageSet, default_package_root};
 
         let installed = match self.shell_packages.as_ref() {
@@ -4433,7 +4447,7 @@ impl Controller {
         .map_err(|fault| ControllerError::ShellIntegrationUnsupported(fault.to_string()))?;
         installed
             .select(requested)
-            .map(|_| ())
+            .map(|package| package.directory.clone())
             .map_err(|fault| ControllerError::ShellIntegrationUnsupported(fault.to_string()))
     }
 
@@ -4489,7 +4503,7 @@ impl Controller {
                 // Nothing is reserved and nothing is spawned before this, so an unsupported shell
                 // costs the caller a named error rather than a session that closes itself a moment
                 // later.
-                qualified?;
+                let _resolved = qualified?;
             }
             registry.reserve(
                 actor_id,

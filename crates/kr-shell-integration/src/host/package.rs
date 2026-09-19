@@ -113,6 +113,35 @@ pub struct ShellPackage {
 }
 
 impl ShellPackage {
+    /// Reads the one package installed in a directory.
+    ///
+    /// The directory is an identity directory a build wrote, which is what a controller records
+    /// when it resolves a create request's package: the worker then launches exactly the package
+    /// its daemon qualified rather than resolving one of its own from its own environment. The
+    /// same ownership rule applies as for a discovered package — a record naming paths outside the
+    /// directory it sits in describes some other installation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PackageFault::Unreadable`] when the directory holds no identity record, when the
+    /// record cannot be parsed, or when it names paths outside itself, and
+    /// [`PackageFault::MissingExecutable`] when the executable it names is not installed.
+    pub fn read(directory: &Path) -> Result<Self, PackageFault> {
+        let candidate = directory.join(MANIFEST_BASENAME);
+        let package = read_manifest(&candidate, None, directory)?.ok_or_else(|| {
+            PackageFault::Unreadable {
+                path: candidate.display().to_string(),
+                detail: "this directory holds no identity record".to_owned(),
+            }
+        })?;
+        if !package.executable().is_file() {
+            return Err(PackageFault::MissingExecutable {
+                path: package.directory.display().to_string(),
+            });
+        }
+        Ok(package)
+    }
+
     /// Returns which managed shell this package is.
     #[must_use]
     pub const fn kind(&self) -> ShellKind {
@@ -346,6 +375,66 @@ pub fn default_package_root() -> PathBuf {
     }
 }
 
+/// Reads one identity record into a package.
+///
+/// `expected` is the shell the enclosing directory installs it as, where there is one: a record
+/// that says it is a different shell describes some other package and is refused rather than
+/// launched. `fallback` is the directory a record with no parent belongs to.
+///
+/// Returns `None` when the record is not there, which is what makes a directory holding no
+/// manifest an installation without that package rather than a failure.
+fn read_manifest(
+    candidate: &Path,
+    expected: Option<ShellKind>,
+    fallback: &Path,
+) -> Result<Option<ShellPackage>, PackageFault> {
+    let text = match std::fs::read_to_string(candidate) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(PackageFault::Unreadable {
+                path: candidate.display().to_string(),
+                detail: error.to_string(),
+            });
+        }
+    };
+    let manifest: PackageManifest =
+        serde_json::from_str(&text).map_err(|error| PackageFault::Unreadable {
+            path: candidate.display().to_string(),
+            detail: error.to_string(),
+        })?;
+    if let Some(expected) = expected
+        && manifest.shell.kind != expected
+    {
+        return Err(PackageFault::Unreadable {
+            path: candidate.display().to_string(),
+            detail: format!(
+                "the record says {} and it is installed as {}",
+                manifest.shell.kind,
+                expected.as_str()
+            ),
+        });
+    }
+    let directory = candidate
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| fallback.to_path_buf());
+    let package = ShellPackage {
+        manifest,
+        directory,
+    };
+    // A record whose paths name neither this directory nor a directory of its own identity
+    // describes some other installation. Launching what it names would launch that one, and this
+    // host has no way to say which package it would be.
+    if !package.owns_its_paths() {
+        return Err(PackageFault::Unreadable {
+            path: candidate.display().to_string(),
+            detail: "it names paths outside the package it is in".to_owned(),
+        });
+    }
+    Ok(Some(package))
+}
+
 /// The qualified packages this installation has.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PackageSet {
@@ -367,49 +456,10 @@ impl PackageSet {
         for kind in ShellKind::ALL {
             let directory = root.join(kind.as_str());
             for candidate in manifest_candidates(&directory)? {
-                let text = match std::fs::read_to_string(&candidate) {
-                    Ok(text) => text,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => {
-                        return Err(PackageFault::Unreadable {
-                            path: candidate.display().to_string(),
-                            detail: error.to_string(),
-                        });
-                    }
-                };
-                let manifest: PackageManifest =
-                    serde_json::from_str(&text).map_err(|error| PackageFault::Unreadable {
-                        path: candidate.display().to_string(),
-                        detail: error.to_string(),
-                    })?;
-                if manifest.shell.kind != *kind {
-                    return Err(PackageFault::Unreadable {
-                        path: candidate.display().to_string(),
-                        detail: format!(
-                            "the record says {} and it is installed as {}",
-                            manifest.shell.kind,
-                            kind.as_str()
-                        ),
-                    });
+                match read_manifest(&candidate, Some(*kind), &directory)? {
+                    Some(package) => packages.push(package),
+                    None => continue,
                 }
-                let directory = candidate
-                    .parent()
-                    .map(Path::to_path_buf)
-                    .unwrap_or_else(|| directory.clone());
-                let package = ShellPackage {
-                    manifest,
-                    directory,
-                };
-                // A record whose paths name neither this directory nor a directory of its own
-                // identity describes some other installation. Launching what it names would launch
-                // that one, and this host has no way to say which package it would be.
-                if !package.owns_its_paths() {
-                    return Err(PackageFault::Unreadable {
-                        path: candidate.display().to_string(),
-                        detail: "it names paths outside the package it is in".to_owned(),
-                    });
-                }
-                packages.push(package);
                 break;
             }
         }

@@ -404,6 +404,14 @@ fn managed_package(specification: &WorkerLaunchSpec) -> Result<Option<ShellPacka
     if specification.create.shell_mode != ShellMode::Managed {
         return Ok(None);
     }
+    // The controller resolved this create's package against its own configured root, and refused
+    // the create where it could not. Reading that exact directory is what makes the session run
+    // the package it was admitted against: a worker whose own environment names a different root
+    // would otherwise resolve a second time and could launch a different build, or a different
+    // shell entirely.
+    if let Some(directory) = specification.shell_package.as_ref() {
+        return ShellPackage::read(std::path::Path::new(directory)).map(Some);
+    }
     let installed = PackageSet::installed(&default_package_root())?;
     installed
         .select(specification.create.shell.0.as_deref())

@@ -21165,6 +21165,17 @@
         "session_id": {
           "$ref": "#/$defs/SessionId",
           "description": "The session the worker will own."
+        },
+        "shell_package": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The qualified shell package the controller resolved, as an absolute directory.\n\nNull for a create that launches no managed package. Where it is present the worker launches\nthat package and no other: the daemon and the worker can be configured with different\npackage roots, and a session must run the package its create was admitted against rather\nthan whichever one the worker's own environment would have found."
         }
       },
       "required": [
@@ -21173,6 +21184,7 @@
         "environment_id",
         "display_number",
         "create",
+        "shell_package",
         "controller_public_key",
         "controller_generation",
         "release"

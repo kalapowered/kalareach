@@ -28,7 +28,7 @@ use kr_protocol::session::{EnvironmentVariable, Presentation, SessionCreateParam
 use kr_shell_integration::contract::qualification::ShellKind;
 use kr_shell_integration::host::package::{
     CURRENT_BASENAME, MANIFEST_BASENAME, PACKAGE_ROOT_VARIABLE, PackageManifest, PackageSet,
-    PackageShell, PackageStartupEntry, StartupMode,
+    PackageShell, PackageStartupEntry, ShellPackage, StartupMode,
 };
 use kr_shell_integration::host::startup::{self, Change, HomeLayout};
 use kr_shell_integration::host::terminal::{
@@ -231,6 +231,46 @@ async fn a_managed_create_without_a_qualified_package_is_refused_before_anything
         .expect("reaches the daemon")
         .expect_err("refused");
     assert_eq!(refused.code, ErrorCode::ShellIntegrationUnsupported);
+}
+
+/// KR-REQ-07.16: the worker launches the package its daemon resolved, not one of its own.
+#[test]
+fn the_package_a_worker_launches_is_the_one_the_daemon_resolved() {
+    let admitted = tempfile::tempdir().expect("a directory");
+    install_package(admitted.path(), ShellKind::Zsh);
+    let elsewhere = tempfile::tempdir().expect("a second directory");
+    install_package(elsewhere.path(), ShellKind::Zsh);
+
+    let resolved = PackageSet::discover(admitted.path())
+        .expect("reads the package")
+        .select(Some("zsh"))
+        .expect("qualified")
+        .directory
+        .clone();
+    // What the worker is told to read is one directory, and reading it gives exactly the package
+    // that directory holds: the other installation is a different build of the same shell and is
+    // never reached from here.
+    let launched = ShellPackage::read(&resolved).expect("reads the resolved package");
+    assert_eq!(launched.directory, resolved);
+    assert_eq!(launched.kind(), ShellKind::Zsh);
+    let other = ShellPackage::read(
+        &PackageSet::discover(elsewhere.path())
+            .expect("reads the package")
+            .select(Some("zsh"))
+            .expect("qualified")
+            .directory
+            .clone(),
+    )
+    .expect("reads the other package");
+    assert_ne!(
+        launched.executable(),
+        other.executable(),
+        "two installations of the same shell are two different binaries"
+    );
+
+    // A directory with no identity record is a named failure rather than a fall back to discovery.
+    let empty = tempfile::tempdir().expect("a third directory");
+    assert!(ShellPackage::read(empty.path()).is_err());
 }
 
 /// KR-REQ-07.20, KR-ACC-035: stock compatibility is an explicit choice and never a substitution.
