@@ -253,9 +253,9 @@ pub struct LaunchProfile {
     pub startup: ShellStartup,
     /// Whether a host-authorised `shell.launch` may install a command in this session's editor.
     ///
-    /// A profile that says no keeps everything else a managed session has — the fence, the
-    /// empty-prompt end-of-file gesture, the attributed acceptance — and refuses the one operation
-    /// that puts text a person did not type into their editor.
+    /// A profile that says no keeps everything else a managed session has: the fence, the
+    /// empty-prompt end-of-file gesture and the attributed acceptance. What it refuses is the one
+    /// operation that puts text a person did not type into their editor.
     pub fenced_launch: bool,
     /// The opt-in command integrations this session applies to interactive invocations.
     pub command_integrations: Vec<CommandIntegration>,
@@ -852,9 +852,10 @@ pub struct SessionReadResult {
     /// How many `shell.launch` confirmations this session is still waiting on its reader for.
     ///
     /// Work this host has admitted and not finished: a launch is with the reader, and the caller
-    /// is waiting for the reader's decision. Null and zero are different answers. Null is a
-    /// session that cannot have one — no managed root editor, or a session that has closed — and
-    /// says nothing about outstanding work; zero is a session that could have one and has none.
+    /// is waiting for the reader's decision. Null and zero are different answers. Null is the host
+    /// not saying: a session with no managed root editor, one that has closed, or one whose worker
+    /// is from a build that did not report a count. Zero is a session that could have one and has
+    /// none.
     pub outstanding_launches: Nullable<U64>,
 }
 

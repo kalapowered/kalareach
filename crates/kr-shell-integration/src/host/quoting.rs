@@ -71,7 +71,7 @@ pub const CALL_OPERATOR: &str = "&";
 /// Returns one argument as a single literal word in this shell.
 #[must_use]
 pub fn quote(kind: ShellKind, argument: &str) -> String {
-    if !argument.is_empty() && argument.chars().all(is_bare) {
+    if !argument.is_empty() && argument.chars().all(|character| is_bare(kind, character)) {
         return argument.to_owned();
     }
     match kind {
@@ -87,8 +87,16 @@ pub fn quote(kind: ShellKind, argument: &str) -> String {
     }
 }
 
-/// Returns true for a character that needs no quoting in any of the four shells.
-const fn is_bare(character: char) -> bool {
+/// Returns true for a character that needs no quoting in this shell.
+///
+/// The set is the same everywhere but for `@`, which PowerShell reads at the start of a word as
+/// splatting: `@payload` there is the contents of `$payload` rather than the two-character word
+/// the person typed, and a word that is not preserved literally is not the argument vector the
+/// caller named.
+const fn is_bare(kind: ShellKind, character: char) -> bool {
+    if matches!(kind, ShellKind::PowerShell) && character == '@' {
+        return false;
+    }
     character.is_ascii_alphanumeric()
         || matches!(
             character,
@@ -198,6 +206,17 @@ mod tests {
             install_text(ShellKind::PowerShell, &quoted),
             "Get-ChildItem | Select-Object -First 5"
         );
+    }
+
+    /// KR-REQ-23.54: a word PowerShell would read as splatting is quoted rather than left bare.
+    #[test]
+    fn powershell_quotes_a_word_it_would_otherwise_expand() {
+        assert_eq!(quote(ShellKind::PowerShell, "@payload"), "'@payload'");
+        assert_eq!(quote(ShellKind::PowerShell, "a@b"), "'a@b'");
+        // The other three read `@` as an ordinary character, so nothing about them changes.
+        for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+            assert_eq!(quote(kind, "@payload"), "@payload");
+        }
     }
 
     #[test]

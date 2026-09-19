@@ -920,7 +920,7 @@ async fn read_from_controller(
     let outcome = client
         .request(Method::SessionRead, &SessionReadParams { session_id })
         .await?;
-    typed::<SessionReadResult>(outcome)
+    read_result(outcome)
 }
 
 async fn read_session(
@@ -935,7 +935,49 @@ async fn read_session(
             },
         )
         .await?;
-    typed::<SessionReadResult>(outcome)
+    read_result(outcome)
+}
+
+/// Reads a session read, from a worker of this build or of the one before it.
+///
+/// A host is upgraded without its workers: the daemon and this command are replaced while every
+/// live session's worker goes on running the build that started it. Such a worker answers with the
+/// fields its own build has, and the launch profile, the last command block and the outstanding
+/// launch count are not among them, so its answer is read with those three absent rather than
+/// refused. What this command then prints about that session is what the worker said.
+///
+/// Remove `Reported` and this fallback once no worker from a build before those fields can still
+/// be running, which is when every session that was live across the upgrade has closed.
+fn read_result(
+    outcome: std::result::Result<
+        kr_protocol::envelope::ParamsValue,
+        kr_protocol::error::ProtocolError,
+    >,
+) -> Result<SessionReadResult> {
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Reported {
+        session: kr_protocol::session::SessionSummary,
+        endpoint: Nullable<String>,
+    }
+
+    let value = match outcome {
+        Ok(value) => value,
+        Err(error) => return Err(CliError::Refused(error)),
+    };
+    match value.to_typed::<SessionReadResult>() {
+        Ok(read) => Ok(read),
+        Err(error) => match value.to_typed::<Reported>() {
+            Ok(reported) => Ok(SessionReadResult {
+                session: reported.session,
+                endpoint: reported.endpoint,
+                launch_profile: Nullable::null(),
+                last_command_block: Nullable::null(),
+                outstanding_launches: Nullable::null(),
+            }),
+            Err(_) => Err(CliError::Other(error.to_string())),
+        },
+    }
 }
 
 fn session_selector(named: Option<&str>) -> Result<SessionSelector> {

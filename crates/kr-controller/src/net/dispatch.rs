@@ -959,8 +959,8 @@ impl RemoteConnection {
     /// Two things need it. A listing names no session, so the selector has nothing to check and
     /// the narrowing has to happen to the answer: the registry's own words for this method are
     /// "the sessions this actor may observe". And a session read carries the last command block,
-    /// which is session content rather than metadata — a command line and the directory it ran in
-    /// — so the grant's history lower bound decides whether this device sees it.
+    /// which is session content rather than metadata: a command line and the directory it ran in.
+    /// The grant's history lower bound decides whether this device sees it.
     fn narrow(&self, answer: ControlFrame) -> ControlFrame {
         let ControlFrame::Response(Response {
             request_id,

@@ -185,14 +185,14 @@ pub fn select(
         .ok_or(TerminalUnavailable::NoneAvailable)
 }
 
-/// How long a launcher is given to say it could not open a window.
+/// How long a launcher is given to open a window, or to say it could not.
 ///
-/// A window opens by a process this host starts and does not wait for, so what a bounded wait
-/// establishes is the failure rather than the success: a launcher that has already exited with a
-/// status means no window appeared, and one still running means it accepted the request. The bound
-/// is short because the answer belongs to the create reply that is waiting for it.
-#[cfg(not(target_vendor = "apple"))]
-const LAUNCH_ACKNOWLEDGEMENT: std::time::Duration = std::time::Duration::from_millis(750);
+/// On the platforms whose launcher exits as soon as it has asked, what a bounded wait establishes
+/// is the failure rather than the success: a launcher that has already exited with a status means
+/// no window appeared, and one still running means it accepted the request. On macOS the script
+/// runs until the application answers it, so this is the whole patience the host has for that
+/// answer. Either way the bound is short, because the create reply is waiting behind it.
+const LAUNCH_ACKNOWLEDGEMENT: std::time::Duration = std::time::Duration::from_millis(3_000);
 
 /// Opens the chosen terminal application on a command.
 ///
@@ -241,17 +241,48 @@ pub fn open(selection: &Selection, command: &[String]) -> Result<(), TerminalUna
         .arg(&script)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
-        .status();
-    match started {
-        Ok(status) if status.success() => Ok(()),
-        Ok(status) => Err(TerminalUnavailable::CouldNotOpen {
-            application: selection.application.name.clone(),
-            detail: format!("the script ended with {status}"),
-        }),
-        Err(error) => Err(TerminalUnavailable::CouldNotOpen {
-            application: selection.application.name.clone(),
-            detail: error.to_string(),
-        }),
+        .spawn();
+    let mut child = match started {
+        Ok(child) => child,
+        Err(error) => {
+            return Err(TerminalUnavailable::CouldNotOpen {
+                application: selection.application.name.clone(),
+                detail: error.to_string(),
+            });
+        }
+    };
+    // The script has a deadline of the host's own. An application that will not answer, one waiting
+    // on a dialogue or one that has stopped, must not leave the create reply waiting for it: the
+    // session exists, and what the caller is owed is the reason a window did not appear.
+    let deadline = std::time::Instant::now() + LAUNCH_ACKNOWLEDGEMENT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Ok(()),
+            Ok(Some(status)) => {
+                return Err(TerminalUnavailable::CouldNotOpen {
+                    application: selection.application.name.clone(),
+                    detail: format!("the script ended with {status}"),
+                });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return Err(TerminalUnavailable::CouldNotOpen {
+                    application: selection.application.name.clone(),
+                    detail: error.to_string(),
+                });
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            // Terminated and reaped, so nothing this host started is left waiting on an
+            // application that is not answering.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TerminalUnavailable::CouldNotOpen {
+                application: selection.application.name.clone(),
+                detail: format!("it did not open a window within {LAUNCH_ACKNOWLEDGEMENT:?}"),
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
 }
 
@@ -266,7 +297,7 @@ fn shell_quoted(word: &str) -> String {
 /// Waits a bounded moment for a launcher that refuses the request.
 ///
 /// A launcher that opens a window goes on running, so this returns as soon as the bound passes. A
-/// launcher that cannot — no display, a refused connection to the session bus — exits with a
+/// launcher that cannot, for want of a display or a session bus it could reach, exits with a
 /// status within that bound, and that status is the failure the caller reports.
 #[cfg(not(target_vendor = "apple"))]
 fn acknowledged(
@@ -312,8 +343,11 @@ fn acknowledged(
 pub fn open(selection: &Selection, command: &[String]) -> Result<(), TerminalUnavailable> {
     // Each launcher takes its own separator before the vector, and the vector is passed as
     // arguments rather than as a line a shell would re-parse.
+    // Each launcher's own word for "and here is the argument vector". `-e` takes one command
+    // string in the terminals that follow `xterm`, so the two that read a vector are named.
     let separator = match selection.application.id.as_str() {
         "gnome-terminal" => "--",
+        "xfce4-terminal" => "-x",
         _ => "-e",
     };
     let mut arguments = vec![separator.to_owned()];

@@ -109,17 +109,20 @@ no terminal to ask.
 
 ### Shell mode
 
-This host implements the explicitly selected `native_compat` mode: the stock shell you name, run as
-an interactive session root shell. It keeps create, attach, detach, close, transfer and terminal
-presentation. It does **not** claim managed empty-prompt Ctrl-D, fenced `shell.launch` or
-authoritative editor-buffer observation.
+`native_compat` is the stock shell you name, run as an interactive session root shell. It keeps
+create, attach, detach, close, transfer and terminal presentation. It does **not** claim managed
+empty-prompt Ctrl-D, fenced `shell.launch` or authoritative editor-buffer observation.
+
+`managed` launches a KalaReach-qualified shell package, and claims all three. A shell no installed
+package qualifies returns `SHELL_INTEGRATION_UNSUPPORTED` naming that shell; `native_compat` is
+never substituted for it.
 
 In `native_compat`, Ctrl-D at the prompt does whatever that shell does, which usually means the
-shell exits and the session closes. `kr detach` always works and is the way to leave a session
-without ending it. The mode is printed when a session is created and appears in `kr list`,
-`kr status` and the `--json` output. Asking for `managed` returns
-`SHELL_INTEGRATION_UNSUPPORTED` naming `native_compat` as the available choice; it is never silently
-substituted.
+shell exits and the session closes. `kr detach` is the way to leave a session without ending it,
+and outside the session's own context it takes `--attachment`, which a `native_compat` session
+always is: it records no originating attachment. The mode is printed when a session is created and
+appears in `kr list`, `kr status` and the `--json` output, beside the launch profile, which says
+whether a fenced launch is admitted at all.
 
 ## `kr attach`
 

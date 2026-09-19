@@ -165,8 +165,8 @@ impl HomeLayout {
     /// sources `.bashrc` needs no entry of its own: the entry in `.bashrc` will run.
     ///
     /// What counts as sourcing it is a `source` or `.` of a path whose last component is
-    /// `.bashrc`, on a line that is not a comment. A file that merely mentions the name — in a
-    /// comment, in a message, in a variable that is never read — is not a file that runs it, and
+    /// `.bashrc`, on a line that is not a comment. A file that merely mentions the name, in a
+    /// comment, in a message or in a variable that is never read, is not a file that runs it, and
     /// treating it as one would leave a login shell with no entry at all.
     fn bash_login_file(&self) -> Option<PathBuf> {
         for name in [".bash_profile", ".bash_login", ".profile"] {
@@ -187,28 +187,70 @@ impl HomeLayout {
 ///
 /// The shape is a `source` or `.` command whose next word is a path ending in `.bashrc`, wherever
 /// on the line it appears: a login file writes it inside a test, after a `then`, behind a `&&`.
-/// A line that merely contains the name — in a comment, in a message, in a variable nothing reads
-/// — is not a line that runs it, and treating it as one would leave a login shell with no entry.
+/// A line that merely contains the name, in a comment, in a message or in a variable nothing
+/// reads, is not a line that runs it, and treating it as one would leave a login shell with no
+/// entry.
 fn sources_bashrc(line: &str) -> bool {
     let line = line.trim();
     if line.starts_with('#') {
         return false;
     }
-    // A comment starts at a `#` that begins a word, and everything after it is text rather than a
-    // command: `export EDITOR=vim # source ~/.bashrc` runs nothing of the kind.
-    let mut words = Vec::new();
-    for word in line.split_whitespace() {
-        if word.starts_with('#') {
-            break;
+    // The words of the line, with quoting tracked and a comment ending it. What is inside quotes
+    // is an argument or a message rather than a command, so `echo "please source ~/.bashrc"` is
+    // not a line that sources anything; a `#` that begins a word ends the command.
+    let mut words: Vec<(String, bool)> = Vec::new();
+    let mut word = String::new();
+    let mut quoted = false;
+    let mut quote = '\0';
+    let mut started_quoted = false;
+    let mut began = true;
+    for character in line.chars() {
+        if quoted {
+            if character == quote {
+                quoted = false;
+            } else {
+                word.push(character);
+            }
+            continue;
         }
-        words.push(word);
+        match character {
+            '\'' | '"' => {
+                if word.is_empty() {
+                    started_quoted = true;
+                }
+                quoted = true;
+                quote = character;
+            }
+            '#' if began => break,
+            character if character.is_whitespace() => {
+                if !word.is_empty() || started_quoted {
+                    words.push((std::mem::take(&mut word), started_quoted));
+                    started_quoted = false;
+                }
+                began = true;
+            }
+            character => {
+                word.push(character);
+                began = false;
+            }
+        }
     }
+    if !word.is_empty() || started_quoted {
+        words.push((word, started_quoted));
+    }
+    // A `source` or `.` whose next word is a path ending in `.bashrc`. The verb has to be a bare
+    // word: a quoted one is text, and so is a quoted path.
     words.windows(2).any(|pair| {
-        let verb = pair[0].trim_start_matches([';', '&', '|']);
+        let (verb, verb_quoted) = &pair[0];
+        if *verb_quoted {
+            return false;
+        }
+        let verb = verb.trim_start_matches([';', '&', '|']);
         if verb != "source" && verb != "." {
             return false;
         }
-        let argument = pair[1].trim_matches(['"', '\'', ';']);
+        let (argument, _) = &pair[1];
+        let argument = argument.trim_end_matches(';');
         std::path::Path::new(argument)
             .file_name()
             .is_some_and(|name| name == ".bashrc")
@@ -497,9 +539,12 @@ impl Drop for FileLock {
     fn drop(&mut self) {
         #[cfg(unix)]
         {
-            // The file is removed while the lock is still held, so nobody can be waiting on the
-            // name this removes; the kernel releases the lock when the file closes with this guard.
-            let _ = std::fs::remove_file(&self.path);
+            // The file stays. A waiter is holding the same inode open and waiting on the kernel's
+            // lock, and removing the name would let a third process create another file with it:
+            // two writers would then hold two different locks and write over each other. Closing
+            // the file is what releases the lock, and the empty file left beside the startup file
+            // costs nothing.
+            let _ = &self.path;
             drop(self.held.take());
         }
         #[cfg(not(unix))]
@@ -742,6 +787,8 @@ mod tests {
             "# . ~/.bashrc\n",
             "export EDITOR=vim # source ~/.bashrc\n",
             "PS1='> ' ## . ~/.bashrc\n",
+            "echo \"please source ~/.bashrc\"\n",
+            "echo 'run . ~/.bashrc yourself'\n",
         ] {
             std::fs::write(root.path().join(".bash_profile"), mentions).expect("writes");
             assert_eq!(
@@ -784,7 +831,10 @@ mod tests {
         let refused = FileLock::take(&path).expect_err("one writer at a time");
         assert_eq!(refused.kind(), std::io::ErrorKind::TimedOut);
         drop(held);
-        assert!(!lock.exists(), "and it goes when the write is finished");
+        // The name stays where a waiter can be holding the same file open; what the drop releases
+        // is the kernel's lock, which the next writer takes at once.
+        let after = FileLock::take(&path).expect("the next writer takes it straight away");
+        drop(after);
 
         let body = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), false);
         assert_eq!(install(&path, &body).expect("installs"), Change::Added);
@@ -794,7 +844,6 @@ mod tests {
                 .starts_with("export EDITOR=vim"),
             "the user's own line is still first"
         );
-        assert!(!lock.exists(), "and no lock is left behind");
     }
 
     /// KR-REQ-07.29: a first-time setup creates the directory and still takes a lock in it.
@@ -1011,7 +1060,11 @@ mod tests {
             .filter_map(|entry| entry.ok().map(|entry| entry.file_name()))
             .filter(|name| {
                 let name = name.to_string_lossy();
-                name.contains("kalareach-") && name != ".zshrc.kalareach-new"
+                // The lock file is not a leftover: it is the name a waiter holds open, and on
+                // Unix it stays so that two writers cannot end up holding two different locks.
+                name.contains("kalareach-")
+                    && name != ".zshrc.kalareach-new"
+                    && !name.ends_with("kalareach-lock")
             })
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");

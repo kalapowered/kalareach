@@ -118,7 +118,7 @@ impl ShellPackage {
     /// The directory is an identity directory a build wrote, which is what a controller records
     /// when it resolves a create request's package: the worker then launches exactly the package
     /// its daemon qualified rather than resolving one of its own from its own environment. The
-    /// same ownership rule applies as for a discovered package — a record naming paths outside the
+    /// same ownership rule applies as for a discovered package: a record naming paths outside the
     /// directory it sits in describes some other installation.
     ///
     /// # Errors
@@ -553,7 +553,7 @@ impl PackageSet {
     /// not installed.
     pub fn select(&self, requested: Option<&str>) -> Result<&ShellPackage, PackageFault> {
         let package = match requested {
-            None => self.default_package().ok_or(PackageFault::NoPackages)?,
+            None => self.default_package()?,
             Some(requested) => {
                 let requested = requested.trim();
                 if let Some(detail) = script_invocation(requested) {
@@ -592,19 +592,28 @@ impl PackageSet {
     /// The shell this user's own login uses, when a package qualifies it: a session should start
     /// the shell the person already has. Failing that, the first package this installation holds,
     /// in the order [`ShellKind::ALL`] lists them.
-    fn default_package(&self) -> Option<&ShellPackage> {
+    fn default_package(&self) -> Result<&ShellPackage, PackageFault> {
         let configured = std::env::var("SHELL")
             .ok()
-            .map(|shell| executable_name(&shell));
-        configured
+            .map(|shell| executable_name(&shell))
             .and_then(|name| {
                 ShellKind::ALL
                     .iter()
                     .copied()
                     .find(|kind| kind.as_str() == name || alias(*kind) == name)
-            })
-            .and_then(|kind| self.get(kind))
-            .or_else(|| self.packages.first())
+            });
+        if let Some(kind) = configured {
+            // The shell this user's own login uses, and its own record's fault where it has one: a
+            // create that named no shell must not quietly start a different one because the shell
+            // the person actually uses has a record this host cannot read.
+            if let Some(fault) = self.faults.get(&kind) {
+                return Err(fault.clone());
+            }
+            if let Some(package) = self.get(kind) {
+                return Ok(package);
+            }
+        }
+        self.packages.first().ok_or(PackageFault::NoPackages)
     }
 }
 

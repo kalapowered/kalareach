@@ -756,14 +756,10 @@ impl Session {
 
     /// Decides what one interactive invocation resolves to, and establishes its backend first.
     ///
-    /// Section 12's order is the point. The worker-owned backend is bound to this session and this
-    /// prompt generation, and it exists before this answer is sent, so it is there before the
-    /// program the answer names is started. There is no route by which a program already running
-    /// acquires one: this hook is the only place a binding is made, a second resolve for the same
-    /// generation is answered with the binding that already exists, and a generation that has
-    /// moved on has none. An invocation the session cannot establish a backend for runs exactly as
-    /// it was typed, with no flags added: an agent started with the integration's flags and no
-    /// gateway behind them is worse off than one started without them.
+    /// Section 12's order is the point: the worker-owned backend has to exist before the native
+    /// program does. This host establishes none, so an invocation that would take the integration
+    /// runs exactly as it was typed, with no flags added, and is told why. An agent started with
+    /// the integration's flags and no gateway behind them is worse off than one started without.
     fn resolve_invocation(
         &mut self,
         params: &kr_protocol::root::RootCommandResolveParams,

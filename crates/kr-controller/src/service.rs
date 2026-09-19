@@ -5892,8 +5892,8 @@ fn qualified_package(root: Option<&Path>, requested: Option<&str>) -> Result<Pat
 ///
 /// A daemon is replaced without its workers: an upgrade restarts this process and leaves every
 /// live session's worker running the build that started it. Such a worker answers with the fields
-/// its own build has, and the ones this build added — the launch profile, the last command block
-/// and the outstanding launch count — are not among them. It is read through [`ReportedRead`]
+/// its own build has, and the three this build added are not among them: the launch profile, the
+/// last command block and the outstanding launch count. It is read through [`ReportedRead`]
 /// instead, which is that answer with those three absent, so an upgraded daemon goes on listing
 /// and describing the sessions it inherited.
 ///
@@ -5945,8 +5945,10 @@ impl From<ReportedRead> for SessionReadResult {
 /// fields have, which is exactly what that session was created with.
 ///
 /// Remove `RecordedCreate` and this fallback once no reservation recorded before the launch
-/// profile existed can still be in a registry: every environment that upgraded across it has to
-/// have closed the sessions it had open at the time, which one full restart does.
+/// profile existed can still be in a registry. A reservation row outlives the session it made, so
+/// that is a migration or a retention boundary rather than a restart: the condition is met when
+/// the registry has been rewritten forward, or when retention has removed every row written before
+/// the field existed.
 ///
 /// # Errors
 ///

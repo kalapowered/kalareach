@@ -285,21 +285,22 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
         let _ = child.kill();
         let _ = child.wait();
     }
-    // What the readers managed to send by the deadline. A reader that is still waiting on a pipe
-    // some descendant holds open is left to end on its own; this reading is over.
-    let taken = |heard: Option<std::sync::mpsc::Receiver<Vec<u8>>>| {
-        heard
-            .and_then(|heard| {
-                let left = deadline.saturating_duration_since(std::time::Instant::now());
-                heard
-                    .recv_timeout(left.max(std::time::Duration::from_millis(50)))
-                    .ok()
-            })
-            .unwrap_or_default()
+    // What the readers managed to send by the deadline. A reader still waiting on a pipe that some
+    // descendant holds open is left to end on its own, and a capture that did not finish is not
+    // output: an empty answer where a session facility's words should be reads as "no desktop",
+    // and a reading this host could not take establishes nothing of the kind.
+    let taken = |heard: Option<std::sync::mpsc::Receiver<Vec<u8>>>| match heard {
+        None => Some(Vec::new()),
+        Some(heard) => {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            heard
+                .recv_timeout(left.max(std::time::Duration::from_millis(50)))
+                .ok()
+        }
     };
     let printed = taken(out);
     let failed = taken(err);
-    let Some(status) = status else {
+    let (Some(status), Some(printed), Some(failed)) = (status, printed, failed) else {
         return Printed::NotRun;
     };
     if status.success() {
