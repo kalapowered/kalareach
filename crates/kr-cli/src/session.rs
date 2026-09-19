@@ -796,6 +796,10 @@ async fn drive(
                                 .payload
                                 .to_typed::<kr_protocol::recovery::OutputEvent>()
                         {
+                            // The session's own bytes: this terminal is being handed the live
+                            // stream, so what it shows is the live screen whatever a projection
+                            // last said about it.
+                            showing_history = false;
                             let mut handle = output.as_ref();
                             if handle.write_all(event.bytes.as_slice()).is_err() {
                                 return AttachOutcome::Disconnected;
@@ -1329,7 +1333,8 @@ async fn drive(
                     input.extend_from_slice(&bytes);
                     (input, 0)
                 };
-                let mine = outside_a_paste && display.showing_history_buffer();
+                let mine =
+                    outside_a_paste && display.holds_screen() && display.showing_history_buffer();
                 // A key is the whole read and nothing of it goes on; a wheel report was taken out
                 // of the read, and whatever else was in that read is still the session's.
                 let key = mine.then(|| scroll_keys(&bytes)).flatten();
