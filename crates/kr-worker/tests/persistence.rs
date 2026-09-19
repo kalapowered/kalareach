@@ -1339,6 +1339,59 @@ fn the_spool_writes_its_boundary_before_it_deletes_what_supports_it() {
 }
 
 #[test]
+fn a_purge_reaches_the_files_a_lost_spool_left_on_the_disk() {
+    // A write failure drops the spool so nothing more is appended to a store that is failing.
+    // What it wrote before that is still on the disk. A privacy purge that answered "nothing to
+    // remove" because the handle had gone would be reporting a removal it never made, and the
+    // archive could still be served those segments afterwards.
+    use std::os::unix::fs::PermissionsExt as _;
+    let directory = std::env::temp_dir().join(format!("kr-persist-lost-{}", kr_ipc::new_uuid()));
+    let mut history =
+        kr_worker::history::OutputHistory::with_spool(4, &directory, SpoolLayout::new(64, 1 << 20))
+            .expect("a spool");
+    for _ in 0..8 {
+        history.append(&[b'x'; 64]);
+    }
+    let before = std::fs::read_dir(&directory)
+        .expect("reads the spool")
+        .count();
+    assert!(before > 1, "the spool wrote segments: {before}");
+
+    // The directory stops taking new files, which is what a rotation needs.
+    let mode = std::fs::metadata(&directory).expect("reads").permissions();
+    std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o500))
+        .expect("makes the directory unwritable");
+    for _ in 0..8 {
+        history.append(&[b'y'; 64]);
+    }
+    std::fs::set_permissions(&directory, mode).expect("puts the permissions back");
+    let page = history.page(0, 1024).expect("a page");
+    assert_eq!(
+        page.gap.as_ref().and_then(|gap| gap.cause),
+        Some(HistoryGapCause::SpoolUnavailable),
+        "the spool was lost rather than evicted"
+    );
+
+    let discarded = history.discard_retained();
+    assert!(
+        discarded.left_behind.is_none(),
+        "the purge finished: {:?}",
+        discarded.left_behind
+    );
+    assert!(discarded.segments > 0, "it removed the segments it found");
+    let left: Vec<_> = std::fs::read_dir(&directory)
+        .expect("reads the spool")
+        .flatten()
+        .map(|entry| entry.file_name())
+        .collect();
+    assert!(
+        left.is_empty(),
+        "a lost spool's files are gone after the purge: {left:?}"
+    );
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
 fn a_boundary_this_host_cannot_read_is_reported_rather_than_guessed_at() {
     let directory =
         std::env::temp_dir().join(format!("kr-persist-unreadable-{}", kr_ipc::new_uuid()));

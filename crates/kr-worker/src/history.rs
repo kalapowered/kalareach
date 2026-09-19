@@ -142,6 +142,14 @@ pub struct OutputHistory {
     /// A write failure narrows the retained range to the resident window, and that is a different
     /// answer from a bound being reached: it is reported as one rather than as retention.
     spool_lost: bool,
+    /// Where a spool this session lost kept what it had already written.
+    ///
+    /// The spool is dropped on a write failure so nothing more is appended to a store that is
+    /// failing. What it wrote before that is still on the disk, and is still content this session
+    /// can be asked to remove: a privacy purge that answered "nothing to remove" because the
+    /// handle had gone would be reporting a removal it never made. Keeping the directory is what
+    /// lets the purge reach those files.
+    lost_spool_directory: Option<PathBuf>,
     /// What retention took, newest last.
     ///
     /// A gap is reported by the cursors a page carries, and those say what is gone. This says
@@ -164,6 +172,7 @@ impl OutputHistory {
             spool: None,
             retaining: true,
             spool_lost: false,
+            lost_spool_directory: None,
             resident_marks: VecDeque::new(),
             evictions: VecDeque::new(),
         }
@@ -253,7 +262,9 @@ impl OutputHistory {
             && spool.append(start, bytes).is_err()
         {
             // Losing the spool costs history, not correctness: the resident window still serves
-            // recent output and everything older reads as an explicit gap.
+            // recent output and everything older reads as an explicit gap. Where it wrote is kept,
+            // because those files are still there and are still this session's to remove.
+            self.lost_spool_directory = self.spool.as_ref().map(|spool| spool.directory.clone());
             self.spool = None;
             self.spool_lost = true;
         }
@@ -362,6 +373,18 @@ impl OutputHistory {
             left_behind: None,
         };
         let Some(spool) = self.spool.as_mut() else {
+            // A spool this session lost still has files where it left them, and they are what a
+            // purge is owed. Answering "nothing to remove" over them would call the removal
+            // complete over output the archive can still be served.
+            if let Some(directory) = self.lost_spool_directory.clone() {
+                let (bytes, segments, left_behind) = remove_spool_files(&directory);
+                discarded.bytes += bytes;
+                discarded.segments += segments;
+                discarded.left_behind = left_behind;
+                if discarded.left_behind.is_none() {
+                    self.lost_spool_directory = None;
+                }
+            }
             return discarded;
         };
         if !spool.record_boundary() {
@@ -998,6 +1021,44 @@ fn read_boundary(directory: &Path) -> RecordedBoundary {
             .parse::<u64>()
             .map_or(RecordedBoundary::Unreadable, RecordedBoundary::At),
     }
+}
+
+/// Removes what a lost spool left on the disk, and says what is still there.
+///
+/// This is the purge path for a spool whose handle has gone: the segment files and the boundary
+/// are ordinary files in a directory this session owns, and removing them is what makes a privacy
+/// cleanup true rather than merely reported. A file this host cannot unlink is named rather than
+/// counted as removed.
+fn remove_spool_files(directory: &std::path::Path) -> (u64, u64, Option<String>) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return (
+            0,
+            0,
+            Some(format!(
+                "this session's spool directory at {} could not be read, so what it holds was \
+                 left where it was",
+                directory.display()
+            )),
+        );
+    };
+    let mut bytes = 0;
+    let mut removed = 0;
+    let mut left = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let size = entry.metadata().map(|data| data.len()).unwrap_or_default();
+        if std::fs::remove_file(&path).is_ok() {
+            if path.file_name().is_some_and(|name| name != BOUNDARY_FILE) {
+                bytes += size;
+                removed += 1;
+            }
+        } else {
+            left += 1;
+        }
+    }
+    let left_behind =
+        (left > 0).then(|| format!("{left} of this session's spool files could not be removed"));
+    (bytes, removed, left_behind)
 }
 
 /// Writes the boundary down, replacing it in one step, and says whether it is published.
