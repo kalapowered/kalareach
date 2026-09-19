@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// What every one of these directories is called, before the process that owns it.
+/// What every one of these directories is called, before what tells one run's from another's.
 const PREFIX: &str = "kalareach-command-tests-";
 
 /// The command binaries, on the internal disk.
@@ -64,33 +64,39 @@ pub fn command_binaries() -> &'static Path {
 
 /// Makes this run's own directory under `temporary` and returns it.
 ///
-/// It is created rather than opened, so what comes back is a directory this process made and
-/// therefore owns. A name that is already taken is not reused: nothing here can establish who owns
-/// a directory that was already there, and the sweep below decides what it may remove by comparing
-/// against the owner of this one. The name it falls back to still ends in this process's number,
-/// which is the only part of it that anything reads.
+/// Two things about the name. It is created rather than opened, so what comes back is a directory
+/// this process made and therefore owns, which is what lets the sweep below decide whose a
+/// directory is. And it carries the moment it was made as well as the number of the process that
+/// made it, so no two runs of these suites ever want the same name - a number on its own comes
+/// round again, and a sweep that had decided to remove the name a dead run left could otherwise
+/// remove a live run that had since been given the same number and made the same name. The number
+/// still ends the name, because that is the part the sweep reads.
 ///
 /// # Panics
 ///
 /// Panics when no directory can be made, which is not something these tests can go on without.
 fn make_our_own(temporary: &Path) -> PathBuf {
+    const ATTEMPTS: usize = 100;
+
     let pid = std::process::id();
-    let mut taken = 0;
-    loop {
-        let root = if taken == 0 {
-            temporary.join(format!("{PREFIX}{pid}"))
-        } else {
-            temporary.join(format!("{PREFIX}{taken}-{pid}"))
-        };
+    for _ in 0..ATTEMPTS {
+        let made_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_nanos());
+        let root = temporary.join(format!("{PREFIX}{made_at}-{pid}"));
         match std::fs::create_dir(&root) {
             Ok(()) => return root,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => taken += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => panic!(
                 "a directory for the command binaries at {}: {error}",
                 root.display()
             ),
         }
     }
+    panic!(
+        "a directory for the command binaries under {}",
+        temporary.display()
+    );
 }
 
 /// Removes the directories that earlier runs of these suites left in `temporary`, given `ours`,
@@ -103,22 +109,21 @@ fn make_our_own(temporary: &Path) -> PathBuf {
 /// directory those runs left behind, so a run that swept only its own form would tidy nothing that
 /// is actually there.
 ///
-/// The three conditions together are what make a removal safe rather than merely likely. Given a
-/// directory this user owns, a `kill -0` that answers no settles it either way: either nothing
-/// holds that number, or something does and it is not ours to signal, and a process that is not
-/// ours is not the process of ours that made this directory. What must not be read as an answer is
-/// anything that is not one - `kill` that could not be started at all, or a `kill` that was itself
-/// ended by a signal rather than by exiting - so only a plain exit code of one, which is what both
-/// of this project's platforms report for a number they cannot signal, removes anything. Confining
-/// the sweep to this user's own directories also settles what a shared temporary directory's
-/// sticky bit would otherwise leave half-done.
+/// The question put about the owner is whether it exists, not whether this process could signal
+/// it. `ps` answers the first and `kill -0` answers the second, and they differ: a process of this
+/// user that some security policy puts out of this one's reach is refused a signal while plainly
+/// existing, and a directory whose owner is still launching binaries out of it must not be taken
+/// away. Only `ps` saying that nothing holds that number - a plain exit code of one - removes
+/// anything. A question that was never asked, one whose asker was itself ended by a signal, and any
+/// other exit all leave the directory where it is. Confining the sweep to this user's own
+/// directories settles, in the same way, what a shared temporary directory's sticky bit would
+/// otherwise leave half-done.
 ///
-/// Whether the owner is running is asked of the operating system rather than assumed from an age:
-/// a suite of these can take minutes, and a directory whose owner is still launching binaries out
-/// of it is not one to take away. The cost of asking is that a number the operating system has
-/// since given to some other process keeps a directory for as long as that process lives, which on
-/// a machine that has been up for weeks can be a long time; it is the safe direction to err in,
-/// and the directories it holds are the few whose numbers came round again.
+/// Whether the owner exists is asked of the operating system rather than assumed from an age: a
+/// suite of these can take minutes. The cost of asking is that a number since given to some other
+/// process keeps a directory for as long as that process lives, which on a machine that has been
+/// up for weeks can be a long time; it is the safe direction to err in, and the directories it
+/// holds are the few whose numbers came round again.
 fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
     use std::os::unix::fs::MetadataExt;
 
@@ -129,6 +134,12 @@ fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
         return;
     };
     for entry in entries.flatten() {
+        // Never the one this run is about to launch binaries out of. Nothing below would remove
+        // it, because the process it is named after is this one; saying so here is cheaper than
+        // relying on that.
+        if entry.path() == ours {
+            continue;
+        }
         let name = entry.file_name();
         let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(PREFIX)) else {
             continue;
@@ -144,18 +155,20 @@ fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
         if !about.is_dir() || about.uid() != mine {
             continue;
         }
-        let Ok(answer) = std::process::Command::new("kill")
-            .arg("-0")
+        let Ok(answer) = std::process::Command::new("ps")
+            .arg("-p")
             .arg(owner)
+            .arg("-o")
+            .arg("pid=")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
         else {
             continue;
         };
-        // `Some(1)` and nothing else. A question that was never asked and a question whose asker
-        // was killed both arrive here looking like a failure, and neither says anything about the
-        // process this directory is named after.
+        // `Some(1)`, which is "no process holds that number", and nothing else. A question that
+        // was never asked and a question whose asker was killed both arrive here looking like a
+        // failure, and neither says anything about the process this directory is named after.
         if answer.code() == Some(1) {
             let _ = std::fs::remove_dir_all(entry.path());
         }
