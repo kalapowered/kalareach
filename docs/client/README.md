@@ -162,7 +162,7 @@ service client unconditionally and get an honest answer rather than a silent def
 | --- | --- |
 | KR-REQ-04.23 | `crates/kr-cli/tests/client_paths.rs`, and `the_local_path_is_a_socket_and_the_remote_path_is_iroh_behind_one_seam` in `crates/kr-client/tests/session.rs` |
 | KR-REQ-11.46 | `crates/kr-client/src/controls.rs` tests |
-| KR-PERF-006 | `a_reconnect_reaches_a_screen_a_terminal_can_draw_inside_the_budget` in `crates/kr-client/tests/session.rs` for the client's half, and `scripts/performance.sh` for the whole of it |
+| KR-PERF-006 | Nothing here. `a_reconnect_reaches_a_screen_a_terminal_can_draw_inside_the_budget` in `crates/kr-client/tests/session.rs` measures the client's half against a host that answers at once, which is a necessary condition and not the row's own measurement: it leaves out the attach a subscription follows and everything a real host spends |
 | KR-REQ-17.14 | `a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_change_with_one` in `crates/kr-client/tests/session.rs` |
 | KR-REQ-23.57 | `crates/kr-client/src/retry.rs` tests, and the retry tests in `crates/kr-client/tests/session.rs` |
 | KR-REQ-24.13 | `crates/kr-client/src/drafts.rs` tests, and `a_draft_outlives_its_attachment_its_connection_and_another_devices_write` in `crates/kr-client/tests/session.rs` |

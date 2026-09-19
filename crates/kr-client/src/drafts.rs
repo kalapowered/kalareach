@@ -1081,31 +1081,39 @@ fn private_directory(directory: &Path) -> std::io::Result<()> {
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
         }
     }
-    flush_path_names(directory);
-    Ok(())
+    flush_path_names(directory)
 }
 
-/// Flushes the directory entry of every name on this path.
+/// Flushes the directory entry of every name on this store's path.
 ///
 /// Creating the levels this call was missing is not enough. Another opener may have created one a
 /// moment ago and not yet flushed it, and a store that returned success under such a name would be
-/// a store whose own path a crash could lose. Flushing them all costs a handful of operations once
-/// per store, which is what opening one is.
+/// a store whose own path a crash could lose. Flushing them all costs a handful of metadata
+/// operations once per store, which is what opening one is.
 ///
-/// A failure is not reported. An ancestor this call did not create belongs to whoever did, and a
-/// directory a caller cannot open for reading is a directory this store has no business failing
-/// over: the levels it made itself were flushed above, where a failure *is* reported.
-fn flush_path_names(directory: &Path) {
-    let mut level = directory;
-    while let Some(parent) = level.parent() {
-        if parent.as_os_str().is_empty() {
-            // A relative path of one component: the working directory holds that name.
-            let _ = sync_directory(Path::new("."));
-            return;
+/// A failure is reported. A store that cannot open the directories its own path is made of cannot
+/// establish that the path survives a crash, and saying so is better than returning success that
+/// means less than it looks.
+///
+/// The path is resolved first, so what is flushed is the names the filesystem actually holds rather
+/// than the ones the caller spelled. A symbolic link in the way leads to its target, and the
+/// target's ancestors are what a draft under it depends on.
+fn flush_path_names(directory: &Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        let resolved = std::fs::canonicalize(directory)?;
+        let mut level = resolved.as_path();
+        while let Some(parent) = level.parent() {
+            sync_directory(parent)?;
+            level = parent;
         }
-        let _ = sync_directory(parent);
-        level = parent;
     }
+    #[cfg(not(unix))]
+    {
+        // Nothing here flushes a directory on Windows, so there is nothing to walk.
+        let _ = directory;
+    }
+    Ok(())
 }
 
 /// The directory one name lives in.
@@ -1462,6 +1470,37 @@ mod tests {
         assert_eq!(holder_of(Path::new("beside-me")), Path::new("."));
         assert_eq!(holder_of(Path::new("support/drafts")), Path::new("support"));
         assert_eq!(holder_of(&deep), deep.parent().expect("a parent"));
+    }
+
+    #[test]
+    fn a_store_reached_through_a_link_makes_its_targets_own_names_durable() {
+        // What a draft under a link depends on is the names the filesystem holds, not the ones the
+        // caller spelled, so the walk resolves the path before it flushes anything.
+        let directory = tempfile::tempdir().expect("a directory");
+        let target = directory.path().join("data").join("drafts");
+        let store = DraftStore::open(&target, device()).expect("a store");
+        let draft = store
+            .create(
+                open_target(),
+                "through a link".to_owned(),
+                TimestampMs::new(1),
+            )
+            .expect("a draft");
+
+        #[cfg(unix)]
+        {
+            let link = directory.path().join("links");
+            std::os::unix::fs::symlink(directory.path().join("data"), &link).expect("a link");
+            let through_the_link =
+                DraftStore::open(link.join("drafts"), device()).expect("a store through a link");
+            assert_eq!(
+                through_the_link
+                    .load(draft.draft_id)
+                    .expect("the same draft")
+                    .text,
+                "through a link"
+            );
+        }
     }
 
     #[test]
