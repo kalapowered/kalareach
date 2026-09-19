@@ -837,9 +837,15 @@ async fn kr_req_11_33_what_changes_inside_the_admission_interval_is_still_a_reje
             let outcome = send(&mut client, mutation).await;
             (outcome, client)
         });
-        tokio::task::spawn_blocking(move || arrived.recv().expect("the service reached the pause"))
-            .await
-            .expect("the wait finishes");
+        // Bounded, because the service keeps the other end of this channel: a request that
+        // answered without reaching the pause would leave an unbounded wait rather than a failure.
+        tokio::task::spawn_blocking(move || {
+            arrived
+                .recv_timeout(std::time::Duration::from_secs(20))
+                .expect("the service reached the pause before its admission")
+        })
+        .await
+        .expect("the wait finishes");
 
         // The receipt is durably accepted and nothing has been marked for dispatch.
         let (state, events) = durable(&host, action_id);
