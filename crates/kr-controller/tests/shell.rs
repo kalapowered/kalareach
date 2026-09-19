@@ -574,10 +574,13 @@ fn the_terminal_is_chosen_in_order_and_a_host_with_none_says_so_once() {
     );
 }
 
+/// One request a presenter was asked to open: the application named, and the command.
+type PresentationRequest = (Option<String>, Vec<String>);
+
 /// A presenter that opens nothing and records what it was asked to open.
 #[derive(Debug, Clone, Default)]
 struct RefusingTerminal {
-    asked: Arc<std::sync::Mutex<Vec<(Option<String>, Vec<String>)>>>,
+    asked: Arc<std::sync::Mutex<Vec<PresentationRequest>>>,
 }
 
 impl kr_controller::supervision::TerminalPresenter for RefusingTerminal {
@@ -683,7 +686,11 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
 
     // Exactly one, and the window it would have opened names the session's own identifier and its
     // environment rather than a display number.
-    let asked = presenter.asked.lock().expect("the record is not poisoned");
+    let asked: Vec<PresentationRequest> = presenter
+        .asked
+        .lock()
+        .expect("the record is not poisoned")
+        .clone();
     assert_eq!(asked.len(), 1, "a presentation is attempted once");
     let (requested, command) = &asked[0];
     assert_eq!(requested.as_deref(), None);
@@ -694,7 +701,6 @@ async fn a_terminal_that_cannot_be_opened_leaves_one_live_session_and_a_presenta
         !command.contains(&created.session.display_number.to_string()),
         "a window opened on a display number would attach to whichever environment resolved it"
     );
-    drop(asked);
 
     let listed: kr_protocol::session::SessionListResult = client
         .request(
