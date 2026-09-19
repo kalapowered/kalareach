@@ -19,12 +19,12 @@ kr-ipc.workspace = true
 kr-protocol.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
+
 # A startup file is rewritten under a lock the kernel holds, so a `kr` process that dies releases
 # it rather than leaving a file every later write would wait on.
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["fs"] }
-
-thiserror.workspace = true
 
 [dev-dependencies]
 # The package tests drive a built shell in a real pseudo-terminal and check its proof against the
