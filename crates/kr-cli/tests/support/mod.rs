@@ -11,7 +11,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-/// What every one of these directories is called, before what tells one run's from another's.
+/// What every one of these directories is called, before what tells one run's from every other's.
 const PREFIX: &str = "kalareach-command-tests-";
 
 /// The command binaries, on the internal disk.
@@ -23,21 +23,19 @@ const PREFIX: &str = "kalareach-command-tests-";
 /// operating system does not guard, and every test launches them from there. Both are copied
 /// together and keep their names, because `kr` looks for its restoration guard beside itself.
 ///
-/// The directory belongs to this process, because two runs of two different builds sharing one
-/// would each be launching the other's binaries. A directory named after a process nobody is
-/// running was nobody's to remove, so each run of each of these suites left half a gigabyte of
-/// copied binaries where it fell, and a machine that runs them all day filled its temporary
-/// filesystem with them. A run still leaves its own behind - it is launching binaries out of it
-/// until it ends, and a run that is killed never reaches its own end - so what changed is that
-/// each run takes away the ones the runs before it left, at the one moment when whether they are
-/// still in use can be asked rather than guessed.
+/// The directory belongs to this run alone, and it goes when this run does. Half a gigabyte of
+/// copied binaries left behind by every run of every one of these suites is what filled a build
+/// machine's temporary filesystem, and a directory nobody owns any more is nobody's to remove.
+/// What owns this one is the process that made it, for exactly as long as it is running.
 pub fn command_binaries() -> &'static Path {
     static COPIED: OnceLock<PathBuf> = OnceLock::new();
     COPIED.get_or_init(|| {
         let temporary = std::env::temp_dir();
-        let root = make_our_own(&temporary);
+        let root = temporary.join(this_runs_name());
+        std::fs::create_dir(&root).expect("a directory of this run's own for the command binaries");
+        take_it_away_when_this_run_ends(&root);
         // After this run's own directory exists, because a directory this run certainly made is
-        // what says which user "ours" means below.
+        // what says which user the sweep may act for.
         remove_what_earlier_runs_left(&temporary, &root);
         for source in [
             Path::new(env!("CARGO_BIN_EXE_kr")),
@@ -62,78 +60,92 @@ pub fn command_binaries() -> &'static Path {
     })
 }
 
-/// Makes this run's own directory under `temporary` and returns it.
+/// What this run calls its directory: the suite, the process, and a token of this run's own.
 ///
-/// Two things about the name. It is created rather than opened, so what comes back is a directory
-/// this process made and therefore owns, which is what lets the sweep below decide whose a
-/// directory is. And it carries the moment it was made as well as the number of the process that
-/// made it, so no two runs of these suites ever want the same name - a number on its own comes
-/// round again, and a sweep that had decided to remove the name a dead run left could otherwise
-/// remove a live run that had since been given the same number and made the same name. The number
-/// still ends the name, because that is the part the sweep reads.
+/// The token is what makes the name this run's and no other's. A number comes round again - the
+/// operating system gives it to a later process, which would then want a name an earlier one had
+/// already used - and a name two runs can both want is a name one of them can take away from the
+/// other. A reading of the clock and a value drawn when this process started never repeat together,
+/// so no run of any build, before this one or beside it, can produce this name.
 ///
-/// # Panics
-///
-/// Panics when no directory can be made, which is not something these tests can go on without.
-fn make_our_own(temporary: &Path) -> PathBuf {
-    const ATTEMPTS: usize = 100;
+/// The number stays in it because the sweep below reads it, and the suite's name stays in it
+/// because a person looking at a temporary directory should be able to see which test made what.
+fn this_runs_name() -> String {
+    use std::hash::{BuildHasher, Hasher};
 
-    let pid = std::process::id();
-    for _ in 0..ATTEMPTS {
-        let made_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |since| since.as_nanos());
-        let root = temporary.join(format!("{PREFIX}{made_at}-{pid}"));
-        match std::fs::create_dir(&root) {
-            Ok(()) => return root,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => panic!(
-                "a directory for the command binaries at {}: {error}",
-                root.display()
-            ),
-        }
-    }
-    panic!(
-        "a directory for the command binaries under {}",
-        temporary.display()
-    );
+    let started = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_nanos());
+    // Drawn once for this process by the standard library, from the operating system's own source.
+    let drawn = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    format!(
+        "{PREFIX}{}-{}-{started:x}{drawn:016x}",
+        env!("CARGO_CRATE_NAME"),
+        std::process::id()
+    )
 }
 
-/// Removes the directories that earlier runs of these suites left in `temporary`, given `ours`,
-/// the one this run made.
+/// Arranges for `root` to be taken away when this process ends, however it ends.
 ///
-/// A candidate's name is the prefix above and then, at its end, the number of the process that made
-/// it. Whether the name of a test binary or the moment of a run stands between the two makes no
-/// difference: those are the forms this helper has used, and every directory left behind is in one
-/// of them, so a sweep that knew only the newest form would tidy nothing that is actually there.
+/// A run cannot remove its own directory on the way out: it is launching binaries out of it until
+/// it ends, the harness that runs these tests ends the process itself rather than returning
+/// through anything this module could hook, and a run that is killed reaches no ending of its own
+/// at all. So the ending is watched from outside. A small process is started that reads from a
+/// pipe this one holds the other end of and does nothing else; when this process ends, every
+/// descriptor it held closes, the read reaches its end, and the directory goes. That is true of
+/// every way a process can end, including being killed, and it does not depend on recognising this
+/// process afterwards by a number that may by then belong to something else.
 ///
-/// Four things are then established before anything is removed, and each answers a way this could
-/// take away something it should not.
+/// The end this run holds is kept for the life of the process on purpose. Dropping it would be
+/// telling the watcher to remove the directory these tests are still launching binaries from.
+fn take_it_away_when_this_run_ends(root: &Path) {
+    static HELD: OnceLock<std::process::ChildStdin> = OnceLock::new();
+
+    let Ok(mut watching) = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(r#"cat >/dev/null; rm -rf -- "$1""#)
+        .arg("sh")
+        .arg(root)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    else {
+        // Nothing to do about it here. The sweep below is what answers for a run whose ending
+        // nothing watched.
+        return;
+    };
+    if let Some(end) = watching.stdin.take() {
+        let _ = HELD.set(end);
+    }
+}
+
+/// Removes what runs whose ending nothing watched left behind in `temporary`, given `ours`, the
+/// directory this run made.
+///
+/// Only names of the form above are considered, and nothing else in the temporary directory is
+/// touched. That is what makes this safe to do while other runs are going on: a name carrying a
+/// token of one run's own is a name no other run can ever produce, so a directory found under one
+/// either belongs to a run that is still going - and is left alone - or to one that has ended. The
+/// directories that earlier versions of these suites left under a name of a process number alone
+/// are not this sweep's to judge, because a number comes round again and a name two runs can both
+/// want is one this could take from under a living run.
+///
+/// Two things are established before anything is removed.
 ///
 /// * It is a directory, read without following a symbolic link, and the user who owns it is the
 ///   user who owns `ours` - which is a directory this process made, so that user is this
-///   process's. This is also what settles what a shared temporary directory's sticky bit would
-///   leave half-done.
-/// * Nothing holds the number its name ends in. The question is put to the kernel rather than to a
+///   process's. This also settles what a shared temporary directory's sticky bit would leave
+///   half-done.
+/// * No process holds the number in its name. The question goes to the kernel rather than to a
 ///   command, because what has to be told apart is "no such process" from "that process is not
-///   yours to signal", and a command reports both as a failure. Only the first removes anything.
-/// * It was last written to before `ours` was made. Everything genuinely left behind is older than
-///   this run; a directory that something else has touched since is something else's business.
-/// * It is still the same directory at the moment of removal as it was when all of that was
-///   established - the same filesystem object, unchanged. A name released by one run and taken
-///   again by another is a different object under the same name, and this is what keeps a sweep
-///   that had decided about the first from reaching the second.
-///
-/// A number since given to another process keeps a directory for as long as that process lives,
-/// which on a machine that has been up for weeks can be a long time; that is the safe direction to
-/// err in, and the directories it holds are the few whose numbers came round again.
+///   yours to signal", and a command reports both as a failure.
 fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
     use std::os::unix::fs::MetadataExt;
 
     let Ok(us) = std::fs::metadata(ours) else {
-        return;
-    };
-    let Ok(began) = us.modified() else {
         return;
     };
     let Ok(entries) = std::fs::read_dir(temporary) else {
@@ -145,14 +157,7 @@ fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
             continue;
         }
         let name = entry.file_name();
-        let Some(rest) = name.to_str().and_then(|name| name.strip_prefix(PREFIX)) else {
-            continue;
-        };
-        let Some(owner) = rest
-            .rsplit('-')
-            .next()
-            .and_then(|end| end.parse::<i32>().ok())
-        else {
+        let Some(owner) = name.to_str().and_then(one_of_ours) else {
             continue;
         };
         let Ok(about) = entry.metadata() else {
@@ -161,35 +166,40 @@ fn remove_what_earlier_runs_left(temporary: &Path, ours: &Path) {
         if !about.is_dir() || about.uid() != us.uid() {
             continue;
         }
-        if !about.modified().is_ok_and(|written| written < began) {
-            continue;
-        }
         if !nothing_holds(owner) {
-            continue;
-        }
-        let Ok(still) = entry.metadata() else {
-            continue;
-        };
-        if still.dev() != about.dev()
-            || still.ino() != about.ino()
-            || still.modified().ok() != about.modified().ok()
-        {
             continue;
         }
         let _ = std::fs::remove_dir_all(entry.path());
     }
 }
 
+/// The process number in `name`, when `name` is one of the directories this module makes.
+///
+/// It is the prefix, then a suite, then a number, then a token: four parts, and the last two are
+/// what this reads. A name of fewer parts is one an earlier version of these suites made and is
+/// not answered for here, and neither is one whose number or token is not what it should be.
+fn one_of_ours(name: &str) -> Option<i32> {
+    let rest = name.strip_prefix(PREFIX)?;
+    let mut parts = rest.rsplitn(3, '-');
+    let token = parts.next()?;
+    let number = parts.next()?;
+    let suite = parts.next()?;
+    let known = !suite.is_empty()
+        && token.len() >= 16
+        && token.bytes().all(|byte| byte.is_ascii_hexdigit());
+    known.then(|| number.parse().ok())?
+}
+
 /// Whether no process holds `number`.
 ///
 /// `kill(number, 0)` sends nothing and answers with the kernel's own error, which is the only
 /// thing that tells "no such process" apart from "that process is not yours to signal". A command
-/// would report both as a failure, and so would every other way of asking that this one could not
-/// start, so the syscall is what is asked. Anything but "no such process" is read as something
-/// holding the number, which leaves the directory where it is.
+/// reports both as a failure, and reports a question it could not ask as one too, so the syscall
+/// is what is asked. Anything but "no such process" is read as something holding the number, which
+/// leaves the directory where it is.
 fn nothing_holds(number: i32) -> bool {
     let Some(pid) = rustix::process::Pid::from_raw(number) else {
-        // Not a number any process can hold, and not one this helper wrote either.
+        // Not a number any process can hold, and not one this module ever wrote.
         return false;
     };
     matches!(
