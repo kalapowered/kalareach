@@ -1318,10 +1318,12 @@ reported stale rather than current.
 `grants::policy` holds what is true of this host rather than of one grant.
 
 * **Organisation leases.** A signed membership lease lasts at most 15 minutes and is held per
-  member account. When a grant that requires membership is decided, the lease is checked against
-  the clock rather than against whether a socket is open, so an expired membership blocks
-  organisation-mediated reads and mutations while the transport stays connected, and one member's
-  lease never answers for another.
+  member account. When `grants::decide` decides a grant that requires membership, the lease is
+  checked against the clock rather than against whether a socket is open, so an expired membership
+  blocks organisation-mediated reads and mutations while the transport stays connected, and one
+  member's lease never answers for another. A paired device's session request is decided at the
+  network boundary against the grant its pairing recorded, which is the other of the two stores
+  described above.
   A lease longer than 15 minutes, signed under an unpinned key revision, or wider than its role's
   ceiling is not stored at all. Personal local owner access continues through an organisation
   outage unless the host is exclusively organisation-managed.

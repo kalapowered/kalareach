@@ -312,9 +312,10 @@ own, so a different version could be a different profile.
 This crate issues grants and validates the rules for the kind being issued. What happens to a grant
 after it exists belongs to the control daemon, and `docs/host/README.md` states it: the intersection
 it takes when it decides a request, the revocation cascade along the parent link, the per-worker
-dispatch barrier a revocation completes through, the organisation lease that stops a grant while the
-transport stays connected once the host holds one, and the bounded offline-validity policy an owner
-may choose.
+dispatch barrier a revocation completes through, the organisation lease that stops a grant
+while the transport stays connected, and the bounded offline-validity policy an owner may choose.
+Those are rules the control daemon implements and decides with `grants::decide`; a paired device's
+session request is decided at the network boundary, against the grant its pairing recorded.
 
 Two rules cross the boundary and are worth stating on both sides.
 

@@ -155,6 +155,17 @@ impl ConfirmedTransfer {
             destination_keys: Some(host.recipient_keys),
             destination_rights: &plan.actions,
         };
+        // The deadline this host is enforcing for this challenge, read from the ledger before the
+        // acceptance consumes it. It is monotonic and belongs to a boot, which is what makes it a
+        // deadline the wall clock cannot lengthen; recomputing one from `expires_at_ms` would take
+        // whatever the wall clock said at acceptance, and a clock that had gone back in the
+        // meantime would hand the confirmation more life than it was issued with.
+        let (boot, expires_at_monotonic_ms) =
+            ledger.deadline(request.confirmation_id).ok_or_else(|| {
+                ControllerError::PermissionDenied {
+                    detail: "this host has no such outstanding confirmation".to_owned(),
+                }
+            })?;
         kr_pairing::confirm::accept_confirmation(
             ledger,
             clock,
@@ -167,21 +178,11 @@ impl ConfirmedTransfer {
         .map_err(|error| ControllerError::PermissionDenied {
             detail: format!("the owner's confirmation does not authorise this transfer: {error}"),
         })?;
-        // What is left of the challenge's **own** deadline, carried onto this host's monotonic
-        // clock. Starting a fresh lifetime at acceptance would give a challenge answered a second
-        // before it expired another two minutes of life, which is exactly what a short expiry is
-        // there to prevent. The wall clock is read once, here, to measure the remainder; the
-        // deadline the transfer enforces is monotonic and bound to this boot, so nothing the wall
-        // clock does afterwards lengthens it.
-        let remaining = request
-            .expires_at_ms
-            .get()
-            .saturating_sub(clock.wall_clock_ms());
         Ok(Self {
             action_digest,
             host_device_id: host.device_id,
-            boot: clock.boot_identity(),
-            expires_at_monotonic_ms: clock.monotonic_ms().saturating_add(remaining),
+            boot,
+            expires_at_monotonic_ms,
         })
     }
 

@@ -244,6 +244,19 @@ impl ConfirmationLedger {
             .map(|challenge| &challenge.request)
     }
 
+    /// Returns the deadline this host will enforce for an outstanding challenge, and its boot.
+    ///
+    /// The deadline is monotonic and belongs to one boot, which is what makes it a deadline a
+    /// moving wall clock cannot lengthen. A caller that carries the acceptance forward carries
+    /// *these* values rather than recomputing anything from the wall clock, because the wall clock
+    /// may have moved between the moment the challenge was issued and the moment it was answered.
+    #[must_use]
+    pub fn deadline(&self, confirmation_id: ConfirmationId) -> Option<(BootIdentity, u64)> {
+        self.outstanding
+            .get(confirmation_id.get().as_bytes())
+            .map(|challenge| (challenge.boot_identity, challenge.deadline_monotonic_ms))
+    }
+
     /// Consumes a challenge, which succeeds exactly once and only before its deadline.
     ///
     /// The presented challenge must equal the one the host issued, member for member.

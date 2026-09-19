@@ -311,6 +311,50 @@ fn a_confirmation_keeps_its_own_deadline_and_its_own_boot() {
         error.to_string().contains("earlier boot"),
         "unexpected refusal: {error}"
     );
+
+    // And a wall clock that went **back** between issue and acceptance buys nothing. The deadline
+    // this host enforces is the monotonic one it recorded when it issued the challenge, so a
+    // second acceptance staged that way expires at the same moment as the first.
+    let rolled_back = Staged {
+        monotonic_ms: std::sync::atomic::AtomicU64::new(5_000 + lifetime - 1_000),
+        wall_clock_ms: 1_000,
+        boot: std::sync::Mutex::new([3; 32]),
+    };
+    let request = kr_pairing::confirm::request_confirmation(
+        &issuing,
+        TransferPlan::sensitive_action(),
+        plan.action_digest().expect("a digest"),
+        Some(keys),
+        plan.actions.iter().copied().collect(),
+        host.device_id,
+        host.endpoint_id,
+    )
+    .expect("a challenge");
+    let mut ledger = kr_pairing::confirm::ConfirmationLedger::new();
+    ledger.issue(&request, &issuing);
+    let proof = kr_pairing::confirm::sign_confirmation(
+        &owner_key,
+        &request,
+        kr_protocol::pairing::ConfirmationChannel::PairedOwnerDevice,
+    )
+    .expect("a proof");
+    let confirmed = ConfirmedTransfer::verify(
+        &plan,
+        &host,
+        &mut ledger,
+        &rolled_back,
+        &request,
+        &proof,
+        owner_key.public(),
+        kr_pairing::confirm::HostEnrolment::Enrolled,
+    )
+    .expect("accepted while the wall clock said the challenge had just been issued");
+    rolled_back
+        .monotonic_ms
+        .store(5_000 + lifetime + 1, std::sync::atomic::Ordering::SeqCst);
+    confirmed
+        .covers(&plan, host.device_id, &rolled_back)
+        .expect_err("a wall clock that went back does not lengthen the deadline");
 }
 
 /// A challenge answered for another host does not confirm a transfer on this one.

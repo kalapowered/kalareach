@@ -497,9 +497,15 @@ impl SharingService {
             revoked_at_ms: None,
             revoked_by_parent: None,
         };
+        let host_device_id = self.host_device_id;
         let revoked =
             self.grants
                 .transfer(plan.revoking_grant_id, &replacement, now_ms, |source| {
+                    // Again, inside the transaction. The check above happened before the store's
+                    // lock was taken, and a confirmation's deadline is short enough that a wait
+                    // for that lock can outlast it; a check before a wait proves only what was
+                    // true before the wait.
+                    confirmation.covers(plan, host_device_id, clock)?;
                     transfer::check_transfer(plan, &source.grant)
                 })?;
         Ok(ControlTransfer {
