@@ -377,7 +377,8 @@ impl OutputHistory {
             // purge is owed. Answering "nothing to remove" over them would call the removal
             // complete over output the archive can still be served.
             if let Some(directory) = self.lost_spool_directory.clone() {
-                let (bytes, segments, left_behind) = remove_spool_files(&directory);
+                let (bytes, segments, left_behind) =
+                    remove_spool_files(&directory, self.next_cursor);
                 discarded.bytes += bytes;
                 discarded.segments += segments;
                 discarded.left_behind = left_behind;
@@ -1025,11 +1026,26 @@ fn read_boundary(directory: &Path) -> RecordedBoundary {
 
 /// Removes what a lost spool left on the disk, and says what is still there.
 ///
-/// This is the purge path for a spool whose handle has gone: the segment files and the boundary
-/// are ordinary files in a directory this session owns, and removing them is what makes a privacy
-/// cleanup true rather than merely reported. A file this host cannot unlink is named rather than
-/// counted as removed.
-fn remove_spool_files(directory: &std::path::Path) -> (u64, u64, Option<String>) {
+/// This is the purge path for a spool whose handle has gone: the segment files are ordinary files
+/// in a directory this session owns, and removing them is what makes a privacy cleanup true
+/// rather than merely reported. A file this host cannot unlink, and a directory it cannot read,
+/// are named rather than counted as removed.
+///
+/// The boundary is written first and kept. It says where this session's output got to, which is
+/// what makes the range that went read as a gap rather than as a session that started at nought,
+/// and it is a number rather than content, so privacy mode has no reason to take it.
+fn remove_spool_files(directory: &Path, boundary: u64) -> (u64, u64, Option<String>) {
+    if !write_boundary(directory, boundary) {
+        return (
+            0,
+            0,
+            Some(
+                "this session's spool boundary could not be written, so what its lost spool left \
+                 was kept rather than deleted behind a range nothing could account for"
+                    .to_owned(),
+            ),
+        );
+    }
     let Ok(entries) = std::fs::read_dir(directory) else {
         return (
             0,
@@ -1044,14 +1060,20 @@ fn remove_spool_files(directory: &std::path::Path) -> (u64, u64, Option<String>)
     let mut bytes = 0;
     let mut removed = 0;
     let mut left = 0;
-    for entry in entries.flatten() {
+    for entry in entries {
+        // An entry this host could not even read is an entry it cannot say it removed.
+        let Ok(entry) = entry else {
+            left += 1;
+            continue;
+        };
         let path = entry.path();
+        if path.file_name().is_some_and(|name| name == BOUNDARY_FILE) {
+            continue;
+        }
         let size = entry.metadata().map(|data| data.len()).unwrap_or_default();
         if std::fs::remove_file(&path).is_ok() {
-            if path.file_name().is_some_and(|name| name != BOUNDARY_FILE) {
-                bytes += size;
-                removed += 1;
-            }
+            bytes += size;
+            removed += 1;
         } else {
             left += 1;
         }

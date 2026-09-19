@@ -1339,6 +1339,7 @@ fn the_spool_writes_its_boundary_before_it_deletes_what_supports_it() {
 }
 
 #[test]
+#[cfg(unix)]
 fn a_purge_reaches_the_files_a_lost_spool_left_on_the_disk() {
     // A write failure drops the spool so nothing more is appended to a store that is failing.
     // What it wrote before that is still on the disk. A privacy purge that answered "nothing to
@@ -1383,10 +1384,18 @@ fn a_purge_reaches_the_files_a_lost_spool_left_on_the_disk() {
         .expect("reads the spool")
         .flatten()
         .map(|entry| entry.file_name())
+        .filter(|name| name != "boundary")
         .collect();
     assert!(
         left.is_empty(),
-        "a lost spool's files are gone after the purge: {left:?}"
+        "a lost spool's segments are gone after the purge: {left:?}"
+    );
+    // The boundary stays, because it is where this session's output got to rather than content,
+    // and a reader that lost it would be told the session started at nought.
+    let page = history.page(0, 1024).expect("a page");
+    assert!(
+        page.gap.is_present(),
+        "the range that went still reads as a gap after the purge"
     );
     std::fs::remove_dir_all(&directory).ok();
 }
