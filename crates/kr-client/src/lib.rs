@@ -29,6 +29,7 @@
 //! | [`reconnect`] | The reconnect loop and what it refuses to carry across |
 //! | [`retry`] | What a failure means for the request, and what it means for the person |
 //! | [`services`] | Replaceable service clients and the null implementation |
+//! | [`uploads`] | One upload, from a local file to a verified attachment handle |
 //!
 //! # What this crate does not do
 //!
@@ -50,6 +51,7 @@ pub mod retry;
 pub mod services;
 pub mod session;
 pub mod transport;
+pub mod uploads;
 pub mod viewport;
 
 pub use error::{ClientError, Result};

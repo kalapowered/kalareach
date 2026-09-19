@@ -1,0 +1,59 @@
+[package]
+name = "companion-tauri"
+description = "The KalaReach companion application's native backend: the named commands the WebView may call, and nothing else"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lib]
+# The desktop binary and the tests share one library. `cdylib` is what the mobile targets link.
+name = "companion_tauri"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[bin]]
+name = "kalareach-companion"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { workspace = true, features = [] }
+
+[dependencies]
+kr-cbor.workspace = true
+# The shared native client: sessions, cursors, projection, drafts, controls and the upload path.
+kr-client.workspace = true
+kr-protocol.workspace = true
+kr-term.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tauri.workspace = true
+tauri-plugin-dialog.workspace = true
+tauri-plugin-opener.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+ureq.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# The platform user-verification ceremony section 10 asks for on an unlocked owner device.
+block2.workspace = true
+objc2.workspace = true
+objc2-foundation = { workspace = true, features = ["std", "NSString", "NSError"] }
+objc2-local-authentication = { workspace = true, features = ["std", "LAContext", "LAError", "block2"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+# The workspace forbids unsafe code, which the macOS user-verification ceremony cannot honour: it
+# is a call into Apple's LocalAuthentication runtime and there is no safe wrapper for it. This
+# crate denies it instead and allows it in exactly one function, in `verify`. Nothing else here may
+# relax the rule.
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "deny"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }

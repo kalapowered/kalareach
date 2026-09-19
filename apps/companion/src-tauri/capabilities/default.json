@@ -1,0 +1,19 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "What the bundled interface may reach: this application's own named commands, the window it is drawn in, the events it listens for, and one save dialog. There is no shell, no general filesystem path and no general HTTP.",
+  "windows": ["main"],
+  "local": true,
+  "permissions": [
+    "core:default",
+    "core:event:allow-listen",
+    "core:event:allow-unlisten",
+    "core:window:allow-start-dragging",
+    "core:window:allow-set-title",
+    "dialog:allow-save",
+    {
+      "identifier": "opener:allow-open-url",
+      "allow": [{ "url": "https://*" }, { "url": "mailto:*" }]
+    }
+  ]
+}
