@@ -116,8 +116,8 @@ struct HostScript {
     actions: Mutex<Vec<kr_protocol::ids::ActionId>>,
     /// The window identifiers the client presented, in order.
     windows: Mutex<Vec<String>>,
-    /// Answer the next read with this error instead of a result.
-    refuse_reads_with: Mutex<Option<ErrorCode>>,
+    /// Answer this many of the next reads with this error instead of a result.
+    refuse_reads_with: Mutex<Option<(ErrorCode, u32)>>,
     /// Answer every mutation with a correlated protocol error instead of a receipt.
     refuse_mutations_with: Mutex<Option<ErrorCode>>,
 }
@@ -191,13 +191,19 @@ fn spawn_host(
                     let answer = match frame {
                         ControlFrame::Request(request) => {
                             script.reads.fetch_add(1, Ordering::AcqRel);
-                            let refusal = script.refuse_reads_with.lock().await.take();
+                            let refusal = {
+                                let mut held = script.refuse_reads_with.lock().await;
+                                match held.as_mut() {
+                                    Some((code, left)) if *left > 0 => {
+                                        *left -= 1;
+                                        Some(*code)
+                                    }
+                                    _ => None,
+                                }
+                            };
                             let outcome = match refusal {
                                 Some(code) => Outcome::Error(ProtocolError::new(code, "refused")),
-                                None => Outcome::Ok(
-                                    ParamsValue::from_typed(&SessionList { count: 2 })
-                                        .expect("a result"),
-                                ),
+                                None => Outcome::Ok(answer_read(&request)),
                             };
                             ControlFrame::Response(Response {
                                 request_id: request.request_id,
@@ -248,6 +254,23 @@ fn spawn_host(
             });
         }
     })
+}
+
+/// What the host answers one read with.
+///
+/// A restoration asks for a subscription before it installs anything, so that one answer is the
+/// protocol's own; everything else in these tests is a listing.
+fn answer_read(request: &kr_protocol::envelope::Request) -> ParamsValue {
+    if request.method.as_str() == kr_protocol::method::Method::EventsSubscribe.entry().name {
+        return ParamsValue::from_typed(&kr_protocol::recovery::EventsSubscribeResult {
+            stream_id: StreamId::new("session:1").expect("a stream identifier"),
+            from_cursor: U64::ZERO,
+            oldest_retained_cursor: U64::ZERO,
+            gap: Nullable::null(),
+        })
+        .expect("a result");
+    }
+    ParamsValue::from_typed(&SessionList { count: 2 }).expect("a result")
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug, PartialEq, Eq)]
@@ -396,7 +419,7 @@ async fn a_resynchronisation_requirement_is_its_own_error() {
     let host = side(1, true).await;
     let client = side(2, false).await;
     let script = Arc::new(HostScript::default());
-    *script.refuse_reads_with.lock().await = Some(ErrorCode::ResyncRequired);
+    *script.refuse_reads_with.lock().await = Some((ErrorCode::ResyncRequired, 1));
     let serving = spawn_host(&host, client.record, Arc::clone(&script), None);
     let session = connect(&client, &host).await;
 
@@ -769,7 +792,7 @@ async fn a_transient_refusal_of_an_idempotent_read_is_sent_again_and_never_reach
     let session = connect(&client, &host).await;
 
     // The host refuses the first read with a transient code and answers the next one.
-    *script.refuse_reads_with.lock().await = Some(ErrorCode::ResourceUnavailable);
+    *script.refuse_reads_with.lock().await = Some((ErrorCode::ResourceUnavailable, 1));
     let listing: SessionList = session
         .read(Method::SessionList, &Empty {})
         .await
@@ -795,7 +818,7 @@ async fn a_refusal_that_a_retry_cannot_change_comes_straight_back_with_its_actio
 
     // A configuration failure. Sending it again cannot change the answer, so the library does not,
     // even though the host would have answered the second attempt.
-    *script.refuse_reads_with.lock().await = Some(ErrorCode::PermissionDenied);
+    *script.refuse_reads_with.lock().await = Some((ErrorCode::PermissionDenied, 1));
     let error = session
         .read::<_, SessionList>(Method::SessionList, &Empty {})
         .await
@@ -1575,4 +1598,278 @@ async fn a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_chan
     assert_eq!(first.4, second.4, "the control decision differed");
     // The one thing that does differ is whether anything is configured, which is the point.
     assert!(first.5 && !second.5);
+}
+
+/// The canonical size KR-PERF-006 names.
+const PERF_ROWS: u64 = 40;
+const PERF_COLUMNS: u64 = 120;
+
+/// The state half of a projected screen of that size.
+fn perf_snapshot() -> Box<kr_protocol::projection::ProjectionSnapshot> {
+    use kr_protocol::projection::{
+        CharsetState, KittyKeyboardState, MarginState, PaletteProvenance, PaletteState,
+        ProjectedBuffer, ProjectedCursor, ProjectedKeyboard, ProjectedMode, ProjectedModeKind,
+        ProjectedTitle, ProjectedViewport, ProjectionSnapshot, Rgb,
+    };
+
+    let colour = Rgb {
+        red: 1,
+        green: 2,
+        blue: 3,
+    };
+    Box::new(ProjectionSnapshot {
+        projection_generation: U64::new(1),
+        output_cursor: U64::new(1),
+        active_buffer: ProjectedBuffer::Primary,
+        dimensions: kr_protocol::session::Dimensions::new(PERF_COLUMNS, PERF_ROWS),
+        viewport: ProjectedViewport {
+            top_row: U64::ZERO,
+            rows: U64::new(PERF_ROWS),
+            left_column: U64::ZERO,
+            columns: U64::new(PERF_COLUMNS),
+        },
+        cursor: ProjectedCursor {
+            column: U64::ZERO,
+            row: U64::ZERO,
+            visible: true,
+            style: U64::new(1),
+            pending_wrap: false,
+        },
+        saved_cursors: Vec::new(),
+        margins: MarginState {
+            top: U64::ZERO,
+            bottom: U64::new(PERF_ROWS - 1),
+            left: U64::ZERO,
+            right: U64::new(PERF_COLUMNS - 1),
+        },
+        rendition: kr_protocol::projection::CellRendition::PLAIN,
+        tab_stops: vec![U64::ZERO],
+        charsets: CharsetState {
+            g0: "Ascii".to_owned(),
+            g1: "Ascii".to_owned(),
+            shift_out: false,
+        },
+        modes: vec![ProjectedMode {
+            kind: ProjectedModeKind::Dec,
+            mode: U64::new(7),
+            enabled: true,
+        }],
+        keypad_application: false,
+        keyboard: ProjectedKeyboard {
+            modify_other_keys: U64::ZERO,
+            primary: KittyKeyboardState {
+                flags: Nullable::null(),
+                stack: Vec::new(),
+            },
+            alternate: KittyKeyboardState {
+                flags: Nullable::null(),
+                stack: Vec::new(),
+            },
+        },
+        title: ProjectedTitle::default(),
+        title_stack: Vec::new(),
+        hyperlink: Nullable::null(),
+        palette: PaletteState {
+            source: PaletteProvenance::DarkPreset,
+            foreground: colour,
+            background: colour,
+            cursor: colour,
+            pointer_foreground: colour,
+            pointer_background: colour,
+            selection_background: colour,
+            selection_foreground: colour,
+            overrides: Vec::new(),
+        },
+        oldest_retained_row: U64::ZERO,
+        evicted: false,
+        degraded: false,
+    })
+}
+
+/// Every row of that screen, full width.
+fn perf_rows() -> kr_protocol::projection::ProjectionRowPage {
+    use kr_protocol::projection::{
+        CellRendition, CellRun, ProjectedBuffer, ProjectedRow, ProjectionRowPage,
+    };
+
+    let rows = (0..PERF_ROWS)
+        .map(|row| ProjectedRow {
+            row: U64::new(row),
+            soft_wrapped: false,
+            truncated: false,
+            runs: vec![CellRun {
+                column: U64::ZERO,
+                cells: U64::new(PERF_COLUMNS),
+                text: "x".repeat(usize::try_from(PERF_COLUMNS).expect("a column count")),
+                rendition: CellRendition::PLAIN,
+                hyperlink: Nullable::null(),
+            }],
+        })
+        .collect();
+    ProjectionRowPage {
+        projection_generation: U64::new(1),
+        output_cursor: U64::new(1),
+        buffer: ProjectedBuffer::Primary,
+        rows,
+        oldest_retained_row: U64::ZERO,
+        evicted: false,
+        more: false,
+    }
+}
+
+/// Sends one projection event as the notification a host publishes it as.
+async fn push_projection(
+    pushes: &tokio::sync::mpsc::Sender<ControlFrame>,
+    stream_id: &StreamId,
+    sequence: u64,
+    event: &kr_protocol::projection::ProjectionEvent,
+) {
+    let payload = match event {
+        kr_protocol::projection::ProjectionEvent::Snapshot(snapshot) => {
+            ParamsValue::from_typed(snapshot.as_ref()).expect("a snapshot")
+        }
+        kr_protocol::projection::ProjectionEvent::Rows(page) => {
+            ParamsValue::from_typed(page).expect("a page")
+        }
+        _ => unreachable!("these tests publish a snapshot and its rows"),
+    };
+    pushes
+        .send(ControlFrame::Notification(Notification {
+            stream_id: stream_id.clone(),
+            sequence: EventSequence::new(sequence),
+            event_type: EventType::new(event.event_type()).expect("an event type"),
+            payload,
+        }))
+        .await
+        .expect("the host accepted the event");
+}
+
+/// Restores a projected screen the way a reconnecting client does, and returns how long it took.
+///
+/// The clock starts where KR-PERF-006 starts it: the transport has returned, and nothing has been
+/// asked for yet. It stops when there is a screen a terminal can draw.
+async fn restore_a_screen(
+    session: &Session,
+    pushes: &tokio::sync::mpsc::Sender<ControlFrame>,
+    stream_id: &StreamId,
+) -> (Duration, usize) {
+    use kr_client::projection::paint::{Keyboard, Window};
+    use kr_client::projection::{Applied, Projection};
+    use kr_protocol::projection::ProjectionEvent;
+
+    let mut events = session.events();
+    let started = std::time::Instant::now();
+
+    // Subscribe from the cursor, before anything is installed.
+    let mut restoration = Restoration::start(stream_id.clone(), &session.cursors().await);
+    let params = restoration
+        .subscribe_params(
+            SessionId::new(Uuid::from_bytes([7; 16])),
+            AttachmentId::new(Uuid::from_bytes([8; 16])),
+            &[EventStream::Output],
+        )
+        .expect("the stream is waiting to subscribe");
+    let subscribed = session
+        .subscribe_events(&params)
+        .await
+        .expect("the subscription succeeded");
+    assert_eq!(subscribed.stream_id, *stream_id);
+    restoration
+        .subscribed()
+        .expect("the subscription succeeded");
+
+    // The host publishes the screen it holds, and the client folds it in.
+    push_projection(
+        pushes,
+        stream_id,
+        1,
+        &ProjectionEvent::Snapshot(perf_snapshot()),
+    )
+    .await;
+    push_projection(pushes, stream_id, 2, &ProjectionEvent::Rows(perf_rows())).await;
+
+    let mut projection = Projection::new();
+    let mut installed = false;
+    while !installed {
+        let notification = tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("an event arrived")
+            .expect("the channel is open");
+        let Some(event) =
+            kr_client::projection::decode(notification.event_type.as_str(), &notification.payload)
+        else {
+            continue;
+        };
+        installed = matches!(projection.apply(event), Applied::Installed);
+    }
+    restoration.installed().expect("the snapshot is installed");
+
+    // And there is a screen to draw.
+    let screen = projection.screen().expect("a screen");
+    let painted =
+        kr_client::projection::paint::install(screen, Window::of(screen), Keyboard::EVERYTHING);
+    (started.elapsed(), painted.bytes.len())
+}
+
+#[tokio::test]
+async fn a_reconnect_reaches_a_screen_a_terminal_can_draw_inside_the_budget() {
+    // KR-PERF-006: usable state within two seconds for a 120x40 screen, measured from where the
+    // transport returns. What is measured here is the client's own half: the round trip it makes,
+    // the retry policy that goes through, folding the screen in and painting it. What a host spends
+    // answering is the host's, and `scripts/performance.sh` is what measures the whole of it.
+    let client = side(2, false).await;
+    let stream_id = StreamId::new("session:1").expect("a stream identifier");
+
+    // One host answers at once.
+    let first_host = side(1, true).await;
+    let (pushes, receiver) = tokio::sync::mpsc::channel(8);
+    let first_serving = spawn_host(
+        &first_host,
+        client.record,
+        Arc::new(HostScript::default()),
+        Some(receiver),
+    );
+    let session = connect(&client, &first_host).await;
+    let (elapsed, drawn) = restore_a_screen(&session, &pushes, &stream_id).await;
+    assert!(drawn > 0, "the screen was painted");
+    assert!(
+        elapsed < kr_client::retry::RECONNECT_BUDGET,
+        "a restoration took {elapsed:?}, over the {:?} budget",
+        kr_client::retry::RECONNECT_BUDGET
+    );
+    session.close();
+    first_serving.abort();
+
+    // Another refuses the restoration's read once, so the policy's own delay is inside the
+    // measurement rather than beside it.
+    let second_host = side(3, true).await;
+    let script = Arc::new(HostScript::default());
+    *script.refuse_reads_with.lock().await = Some((ErrorCode::ResourceUnavailable, 1));
+    let (pushes, receiver) = tokio::sync::mpsc::channel(8);
+    let second_serving = spawn_host(
+        &second_host,
+        client.record,
+        Arc::clone(&script),
+        Some(receiver),
+    );
+    let session = connect(&client, &second_host).await;
+    let (with_retries, drawn) = restore_a_screen(&session, &pushes, &stream_id).await;
+    assert!(drawn > 0, "the screen was painted");
+    assert_eq!(
+        script.reads.load(Ordering::Acquire),
+        2,
+        "the read was refused once and sent again"
+    );
+    assert!(
+        with_retries >= kr_client::retry::RETRY_BACKOFF_MIN,
+        "the refusal and its delay were not in the measurement: {with_retries:?}"
+    );
+    assert!(
+        with_retries < kr_client::retry::RECONNECT_BUDGET,
+        "a restoration that retried took {with_retries:?}, over the {:?} budget",
+        kr_client::retry::RECONNECT_BUDGET
+    );
+
+    session.close();
+    second_serving.abort();
 }

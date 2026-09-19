@@ -681,12 +681,10 @@ impl DraftStore {
             if let Ok(draft) = self.read(draft_id) {
                 self.check_owner(&draft)?;
             }
-            remove_if_present(&self.draft_path(draft_id))?;
-            remove_if_present(&self.checkpoint_path(draft_id))?;
             // A removal is a name leaving a directory, and it is durable on the same terms a name
             // arriving is.
-            sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))?;
-            Ok(())
+            remove_if_present(&self.draft_path(draft_id))?;
+            self.remove_file(&self.checkpoint_path(draft_id))
         })();
         drop(guard);
         outcome
@@ -757,6 +755,15 @@ impl DraftStore {
         outcome
     }
 
+    /// Removes one of this store's files, and makes its absence durable.
+    ///
+    /// The caller holds the exclusive lock.
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        remove_if_present(path)?;
+        sync_directory(&self.directory).map_err(|source| storage(&self.directory, source))?;
+        Ok(())
+    }
+
     /// Forgets where a draft reached on the synchronisation service.
     ///
     /// A device that has been signed out of the service, or that is starting again against a
@@ -769,7 +776,7 @@ impl DraftStore {
     /// Returns [`DraftError::Storage`] when the note cannot be removed.
     pub fn forget_checkpoint(&self, draft_id: DraftId) -> Result<()> {
         let guard = self.exclusive()?;
-        let removed = remove_if_present(&self.checkpoint_path(draft_id));
+        let removed = self.remove_file(&self.checkpoint_path(draft_id));
         drop(guard);
         removed
     }
@@ -867,7 +874,7 @@ impl DraftStore {
         ) {
             Ok(checkpoint) => Ok(Some(checkpoint)),
             Err(_) => {
-                remove_if_present(&path)?;
+                self.remove_file(&path)?;
                 Ok(None)
             }
         }
@@ -915,7 +922,7 @@ impl DraftStore {
             if path.extension().and_then(std::ffi::OsStr::to_str) == Some(PARTIAL_EXTENSION) {
                 // Nothing else can be writing one: every write holds this lock from the moment it
                 // creates its temporary file until the rename has landed.
-                remove_if_present(&path)?;
+                self.remove_file(&path)?;
             }
         }
         Ok(())
@@ -1028,15 +1035,35 @@ fn fresh_uuid() -> Result<Uuid> {
 /// not narrow: what protects it there is the access list of the directory the caller chose, so a
 /// caller puts the store under its own per-user application data rather than somewhere shared.
 fn private_directory(directory: &Path) -> std::io::Result<()> {
-    let existed = directory.is_dir();
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
+    // Each missing level is created in turn rather than all at once, because a directory is a name
+    // in the directory above it and a name is durable only once *that* directory's entry is
+    // flushed. One recursive create would make several names and leave every one of them in
+    // whatever state a crash found.
+    let mut missing = Vec::new();
+    let mut level = Some(directory);
+    while let Some(path) = level {
+        if path.as_os_str().is_empty() || path.is_dir() {
+            break;
+        }
+        missing.push(path);
+        level = path.parent();
     }
-    builder.create(directory)?;
+    for path in missing.iter().rev() {
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            builder.mode(0o700);
+        }
+        match builder.create(path) {
+            Ok(()) => {}
+            // Another process made it between the walk and here, which is not a failure: what this
+            // call wanted was for the directory to be there.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+        sync_directory(holder_of(path))?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1045,13 +1072,18 @@ fn private_directory(directory: &Path) -> std::io::Result<()> {
             std::fs::set_permissions(directory, std::fs::Permissions::from_mode(0o700))?;
         }
     }
-    // A directory that was just created is a name in its parent, and a name is durable only once
-    // the parent's own entry is flushed. Flushing the store directory afterwards says nothing about
-    // the name it is known by.
-    if !existed && let Some(parent) = directory.parent() {
-        sync_directory(parent)?;
-    }
     Ok(())
+}
+
+/// The directory one name lives in.
+///
+/// A relative path of one component has an empty parent, and an empty path is not a directory
+/// anything can open. What holds that name is the working directory.
+fn holder_of(path: &Path) -> &Path {
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent,
+        _ => Path::new("."),
+    }
 }
 
 /// Writes a new file whole, and flushes it to the device before anything renames it into place.
@@ -1138,7 +1170,11 @@ pub fn draft_collection(draft_id: DraftId) -> String {
 pub enum Published {
     /// The service accepted it, at this generation.
     Accepted {
-        /// The generation the service now holds, which the next comparison names.
+        /// The generation the service assigned this write.
+        ///
+        /// It is what the service answered, not necessarily what the next comparison will name: a
+        /// note this device had already written from a later answer stands, so read the note when
+        /// what matters is where this device thinks the object stands.
         generation: u64,
     },
     /// Another device had written first.
@@ -1161,7 +1197,10 @@ pub enum Published {
 pub struct Fetched {
     /// The draft as the service held it.
     pub remote: Draft,
-    /// The generation the service holds it at.
+    /// The generation the service answered this fetch with.
+    ///
+    /// As on [`Published::Accepted`]: a note already naming a later generation stands, so this is
+    /// what the service said rather than necessarily what the next comparison will name.
     pub generation: u64,
     /// The copy this device kept beside its own.
     pub copy: Draft,
@@ -1367,6 +1406,29 @@ mod tests {
             text: text.to_owned(),
             ..draft.clone()
         }
+    }
+
+    #[test]
+    fn a_store_opens_under_a_relative_path_and_under_levels_that_are_not_there_yet() {
+        let directory = tempfile::tempdir().expect("a directory");
+        // Several levels at once: each is made and its own name flushed into the level above it.
+        let deep = directory
+            .path()
+            .join("support")
+            .join("kalareach")
+            .join("drafts");
+        let store = DraftStore::open(&deep, device()).expect("a store");
+        assert!(store.directory().is_dir());
+        store
+            .create(open_target(), "written".to_owned(), TimestampMs::new(1))
+            .expect("a draft");
+
+        // A path with one component has an empty parent, and an empty path is not a directory
+        // anything can open. What holds that name is the working directory, which is what a store
+        // under a relative path is created beside.
+        assert_eq!(holder_of(Path::new("beside-me")), Path::new("."));
+        assert_eq!(holder_of(Path::new("support/drafts")), Path::new("support"));
+        assert_eq!(holder_of(&deep), deep.parent().expect("a parent"));
     }
 
     #[test]

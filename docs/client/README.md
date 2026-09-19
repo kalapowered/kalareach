@@ -6,9 +6,10 @@ applications and anything else that talks to a host, which is why the decisions 
 here rather than five times in five clients.
 
 It holds no authority. It carries requests to a host and answers back, and it knows which of its own
-actions are unresolved. What it does hold is its own copy of what the host told it: the screen a
-projected client draws, the cursors a stream has reached, the drafts this device wrote. Everything a
-request means belongs to the host.
+actions are unresolved. What it does hold is the screen a projected client draws and the cursors a
+stream has reached, which are its copies of what the host told it, and the drafts on this device,
+which are the person's own and were never the host's. Everything a request means belongs to the
+host.
 
 ## Two ways in, one contract above them
 
@@ -42,10 +43,15 @@ a bounded attempt count and jittered backoff, and the caller sees the last answe
 attempt. `Session::mutate` never retries: the library cannot know whether the host dispatched a
 mutation, so the decision goes back to the caller with `ClientError::decision`.
 
-The attempt count and the backoff are bounded so that a retry cannot spend a reconnect's budget. A
-restoration is idempotent reads, which is exactly what this library retries, and section 27 gives a
-reconnect two seconds to a usable screen; the most the delays can add to one read is 700
-milliseconds, which `a_retry_cannot_spend_a_reconnects_budget` holds them to.
+The attempt count and the backoff are bounded so that retrying is not what makes a reconnect slow.
+Section 27 gives a reconnect two seconds to a usable screen, and a restoration is idempotent reads,
+which is exactly what this library retries. The most the delays can add to *one* read is 700
+milliseconds, which `a_retry_cannot_spend_a_reconnects_budget` holds them to; each read has its own
+budget, so a restoration that made several would have several. What a whole restoration costs is
+measured rather than argued: `a_reconnect_reaches_a_screen_a_terminal_can_draw_inside_the_budget`
+goes from an available transport through the subscription to a painted 120x40 screen, once against
+a host that answers and once against one that refuses the read first, and holds both inside the two
+seconds.
 
 | Code | Step | What a person is offered |
 | --- | --- | --- |
@@ -79,8 +85,9 @@ client makes, and an association cannot outlive the connection that produced the
   process. A second editor that lost the comparison is told so and overwrites nothing. Reading the
   note beside a draft takes the exclusive lock instead, because a note this build cannot read is
   removed rather than returned. The contents are flushed before the rename on every platform; on
-  Unix the directory entry is flushed too, on creation, replacement and removal, and on Windows this
-  build flushes none and claims no durability for the names themselves.
+  Unix the directory entry is flushed too: every level the store creates has its own name flushed
+  into the level above it, and a replacement or a removal flushes the directory it happened in. On
+  Windows this build flushes none and claims no durability for the names themselves.
 - `Associations::connection_lost` clears every association and touches no draft. A `Session` does
   not own the associations and does not clear them: whoever holds both calls it when a connection
   ends, which is the same caller that binds a draft to a new attachment on reconnect.
@@ -153,6 +160,7 @@ service client unconditionally and get an honest answer rather than a silent def
 | --- | --- |
 | KR-REQ-04.23 | `crates/kr-cli/tests/client_paths.rs`, and `the_local_path_is_a_socket_and_the_remote_path_is_iroh_behind_one_seam` in `crates/kr-client/tests/session.rs` |
 | KR-REQ-11.46 | `crates/kr-client/src/controls.rs` tests |
+| KR-PERF-006 | `a_reconnect_reaches_a_screen_a_terminal_can_draw_inside_the_budget` in `crates/kr-client/tests/session.rs` for the client's half, and `scripts/performance.sh` for the whole of it |
 | KR-REQ-17.14 | `a_session_a_draft_and_a_control_need_no_managed_service_and_do_not_change_with_one` in `crates/kr-client/tests/session.rs` |
 | KR-REQ-23.57 | `crates/kr-client/src/retry.rs` tests, and the retry tests in `crates/kr-client/tests/session.rs` |
 | KR-REQ-24.13 | `crates/kr-client/src/drafts.rs` tests, and `a_draft_outlives_its_attachment_its_connection_and_another_devices_write` in `crates/kr-client/tests/session.rs` |
