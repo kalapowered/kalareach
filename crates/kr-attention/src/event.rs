@@ -106,7 +106,8 @@ pub enum EventKind {
         /// It is asked about separately from [`SourceEvent::at_anchor`] because it is a different
         /// moment: a request can become pending long before the record of it is written. Without
         /// it the five-minute reminder counts from where the engine read the record, which is
-        /// late; with it, from where the request actually started waiting.
+        /// late; with one from the boot the engine is reading in, from where the request actually
+        /// started waiting. An anchor from any other boot measures nothing, like any other.
         pending_since_anchor: Option<Anchor>,
         /// One line naming what is being asked.
         summary: String,

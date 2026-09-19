@@ -1247,8 +1247,9 @@ vouches for are not two readings on one scale. Intervals are measured on the mac
 clock instead: it only goes forward, nobody can set it, and it counts the time the machine spent
 asleep. It means nothing outside its own boot, so every interval the host writes down is kept as the
 continuous reading it starts from *and* the boot that reading was taken in, and one whose boot has
-ended starts again rather than being worked out across the gap - once, because the restart writes
-its own new start down, so the next reopen finds an interval this boot can measure. An event brings an anchor
+ended starts again rather than being worked out across the gap - once, because opening the store is
+what restarts it and opening the store writes the new start down, so the next open finds an
+interval this boot can measure. An event brings an anchor
 of its own when its producer read that clock, separately for each moment it carries, because a
 request can become pending long before the record of it is written. Every one of those answers is
 nought or less than the true wait, never more: a reminder that comes late is still a reminder, and

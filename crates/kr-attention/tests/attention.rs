@@ -3638,3 +3638,81 @@ fn a_wall_clock_stepped_inside_one_boot_moves_no_interval() {
         "and the repeat is still inside its own minute: {repeated:?}"
     );
 }
+
+#[test]
+fn an_interval_a_reopen_restarted_survives_a_reopen_that_changed_nothing_else() {
+    // Opening the store is what re-anchors an interval whose boot has ended, so opening is what
+    // writes the new start down. A session that opened, changed nothing and closed would otherwise
+    // leave the dead anchor there for the next one to find.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    {
+        let mut attention = Attention::open(&path, HostReading::new(boot(), 0, NOON, true))
+            .expect("the feature store opens");
+        attention
+            .apply(
+                &notice(1, 1_000, "build finished", false),
+                HostReading::new(boot(), 10_000, NOON, true),
+            )
+            .expect("the store records the decision");
+        deliver(&mut attention);
+    }
+    // A reboot. This open restarts the interval, and nothing else happens in this session.
+    {
+        let _ = Attention::open(
+            &path,
+            HostReading::new(next_boot(), 1_000, NOON + 60_000, true),
+        )
+        .expect("the store reopens");
+    }
+    // Sixty-one seconds of that boot's own clock later.
+    let mut again = Attention::open(
+        &path,
+        HostReading::new(next_boot(), 62_000, NOON + 121_000, true),
+    )
+    .expect("the store reopens");
+    let repeated = again
+        .apply(
+            &notice(2, 2_000, "build finished", false),
+            HostReading::new(next_boot(), 62_000, NOON + 121_000, true),
+        )
+        .expect("the store records the decision");
+    assert!(
+        !notified(&repeated).is_empty(),
+        "the window ran from where the first reopen restarted it: {repeated:?}"
+    );
+}
+
+#[test]
+fn a_wait_a_reopen_restarted_is_not_restarted_by_the_next_one() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    {
+        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        attention
+            .apply(&pending_question(1, 0, question(9), true, 0), reading(0))
+            .expect("the store records the decision");
+    }
+    // A reboot, then two opens of the new boot with nothing else between them.
+    {
+        let _ = Attention::open(&path, HostReading::new(next_boot(), 1_000, NOON, true))
+            .expect("the store reopens");
+    }
+    let mut reopened = Attention::open(
+        &path,
+        HostReading::new(next_boot(), 1_000 + IDLE_REMINDER_MS + 1, NOON, true),
+    )
+    .expect("the store reopens");
+    let owed = reopened
+        .tick(HostReading::new(
+            next_boot(),
+            1_000 + IDLE_REMINDER_MS + 1,
+            NOON,
+            true,
+        ))
+        .expect("the store records the decision");
+    assert!(
+        raised(&owed).contains(&AttentionRule::InputIdleReminder),
+        "five minutes ran from where the first reopen restarted the wait: {owed:?}"
+    );
+}

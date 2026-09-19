@@ -71,8 +71,9 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the store cannot be opened or read, and
-    /// [`crate::Error::StoreUnreadable`] when it holds a value this build cannot read back.
+    /// Returns [`crate::Error::StoreUnavailable`] when the store cannot be opened, read or written
+    /// back, and [`crate::Error::StoreUnreadable`] when it holds a value this build cannot read.
+    /// Opening writes, because what it read back may have had to be re-anchored.
     pub fn open(path: impl AsRef<Path>, reading: HostReading) -> Result<Self> {
         Self::from_store(Store::open(path)?, reading)
     }
@@ -81,8 +82,9 @@ impl Attention {
     ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the store cannot be opened or read, and
-    /// [`crate::Error::StoreUnreadable`] when it holds a value this build cannot read back.
+    /// Returns [`crate::Error::StoreUnavailable`] when the store cannot be opened, read or written
+    /// back, and [`crate::Error::StoreUnreadable`] when it holds a value this build cannot read.
+    /// Opening writes, because what it read back may have had to be re-anchored.
     pub fn beside(path: Option<&Path>, reading: HostReading) -> Result<Self> {
         Self::from_store(Store::beside(path)?, reading)
     }
@@ -121,7 +123,7 @@ impl Attention {
             stored.summaries,
             stored.visits,
         );
-        Ok(Self {
+        let mut attention = Self {
             state: State {
                 engine,
                 reviews,
@@ -129,7 +131,14 @@ impl Attention {
                 revisions: stored.revisions,
             },
             store,
-        })
+        };
+        // Re-anchoring replaced the start of every interval whose boot has ended, and writing that
+        // down here is what makes the restart happen once. A session that opened, changed nothing
+        // and closed would otherwise leave the dead anchors in the store, and the next open would
+        // find them and start the same intervals again, however long this boot had been running.
+        // The key secret a fresh store generated is durable from here for the same reason.
+        attention.store.save(&snapshot(&attention.state))?;
+        Ok(attention)
     }
 
     /// Returns the engine.

@@ -94,14 +94,20 @@ pub struct Item {
     ///
     /// [`Item::first_seen_ms`] says when the condition was first seen, for a person reading the
     /// record; this says where that moment sits on a continuous clock, and in which boot. An
-    /// anchor from another boot measures nothing, so the age starts again, which is late rather
-    /// than wrong. `None` is an item whose producer never read that clock.
+    /// anchor from another boot measures nothing, so the age starts again from the reading that
+    /// found it, and this is moved to that reading. It is always set for an item this engine
+    /// raised, whether or not its producer had a reading of its own: what a producer supplies is
+    /// where the age *starts*, and what is kept here is where it starts on a clock this host can
+    /// measure. `None` is only a row from a store that carried none.
     pub anchor: Option<Anchor>,
     /// Where the interval since the last announcement is measured from.
     ///
-    /// [`Item::last_notified_ms`] says when it went out, for a person reading the record; this
-    /// says where that moment sits on a continuous clock, and in which boot. `None` is an item
-    /// nothing has been announced about yet. An announcement made in a boot that has ended
+    /// [`Item::last_notified_ms`] says when the decision was made, for a person reading the
+    /// record; this says where that moment sits on a continuous clock, and in which boot. Both are
+    /// set when the decision is made, which is before quiet hours are asked whether it goes out
+    /// now, so a deferred announcement has them too: the interval they measure is the one the
+    /// de-duplication window and the repeat both run on, and that runs from the decision. `None`
+    /// is an item nothing has been decided about yet. An announcement made in a boot that has ended
     /// measures nothing across the gap, so the interval starts again at the reading that found it,
     /// and this is moved to that reading: the same condition is then folded into the item for one
     /// more window rather than announced twice inside one, and a second restart does not start it
