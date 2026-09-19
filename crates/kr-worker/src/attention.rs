@@ -167,9 +167,15 @@ fn translate(error: kr_attention::Error) -> WorkerError {
 impl Attention {
     /// Opens the feature store beside the session's journal, or in memory when there is none.
     ///
+    /// Opening writes. What it reads back may have to be re-anchored - every interval whose boot
+    /// has ended starts again - and the new starts are written down as part of the same
+    /// transaction, so a session that opens and changes nothing still leaves the store where the
+    /// next one can pick the intervals up.
+    ///
     /// # Errors
     ///
-    /// Returns [`WorkerError::JournalUnavailable`] when the store cannot be opened or read back.
+    /// Returns [`WorkerError::JournalUnavailable`] when the store cannot be opened, read back, or
+    /// written.
     pub fn open(journal_path: Option<&Path>, time: &TimeContract) -> Result<Self> {
         let engine = Engine::beside(journal_path, reading(time)).map_err(translate)?;
         Ok(Self {

@@ -91,15 +91,32 @@ impl Attention {
 
     /// Opens a store that lives only as long as this value.
     ///
+    /// Nothing it holds outlives the drop, so its opening write is a write to memory and the
+    /// intervals it re-anchors are re-anchored for this value alone.
+    ///
     /// # Errors
     ///
-    /// Returns [`crate::Error::StoreUnavailable`] when the schema cannot be created.
+    /// Returns [`crate::Error::StoreUnavailable`] when the schema cannot be created or the state
+    /// this open re-anchored cannot be written back.
     pub fn in_memory(reading: HostReading) -> Result<Self> {
         Self::from_store(Store::in_memory()?, reading)
     }
 
-    fn from_store(store: Store, reading: HostReading) -> Result<Self> {
-        let stored = store.load()?;
+    fn from_store(mut store: Store, reading: HostReading) -> Result<Self> {
+        // The read, the re-anchoring and the write that records it are one transaction, and its
+        // write lock is taken before the read. A whole-state write replaces everything, so another
+        // connection that committed between the two would have its work replaced by the older
+        // state this one had read.
+        let state = store.recover(|stored| {
+            let state = Self::restore(stored, reading);
+            let written = snapshot(&state);
+            Ok((written, state))
+        })?;
+        Ok(Self { state, store })
+    }
+
+    /// Builds the state one stored snapshot and one reading describe.
+    fn restore(stored: crate::store::StoredState, reading: HostReading) -> State {
         let mut engine = Engine::new();
         engine.install(Restored {
             items: stored.items,
@@ -123,22 +140,12 @@ impl Attention {
             stored.summaries,
             stored.visits,
         );
-        let mut attention = Self {
-            state: State {
-                engine,
-                reviews,
-                visits,
-                revisions: stored.revisions,
-            },
-            store,
-        };
-        // Re-anchoring replaced the start of every interval whose boot has ended, and writing that
-        // down here is what makes the restart happen once. A session that opened, changed nothing
-        // and closed would otherwise leave the dead anchors in the store, and the next open would
-        // find them and start the same intervals again, however long this boot had been running.
-        // The key secret a fresh store generated is durable from here for the same reason.
-        attention.store.save(&snapshot(&attention.state))?;
-        Ok(attention)
+        State {
+            engine,
+            reviews,
+            visits,
+            revisions: stored.revisions,
+        }
     }
 
     /// Returns the engine.

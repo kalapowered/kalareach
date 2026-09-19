@@ -3716,3 +3716,38 @@ fn a_wait_a_reopen_restarted_is_not_restarted_by_the_next_one() {
         "five minutes ran from where the first reopen restarted the wait: {owed:?}"
     );
 }
+
+#[test]
+fn an_open_that_reads_an_older_state_does_not_replace_what_was_committed_meanwhile() {
+    // Opening the store reads it and writes it again, and a whole-state write replaces
+    // everything. If the read came before another connection's commit and the write after it,
+    // that commit would be replaced by the state this open had read. The write lock is taken
+    // before the read so the two cannot interleave that way.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let who = actor("device:phone");
+    let mut held = Attention::open(&path, reading(0)).expect("the feature store opens");
+    held.apply(&approval(1, 1_000, "req-1"), reading(0))
+        .expect("the store records the decision");
+    let key = held.key_for(AttentionRule::PendingApproval, "req-1");
+
+    // One owner acknowledges, and its work is committed.
+    held.acknowledge(&who, std::slice::from_ref(&key), reading(1_000))
+        .expect("the store records the acknowledgement");
+    assert_eq!(held.revision(&who), 1);
+
+    // Another opens the same file afterwards. Its own opening write must not put back the state
+    // that stood before the acknowledgement.
+    let second = Attention::open(&path, reading(2_000)).expect("the store reopens");
+    assert_eq!(
+        second.revision(&who),
+        1,
+        "the acknowledgement another owner committed is still there"
+    );
+    assert!(
+        second
+            .inbox(&who, false, Content::Whole)
+            .is_empty(),
+        "and it still means what it meant"
+    );
+}

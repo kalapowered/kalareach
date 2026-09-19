@@ -415,9 +415,13 @@ impl Store {
     /// Returns [`Error::StoreUnavailable`] when a read fails and [`Error::StoreUnreadable`] when a
     /// stored value is not one this build can read back exactly.
     pub fn load(&self) -> Result<StoredState> {
-        let changes = self.load_changes()?;
-        let head: Option<i64> = self
-            .connection
+        Self::load_from(&self.connection)
+    }
+
+    /// Reads the whole state through a connection the caller owns, which may be a transaction.
+    fn load_from(connection: &Connection) -> Result<StoredState> {
+        let changes = Self::load_changes(connection)?;
+        let head: Option<i64> = connection
             .query_row(
                 "SELECT next_cursor FROM attention_change_head WHERE id = 0",
                 [],
@@ -430,16 +434,14 @@ impl Store {
                 .back()
                 .map_or(0, |change| change.cursor.get().saturating_add(1)),
         };
-        let dropped: Option<i64> = self
-            .connection
+        let dropped: Option<i64> = connection
             .query_row(
                 "SELECT items FROM attention_dropped WHERE id = 0",
                 [],
                 |row| row.get(0),
             )
             .optional()?;
-        let secret: Option<Vec<u8>> = self
-            .connection
+        let secret: Option<Vec<u8>> = connection
             .query_row(
                 "SELECT secret FROM attention_key_secret WHERE id = 0",
                 [],
@@ -456,11 +458,10 @@ impl Store {
                 <[u8; crate::key::SECRET_BYTES]>::try_from(bytes.as_slice())
                     .map_err(|_| unreadable("key secret"))?,
             ),
-            None if self.is_empty()? => crate::key::KeySecret::fresh(),
+            None if Self::is_empty(connection)? => crate::key::KeySecret::fresh(),
             None => return Err(unreadable("key secret")),
         };
-        let announcement: Option<i64> = self
-            .connection
+        let announcement: Option<i64> = connection
             .query_row(
                 "SELECT next FROM attention_announcements WHERE id = 0",
                 [],
@@ -468,11 +469,11 @@ impl Store {
             )
             .optional()?;
         Ok(StoredState {
-            items: self.load_items()?,
-            item_acks: self.load_item_acks()?,
-            revisions: self.load_revisions()?,
-            consumed: self.load_consumed()?,
-            gaps: self.load_gaps()?,
+            items: Self::load_items(connection)?,
+            item_acks: Self::load_item_acks(connection)?,
+            revisions: Self::load_revisions(connection)?,
+            consumed: Self::load_consumed(connection)?,
+            gaps: Self::load_gaps(connection)?,
             dropped: match dropped {
                 Some(value) => as_u64(value, "dropped count")?,
                 None => 0,
@@ -482,15 +483,15 @@ impl Store {
                 Some(value) => as_u64(value, "announcement counter")?,
                 None => 0,
             },
-            pending_inputs: self.load_pending()?,
-            quiet: self.load_quiet()?,
-            subjects: self.load_subjects()?,
-            review_acks: self.load_review_acks()?,
+            pending_inputs: Self::load_pending(connection)?,
+            quiet: Self::load_quiet(connection)?,
+            subjects: Self::load_subjects(connection)?,
+            review_acks: Self::load_review_acks(connection)?,
             changes,
             next_cursor,
-            omitted: self.load_omitted()?,
-            summaries: self.load_summaries()?,
-            visits: self.load_visits()?,
+            omitted: Self::load_omitted(connection)?,
+            summaries: Self::load_summaries(connection)?,
+            visits: Self::load_visits(connection)?,
         })
     }
 
@@ -500,9 +501,9 @@ impl Store {
     /// secret, a key derivation and a schema this build has to be able to read back exactly. It
     /// answers about what is there now rather than about what was ever written: a store whose rows
     /// have all been removed is empty, and nothing in it needs a secret to name.
-    fn is_empty(&self) -> Result<bool> {
+    fn is_empty(connection: &Connection) -> Result<bool> {
         for table in TABLES {
-            let held: i64 = self.connection.query_row(
+            let held: i64 = connection.query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM {table})"),
                 [],
                 |row| row.get(0),
@@ -514,6 +515,35 @@ impl Store {
         Ok(true)
     }
 
+    /// Reads the state back, hands it to `settle`, and writes what comes back, with nothing able
+    /// to come between the three.
+    ///
+    /// This is what a session opening its store does. Re-anchoring an interval reads the state and
+    /// writes it again, and a whole-state write replaces everything: another connection that
+    /// committed between the read and the write would have its work replaced by the older state
+    /// this one had read. So the write lock is taken before the read rather than at the write,
+    /// which is the whole of the difference. It is held for one read and one write and then
+    /// released, so the other owners of tables in the same file are not kept out.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever `settle` returns, [`Error::StoreUnavailable`] when the transaction cannot
+    /// be taken or committed, and [`Error::StoreUnreadable`] for a value this build cannot read
+    /// back or write down. Nothing is left half written.
+    pub fn recover<T>(
+        &mut self,
+        settle: impl FnOnce(StoredState) -> Result<(StoredState, T)>,
+    ) -> Result<T> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let stored = Self::load_from(&transaction)?;
+        let (state, answer) = settle(stored)?;
+        Self::save_into(&transaction, &state)?;
+        transaction.commit()?;
+        Ok(answer)
+    }
+
     /// Replaces the stored state with `state`, in one transaction.
     ///
     /// # Errors
@@ -523,6 +553,13 @@ impl Store {
     /// left half written: the store is either at the previous state or at this one.
     pub fn save(&mut self, state: &StoredState) -> Result<()> {
         let transaction = self.connection.transaction()?;
+        Self::save_into(&transaction, state)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Writes the whole state through a transaction the caller owns.
+    fn save_into(transaction: &Connection, state: &StoredState) -> Result<()> {
         for table in TABLES {
             transaction.execute(&format!("DELETE FROM {table}"), [])?;
         }
@@ -755,12 +792,11 @@ impl Store {
                 )?;
             }
         }
-        transaction.commit()?;
         Ok(())
     }
 
-    fn load_items(&self) -> Result<Vec<Item>> {
-        let mut statement = self.connection.prepare(
+    fn load_items(connection: &Connection) -> Result<Vec<Item>> {
+        let mut statement = connection.prepare(
             "SELECT key, rule, source, session_id, summary, routing, level, steps_taken,
                     occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
                     announced_boot, announced_continuous_ms, announced_level, announcements,
@@ -845,10 +881,11 @@ impl Store {
         Ok(items)
     }
 
-    fn load_item_acks(&self) -> Result<BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT actor, key, occurrences, at_ms FROM attention_item_acks")?;
+    fn load_item_acks(
+        connection: &Connection,
+    ) -> Result<BTreeMap<ActorId, BTreeMap<AttentionKey, ItemAck>>> {
+        let mut statement =
+            connection.prepare("SELECT actor, key, occurrences, at_ms FROM attention_item_acks")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -873,10 +910,8 @@ impl Store {
         Ok(acks)
     }
 
-    fn load_revisions(&self) -> Result<BTreeMap<ActorId, u64>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT actor, revision FROM attention_actors")?;
+    fn load_revisions(connection: &Connection) -> Result<BTreeMap<ActorId, u64>> {
+        let mut statement = connection.prepare("SELECT actor, revision FROM attention_actors")?;
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -891,10 +926,9 @@ impl Store {
         Ok(revisions)
     }
 
-    fn load_consumed(&self) -> Result<BTreeMap<AttentionSource, u64>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT source, sequence FROM attention_consumed")?;
+    fn load_consumed(connection: &Connection) -> Result<BTreeMap<AttentionSource, u64>> {
+        let mut statement =
+            connection.prepare("SELECT source, sequence FROM attention_consumed")?;
         let rows = statement.query_map([], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
         })?;
@@ -907,8 +941,8 @@ impl Store {
         Ok(consumed)
     }
 
-    fn load_gaps(&self) -> Result<Vec<AttentionGap>> {
-        let mut statement = self.connection.prepare(
+    fn load_gaps(connection: &Connection) -> Result<Vec<AttentionGap>> {
+        let mut statement = connection.prepare(
             "SELECT source, from_sequence, to_sequence FROM attention_gaps ORDER BY position, from_sequence",
         )?;
         let rows = statement.query_map([], |row| {
@@ -930,8 +964,8 @@ impl Store {
         Ok(gaps)
     }
 
-    fn load_pending(&self) -> Result<BTreeMap<QuestionId, PendingInput>> {
-        let mut statement = self.connection.prepare(
+    fn load_pending(connection: &Connection) -> Result<BTreeMap<QuestionId, PendingInput>> {
+        let mut statement = connection.prepare(
             "SELECT question_id, session_id, summary, pending_since_ms, reminded, anchor_boot,
                     anchor_continuous_ms
              FROM attention_pending_inputs",
@@ -967,9 +1001,8 @@ impl Store {
         Ok(pending)
     }
 
-    fn load_quiet(&self) -> Result<Option<QuietHours>> {
-        let row: Option<(i64, i64, Option<String>)> = self
-            .connection
+    fn load_quiet(connection: &Connection) -> Result<Option<QuietHours>> {
+        let row: Option<(i64, i64, Option<String>)> = connection
             .query_row(
                 "SELECT start_minute, end_minute, zone FROM attention_quiet_hours WHERE id = 0",
                 [],
@@ -986,8 +1019,8 @@ impl Store {
         .transpose()
     }
 
-    fn load_subjects(&self) -> Result<BTreeMap<String, Subject>> {
-        let mut statement = self.connection.prepare(
+    fn load_subjects(connection: &Connection) -> Result<BTreeMap<String, Subject>> {
+        let mut statement = connection.prepare(
             "SELECT key, kind, session_id, object, version, at_ms, sequence
              FROM attention_review_subjects",
         )?;
@@ -1037,9 +1070,10 @@ impl Store {
         Ok(subjects)
     }
 
-    fn load_review_acks(&self) -> Result<BTreeMap<ActorId, BTreeMap<String, ReviewAck>>> {
-        let mut statement = self
-            .connection
+    fn load_review_acks(
+        connection: &Connection,
+    ) -> Result<BTreeMap<ActorId, BTreeMap<String, ReviewAck>>> {
+        let mut statement = connection
             .prepare("SELECT actor, subject, version, at_ms FROM attention_review_acks")?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -1065,8 +1099,8 @@ impl Store {
         Ok(acks)
     }
 
-    fn load_changes(&self) -> Result<VecDeque<SemanticChange>> {
-        let mut statement = self.connection.prepare(
+    fn load_changes(connection: &Connection) -> Result<VecDeque<SemanticChange>> {
+        let mut statement = connection.prepare(
             "SELECT cursor, kind, session_id, summary, at_ms FROM attention_changes ORDER BY cursor",
         )?;
         let rows = statement.query_map([], |row| {
@@ -1093,8 +1127,8 @@ impl Store {
         Ok(changes)
     }
 
-    fn load_omitted(&self) -> Result<Vec<Omitted>> {
-        let mut statement = self.connection.prepare(
+    fn load_omitted(connection: &Connection) -> Result<Vec<Omitted>> {
+        let mut statement = connection.prepare(
             "SELECT at_cursor, source, from_sequence, to_sequence FROM attention_omitted
              ORDER BY position, at_cursor, from_sequence",
         )?;
@@ -1122,8 +1156,8 @@ impl Store {
         Ok(omitted)
     }
 
-    fn load_summaries(&self) -> Result<Vec<ChangeSummary>> {
-        let mut statement = self.connection.prepare(
+    fn load_summaries(connection: &Connection) -> Result<Vec<ChangeSummary>> {
+        let mut statement = connection.prepare(
             "SELECT from_cursor, to_cursor, from_ms, to_ms, model, text
              FROM attention_summaries ORDER BY from_cursor",
         )?;
@@ -1152,10 +1186,9 @@ impl Store {
         Ok(summaries)
     }
 
-    fn load_visits(&self) -> Result<BTreeMap<ActorId, Visit>> {
-        let mut statement = self
-            .connection
-            .prepare("SELECT actor, cursor, revision FROM attention_visits")?;
+    fn load_visits(connection: &Connection) -> Result<BTreeMap<ActorId, Visit>> {
+        let mut statement =
+            connection.prepare("SELECT actor, cursor, revision FROM attention_visits")?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -1175,7 +1208,7 @@ impl Store {
                 },
             );
         }
-        let mut statement = self.connection.prepare(
+        let mut statement = connection.prepare(
             "SELECT actor, view_id, source_offset, filter FROM attention_log_views ORDER BY position",
         )?;
         let rows = statement.query_map([], |row| {
