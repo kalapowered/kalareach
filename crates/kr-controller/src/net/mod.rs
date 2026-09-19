@@ -1156,6 +1156,13 @@ impl Controller {
             )
             .await
             .map(|value| ClosedRemotely { value, retained });
+        // A closure this host has accepted and not finished is a request outstanding, and section
+        // 3's setting decides whether that keeps the machine awake while it finishes. The local
+        // close reviews the setting where it accepts, and a close that arrived over the network is
+        // the same outstanding work: without this, a remote close on a host whose owner enabled
+        // inhibition would release an assertion it never took, and the machine could sleep part
+        // way through a closure. The device's own answer does not wait for the review.
+        self.review_power_soon();
         let _ = answer.send(settled);
         if let Some(proxy) = link {
             let _ = tokio::time::timeout(CLOSE_DELIVERY, delivered).await;

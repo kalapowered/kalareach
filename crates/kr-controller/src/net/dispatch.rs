@@ -573,9 +573,16 @@ impl RemoteConnection {
         // host's own principal would be answered about the host's own objects.
         let actor_id = self.device.principal();
         let answer = match entry.method {
-            Method::HostInfo | Method::EnvironmentList | Method::HostDoctor => {
-                self.controller.read_method(&actor_id, request).await
-            }
+            // `host.info` carries this host's sleep inhibition and the reason for it, and
+            // `environment.capabilities` carries the desktop's capability records with their
+            // platform distinctions. Both are the daemon's own answer, and a device is given the
+            // answer the owner's own socket is given: capability evidence describes feasibility
+            // and never authority, so narrowing it would say something untrue about the machine
+            // rather than protect anything.
+            Method::HostInfo
+            | Method::EnvironmentList
+            | Method::EnvironmentCapabilities
+            | Method::HostDoctor => self.controller.read_method(&actor_id, request).await,
             // The project and workspace metadata reads. They name no session, so the grant's
             // environment selector and the rights the registry lists are the whole of what
             // narrows them, and the service answers a device exactly as it answers this user's
