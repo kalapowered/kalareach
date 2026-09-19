@@ -224,15 +224,31 @@ pub fn capture(
     // Where this repository actually keeps its administrative data, read from the repository this
     // capture opened rather than assumed to be `.git`.
     let administrative = administrative_prefix(repository);
-    let nested = BTreeSet::new();
+    if request.required_consistency == Some(SourceConsistency::AtomicSnapshot) {
+        // A snapshot reads the commit's own tree and nothing of the working tree, but which paths
+        // hold another repository is a question about the tree on disk, and it is asked here for
+        // the same reason: a version does not hold another repository's configuration, whichever
+        // side its content was read from.
+        let reading = Reading::take(
+            profile,
+            repository,
+            request.grant,
+            administrative.as_deref(),
+        )?;
+        let nested = nested_repositories(repository, &reading, administrative.as_deref())?;
+        let request = Scope {
+            request,
+            administrative_prefix: administrative.as_deref(),
+            nested: &nested,
+        };
+        return snapshot(profile, repository, store, request);
+    }
+    let nothing = BTreeSet::new();
     let request = Scope {
         request,
         administrative_prefix: administrative.as_deref(),
-        nested: &nested,
+        nested: &nothing,
     };
-    if request.required_consistency == Some(SourceConsistency::AtomicSnapshot) {
-        return snapshot(profile, repository, store, request);
-    }
     let mut last_change = String::new();
     for attempt in 0..=MAX_CAPTURE_RETRIES {
         let before = Reading::take(
@@ -1157,13 +1173,29 @@ fn nested_repositories(
                 )
                 .into(),
             })?;
+        // Is it a directory at all? A path a reading names is usually a file, which has nothing
+        // inside it to be a repository. One this host cannot ask about is a different matter: it
+        // cannot then say whether a repository is in there.
+        let Ok(here) = RelativeName::parse(directory) else {
+            continue;
+        };
+        match tree.probe(&here) {
+            Ok(kr_transfer::authority::ObjectKind::Directory) => {}
+            Ok(_) | Err(kr_transfer::Escape::NotFound { .. }) => continue,
+            Err(_) => return Err(unplaceable(directory)),
+        }
         let Ok(name) =
             RelativeName::parse(&format!("{directory}/{}", grant::ADMINISTRATIVE_DIRECTORY))
         else {
             continue;
         };
-        let Ok(held) = tree.probe(&name) else {
-            continue;
+        let held = match tree.probe(&name) {
+            Ok(held) => held,
+            // Nothing of the sort in it, which is what an ordinary directory answers.
+            Err(kr_transfer::Escape::NotFound { .. }) => continue,
+            // A directory this host could not look into. It cannot say whether a repository is in
+            // there, and a capture that might hold one's configuration is not one it takes.
+            Err(_) => return Err(unplaceable(directory)),
         };
         // Where that repository's data is, as a name this host walked to rather than one it read.
         let data = if held == kr_transfer::authority::ObjectKind::Directory {
@@ -1971,6 +2003,22 @@ fn descend(
             format!("{prefix}/{}", entry.name)
         };
         if entry.kind == "tree" {
+            // Another repository's own tree or data, whichever side the content is read from.
+            if request
+                .nested
+                .iter()
+                .any(|prefix| grant::under(&path, prefix))
+            {
+                manifest.exclusions.push(Exclusion {
+                    path,
+                    reason: ExclusionReason::Unsupported,
+                    detail: "this path is a repository nested in this tree, or its own \
+                             administrative data, rather than this repository's content: this \
+                             host never reads inside one"
+                        .to_owned(),
+                });
+                continue;
+            }
             // A directory is walked into when anything the grant selects can lie beneath it, and
             // its own exclusion is recorded when nothing can.
             if !grant::may_traverse(request.grant, &path) || administrative(request, &path) {
