@@ -672,3 +672,75 @@ fn a_session_closed_by_an_earlier_build_is_brought_forward_rather_than_refused()
         "the store was brought forward once rather than read twice"
     );
 }
+
+#[test]
+fn a_store_whose_worker_may_still_own_it_is_not_migrated() {
+    // Review 10's finding, and the reason the migration asks its own question. A closure can be
+    // recorded for a session whose death this host never confirmed, and the registry row that
+    // every later read checks goes with the closure. So the migration - which is a write - asks
+    // the published descriptor itself: a process the kernel has not said ended may still own this
+    // store, and opening it writable would be a second writer.
+    let (_temp, archive) = host();
+    let session_id = session();
+    {
+        let mut journal = journal_for(&archive, session_id);
+        journal
+            .record_session(&summary(session_id))
+            .expect("records the summary");
+    }
+    let path = archive.paths().journal_database(session_id);
+    {
+        let connection = rusqlite::Connection::open(&path).expect("opens the store");
+        connection
+            .execute_batch(
+                "DROP TABLE privacy;
+                 DROP TABLE outbox;
+                 DROP TABLE outbox_cursors;
+                 DROP TABLE journal_gaps;
+                 UPDATE schema_version SET version = 3;",
+            )
+            .expect("puts it back to the earlier shape");
+    }
+    // A descriptor naming this process, which is alive. That is what a worker publishes, and it
+    // outlives the worker that wrote it.
+    let alive = kr_ipc::identity::current_process_start_identity().expect("an identity");
+    publish_descriptor(&archive, session_id, &alive);
+
+    archive.bring_forward(session_id);
+    assert_eq!(
+        kr_worker::journal::Journal::recorded_schema_version(&path).expect("reads the version"),
+        3,
+        "a store a live worker may own is left exactly where it is"
+    );
+
+    // Once the descriptor names a process that has ended, the same call brings it forward.
+    let ended = kr_ipc::identity::ended_process_identity(1);
+    publish_descriptor(&archive, session_id, &ended);
+    archive.bring_forward(session_id);
+    assert_eq!(
+        kr_worker::journal::Journal::recorded_schema_version(&path).expect("reads the version"),
+        kr_worker::persistence::migration::CURRENT
+    );
+}
+
+/// Publishes a descriptor for a session, as a worker does when it starts.
+fn publish_descriptor(
+    archive: &ArchiveService,
+    session_id: SessionId,
+    identity: &kr_protocol::identity::ProcessStartIdentity,
+) {
+    let descriptor = kr_protocol::worker::WorkerDescriptor {
+        session_id,
+        session_epoch: SessionEpoch::V1,
+        environment_id: archive.paths().environment_id(),
+        display_number: DisplayNumber::new(1),
+        boot_identity: kr_ipc::identity::boot_identity().expect("a boot identity"),
+        process_start_identity: identity.clone(),
+        protocol_version: kr_protocol::hello::PROTOCOL_VERSION,
+        endpoint: "/tmp/kr-archive-test.sock".to_owned(),
+        worker_public_key: kr_protocol::scalars::AuthorisationKey::from_bytes([7; 32]),
+        worker_profile: kr_protocol::identity::WorkerProfile::HeadlessUser,
+        published_at_ms: kr_ipc::now_ms(),
+    };
+    kr_ipc::descriptor::publish(archive.paths(), &descriptor).expect("publishes the descriptor");
+}

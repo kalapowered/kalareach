@@ -361,6 +361,24 @@ impl ArchiveService {
         ))
     }
 
+    /// Returns whether a worker this host has not seen end may still own this session.
+    ///
+    /// The published descriptor names the process, and it outlives the worker that wrote it. A
+    /// kernel answer of `Ended` is the only one that clears this: `Running` is a worker, and a
+    /// query the platform declines establishes nothing, which is not the same as establishing
+    /// that there is nothing there.
+    #[must_use]
+    fn a_worker_may_still_own(&self, session_id: SessionId) -> bool {
+        let Ok(Some(descriptor)) = kr_ipc::descriptor::read(&self.paths, session_id) else {
+            // No descriptor is no worker to have published one.
+            return false;
+        };
+        !matches!(
+            kr_ipc::identity::process_state(&descriptor.process_start_identity),
+            kr_ipc::identity::ProcessState::Ended
+        )
+    }
+
     /// Brings a store an earlier build wrote forward, so this build's one reader can read it.
     ///
     /// Section 24 asks for forward-only migrations and one current schema read by code. A worker
@@ -378,6 +396,14 @@ impl ArchiveService {
     /// is left alone and reported by the reader, because restoring one in part is worse than
     /// saying it cannot be read.
     pub fn bring_forward(&self, session_id: SessionId) {
+        // A migration is a write, so it asks the question recovery ownership asks, and asks it
+        // here rather than trusting a caller: a session whose published descriptor names a process
+        // the kernel has not said ended may still own this store, and a closure written over an
+        // unvalidated death does not change that. The store is then left where it is and the
+        // reader reports it, which is the safe direction.
+        if self.a_worker_may_still_own(session_id) {
+            return;
+        }
         let path = self.paths.journal_database(session_id);
         if !path.exists() {
             return;
