@@ -440,18 +440,24 @@ fn a_crash_fences_the_workers_own_boundary_and_never_claims_more() {
     let session_id = session();
 
     // A process group of this test's own making, standing in for the boundary a worker leads.
-    // Job control is what puts a background job in a group of its own on every Unix this host
-    // builds for, and the shell writes the group down rather than leaving this test to look for
-    // it. The parent shell stays in this test's own group and is never touched.
+    // The leader writes the group down and then exits, which is the shape a crashed worker leaves
+    // behind: the leader is gone and what it started is still in its group. `setsid` is what a
+    // worker does and is what this uses where the platform ships it; job control is the fallback,
+    // and a shell that gives neither a group of its own is a shell this test says so about rather
+    // than one it asserts against this daemon's own group.
     let marker = std::env::temp_dir().join(format!("kr-fence-{}", kr_ipc::new_uuid()));
+    let inner = format!(
+        "/bin/sh -c 'sleep 30 & ps -o pgid= -p $$ > {0}'",
+        marker.display()
+    );
+    let script = if std::path::Path::new("/usr/bin/setsid").exists() {
+        format!("exec /usr/bin/setsid {inner}")
+    } else {
+        format!("set -m; {inner} & wait")
+    };
     let mut leader = std::process::Command::new("/bin/sh")
         .arg("-c")
-        // The inner shell leads the group and then exits, which is the shape a crashed worker
-        // leaves behind: the leader is gone and what it started is still in its group.
-        .arg(format!(
-            "set -m; /bin/sh -c 'sleep 30 & ps -o pgid= -p $$ > {0}' & wait",
-            marker.display()
-        ))
+        .arg(&script)
         .spawn()
         .expect("starts a group leader");
     let mut group = None;
@@ -466,6 +472,14 @@ fn a_crash_fences_the_workers_own_boundary_and_never_claims_more() {
     }
     let group = group.expect("the group leader recorded its own group");
     std::fs::remove_file(&marker).ok();
+    if Some(group) == this_process_group() {
+        // This shell put the job in this test's own group, so there is no separate boundary to
+        // fence. The archive refuses to touch its own group, which is the behaviour the other
+        // test covers; asserting against it here would be asserting that this host stops itself.
+        let _ = leader.wait();
+        eprintln!("skipped: this shell gives a background job no process group of its own");
+        return;
+    }
 
     let ownership = archive
         .take_ownership(
@@ -506,6 +520,22 @@ fn a_crash_fences_the_workers_own_boundary_and_never_claims_more() {
         "the fence stayed inside the session's own boundary"
     );
     let _ = leader.wait();
+}
+
+/// Returns this test process's own process group.
+#[cfg(unix)]
+fn this_process_group() -> Option<u32> {
+    std::process::Command::new("/bin/ps")
+        .args(["-o", "pgid=", "-p"])
+        .arg(std::process::id().to_string())
+        .output()
+        .ok()
+        .and_then(|output| {
+            String::from_utf8_lossy(&output.stdout)
+                .trim()
+                .parse::<u32>()
+                .ok()
+        })
 }
 
 #[test]
