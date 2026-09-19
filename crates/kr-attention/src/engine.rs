@@ -46,7 +46,7 @@ use kr_protocol::scalars::{Nullable, TimestampMs, U64};
 
 use crate::event::{EventKind, SourceEvent};
 use crate::rule::rule;
-use crate::time::{Elapsed, HostReading, MS_IN_MINUTE};
+use crate::time::{Anchor, Elapsed, HostReading, MS_IN_MINUTE};
 
 /// Largest number of gaps the engine keeps. The oldest is dropped past it.
 pub const MAX_GAPS: usize = 64;
@@ -90,14 +90,13 @@ pub struct Item {
     pub notification: NotificationState,
     /// When the last announcement was decided, when there has been one.
     pub last_notified_ms: Option<TimestampMs>,
-    /// Whether the producer could prove the clock that stamped [`Item::first_seen_ms`].
+    /// Where this item's age is measured from, on the clock that can measure one.
     ///
-    /// That moment is what an age measured against the present starts from, and it belongs to the
-    /// producer that recorded the condition rather than to the host that read the record. A moment
-    /// nobody vouched for cannot be subtracted from a clock this host can prove: the two are not
-    /// on one scale, and the difference would be whatever separates them. So the two are kept
-    /// together, and an age with an anchor nobody vouched for starts again.
-    pub anchor_wall_proven: bool,
+    /// [`Item::first_seen_ms`] says when the condition was first seen, for a person reading the
+    /// record; this says where that moment sits on a continuous clock, and in which boot. An
+    /// anchor from another boot measures nothing, so the age starts again, which is late rather
+    /// than wrong. `None` is an item whose producer never read that clock.
+    pub anchor: Option<Anchor>,
     /// Whether the clock that stamped [`Item::last_notified_ms`] could be proved at the time.
     ///
     /// A host that cannot prove its wall clock still stamps the moment it read, because the
@@ -105,7 +104,7 @@ pub struct Item {
     /// once the clock is proved: the two readings are not on the same scale, and subtracting one
     /// from the other can make a two-second-old announcement look an hour old, which would announce
     /// the same condition again inside its own window.
-    pub announced_wall_proven: bool,
+    pub announced_anchor: Option<Anchor>,
     /// The level the last announcement went out at.
     ///
     /// An item that has climbed past it is owed another announcement; one that has not is not.
@@ -295,13 +294,11 @@ pub struct PendingInput {
     pub waited: Elapsed,
     /// Whether the reminder has already been raised for this request.
     pub reminded: bool,
-    /// Whether the producer could prove the clock that stamped
-    /// [`PendingInput::pending_since_ms`].
+    /// Where the wait is measured from, on the clock that can measure one.
     ///
-    /// The five-minute reminder is measured from that moment. A moment nobody vouched for cannot
-    /// be subtracted from a clock this host can prove, so the wait starts again instead, which
-    /// raises the reminder late rather than at once.
-    pub anchor_wall_proven: bool,
+    /// `None`, or an anchor from another boot, starts the wait where the engine read the record,
+    /// which raises the reminder late rather than at once.
+    pub anchor: Option<Anchor>,
 }
 
 /// The attention engine.
@@ -340,7 +337,7 @@ struct Raise {
     summary: String,
     routing: AttentionRouting,
     at_ms: TimestampMs,
-    at_proven: bool,
+    at_anchor: Option<Anchor>,
 }
 
 impl Engine {
@@ -575,11 +572,11 @@ impl Engine {
 
     /// Rebuilds state from one retained event without announcing anything.
     ///
-    /// This is the reconstruction path. An item's age is taken from the event's own recorded time
-    /// when the producer vouched for the clock that stamped it, so an approval that has been
-    /// outstanding for an hour comes back an hour old; an event that vouched for nothing starts
-    /// its age here instead. Either way nothing is announced for something that happened before
-    /// this host was running. The first
+    /// This is the reconstruction path. An item's age is taken from the anchor its event carried,
+    /// when that anchor is on this boot's clock, so an approval that has been outstanding for an
+    /// hour inside this boot comes back an hour old; an event with no anchor, or one from a boot
+    /// that has ended, starts its age here instead. Either way nothing is announced for something
+    /// that happened before this host was running. The first
     /// [`Engine::tick`] after a replay decides every announcement against the present.
     pub fn replay(&mut self, event: &SourceEvent, reading: HostReading) -> Vec<Outcome> {
         self.consume(event, reading, Mode::Replay)
@@ -725,49 +722,22 @@ impl Engine {
 
     /// Re-anchors every interval at `reading`, from the wall-clock moments the store kept.
     ///
-    /// The continuous clock restarts with the machine, so the durable half of an interval is the
-    /// moment it started. An interval is measured again only when both ends were taken on a clock
-    /// somebody could prove: this reading, and the reading that stamped the anchor. That keeps an
-    /// interval exactly where it was, including one already overdue, whenever it can be trusted,
-    /// and starts every other one again rather than subtracting two readings that are not on the
-    /// same scale. Starting again makes a reminder late; the arithmetic would make it immediate,
-    /// which is the failure that matters.
+    /// The continuous clock restarts with the machine, so each interval is kept as the anchor it
+    /// was measured from: a continuous reading and the boot it was taken in. An anchor from this
+    /// boot measures the interval exactly, including one already overdue, because nothing can set
+    /// that clock. An anchor from a boot that has ended measures nothing, and the interval starts
+    /// again. Starting again makes a reminder late; working it out across two wall-clock readings
+    /// would make it immediate the moment somebody corrected a clock, which is the failure that
+    /// matters.
     pub(crate) fn reanchor(&mut self, reading: HostReading) {
-        let since = |recorded: TimestampMs| {
-            if reading.wall_proven {
-                reading.wall_ms.get().saturating_sub(recorded.get())
-            } else {
-                0
-            }
-        };
         for item in self.items.values_mut() {
-            let anchored = item.anchor_wall_proven;
-            item.age = Elapsed::already(
-                if anchored {
-                    since(item.first_seen_ms)
-                } else {
-                    0
-                },
-                reading,
-            );
-            // Both ends of the interval have to be on a clock somebody can vouch for. An anchor
-            // stamped while this host could not prove its clock is not one, whatever the clock
-            // says now, so that interval starts again rather than being measured against it.
-            let announced = item.announced_wall_proven;
+            item.age = Elapsed::already(Self::waited(item.anchor, reading), reading);
             item.since_notified = item
                 .last_notified_ms
-                .map(|at| Elapsed::already(if announced { since(at) } else { 0 }, reading));
+                .map(|_| Elapsed::already(Self::waited(item.announced_anchor, reading), reading));
         }
         for pending in self.pending_inputs.values_mut() {
-            let anchored = pending.anchor_wall_proven;
-            pending.waited = Elapsed::already(
-                if anchored {
-                    since(pending.pending_since_ms)
-                } else {
-                    0
-                },
-                reading,
-            );
+            pending.waited = Elapsed::already(Self::waited(pending.anchor, reading), reading);
         }
     }
 
@@ -817,7 +787,7 @@ impl Engine {
                     summary: summary.clone(),
                     routing: AttentionRouting::OwnerPolicy,
                     at_ms: event.at_ms,
-                    at_proven: event.at_proven,
+                    at_anchor: event.at_anchor,
                 },
                 reading,
                 mode,
@@ -830,7 +800,7 @@ impl Engine {
                 session_id,
                 verified,
                 pending_since_ms,
-                pending_since_proven,
+                pending_since_anchor,
                 summary,
             } => {
                 if !*verified {
@@ -839,13 +809,7 @@ impl Engine {
                     // not admit is a claim rather than a request.
                     return Vec::new();
                 }
-                let waited = Self::waited(
-                    *pending_since_ms,
-                    *pending_since_proven,
-                    event.at_ms,
-                    event.at_proven,
-                    reading,
-                );
+                let waited = Self::waited(*pending_since_anchor, reading);
                 self.bound_pending_inputs(*question_id);
                 self.pending_inputs.insert(
                     *question_id,
@@ -855,7 +819,7 @@ impl Engine {
                         pending_since_ms: *pending_since_ms,
                         waited: Elapsed::already(waited, reading),
                         reminded: false,
-                        anchor_wall_proven: *pending_since_proven,
+                        anchor: *pending_since_anchor,
                     },
                 );
                 self.raise(
@@ -867,7 +831,7 @@ impl Engine {
                         summary: summary.clone(),
                         routing: AttentionRouting::OwnerPolicy,
                         at_ms: event.at_ms,
-                        at_proven: event.at_proven,
+                        at_anchor: event.at_anchor,
                     },
                     reading,
                     mode,
@@ -899,7 +863,7 @@ impl Engine {
                         summary: format!("{command} exited {exit_code}"),
                         routing: AttentionRouting::OwnerPolicy,
                         at_ms: event.at_ms,
-                        at_proven: event.at_proven,
+                        at_anchor: event.at_anchor,
                     },
                     reading,
                     mode,
@@ -919,7 +883,7 @@ impl Engine {
                     summary: summary.clone(),
                     routing: AttentionRouting::OwnerPolicy,
                     at_ms: event.at_ms,
-                    at_proven: event.at_proven,
+                    at_anchor: event.at_anchor,
                 },
                 reading,
                 mode,
@@ -941,7 +905,7 @@ impl Engine {
                     summary: format!("{plugin_id}: {detail}"),
                     routing: AttentionRouting::OwnerPolicy,
                     at_ms: event.at_ms,
-                    at_proven: event.at_proven,
+                    at_anchor: event.at_anchor,
                 },
                 reading,
                 mode,
@@ -958,7 +922,7 @@ impl Engine {
                     summary: detail.clone(),
                     routing: AttentionRouting::OwnerPolicy,
                     at_ms: event.at_ms,
-                    at_proven: event.at_proven,
+                    at_anchor: event.at_anchor,
                 },
                 reading,
                 mode,
@@ -984,7 +948,7 @@ impl Engine {
                         summary,
                         routing,
                         at_ms: event.at_ms,
-                        at_proven: event.at_proven,
+                        at_anchor: event.at_anchor,
                     },
                     reading,
                     mode,
@@ -1020,36 +984,17 @@ impl Engine {
         }
     }
 
-    /// Returns how long a request has been pending at this reading.
+    /// Returns how much of an interval had already run at this reading.
     ///
-    /// Both ends of an interval have to be on a clock somebody could vouch for, and each end is
-    /// asked about on its own. The moment it starts from is the one that has to be vouched for
-    /// first: without it there is nothing to measure against, whatever else can be proved, so the
-    /// interval starts here. With it, the reading this host holds is preferred, because the delay
-    /// between the producer recording the event and the engine consuming it is part of the wait;
-    /// failing that, the event's own recorded moment, when the producer vouched for that too.
-    /// Every fallback is nought or less than the true wait, never more: a reminder that comes late
-    /// is a reminder, and one that comes at once because a clock moved is an interruption nobody
-    /// earned.
-    fn waited(
-        since: TimestampMs,
-        since_proven: bool,
-        at_ms: TimestampMs,
-        at_proven: bool,
-        reading: HostReading,
-    ) -> u64 {
-        if !since_proven {
-            // Nobody can say what the moment the interval starts from means, so there is no
-            // interval to measure. It starts here instead.
-            return 0;
-        }
-        if reading.wall_proven {
-            return reading.wall_ms.get().saturating_sub(since.get());
-        }
-        if at_proven {
-            return at_ms.get().saturating_sub(since.get());
-        }
-        0
+    /// Only one clock answers that: the boot-scoped continuous one, which nobody can set. An
+    /// anchor on it, taken in this boot, gives the exact figure; anything else - no anchor at all,
+    /// or one from a boot that has ended - gives nought, and the interval starts here. Nought is
+    /// less than the true wait, never more, which makes a reminder late; the alternative is
+    /// arithmetic on a wall clock somebody may have moved, which makes one fire at once.
+    fn waited(anchor: Option<Anchor>, reading: HostReading) -> u64 {
+        anchor
+            .and_then(|anchor| anchor.elapsed_at(reading))
+            .unwrap_or_default()
     }
 
     fn raise(&mut self, raise: Raise, reading: HostReading, mode: Mode) -> Vec<Outcome> {
@@ -1111,23 +1056,14 @@ impl Engine {
             first_seen_ms: raise.at_ms,
             last_seen_ms: raise.at_ms,
             notification: NotificationState::Pending,
-            anchor_wall_proven: raise.at_proven,
+            anchor: raise.at_anchor,
             last_notified_ms: None,
-            announced_wall_proven: false,
+            announced_anchor: None,
             announced_level: None,
             announcements: 0,
             pending_handoff: None,
             uncertain: false,
-            age: Elapsed::already(
-                Self::waited(
-                    raise.at_ms,
-                    raise.at_proven,
-                    raise.at_ms,
-                    raise.at_proven,
-                    reading,
-                ),
-                reading,
-            ),
+            age: Elapsed::already(Self::waited(raise.at_anchor, reading), reading),
             since_notified: None,
             deferred: false,
         };
@@ -1221,7 +1157,7 @@ impl Engine {
         // inside quiet hours is deferred once rather than re-decided on every tick.
         item.since_notified = Some(Elapsed::starting(reading));
         item.last_notified_ms = Some(reading.wall_ms);
-        item.announced_wall_proven = reading.wall_proven;
+        item.announced_anchor = Some(reading.anchor());
         if quiet {
             item.deferred = true;
             item.notification = NotificationState::Deferred;
@@ -1355,8 +1291,8 @@ impl Engine {
                     routing: AttentionRouting::OwnerPolicy,
                     at_ms: reading.wall_ms,
                     // The reminder is raised now, on the reading this host is holding, so its
-                    // anchor is exactly as vouched for as that reading is.
-                    at_proven: reading.wall_proven,
+                    // anchor is that reading.
+                    at_anchor: Some(reading.anchor()),
                 },
                 reading,
                 Mode::Live,

@@ -44,6 +44,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use kr_attention::event::{ApplicationNotice, EventCursor, EventKind, SourceEvent};
+use kr_attention::time::BootMark;
 use kr_attention::{Attention as Engine, Content, HostReading, Outcome};
 use kr_protocol::action::WallClockTrust;
 use kr_protocol::attention::{
@@ -68,8 +69,8 @@ pub const MAX_STORED_COUNTER: u64 = i64::MAX as u64;
 /// How many retained records one page takes from each source.
 ///
 /// A page is bounded so a session that has been running for a week does not read its whole history
-/// in one read. A pass takes as many pages as it needs, up to its own bound; what is left after
-/// that is taken on the next pass, and the cursor is what says where that is.
+/// in one read. A pass takes as many pages as it needs, up to [`crate::service::ATTENTION_CATCH_UP_PAGES`];
+/// what is left after that is taken on the next pass, and the cursor is what says where that is.
 pub const PAGE: usize = 512;
 
 /// Returns the one line a refusal names a review subject by.
@@ -92,17 +93,34 @@ pub struct Attention {
 
 /// Returns the host time contract's answer, in the form the engine takes.
 ///
-/// The continuous reading is the machine's boot-scoped clock, which is the one the contract itself
-/// measures intervals on and which counts time the machine spent asleep. The wall reading is the
-/// clock the contract watches, and whether it can be proved is the contract's own answer rather
-/// than this module's opinion.
+/// Three things travel, and each answers only its own question. The **boot** is the contract's own
+/// boot identity, reduced to a fixed-width mark: it is what says whether a continuous reading
+/// written down earlier is on the same clock as this one. The **continuous** reading is the
+/// machine's boot-scoped clock, which the contract measures every interval on and which counts
+/// time the machine spent asleep. The **wall** reading is the clock the contract watches, and
+/// whether it can be proved is the contract's own answer rather than this module's opinion; it
+/// decides quiet hours and says when something happened, and it measures nothing, because a clock
+/// a host trusts is still a clock somebody can set forward.
 #[must_use]
 pub fn reading(time: &TimeContract) -> HostReading {
     HostReading::new(
+        boot_mark(time),
         kr_ipc::clock::boot_elapsed_ms(),
         kr_ipc::now_ms().get(),
         time.trust() == WallClockTrust::Trusted,
     )
+}
+
+/// Returns the mark for the boot this host's time contract belongs to.
+///
+/// The identity is opaque and compared for equality, so the mark is taken over its source and its
+/// value together: two boots that differ in either are two boots.
+fn boot_mark(time: &TimeContract) -> BootMark {
+    let identity = time.boot_identity();
+    let mut bytes = format!("{:?}", identity.source).into_bytes();
+    bytes.push(b'|');
+    bytes.extend_from_slice(identity.value.as_slice());
+    BootMark::of(&bytes)
 }
 
 /// Refuses a value the feature store could not write down as the one it was given.
@@ -540,11 +558,11 @@ impl Attention {
 /// section 25 means by a verified pending request. The label a caller gave itself is not part of
 /// it, and neither is anything the question's text says.
 ///
-/// The event says nothing about the clock its moments were taken on, because the ledger records a
-/// moment without recording what could be proved about the clock at the time. The engine therefore
-/// measures the wait inside the event's own moments rather than against the clock it reads now,
-/// which makes a reminder late rather than immediate. A ledger that comes to record that evidence
-/// builds the event with `SourceEvent::proven` instead.
+/// The event carries no anchor, because the ledger records a moment on the wall clock and not
+/// where that moment sat on this machine's continuous clock. Every interval the engine measures
+/// therefore starts where the host read the record, which makes a reminder late rather than
+/// immediate. A ledger that comes to record a continuous reading builds the event with
+/// `SourceEvent::anchored` and passes `pending_since_anchor`.
 #[must_use]
 pub fn question_event(sequence: u64, event: &kr_protocol::question::QuestionEvent) -> SourceEvent {
     let kind = match event.kind {
@@ -553,7 +571,11 @@ pub fn question_event(sequence: u64, event: &kr_protocol::question::QuestionEven
             session_id: event.question.session_id,
             verified: event.question.source.session_member,
             pending_since_ms: event.pending_since_ms,
-            pending_since_proven: false,
+            // The ledger records when a request became pending, and not where that moment sat on
+            // this machine's continuous clock. So the five-minute reminder counts from where this
+            // host read the record, which is late by however long the record waited to be read. A
+            // ledger that comes to record a continuous reading beside its moment passes it here.
+            pending_since_anchor: None,
             summary: event.question.question.clone(),
         },
         kr_protocol::question::QuestionEventKind::Answered => EventKind::QuestionResolved {
@@ -585,8 +607,9 @@ pub fn question_event(sequence: u64, event: &kr_protocol::question::QuestionEven
 /// to the lease holder, and this record exists because there was none. That is why the notice says
 /// no lease was held, and why section 25 routes it through the owner's notification policy.
 ///
-/// As with a question, the record carries a moment and no evidence about the clock that stamped
-/// it, so the event does not claim any.
+/// As with a question, the record carries a wall-clock moment and no reading of the continuous
+/// clock beside it, so the event carries no anchor and the notice's age starts where the host read
+/// the record.
 #[must_use]
 pub fn host_event(
     sequence: u64,

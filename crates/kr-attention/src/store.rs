@@ -38,13 +38,15 @@
 //! # What is durable, and what is re-anchored
 //!
 //! Every interval the engine measures is measured on the boot-scoped continuous clock, which means
-//! nothing after a restart. So the store records the wall-clock moments instead - when an item was
-//! first seen, when it was last announced, when a request became pending - and, beside each one,
-//! whether the clock that stamped it could be proved. [`crate::host::Attention::open`] re-anchors
-//! each interval against the reading it opened at, and only where both ends were taken on a clock
-//! somebody could vouch for: this reading, and the moment itself. Every other interval starts
-//! again, which is the conservative answer rather than arithmetic across two clocks that were
-//! never on one scale.
+//! nothing outside its own boot. So the store records two things for each of them - when an item
+//! was first seen, when it was last announced, when a request became pending - the wall-clock
+//! moment, which says when it happened for a person reading the record, and the anchor: the
+//! continuous reading at that moment and the boot it was taken in.
+//! [`crate::host::Attention::open`] re-anchors each interval from that anchor when the boot is
+//! still this one, which is exact, and starts it again when it is not. A row that carries half an
+//! anchor is refused rather than half measured. No interval is worked out from the wall-clock
+//! moments: a clock this host trusts is still a clock somebody can set forward, and two readings
+//! it vouches for are not two readings on one scale.
 //!
 //! # What a stored value may not do
 //!
@@ -69,7 +71,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use crate::engine::{Item, ItemAck, PendingInput};
 use crate::error::{Error, Result};
 use crate::review::{ReviewAck, Subject, subject_key};
-use crate::time::{Elapsed, HostReading};
+use crate::time::{Anchor, BootMark, Elapsed, HostReading};
 use crate::visit::{Omitted, Visit};
 
 /// The schema this build writes and reads.
@@ -77,10 +79,9 @@ use crate::visit::{Omitted, Visit};
 /// A store written under any other version is refused rather than read. Two things in here are
 /// derived rather than stored on their own - an item's key, and the order a review page continues
 /// by - so a row written under a different derivation would be read under a name that does not
-/// describe it, which is worse than not reading it at all. Every row also has to say which of its
-/// moments were taken on a clock somebody could prove, and a row that predates those columns
-/// cannot answer.
-pub const SCHEMA_VERSION: i64 = 4;
+/// describe it, which is worse than not reading it at all. Every row also has to carry the anchor
+/// each of its intervals is measured from, and a row that predates those columns carries none.
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// How long a write waits for another holder of the same file before it is refused.
 pub const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -163,8 +164,10 @@ const SCHEMA: &str = "
         last_seen_ms INTEGER NOT NULL,
         notification TEXT NOT NULL,
         last_notified_ms INTEGER,
-        announced_proven INTEGER NOT NULL,
-        anchor_proven INTEGER NOT NULL,
+        announced_boot TEXT,
+        announced_continuous_ms INTEGER,
+        anchor_boot TEXT,
+        anchor_continuous_ms INTEGER,
         announced_level TEXT,
         announcements INTEGER NOT NULL,
         pending_handoff INTEGER,
@@ -200,7 +203,8 @@ const SCHEMA: &str = "
         summary TEXT NOT NULL,
         pending_since_ms INTEGER NOT NULL,
         reminded INTEGER NOT NULL,
-        anchor_proven INTEGER NOT NULL
+        anchor_boot TEXT,
+        anchor_continuous_ms INTEGER
     );
     CREATE TABLE IF NOT EXISTS attention_quiet_hours (
         id INTEGER PRIMARY KEY CHECK (id = 0),
@@ -290,6 +294,26 @@ const TABLES: &[&str] = &[
 
 fn unreadable(field: &'static str) -> Error {
     Error::StoreUnreadable { field }
+}
+
+/// Returns the anchor a pair of stored columns holds, or `None` when the row carries none.
+///
+/// A row with one half of an anchor is refused: an anchor is a continuous reading *and* the boot
+/// it was taken in, and half of one would measure an interval against a clock that may have
+/// restarted since.
+fn anchor(
+    boot: Option<&str>,
+    continuous: Option<i64>,
+    field: &'static str,
+) -> Result<Option<Anchor>> {
+    match (boot, continuous) {
+        (None, None) => Ok(None),
+        (Some(boot), Some(continuous)) => Ok(Some(Anchor::new(
+            BootMark::from_hex(boot).ok_or_else(|| unreadable(field))?,
+            as_u64(continuous, field)?,
+        ))),
+        _ => Err(unreadable(field)),
+    }
 }
 
 /// Returns `value` as the integer SQLite stores, refusing one it cannot hold.
@@ -525,10 +549,10 @@ impl Store {
                 "INSERT INTO attention_items (
                      key, rule, source, session_id, summary, routing, level, steps_taken,
                      occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
-                     announced_proven, announced_level, announcements, pending_handoff, uncertain,
-                     deferred, anchor_proven
+                     announced_boot, announced_continuous_ms, announced_level, announcements,
+                     pending_handoff, uncertain, deferred, anchor_boot, anchor_continuous_ms
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
-                           ?17, ?18, ?19, ?20)",
+                           ?17, ?18, ?19, ?20, ?21, ?22)",
                 params![
                     item.key.as_str(),
                     item.rule.as_str(),
@@ -545,7 +569,10 @@ impl Store {
                     item.last_notified_ms
                         .map(|at| as_i64(at.get(), "last announced"))
                         .transpose()?,
-                    i64::from(item.announced_wall_proven),
+                    item.announced_anchor.map(|anchor| anchor.boot.to_hex()),
+                    item.announced_anchor
+                        .map(|anchor| as_i64(anchor.continuous_ms, "announced anchor"))
+                        .transpose()?,
                     item.announced_level.map(AttentionLevel::as_str),
                     as_i64(item.announcements, "announcement count")?,
                     item.pending_handoff
@@ -553,7 +580,10 @@ impl Store {
                         .transpose()?,
                     i64::from(item.uncertain),
                     i64::from(item.deferred),
-                    i64::from(item.anchor_wall_proven),
+                    item.anchor.map(|anchor| anchor.boot.to_hex()),
+                    item.anchor
+                        .map(|anchor| as_i64(anchor.continuous_ms, "item anchor"))
+                        .transpose()?,
                 ],
             )?;
         }
@@ -592,15 +622,20 @@ impl Store {
         for (question_id, pending) in &state.pending_inputs {
             transaction.execute(
                 "INSERT INTO attention_pending_inputs (
-                     question_id, session_id, summary, pending_since_ms, reminded, anchor_proven
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     question_id, session_id, summary, pending_since_ms, reminded, anchor_boot,
+                     anchor_continuous_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     question_id.to_string(),
                     pending.session_id.to_string(),
                     pending.summary,
                     as_i64(pending.pending_since_ms.get(), "pending since")?,
                     i64::from(pending.reminded),
-                    i64::from(pending.anchor_wall_proven)
+                    pending.anchor.map(|anchor| anchor.boot.to_hex()),
+                    pending
+                        .anchor
+                        .map(|anchor| as_i64(anchor.continuous_ms, "pending anchor"))
+                        .transpose()?
                 ],
             )?;
         }
@@ -728,8 +763,8 @@ impl Store {
         let mut statement = self.connection.prepare(
             "SELECT key, rule, source, session_id, summary, routing, level, steps_taken,
                     occurrences, first_seen_ms, last_seen_ms, notification, last_notified_ms,
-                    announced_proven, announced_level, announcements, pending_handoff, uncertain,
-                    deferred, anchor_proven
+                    announced_boot, announced_continuous_ms, announced_level, announcements,
+                    pending_handoff, uncertain, deferred, anchor_boot, anchor_continuous_ms
              FROM attention_items ORDER BY first_seen_ms, key",
         )?;
         let rows = statement.query_map([], |row| {
@@ -747,16 +782,18 @@ impl Store {
                 row.get::<_, i64>(10)?,
                 row.get::<_, String>(11)?,
                 row.get::<_, Option<i64>>(12)?,
-                row.get::<_, i64>(13)?,
-                row.get::<_, Option<String>>(14)?,
-                row.get::<_, i64>(15)?,
-                row.get::<_, Option<i64>>(16)?,
-                row.get::<_, i64>(17)?,
+                row.get::<_, Option<String>>(13)?,
+                row.get::<_, Option<i64>>(14)?,
+                row.get::<_, Option<String>>(15)?,
+                row.get::<_, i64>(16)?,
+                row.get::<_, Option<i64>>(17)?,
                 row.get::<_, i64>(18)?,
                 row.get::<_, i64>(19)?,
+                row.get::<_, Option<String>>(20)?,
+                row.get::<_, Option<i64>>(21)?,
             ))
         })?;
-        let unanchored = Elapsed::starting(HostReading::new(0, 0, false));
+        let unanchored = Elapsed::starting(HostReading::new(BootMark::default(), 0, 0, false));
         let mut items = Vec::new();
         for row in rows {
             let row = row?;
@@ -784,25 +821,25 @@ impl Store {
                 notification: NotificationState::from_wire(&row.11)
                     .ok_or_else(|| unreadable("notification"))?,
                 last_notified_ms,
-                anchor_wall_proven: row.19 != 0,
-                announced_wall_proven: row.13 != 0,
+                announced_anchor: anchor(row.13.as_deref(), row.14, "announced anchor")?,
                 announced_level: row
-                    .14
+                    .15
                     .map(|level| {
                         AttentionLevel::from_wire(&level).ok_or_else(|| unreadable("level"))
                     })
                     .transpose()?,
-                announcements: as_u64(row.15, "announcement count")?,
+                announcements: as_u64(row.16, "announcement count")?,
                 pending_handoff: row
-                    .16
+                    .17
                     .map(|number| as_u64(number, "announcement number"))
                     .transpose()?,
-                uncertain: row.17 != 0,
+                uncertain: row.18 != 0,
+                anchor: anchor(row.20.as_deref(), row.21, "item anchor")?,
                 // Both intervals are re-anchored before anything reads them; the values here stand
                 // only until `Attention::open` does that.
                 age: unanchored,
                 since_notified: last_notified_ms.map(|_| unanchored),
-                deferred: row.18 != 0,
+                deferred: row.19 != 0,
             });
         }
         Ok(items)
@@ -895,7 +932,8 @@ impl Store {
 
     fn load_pending(&self) -> Result<BTreeMap<QuestionId, PendingInput>> {
         let mut statement = self.connection.prepare(
-            "SELECT question_id, session_id, summary, pending_since_ms, reminded, anchor_proven
+            "SELECT question_id, session_id, summary, pending_since_ms, reminded, anchor_boot,
+                    anchor_continuous_ms
              FROM attention_pending_inputs",
         )?;
         let rows = statement.query_map([], |row| {
@@ -905,13 +943,14 @@ impl Store {
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<i64>>(6)?,
             ))
         })?;
-        let unanchored = Elapsed::starting(HostReading::new(0, 0, false));
+        let unanchored = Elapsed::starting(HostReading::new(BootMark::default(), 0, 0, false));
         let mut pending = BTreeMap::new();
         for row in rows {
-            let (question_id, session_id, summary, since, reminded, anchored) = row?;
+            let (question_id, session_id, summary, since, reminded, boot, continuous) = row?;
             pending.insert(
                 QuestionId::from_str(&question_id).map_err(|_| unreadable("question"))?,
                 PendingInput {
@@ -921,7 +960,7 @@ impl Store {
                     pending_since_ms: TimestampMs::new(as_u64(since, "pending since")?),
                     waited: unanchored,
                     reminded: reminded != 0,
-                    anchor_wall_proven: anchored != 0,
+                    anchor: anchor(boot.as_deref(), continuous, "pending anchor")?,
                 },
             );
         }

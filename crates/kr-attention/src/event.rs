@@ -21,6 +21,8 @@ use kr_protocol::ids::{
 };
 use kr_protocol::scalars::TimestampMs;
 
+use crate::time::Anchor;
+
 /// Where one event sat in its retained source.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EventCursor {
@@ -99,14 +101,13 @@ pub enum EventKind {
         verified: bool,
         /// When it became pending, which is where the idle interval counts from.
         pending_since_ms: TimestampMs,
-        /// Whether the clock that stamped [`EventKind::QuestionPending::pending_since_ms`] could
-        /// be proved at the time.
+        /// Where [`EventKind::QuestionPending::pending_since_ms`] sits on the continuous clock.
         ///
-        /// It is asked about separately from [`SourceEvent::at_proven`] because it is a different
-        /// moment: a request can become pending long before the record of it is written, and a
-        /// clock can be corrected in between. One producer reading one clock twice does not put
-        /// two readings on one scale if somebody moved the clock between them.
-        pending_since_proven: bool,
+        /// It is asked about separately from [`SourceEvent::at_anchor`] because it is a different
+        /// moment: a request can become pending long before the record of it is written. Without
+        /// it the five-minute reminder counts from where the engine read the record, which is
+        /// late; with it, from where the request actually started waiting.
+        pending_since_anchor: Option<Anchor>,
         /// One line naming what is being asked.
         summary: String,
     },
@@ -203,38 +204,43 @@ pub struct SourceEvent {
     pub cursor: EventCursor,
     /// When the host recorded it.
     pub at_ms: TimestampMs,
-    /// Whether the clock that stamped [`SourceEvent::at_ms`] could be proved at the time.
+    /// Where [`SourceEvent::at_ms`] sits on the only clock an interval can be measured on.
     ///
-    /// The engine measures an interval from a moment an event names - how long a request has been
-    /// pending, how long an adapter has been down - against the clock it reads now. Those two are
-    /// on the same scale only when both were taken on a clock somebody could vouch for, and the
-    /// producer is the only one that knows about its own. An event that does not say is taken not
-    /// to know, so the interval is measured inside the event's own moments instead, which
-    /// understates the wait rather than inventing one.
-    pub at_proven: bool,
+    /// The engine measures an interval from a moment an event names - how long a condition has
+    /// stood - against the clock it reads now, and the only clock that answers that is the
+    /// boot-scoped continuous one. A producer that read it when it recorded the event says so
+    /// here; one that did not, or one from another boot, gives the engine nothing to measure
+    /// across, and the interval starts where the engine reads the record. That makes a reminder
+    /// late rather than making it fire the moment somebody corrects a wall clock.
+    pub at_anchor: Option<Anchor>,
     /// What it says.
     pub kind: EventKind,
 }
 
 impl SourceEvent {
-    /// Builds an event whose recorded moment nobody has vouched for.
+    /// Builds an event whose recorded moment has no place on this engine's clock.
     #[must_use]
     pub const fn new(cursor: EventCursor, at_ms: TimestampMs, kind: EventKind) -> Self {
         Self {
             cursor,
             at_ms,
-            at_proven: false,
+            at_anchor: None,
             kind,
         }
     }
 
-    /// Builds an event whose recorded moment was taken on a clock the producer could prove.
+    /// Builds an event whose producer read the continuous clock when it recorded the moment.
     #[must_use]
-    pub const fn proven(cursor: EventCursor, at_ms: TimestampMs, kind: EventKind) -> Self {
+    pub const fn anchored(
+        cursor: EventCursor,
+        at_ms: TimestampMs,
+        anchor: Anchor,
+        kind: EventKind,
+    ) -> Self {
         Self {
             cursor,
             at_ms,
-            at_proven: true,
+            at_anchor: Some(anchor),
             kind,
         }
     }

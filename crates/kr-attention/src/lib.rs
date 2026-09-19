@@ -41,13 +41,14 @@
 //!
 //! ```
 //! use kr_attention::event::{EventCursor, EventKind, SourceEvent};
+//! use kr_attention::time::BootMark;
 //! use kr_attention::{Engine, HostReading, Outcome};
 //! use kr_protocol::attention::AttentionSource;
 //! use kr_protocol::ids::{ApprovalRequestId, SessionId};
 //! use kr_protocol::scalars::{TimestampMs, Uuid};
 //!
 //! let mut engine = Engine::new();
-//! let now = HostReading::new(0, 1_700_000_000_000, true);
+//! let now = HostReading::new(BootMark::of(b"this boot"), 0, 1_700_000_000_000, true);
 //! let outcomes = engine.apply(
 //!     &SourceEvent::new(
 //!         EventCursor::new(AttentionSource::Receipts, 1),

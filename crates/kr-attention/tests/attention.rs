@@ -46,8 +46,18 @@ fn nth_question(index: usize) -> QuestionId {
     QuestionId::new(Uuid::from_bytes(bytes))
 }
 
+/// The boot every reading in these tests is taken in, unless the test is about two of them.
+fn boot() -> kr_attention::time::BootMark {
+    kr_attention::time::BootMark::from_bytes([7; 16])
+}
+
+/// A second boot, for the tests that are about what an interval may not be measured across.
+fn next_boot() -> kr_attention::time::BootMark {
+    kr_attention::time::BootMark::from_bytes([9; 16])
+}
+
 fn reading(continuous_ms: u64) -> HostReading {
-    HostReading::new(continuous_ms, NOON + continuous_ms, true)
+    HostReading::new(boot(), continuous_ms, NOON + continuous_ms, true)
 }
 
 /// Builds an event `at_ms` after noon, so every recorded moment and every reading are on one
@@ -116,7 +126,7 @@ fn pending_question(
             pending_since_ms: TimestampMs::new(NOON + pending_since_ms),
             // The producer vouched for the clock it stamped the moment on, which is what lets the
             // wait be measured from there. The tests about a clock nobody vouched for say so.
-            pending_since_proven: true,
+            pending_since_anchor: Some(kr_attention::time::Anchor::new(boot(), 0)),
             summary: "which branch?".to_owned(),
         },
     )
@@ -427,7 +437,7 @@ fn an_announcement_inside_quiet_hours_is_deferred_and_released_when_they_end() {
     assert_eq!(item.notification, NotificationState::Deferred);
 
     // One hour later the window has ended and the held announcement is released.
-    let after = HostReading::new(3_600_000, NOON + 3_600_000, true);
+    let after = HostReading::new(boot(), 3_600_000, NOON + 3_600_000, true);
     assert!(!attention.engine().quiet_now(after));
     let released = attention
         .tick(after)
@@ -489,7 +499,7 @@ fn an_item_that_escalated_and_was_released_is_announced_once() {
         .apply(&adapter_failed(1, 1_000), reading(0))
         .expect("the store records the decision");
     // Long enough for the ladder, and past the end of the window.
-    let after = HostReading::new(3_600_000, NOON + 3_600_000, true);
+    let after = HostReading::new(boot(), 3_600_000, NOON + 3_600_000, true);
     let outcomes = attention
         .tick(after)
         .expect("the store records the decision");
@@ -549,7 +559,7 @@ fn quiet_hours_are_not_enforced_on_a_clock_this_host_cannot_prove() {
     attention
         .set_quiet_hours(Some(quiet_over_noon()))
         .expect("the store records the window");
-    let unproven = HostReading::new(0, NOON, false);
+    let unproven = HostReading::new(boot(), 0, NOON, false);
     assert!(!attention.engine().quiet_now(unproven));
     let outcomes = attention
         .apply(&approval(1, 1_000, "req-1"), unproven)
@@ -1685,9 +1695,10 @@ fn an_item_restored_after_a_restart_keeps_the_time_it_had_already_waited() {
         // interval be measured against a later reading rather than started again.
         attention
             .apply(
-                &SourceEvent::proven(
+                &SourceEvent::anchored(
                     EventCursor::new(AttentionSource::Semantic, 1),
                     TimestampMs::new(NOON),
+                    kr_attention::time::Anchor::new(boot(), 0),
                     EventKind::AdapterFailed {
                         plugin_id: PluginId::new("git").expect("an identifier"),
                         session_id: Some(session(1)),
@@ -1702,8 +1713,9 @@ fn an_item_restored_after_a_restart_keeps_the_time_it_had_already_waited() {
             AttentionLevel::Notable
         );
     }
-    // The machine restarted; the failure had already stood for the whole escalation interval.
-    let after_restart = HostReading::new(1_000, NOON + ADAPTER_ESCALATION_MS, true);
+    // The process restarted inside the same boot. The continuous clock did not restart with it,
+    // so the failure has stood for exactly as long as that clock says.
+    let after_restart = HostReading::new(boot(), ADAPTER_ESCALATION_MS, NOON + 1_000, true);
     let mut reopened = Attention::open(&path, after_restart).expect("the feature store reopens");
     let climbed = reopened
         .tick(after_restart)
@@ -1716,7 +1728,46 @@ fn an_item_restored_after_a_restart_keeps_the_time_it_had_already_waited() {
                 ..
             }
         )),
-        "the ladder is where the wall clock says it should be: {climbed:?}"
+        "the ladder is where the continuous clock says it should be: {climbed:?}"
+    );
+}
+
+#[test]
+fn an_interval_is_never_measured_across_a_clock_somebody_can_set() {
+    // The one thing a trusted wall clock does not establish: that two of its readings are on one
+    // scale. It stays trusted across a step forward, so an interval worked out between two of its
+    // readings can be an hour where two seconds passed, and the same condition is announced twice
+    // inside the minute it should have been folded into.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    {
+        let mut attention = Attention::open(&path, HostReading::new(boot(), 0, NOON, true))
+            .expect("the feature store opens");
+        attention
+            .apply(
+                &notice(1, 1_000, "build finished", false),
+                HostReading::new(boot(), 10_000, NOON, true),
+            )
+            .expect("the store records the decision");
+        assert_eq!(attention.awaiting_delivery(), 1, "it went out at once");
+    }
+
+    // The machine rebooted two seconds later and its wall clock was stepped an hour forward. Both
+    // readings are trusted; neither says anything about the other.
+    let stepped = HostReading::new(next_boot(), 12_000, NOON + 3_602_000, true);
+    let mut reopened = Attention::open(&path, stepped).expect("the feature store reopens");
+    let repeated = reopened
+        .apply(&notice(2, 2_000, "build finished", false), stepped)
+        .expect("the store records the decision");
+    assert!(
+        notified(&repeated).is_empty(),
+        "the repeat is folded into the item rather than announced an hour early: {repeated:?}"
+    );
+    // The item's own age starts again for the same reason, so nothing has climbed a ladder it did
+    // not climb.
+    assert_eq!(
+        whole_inbox(&reopened)[0].level,
+        AttentionLevel::Informational
     );
 }
 
@@ -3261,21 +3312,21 @@ fn an_announcement_stamped_on_an_unprovable_clock_is_not_measured_against_a_prov
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, HostReading::new(0, 1_000, false))
+        let mut attention = Attention::open(&path, HostReading::new(boot(), 0, 1_000, false))
             .expect("the feature store opens");
         attention
             .apply(
                 &notice(1, 1_000, "build finished", false),
-                HostReading::new(10_000, 1_000, false),
+                HostReading::new(boot(), 10_000, 1_000, false),
             )
             .expect("the store records the decision");
         assert_eq!(attention.awaiting_delivery(), 1, "it went out at once");
     }
     // Two seconds later on the machine's own clock, with the wall clock corrected and proved.
-    let mut reopened = Attention::open(&path, HostReading::new(12_000, NOON, true))
+    let mut reopened = Attention::open(&path, HostReading::new(boot(), 12_000, NOON, true))
         .expect("the feature store reopens");
     let outcomes = reopened
-        .tick(HostReading::new(12_000, NOON, true))
+        .tick(HostReading::new(boot(), 12_000, NOON, true))
         .expect("the store records the decision");
     assert!(
         notified(&outcomes).is_empty(),
@@ -3285,7 +3336,7 @@ fn an_announcement_stamped_on_an_unprovable_clock_is_not_measured_against_a_prov
     let repeated = reopened
         .apply(
             &notice(2, 2_000, "build finished", false),
-            HostReading::new(12_500, NOON + 500, true),
+            HostReading::new(boot(), 12_500, NOON + 500, true),
         )
         .expect("the store records the decision");
     assert!(
@@ -3304,7 +3355,7 @@ fn a_request_stamped_on_an_unprovable_clock_does_not_come_back_five_minutes_old(
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, HostReading::new(0, 1_000, false))
+        let mut attention = Attention::open(&path, HostReading::new(boot(), 0, 1_000, false))
             .expect("the feature store opens");
         attention
             .apply(
@@ -3317,20 +3368,20 @@ fn a_request_stamped_on_an_unprovable_clock_does_not_come_back_five_minutes_old(
                         session_id: session(1),
                         verified: true,
                         pending_since_ms: TimestampMs::new(1_000),
-                        // Nobody vouched for the clock that stamped it, which is the whole case.
-                        pending_since_proven: false,
+                        // No anchor at all, which is what every producer in this build gives.
+                        pending_since_anchor: None,
                         summary: "which branch?".to_owned(),
                     },
                 ),
-                HostReading::new(10_000, 1_000, false),
+                HostReading::new(boot(), 10_000, 1_000, false),
             )
             .expect("the store records the decision");
     }
     // Two seconds of the machine's own clock later, with the wall clock corrected an hour ahead.
-    let mut reopened = Attention::open(&path, HostReading::new(12_000, 3_603_000, true))
+    let mut reopened = Attention::open(&path, HostReading::new(boot(), 12_000, 3_603_000, true))
         .expect("the feature store reopens");
     let decided = reopened
-        .tick(HostReading::new(12_000, 3_603_000, true))
+        .tick(HostReading::new(boot(), 12_000, 3_603_000, true))
         .expect("the store records the decision");
     assert!(
         !raised(&decided).contains(&AttentionRule::InputIdleReminder),
@@ -3340,6 +3391,7 @@ fn a_request_stamped_on_an_unprovable_clock_does_not_come_back_five_minutes_old(
     // And the reminder is still owed, at five minutes from where the wait started again.
     let late = reopened
         .tick(HostReading::new(
+            boot(),
             12_000 + IDLE_REMINDER_MS + 1,
             3_603_000,
             true,
@@ -3358,18 +3410,21 @@ fn an_escalation_stamped_on_an_unprovable_clock_does_not_come_back_urgent() {
     let directory = tempfile::tempdir().expect("a temporary directory");
     let path = directory.path().join("attention.db");
     {
-        let mut attention = Attention::open(&path, HostReading::new(0, NOON, false))
+        let mut attention = Attention::open(&path, HostReading::new(boot(), 0, NOON, false))
             .expect("the feature store opens");
         attention
-            .apply(&adapter_failed(1, 0), HostReading::new(10_000, NOON, false))
+            .apply(
+                &adapter_failed(1, 0),
+                HostReading::new(boot(), 10_000, NOON, false),
+            )
             .expect("the store records the decision");
         assert_eq!(whole_inbox(&attention)[0].level, AttentionLevel::Notable);
     }
     let later = NOON + 3_602_000;
-    let mut reopened =
-        Attention::open(&path, HostReading::new(12_000, later, true)).expect("the store reopens");
+    let mut reopened = Attention::open(&path, HostReading::new(boot(), 12_000, later, true))
+        .expect("the store reopens");
     reopened
-        .tick(HostReading::new(12_000, later, true))
+        .tick(HostReading::new(boot(), 12_000, later, true))
         .expect("the store records the decision");
     assert_eq!(
         whole_inbox(&reopened)[0].level,
@@ -3379,6 +3434,7 @@ fn an_escalation_stamped_on_an_unprovable_clock_does_not_come_back_urgent() {
     // And the escalation is late rather than lost.
     reopened
         .tick(HostReading::new(
+            boot(),
             12_000 + ADAPTER_ESCALATION_MS + 1,
             later,
             true,
@@ -3388,10 +3444,11 @@ fn an_escalation_stamped_on_an_unprovable_clock_does_not_come_back_urgent() {
 }
 
 #[test]
-fn a_moment_no_producer_vouched_for_is_not_measured_against_this_host_s_proved_clock() {
-    // The event is consumed for the first time *after* the clock was corrected and proved. Its own
-    // moment was taken before that, by a producer that said nothing about its clock, so the two
-    // are not on one scale and the wait is measured inside the event instead.
+fn a_moment_with_no_anchor_starts_its_interval_where_the_host_read_the_record() {
+    // The record says when the request became pending on a wall clock, and nothing about where
+    // that moment sat on a clock an interval can be measured on. So the wait starts where the host
+    // read the record: late by however long the record waited, rather than an hour old because a
+    // wall clock moved.
     let mut attention = engine();
     attention
         .apply(
@@ -3404,46 +3461,53 @@ fn a_moment_no_producer_vouched_for_is_not_measured_against_this_host_s_proved_c
                     session_id: session(1),
                     verified: true,
                     pending_since_ms: TimestampMs::new(NOON),
-                    pending_since_proven: false,
+                    pending_since_anchor: None,
                     summary: "which branch?".to_owned(),
                 },
             ),
-            HostReading::new(12_000, NOON + 3_602_000, true),
+            HostReading::new(boot(), 12_000, NOON + 3_602_000, true),
         )
         .expect("the store records the decision");
     let decided = attention
-        .tick(HostReading::new(12_000, NOON + 3_602_000, true))
+        .tick(HostReading::new(boot(), 12_000, NOON + 3_602_000, true))
         .expect("the store records the decision");
     assert!(
         !raised(&decided).contains(&AttentionRule::InputIdleReminder),
-        "a wait nobody vouched for is not an hour: {decided:?}"
+        "a wait with no anchor is not an hour old: {decided:?}"
     );
 
-    // A producer that *can* vouch for its own clock says so, and the wait counts from there.
+    // A producer that read the continuous clock when it recorded the moment passes that reading,
+    // and the wait counts from there.
     let mut vouched = engine();
     vouched
         .apply(
-            &SourceEvent::proven(
+            &SourceEvent::anchored(
                 EventCursor::new(AttentionSource::Questions, 1),
                 TimestampMs::new(NOON),
+                kr_attention::time::Anchor::new(boot(), 0),
                 EventKind::QuestionPending {
                     question_id: question(9),
                     session_id: session(1),
                     verified: true,
                     pending_since_ms: TimestampMs::new(NOON),
-                    pending_since_proven: true,
+                    pending_since_anchor: Some(kr_attention::time::Anchor::new(boot(), 0)),
                     summary: "which branch?".to_owned(),
                 },
             ),
-            HostReading::new(12_000, NOON + 3_602_000, true),
+            HostReading::new(boot(), IDLE_REMINDER_MS + 1, NOON + 3_602_000, true),
         )
         .expect("the store records the decision");
     let owed = vouched
-        .tick(HostReading::new(12_000, NOON + 3_602_000, true))
+        .tick(HostReading::new(
+            boot(),
+            IDLE_REMINDER_MS + 1,
+            NOON + 3_602_000,
+            true,
+        ))
         .expect("the store records the decision");
     assert!(
         raised(&owed).contains(&AttentionRule::InputIdleReminder),
-        "and a wait the producer vouched for is measured from where it started: {owed:?}"
+        "and a wait the producer anchored is measured from where it started: {owed:?}"
     );
 }
 

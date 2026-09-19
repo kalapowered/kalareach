@@ -1237,14 +1237,19 @@ Maintenance otherwise wakes at the earlier of its own cadence and the moment the
 timer is due, so a five-minute reminder is five minutes from the request rather than five minutes
 rounded up to the next time the host happened to look.
 
-Every interval the engine measures needs both of its ends on a clock somebody could vouch for: the
-reading it holds now, and the moment it is measuring from. An event says whether the producer could
-vouch for each moment it carries, separately, because a request can become pending long before the
-record of it is written and a clock can be corrected in between. A moment nobody vouched for is not
-measured from at all: the interval starts where the host read the record. Every answer but the
-vouched one is nought or less than the true wait, never more, because a reminder that comes late is
-still a reminder, and one raised seconds after a request because somebody corrected a clock is an
-interruption nobody earned.
+One clock measures every interval, and it is not the wall clock. A wall clock can be set, and a
+host that trusts one still trusts it after somebody moves it forward an hour, so two readings it
+vouches for are not two readings on one scale. Intervals are measured on the machine's continuous
+clock instead: it only goes forward, nobody can set it, and it counts the time the machine spent
+asleep. It means nothing outside its own boot, so every moment the host writes down carries the
+continuous reading *and* the boot it was taken in, and an interval whose anchor belongs to a boot
+that has ended starts again rather than being worked out across the gap. An event brings an anchor
+of its own when its producer read that clock, separately for each moment it carries, because a
+request can become pending long before the record of it is written. Every one of those answers is
+nought or less than the true wait, never more: a reminder that comes late is still a reminder, and
+one raised seconds after a request because somebody corrected a clock is an interruption nobody
+earned. The wall clock keeps the two jobs it can do - deciding quiet hours, and saying when
+something happened for a person reading the record.
 
 ### The rule set
 
@@ -1374,8 +1379,8 @@ session's life says where it is starting rather than leaving the first record to
 eviction.
 
 A rebuild announces nothing. An event from an hour ago is history rather than a notification to
-send now, so the replay restores each item with the age it had, where the producer vouched for the
-moment that age is measured from, and starts the age here where nobody did. Either way the first
+send now, so the replay restores each item with the age it had, where the anchor that age is
+measured from belongs to this boot, and starts the age here where it does not. Either way the first
 timer pass after the rebuild decides what still needs saying.
 
 The inbox is a working set rather than a record: the receipts, the question ledger and the retained
