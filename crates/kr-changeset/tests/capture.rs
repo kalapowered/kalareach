@@ -1246,6 +1246,17 @@ fn both_administrative_directories_a_repository_reports_are_excluded() {
     )
     .expect("something only this worktree has");
     std::fs::write(path.join(".git"), b"gitdir: meta\n").expect("and the file that names it");
+    // Tracked, so the capture has every reason to reach it: it is in the index and in a commit.
+    git_raw(&path, ["add", "--force", "meta/config.worktree"]);
+    git_raw(
+        &path,
+        [
+            "commit",
+            "--quiet",
+            "-m",
+            "the worktree's own configuration",
+        ],
+    );
 
     let workspace = fixture.workspace("split-tree");
     let outcome = fixture.capture_with(
@@ -1306,15 +1317,15 @@ fn a_linked_worktree_holds_neither_of_its_repository_s_directories() {
         return;
     }
     let workspace = fixture.workspace("linked-tree");
-    let Ok(record) = fixture.capture_with(
-        workspace,
-        &include_everything(),
-        &kr_protocol::changeset::FileGrant::default(),
-        None,
-        None,
-    ) else {
-        return;
-    };
+    let record = fixture
+        .capture_with(
+            workspace,
+            &include_everything(),
+            &kr_protocol::changeset::FileGrant::default(),
+            None,
+            None,
+        )
+        .expect("an ordinary linked worktree is captured");
     let manifest = fixture
         .service()
         .manifest(record.change_set_id, record.version)
@@ -1323,6 +1334,40 @@ fn a_linked_worktree_holds_neither_of_its_repository_s_directories() {
         assert!(
             !entry.path.contains(".git"),
             "nothing of either administrative directory is in the version: {}",
+            entry.path
+        );
+    }
+}
+
+/// KR-REQ-14.33 and D-087b: a second name for this repository's own data is excluded by identity.
+///
+/// The name can be a link inside the tree, and on a filesystem that ignores case it can be the
+/// same directory under another spelling. Neither changes what the directory **is**, and that is
+/// what the exclusion set holds.
+#[test]
+fn another_name_for_this_repository_s_own_data_is_excluded_too() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "aliased-data");
+    // A second name for the repository's own directory, inside the tree this capture reads.
+    std::os::unix::fs::symlink(".git", path.join("history")).expect("a second name for it");
+    let workspace = fixture.workspace("aliased-data");
+    let record = fixture
+        .capture_with(
+            workspace,
+            &include_everything(),
+            &kr_protocol::changeset::FileGrant::default(),
+            None,
+            None,
+        )
+        .expect("the capture runs");
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    for entry in &manifest.paths {
+        assert!(
+            !entry.path.starts_with("history/"),
+            "nothing of this repository's own data reaches a version under a second name: {}",
             entry.path
         );
     }

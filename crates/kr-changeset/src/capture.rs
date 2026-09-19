@@ -1221,14 +1221,14 @@ fn nested_repositories(
     refused.insert((reported.device, reported.file_id));
     let environment_id = tree.environment_id();
     for path in [repository.git_dir_path(), repository.own_dir_path()] {
-        // Outside this working tree or inside it, the object is the object: what decides is
-        // whether a directory this capture opens **is** it.
-        if let Some(identity) = administrative_identity(environment_id, path)? {
-            if identity == here {
-                return Err(unplaceable("this working tree"));
-            }
-            refused.insert(identity);
+        // Outside this working tree or inside it, the object is the object, and it goes in
+        // unconditionally: what decides anything later is whether a directory this capture opens
+        // **is** it, and holding one that nothing reaches costs nothing.
+        let identity = administrative_identity(environment_id, path)?;
+        if identity == here {
+            return Err(unplaceable("this working tree"));
         }
+        refused.insert(identity);
     }
     for (directory, held) in &opened {
         let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
@@ -1306,18 +1306,16 @@ fn nested_repositories(
 /// followed all answer the one object. That object is what the exclusion set holds, and a
 /// directory this capture opens is compared with it whatever it is called there.
 ///
-/// A path that is not there answers nothing, because there is nothing of it for a version to
-/// hold. Anything else this host could not open refuses the capture: it cannot then say the tree
-/// is free of that repository's own data.
+/// **Every** failure to open one refuses the capture, an absence included (D-087b): a repository
+/// whose own directory Git has just reported and this host cannot open is not one it can say
+/// anything about, least of all that a tree is free of its data.
 fn administrative_identity(
     environment_id: kr_protocol::ids::EnvironmentId,
     path: &std::path::Path,
-) -> Result<Option<(u64, u64)>> {
-    match AuthorisedDirectory::open_root(environment_id, path) {
-        Ok(held) => Ok(Some(identity_of(&held))),
-        Err(kr_transfer::Escape::NotFound { .. }) => Ok(None),
-        Err(_) => Err(unplaceable("this repository's own data")),
-    }
+) -> Result<(u64, u64)> {
+    AuthorisedDirectory::open_root(environment_id, path)
+        .map(|held| identity_of(&held))
+        .map_err(|_| unplaceable("this repository's own data"))
 }
 
 /// Returns the object one open directory is.
