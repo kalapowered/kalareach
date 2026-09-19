@@ -127,11 +127,13 @@ impl ShellPackage {
 
     /// Returns a path the record names, as this package's own copy of it.
     ///
-    /// A build records the paths it installed, which are absolute and inside the directory it
-    /// installed them in. A package that was copied somewhere else carries paths that point back
-    /// at the original, and launching that original would be launching a package this one only
-    /// describes. So a recorded path inside this directory is taken as it is, and one outside it
-    /// is taken as its own tail under this directory: the package is the directory it is in.
+    /// A build records the paths it installed, which are absolute and inside a directory named for
+    /// the package's own identity. A package that was copied somewhere else carries paths that
+    /// point back at the original, and launching that original would be launching a package this
+    /// one only describes. So a recorded path inside this directory is taken as it is, one that is
+    /// not absolute is taken under it, and one that is absolute keeps whatever follows the identity
+    /// component: the layout inside the package is the build's, and where the package is, is this
+    /// installation's. [`PackageSet::discover`] refuses a record whose paths say neither.
     fn own(&self, recorded: &Path) -> PathBuf {
         if recorded.starts_with(&self.directory) {
             return recorded.to_path_buf();
@@ -139,17 +141,30 @@ impl ShellPackage {
         if !recorded.is_absolute() {
             return self.directory.join(recorded);
         }
-        // The last two components of an installed path are the kind of place it sits in and its
-        // own name: `bin/zsh`, `lib/zsh/5.9`. Keeping the tail keeps the layout the build made.
-        let tail: PathBuf = recorded
-            .components()
-            .rev()
-            .take(2)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        self.directory.join(tail)
+        match inside_identity(recorded, &self.manifest.identity) {
+            Some(tail) => self.directory.join(tail),
+            None => recorded.to_path_buf(),
+        }
+    }
+
+    /// Returns whether every path this record names is one this package can answer for.
+    fn owns_its_paths(&self) -> bool {
+        std::iter::once(self.manifest.shell.executable.as_path())
+            .chain(
+                self.manifest
+                    .shell
+                    .modules
+                    .iter()
+                    .map(|module| Path::new(&module.search_path)),
+            )
+            .chain(std::iter::once(Path::new(
+                &self.manifest.startup_entry.file,
+            )))
+            .all(|recorded| {
+                !recorded.is_absolute()
+                    || recorded.starts_with(&self.directory)
+                    || inside_identity(recorded, &self.manifest.identity).is_some()
+            })
     }
 
     /// Returns the guarded startup entry this package installs.
@@ -360,10 +375,20 @@ impl PackageSet {
                     .parent()
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| directory.clone());
-                packages.push(ShellPackage {
+                let package = ShellPackage {
                     manifest,
                     directory,
-                });
+                };
+                // A record whose paths name neither this directory nor a directory of its own
+                // identity describes some other installation. Launching what it names would launch
+                // that one, and this host has no way to say which package it would be.
+                if !package.owns_its_paths() {
+                    return Err(PackageFault::Unreadable {
+                        path: candidate.display().to_string(),
+                        detail: "it names paths outside the package it is in".to_owned(),
+                    });
+                }
+                packages.push(package);
                 break;
             }
         }
@@ -523,6 +548,25 @@ fn manifest_candidates(directory: &Path) -> Result<Vec<PathBuf>, PackageFault> {
     Ok(nested)
 }
 
+/// Returns what an installed path holds after the directory named for a package's identity.
+///
+/// The build puts everything a package is under one directory of that name, so what follows it is
+/// where a file sits inside the package however many components deep that is: `bin/zsh`,
+/// `lib/zsh/5.9`, `startup/kr-zshrc.zsh`.
+fn inside_identity(recorded: &Path, identity: &str) -> Option<PathBuf> {
+    if identity.is_empty() {
+        return None;
+    }
+    let mut components = recorded.components();
+    while let Some(component) = components.next() {
+        if component.as_os_str() == identity {
+            let tail: PathBuf = components.collect();
+            return (!tail.as_os_str().is_empty()).then_some(tail);
+        }
+    }
+    None
+}
+
 /// Returns the alternative name a shell's binary is installed under.
 const fn alias(kind: ShellKind) -> &'static str {
     match kind {
@@ -674,12 +718,16 @@ mod tests {
         let installed = original.path().join("zsh/identity-1");
         let mut record = manifest(ShellKind::Zsh);
         record.identity = "identity-1".to_owned();
-        record.shell.executable = installed.join("bin/shell");
+        record.shell.executable = installed.join("bin/zsh");
+        // The layout a build makes, three components deep, which is what the real Zsh package has.
         record.shell.modules = vec![ModuleEntry {
-            name: "kr-bridge".to_owned(),
-            search_path: installed.join("lib/zsh").display().to_string(),
+            name: "zsh/zle".to_owned(),
+            search_path: installed.join("lib/zsh/5.9").display().to_string(),
             editor_abi: "zle-5.9".to_owned(),
         }];
+        record.startup_entry.file = "startup/kr-zshrc.zsh".to_owned();
+        std::fs::create_dir_all(installed.join("lib/zsh/5.9")).expect("creates the module tree");
+        std::fs::write(installed.join("bin/zsh"), b"#!/bin/sh\n").expect("writes the binary");
         std::fs::write(
             installed.join(MANIFEST_BASENAME),
             serde_json::to_string(&record).expect("encodes"),
@@ -690,7 +738,9 @@ mod tests {
         let copy = tempfile::tempdir().expect("a directory");
         let there = copy.path().join("zsh/identity-1");
         std::fs::create_dir_all(there.join("bin")).expect("creates the copy");
-        std::fs::copy(installed.join("bin/shell"), there.join("bin/shell")).expect("copies");
+        std::fs::create_dir_all(there.join("lib/zsh/5.9")).expect("copies the module tree");
+        std::fs::create_dir_all(there.join("startup")).expect("copies the entry directory");
+        std::fs::copy(installed.join("bin/zsh"), there.join("bin/zsh")).expect("copies");
         std::fs::copy(
             installed.join(MANIFEST_BASENAME),
             there.join(MANIFEST_BASENAME),
@@ -700,13 +750,32 @@ mod tests {
 
         let set = PackageSet::discover(copy.path()).expect("reads the copy");
         let package = set.get(ShellKind::Zsh).expect("the copy");
-        assert_eq!(package.executable(), there.join("bin/shell"));
+        assert_eq!(package.executable(), there.join("bin/zsh"));
+        assert_eq!(
+            package.startup_entry(),
+            there.join("startup/kr-zshrc.zsh"),
+            "the entry it sources is the copy's"
+        );
         let identity = package.identity();
         assert_eq!(
             identity.modules[0].search_path,
-            there.join("lib/zsh").display().to_string(),
-            "the module tree is the copy's too"
+            there.join("lib/zsh/5.9").display().to_string(),
+            "the module tree is the copy's too, all the way down"
         );
+
+        // A record that names paths belonging to neither is not a package this host can answer for.
+        let stray = tempfile::tempdir().expect("a directory");
+        let elsewhere = stray.path().join("zsh/identity-1");
+        std::fs::create_dir_all(elsewhere.join("bin")).expect("creates it");
+        record.shell.executable = PathBuf::from("/opt/somebody-elses/bin/zsh");
+        std::fs::write(
+            elsewhere.join(MANIFEST_BASENAME),
+            serde_json::to_string(&record).expect("encodes"),
+        )
+        .expect("writes the record");
+        std::fs::write(stray.path().join("zsh/current"), "identity-1").expect("names one");
+        let fault = PackageSet::discover(stray.path()).expect_err("refused");
+        assert!(matches!(fault, PackageFault::Unreadable { .. }), "{fault}");
     }
 
     #[test]
