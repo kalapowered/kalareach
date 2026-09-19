@@ -4,6 +4,10 @@ PROMPT='KR> '
 setopt no_beep
 unsetopt zle_rprompt_indent 2>/dev/null
 HISTFILE=
+# This person deletes with the key rather than listing what completes: a listing of every command
+# on the machine is not what they want from it, and a question about one is a reader waiting for an
+# answer. The integration decides before the binding runs, so what the key is bound to is theirs.
+bindkey '^D' delete-char
 typeset -g KR_TEST_USER_CONFIGURATION=1
 
 # A native module of the person's own, ahead of the shell's own module path. This build cannot

@@ -29,7 +29,7 @@ use std::time::{Duration, Instant};
 use hmac::{Hmac, KeyInit, Mac};
 use kr_protocol::ids::SessionId;
 use kr_protocol::scalars::Uuid;
-use kr_shell_integration::contract::qualification::ShellKind;
+use kr_shell_integration::contract::qualification::{DetachExclusion, ShellKind};
 use kr_shell_integration::contract::transport::{
     BOOTSTRAP_SECRET_LEN, BridgeEndpoint, BridgeFrame, HandshakeOutcome, ObservedPeer,
     ProofVerdict, WorkerExpectation, bootstrap_transcript, decide_handshake,
@@ -199,6 +199,9 @@ pub struct QualificationCase {
     pub binding: String,
     /// What this case claims to prove.
     pub checks: Vec<String>,
+    /// What this case does not drive, and why, where that is not obvious from the checks.
+    #[serde(default)]
+    pub notes: Option<String>,
     #[serde(default)]
     pub plugin: Option<PluginProbe>,
     #[serde(default)]
@@ -768,8 +771,22 @@ impl Session {
     #[must_use]
     pub fn user_binding_ran(&mut self) -> bool {
         let start = self.written();
-        self.type_bytes(USER_BINDING_KEY);
-        self.wait_for_output_after(start, USER_BINDING_TEXT, REPLY)
+        // An editor that takes the terminal out of its own line mode can still be between one
+        // read and the next, where the two bytes go to the line discipline instead. The key is
+        // offered again once; what the binding writes is the same text either way.
+        for attempt in 0..2 {
+            self.ensure_reading();
+            self.type_bytes(USER_BINDING_KEY);
+            let within = if attempt == 0 {
+                Duration::from_secs(4)
+            } else {
+                REPLY
+            };
+            if self.wait_for_output_after(start, USER_BINDING_TEXT, within) {
+                return true;
+            }
+        }
+        false
     }
 
     /// How much the terminal has shown so far, as an offset a later wait counts from.
@@ -794,6 +811,48 @@ impl Session {
             }
             self.pump(Duration::from_millis(25));
         }
+    }
+
+    /// Takes the reader to a fenced empty prompt that nothing before this has a claim on.
+    ///
+    /// A check that has just run commands leaves reader entries in this session's own event
+    /// queue, and the next one taken from it names a reader that has since moved. Clearing the
+    /// queue and running one command of this session's own is what makes the prompt that follows
+    /// the one the fence is about.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the shell does not answer, which is a shell that has stopped reading.
+    pub fn fenced_after_a_command(&mut self, index: u8) -> (RootEditorEnterParams, EditorFence) {
+        self.recover();
+        self.forget_events();
+        assert!(
+            self.run("echo kr-fence-ready", "kr-fence-ready"),
+            "the shell did not answer before a fence was asked for:\n{}",
+            self.terminal_output()
+        );
+        let published = self.fenced_prompt(index);
+        // An editor that reaches its own queue only when the reader steps has not taken the
+        // publication yet. The step a person gives it by typing is given here, before the gesture
+        // this fence is about.
+        if dialect(self.package_kind).answers_at_the_next_step {
+            self.nudge();
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        published
+    }
+
+    /// Puts the reader back where a drive left it, before anything is asked of it.
+    ///
+    /// A check that drove an excluded state can leave the editor inside a listing, a search or a
+    /// pending sequence. The keys here are the ones every one of these editors answers with
+    /// "stop what you are doing and keep the line", followed by clearing the line itself.
+    pub fn recover(&mut self) {
+        for keys in [CTRL_G, CTRL_C, CTRL_U] {
+            self.type_bytes(keys);
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        std::thread::sleep(Duration::from_millis(120));
     }
 
     /// Asks the shell whether the case's customisation is loaded and working.
@@ -974,5 +1033,82 @@ pub fn settle(session: &mut Session, quiet: Duration, within: Duration) {
             last = now;
             since = Instant::now();
         }
+    }
+}
+
+/// Which of section 7's exclusions this reader could be put into, and why the rest could not.
+///
+/// The corpus names ten states that exclude the detach condition. Some of them are not states a
+/// particular reader has — an editor with no quoted insertion cannot be waiting inside one — and
+/// one of them, the requirement that this is the managed root editor at all, is not a state of a
+/// managed reader. Those are recorded with their reason rather than left out, so a reader that
+/// stopped reporting a state it does have fails rather than passing quietly.
+#[must_use]
+pub fn exclusions_accounted_for(kind: ShellKind) -> Vec<(DetachExclusion, String)> {
+    DetachExclusion::ALL
+        .iter()
+        .copied()
+        .chain(std::iter::once(DetachExclusion::NotManagedRootEditor))
+        .filter_map(|exclusion| {
+            not_constructible_here(kind, exclusion).map(|reason| (exclusion, reason.to_owned()))
+        })
+        .collect()
+}
+
+/// The shell's own `read` through the editor, where it has one that reads through it.
+#[must_use]
+pub fn read_builtin_command(kind: ShellKind) -> Option<&'static str> {
+    match kind {
+        ShellKind::Bash => Some("read -e -t 5 kr_read_var"),
+        ShellKind::Fish => Some("read -l kr_read_var"),
+        // Zsh's `vared` ends on the gesture rather than surviving it, and this editor's own
+        // `Read-Host` does not read through the editor at all.
+        ShellKind::Zsh | ShellKind::PowerShell => None,
+    }
+}
+
+/// Switching the editor to vi bindings and back, where a motion waits for its target there.
+#[must_use]
+pub fn vi_keymap_commands(kind: ShellKind) -> Option<(&'static str, &'static str)> {
+    match kind {
+        ShellKind::Zsh => Some(("bindkey -v; echo kr-vi-on", "bindkey -e; echo kr-vi-off")),
+        ShellKind::Bash => Some(("set -o vi; echo kr-vi-on", "set -o emacs; echo kr-vi-off")),
+        ShellKind::Fish => Some((
+            "fish_vi_key_bindings; echo kr-vi-on",
+            "fish_default_key_bindings; echo kr-vi-off",
+        )),
+        // This editor's vi mode is the host's own and its operators take their keys themselves.
+        ShellKind::PowerShell => None,
+    }
+}
+
+/// A binding that feeds the gesture back as the reader's own input.
+#[must_use]
+pub fn macro_binding(kind: ShellKind) -> Option<&'static str> {
+    match kind {
+        ShellKind::Zsh => Some("bindkey -s '^T' $'\\x04'; echo kr-macro-bound"),
+        ShellKind::Bash => Some("bind '\"\\C-t\": \"\\C-d\"' ; echo kr-macro-bound"),
+        // Neither editor replays a macro of its own.
+        ShellKind::Fish | ShellKind::PowerShell => None,
+    }
+}
+
+/// What this qualification cannot put a reader into, beyond what the package suite records.
+///
+/// [`not_constructible_here`] says what a reader does not have. This says what it has and this
+/// corpus cannot reach: a state that exists only where a person bound it, where the corpus binds
+/// nothing of the kind.
+#[must_use]
+pub fn not_driven_by_the_qualification(
+    kind: ShellKind,
+    exclusion: DetachExclusion,
+) -> Option<&'static str> {
+    match (kind, exclusion) {
+        // This shell ships no numeric-argument binding of its own. Its reader accumulates one
+        // where a person has bound `up-line-or-search`-style digits, and none of these cases does.
+        (ShellKind::Fish, DetachExclusion::NumericArgument) => Some(
+            "this shell binds no numeric argument by default and no case in this corpus binds one",
+        ),
+        _ => None,
     }
 }

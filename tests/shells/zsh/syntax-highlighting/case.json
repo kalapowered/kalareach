@@ -18,14 +18,24 @@
     "profile_order",
     "plugin_active",
     "plugin_buffer",
-    "user_bindings"
+    "user_bindings",
+    "gesture_detaches",
+    "gesture_is_native_outside_the_condition",
+    "escape_then_gesture_is_native",
+    "takeover_under_the_stack"
   ],
   "plugin": {
     "probe": "echo kr-plugin=$ZSH_HIGHLIGHT_VERSION",
     "marker": "kr-plugin=0.8.0"
   },
   "covers": [
-    "KR-REQ-07.87"
+    "KR-REQ-07.87",
+    "KR-REQ-07.72",
+    "KR-REQ-07.73",
+    "KR-REQ-07.74",
+    "KR-REQ-07.78",
+    "KR-REQ-07.79",
+    "KR-REQ-07.83"
   ],
   "home": [
     {

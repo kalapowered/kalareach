@@ -18,14 +18,20 @@
     "profile_order",
     "plugin_active",
     "plugin_buffer",
-    "user_bindings"
+    "user_bindings",
+    "gesture_detaches",
+    "gesture_is_native_outside_the_condition",
+    "escape_then_gesture_is_native"
   ],
   "plugin": {
     "probe": "echo kr-plugin=${ATUIN_SESSION:+on}",
     "marker": "kr-plugin=on"
   },
   "covers": [
-    "KR-REQ-07.87"
+    "KR-REQ-07.87",
+    "KR-REQ-07.72",
+    "KR-REQ-07.73",
+    "KR-REQ-07.74"
   ],
   "home": [
     {

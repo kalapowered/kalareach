@@ -19,14 +19,25 @@
     "plugin_active",
     "plugin_writes_buffer",
     "plugin_buffer",
-    "user_bindings"
+    "user_bindings",
+    "gesture_detaches",
+    "gesture_is_native_outside_the_condition",
+    "escape_then_gesture_is_native",
+    "takeover_under_the_stack",
+    "launch_deadline_installs_nothing"
   ],
   "plugin": {
     "probe": "echo kr-plugin=$(( $+functions[_zsh_autosuggest_start] ))",
     "marker": "kr-plugin=1"
   },
   "covers": [
-    "KR-REQ-07.87"
+    "KR-REQ-07.87",
+    "KR-REQ-07.72",
+    "KR-REQ-07.73",
+    "KR-REQ-07.74",
+    "KR-REQ-07.78",
+    "KR-REQ-07.79",
+    "KR-REQ-07.83"
   ],
   "home": [
     {

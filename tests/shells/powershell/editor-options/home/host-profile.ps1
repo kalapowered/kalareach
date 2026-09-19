@@ -3,11 +3,13 @@ Add-Content -LiteralPath $env:KR_TEST_ORDER -Value 'user-top'
 function global:prompt { 'KR> ' }
 $global:KR_TEST_USER_CONFIGURATION = 1
 Set-PSReadLineOption -HistorySaveStyle SaveNothing
-Set-PSReadLineOption -PredictionSource History
-Set-PSReadLineOption -PredictionViewStyle InlineView
+Set-PSReadLineOption -PredictionSource None
 Set-PSReadLineOption -BellStyle None
 Set-PSReadLineOption -EditMode Emacs
 Set-PSReadLineKeyHandler -Chord Ctrl+j -Function AcceptLine
+# This person deletes with the key rather than leaving the session with it. The integration
+# decides before the editor's own handler runs, so what the key does is still theirs.
+Set-PSReadLineKeyHandler -Chord Ctrl+d -Function DeleteChar
 Set-PSReadLineKeyHandler -Chord Ctrl+w -Function BackwardDeleteWord
 Set-PSReadLineKeyHandler -Chord Alt+d -Function DeleteWord
 

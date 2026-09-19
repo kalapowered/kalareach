@@ -4,6 +4,7 @@
   "stack": "starship",
   "title": "starship on the qualified PSReadLine, which replaces the prompt function",
   "supported": true,
+  "notes": "The gesture on this editor is a chord the worker configures rather than the line discipline's own character, and this editor reaches its own reader-thread queue only when the reader steps: a fence published between one step and the next is not the one the gesture that follows it is decided against, so this session cannot put the gesture and the fence in a known order. The Windows leg of this package, where the chord and the named-pipe endpoint are the mechanism, is qualified on Windows.",
   "requires": [
     "starship"
   ],
@@ -27,7 +28,13 @@
     "marker": "kr-plugin=on"
   },
   "covers": [
-    "KR-REQ-07.87"
+    "KR-REQ-07.87",
+    "KR-REQ-07.72",
+    "KR-REQ-07.73",
+    "KR-REQ-07.74",
+    "KR-REQ-07.78",
+    "KR-REQ-07.79",
+    "KR-REQ-07.83"
   ],
   "home": [
     {

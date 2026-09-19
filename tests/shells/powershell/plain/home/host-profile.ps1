@@ -8,6 +8,9 @@ Set-PSReadLineOption -PredictionSource None
 # discipline, which sends a line feed where the return was. This person has bound that to the same
 # acceptance, so a line they type a moment early is still theirs.
 Set-PSReadLineKeyHandler -Chord Ctrl+j -Function AcceptLine
+# This person deletes with the key rather than leaving the session with it. The integration
+# decides before the editor's own handler runs, so what the key does is still theirs.
+Set-PSReadLineKeyHandler -Chord Ctrl+d -Function DeleteChar
 
 # A handler of the person's own, on a chord nothing in the integration claims.
 Set-PSReadLineKeyHandler -Chord Alt+q -BriefDescription 'kr-user-binding' -LongDescription 'the person own binding' -ScriptBlock {

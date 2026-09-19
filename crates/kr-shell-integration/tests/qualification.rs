@@ -27,7 +27,16 @@ mod shellpkg;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
-use kr_shell_integration::contract::qualification::{BridgeAbi, ShellKind};
+use kr_protocol::root::{
+    DETACH_HINT, FENCE_EXCHANGE_TIMEOUT, FenceCause, LaunchCommand, RootEditorFenceParams,
+    RootEditorFenceResult,
+};
+use kr_shell_integration::contract::events::{BridgeEvent, ConsumeReason, EofGesture};
+use kr_shell_integration::contract::qualification::{BridgeAbi, DetachExclusion, ShellKind};
+use kr_shell_integration::contract::requests::{
+    BridgeAnswer, CancelKeyWait, LaunchDecision, LaunchMailboxRequest, LaunchRejectionReason,
+    LaunchTransactionId, WorkerRequest,
+};
 
 use shellpkg::{
     CaseOutcome, CaseSetup, Package, QualificationCase, Session, StackIndex, StackLock, cases,
@@ -50,6 +59,14 @@ const KNOWN_CHECKS: &[&str] = &[
     "plugin_writes_buffer",
     "plugin_buffer",
     "user_bindings",
+    "gesture_detaches",
+    "gesture_is_native_outside_the_condition",
+    "every_exclusion_accounted_for",
+    "escape_then_gesture_is_native",
+    "unattributable_gesture_hints",
+    "gesture_follows_the_line_discipline",
+    "takeover_under_the_stack",
+    "launch_deadline_installs_nothing",
     "instant_prompt",
 ];
 
@@ -229,6 +246,22 @@ fn every_combination_of_a_shell_and_a_startup_customisation_is_accounted_for() {
              round",
             case.id
         );
+        // The whole invoking sequence being the gesture is a rule of the two patched readers
+        // that have an escape prefix and a setting of the person's own for the native answer.
+        assert_eq!(
+            case.checks
+                .contains(&"escape_then_gesture_is_native".to_owned()),
+            case.supported && shellpkg::dialect(case.shell).ignore_eof_on.is_some(),
+            "{} claims the escape rule for a reader that has no such prefix or no setting to \
+             make the native answer observable, or the other way round",
+            case.id
+        );
+        assert!(
+            !case.checks.contains(&"takeover_under_the_stack".to_owned())
+                || shellpkg::pending_wait(case.shell).is_some(),
+            "{} claims a takeover for a reader this session cannot leave inside a key wait",
+            case.id
+        );
         if case.checks.contains(&"instant_prompt".to_owned()) {
             assert!(
                 case.warm_order.is_some(),
@@ -319,7 +352,12 @@ fn every_case_holds_against_the_package_it_names() {
     let mut failures = Vec::new();
     let mut ran = 0;
 
+    // One case at a time, for a run that is looking at one of them.
+    let only = std::env::var("KR_QUALIFICATION_CASE").ok();
     for case in &corpus {
+        if only.as_deref().is_some_and(|wanted| wanted != case.id) {
+            continue;
+        }
         if !case.supported {
             outcomes.push(CaseOutcome::skipped(
                 case,
@@ -401,7 +439,7 @@ fn every_case_holds_against_the_package_it_names() {
             ran > 0,
             "the packages or the stacks were required and no case ran"
         );
-    } else if ran == 0 {
+    } else if ran == 0 && only.is_none() {
         println!(
             "skipped: no package is built here and no stack is fetched here; run \
              scripts/build-shells.sh --all and scripts/fetch-shell-stacks.sh"
@@ -443,95 +481,90 @@ fn installed_stacks() -> Option<StackIndex> {
     }
 }
 
-/// Drives one case's shell through the checks it claims, in this suite's own order.
+/// Drives one case through the checks it claims, a fresh shell for each group of them.
+///
+/// A group is a set of checks that can share one reader without one of them deciding what the
+/// next one sees. Driving an excluded state leaves the editor somewhere — inside a listing, a
+/// search, a pending sequence — and a check that started from there would be measuring the drive
+/// before it rather than the package. A shell costs a second to start; a check that measured the
+/// wrong thing costs a qualification that says nothing.
 fn run_case(case: &QualificationCase, package: &Package) {
     let index = StackIndex::read().expect("the index was read before this case was chosen");
     let setup = CaseSetup::prepare(case, package, &index);
-    let mut session = Session::start_for(package, case, &setup);
+    let claimed = |name: &str| case.checks.iter().any(|check| check == name);
+
+    the_startup_and_the_customisation(case, package, &setup);
+
+    if claimed("gesture_detaches") || claimed("unattributable_gesture_hints") {
+        let mut session = fresh(case, package, &setup);
+        if claimed("gesture_detaches") {
+            the_gesture_detaches_at_an_eligible_prompt(case, &mut session);
+        }
+        if claimed("unattributable_gesture_hints") {
+            an_unattributable_gesture_is_consumed_with_one_hint(case, &mut session);
+        }
+    }
+
+    if claimed("gesture_is_native_outside_the_condition") {
+        let mut session = fresh(case, package, &setup);
+        outside_the_condition_the_editor_keeps_the_key(
+            case,
+            &mut session,
+            claimed("every_exclusion_accounted_for"),
+        );
+    }
+
+    if claimed("escape_then_gesture_is_native") {
+        let mut session = fresh(case, package, &setup);
+        the_whole_invoking_sequence_is_the_gesture(case, &mut session);
+    }
+
+    if claimed("gesture_follows_the_line_discipline") {
+        let mut session = fresh(case, package, &setup);
+        the_gesture_follows_the_terminals_own_character(case, &mut session);
+    }
+
+    if claimed("takeover_under_the_stack") {
+        let mut session = fresh(case, package, &setup);
+        a_takeover_ends_a_wait_the_customisation_left_the_reader_in(case, &mut session);
+    }
+
+    if claimed("launch_deadline_installs_nothing") {
+        let mut session = fresh(case, package, &setup);
+        a_launch_past_its_reader_budget_installs_nothing(case, &mut session);
+    }
+
+    if claimed("instant_prompt") {
+        a_second_start_draws_from_the_cache_the_first_wrote(case, package, &setup);
+    }
+}
+
+/// A shell of this case's own, at its first prompt and reading.
+fn fresh(case: &QualificationCase, package: &Package, setup: &CaseSetup) -> Session {
+    setup.forget_order();
+    let mut session = Session::start_for(package, case, setup);
+    session.first_prompt();
+    settle(&mut session, Duration::from_millis(300), REPLY);
+    session.ensure_reading();
+    session
+}
+
+/// What the startup files did, and what the customisation does to the line the reader holds.
+fn the_startup_and_the_customisation(
+    case: &QualificationCase,
+    package: &Package,
+    setup: &CaseSetup,
+) {
+    let claimed = |name: &str| case.checks.iter().any(|check| check == name);
+    let mut session = Session::start_for(package, case, setup);
     let mut enter = session.first_prompt();
     // Several of these prompts are drawn by a program that runs at every prompt, so the reader is
     // given until its drawing stops before anything is typed at it.
     settle(&mut session, Duration::from_millis(300), REPLY);
     session.ensure_reading();
 
-    let claimed = |name: &str| case.checks.iter().any(|check| check == name);
-
     if claimed("identity") {
-        // What the package declares is checked against the record the build wrote beside the
-        // binary, rather than against itself: the handshake this harness answers takes the hello's
-        // own editor ABI as supported, so the record is what makes this an identity at all.
-        assert_eq!(
-            session.hello.shell.kind, case.shell,
-            "{} declared another shell",
-            case.id
-        );
-        assert_eq!(
-            session.hello.abi,
-            BridgeAbi::qualified(case.shell),
-            "{} declared a mechanism this shell is not qualified for",
-            case.id
-        );
-        let record = &package.record["shell"];
-        for (field, declared) in [
-            ("executable", package.executable.display().to_string()),
-            ("editor_abi", session.hello.shell.editor_abi.clone()),
-            (
-                "integration_version",
-                session.hello.shell.integration_version.clone(),
-            ),
-            (
-                "upstream_version",
-                session.hello.shell.upstream_version.clone(),
-            ),
-        ] {
-            let recorded = record[field]
-                .as_str()
-                .unwrap_or_else(|| panic!("{} has no {field} in its identity record", case.id));
-            let declared = if field == "executable" {
-                package.executable.display().to_string()
-            } else {
-                declared
-            };
-            assert_eq!(
-                declared, recorded,
-                "{} declared a {field} the installed package does not record",
-                case.id
-            );
-        }
-        let declared: Vec<String> = session
-            .hello
-            .shell
-            .patches
-            .iter()
-            .map(|patch| patch.name.clone())
-            .collect();
-        assert_eq!(
-            declared,
-            package.patch_names(),
-            "{} declared patches the installed package does not record",
-            case.id
-        );
-        let modules: Vec<String> = session
-            .hello
-            .shell
-            .modules
-            .iter()
-            .map(|module| module.name.clone())
-            .collect();
-        let recorded: Vec<String> = package.record["shell"]["modules"]
-            .as_array()
-            .map(|entries| {
-                entries
-                    .iter()
-                    .filter_map(|module| module["name"].as_str().map(str::to_owned))
-                    .collect()
-            })
-            .unwrap_or_default();
-        assert_eq!(
-            modules, recorded,
-            "{} declared a module tree the installed package does not record",
-            case.id
-        );
+        the_package_is_the_one_the_record_names(case, &session, package);
     }
 
     if claimed("profile_order") {
@@ -558,40 +591,7 @@ fn run_case(case: &QualificationCase, package: &Package) {
     }
 
     if claimed("native_module") {
-        let module = case
-            .native_module
-            .as_ref()
-            .expect("the corpus check refused a case without one");
-        let recorded = setup.recorded_order();
-        assert!(
-            recorded.contains(&module.marker),
-            "{}: {} was not diagnosed; the startup recorded {recorded:?}",
-            case.id,
-            module.name
-        );
-        assert!(
-            !recorded.iter().any(|line| line == "kr-module-loaded"),
-            "{}: {} was loaded",
-            case.id,
-            module.name
-        );
-        assert!(
-            recorded.iter().any(|line| line == "kr-module-absent"),
-            "{}: {} is in the shell's own list of loaded modules",
-            case.id,
-            module.name
-        );
-        let diagnosis =
-            std::fs::read_to_string(setup.home.join("module-error")).unwrap_or_default();
-        assert!(
-            diagnosis.contains(&module.name),
-            "{}: what was said about {} does not name it: {diagnosis:?}",
-            case.id,
-            module.name
-        );
-        // The integration is what it was before: the reader is there and answers.
-        let acknowledgement = session.fence_exchange(&enter, shellpkg::fence_id(3));
-        assert_eq!(acknowledgement.prompt_generation, enter.prompt_generation);
+        the_module_this_build_cannot_load_is_diagnosed(case, &mut session, setup, &enter);
     }
 
     if claimed("plugin_active") {
@@ -614,7 +614,7 @@ fn run_case(case: &QualificationCase, package: &Package) {
     }
 
     if claimed("plugin_writes_buffer") {
-        enter = plugin_writes_the_buffer(case, &mut session, &enter);
+        enter = plugin_writes_the_buffer(case, &mut session);
     }
 
     if claimed("plugin_buffer") {
@@ -641,6 +641,7 @@ fn run_case(case: &QualificationCase, package: &Package) {
     }
 
     if claimed("user_bindings") {
+        session.ensure_reading();
         assert!(
             session.user_binding_ran(),
             "{}: the person's own binding {} did not survive the integration; the terminal \
@@ -654,16 +655,653 @@ fn run_case(case: &QualificationCase, package: &Package) {
 
     assert!(
         session.alive(),
-        "{}: the shell did not survive its own qualification",
+        "{}: the shell did not survive its own startup",
+        case.id
+    );
+}
+
+/// The declaration against the identity record the build wrote beside the binary.
+fn the_package_is_the_one_the_record_names(
+    case: &QualificationCase,
+    session: &Session,
+    package: &Package,
+) {
+    assert_eq!(
+        session.hello.shell.kind, case.shell,
+        "{} declared another shell",
+        case.id
+    );
+    assert_eq!(
+        session.hello.abi,
+        BridgeAbi::qualified(case.shell),
+        "{} declared a mechanism this shell is not qualified for",
+        case.id
+    );
+    // The handshake this harness answers takes the hello's own editor ABI as supported, so the
+    // record beside the binary is what makes this an identity rather than a declaration about
+    // itself.
+    let record = &package.record["shell"];
+    for (field, declared) in [
+        ("executable", package.executable.display().to_string()),
+        ("editor_abi", session.hello.shell.editor_abi.clone()),
+        (
+            "integration_version",
+            session.hello.shell.integration_version.clone(),
+        ),
+        (
+            "upstream_version",
+            session.hello.shell.upstream_version.clone(),
+        ),
+    ] {
+        let recorded = record[field]
+            .as_str()
+            .unwrap_or_else(|| panic!("{} has no {field} in its identity record", case.id));
+        assert_eq!(
+            declared, recorded,
+            "{} declared a {field} the installed package does not record",
+            case.id
+        );
+    }
+    let declared: Vec<String> = session
+        .hello
+        .shell
+        .patches
+        .iter()
+        .map(|patch| patch.name.clone())
+        .collect();
+    assert_eq!(
+        declared,
+        package.patch_names(),
+        "{} declared patches the installed package does not record",
+        case.id
+    );
+    let modules: Vec<String> = session
+        .hello
+        .shell
+        .modules
+        .iter()
+        .map(|module| module.name.clone())
+        .collect();
+    let recorded: Vec<String> = record["modules"]
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|module| module["name"].as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    assert_eq!(
+        modules, recorded,
+        "{} declared a module tree the installed package does not record",
+        case.id
+    );
+}
+
+/// A module this build cannot load, diagnosed rather than loaded silently.
+fn the_module_this_build_cannot_load_is_diagnosed(
+    case: &QualificationCase,
+    session: &mut Session,
+    setup: &CaseSetup,
+    enter: &kr_protocol::root::RootEditorEnterParams,
+) {
+    let module = case
+        .native_module
+        .as_ref()
+        .expect("the corpus check refused a case without one");
+    let recorded = setup.recorded_order();
+    assert!(
+        recorded.contains(&module.marker),
+        "{}: {} was not diagnosed; the startup recorded {recorded:?}",
+        case.id,
+        module.name
+    );
+    assert!(
+        !recorded.iter().any(|line| line == "kr-module-loaded"),
+        "{}: {} was loaded",
+        case.id,
+        module.name
+    );
+    assert!(
+        recorded.iter().any(|line| line == "kr-module-absent"),
+        "{}: {} is in the shell's own list of loaded modules",
+        case.id,
+        module.name
+    );
+    let diagnosis = std::fs::read_to_string(setup.home.join("module-error")).unwrap_or_default();
+    assert!(
+        diagnosis.contains(&module.name),
+        "{}: what was said about {} does not name it: {diagnosis:?}",
+        case.id,
+        module.name
+    );
+    // The integration is what it was before: the reader is there and answers.
+    let acknowledgement = session.fence_exchange(enter, shellpkg::fence_id(3));
+    assert_eq!(acknowledgement.prompt_generation, enter.prompt_generation);
+}
+
+/// A character at the end of a longer sequence is part of that sequence, so the editor keeps it.
+fn the_whole_invoking_sequence_is_the_gesture(case: &QualificationCase, session: &mut Session) {
+    // The person's own end-of-file setting is what makes the editor's own answer observable
+    // without ending the session, and it is left exactly as they set it.
+    let speech = shellpkg::dialect(case.shell);
+    let ready = speech
+        .ignore_eof_on
+        .expect("the corpus check refused this claim for a shell with no such setting");
+    assert!(
+        session.run(ready, "kr-ready"),
+        "{}: the shell did not answer before the sequence was driven",
+        case.id
+    );
+    let _ = session.fenced_after_a_command(16);
+    settle(session, Duration::from_millis(200), REPLY);
+    session.type_bytes(shellpkg::ESCAPE);
+    std::thread::sleep(Duration::from_millis(120));
+    session.type_bytes(shellpkg::CTRL_D);
+    assert!(
+        !session.saw_event(Duration::from_millis(600), |event| matches!(
+            event,
+            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+        )),
+        "{}: a gesture at the end of a longer sequence was taken as a detach",
+        case.id
+    );
+    assert!(
+        session.alive(),
+        "{}: a gesture at the end of a longer sequence ended the shell",
+        case.id
+    );
+}
+
+/// An eligible gesture at a fenced empty primary prompt is an attributable detach.
+///
+/// The customisation the case installs is live while this runs, which is the point: a plugin that
+/// wrapped the reader's widgets, redrew the line or bound the key itself would take the gesture
+/// somewhere else, and the decision section 7 asks for is made before any of that.
+fn the_gesture_detaches_at_an_eligible_prompt(
+    case: &QualificationCase,
+    session: &mut Session,
+) -> kr_protocol::root::RootEditorEnterParams {
+    let (enter, fence) = session.fenced_after_a_command(11);
+    settle(session, Duration::from_millis(200), REPLY);
+    session.type_bytes(shellpkg::CTRL_D);
+
+    let (id, event) = session.expect_event("eof_detach", |event| {
+        matches!(event, BridgeEvent::EofDetach(_))
+    });
+    let BridgeEvent::EofDetach(detach) = event else {
+        unreachable!()
+    };
+    assert_eq!(detach.fence_id, fence.fence_id, "{}", case.id);
+    assert_eq!(
+        detach.prompt_generation, enter.prompt_generation,
+        "{}",
+        case.id
+    );
+    assert_eq!(detach.input_epoch, fence.input_epoch, "{}", case.id);
+    session.answer_event(id, shellpkg::detached(shellpkg::attachment_id(1)));
+    assert!(
+        !session.saw_event(Duration::from_millis(400), |event| matches!(
+            event,
+            BridgeEvent::PreEofConsumed(_)
+        )),
+        "{}: an attributable gesture was consumed rather than submitted",
+        case.id
+    );
+    assert!(
+        session.alive(),
+        "{}: the gesture ended the shell instead of detaching an attachment",
         case.id
     );
 
-    if claimed("instant_prompt") {
-        // The shell has to have gone before the second one starts: the cache the theme draws its
-        // early prompt from is written by the run that is ending.
-        drop(session);
-        a_second_start_draws_from_the_cache_the_first_wrote(case, package, &setup);
+    // After a detach the bridge drops its fence, so a repeated gesture cannot take on the next
+    // attachment's identity.
+    session.type_bytes(shellpkg::CTRL_D);
+    let (_, repeated) = session.expect_event("pre_eof_consumed", |event| {
+        matches!(event, BridgeEvent::PreEofConsumed(_))
+    });
+    let BridgeEvent::PreEofConsumed(repeated) = repeated else {
+        unreachable!()
+    };
+    assert_eq!(repeated.reason, ConsumeReason::FenceMissing, "{}", case.id);
+    assert!(session.alive(), "{}", case.id);
+    enter
+}
+
+/// Every state section 7 excludes, driven where this reader has it and recorded where it does not.
+fn outside_the_condition_the_editor_keeps_the_key(
+    case: &QualificationCase,
+    session: &mut Session,
+    exhaustive: bool,
+) {
+    let speech = shellpkg::dialect(case.shell);
+    // Outside the condition the key is the editor's own, and at an empty prompt the editor's own
+    // answer can be to end the shell. Where the shell has a setting of its own for that, the
+    // person's setting is what makes the answer observable without ending this session.
+    session.clear_line();
+    session.forget_events();
+    assert!(
+        session.run(speech.ignore_eof_on.unwrap_or("echo kr-ready"), "kr-ready"),
+        "{}: the shell did not answer before the exclusions were driven",
+        case.id
+    );
+    let (_entered, _fence) = session.fenced_prompt(12);
+    settle(session, Duration::from_millis(200), REPLY);
+
+    let mut driven = Vec::new();
+    for drive in shellpkg::exclusion_drives(case.shell) {
+        if let Some((command, marker)) = drive.prepare {
+            assert!(
+                session.run(command, marker),
+                "{}: {} could not be prepared",
+                case.id,
+                drive.exclusion.as_str()
+            );
+            std::thread::sleep(Duration::from_millis(200));
+            session.forget_events();
+        }
+        for bytes in drive.setup {
+            session.type_bytes(bytes);
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        session.type_bytes(shellpkg::CTRL_D);
+        assert!(
+            !session.saw_event(Duration::from_millis(500), |event| matches!(
+                event,
+                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+            )),
+            "{}: {} did not exclude the gesture; the terminal showed:\n{}",
+            case.id,
+            drive.exclusion.as_str(),
+            session.terminal_output()
+        );
+        for bytes in drive.teardown {
+            session.type_bytes(bytes);
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        session.clear_line();
+        assert!(
+            session.alive(),
+            "{}: {} ended the shell",
+            case.id,
+            drive.exclusion.as_str()
+        );
+        driven.push(drive.exclusion);
     }
+
+    if exhaustive {
+        driven.extend(the_states_that_need_a_command_first(case, session));
+    }
+
+    // What is not driven here is recorded with its reason rather than left out, so nothing is
+    // quietly absent from the qualification.
+    let mut accounted: Vec<String> = shellpkg::exclusions_accounted_for(case.shell)
+        .into_iter()
+        .map(|(exclusion, reason)| format!("{}: {reason}", exclusion.as_str()))
+        .collect();
+    for exclusion in DetachExclusion::ALL {
+        if let Some(reason) = shellpkg::not_driven_by_the_qualification(case.shell, *exclusion) {
+            accounted.push(format!("{}: {reason}", exclusion.as_str()));
+        }
+    }
+    if exhaustive {
+        for exclusion in DetachExclusion::ALL
+            .iter()
+            .copied()
+            .chain(std::iter::once(DetachExclusion::NotManagedRootEditor))
+        {
+            assert!(
+                driven.contains(&exclusion)
+                    || shellpkg::not_constructible_here(case.shell, exclusion).is_some()
+                    || shellpkg::not_driven_by_the_qualification(case.shell, exclusion).is_some(),
+                "{}: {} is neither driven here nor recorded as one this reader cannot be put \
+                 into",
+                case.id,
+                exclusion.as_str()
+            );
+        }
+    }
+    shellpkg::record(
+        &format!("exclusions-{}.txt", case.id),
+        &format!(
+            "driven: {}\naccounted for: {}\n",
+            driven
+                .iter()
+                .map(|exclusion| exclusion.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            accounted.join("; ")
+        ),
+    );
+}
+
+/// The excluded states that need a command run first: a continuation reader, the shell's own
+/// `read` through the editor, a vi motion waiting for its target, and a macro being replayed.
+///
+/// Each is a state the reader is in rather than a key it is holding, so each needs the shell told
+/// something first. The setting a case changes to reach one is the person's own, and it is put
+/// back afterwards.
+fn the_states_that_need_a_command_first(
+    case: &QualificationCase,
+    session: &mut Session,
+) -> Vec<DetachExclusion> {
+    let speech = shellpkg::dialect(case.shell);
+    let mut driven = Vec::new();
+
+    if let Some((open, close)) = speech.continuation {
+        session.clear_line();
+        session.forget_events();
+        session.type_line(open);
+        let (_, event) = session.expect_event("a continuation reader", |event| {
+            matches!(
+                event,
+                BridgeEvent::EditorEnter(params)
+                    if params.reader_context == kr_protocol::root::ReaderContext::Continuation
+            )
+        });
+        let BridgeEvent::EditorEnter(_) = event else {
+            unreachable!()
+        };
+        session.type_bytes(shellpkg::CTRL_D);
+        assert!(
+            !session.saw_event(Duration::from_millis(600), |event| matches!(
+                event,
+                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+            )),
+            "{}: a gesture in a continuation reader was taken as the root editor's",
+            case.id
+        );
+        assert!(
+            session.alive(),
+            "{}: a continuation gesture ended the shell",
+            case.id
+        );
+        driven.push(DetachExclusion::ContinuationInput);
+        assert!(
+            session.run(close, "kr-continuation-ok"),
+            "{}: the continuation reader did not close",
+            case.id
+        );
+    }
+
+    if let Some(command) = shellpkg::read_builtin_command(case.shell) {
+        session.type_line(command);
+        std::thread::sleep(Duration::from_millis(500));
+        session.forget_events();
+        session.type_bytes(shellpkg::CTRL_D);
+        assert!(
+            !session.saw_event(Duration::from_millis(600), |event| matches!(
+                event,
+                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+            )),
+            "{}: a gesture inside the read builtin was treated as the root editor's",
+            case.id
+        );
+        assert!(
+            session.alive(),
+            "{}: the read builtin's gesture ended the shell",
+            case.id
+        );
+        driven.push(DetachExclusion::ReadBuiltin);
+        assert!(
+            session.run("echo kr-read-done", "kr-read-done"),
+            "{}: the read builtin did not end",
+            case.id
+        );
+    }
+
+    if let Some(command) = shellpkg::macro_binding(case.shell) {
+        session.clear_line();
+        assert!(
+            session.run(command, "kr-macro-bound"),
+            "{}: the macro could not be bound",
+            case.id
+        );
+        let _ = session.next_prompt();
+        settle(session, Duration::from_millis(200), REPLY);
+        session.forget_events();
+        // The key the person pressed is not the gesture; what the reader is reading is the macro
+        // this binding pushed back, and a character from there is not a gesture either.
+        session.type_bytes(shellpkg::CTRL_T);
+        assert!(
+            !session.saw_event(Duration::from_millis(600), |event| matches!(
+                event,
+                BridgeEvent::EofDetach(_)
+            )),
+            "{}: a character a macro replayed was treated as a detach",
+            case.id
+        );
+        assert!(
+            session.alive(),
+            "{}: a replayed gesture ended the shell",
+            case.id
+        );
+        driven.push(DetachExclusion::MacroInput);
+        session.clear_line();
+    }
+
+    if let Some((vi_mode, emacs_mode)) = shellpkg::vi_keymap_commands(case.shell) {
+        session.clear_line();
+        session.forget_events();
+        assert!(
+            session.run(vi_mode, "kr-vi-on"),
+            "{}: the editor did not take vi bindings",
+            case.id
+        );
+        let _ = session.next_prompt();
+        settle(session, Duration::from_millis(300), REPLY);
+        session.forget_events();
+        session.type_bytes(shellpkg::ESCAPE);
+        std::thread::sleep(Duration::from_millis(120));
+        session.type_bytes(b"d");
+        std::thread::sleep(Duration::from_millis(120));
+        session.type_bytes(shellpkg::CTRL_D);
+        assert!(
+            !session.saw_event(Duration::from_millis(600), |event| matches!(
+                event,
+                BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+            )),
+            "{}: a gesture a vi motion was waiting for was treated as a detach",
+            case.id
+        );
+        assert!(
+            session.alive(),
+            "{}: a vi motion's gesture ended the shell",
+            case.id
+        );
+        driven.push(DetachExclusion::ViMotion);
+        session.type_bytes(shellpkg::CTRL_C);
+        std::thread::sleep(Duration::from_millis(150));
+        session.clear_line();
+        assert!(
+            session.run(emacs_mode, "kr-vi-off"),
+            "{}: the editor's bindings were not put back",
+            case.id
+        );
+    }
+
+    driven
+}
+
+/// A gesture no fence can attribute is consumed, with one short hint per prompt.
+fn an_unattributable_gesture_is_consumed_with_one_hint(
+    case: &QualificationCase,
+    session: &mut Session,
+) {
+    session.recover();
+    session.forget_events();
+    assert!(
+        session.run("echo kr-hint-ready", "kr-hint-ready"),
+        "{}: the shell did not reach a prompt with no fence",
+        case.id
+    );
+    let enter = session.next_prompt();
+    settle(session, Duration::from_millis(200), REPLY);
+    session.forget_events();
+
+    session.type_bytes(shellpkg::CTRL_D);
+    let (_, first) = session.expect_event("pre_eof_consumed", |event| {
+        matches!(event, BridgeEvent::PreEofConsumed(_))
+    });
+    let BridgeEvent::PreEofConsumed(first) = first else {
+        unreachable!()
+    };
+    assert!(
+        matches!(
+            first.reason,
+            ConsumeReason::FenceMissing | ConsumeReason::FenceStale
+        ),
+        "{}: a gesture no fence can attribute was consumed for {:?}",
+        case.id,
+        first.reason
+    );
+    assert!(first.hint_printed, "{}", case.id);
+    assert_eq!(
+        first.prompt_generation, enter.prompt_generation,
+        "{}",
+        case.id
+    );
+    assert!(
+        session.wait_for_output(DETACH_HINT, REPLY),
+        "{}: the hint was not printed; the terminal showed:\n{}",
+        case.id,
+        session.terminal_output()
+    );
+    let after_first = session.terminal_output().matches(DETACH_HINT).count();
+
+    session.type_bytes(shellpkg::CTRL_D);
+    let (_, second) = session.expect_event("a second pre_eof_consumed", |event| {
+        matches!(event, BridgeEvent::PreEofConsumed(_))
+    });
+    let BridgeEvent::PreEofConsumed(second) = second else {
+        unreachable!()
+    };
+    assert!(
+        !second.hint_printed,
+        "{}: the hint is printed at most once per prompt",
+        case.id
+    );
+    assert_eq!(
+        session.terminal_output().matches(DETACH_HINT).count(),
+        after_first,
+        "{}: a second gesture at one prompt printed the hint again",
+        case.id
+    );
+    assert!(session.alive(), "{}", case.id);
+
+    // A fence from an earlier prompt is as stale as none at all.
+    let stale = shellpkg::fence_for(
+        &enter,
+        shellpkg::fence_id(13),
+        shellpkg::attachment_id(2),
+        shellpkg::epoch(6),
+    );
+    session.publish(&stale);
+    assert!(
+        session.run("echo kr-stale-ready", "kr-stale-ready"),
+        "{}: the shell did not reach the next prompt",
+        case.id
+    );
+    let _ = session.next_prompt();
+    settle(session, Duration::from_millis(200), REPLY);
+    session.type_bytes(shellpkg::CTRL_D);
+    let (_, third) = session.expect_event("a stale-fence consume", |event| {
+        matches!(event, BridgeEvent::PreEofConsumed(_))
+    });
+    let BridgeEvent::PreEofConsumed(third) = third else {
+        unreachable!()
+    };
+    assert_eq!(third.reason, ConsumeReason::FenceStale, "{}", case.id);
+    assert!(
+        third.hint_printed,
+        "{}: a new prompt prints the hint again",
+        case.id
+    );
+}
+
+/// The gesture moves with the terminal's own end-of-file character, at the next prompt.
+///
+/// One of these readers holds the terminal in the shell's own modes and refreshes them from the
+/// terminal after every command, which is where a `stty eof` of the person's own lands. A command
+/// is run between the change and the gesture for exactly that reason.
+fn the_gesture_follows_the_terminals_own_character(
+    case: &QualificationCase,
+    session: &mut Session,
+) {
+    let speech = shellpkg::dialect(case.shell);
+    let (Some(change), Some(disable)) = (speech.veof_change, speech.veof_disable) else {
+        panic!(
+            "{}: this case claims a gesture change its shell cannot be told to make",
+            case.id
+        );
+    };
+    session.forget_events();
+    assert!(
+        session.run(change, "kr-veof-set"),
+        "{}: the terminal's end-of-file character was not changed",
+        case.id
+    );
+    let (_, changed) = session.expect_event("gesture_changed", |event| {
+        matches!(event, BridgeEvent::GestureChanged(_))
+    });
+    let BridgeEvent::GestureChanged(changed) = changed else {
+        unreachable!()
+    };
+    assert_eq!(
+        changed.gesture,
+        EofGesture::TerminalEof {
+            byte: kr_protocol::scalars::U64::new(0x07)
+        },
+        "{}: the gesture did not follow the terminal's own character",
+        case.id
+    );
+
+    // A command runs between the change and the gesture: this reader takes the terminal back into
+    // its own modes afterwards, and the change has to survive that rather than the first prompt.
+    assert!(
+        session.run("echo kr-veof-between", "kr-veof-between"),
+        "{}: the shell did not run a command after the change",
+        case.id
+    );
+    let (_, fence) = session.fenced_after_a_command(14);
+    settle(session, Duration::from_millis(200), REPLY);
+    session.type_bytes(shellpkg::CTRL_G);
+    let (id, event) = session.expect_event("eof_detach on the new gesture", |event| {
+        matches!(event, BridgeEvent::EofDetach(_))
+    });
+    let BridgeEvent::EofDetach(detach) = event else {
+        unreachable!()
+    };
+    assert_eq!(detach.fence_id, fence.fence_id, "{}", case.id);
+    session.answer_event(id, shellpkg::detached(shellpkg::attachment_id(3)));
+    assert!(session.alive(), "{}", case.id);
+
+    // With no end-of-file character there is no gesture at all.
+    assert!(
+        session.run(disable, "kr-veof-undef"),
+        "{}: the terminal's end-of-file character was not taken away",
+        case.id
+    );
+    let (_, gone) = session.expect_event("gesture_changed to none", |event| {
+        matches!(
+            event,
+            BridgeEvent::GestureChanged(change) if change.gesture == EofGesture::Disabled
+        )
+    });
+    let BridgeEvent::GestureChanged(_) = gone else {
+        unreachable!()
+    };
+    // A terminal with no end-of-file character has no gesture, so no character is one.
+    let (_, _fence) = session.fenced_after_a_command(15);
+    session.type_bytes(shellpkg::CTRL_G);
+    assert!(
+        !session.saw_event(Duration::from_millis(500), |event| matches!(
+            event,
+            BridgeEvent::EofDetach(_) | BridgeEvent::PreEofConsumed(_)
+        )),
+        "{}: a terminal with no gesture still produced one",
+        case.id
+    );
 }
 
 /// The customisation itself writes the line, and the reader reports what it wrote.
@@ -675,7 +1313,6 @@ fn run_case(case: &QualificationCase, package: &Package) {
 fn plugin_writes_the_buffer(
     case: &QualificationCase,
     session: &mut Session,
-    enter: &kr_protocol::root::RootEditorEnterParams,
 ) -> kr_protocol::root::RootEditorEnterParams {
     // The line the customisation remembers prints something its own text does not contain, so a
     // run of it is the buffer having held the whole line rather than the editor having drawn one.
@@ -726,11 +1363,171 @@ fn plugin_writes_the_buffer(
         case.id,
         session.terminal_output()
     );
-    let _ = enter;
     let entered = session.next_prompt();
     settle(session, Duration::from_millis(300), REPLY);
     session.ensure_reading();
     entered
+}
+
+/// A takeover while the customisation has the reader waiting for the rest of a key sequence.
+///
+/// Section 7 says a takeover cancels the incomplete decoder and editor operations through the
+/// native cancellation path, discards the old lease's unread input and keeps the edit buffer. A
+/// plugin that binds a multi-key sequence is exactly how a reader ends up in such a wait in an
+/// ordinary session, so the wait is entered through the customisation's own bindings where the
+/// shell has them and through the reader's own escape prefix where it does not.
+fn a_takeover_ends_a_wait_the_customisation_left_the_reader_in(
+    case: &QualificationCase,
+    session: &mut Session,
+) {
+    let wait = shellpkg::pending_wait(case.shell)
+        .expect("the corpus check refused this claim for a reader with no such wait");
+    let (enter, _fence) = session.fenced_after_a_command(17);
+    settle(session, Duration::from_millis(200), REPLY);
+    if let Some((command, marker)) = wait.prepare {
+        assert!(
+            session.run(command, marker),
+            "{}: the wait could not be prepared",
+            case.id
+        );
+        let _ = session.next_prompt();
+        settle(session, Duration::from_millis(200), REPLY);
+    }
+
+    // A line of the person's, which the cancellation has to keep.
+    session.type_bytes(b"kr-kept");
+    std::thread::sleep(Duration::from_millis(120));
+    session.type_bytes(wait.enter);
+    std::thread::sleep(Duration::from_millis(150));
+
+    // A fence asked while the reader is inside that wait reports the queue that is holding it,
+    // rather than a clear one.
+    let held = session.ask(WorkerRequest::Fence(RootEditorFenceParams {
+        session_id: session.session_id,
+        fence_id: shellpkg::fence_id(18),
+        prompt_generation: enter.prompt_generation,
+        reader_revision: enter.reader_revision,
+        deadline_ms: FENCE_EXCHANGE_TIMEOUT,
+        cause: FenceCause::LeaseChange,
+    }));
+    match session.answer(held) {
+        BridgeAnswer::Fence(RootEditorFenceResult::Acknowledged(acknowledgement)) => {
+            if wait.partial_key_queue {
+                assert!(
+                    !acknowledgement.queues.partial_key_drained,
+                    "{}: the reader reported every queue clear while it was waiting for a key",
+                    case.id
+                );
+            }
+        }
+        BridgeAnswer::Fence(RootEditorFenceResult::Refused(_)) => {}
+        other => panic!("{}: the reader answered a fence with {other:?}", case.id),
+    }
+
+    // The takeover's own cancellation ends that wait without taking the line away.
+    let cancelled = session.ask(WorkerRequest::Cancel(CancelKeyWait {
+        session_id: session.session_id,
+        sequence: kr_protocol::scalars::U64::new(1),
+        epoch: enter_epoch(),
+        prompt_generation: enter.prompt_generation,
+        reader_revision: enter.reader_revision,
+    }));
+    let BridgeAnswer::Cancel(report) = session.answer(cancelled) else {
+        panic!(
+            "{}: the reader answered a cancellation with something else",
+            case.id
+        )
+    };
+    assert_eq!(
+        report.sequence,
+        kr_protocol::scalars::U64::new(1),
+        "{}",
+        case.id
+    );
+    assert!(
+        report.buffer_preserved,
+        "{}: a cancellation took the person's line away",
+        case.id
+    );
+
+    // The retried fence finds the reader out of its wait and its queues clear, with the line still
+    // there: what was discarded was the key the wait was holding, not the edit buffer.
+    let retried = session.fence_exchange(&enter, shellpkg::fence_id(19));
+    assert!(
+        retried.queues.partial_key_drained,
+        "{}: the partial-key queue is still holding something after the cancellation",
+        case.id
+    );
+    assert!(
+        !retried.editor.buffer_empty,
+        "{}: the line the person had typed did not survive the takeover",
+        case.id
+    );
+}
+
+/// A launch whose reader budget has already gone installs nothing.
+///
+/// Section 7 bounds the reservation at 250 ms and says that on timeout the launch is rejected with
+/// `EDITOR_BUSY` and no command is installed. The reader is bound by the same budget, which is
+/// what makes "no command is installed" true rather than a hope that the worker's own answer wins
+/// the race: this asks for a launch whose budget is already spent and checks the editor.
+fn a_launch_past_its_reader_budget_installs_nothing(
+    case: &QualificationCase,
+    session: &mut Session,
+) {
+    let (entered, fence) = session.fenced_after_a_command(20);
+    settle(session, Duration::from_millis(200), REPLY);
+
+    let id = session.ask(WorkerRequest::Launch(LaunchMailboxRequest {
+        session_id: session.session_id,
+        transaction: LaunchTransactionId::new(kr_protocol::scalars::Uuid::from_bytes([0x63; 16])),
+        fence_id: fence.fence_id,
+        command: LaunchCommand::Arguments(vec![
+            "printf".to_owned(),
+            "kr-launch-must-not-run".to_owned(),
+        ]),
+        expected_prompt_generation: entered.prompt_generation,
+        expected_buffer_revision: entered.editor.buffer_revision,
+        expected_cwd_revision: entered.cwd_revision,
+        // Already spent: the reader measures it from when the request reached it.
+        deadline_ms: kr_protocol::scalars::DurationMs::new(0),
+    }));
+    let BridgeAnswer::Launch(decision) = session.answer(id) else {
+        panic!(
+            "{}: the reader answered a launch with something else",
+            case.id
+        )
+    };
+    let rejected = match decision {
+        LaunchDecision::Rejected(rejected) => rejected,
+        LaunchDecision::Accepted(_) => {
+            panic!("{}: a launch with no budget left was installed", case.id)
+        }
+    };
+    assert_eq!(
+        rejected.reason,
+        LaunchRejectionReason::Timeout,
+        "{}: a spent budget was refused for another reason",
+        case.id
+    );
+
+    // Nothing is in the editor and nothing ran.
+    let after = session.fence_exchange(&entered, shellpkg::fence_id(21));
+    assert!(
+        after.editor.buffer_empty,
+        "{}: the editor is holding a command a refused launch did not install",
+        case.id
+    );
+    assert!(
+        !session.terminal_output().contains("kr-launch-must-not-run"),
+        "{}: a refused launch ran",
+        case.id
+    );
+}
+
+/// The lease epoch the harness's own fences are published under.
+fn enter_epoch() -> kr_protocol::ids::InputLeaseEpoch {
+    shellpkg::epoch(4)
 }
 
 /// A second start over the same home, which is the only one a cached early prompt exists for.
@@ -792,4 +1589,359 @@ fn every_case_names_the_requirement_rows_it_closes() {
         covered.contains("KR-REQ-07.85"),
         "no case covers the managed baselines"
     );
+}
+
+/// One row of a table in the upstream register.
+fn register_rows(body: &str, marker: &str) -> Vec<Vec<String>> {
+    let open = format!("<!-- kr:{marker} -->");
+    let close = format!("<!-- /kr:{marker} -->");
+    let start = body
+        .find(&open)
+        .unwrap_or_else(|| panic!("docs/shell-integration/upstream.md has no {open}"))
+        + open.len();
+    let end = body[start..]
+        .find(&close)
+        .unwrap_or_else(|| panic!("docs/shell-integration/upstream.md has no {close}"))
+        + start;
+    body[start..end]
+        .lines()
+        .map(str::trim)
+        .filter(|line| line.starts_with('|'))
+        .map(|line| {
+            line.trim_matches('|')
+                .split('|')
+                .map(|cell| cell.trim().to_owned())
+                .collect::<Vec<_>>()
+        })
+        // The header and the separator under it are not rows.
+        .skip(2)
+        .collect()
+}
+
+/// Today, as the register writes its dates.
+fn today() -> (i64, u32, u32) {
+    let days = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("a clock after 1970")
+            .as_secs()
+            / 86_400,
+    )
+    .expect("a date inside this era");
+    // Days from the civil epoch to the year, month and day, by Howard Hinnant's algorithm.
+    let shifted = days + 719_468;
+    let era = shifted.div_euclid(146_097);
+    let day_of_era = shifted.rem_euclid(146_097);
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = u32::try_from(day_of_year - (153 * shifted_month + 2) / 5 + 1).expect("a day");
+    let month = u32::try_from(if shifted_month < 10 {
+        shifted_month + 3
+    } else {
+        shifted_month - 9
+    })
+    .expect("a month");
+    (if month <= 2 { year + 1 } else { year }, month, day)
+}
+
+/// Reads a `YYYY-MM-DD` cell.
+fn as_date(cell: &str) -> (i64, u32, u32) {
+    let mut parts = cell.split('-');
+    let mut next = |what: &str| -> i64 {
+        parts
+            .next()
+            .and_then(|part| part.parse().ok())
+            .unwrap_or_else(|| panic!("{cell:?} is not a date: no {what}"))
+    };
+    let year = next("year");
+    let month = u32::try_from(next("month")).expect("a month");
+    let day = u32::try_from(next("day")).expect("a day");
+    (year, month, day)
+}
+
+/// KR-REQ-07.88: the register, the pins and what is installed are one thing.
+#[test]
+fn the_upstream_register_agrees_with_the_pins_and_with_what_is_installed() {
+    let path = repository_root().join("docs/shell-integration/upstream.md");
+    let body = std::fs::read_to_string(&path).expect("the register is committed");
+    let pins = register_rows(&body, "pins");
+    assert!(
+        pins.len() >= 4,
+        "the register names {} packages",
+        pins.len()
+    );
+
+    let target = {
+        let open = "<!-- kr:target -->";
+        let close = "<!-- /kr:target -->";
+        let start = body.find(open).expect("the register states its target") + open.len();
+        let end = body[start..].find(close).expect("the target block closes") + start;
+        body[start..end].to_owned()
+    };
+    for phrase in [
+        "within one working day",
+        "within fourteen days",
+        "requalified",
+        "already running",
+    ] {
+        assert!(
+            target.contains(phrase),
+            "the published update target does not say {phrase:?}"
+        );
+    }
+
+    // Every pin the register names is the pin the builder uses, and the identity record the build
+    // wrote beside the binary is read rather than left in the file.
+    for row in &pins {
+        let [package, _upstream, revision, source, digest, watched] = row.as_slice() else {
+            panic!("a pin row has {} cells", row.len());
+        };
+        assert!(
+            !watched.is_empty(),
+            "{package} names no source of advisories"
+        );
+        let manifest_path = repository_root().join(format!("shells/{package}/manifest.json"));
+        let manifest: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&manifest_path).expect("a manifest"))
+                .expect("the manifest decodes");
+        if package == "psreadline" {
+            // This package fetches nothing: what it pins is the range it was qualified against.
+            let qualified = &manifest["qualified"];
+            for version in [
+                qualified["psreadline_from"].as_str().unwrap_or_default(),
+                qualified["psreadline_before"].as_str().unwrap_or_default(),
+            ] {
+                assert!(
+                    revision.contains(version.trim_end_matches(".0")) || revision.contains(version),
+                    "the register's range for psreadline does not carry {version}"
+                );
+            }
+            continue;
+        }
+        let upstream = &manifest["upstream"];
+        assert_eq!(
+            revision,
+            upstream["revision"].as_str().unwrap_or_default(),
+            "the register and {package}'s manifest name different revisions"
+        );
+        assert_eq!(
+            source,
+            upstream["url"].as_str().unwrap_or_default(),
+            "the register and {package}'s manifest name different sources"
+        );
+        assert_eq!(
+            digest,
+            upstream["sha256"].as_str().unwrap_or_default(),
+            "the register and {package}'s manifest name different archives"
+        );
+
+        let kind = match package.as_str() {
+            "zsh" => ShellKind::Zsh,
+            "bash" => ShellKind::Bash,
+            "fish" => ShellKind::Fish,
+            other => panic!("the register names a package called {other}"),
+        };
+        let Ok(installed) = Package::find(kind) else {
+            continue;
+        };
+        let record = &installed.record;
+        assert_eq!(
+            record["build"]["upstream"]["url"]
+                .as_str()
+                .unwrap_or_default(),
+            source,
+            "the {package} package installed here was built from another source"
+        );
+        assert_eq!(
+            record["build"]["upstream"]["sha256"]
+                .as_str()
+                .unwrap_or_default(),
+            digest,
+            "the {package} package installed here was built from another archive"
+        );
+        assert_eq!(
+            record["shell"]["upstream_version"]
+                .as_str()
+                .unwrap_or_default(),
+            upstream["version"].as_str().unwrap_or_default(),
+            "the {package} package installed here records another upstream version"
+        );
+        let declared: Vec<String> = manifest["patches"]
+            .as_array()
+            .expect("a patch list")
+            .iter()
+            .filter_map(|patch| patch["name"].as_str().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            installed.patch_names(),
+            declared,
+            "the {package} package installed here records another patch set"
+        );
+        let modules: Vec<String> = record["shell"]["modules"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|module| module["name"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let expected: Vec<String> = manifest["modules"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|module| module.as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            modules, expected,
+            "the {package} package installed here records another module tree"
+        );
+    }
+
+    // Every package has been triaged, every row has a target date, and a row past its date that
+    // has not been released says so rather than leaving a stale package as a silent default.
+    let triage = register_rows(&body, "triage");
+    assert!(!triage.is_empty(), "the triage record is empty");
+    let now = today();
+    for row in &triage {
+        let [date, change, packages, assessment, target_release, status] = row.as_slice() else {
+            panic!("a triage row has {} cells", row.len());
+        };
+        let _ = as_date(date);
+        assert!(!change.is_empty() && assessment.split_whitespace().count() >= 8);
+        assert!(
+            ["released", "scheduled", "flagged", "not-affected"].contains(&status.as_str()),
+            "{status:?} is not one of the statuses the register defines"
+        );
+        let due = as_date(target_release);
+        if due < now && status == "scheduled" {
+            panic!(
+                "the triage row of {date} is past its target release and is still scheduled; a \
+                 package that cannot meet its target is flagged with its compatibility-mode \
+                 choices"
+            );
+        }
+        for package in packages.split(", ") {
+            assert!(
+                pins.iter().any(|pin| pin[0] == package),
+                "the triage record names {package}, which the register does not pin"
+            );
+        }
+    }
+    for pin in &pins {
+        assert!(
+            triage
+                .iter()
+                .any(|row| row[2].split(", ").any(|package| package == pin[0])),
+            "{} has never been triaged",
+            pin[0]
+        );
+    }
+    assert!(
+        body.contains("native_compat"),
+        "the register does not name the compatibility-mode choices"
+    );
+}
+
+/// KR-REQ-07.88: no unqualified binary is hot-swapped into a session that is already running.
+///
+/// The installation is what a new session resolves its package from. A session that is already
+/// running holds the one it started with: it launched that executable, its handshake declared that
+/// identity, and nothing about a newer installation reaches it. This installs a second identity
+/// under a root of this test's own while a session is live, and checks both halves.
+#[test]
+fn a_live_session_keeps_the_package_it_started_with() {
+    let Some(first) = Package::found(ShellKind::Zsh) else {
+        return;
+    };
+    let Some(index) = installed_stacks() else {
+        return;
+    };
+    let case = cases()
+        .into_iter()
+        .find(|case| case.id == "zsh-plain")
+        .expect("the plain Zsh case is committed");
+
+    let root = tempfile::Builder::new()
+        .prefix("kr-installation-")
+        .tempdir()
+        .expect("an installation root on the internal disk");
+    let shell = root.path().join("zsh");
+    let before = install_identity(&shell, &first, "aaaaaaaaaaaaaaaa");
+    std::fs::write(shell.join("current"), "aaaaaaaaaaaaaaaa").expect("the pointer");
+    assert_eq!(current_identity(&shell), "aaaaaaaaaaaaaaaa");
+
+    let setup = CaseSetup::prepare(&case, &before, &index);
+    let mut session = Session::start_for(&before, &case, &setup);
+    let enter = session.first_prompt();
+    settle(&mut session, Duration::from_millis(300), REPLY);
+
+    // A newer package is installed while that session is running.
+    let after = install_identity(&shell, &first, "bbbbbbbbbbbbbbbb");
+    std::fs::write(shell.join("current"), "bbbbbbbbbbbbbbbb").expect("the pointer");
+    assert_eq!(
+        current_identity(&shell),
+        "bbbbbbbbbbbbbbbb",
+        "a new session would still resolve the old installation"
+    );
+    assert_ne!(before.identity, after.identity);
+
+    // The live session is untouched: it still declares what it started with, and it still answers.
+    assert_eq!(
+        session.hello.shell.executable,
+        before.executable.display().to_string(),
+        "a live session is running another binary than the one it started"
+    );
+    let acknowledgement = session.fence_exchange(&enter, shellpkg::fence_id(30));
+    assert_eq!(acknowledgement.prompt_generation, enter.prompt_generation);
+    assert!(
+        session.run("echo kr-still-here", "kr-still-here"),
+        "the live session stopped answering when another package was installed"
+    );
+    assert!(session.alive());
+}
+
+/// Writes one identity of the installed package into a root of this test's own.
+///
+/// The record names the real executable, so the session this starts is the real packaged shell.
+/// What differs between the two identities is the installation the pointer names, which is what a
+/// new session resolves and a running one does not.
+fn install_identity(shell: &std::path::Path, from: &Package, identity: &str) -> Package {
+    let directory = shell.join(identity);
+    std::fs::create_dir_all(directory.join("startup")).expect("an installation directory");
+    let mut record = from.record.clone();
+    record["identity"] = serde_json::Value::String(identity.to_owned());
+    std::fs::write(
+        directory.join("kr-shell-identity.json"),
+        serde_json::to_string_pretty(&record).expect("the record encodes"),
+    )
+    .expect("the identity record");
+    let entry = from
+        .startup_entry
+        .file_name()
+        .expect("the startup entry has a name");
+    std::fs::copy(&from.startup_entry, directory.join("startup").join(entry))
+        .expect("the startup entry");
+    Package {
+        kind: from.kind,
+        identity: identity.to_owned(),
+        executable: from.executable.clone(),
+        startup_entry: directory.join("startup").join(entry),
+        module_directory: from.module_directory.clone(),
+        record,
+    }
+}
+
+/// What a new session would resolve from an installation.
+fn current_identity(shell: &std::path::Path) -> String {
+    std::fs::read_to_string(shell.join("current"))
+        .expect("the installation names a current identity")
+        .trim()
+        .to_owned()
 }

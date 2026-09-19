@@ -4,6 +4,7 @@
   "stack": "fzf",
   "title": "fzf's key bindings on the packaged fish, which claim keys in every bind mode",
   "supported": true,
+  "notes": "These widgets claim keys in every bind mode this shell ships, including the one this session would bind a sequence in to leave the reader waiting for another key. The takeover is driven on this shell under its own bindings in the plain case instead.",
   "requires": [
     "fzf",
     "fzf-shell"
@@ -20,14 +21,22 @@
     "profile_order",
     "plugin_active",
     "plugin_buffer",
-    "user_bindings"
+    "user_bindings",
+    "gesture_detaches",
+    "gesture_is_native_outside_the_condition"
   ],
   "plugin": {
     "probe": "echo kr-plugin=(functions -q fzf-file-widget; and echo on; or echo off)",
     "marker": "kr-plugin=on"
   },
   "covers": [
-    "KR-REQ-07.87"
+    "KR-REQ-07.87",
+    "KR-REQ-07.72",
+    "KR-REQ-07.73",
+    "KR-REQ-07.74",
+    "KR-REQ-07.78",
+    "KR-REQ-07.79",
+    "KR-REQ-07.83"
   ],
   "home": [
     {

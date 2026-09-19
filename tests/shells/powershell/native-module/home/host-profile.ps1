@@ -5,6 +5,9 @@ $global:KR_TEST_USER_CONFIGURATION = 1
 Set-PSReadLineOption -HistorySaveStyle SaveNothing
 Set-PSReadLineOption -PredictionSource None
 Set-PSReadLineKeyHandler -Chord Ctrl+j -Function AcceptLine
+# This person deletes with the key rather than leaving the session with it. The integration
+# decides before the editor's own handler runs, so what the key does is still theirs.
+Set-PSReadLineKeyHandler -Chord Ctrl+d -Function DeleteChar
 
 # A binary module of the person's own, ahead of this runtime's own module path. It cannot be
 # loaded here, and what the person gets is the runtime saying so rather than a session that

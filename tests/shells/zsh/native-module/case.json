@@ -17,7 +17,10 @@
     "identity",
     "profile_order",
     "native_module",
-    "user_bindings"
+    "user_bindings",
+    "gesture_detaches",
+    "gesture_is_native_outside_the_condition",
+    "escape_then_gesture_is_native"
   ],
   "native_module": {
     "name": "kr_wrong_abi",
@@ -25,7 +28,10 @@
     "note": "What this case ships is a file named like a module whose contents this build's loader refuses, so what it proves is the diagnosis rather than an editor-ABI mismatch: the loader names the module it would not load, the shell's own list of loaded modules does not hold it, and the integration is still qualified afterwards. A module compiled against another ABI of this shell would prove the mismatch itself and needs a compiler and that shell's headers at qualification time, which this corpus does not have."
   },
   "covers": [
-    "KR-REQ-07.87"
+    "KR-REQ-07.87",
+    "KR-REQ-07.72",
+    "KR-REQ-07.73",
+    "KR-REQ-07.74"
   ],
   "home": [
     {

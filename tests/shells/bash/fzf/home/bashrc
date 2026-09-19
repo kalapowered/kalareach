@@ -2,6 +2,9 @@ printf '%s\n' user-top >> "$KR_TEST_ORDER"
 
 PS1='KR> '
 HISTFILE=
+# This person does not leave the shell with a keystroke. The integration decides before the
+# reader's own end-of-file branch, so what that branch would have done is still theirs.
+set -o ignoreeof
 KR_TEST_USER_CONFIGURATION=1
 
 PATH="$KR_STACK_FZF:$PATH"
