@@ -157,6 +157,15 @@ pub enum DurabilityPosture {
 }
 
 impl DurabilityPosture {
+    /// Returns the fault this posture is under, when it is under one.
+    #[must_use]
+    pub const fn fault(&self) -> Option<&JournalFault> {
+        match self {
+            Self::Full => None,
+            Self::VolatileNative(fault) => Some(fault),
+        }
+    }
+
     /// Returns the posture this condition puts a worker in.
     #[must_use]
     pub fn of(condition: &JournalCondition) -> Self {

@@ -1518,6 +1518,68 @@ async fn a_full_journal_fences_a_rich_mutation_while_raw_input_keeps_flowing() {
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_condition_the_store_already_reported_fences_rich_work_before_the_next_write() {
+    // KR-REQ-24.23 and the seam together. A store that has told this host it cannot be trusted
+    // does not have to refuse the *next* statement for the work that statement is part of to be
+    // work this host must not start: a value nothing can decode leaves the rows around it
+    // perfectly writable, and a mutation admitted over that would be a mutation this host had
+    // already said it could not account for.
+    let host = host().await;
+    {
+        // A stored value this build cannot read, which is the condition that does not repeat
+        // itself on the next write.
+        let mut session = host.runtime.session();
+        let journal = session.journal_mut().expect("a journal");
+        journal.accept(&submission(7, 7)).expect("accepts");
+        journal.checkpoint().expect("checkpoints");
+    }
+    let path = host.journal_path.clone();
+    rusqlite::Connection::open(&path)
+        .expect("the same database")
+        .execute(
+            "UPDATE outbox SET stream = 'a stream no build writes' WHERE cursor = 1",
+            [],
+        )
+        .expect("writes an undecodable row");
+    {
+        let session = host.runtime.session();
+        let journal = session.journal().expect("a journal");
+        assert!(
+            journal.outbox_after(0, 64).is_err(),
+            "the row is unreadable"
+        );
+    }
+    assert_eq!(
+        host.runtime
+            .session()
+            .health()
+            .condition()
+            .fault()
+            .map(|fault| fault.kind),
+        Some(FaultKind::Corrupt)
+    );
+
+    // The next write would succeed on its own, and the mutation is refused anyway.
+    let mut client = cli(&host).await;
+    let outcome = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &attach_params(host.session_id),
+        )
+        .await
+        .expect("the call reaches the worker");
+    let failure = outcome.expect_err("rich work is fenced by the condition already reported");
+    assert_eq!(failure.code, ErrorCode::StorageUnavailable);
+    assert!(failure.message.contains("read back"), "{}", failure.message);
+
+    // And the authorised stop is not: section 7's exception survives the condition.
+    let result = close(&mut client, &host).await;
+    assert_eq!(result.durability, Durability::Volatile);
+}
+
 // ---------------------------------------------------------------------------------------------
 // KR-REQ-23.48: state-recovery reads bounded by cursor, range and authority
 // ---------------------------------------------------------------------------------------------

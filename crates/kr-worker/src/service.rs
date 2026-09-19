@@ -2479,6 +2479,34 @@ impl WorkerService {
         // lifecycle state — can move between the check and the effect.
         let mut session = self.runtime.session();
 
+        // The condition the journal publishes, asked inside the boundary and before anything is
+        // admitted. A write that fails is refused where it fails, which is what the arms below
+        // do; this is the other half, and section 24 needs both. A store that has already told
+        // this host it cannot be trusted — a value nothing can decode, a device with no space —
+        // does not have to refuse the *next* write for the work that write is part of to be work
+        // this host must not start. So a fault fences rich work whether or not the journal
+        // happens to answer the next statement.
+        //
+        // The two named exceptions pass: section 7's authorised stop and section 11's raw
+        // terminal input, which does not travel this path at all.
+        let work = if stopping {
+            crate::persistence::fault::WorkClass::AuthorisedStop
+        } else {
+            crate::persistence::fault::WorkClass::RichMutation
+        };
+        let posture = session.durability_posture();
+        if !posture.admits(work) {
+            let kind = posture
+                .fault()
+                .map_or(crate::persistence::fault::FaultKind::WriteFailed, |fault| {
+                    fault.kind
+                });
+            let refusal = crate::persistence::capacity::StoreCapacity::refusal(kind);
+            return Err(WorkerError::JournalUnavailable {
+                detail: refusal.message,
+            });
+        }
+
         // Storage failure stops an ordinary typed mutation before dispatch. An authorised stop is
         // the named exception: section 7 requires `session.close` to proceed on the worker's
         // current in-memory authority and report `durability=volatile`. A journal that is *open
