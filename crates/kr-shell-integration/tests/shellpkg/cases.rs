@@ -676,7 +676,11 @@ pub fn the_detach_condition_excludes_what_the_corpus_names(kind: ShellKind) {
         );
         driven.push(DetachExclusion::ContinuationInput);
         session.type_line(close);
-        assert!(session.wait_for_output("kr-exclusions-ok", REPLY));
+        assert!(
+            session.wait_for_output("kr-continuation-ok", REPLY),
+            "the continuation did not close:\n{}",
+            session.terminal_output()
+        );
     }
 
     for exclusion in &named {
