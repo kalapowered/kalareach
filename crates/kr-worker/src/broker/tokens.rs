@@ -84,7 +84,7 @@ impl TokenStore {
 
     /// Checks that there is room to issue one more token.
     ///
-    /// Separate from [`Tokens::issue`] so the same refusal can be made before anything is marked.
+    /// Separate from [`TokenStore::issue`] so the same refusal can be made before anything is marked.
     /// A full table is not a state a caller changed, so discovering it during dispatch would turn
     /// a refusal this host can always make into an outcome nobody can establish.
     ///

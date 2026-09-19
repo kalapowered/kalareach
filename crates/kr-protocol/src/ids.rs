@@ -25,10 +25,12 @@ pub const MAX_OPAQUE_ID_LEN: usize = 256;
 /// The longest an upstream request identifier may be, in bytes of its JSON form.
 ///
 /// An upstream identifier is carried as JSON, so its value is bounded by [`MAX_OPAQUE_ID_LEN`] and
-/// its text by what encoding that value can cost: two quotes, and a backslash before every byte in
-/// the worst case. The gateway checks the value against [`MAX_OPAQUE_ID_LEN`] before it encodes,
-/// so this bound is never what refuses an identifier a person chose.
-pub const MAX_UPSTREAM_REQUEST_ID_LEN: usize = 2 * MAX_OPAQUE_ID_LEN + 2;
+/// its text by what encoding that value can cost. The worst case is a control character, which
+/// costs six bytes as `\u0000`; a multi-byte character costs only its own bytes, because the
+/// encoder copies it. Two quotes are added. The gateway checks the value against
+/// [`MAX_OPAQUE_ID_LEN`] before it encodes, so this bound is never what refuses an identifier a
+/// person chose.
+pub const MAX_UPSTREAM_REQUEST_ID_LEN: usize = 6 * MAX_OPAQUE_ID_LEN + 2;
 
 macro_rules! uuid_id {
     ($(#[$meta:meta])* $name:ident, $description:literal) => {
@@ -770,9 +772,9 @@ opaque_id!(
     ///
     /// A JSON-RPC identifier is a string or a number, and the two are different identifiers, so
     /// what is carried is the member's JSON form: the string eleven is `"11"` and the number
-    /// eleven is `11`. The form is this host's own encoding of the value, so two spellings of one
-    /// string, `"a"` and `"\u0061"`, are one identifier, which is what a correlation key has to
-    /// be. The value keeps the 256-byte bound every opaque identifier has, and
+    /// eleven is `11`. The form is this host's own encoding of the value, not the upstream's own
+    /// spelling of it, so `"a"` and `"\u0061"` are one identifier, which is what a correlation key
+    /// has to be. The value keeps the [`MAX_OPAQUE_ID_LEN`] bound every opaque identifier has, and
     /// [`MAX_UPSTREAM_REQUEST_ID_LEN`] is what encoding that value can cost. It is correlation
     /// data. An upstream identifier never becomes a KalaReach identifier.
     UpstreamRequestId,

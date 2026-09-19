@@ -444,7 +444,17 @@ fn check_error_payload(error: &serde_json::Value, field: &str) -> Result<()> {
             "{field} is not an object, so it reports no failure"
         ))
     })?;
-    if !object.get("code").is_some_and(serde_json::Value::is_i64) {
+    // JSON-RPC §5.1 asks for an integer, not for one that fits a signed 64-bit word, and a
+    // number is integral however it is spelled: 4 and 4.0 and 4e0 are one integer.
+    let integral = object
+        .get("code")
+        .and_then(serde_json::Value::as_number)
+        .is_some_and(|code| {
+            code.is_i64()
+                || code.is_u64()
+                || code.as_f64().is_some_and(|value| value.fract() == 0.0)
+        });
+    if !integral {
         return Err(BrokerError::invalid(format!(
             "{field} carries no integer code, so it reports no failure"
         )));
@@ -777,6 +787,43 @@ mod tests {
                 .upstream
                 .as_str(),
             "\"11\""
+        );
+    }
+
+    #[test]
+    fn an_identifier_is_bounded_by_its_value_and_never_by_what_encoding_costs() {
+        let gateway = native_gateway();
+        // A value at the limit is admitted, however expensive its encoding is: plain text, text
+        // that needs a backslash, and text a control character costs six bytes each.
+        for value in [
+            "a".repeat(MAX_OPAQUE_ID_LEN),
+            "\"".repeat(MAX_OPAQUE_ID_LEN),
+            "\u{7}".repeat(MAX_OPAQUE_ID_LEN),
+            "é".repeat(MAX_OPAQUE_ID_LEN / 2),
+        ] {
+            let frame = serde_json::json!({ "id": value, "method": "fs/write_text_file" });
+            let forwarded = gateway
+                .forward_native(
+                    GatewayConnectionId::new(1),
+                    serde_json::to_vec(&frame).expect("encodes").as_slice(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("a {}-byte value is admitted: {error}", value.len())
+                });
+            assert!(forwarded.request.is_some());
+        }
+        // One byte past it is refused, and refused for its value rather than for its encoding.
+        let frame = serde_json::json!({
+            "id": "a".repeat(MAX_OPAQUE_ID_LEN + 1),
+            "method": "fs/write_text_file",
+        });
+        assert!(
+            gateway
+                .forward_native(
+                    GatewayConnectionId::new(1),
+                    serde_json::to_vec(&frame).expect("encodes").as_slice(),
+                )
+                .is_err()
         );
     }
 

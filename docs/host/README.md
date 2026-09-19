@@ -3072,9 +3072,10 @@ throughout: suspension is a state a client reads, not an error it hits.
 Downstream request identifiers are namespaced by connection, so two connections that both call
 their first request `1` are two different pending resources, and a restarted worker numbers its
 connections above every identifier its ledger holds rather than starting again at one. The
-upstream's own identifier is carried in the JSON form it wrote: a string identifier keeps its
-quotes, so the number `11` and the string `"11"` stay two requests, and the 256-byte bound is on
-that text. An upstream identifier never becomes a KalaReach identifier. One resource takes one
+upstream's own identifier is carried in JSON form: a string identifier keeps its quotes, so the
+number `11` and the string `"11"` stay two requests. The form is this host's own encoding, so two
+spellings of one string are one identifier, and the 256-byte bound is on the value rather than on
+what encoding it costs. An upstream identifier never becomes a KalaReach identifier. One resource takes one
 response transition, and a response has to be one: a frame that names the table's method member is
 a request, a frame that names both or neither of the table's result and error members is neither an
 answer nor two of them, and an error that carries no code and message reports no failure. None of

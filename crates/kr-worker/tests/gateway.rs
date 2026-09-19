@@ -696,6 +696,8 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
         r#"{"id":"11","error":{}}"#,
         r#"{"id":"11","error":{"code":-32601}}"#,
         r#"{"id":"11","error":{"message":"no such method"}}"#,
+        r#"{"id":"11","error":{"code":"-32601","message":"no such method"}}"#,
+        r#"{"id":"11","error":{"code":-3.5,"message":"no such method"}}"#,
     ] {
         assert!(
             broker
@@ -715,6 +717,37 @@ fn kr_req_12_13_an_identifier_keeps_its_json_type_and_a_request_resolves_nothing
             .state,
         PendingState::Pending
     );
+
+    // An integer is an integer however the upstream spells it, and a code beyond a signed 64-bit
+    // word is still one. Refusing either would leave a resource pending on a real answer.
+    for (id, spelling) in [
+        (
+            "21",
+            r#"{"id":21,"error":{"code":-32601.0,"message":"no such method"}}"#,
+        ),
+        (
+            "22",
+            r#"{"id":22,"error":{"code":9223372036854775808,"message":"no such method"}}"#,
+        ),
+    ] {
+        let opened = broker
+            .forward_native(
+                GatewayConnectionId::new(1),
+                frame(id, "fs/write_text_file").as_bytes(),
+                TimestampMs::new(9),
+            )
+            .expect("forwarded")
+            .1
+            .expect("it expects a response");
+        let answered = broker
+            .native_answer(
+                GatewayConnectionId::new(1),
+                spelling.as_bytes(),
+                TimestampMs::new(10),
+            )
+            .unwrap_or_else(|error| panic!("an integral code is an integer: {spelling}: {error}"));
+        assert_eq!(answered.resource_id, opened.resource_id);
+    }
 
     // The upstream's own failure is an answer.
     let failed = broker

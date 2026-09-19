@@ -25654,7 +25654,7 @@
     },
     "UpstreamRequestId": {
       "description": "An upstream JSON-RPC request identifier, in its JSON form: a string identifier keeps its quotes, so a string and a number never collide. Correlation data, not authority.",
-      "maxLength": 514,
+      "maxLength": 1538,
       "minLength": 1,
       "type": "string"
     },
