@@ -2156,6 +2156,15 @@ impl Controller {
         // wait for a blocking thread; what the contract forbids is *disclosing* a retained result
         // under authority that has since been withdrawn, so the check belongs where the answer is
         // about to be written rather than only where the lookup began.
+        // The authority revision this mutation is admitted under, read here: beside the
+        // registration check above and before the first thing this daemon waits for. The network
+        // ingress reads its own in the same critical section as that check, and the two doors have
+        // to agree. A revocation of somebody else's device advances the revision and leaves every
+        // surviving registration stamped with the new one, so a door that read the revision after
+        // a retained lookup, a lock or a task being scheduled would admit a mutation under an
+        // authority the other door refuses the same mutation under. Only the project path uses it;
+        // every other effect still reads it where its own transaction does.
+        let admitted = self.admitted_revision(connection_id).ok();
         let mut retained = self
             .retained(actor_id, &mutation, method, connection_id)
             .await;
@@ -2191,14 +2200,6 @@ impl Controller {
                 });
             }
         };
-        // The authority revision this mutation is admitted under, read here rather than inside the
-        // task below. The network ingress reads it when it checks the registration, before
-        // anything it then waits for, and the two doors have to agree: a revocation of somebody
-        // else's device advances the revision while a task is being scheduled, and a mutation that
-        // picked the revision up afterwards would be admitted under an authority the other door's
-        // mutation is refused under. Only the project path uses it; every other effect still reads
-        // it where its own transaction does.
-        let admitted = self.admitted_revision(connection_id).ok();
         let request_id = mutation.request_id;
         let controller = Arc::clone(self);
         let actor_id = actor_id.clone();

@@ -724,12 +724,12 @@ receives nothing rather than everything.
 
 The registry admits a paired device to all ten project and workspace methods, and the daemon serves
 them through the same call a local caller reaches, so a device's `project.list` and the owner's are
-one answer. The mutations take the daemon's own path: the action's route is recorded with this host
-named as the owner of what it produces, the envelope is checked — a project acts on a repository or
-a working copy, so a target naming a session or an application is refused — and the effect runs on
-a task a dropped connection cannot cancel part way. `Controller::project_mutation` is the one place
-either door reaches the service from, and it asks about the admission the ingress recorded
-immediately before the write.
+one answer. The mutations take the daemon's own path: the envelope is checked first — a project
+acts on a repository or a working copy, so a target naming a session or an application is refused —
+then the action's route is recorded with this host named as the owner of what it produces, and the
+effect runs on a task a dropped connection cannot cancel part way. `Controller::project_mutation`
+is the one place either door reaches the service from, and it asks about the admission the ingress
+recorded immediately before the write.
 
 What a device is additionally held to is its grant: `project.create` for initialising, cloning and
 adopting, `workspace.manage` for creating and removing a working copy. The four reads require no

@@ -3,12 +3,19 @@
 //! What these demonstrate, towards KR-REQ-23.42 and KR-REQ-23.43 for the paired-device ingress.
 //! The registry admits a device to all ten methods; until now the network dispatcher refused the
 //! reads as unsupported and sent the mutations to the worker proxy, which wants a session a
-//! project mutation does not name. These show that the two doors now answer alike: every method
-//! runs over both, the results of the reads are identical, the refusals the daemon decides are
-//! identical, and the grant is what a device is additionally held to. What they do not show is the
-//! rest of those rows: the destination and source authority sections 14 and 23 ask for, which this
-//! host does not yet establish, and recovery through `action.read`, which is refused for an action
-//! this host owns.
+//! project mutation does not name.
+//!
+//! Five of the ten now answer a device differently on purpose: `project.init`, `project.clone`,
+//! `project.adopt`, `workspace.create` and `workspace.remove` name a destination or a source this
+//! host cannot check a device's authority over, so they are refused to one and the owner's own
+//! path is untouched. What is shown to be identical on both doors is the four reads, for the same
+//! subject, and the refusals the daemon decides about an envelope. On top of those, the grant is
+//! what a device is additionally held to, and a device's own action is answered from its own
+//! record rather than performed twice.
+//!
+//! What these do not show is the rest of those rows: the destination and source authority sections
+//! 14 and 23 ask for, which this host does not yet establish and which is why the five are
+//! refused, and recovery through `action.read`, which is refused for an action this host owns.
 //!
 //! No worker is started here. A project acts on a repository rather than on a session, so the
 //! daemon answers all ten itself; the repositories are real ones built with installed Git in a
@@ -813,18 +820,22 @@ async fn a_project_envelope_naming_a_session_or_another_environment_is_refused_o
 /// KR-REQ-23.42: a device's repeated project mutation is answered from its own record.
 ///
 /// A device whose reply was lost submits the same action again. Section 9 makes that one
-/// operation: the service's retained record answers it, nothing is performed twice, and an
+/// operation: the service's retained record answers it and nothing is performed twice, and an
 /// identifier reused with a different payload is refused outright rather than acted on.
 ///
-/// The action is `project.operation.cancel` against an operation this device did not start, which
-/// the service refuses under section 23's resource-owner rule. A refusal is retained exactly as a
-/// result is, and it is what a device can reach: the five mutations that name their own
-/// destination are refused before the service sees them, and an operation a device started is one
-/// it could only have started through those.
+/// The action is `project.operation.cancel`, which is the one project mutation a device reaches:
+/// the five that name their own destination are refused before the service sees them. It is
+/// submitted against an operation that does not exist yet, so the service refuses it, and a
+/// refusal is retained exactly as a result is. The owner then *creates* that operation, so a
+/// second execution of the same action would now give a different answer — section 23 puts the
+/// method under the resource owner's authority and the operation is the owner's. The retry
+/// therefore distinguishes the record from another execution: the record still says the operation
+/// was unknown, and a fresh submission of the same request says it belongs to somebody else.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_performed_again() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
+    let mut control = host.client().await;
     let device = net_support::Device::create().await;
     let record = net_support::pair_with(
         &host,
@@ -836,8 +847,10 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
     let raw = net_support::RawDevice::connect(&host, &device, &record).await;
     raw.claim();
 
+    // The operation this cancellation names does not exist yet.
+    let operation_id = ActionId::new(kr_ipc::new_uuid());
     let params = ProjectOperationCancelParams {
-        operation_action_id: ActionId::new(kr_ipc::new_uuid()),
+        operation_action_id: operation_id,
     };
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let target = ActionTarget::environment(host.environment_id);
@@ -849,7 +862,47 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
             &params,
         )
         .await
-        .expect_err("no such operation");
+        .expect_err("no operation carries that identifier");
+    assert_ne!(first.code, ErrorCode::PermissionDenied);
+
+    // The owner now performs the action that identifier names, so the operation exists and is the
+    // owner's. Anything executed from here on gets a different answer.
+    let initialised: ProjectInitResult = typed(
+        &control
+            .mutate(
+                Method::ProjectInit,
+                operation_id,
+                target.clone(),
+                &ProjectInitParams {
+                    destination: destination(&host, "fresh"),
+                    label: "fresh".to_owned(),
+                    initial_branch: Nullable::some("main".to_owned()),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.init succeeds locally"),
+    );
+    assert_eq!(initialised.operation.action_id, operation_id);
+
+    // A fresh submission of the same request, under an identifier of its own, is executed and
+    // says what executing it now says.
+    let fresh = raw
+        .mutate(
+            Method::ProjectOperationCancel,
+            ActionId::new(kr_ipc::new_uuid()),
+            target.clone(),
+            &params,
+        )
+        .await
+        .expect_err("an operation the owner started is not this device's to stop");
+    assert_eq!(fresh.code, ErrorCode::PermissionDenied);
+    assert_ne!(
+        fresh.code, first.code,
+        "the answer to executing this request has changed, which is what makes the retry a test"
+    );
+
+    // And the retry under the original identifier is the record, not another execution.
     let again = raw
         .mutate(
             Method::ProjectOperationCancel,
@@ -859,8 +912,8 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
         )
         .await
         .expect_err("the repeat is answered from the record the first submission wrote");
-    assert_eq!(first.code, again.code);
-    assert_eq!(first.message, again.message);
+    assert_eq!(again.code, first.code);
+    assert_eq!(again.message, first.message);
 
     // The same identifier with a different payload is a different action, and section 9 refuses it.
     let conflicting = raw
@@ -886,11 +939,14 @@ async fn a_repeated_project_mutation_from_a_device_is_answered_rather_than_perfo
 /// back. The subject of a repository mutation is a repository or an operation, not a session, so a
 /// grant that carries no `session.view` at all is given its own outcome back on a repeat.
 /// Demanding `session.view` for that would ask for authority over something the answer is not
-/// about, and would leave a device that lost its reply unable to recover it.
+/// about, and would leave a device that lost its reply unable to recover it. The operation is
+/// created between the two submissions for the reason the test above gives: it makes the record
+/// and another execution say different things.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_device_without_session_view_still_recovers_its_own_project_outcome() {
     let owner = DeviceKeys::generate().expect("owner keys");
     let host = Host::start(&owner).await;
+    let mut control = host.client().await;
     let device = net_support::Device::create().await;
     let record = net_support::pair_with(
         &host,
@@ -902,8 +958,9 @@ async fn a_device_without_session_view_still_recovers_its_own_project_outcome() 
     let raw = net_support::RawDevice::connect(&host, &device, &record).await;
     raw.claim();
 
+    let operation_id = ActionId::new(kr_ipc::new_uuid());
     let params = ProjectOperationCancelParams {
-        operation_action_id: ActionId::new(kr_ipc::new_uuid()),
+        operation_action_id: operation_id,
     };
     let action_id = ActionId::new(kr_ipc::new_uuid());
     let target = ActionTarget::environment(host.environment_id);
@@ -915,7 +972,23 @@ async fn a_device_without_session_view_still_recovers_its_own_project_outcome() 
             &params,
         )
         .await
-        .expect_err("no such operation");
+        .expect_err("no operation carries that identifier");
+    let _: ProjectInitResult = typed(
+        &control
+            .mutate(
+                Method::ProjectInit,
+                operation_id,
+                target.clone(),
+                &ProjectInitParams {
+                    destination: destination(&host, "fresh"),
+                    label: "fresh".to_owned(),
+                    initial_branch: Nullable::some("main".to_owned()),
+                },
+            )
+            .await
+            .expect("the call reaches the daemon")
+            .expect("project.init succeeds locally"),
+    );
     let again = raw
         .mutate(Method::ProjectOperationCancel, action_id, target, &params)
         .await
@@ -925,7 +998,8 @@ async fn a_device_without_session_view_still_recovers_its_own_project_outcome() 
     assert_ne!(
         again.code,
         ErrorCode::PermissionDenied,
-        "the repeat is the action's own answer, not a refusal about session.view: {again:?}"
+        "the repeat is this action's own answer, neither a refusal about session.view nor the \
+         answer executing it now would give: {again:?}"
     );
 
     raw.close();
