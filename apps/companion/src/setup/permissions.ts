@@ -5,7 +5,7 @@
  * permissions. Full Disk Access is a fourth grant beside Accessibility, Screen & System Audio
  * Recording and the Automation grants, not a master switch above them, and an application holding
  * it still cannot take a screen image. Two more categories exist and belong only to the features
- * that use them: the microphone for voice, and Remote Management for reaching this desktop from
+ * that use them: the microphone for voice, and Remote Desktop for reaching this desktop from
  * somewhere else.
  *
  * Every one of them needs System Settings. None of them can be enabled by this application, and
@@ -62,7 +62,9 @@ export const PERMISSION_CATEGORIES: readonly PermissionCategory[] = [
     core: true,
     caveat:
       'This does not stand in for the others. An application with Full Disk Access still cannot ' +
-      'take a screen image or send a keystroke.'
+      'take a screen image or send a keystroke. And the check below is about the one file it was ' +
+      'given, named beside it: a file outside the places macOS protects establishes nothing ' +
+      'about this grant.'
   },
   {
     name: 'Automation',
@@ -87,9 +89,9 @@ export const PERMISSION_CATEGORIES: readonly PermissionCategory[] = [
     onlyFor: 'voice'
   },
   {
-    name: 'Remote Management',
-    pane: 'remote_management',
-    route: 'System Settings → General → Sharing → Remote Management',
+    name: 'Remote Desktop',
+    pane: 'remote_desktop',
+    route: 'System Settings → Privacy & Security → Remote Desktop',
     purpose: 'Lets you reach this desktop from another machine to watch a session on it.',
     governs: [],
     core: false,

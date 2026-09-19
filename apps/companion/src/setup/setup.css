@@ -314,3 +314,43 @@
     transition: opacity var(--state) var(--ease-out);
   }
 }
+
+/* What a record was established about, under the capability it is about. */
+.setup-about {
+  display: block;
+  margin-top: 2px;
+  overflow-wrap: anywhere;
+}
+
+.setup-commands {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap-2);
+  margin-top: var(--gap-3);
+  padding-top: var(--gap-3);
+  border-top: 1px solid var(--line);
+}
+
+.setup-commands p {
+  margin: 0;
+}
+
+/*
+ * The floating controls are a material over the content, so reduced transparency makes them solid
+ * rather than a gradient the content shows through.
+ */
+@media (prefers-reduced-transparency: reduce) {
+  .setup-controls {
+    background: var(--bg);
+    border-top: 1px solid var(--line);
+  }
+}
+
+/*
+ * A keyboard-driven change is instant. The shared rule resets every duration; a delay is not a
+ * duration, so the one this file sets is reset here as well.
+ */
+html[data-input='keyboard'] .setup-evidence,
+html[data-input='keyboard'] .setup-evidence[data-open='true'] {
+  transition-delay: 0ms;
+}

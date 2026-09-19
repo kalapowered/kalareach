@@ -77,15 +77,18 @@ describe('the identity setup checks before anything else', () => {
       )
     })
     expect(screen.getByTestId('setup-identity').textContent).toMatch(
-      /Install the application before granting anything/
+      /Install a signed build before granting anything/
     )
+    expect(screen.getByTestId('setup-signature').textContent).toMatch(/ad-hoc signature/)
   })
 
   it('states what no check can establish, wherever the identity is shown', async () => {
     start()
     const ceiling = await screen.findByTestId('setup-ceiling-identity')
-    expect(ceiling.textContent).toMatch(/does not read the code signature/)
+    expect(ceiling.textContent).toMatch(/cannot tell you a permission has been granted/)
     expect(ceiling.textContent).toMatch(/perform the operation the permission guards/)
+    // And the signature itself is named, because that is what a grant is filed against.
+    expect(screen.getByTestId('setup-signature').textContent).toMatch(/Developer ID Application/)
   })
 })
 
@@ -111,12 +114,12 @@ describe('the permission categories', () => {
     )
   })
 
-  it('shows the microphone and remote management only for the features that use them', async () => {
+  it('shows the microphone and remote desktop only for the features that use them', async () => {
     start()
     await screen.findByTestId('setup-identity')
     await goTo('permissions')
     expect(screen.getByTestId('setup-permission-microphone').textContent).toMatch(/for voice/)
-    expect(screen.getByTestId('setup-permission-remote_management').textContent).toMatch(
+    expect(screen.getByTestId('setup-permission-remote_desktop').textContent).toMatch(
       /for reaching this desktop from elsewhere/
     )
   })
@@ -260,7 +263,8 @@ describe('how KalaReach runs here', () => {
     await goTo('host')
     const sleep = screen.getByTestId('setup-sleep')
     expect(within(sleep).getByText('off')).toBeInTheDocument()
-    expect(sleep.textContent).toMatch(/setting up KalaReach does not change that/)
+    expect(screen.getByTestId('setup-sleep-now').textContent).toMatch(/It is off\./)
+    expect(sleep.textContent).toMatch(/Setting up KalaReach does not change it/)
     expect(screen.getByTestId('setup-sleep-mains_only').textContent).toMatch(
       /kr host power --set mains_only/
     )
@@ -278,6 +282,7 @@ describe('how KalaReach runs here', () => {
       `${readableBytes(DEFAULT_MODEL.bytes)} to download.`
     )
     await userEvent.click(screen.getByTestId('setup-model-download'))
+    expect(screen.getByTestId('setup-model').textContent).toMatch(/Chosen/)
     await userEvent.click(screen.getByTestId('setup-model-cancel'))
     expect(screen.getByTestId('setup-model').textContent).toMatch(/Cancelled/)
     await userEvent.click(screen.getByTestId('setup-model-decline'))
@@ -362,5 +367,68 @@ describe('when there is no host on this machine', () => {
     // The categories are still guided, because they are facts about this Mac rather than about
     // a host that happens to be running.
     expect(screen.getByTestId('setup-permission-accessibility')).toBeInTheDocument()
+  })
+})
+
+describe('what a restart is asked for, and what a record is about', () => {
+  it('waits for every grant that stands behind a capability before it asks for a restart', async () => {
+    const { controls } = start()
+    await screen.findByTestId('setup-identity')
+    await goTo('permissions')
+    // Reading the accessibility tree is behind two grants. One of them is not enough.
+    await userEvent.click(screen.getByTestId('setup-open-accessibility'))
+    await waitFor(() => {
+      expect(controls.openedPanes).toEqual(['accessibility'])
+    })
+    await goTo('capabilities')
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-recheck').textContent).toBe('Check again')
+    })
+    expect(screen.getByTestId('setup-state-desktop.accessibility').textContent).toBe(
+      'Permission required'
+    )
+
+    // Both of them, and the answer becomes the one that tells the person what to do next.
+    await goTo('permissions')
+    await userEvent.click(screen.getByTestId('setup-open-automation'))
+    await waitFor(() => {
+      expect(controls.openedPanes).toEqual(['accessibility', 'automation'])
+    })
+    await goTo('capabilities')
+    await userEvent.click(screen.getByTestId('setup-recheck'))
+    await waitFor(() => {
+      expect(screen.getByTestId('setup-state-desktop.accessibility').textContent).toBe(
+        'Restart required'
+      )
+    })
+    // The screen capture is behind a grant nobody was sent to, so it stays what it was.
+    expect(screen.getByTestId('setup-state-desktop.screen_capture').textContent).toBe(
+      'Permission required'
+    )
+  })
+
+  it('names what each answer was established about, so one file is not read as a grant', async () => {
+    start()
+    await screen.findByTestId('setup-identity')
+    await goTo('permissions')
+    const about = screen.getByTestId('setup-about-desktop.authorised_file_read')
+    expect(about.textContent).toMatch(/kalareach-check\.txt/)
+    expect(screen.getByTestId('setup-caveat-full_disk_access').textContent).toMatch(
+      /a file outside the places macOS protects establishes nothing/
+    )
+  })
+
+  it('says what will install what, and installs nothing itself', async () => {
+    start()
+    await screen.findByTestId('setup-identity')
+    await goTo('host')
+    const card = screen.getByTestId('setup-install-gui_host')
+    expect(card.textContent).toMatch(/kr host install --desktop/)
+    await userEvent.click(within(card).getByRole('switch'))
+    await goTo('ready')
+    const commands = screen.getByTestId('setup-commands')
+    expect(commands.textContent).toMatch(/Nothing on this screen installed anything/)
+    expect(commands.textContent).toMatch(/kr host install --desktop/)
   })
 })

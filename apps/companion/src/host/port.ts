@@ -77,6 +77,8 @@ export interface SetupIdentity {
   readonly executable: string | null
   /** Whether that executable sits inside an application bundle. */
   readonly bundled: boolean
+  /** The signing identity on that executable, as the platform's own tool names it. */
+  readonly signature: SigningIdentity
   /** Whether the identity is the same on the next launch. */
   readonly stable: boolean
   /** Why it is not, when it is not. */
@@ -87,6 +89,22 @@ export interface SetupIdentity {
   readonly helper_build: string | null
   /** The environment that host owns. */
   readonly helper_environment: string | null
+}
+
+/** The signature on the application, as the platform reports it. */
+export interface SigningIdentity {
+  /** Whether the platform read a signature at all. */
+  readonly read: boolean
+  /** The authority that signed it, where there is one. Absent for an ad-hoc signature. */
+  readonly authority: string | null
+  /** The team the signature belongs to, where it carries one. */
+  readonly team: string | null
+  /** The identifier the signature seals, which is what a grant is filed under. */
+  readonly identifier: string | null
+  /** Whether the signature is ad-hoc: one this machine made, that nothing else can vouch for. */
+  readonly ad_hoc: boolean
+  /** What the platform said, where it would not answer. */
+  readonly refusal: string | null
 }
 
 /** One settings pane this application will open, by name. */

@@ -14,7 +14,7 @@ import {
   capabilityLabel,
   displayState,
   STATE_LABEL,
-  STATE_MEANING,
+  stateMeaning,
   tally,
   tallyLine,
   type DisplayState
@@ -80,7 +80,14 @@ describe('the state one capability is shown as', () => {
   it('asks for a restart once the grant was given and the answer did not change', () => {
     const waiting = record('desktop.screen_capture', 'permission_required')
     expect(displayState(waiting, { grantWasOffered: true })).toBe('restart_required')
-    expect(STATE_MEANING.restart_required).toMatch(/open it again/i)
+    expect(stateMeaning('restart_required', 'disclosed_probe')).toMatch(/open it again/i)
+  })
+
+  it('says what an answer means differently when nothing performed the operation', () => {
+    expect(stateMeaning('ready', 'disclosed_probe')).toMatch(/did the thing and it worked/)
+    expect(stateMeaning('ready', 'platform_query')).toMatch(/Nothing has done it yet/)
+    expect(stateMeaning('desktop_unavailable', 'platform_query')).toMatch(/no desktop/)
+    expect(stateMeaning('desktop_unavailable', 'disclosed_probe')).toMatch(/it was tried/i)
   })
 
   it('does not ask for a restart once the operation works', () => {
@@ -98,7 +105,8 @@ describe('the state one capability is shown as', () => {
   it('has a label for every state it can produce', () => {
     for (const state of Object.keys(STATE_LABEL) as DisplayState[]) {
       expect(STATE_LABEL[state]).toBeTruthy()
-      expect(STATE_MEANING[state]).toBeTruthy()
+      expect(stateMeaning(state, 'disclosed_probe')).toBeTruthy()
+      expect(stateMeaning(state, 'platform_query')).toBeTruthy()
     }
   })
 })

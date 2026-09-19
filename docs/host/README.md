@@ -275,7 +275,7 @@ Selecting a desktop is not a permission, and neither is holding one permission e
 another. On macOS, Accessibility, Screen & System Audio Recording, Full Disk Access and the
 Automation grants are four separate things granted to one signed application, and Full Disk Access
 does not stand in for the rest: an application holding it still cannot take a screen image or send
-a keystroke. The microphone and Remote Management belong to the features that use them and nothing
+a keystroke. The microphone and Remote Desktop belong to the features that use them and nothing
 asks for them until you do.
 
 None of these can be enabled by KalaReach. Some of them can only be set in System Settings at all,
@@ -292,14 +292,15 @@ can put about itself. So the checks perform the operations:
 | Read a file you authorised | opens the file you nominated and reads its first few thousand bytes | that file, and nothing else on the filesystem |
 | Take a screen image | takes one image of the desktop and measures it | writes the image into the check's own directory and removes it before answering |
 | Find an element | asks the accessibility tree for the name of one element | reads the tree; selects nothing, moves nothing, clicks nothing |
-| Open an application | starts one new hidden instance of an application and ends the instance it started | nothing you already have open |
-| Send a keystroke | delivers one keystroke | this one changes something, so it runs only inside a test context of its own |
+| Open an application | starts one new hidden instance of an application that opens no document, and ends the instance it started | nothing you already have open |
+| Send a keystroke | delivers one keystroke | this one changes something, so it runs only inside a test context that owns the application the keystroke lands in, and this build has none |
 
 Each of them runs in the same execution context an agent's own tools run in, each declares what it
 does before it runs, each is bounded, and none sends input to an application you did not ask about
-or changes anything you own. The last one is the exception that proves the rule: without a test
-context of its own it is not run at all, and its record says nothing was established either way
-rather than claiming an answer.
+or changes anything you own. The last one is the exception that proves the rule. Delivering a
+keystroke safely means owning the application it lands in, and the platform's own input facility
+delivers to whatever is in front instead, so it is not performed here at all: its record says
+nothing was established either way rather than claiming an answer.
 
 Every result is a capability record in the shared shape: the state, `disclosed_probe` as what
 produced it, the exact facility it was established about, and what makes it stale. That last part
@@ -328,9 +329,13 @@ other.
 ### Where a grant is recorded
 
 An operating system files a permission under a signed application, which is why setup shows that
-identity before it guides you anywhere. An application whose identity moves between launches, such
-as one running from a build directory, is a different application to the operating system every
-time, and every grant given to it has to be given again. Install the application first.
+identity before it guides you anywhere: the bundle identifier, the file it is running from, and the
+signature on that file as the platform's own signing tool reports it.
+
+What matters is not whether there is a signature but whether it is one the operating system will
+recognise again. An ad-hoc signature is one the machine made for that file; the next build carries
+a different one, and every grant given to the old one stays with it. The same goes for a bundle
+inside a build directory, which the next build overwrites. Install a signed build first.
 
 ### Running the demonstration
 

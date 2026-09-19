@@ -73,6 +73,9 @@ test.describe('the first-start assistant', () => {
       'does not stand in for the others'
     )
     await expect(page.getByTestId('setup-permission-microphone')).toContainText('for voice')
+    await expect(page.getByTestId('setup-permission-remote_desktop')).toContainText(
+      'System Settings → Privacy & Security → Remote Desktop'
+    )
     await capture(page, 'setup-permissions-03.28')
   })
 
@@ -89,6 +92,11 @@ test.describe('the first-start assistant', () => {
       .getByTestId('setup-capability-desktop.screen_capture')
       .locator('.setup-evidence')
     await expect(evidence).toHaveAttribute('data-open', 'true')
+    // And while it was closed, nothing in it was in the accessibility tree.
+    const hidden = page
+      .getByTestId('setup-capability-desktop.accessibility')
+      .locator('.setup-evidence')
+    await expect(hidden).toHaveAttribute('aria-hidden', 'true')
     await expect(evidence).toContainText('a check that performed the operation')
     await expect(evidence).toContainText('/usr/sbin/screencapture')
     await expect(evidence).toContainText('the tool is replaced')
@@ -163,10 +171,14 @@ test.describe('the first-start assistant', () => {
       const card = page.getByTestId(`setup-install-${id}`)
       await expect(card.getByRole('switch')).toHaveAttribute('aria-checked', 'false')
     }
+    await expect(page.getByTestId('setup-sleep-now')).toContainText('It is off.')
     await expect(page.getByTestId('setup-sleep')).toContainText(
-      'setting up KalaReach does not change that'
+      'Setting up KalaReach does not change it'
     )
     await expect(page.getByTestId('setup-model-size')).toContainText('1.9 GB')
+    await expect(page.getByTestId('setup-model')).toContainText(
+      'Nothing is downloading while you read this'
+    )
     await capture(page, 'setup-host-03.28')
   })
 

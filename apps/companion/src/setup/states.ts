@@ -30,8 +30,12 @@ export type DisplayState =
 /** What happened in this run that a reading alone does not say. */
 export interface SinceRead {
   /**
-   * Whether the person has been sent to this permission's own settings pane and the record has
-   * been read again since.
+   * Whether every grant that governs this capability has been opened in System Settings and the
+   * record has been read again since.
+   *
+   * Every one of them, not any one. Two grants stand behind sending a keystroke, and a person who
+   * has just granted one of them is still waiting on the other: telling them to restart would send
+   * them the wrong way.
    */
   readonly grantWasOffered: boolean
 }
@@ -86,15 +90,37 @@ export const STATE_TONE: Readonly<
  *
  * The host says what it found. This says what it means for the person in front of the machine,
  * which is a different sentence and belongs to the interface.
+ *
+ * Two of them depend on what produced the answer, because the same state means different things
+ * from a check that performed the operation and from a question put to the platform. Saying "this
+ * machine did the thing" about an answer nothing performed would be the kind of small untruth this
+ * whole screen exists to avoid.
  */
-export const STATE_MEANING: Readonly<Record<DisplayState, string>> = {
-  ready: 'This machine did the thing and it worked.',
-  permission_required: 'macOS refused it. The grant is yours to give.',
-  restart_required:
-    'macOS gives a new grant to a process when it starts. Quit KalaReach and open it again.',
-  desktop_unavailable: 'There is no desktop to do it on right now.',
-  not_installed: 'The tool this uses is not on this machine, so there is nothing to grant.',
-  not_checked: 'Nothing has done this yet, so nothing is known about it either way.'
+export function stateMeaning(
+  state: DisplayState,
+  evidence: CapabilityRecord['evidence_source']
+): string {
+  const probed = evidence === 'disclosed_probe'
+  switch (state) {
+    case 'ready':
+      return probed
+        ? 'This machine did the thing and it worked.'
+        : 'The operating system says nothing stands in the way. Nothing has done it yet.'
+    case 'permission_required':
+      return probed
+        ? 'macOS refused it. The grant is yours to give.'
+        : 'This needs a grant macOS has not given. The grant is yours to give.'
+    case 'restart_required':
+      return 'macOS gives a new grant to a process when it starts. Quit KalaReach and open it again.'
+    case 'desktop_unavailable':
+      return probed
+        ? 'It was tried and it did not get far enough to establish anything. The reason is below.'
+        : 'There is no desktop to do it on right now.'
+    case 'not_installed':
+      return 'The tool this uses is not on this machine, so there is nothing to grant.'
+    case 'not_checked':
+      return 'Nothing has done this yet, so nothing is known about it either way.'
+  }
 }
 
 /** What produced an answer, in words. */

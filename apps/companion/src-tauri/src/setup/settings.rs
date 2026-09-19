@@ -53,9 +53,9 @@ pub const PANES: &[Pane] = &[
         url: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
     },
     Pane {
-        id: "remote_management",
-        route: "System Settings → General → Sharing → Remote Management",
-        url: "x-apple.systempreferences:com.apple.preferences.sharing?Services_RemoteManagement",
+        id: "remote_desktop",
+        route: "System Settings → Privacy & Security → Remote Desktop",
+        url: "x-apple.systempreferences:com.apple.preference.security?Privacy_RemoteDesktop",
     },
 ];
 

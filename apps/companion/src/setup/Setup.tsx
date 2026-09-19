@@ -55,7 +55,7 @@ import {
   EVIDENCE_LABEL,
   INVALIDATION_LABEL,
   STATE_LABEL,
-  STATE_MEANING,
+  stateMeaning,
   STATE_TONE,
   tally,
   tallyLine
@@ -124,6 +124,29 @@ interface Reading {
   readonly identity: SetupIdentity
   readonly capabilities: EnvironmentCapabilitiesResult | null
   readonly failure: string | null
+}
+
+/**
+ * One record's own identity on this screen.
+ *
+ * A capability can have more than one record, because a record is about a subject: one tool, one
+ * application, one terminal. Keying a card by the capability alone would collapse two answers into
+ * one and lose exactly the attribution that keeps a tool-specific permission visible.
+ */
+function recordKey(record: CapabilityRecord): string {
+  return [
+    record.capability,
+    record.subject.application ?? '',
+    record.subject.terminal ?? '',
+    record.identity.binary ?? ''
+  ].join('|')
+}
+
+/** What a record was established about, in one line, where it names something. */
+function aboutLine(record: CapabilityRecord): string | null {
+  const parts = [record.subject.application, record.subject.terminal, record.identity.binary]
+    .filter((part): part is string => typeof part === 'string' && part.length > 0)
+  return parts.length > 0 ? parts.join(' · ') : null
 }
 
 /** The setup assistant. */
@@ -213,14 +236,18 @@ export function Setup(): ReactNode {
   )
 
   const records = useMemo(() => capabilities?.desktop.records ?? [], [capabilities])
-  const offered = useCallback(
-    (capability: string) =>
-      categoriesFor(capability).some((category) => {
+  const offered = useCallback((capability: string) => {
+    const governing = categoriesFor(capability)
+    // Every grant that governs it, not any one of them: a person who granted Accessibility is
+    // still waiting on Automation, and telling them to restart would send them the wrong way.
+    return (
+      governing.length > 0 &&
+      governing.every((category) => {
         const at = visited[category.pane]
         return at !== undefined && at < reads
-      }),
-    [visited, reads]
-  )
+      })
+    )
+  }, [visited, reads])
   const counted = useMemo(
     () =>
       tally(
@@ -370,6 +397,21 @@ export function Setup(): ReactNode {
 
 /* ---- Step 1: the identity -------------------------------------------------------------------- */
 
+/**
+ * The signature on this application, in one line.
+ *
+ * The distinction that matters is not "signed or not": it is whether the signature is one the
+ * operating system will recognise again tomorrow. An ad-hoc signature is real, and it is different
+ * every build, so a grant given against it is given to a build that will not exist.
+ */
+function signatureLine(signature: SetupIdentity['signature']): string {
+  if (!signature.read) return signature.refusal ?? 'not read'
+  if (signature.ad_hoc || !signature.authority) {
+    return `an ad-hoc signature${signature.identifier ? ` on ${signature.identifier}` : ''}`
+  }
+  return signature.team ? `${signature.authority} (${signature.team})` : signature.authority
+}
+
 function IdentityStep({
   identity,
   failure,
@@ -416,6 +458,10 @@ function IdentityStep({
             <div>
               <dt>Inside an application bundle</dt>
               <dd>{identity.bundled ? 'yes' : 'no'}</dd>
+            </div>
+            <div>
+              <dt>Signed by</dt>
+              <dd data-testid="setup-signature">{signatureLine(identity.signature)}</dd>
             </div>
           </dl>
           {identity.instability ? (
@@ -548,9 +594,20 @@ function PermissionCard({
           <ul className="setup-governs">
             {governed.map((record) => {
               const state = displayState(record, { grantWasOffered: offered(record.capability) })
+              const about = aboutLine(record)
               return (
-                <li key={record.capability}>
-                  <span>{capabilityLabel(record.capability)}</span>
+                <li key={recordKey(record)}>
+                  <span>
+                    {capabilityLabel(record.capability)}
+                    {about ? (
+                      <span
+                        className="mono small faint setup-about"
+                        data-testid={`setup-about-${record.capability}`}
+                      >
+                        {about}
+                      </span>
+                    ) : null}
+                  </span>
                   <Badge tone={STATE_TONE[state]}>{STATE_LABEL[state]}</Badge>
                 </li>
               )
@@ -645,7 +702,7 @@ function CapabilitiesStep({
 
       {capabilities.desktop.records.map((record) => (
         <CapabilityCard
-          key={record.capability}
+          key={recordKey(record)}
           record={record}
           offered={offered(record.capability)}
         />
@@ -672,7 +729,7 @@ function CapabilityCard({
         </Badge>
       </header>
       <div className="card-body">
-        <p>{STATE_MEANING[state]}</p>
+        <p>{stateMeaning(state, record.evidence_source)}</p>
         {record.disabled_reason ? (
           <p className="faint small" data-testid={`setup-reason-${record.capability}`}>
             {record.disabled_reason}
@@ -689,7 +746,12 @@ function CapabilityCard({
         >
           {showEvidence ? 'Hide how this is known' : 'How this is known'}
         </button>
-        <div className="setup-evidence" data-open={showEvidence ? 'true' : 'false'}>
+        <div
+          className="setup-evidence"
+          data-open={showEvidence ? 'true' : 'false'}
+          aria-hidden={showEvidence ? undefined : true}
+          inert={!showEvidence}
+        >
           <div>
             <dl className="detail-list">
               <div>
@@ -725,6 +787,16 @@ function CapabilityCard({
 
 /* ---- Step 4: how KalaReach runs here ---------------------------------------------------------- */
 
+/** What the host's sleep setting is doing, in one sentence. */
+function sleepNow(power: EnvironmentCapabilitiesResult['power'] | undefined): string {
+  if (!power) return 'What it is set to here is not known until a host answers.'
+  if (power.setting === 'off') return 'It is off.'
+  const held = power.active
+    ? `An assertion is held right now${power.reason ? `, because ${power.reason}` : ''}.`
+    : 'Nothing is held right now.'
+  return `It is set to ${power.setting}. ${held}`
+}
+
 function HostStep({
   capabilities,
   install,
@@ -743,8 +815,10 @@ function HostStep({
   return (
     <>
       <p>
-        Three separate things, and you can take any of them without the others. Nothing is
-        installed until you finish this step.
+        Three separate things, and you can take any of them without the others. Choosing one here
+        records the choice; the last step gives you the command that installs it, because an
+        installer that put things on your machine while you were still reading would be the wrong
+        kind of helpful.
       </p>
       {INSTALLABLES.map((item) => {
         const answer = persistence.find((each) => each.profile === item.profile)
@@ -763,6 +837,9 @@ function HostStep({
             <div className="card-body">
               <p>{item.purpose}</p>
               <p className="faint small">{item.installs}</p>
+              <p className="faint small">
+                Installed by <code className="mono">{item.command}</code>
+              </p>
               {answer ? (
                 <p className="setup-persistence" data-testid={`setup-persistence-${item.id}`}>
                   <strong>
@@ -784,9 +861,9 @@ function HostStep({
           </Badge>
         </header>
         <div className="card-body">
-          <p>
-            This is your machine&rsquo;s own sleep policy, so KalaReach leaves it alone until you say
-            otherwise. It is off, and setting up KalaReach does not change that.
+          <p data-testid="setup-sleep-now">
+            This is your machine&rsquo;s own sleep policy, so KalaReach leaves it alone until you
+            say otherwise. {sleepNow(power)} Setting up KalaReach does not change it.
           </p>
           <ul className="setup-choices">
             {SLEEP_OFFERS.map((offer) => (
@@ -804,7 +881,7 @@ function HostStep({
       <Card data-testid="setup-model">
         <header className="card-header">
           <h2>{DEFAULT_MODEL.name}</h2>
-          <Badge tone={download === 'installed' ? 'success' : 'neutral'}>
+          <Badge tone={download === 'chosen' ? 'success' : 'neutral'}>
             {DOWNLOAD_LABEL[download]}
           </Badge>
         </header>
@@ -813,16 +890,20 @@ function HostStep({
           <p className="faint small" data-testid="setup-model-size">
             {readableBytes(DEFAULT_MODEL.bytes)} to download.
           </p>
+          <p className="faint small">
+            Downloaded by <code className="mono">{DEFAULT_MODEL.command}</code>, when you run it.
+            Nothing is downloading while you read this.
+          </p>
         </div>
         <footer className="card-footer setup-route">
-          {download === 'downloading' ? (
+          {download === 'chosen' ? (
             <Button
               data-testid="setup-model-cancel"
               onClick={() => {
                 onDownload('cancelled')
               }}
             >
-              Cancel the download
+              Cancel it
             </Button>
           ) : (
             <Button
@@ -836,10 +917,10 @@ function HostStep({
           )}
           <Button
             tone="primary"
-            disabled={download === 'downloading'}
+            disabled={download === 'chosen'}
             data-testid="setup-model-download"
             onClick={() => {
-              onDownload('downloading')
+              onDownload('chosen')
             }}
           >
             Download it
@@ -877,7 +958,7 @@ function ReadyStep({
             {records.map((record) => {
               const state = displayState(record, { grantWasOffered: false })
               return (
-                <li key={record.capability}>
+                <li key={recordKey(record)}>
                   <span>{capabilityLabel(record.capability)}</span>
                   <Badge tone={STATE_TONE[state]}>{STATE_LABEL[state]}</Badge>
                 </li>
@@ -907,7 +988,7 @@ function ReadyStep({
             ))}
             <li>
               <span>{DEFAULT_MODEL.name}</span>
-              <Badge tone={download === 'installed' ? 'success' : 'neutral'}>
+              <Badge tone={download === 'chosen' ? 'success' : 'neutral'}>
                 {DOWNLOAD_LABEL[download]}
               </Badge>
             </li>
@@ -917,7 +998,27 @@ function ReadyStep({
               Nothing at all, which is a complete answer. KalaReach works from here without any of
               it.
             </p>
-          ) : null}
+          ) : (
+            <div className="setup-commands" data-testid="setup-commands">
+              <p className="faint small">
+                Nothing on this screen installed anything. These are the commands that do:
+              </p>
+              <ul className="setup-choices">
+                {chosen.map((item) => (
+                  <li key={item.id}>
+                    <code className="mono small">{item.command}</code>
+                    <span className="faint small">{item.name}</span>
+                  </li>
+                ))}
+                {download === 'chosen' ? (
+                  <li>
+                    <code className="mono small">{DEFAULT_MODEL.command}</code>
+                    <span className="faint small">{DEFAULT_MODEL.name}</span>
+                  </li>
+                ) : null}
+              </ul>
+            </div>
+          )}
         </div>
       </Card>
 

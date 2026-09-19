@@ -26,6 +26,8 @@ export interface Installable {
   readonly purpose: string
   /** What it writes on this machine, so the person knows what is being added. */
   readonly installs: string
+  /** The command that installs it. Nothing in the assistant runs it. */
+  readonly command: string
   /** The execution profile it provides, where it provides one. */
   readonly profile?: ProfilePersistence['profile']
 }
@@ -39,6 +41,7 @@ export const INSTALLABLES: readonly Installable[] = [
       'Runs sessions inside your own desktop login, so a tool in a session sees the screen you ' +
       'see and the permissions you granted.',
     installs: 'A per-user login item, started when you log in.',
+    command: 'kr host install --desktop',
     profile: 'desktop_bound'
   },
   {
@@ -48,6 +51,7 @@ export const INSTALLABLES: readonly Installable[] = [
       'Runs sessions outside the desktop, for work that has nothing to do with a screen and ' +
       'should not be tied to one.',
     installs: 'A per-user background service.',
+    command: 'kr host install --headless',
     profile: 'headless_user'
   },
   {
@@ -55,7 +59,8 @@ export const INSTALLABLES: readonly Installable[] = [
     name: 'A terminal profile',
     purpose:
       'Teaches your shell about sessions, so `kr` and your prompt agree about which one you are in.',
-    installs: 'One block in your shell startup file, marked so it can be removed again.'
+    installs: 'One block in your shell startup file, marked so it can be removed again.',
+    command: 'kr shell install'
   }
 ]
 
@@ -113,6 +118,8 @@ export interface ModelPackage {
   readonly purpose: string
   /** How big the download is, stated before it starts. */
   readonly bytes: number
+  /** The command that downloads it. Nothing in the assistant runs it. */
+  readonly command: string
 }
 
 /** The package setup offers. */
@@ -121,7 +128,8 @@ export const DEFAULT_MODEL: ModelPackage = {
   purpose:
     'Summaries, titles and suggestions run on this machine instead of somewhere else. Nothing ' +
     'about KalaReach needs it.',
-  bytes: 1_880_000_000
+  bytes: 1_880_000_000,
+  command: 'kr package install --default-model'
 }
 
 /** A size in the units a person reads. */
@@ -137,16 +145,21 @@ export function readableBytes(bytes: number): string {
   return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unit]}`
 }
 
-/** What a download is doing. */
-export type DownloadState = 'offered' | 'downloading' | 'cancelled' | 'declined' | 'installed'
+/**
+ * What the person decided about the download.
+ *
+ * These are choices rather than progress. Nothing in the assistant downloads anything, so a state
+ * called "downloading" would be the interface telling somebody something was happening that was
+ * not.
+ */
+export type DownloadState = 'offered' | 'chosen' | 'cancelled' | 'declined'
 
-/** What the person is told a download is doing. */
+/** What the person is told their choice is. */
 export const DOWNLOAD_LABEL: Readonly<Record<DownloadState, string>> = {
-  offered: 'Not downloaded',
-  downloading: 'Downloading',
+  offered: 'Not chosen',
+  chosen: 'Chosen',
   cancelled: 'Cancelled',
-  declined: 'Turned off',
-  installed: 'Installed'
+  declined: 'Turned off'
 }
 
 /**

@@ -1101,9 +1101,9 @@ const SETTINGS_PANES: readonly SettingsPane[] = [
     url: 'x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone'
   },
   {
-    id: 'remote_management',
-    route: 'System Settings → General → Sharing → Remote Management',
-    url: 'x-apple.systempreferences:com.apple.preferences.sharing?Services_RemoteManagement'
+    id: 'remote_desktop',
+    route: 'System Settings → Privacy & Security → Remote Desktop',
+    url: 'x-apple.systempreferences:com.apple.preference.security?Privacy_RemoteDesktop'
   }
 ]
 
@@ -1116,17 +1116,35 @@ function setupIdentity(stable: boolean, connected: boolean): SetupIdentity {
       ? '/Applications/KalaReach.app/Contents/MacOS/kalareach-companion'
       : '/Users/sam/work/kalareach/target/debug/kalareach-companion',
     bundled: stable,
+    signature: stable
+      ? {
+          read: true,
+          authority: 'Developer ID Application: Kala',
+          team: 'ABCDE12345',
+          identifier: 'to.kala.reach.companion',
+          ad_hoc: false,
+          refusal: null
+        }
+      : {
+          read: true,
+          authority: null,
+          team: null,
+          identifier: 'kalareach_companion-11a57fcfccad3743',
+          ad_hoc: true,
+          refusal: null
+        },
     stable,
     instability: stable
       ? null
-      : 'This build is running from /Users/sam/work/kalareach/target/debug/kalareach-companion, ' +
-        'which is not an application bundle. A permission the operating system grants is recorded ' +
-        'against a signed application, so a grant given to this build is given to this file and a ' +
-        'rebuild replaces it. Install the application before granting anything.',
+      : '/Users/sam/work/kalareach/target/debug/kalareach-companion carries an ad-hoc signature, ' +
+        'which is one this machine made for this file and nothing else can vouch for. The ' +
+        'operating system files a grant against it, and the next build of this application ' +
+        'carries a different one, so every grant given now has to be given again. Install a ' +
+        'signed build before granting anything.',
     unverified:
-      'This reads the identity a grant is filed under. It does not read the code signature ' +
-      'itself, and no check here can tell you a permission has been granted: on this platform ' +
-      'the only way to establish that is to perform the operation the permission guards.',
+      'This reads the identity a grant is filed under, and the signature on it. It cannot tell ' +
+      'you a permission has been granted: on this platform the only way to establish that is to ' +
+      'perform the operation the permission guards.',
     helper_build: connected ? 'kr-controller 0.1.0+2fe00021' : null,
     helper_environment: connected ? ENVIRONMENT : null
   }

@@ -110,6 +110,16 @@ impl Check {
         }
     }
 
+    /// Whether the thing this check acts through is an installed facility with an identity.
+    ///
+    /// Four of them run a program, and replacing that program invalidates what was established
+    /// about it. The read check acts on a file the person nominated, which is theirs rather than
+    /// an installed thing, and it reads only the first block of it by design.
+    #[must_use]
+    pub const fn digests_its_facility(self) -> bool {
+        !matches!(self, Self::AuthorisedFileRead)
+    }
+
     /// What this check does, declared before it is run.
     #[must_use]
     pub const fn effects(self) -> Effects {
@@ -125,11 +135,12 @@ impl Check {
                 bound: Duration::from_secs(5),
             },
             Self::ScreenImage => Effects {
-                performs: "takes one image of the desktop, holds it in memory long enough to \
-                           measure it, and keeps nothing",
-                reads: "whatever is on the screen at that instant",
-                writes: "one image into this check's own directory, removed before the check \
-                         answers",
+                performs: "takes one image of the main display, reads it into memory to measure \
+                           it, and keeps nothing",
+                reads: "whatever is on the main display at that instant",
+                writes: "one image into this check's own directory, read back and removed before \
+                         the check answers; a removal that fails is reported rather than passed \
+                         over",
                 sends_input: false,
                 changes_user_data: false,
                 needs_isolated_context: false,
@@ -145,19 +156,21 @@ impl Check {
                 bound: Duration::from_secs(20),
             },
             Self::ApplicationLaunch => Effects {
-                performs: "starts one new instance of the nominated application in the \
-                           background, and ends the instance it started",
+                performs: "starts one new hidden instance of an application that opens no \
+                           document, and ends the instance it started",
                 reads: "nothing",
-                writes: "nothing outside the application's own state",
+                writes: "nothing, unless an application named in place of the default writes \
+                         something of its own when it starts",
                 sends_input: false,
                 changes_user_data: false,
                 needs_isolated_context: false,
                 bound: Duration::from_secs(30),
             },
             Self::SyntheticInput => Effects {
-                performs: "delivers one keystroke to the application the isolated context owns",
+                performs: "delivers one keystroke to an application that belongs to a test context \
+                           of its own",
                 reads: "nothing",
-                writes: "whatever that keystroke writes, inside the isolated context",
+                writes: "whatever that keystroke writes, inside that context",
                 sends_input: true,
                 changes_user_data: true,
                 needs_isolated_context: true,
@@ -343,8 +356,8 @@ pub fn judge(
             CapabilityState::NotTested,
             CapabilityEvidenceSource::NotProbed,
             Some(format!(
-                "this check {}, so it runs only inside a test context of its own. None was \
-                 supplied, so it was not run and nothing is established either way",
+                "this check {}, so it runs only inside a test context that owns the application \
+                 the keystroke lands in. It was not run and nothing is established either way",
                 check.effects().performs
             )),
         ),
@@ -376,7 +389,14 @@ pub fn record(
     observed_at_ms: kr_protocol::scalars::TimestampMs,
 ) -> Option<CapabilityRecord> {
     let (state, evidence, reason) = judge(ran.check, &ran.outcome);
-    let identity = ran.facility.as_deref().and_then(facility_identity);
+    // Only a facility this check ran is digested. The read check's "facility" is the person's own
+    // file, and reading a document to the end to put a digest of it in a diagnostic is not
+    // something a diagnostic should do, nor is it what the check disclosed.
+    let identity = if ran.check.digests_its_facility() {
+        ran.facility.as_deref().and_then(facility_identity)
+    } else {
+        None
+    };
     Some(CapabilityRecord {
         capability: CapabilityId::new(ran.check.capability()).ok()?,
         version: U64::new(CAPABILITY_VERSION),
@@ -448,38 +468,27 @@ pub struct Fingerprint {
 impl Fingerprint {
     /// Which triggers fired between an earlier fingerprint and this one.
     ///
-    /// A field that is absent on either side has not been established to have changed, so it fires
-    /// nothing: an unreadable permission state is a thing this host does not know, and re-running
-    /// a screen capture every time it cannot read one would be a timer wearing a trigger's name.
+    /// Each field is compared as it was read, including whether it could be read at all. A
+    /// facility that was identified and now cannot be is a change: the thing the answer was about
+    /// is not the thing that is there now, and an answer that went on standing would describe a
+    /// file nobody can point at. A reading that was unknown and stays unknown is not a change, so
+    /// a host that can never read one does not re-run the checks over and over.
     #[must_use]
     pub fn changes_since(&self, earlier: &Self) -> Vec<CapabilityInvalidation> {
         let mut fired = Vec::new();
-        if moved(earlier.facility.as_ref(), self.facility.as_ref())
-            || moved(earlier.host_agent.as_ref(), self.host_agent.as_ref())
-        {
+        if earlier.facility != self.facility || earlier.host_agent != self.host_agent {
             fired.push(CapabilityInvalidation::BinaryIdentity);
         }
-        if moved(earlier.permissions.as_ref(), self.permissions.as_ref()) {
+        if earlier.permissions != self.permissions {
             fired.push(CapabilityInvalidation::OsPermission);
         }
-        if moved(
-            earlier.desktop_generation.as_ref(),
-            self.desktop_generation.as_ref(),
-        ) {
+        if earlier.desktop_generation != self.desktop_generation {
             fired.push(CapabilityInvalidation::DesktopGeneration);
         }
-        if moved(earlier.profile.as_ref(), self.profile.as_ref()) {
+        if earlier.profile != self.profile {
             fired.push(CapabilityInvalidation::WorkerProfile);
         }
         fired
-    }
-}
-
-/// Whether two readings of one field establish that it moved.
-fn moved<T: PartialEq>(earlier: Option<&T>, now: Option<&T>) -> bool {
-    match (earlier, now) {
-        (Some(before), Some(after)) => before != after,
-        _ => false,
     }
 }
 
@@ -500,6 +509,77 @@ pub fn stale(
         .collect()
 }
 
+/// What a caller holds between readings, so a check runs again when it has to and not otherwise.
+///
+/// This is the re-check rule as an object. A caller keeps one of these per subject, hands it the
+/// fingerprint of the moment, and gets the records back; the checks run again only when one of the
+/// triggers the held records name has fired since they were taken. A host-agent update, a changed
+/// permission, a new login and a changed profile each do that. Nothing else does, and in
+/// particular no amount of time passing does, which is the whole point: these checks take an image
+/// of somebody's screen and start an application, and they do that when there is a reason.
+#[derive(Debug, Default)]
+pub struct Schedule {
+    held: Vec<CapabilityRecord>,
+    taken_against: Option<Fingerprint>,
+}
+
+impl Schedule {
+    /// A schedule holding nothing, whose first reading runs the checks.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The records this schedule is holding, whether or not they still stand.
+    #[must_use]
+    pub fn held(&self) -> &[CapabilityRecord] {
+        &self.held
+    }
+
+    /// Which triggers have fired against the held records since they were taken.
+    ///
+    /// Empty where nothing has fired, and empty is what means the checks do not run again. A
+    /// schedule holding nothing has nothing to compare, and answers that it must run.
+    #[must_use]
+    pub fn fired(&self, now: &Fingerprint) -> Vec<CapabilityInvalidation> {
+        let Some(taken_against) = self.taken_against.as_ref() else {
+            return Vec::new();
+        };
+        let mut fired: Vec<CapabilityInvalidation> = Vec::new();
+        for record in &self.held {
+            for trigger in stale(record, taken_against, now) {
+                if !fired.contains(&trigger) {
+                    fired.push(trigger);
+                }
+            }
+        }
+        fired
+    }
+
+    /// Whether the checks have to run again.
+    #[must_use]
+    pub fn must_run(&self, now: &Fingerprint) -> bool {
+        self.held.is_empty() || !self.fired(now).is_empty()
+    }
+
+    /// Returns the records, running the checks again only where something fired.
+    pub fn refresh(
+        &mut self,
+        subject: &CapabilitySubject,
+        desktop: &DesktopContext,
+        revision: CapabilityRevision,
+        now: &Fingerprint,
+        plan: &Plan,
+        facilities: &dyn Facilities,
+    ) -> &[CapabilityRecord] {
+        if self.must_run(now) {
+            self.held = report(subject, desktop, revision, plan, facilities);
+            self.taken_against = Some(now.clone());
+        }
+        &self.held
+    }
+}
+
 /// The facilities of the machine this host is running on.
 ///
 /// One child process per check, started with an argument vector rather than a command line,
@@ -512,7 +592,12 @@ impl Facilities for Platform {
     fn perform(&self, check: Check, plan: &Plan) -> Ran {
         match check {
             Check::AuthorisedFileRead => read_authorised_file(plan),
-            Check::SyntheticInput if plan.isolated.is_none() => Ran {
+            // The destructive check is never performed here, with or without a context. Delivering
+            // a keystroke safely means owning the application it lands in, and nothing this host
+            // can start owns one: the platform's own input facility delivers to whatever is in
+            // front, which is exactly what section 3 forbids. A caller that can supply such a
+            // context supplies the facilities to run it in as well.
+            Check::SyntheticInput => Ran {
                 check,
                 facility: None,
                 outcome: Outcome::WithheldForIsolation,
@@ -541,6 +626,46 @@ fn read_authorised_file(plan: &Plan) -> Ran {
         };
     };
     let facility = Some(path.display().to_string());
+    // A regular file, and nothing else. Opening a pipe or a device would block for as long as
+    // whatever is on the other end feels like, and the bound this check declares is on the
+    // operation rather than on a clock it does not have.
+    match std::fs::metadata(path) {
+        Ok(data) if !data.is_file() => {
+            return Ran {
+                check,
+                facility,
+                outcome: Outcome::NotAttempted {
+                    detail: format!(
+                        "{} is not a regular file, and this check reads only a file",
+                        path.display()
+                    ),
+                },
+            };
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+            return Ran {
+                check,
+                facility,
+                outcome: Outcome::PermissionRefused {
+                    permission: permission_for_path(path).to_owned(),
+                    detail: format!(
+                        "the platform refused to look at {}: {error}",
+                        path.display()
+                    ),
+                },
+            };
+        }
+        Err(error) => {
+            return Ran {
+                check,
+                facility,
+                outcome: Outcome::NotAttempted {
+                    detail: format!("{} could not be looked at: {error}", path.display()),
+                },
+            };
+        }
+    }
     let outcome = match read_first_block(path) {
         Ok(count) => Outcome::Performed {
             detail: format!("it read {count} bytes of {}", path.display()),
@@ -644,16 +769,19 @@ mod platform {
     const LAUNCHER: &str = "/usr/bin/open";
     /// The application the launch check starts when the caller nominates none.
     ///
-    /// The platform's own text editor: it is present on every installation, it opens with an empty
-    /// document, and a new instance of it touches nothing the person owns.
-    const DEFAULT_APPLICATION: &str = "TextEdit";
+    /// The platform's own calculator: it is on every installation, it has no documents to restore
+    /// and no saved state to reopen, so a new hidden instance of it does nothing to anything the
+    /// person owns. An editor would have reopened whatever they last had open.
+    const DEFAULT_APPLICATION: &str = "Calculator";
 
     pub(super) fn perform(check: Check, plan: &Plan) -> Ran {
         match check {
             Check::ScreenImage => screen_image(plan),
             Check::AccessibleElement => accessible_element(plan),
             Check::ApplicationLaunch => application_launch(plan),
-            Check::SyntheticInput => synthetic_input(plan),
+            Check::SyntheticInput => {
+                unreachable!("the destructive check is withheld before it reaches a platform")
+            }
             Check::AuthorisedFileRead => {
                 unreachable!("the file read is the same on every platform")
             }
@@ -678,24 +806,44 @@ mod platform {
         }
         let image: PathBuf = plan.scratch.join("screen-image-check.png");
         let _ = std::fs::remove_file(&image);
+        // `-m` is the main display and nothing else: without it this tool writes one file per
+        // display, and a check that removed the file it named would leave the others behind.
         let ran = bounded(
             check,
             CAPTURE,
-            &["-x", "-t", "png", &image.to_string_lossy()],
+            &["-x", "-m", "-t", "png", &image.to_string_lossy()],
             plan,
         );
-        let measured = std::fs::metadata(&image).map(|data| data.len()).ok();
-        // Removed whatever happened: the image existing after the check is the one thing this
-        // must not leave behind.
-        let _ = std::fs::remove_file(&image);
+        // Read into memory, which is what the capability is about, and dropped again. The bytes
+        // are never looked at beyond their length and their first four, which say whether this is
+        // an image at all.
+        let measured = std::fs::read(&image).ok().map(|bytes| {
+            let png = bytes.starts_with(&[0x89, b'P', b'N', b'G']);
+            (bytes.len() as u64, png)
+        });
+        // Removed whatever happened: an image outliving the check is the one thing this must not
+        // leave behind, and a removal that failed is said rather than passed over.
+        let removal = std::fs::remove_file(&image);
+        let left_behind = match removal {
+            Ok(()) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => Some(format!(
+                ", and it could not remove {}: {error}",
+                image.display()
+            )),
+        };
         let outcome = match (&ran.outcome, measured) {
             // The tool exits successfully whether or not the platform let it see the screen, so
             // an image it did not write is the refusal rather than the exit status.
-            (Outcome::Performed { .. }, Some(bytes)) if bytes > 0 => Outcome::Performed {
-                detail: format!(
-                    "it obtained a {bytes}-byte image of the desktop and kept none of it"
-                ),
-            },
+            (Outcome::Performed { .. }, Some((bytes, png))) if bytes > 0 && png => {
+                Outcome::Performed {
+                    detail: format!(
+                        "it read a {bytes}-byte image of the main display into memory and kept \
+                         none of it{}",
+                        left_behind.unwrap_or_default()
+                    ),
+                }
+            }
             (Outcome::Performed { .. }, _) => refused_recording(
                 "the capture tool ran and produced no image, which is what this platform does \
                  when the application asking has no recording grant",
@@ -732,29 +880,34 @@ mod platform {
                 outcome: Outcome::FacilityMissing,
             };
         }
+        // The question has to be one only the grant answers. A process's own name is a property
+        // of the process and comes back without it; the elements inside that process are the
+        // accessibility tree, and asking for one of those is what the platform gates.
         let ran = bounded(
             check,
             AUTOMATION,
             &[
                 "-e",
-                "tell application \"System Events\" to get name of first application process \
-                 whose frontmost is true",
+                "tell application \"System Events\" to tell (first application process whose \
+                 frontmost is true) to get the count of UI elements",
             ],
             plan,
         );
         let outcome = match ran.outcome {
-            Outcome::Performed { detail } => {
-                let named = detail.trim().to_owned();
-                if named.is_empty() {
-                    Outcome::NotAttempted {
-                        detail: "the accessibility tree answered with no element".to_owned(),
-                    }
-                } else {
-                    Outcome::Performed {
-                        detail: format!("it read one element from the accessibility tree: {named}"),
-                    }
-                }
-            }
+            Outcome::Performed { detail } => match detail.trim().parse::<u64>() {
+                Ok(count) => Outcome::Performed {
+                    detail: format!(
+                        "it read the accessibility tree of the frontmost application and found \
+                         {count} elements in it"
+                    ),
+                },
+                Err(_) => Outcome::NotAttempted {
+                    detail: format!(
+                        "the accessibility tree answered with something that is not a count: {}",
+                        detail.trim()
+                    ),
+                },
+            },
             Outcome::NotAttempted { detail } => refusal(&detail),
             other => other,
         };
@@ -791,6 +944,7 @@ mod platform {
         if lowered.contains("assistive")
             || lowered.contains("accessibility")
             || lowered.contains("-25211")
+            || lowered.contains("-1728")
         {
             return Outcome::PermissionRefused {
                 permission: "Accessibility".to_owned(),
@@ -852,19 +1006,50 @@ mod platform {
             &["-g", "-j", "-n", "-a", application, "--args", &mark],
             plan,
         );
+        let outcome = match ran.outcome {
+            // The launcher accepting the request is not the application having started, so the
+            // answer waits for the process and says what became of it.
+            Outcome::Performed { .. } => match end_marked(&mark, plan) {
+                Ended::Gone(named) => Outcome::Performed {
+                    detail: format!(
+                        "it started a new hidden instance of {application} and ended {named}"
+                    ),
+                },
+                Ended::Lingering(named) => Outcome::Performed {
+                    detail: format!(
+                        "it started a new hidden instance of {application} and asked {named} to \
+                         end, which has not happened yet"
+                    ),
+                },
+                Ended::NeverAppeared => Outcome::NotAttempted {
+                    detail: format!(
+                        "the launcher accepted a request to start {application} and no process of \
+                         it appeared, so whether it starts here is not established"
+                    ),
+                },
+            },
+            // A launcher that did not answer may still have started something, so the instance is
+            // looked for and ended on this path too.
+            other => {
+                let _ = end_marked(&mark, plan);
+                other
+            }
+        };
         Ran {
             check,
             facility: ran.facility,
-            outcome: match ran.outcome {
-                Outcome::Performed { .. } => Outcome::Performed {
-                    detail: format!(
-                        "it started a new hidden instance of {application} and ended {}",
-                        end_marked(&mark, plan)
-                    ),
-                },
-                other => other,
-            },
+            outcome,
         }
+    }
+
+    /// What became of the instance the launch check started.
+    enum Ended {
+        /// It appeared, it was asked to end, and it has.
+        Gone(String),
+        /// It appeared and it was still there when the check stopped waiting.
+        Lingering(String),
+        /// No process carrying this check's mark ever appeared.
+        NeverAppeared,
     }
 
     /// Ends the processes carrying this check's own mark, and says what it ended.
@@ -872,48 +1057,48 @@ mod platform {
     /// The mark was made a moment ago by this check, so a process carrying it is one this check
     /// started. Nothing else is looked for, and the processes are ended by the identifiers the
     /// platform gave back rather than by any pattern of its own.
-    fn end_marked(mark: &str, plan: &Plan) -> String {
+    fn end_marked(mark: &str, plan: &Plan) -> Ended {
         for _ in 0..LAUNCH_ATTEMPTS {
-            let listed = bounded(
-                Check::ApplicationLaunch,
-                "/usr/bin/pgrep",
-                &["-f", mark],
-                plan,
-            );
-            if let Outcome::Performed { detail } = listed.outcome {
-                let pids: Vec<String> = detail
-                    .split_whitespace()
-                    .filter(|word| word.chars().all(|character| character.is_ascii_digit()))
-                    .map(std::borrow::ToOwned::to_owned)
-                    .collect();
-                if !pids.is_empty() {
-                    let arguments: Vec<&str> = pids.iter().map(String::as_str).collect();
-                    let _ = bounded(Check::ApplicationLaunch, "/bin/kill", &arguments, plan);
-                    let named = if pids.len() == 1 {
-                        "the one instance it started".to_owned()
-                    } else {
-                        format!("the {} instances it started", pids.len())
-                    };
-                    // Asked to end is not ended. An application that is still there after being
-                    // asked is reported as still there rather than as tidied up.
-                    for _ in 0..LAUNCH_ATTEMPTS {
-                        std::thread::sleep(LAUNCH_POLL);
-                        let again = bounded(
-                            Check::ApplicationLaunch,
-                            "/usr/bin/pgrep",
-                            &["-f", mark],
-                            plan,
-                        );
-                        if !matches!(again.outcome, Outcome::Performed { .. }) {
-                            return named;
-                        }
+            let pids = marked(mark, plan);
+            if !pids.is_empty() {
+                let arguments: Vec<&str> = pids.iter().map(String::as_str).collect();
+                let _ = bounded(Check::ApplicationLaunch, "/bin/kill", &arguments, plan);
+                let named = if pids.len() == 1 {
+                    "the one instance it started".to_owned()
+                } else {
+                    format!("the {} instances it started", pids.len())
+                };
+                // Asked to end is not ended. An application still there after being asked is
+                // reported as still there rather than as tidied up.
+                for _ in 0..LAUNCH_ATTEMPTS {
+                    std::thread::sleep(LAUNCH_POLL);
+                    if marked(mark, plan).is_empty() {
+                        return Ended::Gone(named);
                     }
-                    return format!("{named}, which has not gone yet");
                 }
+                return Ended::Lingering(named);
             }
             std::thread::sleep(LAUNCH_POLL);
         }
-        "nothing, because the instance it started never appeared in the process table".to_owned()
+        Ended::NeverAppeared
+    }
+
+    /// The process identifiers carrying this check's own mark.
+    fn marked(mark: &str, plan: &Plan) -> Vec<String> {
+        let listed = bounded(
+            Check::ApplicationLaunch,
+            "/usr/bin/pgrep",
+            &["-f", mark],
+            plan,
+        );
+        let Outcome::Performed { detail } = listed.outcome else {
+            return Vec::new();
+        };
+        detail
+            .split_whitespace()
+            .filter(|word| word.chars().all(|character| character.is_ascii_digit()))
+            .map(std::borrow::ToOwned::to_owned)
+            .collect()
     }
 
     /// How many times the launch check looks for the instance it started.
@@ -925,44 +1110,6 @@ mod platform {
 
     /// How long it waits between those looks.
     const LAUNCH_POLL: std::time::Duration = std::time::Duration::from_millis(100);
-
-    /// Delivers one keystroke, and only inside a context that owns its own application.
-    fn synthetic_input(plan: &Plan) -> Ran {
-        let check = Check::SyntheticInput;
-        let Some(isolated) = plan.isolated.as_ref() else {
-            return Ran {
-                check,
-                facility: None,
-                outcome: Outcome::WithheldForIsolation,
-            };
-        };
-        if super::installed(AUTOMATION).is_none() {
-            return Ran {
-                check,
-                facility: None,
-                outcome: Outcome::FacilityMissing,
-            };
-        }
-        let script = format!(
-            "tell application \"System Events\" to tell process \"{}\" to keystroke \"k\"",
-            isolated.application.replace('"', "")
-        );
-        let ran = bounded(check, AUTOMATION, &["-e", &script], plan);
-        Ran {
-            check,
-            facility: ran.facility,
-            outcome: match ran.outcome {
-                Outcome::Performed { .. } => Outcome::Performed {
-                    detail: format!(
-                        "it delivered one keystroke to {} inside {}",
-                        isolated.application, isolated.described_as
-                    ),
-                },
-                Outcome::NotAttempted { detail } => refusal(&detail),
-                other => other,
-            },
-        }
-    }
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1086,9 +1233,17 @@ fn bounded(check: Check, program: &str, arguments: &[&str], plan: &Plan) -> Ran 
         }
         None => {
             // Only this check's own child, by the handle it holds: nothing here looks a process up
-            // by name.
+            // by name. Collecting it is bounded as well, because a child that will not go is not
+            // a reason for a diagnostic to stop answering.
             let _ = child.kill();
-            let _ = child.wait();
+            let collected = std::time::Instant::now();
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) | Err(_) => break,
+                    Ok(None) if collected.elapsed() >= COLLECT => break,
+                    Ok(None) => std::thread::sleep(POLL),
+                }
+            }
             Outcome::NotAnswered {
                 waited: started.elapsed(),
             }
@@ -1106,6 +1261,10 @@ fn bounded(check: Check, program: &str, arguments: &[&str], plan: &Plan) -> Ran 
 /// How often a running facility is asked whether it has finished.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const POLL: Duration = Duration::from_millis(50);
+
+/// How long a facility that was asked to stop is waited for before the check answers anyway.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const COLLECT: Duration = Duration::from_secs(2);
 
 /// A short file-name stem for one check.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -1447,16 +1606,70 @@ mod tests {
     }
 
     #[test]
-    fn a_reading_this_host_does_not_have_fires_nothing() {
+    fn a_facility_that_can_no_longer_be_identified_is_a_change() {
         let taken = Fingerprint {
-            permissions: Some("denied".to_owned()),
+            facility: Some("a".to_owned()),
             ..Fingerprint::default()
         };
-        let unreadable = Fingerprint::default();
-        assert!(
-            unreadable.changes_since(&taken).is_empty(),
-            "a permission state this host cannot read has not been established to have changed"
+        let gone = Fingerprint::default();
+        assert_eq!(
+            gone.changes_since(&taken),
+            vec![CapabilityInvalidation::BinaryIdentity],
+            "an answer about a file nobody can point at any more is not about that file"
         );
+        // And it fires once: a reading that stays unknown is not a change, so a host that can
+        // never read one does not take an image of a screen over and over.
+        assert!(gone.changes_since(&gone).is_empty());
+    }
+
+    #[test]
+    fn a_schedule_runs_the_checks_when_something_fired_and_not_otherwise() {
+        let facilities = Scripted(vec![ran(
+            Check::ScreenImage,
+            Outcome::Performed {
+                detail: "an image".to_owned(),
+            },
+        )]);
+        let desktop = desktop();
+        let subject = subject();
+        let plan = Plan::in_directory(".");
+        let taken = Fingerprint {
+            permissions: Some("denied".to_owned()),
+            profile: Some(WorkerProfile::DesktopBound),
+            ..Fingerprint::default()
+        };
+
+        let mut schedule = Schedule::new();
+        assert!(
+            schedule.must_run(&taken),
+            "nothing held is nothing to trust"
+        );
+        let first = schedule
+            .refresh(&subject, &desktop, revision(), &taken, &plan, &facilities)
+            .to_vec();
+        assert_eq!(first.len(), 5);
+
+        // The same moment: nothing fired, nothing runs, and the answers are the ones already held.
+        assert!(!schedule.must_run(&taken));
+        assert!(schedule.fired(&taken).is_empty());
+        let again = schedule
+            .refresh(&subject, &desktop, revision(), &taken, &plan, &facilities)
+            .to_vec();
+        assert_eq!(
+            again, first,
+            "an unchanged moment does not re-run the checks"
+        );
+
+        // A permission changed, which is one of the triggers every probe record carries.
+        let granted = Fingerprint {
+            permissions: Some("granted".to_owned()),
+            ..taken.clone()
+        };
+        assert_eq!(
+            schedule.fired(&granted),
+            vec![CapabilityInvalidation::OsPermission]
+        );
+        assert!(schedule.must_run(&granted));
     }
 
     #[test]
