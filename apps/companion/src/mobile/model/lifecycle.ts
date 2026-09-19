@@ -74,11 +74,25 @@ export function persist(store: DurableStore, state: DurableState): boolean {
  * of unknown outcome. Both are recoveries, not failures, and neither is a claim.
  */
 export function restore(store: DurableStore): DurableState {
-  const drafts = readList<Draft>(store, DRAFTS_KEY, (each) => typeof each.draftId === 'string')
+  const drafts = readList<Draft>(
+    store,
+    DRAFTS_KEY,
+    (each) =>
+      typeof each.draftId === 'string' &&
+      typeof each.text === 'string' &&
+      typeof each.revision === 'number' &&
+      typeof each.target === 'object' &&
+      each.target !== null &&
+      typeof (each.target as { sessionId?: unknown }).sessionId === 'string' &&
+      Array.isArray(each.attachments)
+  )
   const submissions = readList<Submission>(
     store,
     SUBMISSIONS_KEY,
-    (each) => typeof each.localId === 'string'
+    (each) =>
+      typeof each.localId === 'string' &&
+      typeof each.text === 'string' &&
+      typeof each.state === 'string'
   )
   return {
     drafts: drafts.map(connectionLost),

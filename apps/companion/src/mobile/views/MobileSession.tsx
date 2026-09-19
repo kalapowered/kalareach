@@ -100,7 +100,9 @@ export function MobileSession({
   // What the person picked, held here until there is a command that carries bytes to a host. It
   // is shown rather than dropped, because a file that vanishes after a success message is worse
   // than one that says plainly it has not gone anywhere.
-  const [heldFiles, setHeldFiles] = useState<readonly Picked[]>([])
+  const [heldFiles, setHeldFiles] = useState<
+    readonly { readonly picked: Picked; readonly file: File }[]
+  >([])
   const target = minimumTarget(surface)
   // One scroll position per view, kept across a switch: coming back to a view you were reading
   // halfway down and finding the top of it is losing your place.
@@ -356,11 +358,11 @@ export function MobileSession({
                 <span className="m-row-detail">{describeBytes(attachment.byteLen)}</span>
               </span>
             ))}
-            {heldFiles.map((picked) => (
+            {heldFiles.map(({ picked }) => (
               <span key={`${picked.name}-${picked.byteLen}`} className="m-attachment">
                 {picked.name}
                 <span className="m-row-detail">
-                  {`${describeBytes(picked.byteLen)} · held on this device`}
+                  {`${describeBytes(picked.byteLen)} · held in this screen`}
                 </span>
               </span>
             ))}
@@ -405,13 +407,13 @@ export function MobileSession({
         <AttachmentPicker
           surface={surface}
           onPicked={(files) => {
-            for (const { picked } of files) {
+            for (const { picked, file } of files) {
               const admission = admit(picked)
               if (!admission.admitted) {
                 say(admission.reason, 'danger')
                 continue
               }
-              setHeldFiles((current) => [...current, picked])
+              setHeldFiles((current) => [...current, { picked, file }])
             }
           }}
         />
@@ -476,6 +478,26 @@ function RawTerminal({
     null
   )
 
+  /** Takes the gesture's origin again from the fingers that are still down. */
+  const rebase = (element: HTMLElement) => {
+    void element
+    const points = [...pointers.current.values()]
+    const first = points[0]
+    if (!first) {
+      start.current = null
+      return
+    }
+    start.current = {
+      x: first.x,
+      y: first.y,
+      spread:
+        points.length >= 2 && points[1]
+          ? Math.hypot(first.x - points[1].x, first.y - points[1].y)
+          : 0,
+      pan
+    }
+  }
+
   const gestureFrom = (event: React.PointerEvent): TouchGesture => {
     const origin = start.current
     const points = [...pointers.current.values()]
@@ -530,20 +552,21 @@ function RawTerminal({
         const gesture = gestureFrom(event)
         const outcome = routeGesture(mode, gesture)
         pointers.current.delete(event.pointerId)
-        // The gesture ends only when the last finger leaves. Clearing the origin while another
-        // pointer is still down would restart the drag from wherever that finger happened to be.
-        if (pointers.current.size === 0) start.current = null
+        // A finger leaving changes what the gesture is measured from, so the origin is taken
+        // again from the fingers still down. Keeping the old one makes the view jump by whatever
+        // the lifted finger had travelled.
+        rebase(event.currentTarget)
         if (outcome.kind === 'zoom') onZoom(outcome.steps)
         // In control mode the movement was the program's, so it is handed over rather than used.
         if (outcome.kind === 'application' && outcome.lines !== 0) onApplicationScroll(outcome.lines)
       }}
       onPointerCancel={(event) => {
         pointers.current.delete(event.pointerId)
-        if (pointers.current.size === 0) start.current = null
+        rebase(event.currentTarget)
       }}
       onLostPointerCapture={(event) => {
         pointers.current.delete(event.pointerId)
-        if (pointers.current.size === 0) start.current = null
+        rebase(event.currentTarget)
       }}
     >
       <pre className="m-terminal-grid">{rows.join('\n')}</pre>

@@ -85,6 +85,10 @@ class PreviewEnvelope(
         private fun decode(value: String?): ByteArray? {
             if (value.isNullOrEmpty()) return null
             val text = value.trimEnd('=')
+            // No base64url string has a length one more than a multiple of four: a single
+            // character carries six bits, which is not a byte, so such a field was not produced
+            // by an encoder and is not decoded into a shorter one.
+            if (text.length % 4 == 1) return null
             val bits = StringBuilder()
             for (character in text) {
                 val index = ALPHABET.indexOf(character)

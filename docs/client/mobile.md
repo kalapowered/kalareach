@@ -4,7 +4,8 @@ The iOS and Android builds of `apps/companion` are the same product as the deskt
 semantic interface, one design, one set of named commands to the host. What differs is the layout,
 the input and what has to survive the operating system taking the process away.
 
-This describes what is there, how it is put together and how to run it.
+This describes what is there, how it is put together and how to run it. The sentences that say
+something is not built are as load-bearing as the ones that say something is.
 
 ## The two halves
 
@@ -76,7 +77,9 @@ because nothing on the wire carries a pinch, so zooming takes nothing from anyon
 ## Coming back
 
 A phone suspends an application, terminates it in the background, changes its network underneath it
-and restarts it cold. All four recover, and two rules keep that honest.
+and restarts it cold. The draft survives all four. The rebind that would put a recovered draft back
+into its editor is the decision below, and the path that calls it with what the host reports is not
+built, so a recovered draft is kept and shown rather than re-bound. Two rules keep the rest honest.
 
 **The draft is durable and the association is not.** A draft is this device's own record with its
 own identity and revision. The attachment that presents it in an editor belongs to the connection,
@@ -111,6 +114,11 @@ The iOS Notification Service Extension and the Android messaging service are sta
 with no application and no JavaScript context anywhere. What is built is the decision each of them
 makes, with its own tests; registering this device with the gateway, and the payload shape the
 gateway actually sends, are not wired up yet. Both make the same decision in the same order:
+
+On iOS the extension shows the generic alert the payload carried. On Android the receiver shows it
+where the payload alone decides the content; work it hands to the scheduler currently finishes
+without publishing anything, so a deferred message shows nothing at all. The decision itself, in
+both places, is:
 
 1. A message with no preview shows the generic alert the host chose.
 2. A preview this build cannot read, or one whose lifetime has run out, or one addressed to a key
@@ -169,5 +177,6 @@ mobile build loads its own code from the managed service.
 The account screen offers signing in and shows usage. It carries no payment form, no embedded
 checkout and no control whose purpose is to send a person somewhere to buy something, and the
 mobile tests read the rendered screen and fail on any of them. What is not there yet is the
-authentication itself and the call that reads usage: the screen draws what it is given. Everything
-local works without an account at all, and the screen says so.
+authentication itself and the call that reads usage: the screen draws what it is given. Local operation needs no account, and the screen
+says so; what "everything local works" will mean on a phone is settled by the host connection,
+which is the packaging work above.

@@ -120,6 +120,28 @@ class PreviewDecisionTest {
     }
 
     @Test
+    fun aFieldNoEncoderCouldHaveProducedIsRefused() {
+        val impossible = "A".repeat(33)
+        val decision =
+            PreviewDecider(providingKeys(), openingTo("x"))
+                .decide(payload() + mapOf("preview_nonce" to impossible), now)
+        assertEquals(PreviewDecision.Generic(GenericReason.MALFORMED_PREVIEW), decision)
+    }
+
+    @Test
+    fun theFieldsDecodeToExactlyTheBytesThatWereEncoded() {
+        val nonce = ByteArray(PreviewEnvelope.NONCE_LENGTH) { (it * 7 + 3).toByte() }
+        val parsed =
+            PreviewEnvelope.parse(payload() + mapOf("preview_nonce" to encode(nonce)))
+        check(parsed is ParsedPreview.Sealed)
+        assertEquals(nonce.toList(), parsed.envelope.nonce.toList())
+        assertEquals(
+            recipient.toList(),
+            parsed.envelope.routing.recipientKeyId.toList()
+        )
+    }
+
+    @Test
     fun theRoutingIsReadExactlyAsTheProtocolDeclaresIt() {
         val parsed = PreviewEnvelope.parse(payload())
         check(parsed is ParsedPreview.Sealed)
