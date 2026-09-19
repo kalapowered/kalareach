@@ -23,12 +23,9 @@ $script:ModuleRoot = $PSScriptRoot
 $script:QualifiedFrom = [version]'2.3.4'
 $script:QualifiedBefore = [version]'3.0.0'
 $script:IntegrationVersion = '1'
-$script:SignalIntervalMs = 25
 
 $script:Hooks = @{
     Activated      = $false
-    Timer          = $null
-    Subscription   = $null
     GestureChord   = $null
     GestureBefore  = $null
     Wrapped        = [System.Collections.Generic.List[string]]::new()
@@ -37,6 +34,7 @@ $script:Hooks = @{
 
 # The operations whose key wait this module observes by wrapping them. Each runs its own read loop
 # inside the handler, so being inside the wrapper is exactly being in the middle of the operation.
+# Everything else the editor has bound is wrapped too, but only to read the mailbox before it runs.
 $script:Observed = @(
     @{ Function = 'ReverseSearchHistory'; Pending = 'search' }
     @{ Function = 'ForwardSearchHistory'; Pending = 'search' }
@@ -183,7 +181,6 @@ function Initialize-KalaReachBridge {
     Remove-Item -Path ('Env:' + $script:KR_SECRET_VARIABLE) -ErrorAction SilentlyContinue
 
     Install-KrReadLineWrapper
-    Start-KrSignal
 }
 
 # The host's own read-line entry point, with the reader's boundaries around it.
@@ -192,33 +189,6 @@ function Install-KrReadLineWrapper {
     if ($null -ne $existing) { $script:Hooks.InnerReadLine = $existing.ScriptBlock }
     Set-Item -Path function:global:PSConsoleHostReadLine -Value {
         Invoke-KalaReachReadLine
-    }
-}
-
-function Start-KrSignal {
-    if ($null -ne $script:Hooks.Timer) { return }
-    $timer = [System.Timers.Timer]::new()
-    $timer.Interval = $script:SignalIntervalMs
-    # The signal keeps coming on its own. The work behind it is a poll of a socket and nothing
-    # else: no command of this module's runs on the reader's thread, so a signal the reader takes
-    # a moment to reach is answered rather than piling up behind one that never arrives.
-    $timer.AutoReset = $true
-    # The signal: the host delivers this event on the reader's own thread, inside its read loop,
-    # which is where the mailbox can be answered with the editor's real state.
-    $script:Hooks.Subscription = Register-ObjectEvent -InputObject $timer -EventName Elapsed `
-        -SourceIdentifier 'KalaReach.ShellBridge.Signal' -Action { Invoke-KalaReachService }
-    $timer.Start()
-    $script:Hooks.Timer = $timer
-}
-
-function Stop-KrSignal {
-    if ($null -ne $script:Hooks.Timer) {
-        try { $script:Hooks.Timer.Stop(); $script:Hooks.Timer.Dispose() } catch { }
-        $script:Hooks.Timer = $null
-    }
-    if ($null -ne $script:Hooks.Subscription) {
-        try { Unregister-Event -SourceIdentifier 'KalaReach.ShellBridge.Signal' -ErrorAction SilentlyContinue } catch { }
-        $script:Hooks.Subscription = $null
     }
 }
 
@@ -249,23 +219,31 @@ function Enable-KalaReachHooks {
     $script:Hooks.Wrapped = $installed
 }
 
+# Puts this module in front of every key the editor has a binding for.
+#
+# This is where the reader reaches its own queue: the wrapper reads the mailbox and then runs the
+# editor's own function, so a request the worker sent is answered at the reader's next key, on the
+# reader's own thread, with the editor between operations. The few operations that run an inner
+# read loop also record the state they wait in. A handler the person wrote themselves is left
+# exactly as it is.
 function Install-KrObservedHandlers {
     $wrapped = [System.Collections.Generic.List[string]]::new()
     $bound = try { Get-PSReadLineKeyHandler -Bound } catch { @() }
-    foreach ($observed in $script:Observed) {
-        foreach ($binding in @($bound | Where-Object { $_.Function -eq $observed.Function })) {
-            $chord = $binding.Key
-            $name = $observed.Function
-            $pending = $observed.Pending
-            $block = [scriptblock]::Create(
-                "param(`$key, `$arg) Invoke-KalaReachPending -Function '$name' -Pending '$pending' -Key `$key -Argument `$arg")
-            try {
-                Set-PSReadLineKeyHandler -Chord $chord -ScriptBlock $block `
-                    -BriefDescription $name -Description "KalaReach: $name"
-                $wrapped.Add("$chord=$name")
-            } catch {
-                Write-KrTrace "wrap failed $chord $name : $($_.Exception.Message)"
-            }
+    $pendingFor = @{}
+    foreach ($observed in $script:Observed) { $pendingFor[$observed.Function] = $observed.Pending }
+    foreach ($binding in @($bound)) {
+        $name = "$($binding.Function)"
+        if ([string]::IsNullOrEmpty($name) -or $name -eq 'CustomAction') { continue }
+        $chord = $binding.Key
+        $pending = if ($pendingFor.PSBase.ContainsKey($name)) { $pendingFor[$name] } else { '' }
+        $block = [scriptblock]::Create(
+            "param(`$key, `$arg) Invoke-KalaReachPending -Function '$name' -Pending '$pending' -Key `$key -Argument `$arg")
+        try {
+            Set-PSReadLineKeyHandler -Chord $chord -ScriptBlock $block `
+                -BriefDescription $name -Description "KalaReach: $name"
+            $wrapped.Add("$chord=$name")
+        } catch {
+            Write-KrTrace "wrap failed $chord $name : $($_.Exception.Message)"
         }
     }
     $wrapped
@@ -362,14 +340,16 @@ function Invoke-KalaReachReadLine {
     $script:State.CancelRequested = $false
     $script:State.IdleReported = $false
     $script:State.InvokingKeys = [byte[]]::new(0)
-    $script:State.EntryReported = $false
+    $script:State.Reading = $false
     $script:State.ReaderThreadId = [System.Threading.Thread]::CurrentThread.ManagedThreadId
     $script:State.BufferSeen = ''
     $script:State.BufferRevision++
     # Read here, where the runspace is this function's own, and used by the reader's own thread.
     $script:State.EditMode = try { "$((Get-PSReadLineOption).EditMode)" } catch { 'Emacs' }
     Send-KrEditorEnter
-    $script:State.EntryReported = $true
+    # The reader is about to read and has nothing left, which is one of the three points a worker
+    # retries a withheld fence at. Whatever is already in the mailbox is answered with it.
+    Invoke-KalaReachService
 
     $accepted = $false
     try {
@@ -378,7 +358,7 @@ function Invoke-KalaReachReadLine {
         $line
     } finally {
         $script:State.InsideReader--
-        $script:State.EntryReported = $false
+        $script:State.Reading = $false
         if ($script:Kr.Registered) {
             if ($accepted) {
                 # The accepted line is reported from inside the fence, before the leave that
@@ -410,7 +390,7 @@ function Invoke-KalaReachService {
     }
     try {
         if (-not $script:Kr.Registered) { return }
-        if ($script:State.InsideReader -le 0 -or -not $script:State.EntryReported) { return }
+        if ($script:State.InsideReader -le 0) { return }
         # What the person typed is theirs and goes first: nothing of the worker's is answered
         # while the editor still has keys of its own to act on.
         if ((Get-KrQueuedKeys) -gt 0) { return }
@@ -435,7 +415,14 @@ function Invoke-KalaReachPending {
     [CmdletBinding()]
     param([string]$Function, [string]$Pending, $Key, $Argument)
 
-    $script:Pending[$Pending]++
+    # The reader is between operations here, which is where its own queue is read. Whatever
+    # happens there, the key the person pressed still does what the editor says it does.
+    # The editor is reading, which is what makes its buffer this reader's own.
+    $script:State.Reading = $true
+    try { Invoke-KalaReachService } catch {
+        Write-KrTrace "the key boundary did not read the mailbox: $($_.Exception.Message)"
+    }
+    if (-not [string]::IsNullOrEmpty($Pending)) { $script:Pending[$Pending]++ }
     $script:State.IdleReported = $false
     # The sequence that invoked this operation is what the reader is in the middle of, and it is
     # the person's own: anything the worker asks for waits behind it.
@@ -450,7 +437,7 @@ function Invoke-KalaReachPending {
         $method = $type.GetMethod($Function, [type[]]@([System.Nullable[System.ConsoleKeyInfo]], [object]))
         if ($null -ne $method) { $method.Invoke($null, @($Key, $Argument)) | Out-Null }
     } finally {
-        $script:Pending[$Pending]--
+        if (-not [string]::IsNullOrEmpty($Pending)) { $script:Pending[$Pending]-- }
         $script:State.InvokingKeys = $previousKeys
         $script:State.CancelRequested = $false
         $script:State.IdleReported = $false
@@ -465,6 +452,8 @@ function Invoke-KalaReachGesture {
     [CmdletBinding()]
     param($Key, $Argument)
 
+    # The editor is reading, which is what makes its buffer this reader's own.
+    $script:State.Reading = $true
     # The mailbox is read first: the fence this decision rests on is the one the worker last
     # published, and a frame already on the endpoint belongs before this key.
     Invoke-KrService
@@ -670,7 +659,6 @@ function Remove-KalaReachHooks {
     #>
     [CmdletBinding()]
     param()
-    Stop-KrSignal
     Restore-KrGestureHandler
     if ($null -ne $script:Hooks.InnerReadLine) {
         Set-Item -Path function:global:PSConsoleHostReadLine -Value $script:Hooks.InnerReadLine

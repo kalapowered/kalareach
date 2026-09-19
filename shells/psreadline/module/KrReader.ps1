@@ -132,9 +132,10 @@ function Test-KrQueueReadable {
 # One revision per observed change, counted where it is read.
 function Update-KrRevisions {
     param([hashtable]$State)
-    # Before the reader has started, the editor still holds the line that has just been accepted,
-    # and the buffer this reader is about to have is empty.
-    $text = if ($State.EntryReported) { Get-KrBufferText } else { '' }
+    # The buffer belongs to the reader that is reading it. Between one line being accepted and the
+    # next read starting, the editor still holds the line that has just gone, and the buffer this
+    # reader is about to have is empty.
+    $text = if ($State.Reading) { Get-KrBufferText } else { '' }
     if ($text -ne $State.BufferSeen) {
         $State.BufferSeen = $text
         $State.BufferRevision++

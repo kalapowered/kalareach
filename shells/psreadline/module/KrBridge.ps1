@@ -65,7 +65,7 @@ $script:State = @{
     AcceptRequested  = $false
     CancelRequested  = $false
     IdleReported     = $false
-    EntryReported    = $false
+    Reading          = $false
     EditMode         = 'Emacs'
     ReaderThreadId   = 0
 }
