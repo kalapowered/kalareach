@@ -1053,7 +1053,10 @@ async fn action_read_says_how_to_obtain_an_outcome_this_host_owns() {
     let refused = session
         .read::<_, kr_protocol::receipt::ActionReadResult>(
             Method::ActionRead,
-            &kr_protocol::receipt::ActionReadParams { action_id },
+            &kr_protocol::receipt::ActionReadParams {
+                action_id,
+                session_id: None,
+            },
         )
         .await
         .expect_err("this host keeps no receipt for an action of its own");
@@ -1069,6 +1072,7 @@ async fn action_read_says_how_to_obtain_an_outcome_this_host_owns() {
             Method::ActionRead,
             &kr_protocol::receipt::ActionReadParams {
                 action_id: ActionId::new(kr_ipc::new_uuid()),
+                session_id: None,
             },
         )
         .await
