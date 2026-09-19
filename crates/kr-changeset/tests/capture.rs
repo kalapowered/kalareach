@@ -1140,6 +1140,50 @@ fn a_submodule_whose_data_is_elsewhere_refuses_the_capture() {
     }
 }
 
+/// KR-REQ-14.33 and D-087: this repository's own data is excluded by what it is, not by its name.
+///
+/// A repository can keep its own data under any name, said in a `.git` file, and a filesystem that
+/// ignores case can then open the same directory under a spelling no name rule matches. What the
+/// directory **is** does not change, and that is what decides.
+#[test]
+fn this_repository_s_own_data_is_excluded_by_what_it_is() {
+    let fixture = Fixture::create();
+    let path = ordinary_repository(fixture.work(), "named-tree");
+    // Exactly what a repository with a separate Git directory inside its tree looks like.
+    std::fs::rename(path.join(".git"), path.join("meta"))
+        .expect("this repository keeps its data under another name");
+    std::fs::write(path.join(".git"), b"gitdir: meta\n").expect("and points at it");
+
+    let workspace = fixture.workspace("named-tree");
+    let record = fixture.capture_with(
+        workspace,
+        &include_everything(),
+        &kr_protocol::changeset::FileGrant::default(),
+        None,
+        None,
+    );
+    let Ok(record) = record else {
+        // A repository this host will not read at all is a refusal, not an exposure.
+        return;
+    };
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert!(
+        manifest
+            .paths
+            .iter()
+            .all(|entry| !entry.path.to_ascii_lowercase().starts_with("meta/")),
+        "this repository's own data is not in its own version, whatever it is called: {:?}",
+        manifest
+            .paths
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>()
+    );
+}
+
 /// KR-REQ-14.32: a quiescence declaration is recorded and never decides the consistency class,
 /// because nothing this host can reach holds a working tree still for the whole of a read.
 #[test]

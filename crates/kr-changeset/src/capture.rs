@@ -1204,11 +1204,11 @@ fn nested_repositories(
     // in the set too, so a directory that is that object reaches the same refusal whatever it is
     // called here.
     let mut refused: BTreeSet<(u64, u64)> = BTreeSet::new();
-    if let Ok(own) = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)
-        && let Ok(held) = tree.subdirectory(&own)
-    {
-        refused.insert(identity_of(&held));
-    }
+    // Not a directory called `.git`: the directory **this repository resolves its own data to**,
+    // whatever it is called and however it is reached. A filesystem that ignores case, a `.git`
+    // file naming somewhere else, a link: none of them changes what that object is.
+    let own = repository.identity().git_dir;
+    refused.insert((own.device, own.file_id));
     for (directory, held) in &opened {
         let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
         let kind = match held.probe(&administrative) {
