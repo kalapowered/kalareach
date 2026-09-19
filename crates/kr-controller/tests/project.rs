@@ -1207,6 +1207,7 @@ fn assert_absent(path: &Path, what: &str) {
 ///
 /// A listing that turns a failure into an empty list says "there is nothing here" when it means
 /// "I could not look", and an assertion built on it then passes for the wrong reason.
+#[cfg(unix)]
 fn names_in(directory: &Path) -> Vec<String> {
     let entries = std::fs::read_dir(directory)
         .unwrap_or_else(|error| panic!("{} could not be read: {error}", directory.display()));

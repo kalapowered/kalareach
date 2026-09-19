@@ -13,6 +13,12 @@
 //! and one that reaches a removable volume asks the person sitting at the machine for permission;
 //! a test suite must never do that, so every create checks what the kernel actually gave the
 //! process it started.
+//!
+//! The session this drives is a POSIX shell in a Unix pseudo-terminal, signalled by process group
+//! and read from the process table, so the suite is a Unix suite. The Windows equivalents of the
+//! same paths are qualified against a Windows console in the worker's Windows module.
+
+#![cfg(unix)]
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

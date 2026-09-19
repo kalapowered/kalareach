@@ -309,7 +309,6 @@ pub fn qualified_hello(
 
 #[cfg(test)]
 mod tests {
-    use kr_ipc::paths::OWNER_ONLY_DIRECTORY_MODE;
     use kr_protocol::root::{PromptGeneration, RootEditorEnterResult};
     use kr_protocol::scalars::{Nullable, Uuid};
 
@@ -337,6 +336,8 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
+
+            use kr_ipc::paths::OWNER_ONLY_DIRECTORY_MODE;
 
             std::fs::set_permissions(
                 directory.path(),

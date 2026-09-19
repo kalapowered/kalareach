@@ -89,6 +89,7 @@ const PARTIAL_EXTENSION: &str = "partial";
 /// A backstop rather than the rule. Every kernel this runs on applies a limit of its own, usually
 /// lower than this, and refuses to open through a longer chain before the walk ever sees it. What
 /// this is for is the walk itself: a bound it holds to whatever the filesystem underneath it does.
+#[cfg(unix)]
 const MAX_PATH_LINKS: usize = 40;
 
 /// The name of the store's lock.
@@ -1034,6 +1035,25 @@ fn fresh_uuid() -> Result<Uuid> {
     Ok(kr_transport::random::fresh_uuid_v4()?)
 }
 
+/// Returns a builder that creates a directory only its owner can read.
+///
+/// On Windows the directory takes whatever access list it inherits, which this store does not
+/// narrow: what protects it there is the access list of the directory the caller chose.
+#[cfg(unix)]
+fn owner_only_builder() -> std::fs::DirBuilder {
+    use std::os::unix::fs::DirBuilderExt as _;
+
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+}
+
+/// Returns a builder for a new directory, which this platform does not narrow itself.
+#[cfg(not(unix))]
+fn owner_only_builder() -> std::fs::DirBuilder {
+    std::fs::DirBuilder::new()
+}
+
 /// Creates the directory owner-only, and makes an existing one owner-only.
 ///
 /// Unsent text a person has written. A directory anything on the machine could read would be one
@@ -1056,13 +1076,7 @@ fn private_directory(directory: &Path) -> std::io::Result<()> {
         level = path.parent();
     }
     for path in missing.iter().rev() {
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            builder.mode(0o700);
-        }
-        match builder.create(path) {
+        match owner_only_builder().create(path) {
             Ok(()) => {}
             // Another opener made it between the walk and here, which is not a failure: what this
             // call wanted was for the directory to be there. Something that is *not* a directory
@@ -1554,6 +1568,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn a_store_reached_through_a_link_makes_its_targets_own_names_durable() {
         // What a draft under a link depends on is the names the filesystem holds, not the ones the
         // caller spelled, so the walk resolves the path before it flushes anything.

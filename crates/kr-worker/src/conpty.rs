@@ -474,9 +474,9 @@ mod handle {
     /// it is read into.
     ///
     /// The three are one object because the operating system owns all three for as long as a read
-    /// is outstanding. A read still with it when this is dropped is taken back through the **pipe**
-    /// - cancelling names the handle the read was started on, not the event it signals - and then
-    /// waited for, because cancelling asks and does not wait. Only then can the block and the
+    /// is outstanding. A read still with it when this is dropped is taken back through the **pipe**,
+    /// because cancelling names the handle the read was started on and not the event it signals, and
+    /// then waited for, because cancelling asks and does not wait. Only then can the block and the
     /// buffer be freed.
     pub(super) struct Pending {
         pipe: Arc<OwnedHandle>,

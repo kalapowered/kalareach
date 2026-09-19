@@ -39,6 +39,7 @@ use crate::error::{CryptoError, Result};
 use crate::secret::Secret;
 use crate::sign::{SigningTranscript, sign, verify};
 use crate::sodium;
+#[cfg(unix)]
 use crate::store::{check_owner_only, sync_directory, write_owner_only};
 
 /// The file the relay instance key is kept in, inside the directory the caller names.

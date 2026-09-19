@@ -24,7 +24,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(windows))]
+use std::time::Instant;
 
 use kr_protocol::action::{
     ExpirationTombstone, ExpiryReason, HostTimeState, MAX_WALL_CLOCK_ROLLBACK_MS, ProvenWallClock,

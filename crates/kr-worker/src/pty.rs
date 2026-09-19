@@ -593,8 +593,9 @@ mod tests {
         assert_eq!(several, "/bin/sh -c \"echo hello\"");
     }
 
+    #[cfg(unix)]
     #[test]
-    fn a_wait_of_a_whole_second_is_a_wait_rather_than_a_refusal() {
+    fn a_whole_second_is_expressed_as_a_wait_rather_than_a_refusal() {
         // A nanosecond field of a second or more is not a duration `poll` accepts: it is refused,
         // and a refusal reads as a terminal that has gone, which would stop a session's output for
         // good the first time its application paused.
@@ -604,9 +605,11 @@ mod tests {
         assert_eq!((mixed.tv_sec, mixed.tv_nsec), (1, 20_000_000));
         let small = deadline(std::time::Duration::from_millis(20));
         assert_eq!((small.tv_sec, small.tv_nsec), (0, 20_000_000));
+    }
 
-        // And the wait it expresses is a wait: a terminal with nothing to read has nothing to read,
-        // and has not gone.
+    #[test]
+    fn a_wait_of_a_whole_second_is_a_wait_rather_than_a_refusal() {
+        // A terminal with nothing to read has nothing to read, and has not gone.
         let pty = Pty::open(Dimensions::new(80, 24)).expect("opens");
         let waiter = pty.output_waiter().expect("a waiter");
         let started = std::time::Instant::now();

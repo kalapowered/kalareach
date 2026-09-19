@@ -379,6 +379,10 @@ fn retire_job(label: &str) {
             .stderr(std::process::Stdio::null())
             .status();
     }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = label;
+    }
 }
 
 /// Returns a process's parent and group identifiers, as the operating system reports them.

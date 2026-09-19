@@ -543,7 +543,7 @@ mod platform {
             Ok(PeerIdentity {
                 uid: crate::paths::current_uid(),
                 gid: 0,
-                pid: credentials.pid().and_then(|pid| u32::try_from(pid).ok()),
+                pid: credentials.pid(),
             })
         }
     }
