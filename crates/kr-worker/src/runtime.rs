@@ -816,21 +816,7 @@ impl SessionRuntime {
                 )>,
             > = None;
             loop {
-                // What the watch wants next, decided under the session and taken outside it: a
-                // session held while a login facility answered would keep the fence timer and the
-                // bridge reader out of it for as long as that took.
-                if probing.is_none() {
-                    let wanted = monitor_session
-                        .lock()
-                        .ok()
-                        .and_then(|session| session.desktop_probe(Instant::now()));
-                    if let Some(probe) = wanted {
-                        probing = Some(tokio::task::spawn_blocking(move || {
-                            let sample = probe.take();
-                            (Instant::now(), probe, sample)
-                        }));
-                    }
-                }
+                let mut wanted = None;
                 let initiated = {
                     let Ok(mut session) = monitor_session.lock() else {
                         break;
@@ -846,6 +832,15 @@ impl SessionRuntime {
                     if wake == crate::lifecycle::Wake::Ownership {
                         session.observe_owned();
                     }
+                    // What the watch wants to be asked next, decided here, on the lock this pass
+                    // already holds: a second acquisition per wake would put this loop in front of
+                    // the pseudo-terminal's own reader that many more times. The reading itself is
+                    // taken outside, because a session held while a login facility answered would
+                    // keep the fence timer and the bridge reader out of it for as long as that
+                    // took.
+                    if probing.is_none() {
+                        wanted = session.desktop_probe(Instant::now());
+                    }
                     // A desktop-bound session belongs to one login. When that login ends the
                     // session ends with it, with the reason that says so.
                     let initiated = if session.desktop_lost() {
@@ -860,6 +855,12 @@ impl SessionRuntime {
                     }
                     initiated
                 };
+                if let Some(probe) = wanted {
+                    probing = Some(tokio::task::spawn_blocking(move || {
+                        let sample = probe.take();
+                        (Instant::now(), probe, sample)
+                    }));
+                }
                 if initiated {
                     // A root shell that ended on its own goes through the same sequence a
                     // requested close does, so descendants are still stopped and output is still
