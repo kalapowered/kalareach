@@ -97,13 +97,15 @@ pub struct Item {
     /// anchor from another boot measures nothing, so the age starts again, which is late rather
     /// than wrong. `None` is an item whose producer never read that clock.
     pub anchor: Option<Anchor>,
-    /// Whether the clock that stamped [`Item::last_notified_ms`] could be proved at the time.
+    /// Where the interval since the last announcement is measured from.
     ///
-    /// A host that cannot prove its wall clock still stamps the moment it read, because the
-    /// alternative is no anchor at all. What it must not do is measure against that stamp later,
-    /// once the clock is proved: the two readings are not on the same scale, and subtracting one
-    /// from the other can make a two-second-old announcement look an hour old, which would announce
-    /// the same condition again inside its own window.
+    /// [`Item::last_notified_ms`] says when it went out, for a person reading the record; this
+    /// says where that moment sits on a continuous clock, and in which boot. `None` is an item
+    /// nothing has been announced about yet. An announcement made in a boot that has ended
+    /// measures nothing across the gap, so the interval starts again at the reading that found it,
+    /// and this is moved to that reading: the same condition is then folded into the item for one
+    /// more window rather than announced twice inside one, and a second restart does not start it
+    /// again.
     pub announced_anchor: Option<Anchor>,
     /// The level the last announcement went out at.
     ///
@@ -720,7 +722,7 @@ impl Engine {
         self.keys = restored.keys;
     }
 
-    /// Re-anchors every interval at `reading`, from the wall-clock moments the store kept.
+    /// Re-anchors every interval at `reading`, from the anchors the store kept.
     ///
     /// The continuous clock restarts with the machine, so each interval is kept as the anchor it
     /// was measured from: a continuous reading and the boot it was taken in. An anchor from this
@@ -729,16 +731,39 @@ impl Engine {
     /// again. Starting again makes a reminder late; working it out across two wall-clock readings
     /// would make it immediate the moment somebody corrected a clock, which is the failure that
     /// matters.
+    ///
+    /// Every anchor is then written back on *this* boot's clock, at the moment its interval now
+    /// starts from. That is what makes the restart happen once: without it the store would keep
+    /// the anchor of a boot that has ended, and the next restart would find the same dead anchor
+    /// and start the same interval again, however long this boot had been running.
     pub(crate) fn reanchor(&mut self, reading: HostReading) {
         for item in self.items.values_mut() {
-            item.age = Elapsed::already(Self::waited(item.anchor, reading), reading);
-            item.since_notified = item
-                .last_notified_ms
-                .map(|_| Elapsed::already(Self::waited(item.announced_anchor, reading), reading));
+            let age = Self::waited(item.anchor, reading);
+            item.age = Elapsed::already(age, reading);
+            item.anchor = Some(Self::anchor_of(age, reading));
+            item.since_notified = item.last_notified_ms.map(|_| {
+                let since = Self::waited(item.announced_anchor, reading);
+                item.announced_anchor = Some(Self::anchor_of(since, reading));
+                Elapsed::already(since, reading)
+            });
         }
         for pending in self.pending_inputs.values_mut() {
-            pending.waited = Elapsed::already(Self::waited(pending.anchor, reading), reading);
+            let waited = Self::waited(pending.anchor, reading);
+            pending.waited = Elapsed::already(waited, reading);
+            pending.anchor = Some(Self::anchor_of(waited, reading));
         }
+    }
+
+    /// Returns the anchor, on this reading's own clock, an interval that has run for `elapsed_ms`
+    /// started from.
+    ///
+    /// An interval whose anchor is already this boot's comes back with the same one, so nothing
+    /// drifts; one that had none, or one from a boot that has ended, gets an anchor here.
+    fn anchor_of(elapsed_ms: u64, reading: HostReading) -> Anchor {
+        Anchor::new(
+            reading.boot,
+            reading.continuous_ms.saturating_sub(elapsed_ms),
+        )
     }
 
     fn consume(&mut self, event: &SourceEvent, reading: HostReading, mode: Mode) -> Vec<Outcome> {
@@ -810,6 +835,9 @@ impl Engine {
                     return Vec::new();
                 }
                 let waited = Self::waited(*pending_since_anchor, reading);
+                // Whether the producer anchored the moment or not, the wait now runs from a point
+                // on this boot's clock, and that point is what is written down.
+                let anchor = Self::anchor_of(waited, reading);
                 self.bound_pending_inputs(*question_id);
                 self.pending_inputs.insert(
                     *question_id,
@@ -819,7 +847,7 @@ impl Engine {
                         pending_since_ms: *pending_since_ms,
                         waited: Elapsed::already(waited, reading),
                         reminded: false,
-                        anchor: *pending_since_anchor,
+                        anchor: Some(anchor),
                     },
                 );
                 self.raise(
@@ -1038,6 +1066,11 @@ impl Engine {
             outcomes.extend(self.announce(&key, reading, false));
             return outcomes;
         }
+        // Whether the producer anchored the condition's moment or not, the age now runs from a
+        // point on this boot's clock, and that point is what is written down.
+        let waited = Self::waited(raise.at_anchor, reading);
+        let age = Elapsed::already(waited, reading);
+        let anchor = Some(Self::anchor_of(waited, reading));
         // A fresh item is fresh work. An acknowledgement of an earlier occurrence covered that
         // occurrence, not this one, so it is cleared rather than carried across.
         for acks in self.acks.values_mut() {
@@ -1056,14 +1089,14 @@ impl Engine {
             first_seen_ms: raise.at_ms,
             last_seen_ms: raise.at_ms,
             notification: NotificationState::Pending,
-            anchor: raise.at_anchor,
+            anchor,
             last_notified_ms: None,
             announced_anchor: None,
             announced_level: None,
             announcements: 0,
             pending_handoff: None,
             uncertain: false,
-            age: Elapsed::already(Self::waited(raise.at_anchor, reading), reading),
+            age,
             since_notified: None,
             deferred: false,
         };

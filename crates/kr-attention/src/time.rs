@@ -188,13 +188,14 @@ impl HostReading {
     }
 }
 
-/// An interval measured from a moment the host may have to re-anchor.
+/// An interval, as the engine holds it while it is running.
 ///
-/// The continuous clock restarts with the machine, so a reading written down in one boot means
-/// nothing in the next. An interval is therefore kept as how much of it had already passed at an
-/// anchor, plus the continuous reading of that anchor. Re-anchoring is then arithmetic on the part
-/// that is durable, and an interval that was already overdue stays overdue instead of being
-/// clipped to however long this machine has been running.
+/// It is how much had already passed at a moment, plus the continuous reading of that moment, so
+/// asking how long it has run is one subtraction on a clock nobody can set. It lives only as long
+/// as the process: what the store keeps is the [`Anchor`] the interval starts from, and
+/// `Engine::reanchor` builds these again from those anchors when a session comes back. An interval
+/// that was already overdue comes back overdue rather than clipped to however long this process
+/// has been running.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Elapsed {
     at_anchor_ms: u64,

@@ -1234,16 +1234,21 @@ comes back for the rest a couple of seconds later rather than treating the still
 instruction to try again immediately.
 
 Maintenance otherwise wakes at the earlier of its own cadence and the moment the engine says a
-timer is due, so a five-minute reminder is five minutes from the request rather than five minutes
-rounded up to the next time the host happened to look.
+timer is due, so a five-minute reminder is five minutes rather than five minutes rounded up to the
+next time the host happened to look. What it counts from is where the host read the record, not
+where the request started waiting, because the sources this build reads record when something
+happened and not where that moment sat on the clock intervals are measured on. The reminder is late
+by however long a record waited to be read; the next paragraph is why that is the direction to err
+in.
 
 One clock measures every interval, and it is not the wall clock. A wall clock can be set, and a
 host that trusts one still trusts it after somebody moves it forward an hour, so two readings it
 vouches for are not two readings on one scale. Intervals are measured on the machine's continuous
 clock instead: it only goes forward, nobody can set it, and it counts the time the machine spent
-asleep. It means nothing outside its own boot, so every moment the host writes down carries the
-continuous reading *and* the boot it was taken in, and an interval whose anchor belongs to a boot
-that has ended starts again rather than being worked out across the gap. An event brings an anchor
+asleep. It means nothing outside its own boot, so every interval the host writes down is kept as the
+continuous reading it starts from *and* the boot that reading was taken in, and one whose boot has
+ended starts again rather than being worked out across the gap - once, because the restart writes
+its own new start down, so the next reopen finds an interval this boot can measure. An event brings an anchor
 of its own when its producer read that clock, separately for each moment it carries, because a
 request can become pending long before the record of it is written. Every one of those answers is
 nought or less than the true wait, never more: a reminder that comes late is still a reminder, and

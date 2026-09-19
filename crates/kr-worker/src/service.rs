@@ -498,10 +498,12 @@ impl WorkerService {
     /// reminder promptly rather than a minute later.
     ///
     /// Two sources reach it in this build. The question ledger is where a verified pending input
-    /// request lives, and its events carry the moment a request became pending, which is what
-    /// section 25's idle reminder counts from. The journal's host events are the terminal side
-    /// effects that had no attachment to go to, which is what an `OSC 9`, `OSC 99` or `OSC 777`
-    /// notification becomes when nobody holds the input lease.
+    /// request lives; its events carry the moment a request became pending as a wall-clock time,
+    /// and no reading of the clock intervals are measured on, so section 25's idle reminder counts
+    /// from where this pass read the record rather than from where the request started waiting.
+    /// The journal's host events are the terminal side effects that had no attachment to go to,
+    /// which is what an `OSC 9`, `OSC 99` or `OSC 777` notification becomes when nobody holds the
+    /// input lease.
     ///
     /// The rest of the rule set - a pending approval, a command's exit status, a completed turn,
     /// an adapter failure, lost host contact - reaches the engine the same way. A producer builds

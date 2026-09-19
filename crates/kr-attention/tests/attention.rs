@@ -3538,3 +3538,103 @@ fn a_store_that_holds_state_and_has_lost_its_key_secret_is_refused() {
         "a store that lost the secret its keys were derived under is refused"
     );
 }
+
+// ----- What a restart may not do twice --------------------------------------------------------
+
+#[test]
+fn an_interval_restarted_by_a_reboot_is_not_restarted_again_by_the_next_reopen() {
+    // The first restart is the honest answer to an anchor whose boot has ended. Leaving that dead
+    // anchor written down would make every later reopen give the same answer, and an interval this
+    // boot's clock can measure exactly would never run.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    {
+        let mut attention = Attention::open(&path, HostReading::new(boot(), 0, NOON, true))
+            .expect("the feature store opens");
+        attention
+            .apply(
+                &notice(1, 1_000, "build finished", false),
+                HostReading::new(boot(), 10_000, NOON, true),
+            )
+            .expect("the store records the decision");
+        deliver(&mut attention);
+    }
+    // A reboot. The interval starts again, which is right, and the new start is written down.
+    {
+        let after_reboot = HostReading::new(next_boot(), 1_000, NOON + 60_000, true);
+        let mut reopened = Attention::open(&path, after_reboot).expect("the store reopens");
+        reopened
+            .tick(after_reboot.advanced(40_000))
+            .expect("the store records the decision");
+    }
+    // A second reopen inside that same boot, forty seconds later. The window has run.
+    let later = HostReading::new(next_boot(), 41_000, NOON + 101_000, true);
+    let mut again = Attention::open(&path, later).expect("the store reopens");
+    let repeated = again
+        .apply(
+            &notice(2, 2_000, "build finished", false),
+            HostReading::new(next_boot(), 62_000, NOON + 122_000, true),
+        )
+        .expect("the store records the decision");
+    assert!(
+        !notified(&repeated).is_empty(),
+        "sixty seconds have run since the interval restarted, so the repeat is announced rather \
+         than folded for ever: {repeated:?}"
+    );
+}
+
+#[test]
+fn a_wait_with_no_anchor_is_not_started_again_by_every_restart() {
+    // Its producer gave no anchor, so the wait starts where the host read the record. What it must
+    // not do is start there again at every reopen, which would postpone the reminder for ever.
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    {
+        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        attention
+            .apply(&pending_question(1, 0, question(9), true, 0), reading(0))
+            .expect("the store records the decision");
+    }
+    // Four minutes of this boot's own clock, across two reopens of the store.
+    {
+        let _ = Attention::open(&path, reading(120_000)).expect("the store reopens");
+    }
+    let mut reopened = Attention::open(&path, reading(240_000)).expect("the store reopens");
+    let owed = reopened
+        .tick(reading(IDLE_REMINDER_MS + 1))
+        .expect("the store records the decision");
+    assert!(
+        raised(&owed).contains(&AttentionRule::InputIdleReminder),
+        "five minutes have run on the clock that measures them: {owed:?}"
+    );
+}
+
+#[test]
+fn a_wall_clock_stepped_inside_one_boot_moves_no_interval() {
+    // The same forward step, without a reboot: the continuous clock is untouched, so nothing the
+    // engine measures moves, and the repeat is folded exactly as it would have been.
+    let mut attention = engine();
+    attention
+        .apply(
+            &adapter_failed(1, 0),
+            HostReading::new(boot(), 10_000, NOON, true),
+        )
+        .expect("the store records the decision");
+    let stepped = HostReading::new(boot(), 12_000, NOON + 3_602_000, true);
+    let climbed = attention
+        .tick(stepped)
+        .expect("the store records the decision");
+    assert!(
+        climbed.is_empty(),
+        "an adapter that failed two seconds ago has not been down for five minutes, whatever the \
+         wall clock now reads: {climbed:?}"
+    );
+    assert_eq!(whole_inbox(&attention)[0].level, AttentionLevel::Notable);
+    let repeated = attention
+        .apply(&adapter_failed(2, 1), stepped)
+        .expect("the store records the decision");
+    assert!(
+        notified(&repeated).is_empty(),
+        "and the repeat is still inside its own minute: {repeated:?}"
+    );
+}
