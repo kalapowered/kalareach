@@ -206,6 +206,8 @@ async fn wired(script: &str) -> Wired {
         dimensions: Dimensions::new(80, 24),
         journal_path: Some(environment.journal_database(session_id)),
         spool_directory: Some(environment.session_spool(session_id)),
+        worker_endpoint: None,
+        launch_profile: kr_protocol::session::LaunchProfile::default(),
         send_queue_bytes: 8 * 1024 * 1024,
         resident_bytes: 1024 * 1024,
     };
