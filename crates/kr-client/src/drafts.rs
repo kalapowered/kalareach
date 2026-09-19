@@ -86,8 +86,9 @@ const PARTIAL_EXTENSION: &str = "partial";
 
 /// How many links the walk over a store's path follows before it gives up.
 ///
-/// The same figure Linux and macOS use for resolving one path, so a chain this walk refuses is a
-/// chain the kernel would refuse to open through anyway.
+/// A backstop rather than the rule. Every kernel this runs on applies a limit of its own, usually
+/// lower than this, and refuses to open through a longer chain before the walk ever sees it. What
+/// this is for is the walk itself: a bound it holds to whatever the filesystem underneath it does.
 const MAX_PATH_LINKS: usize = 40;
 
 /// The name of the store's lock.
@@ -1152,69 +1153,100 @@ fn sync_directory(directory: &Path) -> std::io::Result<()> {
 /// operations once per store, which is what opening one is.
 ///
 /// A path is a chain of names, and losing any one of them leaves a store nothing reaches. The chain
-/// is not only the components a caller spelled: a link is a name in a directory, it leads somewhere,
-/// and that somewhere has its own ancestors. So the walk follows each component in turn, flushes the
-/// directory that holds it, and steps into a link's target before going on, which reaches a link
-/// that leads to another link as well as one that leads to a directory.
+/// is not only the components a caller spelled: a link is a name in a directory, it leads
+/// somewhere, and the rest of the path continues from there. So this resolves the path the way the
+/// kernel does, one component at a time, flushing the directory each name lives in and continuing
+/// from a link's target when it meets one. Following it once is what makes [`MAX_PATH_LINKS`] the
+/// same bound the kernel applies rather than a count of repeated work.
 ///
 /// A failure is reported. A store that cannot open the directories its own path is made of cannot
 /// establish that the path survives a crash, and saying so is better than returning success that
 /// means less than it looks.
+#[cfg(unix)]
 fn flush_path_names(directory: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        let start = if directory.is_absolute() {
-            directory.to_path_buf()
+    use std::collections::VecDeque;
+    use std::ffi::OsString;
+
+    /// The components of one path, as owned names, so a link's target can be spliced into the walk.
+    fn parts(path: &Path) -> Vec<OsString> {
+        path.components()
+            .map(|component| component.as_os_str().to_os_string())
+            .collect()
+    }
+
+    let start = if directory.is_absolute() {
+        directory.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(directory)
+    };
+    let mut remaining: VecDeque<OsString> = parts(&start).into();
+    let mut resolved = PathBuf::new();
+    let mut flushed: Vec<PathBuf> = Vec::new();
+    let mut followed = 0_usize;
+
+    while let Some(name) = remaining.pop_front() {
+        // A file cannot be called `.` or `..`, and only the root component is `/`, so what a name
+        // means is not ambiguous.
+        if name == std::path::MAIN_SEPARATOR_STR {
+            resolved.push(&name);
+            continue;
+        }
+        if name == "." {
+            continue;
+        }
+        if name == ".." {
+            resolved.pop();
+            continue;
+        }
+
+        // The directory this name lives in, which is what holds it.
+        let holder = resolved.clone();
+        if !flushed.contains(&holder) {
+            sync_directory(&holder)?;
+            flushed.push(holder.clone());
+        }
+        resolved.push(&name);
+
+        // A failure here is not an absent component: every name on a path that was just opened is
+        // there, so what this can report is the filesystem refusing to say.
+        if !std::fs::symlink_metadata(&resolved)?
+            .file_type()
+            .is_symlink()
+        {
+            continue;
+        }
+        followed += 1;
+        if followed > MAX_PATH_LINKS {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "{} follows more than {MAX_PATH_LINKS} links",
+                    directory.display()
+                ),
+            ));
+        }
+        // The rest of the path continues from the target: an absolute one starts again at the root,
+        // a relative one from the directory the link itself lives in.
+        let target = std::fs::read_link(&resolved)?;
+        resolved = if target.is_absolute() {
+            PathBuf::new()
         } else {
-            std::env::current_dir()?.join(directory)
+            holder
         };
-        let mut pending = vec![start];
-        let mut flushed: Vec<PathBuf> = Vec::new();
-        let mut followed = 0_usize;
-        while let Some(path) = pending.pop() {
-            let mut prefix = PathBuf::new();
-            for component in path.components() {
-                prefix.push(component);
-                let Some(holder) = prefix.parent() else {
-                    // The root holds itself, and there is nothing above it to flush.
-                    continue;
-                };
-                if !flushed.iter().any(|done| done == holder) {
-                    sync_directory(holder)?;
-                    flushed.push(holder.to_path_buf());
-                }
-                let Ok(metadata) = std::fs::symlink_metadata(&prefix) else {
-                    // A component that is not there is one nothing is reaching through: what this
-                    // call had to make durable, it made above.
-                    continue;
-                };
-                if !metadata.file_type().is_symlink() {
-                    continue;
-                }
-                followed += 1;
-                if followed > MAX_PATH_LINKS {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "{} follows more than {MAX_PATH_LINKS} links",
-                            path.display()
-                        ),
-                    ));
-                }
-                let target = std::fs::read_link(&prefix)?;
-                pending.push(if target.is_absolute() {
-                    target
-                } else {
-                    holder.join(target)
-                });
-            }
+        for part in parts(&target).into_iter().rev() {
+            remaining.push_front(part);
         }
     }
-    #[cfg(not(unix))]
-    {
-        // Nothing here flushes a directory on Windows, so there is nothing to walk.
-        let _ = directory;
-    }
+    Ok(())
+}
+
+/// Windows offers no directory handle to flush, so there is nothing to walk.
+#[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Unix half of this function reports what it could not flush"
+)]
+fn flush_path_names(_directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
@@ -1602,6 +1634,53 @@ mod tests {
                 .expect("the same draft")
                 .text,
             "at the far end"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_link_that_leads_back_to_where_it_is_is_followed_once_per_component() {
+        // `hop` points at the directory it lives in, so a path may name it as often as it likes and
+        // still be an ordinary path the kernel opens. What bounds the walk is the links one
+        // resolution follows, not how much work a walk that started again would do.
+        let directory = tempfile::tempdir().expect("a directory");
+        let base = directory.path().join("base");
+        std::fs::create_dir_all(&base).expect("the base");
+        std::os::unix::fs::symlink(".", base.join("hop")).expect("a link to its own directory");
+
+        let mut path = base.clone();
+        for _ in 0..8 {
+            path.push("hop");
+        }
+        path.push("drafts");
+        let store = DraftStore::open(&path, device()).expect("a store behind eight hops");
+        let draft = store
+            .create(
+                open_target(),
+                "behind the hops".to_owned(),
+                TimestampMs::new(1),
+            )
+            .expect("a draft");
+        assert_eq!(
+            DraftStore::open(base.join("drafts"), device())
+                .expect("the same store")
+                .load(draft.draft_id)
+                .expect("the same draft")
+                .text,
+            "behind the hops"
+        );
+
+        // Past the bound the store refuses rather than walking for ever. Which refusal arrives
+        // first is the kernel's: most refuse a path of this many links themselves, at a figure of
+        // their own, and the bound here is what answers on one that does not.
+        let mut too_many = base.clone();
+        for _ in 0..(MAX_PATH_LINKS + 1) {
+            too_many.push("hop");
+        }
+        too_many.push("drafts");
+        assert!(
+            DraftStore::open(&too_many, device()).is_err(),
+            "a path of more links than any resolution follows was accepted"
         );
     }
 
