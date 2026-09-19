@@ -4859,6 +4859,11 @@ impl Controller {
         self: &Arc<Self>,
         session_id: SessionId,
     ) -> Result<crate::archive::Archive> {
+        // The same question every archive read asks first. A session whose registry record names
+        // a process this daemon has not seen end is refused here rather than read from: the
+        // worker owns its own stores while it is alive, and a closure written over a death this
+        // host could not confirm is not a licence to open them.
+        self.refuse_if_live(session_id).await?;
         let recorded = self.registry.lock().await.closure(session_id)?;
         self.archive().archive_beside(session_id, recorded)
     }
