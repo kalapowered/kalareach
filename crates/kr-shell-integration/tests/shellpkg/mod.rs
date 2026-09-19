@@ -467,6 +467,7 @@ impl Session {
             root_process: hello.shell_process.clone(),
             supported_editor_abis: vec![hello.shell.editor_abi.clone()],
             supported_integration_versions: vec![hello.shell.integration_version.clone()],
+            launched_package: None,
             already_registered: false,
             gesture: kr_shell_integration::contract::events::EofGesture::default(),
         };

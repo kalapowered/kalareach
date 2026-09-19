@@ -392,6 +392,8 @@ pub enum QualificationReason {
     IntegrationVersionUnsupported,
     /// A loadable module in the shell's module tree is ABI-incompatible with the packaged reader.
     ModuleTreeUnsupported,
+    /// The declaration does not describe the package this session launched.
+    PackageMismatch,
 }
 
 impl QualificationReason {
@@ -413,6 +415,7 @@ impl QualificationReason {
         Self::EditorAbiUnsupported,
         Self::IntegrationVersionUnsupported,
         Self::ModuleTreeUnsupported,
+        Self::PackageMismatch,
     ];
 
     /// Returns the stable wire string.
@@ -435,6 +438,7 @@ impl QualificationReason {
             Self::EditorAbiUnsupported => "editor_abi_unsupported",
             Self::IntegrationVersionUnsupported => "integration_version_unsupported",
             Self::ModuleTreeUnsupported => "module_tree_unsupported",
+            Self::PackageMismatch => "package_mismatch",
         }
     }
 
@@ -451,7 +455,11 @@ impl QualificationReason {
             | Self::ProcessMismatch
             | Self::ProofMismatch
             | Self::PeerUnidentified
-            | Self::AlreadyRegistered => ErrorCode::PermissionDenied,
+            | Self::AlreadyRegistered
+            // The connecting process passed every identity check and then described a different
+            // build from the one this session started. Whatever produced that declaration, it is
+            // not the package this worker launched, so the answer is the identity answer.
+            | Self::PackageMismatch => ErrorCode::PermissionDenied,
             Self::UnqualifiedMailbox
             | Self::MailboxNotForShell
             | Self::KeyBindingPreEof

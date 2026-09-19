@@ -248,6 +248,10 @@ async fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
                 root_process,
                 supported_editor_abis: vec![identity.editor_abi.clone()],
                 supported_integration_versions: vec![identity.integration_version.clone()],
+                // The whole record this build wrote. A connection that passes every identity check
+                // and then describes a different executable, upstream version, patch set or module
+                // tree is not the package this session launched.
+                launched_package: Some(package.declaration()),
                 already_registered: false,
                 gesture: kr_shell_integration::contract::events::EofGesture::default(),
             };

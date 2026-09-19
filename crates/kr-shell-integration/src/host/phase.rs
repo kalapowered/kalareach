@@ -345,6 +345,8 @@ mod tests {
                 "root.editor.fence",
                 "root.eof.detach",
                 "root.command.accepted",
+                "root.command.resolve",
+                "root.command.block",
             ]
         );
         for name in &names {

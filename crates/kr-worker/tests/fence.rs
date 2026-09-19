@@ -479,6 +479,7 @@ async fn wired_profiled(
         root_process: process.clone(),
         supported_editor_abis: vec!["zle-5.9".to_owned()],
         supported_integration_versions: vec!["1".to_owned()],
+        launched_package: None,
         already_registered: false,
         gesture: EofGesture::default(),
     };

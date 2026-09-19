@@ -451,10 +451,95 @@ pub struct WorkerExpectation {
     pub supported_editor_abis: Vec<String>,
     /// The integration versions this build supports.
     pub supported_integration_versions: Vec<String>,
+    /// What the package this session launched declares about itself.
+    ///
+    /// `None` for a worker with no package to compare against, which is a test harness rather than
+    /// a managed session. Where it is present the hello must describe the same build: the
+    /// executable, the upstream version, the published patches and the module tree, not only the
+    /// editor ABI and the integration version. Two builds of one shell share both of those and are
+    /// still two different readers.
+    pub launched_package: Option<PackageDeclaration>,
     /// Whether a root integration is already registered for this session.
     pub already_registered: bool,
     /// The end-of-file gesture configured for this session, which the accept carries back.
     pub gesture: EofGesture,
+}
+
+/// What the package a session launched declares about itself.
+///
+/// It is the identity record the build wrote, read by the host that launched the executable. The
+/// bridge's own hello says the same things from inside the running shell, and the two are compared:
+/// a declaration that does not match the package this worker started describes a different reader,
+/// whatever else it proved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PackageDeclaration {
+    /// Which managed shell the package is.
+    pub kind: ShellKind,
+    /// The executable the host launched.
+    pub executable: String,
+    /// The upstream shell version the package was built from.
+    pub upstream_version: String,
+    /// The editor ABI revision the package declares.
+    pub editor_abi: String,
+    /// The integration version the package declares.
+    pub integration_version: String,
+    /// Every published reader patch in the package.
+    pub patches: Vec<PatchRevision>,
+    /// The module tree the package installs.
+    pub modules: Vec<ModuleEntry>,
+}
+
+impl PackageDeclaration {
+    /// Returns the first thing a hello's declaration says differently from this package.
+    ///
+    /// The comparison is over everything a build fixes. The executable settles which binary is
+    /// running, the upstream version and the patches settle which reader is inside it, and the
+    /// module tree settles what it will load. Two builds of one shell agree on the editor ABI and
+    /// the integration version and differ in all of these.
+    #[must_use]
+    pub fn disagreement(&self, declared: &ShellIdentity) -> Option<String> {
+        if declared.kind != self.kind {
+            return Some(format!(
+                "it says it is {} and this session launched {}",
+                declared.kind.as_str(),
+                self.kind.as_str()
+            ));
+        }
+        if declared.executable != self.executable {
+            return Some(format!(
+                "it names {} and this session launched {}",
+                declared.executable, self.executable
+            ));
+        }
+        if declared.upstream_version != self.upstream_version {
+            return Some(format!(
+                "it says upstream {} and this package is {}",
+                declared.upstream_version, self.upstream_version
+            ));
+        }
+        if declared.editor_abi != self.editor_abi {
+            return Some(format!(
+                "it says editor ABI {} and this package declares {}",
+                declared.editor_abi, self.editor_abi
+            ));
+        }
+        if declared.integration_version != self.integration_version {
+            return Some(format!(
+                "it says integration version {} and this package declares {}",
+                declared.integration_version, self.integration_version
+            ));
+        }
+        if declared.patches != self.patches {
+            return Some(
+                "its reader patches are not the ones this package was built with".to_owned(),
+            );
+        }
+        if declared.modules != self.modules {
+            return Some("its module tree is not the one this package installs".to_owned());
+        }
+        None
+    }
 }
 
 /// What the worker answers an accepted bridge with.
@@ -621,6 +706,17 @@ pub fn decide_handshake(
                 "module {} was built against editor ABI {} and this reader is {}",
                 module.name, module.editor_abi, hello.shell.editor_abi
             ),
+        );
+    }
+    // Last, and only for a worker that launched a package: the declaration must be *this* build.
+    // Everything above says the reader is one this host supports; this says it is the one this
+    // session started.
+    if let Some(launched) = expectation.launched_package.as_ref()
+        && let Some(disagreement) = launched.disagreement(&hello.shell)
+    {
+        return refuse(
+            Reason::PackageMismatch,
+            format!("the declaration is not this session's package: {disagreement}"),
         );
     }
     HandshakeOutcome::Accepted(BridgeAccepted {
@@ -824,6 +920,7 @@ mod tests {
             root_process: root(),
             supported_editor_abis: vec!["zle-5.9".to_owned()],
             supported_integration_versions: vec!["1".to_owned()],
+            launched_package: None,
             already_registered: false,
             gesture: EofGesture::default(),
         }

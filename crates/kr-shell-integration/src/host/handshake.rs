@@ -219,6 +219,7 @@ mod tests {
             root_process: root(),
             supported_editor_abis: vec!["zle-5.9".to_owned()],
             supported_integration_versions: vec![REFERENCE_INTEGRATION_VERSION.to_owned()],
+            launched_package: None,
             already_registered: false,
             gesture: EofGesture::default(),
         }
@@ -292,6 +293,80 @@ mod tests {
             verify(&elsewhere, &expectation(), &address(), &hello).expect("verifies"),
             ProofVerdict::Failed
         );
+    }
+
+    /// KR-REQ-07.17: the handshake compares the whole package record, not only the two versions.
+    #[test]
+    fn a_hello_that_describes_another_build_of_the_same_shell_is_refused() {
+        use crate::contract::transport::{PackageDeclaration, PatchRevision};
+
+        let secret = Secret::random().expect("a secret");
+        let hello = hello(&secret, root());
+        let launched = PackageDeclaration {
+            kind: ShellKind::Zsh,
+            executable: hello.shell.executable.clone(),
+            upstream_version: hello.shell.upstream_version.clone(),
+            editor_abi: hello.shell.editor_abi.clone(),
+            integration_version: hello.shell.integration_version.clone(),
+            patches: hello.shell.patches.clone(),
+            modules: hello.shell.modules.clone(),
+        };
+        let expecting = |launched: PackageDeclaration| WorkerExpectation {
+            launched_package: Some(launched),
+            ..expectation()
+        };
+        assert!(matches!(
+            admit_observed(
+                &secret,
+                &expecting(launched.clone()),
+                &address(),
+                &seen(&root()),
+                &hello
+            )
+            .expect("decides"),
+            HandshakeOutcome::Accepted(_)
+        ));
+
+        // Each of these is a different build of the same shell, and each agrees with the hello on
+        // the editor ABI and the integration version.
+        let elsewhere = PackageDeclaration {
+            executable: "/opt/kalareach/shells/zsh-5.9-b/bin/zsh".to_owned(),
+            ..launched.clone()
+        };
+        let older = PackageDeclaration {
+            upstream_version: "5.8".to_owned(),
+            ..launched.clone()
+        };
+        let repatched = PackageDeclaration {
+            patches: vec![PatchRevision {
+                name: "zle-reader-mailbox".to_owned(),
+                upstream_revision: "5.9".to_owned(),
+                revision: "2".to_owned(),
+            }],
+            ..launched.clone()
+        };
+        for other in [elsewhere, older, repatched] {
+            let outcome = admit_observed(
+                &secret,
+                &expecting(other),
+                &address(),
+                &seen(&root()),
+                &hello,
+            )
+            .expect("decides");
+            match outcome {
+                HandshakeOutcome::Refused(refusal) => {
+                    assert_eq!(refusal.reason, QualificationReason::PackageMismatch);
+                    assert_eq!(
+                        refusal.error.code,
+                        kr_protocol::error::ErrorCode::PermissionDenied
+                    );
+                }
+                HandshakeOutcome::Accepted(_) => {
+                    panic!("a different build is not this session's package")
+                }
+            }
+        }
     }
 
     #[test]
@@ -387,6 +462,7 @@ mod tests {
     fn a_second_registration_is_refused() {
         let secret = Secret::random().expect("a secret");
         let expectation = WorkerExpectation {
+            launched_package: None,
             already_registered: true,
             ..expectation()
         };

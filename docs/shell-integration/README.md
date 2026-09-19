@@ -133,10 +133,18 @@ refused before its declaration is read at all:
 | `editor_abi_unsupported` | `SHELL_INTEGRATION_UNSUPPORTED` | The editor ABI is not one this build was qualified against |
 | `integration_version_unsupported` | `SHELL_INTEGRATION_UNSUPPORTED` | The integration version is not supported |
 | `module_tree_unsupported` | `SHELL_INTEGRATION_UNSUPPORTED` | A module in the tree was built against a different editor ABI |
+| `package_mismatch` | `PERMISSION_DENIED` | The declaration describes a different build from the package this session launched |
 
 A refusal is a named qualification error, never a false ready state and never a quietly reduced
 contract. Loading ordinary startup files is not evidence that a native module matches the packaged
 reader, which is why the module tree carries each module's ABI.
+
+A worker that launched a package compares the whole declaration against that package's own record:
+the executable, the upstream version, the editor ABI, the integration version, the published reader
+patches and the module tree. Two builds of one shell agree on the editor ABI and the integration
+version and are still two different readers, so those two alone do not establish that the process
+on the endpoint is the package this session started. That comparison comes last, after every
+identity check and every capability check, and its answer is `package_mismatch`.
 
 An accept carries the editor ABI the worker took (`editor_abi`), the hold (`hold_ms`, 250), the
 configured end-of-file gesture (`gesture`), the hint text (`hint`), where the secret now lives

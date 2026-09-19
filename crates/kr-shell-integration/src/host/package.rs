@@ -265,6 +265,24 @@ impl ShellPackage {
         }
     }
 
+    /// Returns what this package declares about itself, for the handshake to compare against.
+    ///
+    /// The whole record, not only the editor ABI and the integration version: two builds of one
+    /// shell agree on both of those and are still two different readers.
+    #[must_use]
+    pub fn declaration(&self) -> crate::contract::transport::PackageDeclaration {
+        let identity = self.identity();
+        crate::contract::transport::PackageDeclaration {
+            kind: identity.kind,
+            executable: identity.executable,
+            upstream_version: identity.upstream_version,
+            editor_abi: identity.editor_abi,
+            integration_version: identity.integration_version,
+            patches: identity.patches,
+            modules: identity.modules,
+        }
+    }
+
     /// Returns the identity a bridge of this package declares.
     ///
     /// The worker records it whole and checks a hello against it, so a package that was rebuilt

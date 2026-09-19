@@ -354,6 +354,7 @@ mod tests {
             root_process: root,
             supported_editor_abis: vec!["zle-5.9".to_owned()],
             supported_integration_versions: vec![REFERENCE_INTEGRATION_VERSION.to_owned()],
+            launched_package: None,
             already_registered: false,
             gesture: EofGesture::default(),
         }

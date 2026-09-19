@@ -1067,6 +1067,7 @@ fn expectation() -> WorkerExpectation {
             "psreadline-2.3".to_owned(),
         ],
         supported_integration_versions: vec!["1".to_owned()],
+        launched_package: None,
         already_registered: false,
         gesture: EofGesture::default(),
     }
@@ -1396,6 +1397,29 @@ fn handshake_reject() -> Scenario {
         QualificationReason::ModuleTreeUnsupported,
         ErrorCode::ShellIntegrationUnsupported,
     ));
+    // A build of the same shell this session did not launch: the same editor ABI and the same
+    // integration version, and a different binary behind them.
+    let mut another_build = refused_case(
+        "a-declaration-of-another-build-of-the-same-shell",
+        root_peer(),
+        zsh_hello(),
+        ProofVerdict::Verified,
+        QualificationReason::PackageMismatch,
+        ErrorCode::PermissionDenied,
+    );
+    another_build.expectation = Some(WorkerExpectation {
+        launched_package: Some(crate::contract::transport::PackageDeclaration {
+            kind: ShellKind::Zsh,
+            executable: "/opt/kalareach/shells/zsh/other-build/bin/zsh".to_owned(),
+            upstream_version: "5.9".to_owned(),
+            editor_abi: "zle-5.9".to_owned(),
+            integration_version: "1".to_owned(),
+            patches: zsh_hello().shell.patches,
+            modules: zsh_hello().shell.modules,
+        }),
+        ..expectation()
+    });
+    cases.push(another_build);
     let mut second = refused_case(
         "a-second-root-integration-for-one-session",
         root_peer(),
@@ -1407,6 +1431,7 @@ fn handshake_reject() -> Scenario {
     // Every other case is refused before registration is considered at all, so they share one
     // worker expectation. This one needs a worker that already has a root integration.
     second.expectation = Some(WorkerExpectation {
+        launched_package: None,
         already_registered: true,
         ..expectation()
     });
