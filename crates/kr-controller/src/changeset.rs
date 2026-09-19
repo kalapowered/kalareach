@@ -348,8 +348,19 @@ impl ChangeSetModule {
                 },
             };
             // Recorded before it is returned, so the reply and the record cannot disagree about
-            // what happened.
-            service.settle_action(&actor, action_id, name, digest, &record)?;
+            // what happened. A journal that will not take the record is not an ordinary failure
+            // of the request: the work was done and no record of it exists, so what the caller is
+            // told is that its outcome is not established rather than an error that reads like
+            // nothing happened.
+            if let Err(error) = service.settle_action(&actor, action_id, name, digest, &record) {
+                return Err(ProtocolError::new(
+                    ErrorCode::OutcomeUnknown,
+                    format!(
+                        "this action was performed and this host could not record what it came \
+                         to: {error}"
+                    ),
+                ));
+            }
             outcome
         })
         .await

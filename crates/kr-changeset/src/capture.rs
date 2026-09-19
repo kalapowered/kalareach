@@ -304,11 +304,20 @@ fn changed(detail: &str) -> ChangeSetError {
 }
 
 /// Returns every distinct content digest a manifest names.
-fn distinct_objects(manifest: &Manifest) -> Vec<kr_protocol::scalars::Digest256> {
+///
+/// A deletion names one too: what the base held for the path it removes is content this version
+/// carries, and a version's objects are everything it would need to be delivered.
+pub(crate) fn distinct_objects(manifest: &Manifest) -> Vec<kr_protocol::scalars::Digest256> {
     let mut digests: Vec<_> = manifest
         .paths
         .iter()
         .map(|entry| entry.content_digest)
+        .chain(
+            manifest
+                .deletions
+                .iter()
+                .filter_map(|deleted| deleted.content_digest),
+        )
         .collect();
     digests.sort_unstable();
     digests.dedup();
@@ -1062,18 +1071,19 @@ fn store_base_content(
     if !REGULAR_MODES.contains(&mode) {
         return Ok(None);
     }
-    budget.objects = budget.objects.saturating_sub(1);
+    budget.read_object()?;
     let bytes = read_object(profile, repository, object_id)?;
     budget.charge(bytes.len() as u64)?;
     store.put(&bytes).map(Some)
 }
 
-/// Returns the directory a nested repository keeps its own data in, when it names one.
+/// Returns the entry of this directory a nested repository keeps its own data under.
 ///
-/// A `.git` file holds one line, `gitdir: <path>`. Only a name inside this same directory is
-/// answered: a path that climbs out or is absolute points somewhere this walk cannot reach
-/// through its handle anyway, and a `.git` directory needs no answer because the name rule
-/// already refuses it.
+/// A `.git` file holds one line, `gitdir: <path>`, and Git accepts many spellings of one place:
+/// `repo-data`, `./repo-data`, `data/repo-data`, or the whole absolute path. Each is resolved
+/// against this directory's own location and reduced to **the first component**, which is the
+/// entry this walk must not descend into. A target that resolves outside this directory is one
+/// the walk never reaches from here, so it answers nothing.
 fn nested_administrative_directory(directory: &kr_transfer::AuthorisedDirectory) -> Option<String> {
     use std::io::Read as _;
 
@@ -1090,10 +1100,44 @@ fn nested_administrative_directory(directory: &kr_transfer::AuthorisedDirectory)
         .read_to_string(&mut text)
         .ok()?;
     let target = text.trim().strip_prefix("gitdir:")?.trim();
-    if target.is_empty() || target.starts_with('/') || target.contains('/') || target == ".." {
+    if target.is_empty() {
         return None;
     }
-    Some(target.to_owned())
+    let here = directory.host_path(&name);
+    let here = here.parent()?;
+    let resolved = if std::path::Path::new(target).is_absolute() {
+        std::path::PathBuf::from(target)
+    } else {
+        here.join(target)
+    };
+    let resolved = lexical_components(&resolved);
+    let inside = lexical_components(here);
+    if resolved.len() <= inside.len() || resolved[..inside.len()] != inside[..] {
+        return None;
+    }
+    resolved
+        .get(inside.len())
+        .and_then(|part| part.clone().into_string().ok())
+}
+
+/// Reduces one path to its components without touching the filesystem.
+///
+/// `.` goes, `..` cancels the component before it, and a root or prefix starts the list again. No
+/// name is resolved: this is arithmetic on a path, used only to decide which entry of one
+/// directory another path names.
+fn lexical_components(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+    let mut parts: Vec<std::ffi::OsString> = Vec::new();
+    for part in path.components() {
+        match part {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                parts.pop();
+            }
+            std::path::Component::Normal(part) => parts.push(part.to_owned()),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => parts.clear(),
+        }
+    }
+    parts
 }
 
 /// Returns true when one path is this repository's own administrative data.
@@ -1147,6 +1191,24 @@ struct Budget {
 }
 
 impl Budget {
+    /// Charges one Git object read, refusing when this capture has had its share of them.
+    fn read_object(&mut self) -> Result<()> {
+        self.objects =
+            self.objects
+                .checked_sub(1)
+                .ok_or_else(|| {
+                    ChangeSetError::QuotaExceeded {
+                detail: format!(
+                    "this capture would read more than {MAX_OBJECT_READS} paths from Git objects \
+                     and one capture reads at most that many; narrow the grant, or capture the \
+                     working tree as the source"
+                )
+                .into(),
+            }
+                })?;
+        Ok(())
+    }
+
     fn charge(&mut self, bytes: u64) -> Result<()> {
         self.bytes =
             self.bytes
@@ -1172,9 +1234,12 @@ fn read_content(
     planned: &BTreeMap<String, Plan>,
     request: Scope<'_>,
 ) -> Result<Manifest> {
+    // Every read of a Git object counts, whichever plan asks for it: a deletion reads the base's
+    // own blob so the version can restore it, exactly as a path the policy takes from the commit
+    // reads one.
     let object_reads = planned
         .values()
-        .filter(|plan| matches!(plan, Plan::GitObject { .. }))
+        .filter(|plan| matches!(plan, Plan::GitObject { .. } | Plan::Deleted { .. }))
         .count();
     if object_reads > MAX_OBJECT_READS {
         return Err(ChangeSetError::QuotaExceeded {
@@ -1232,7 +1297,7 @@ fn read_content(
                         .push(exclusion(path, &unsupported_mode(mode)));
                     continue;
                 }
-                budget.objects = budget.objects.saturating_sub(1);
+                budget.read_object()?;
                 let bytes = read_object(profile, repository, object_id)?;
                 let content = classify_content(&bytes);
                 if leave_out_binary(request, *class, content) {

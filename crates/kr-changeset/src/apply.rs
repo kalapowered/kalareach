@@ -736,9 +736,24 @@ fn proposal(
             started_at_ms: now,
             decided_at_ms: None,
         },
-        // A proposal writes to no working tree, so there is no plan of destination paths to record.
-        &[],
+        // A proposal writes to no working tree, and the one thing about its paths a later reader
+        // has to be able to get back is which operations it could not carry. Those are recorded,
+        // so a recovered answer names them rather than describing a proposal that carried
+        // everything.
+        &unresolved,
     )?;
+    for path in &unresolved {
+        service.locked()?.settle_path(
+            order.action_id,
+            &ProgressRow {
+                path: path.clone(),
+                state: PathProgressState::Unresolved,
+                before_digest: None,
+                after_digest: None,
+                detail: "this proposal could not carry the operation for this path".to_owned(),
+            },
+        )?;
+    }
     // `applied` is every requested operation carried. A proposal that could not carry one is not
     // an applied change, whatever it did carry.
     let (outcome, detail) = if unresolved.is_empty() {
@@ -1007,6 +1022,7 @@ fn direct(
     };
     // Every path the apply did not reach is recorded as one it did not attempt, so the answer
     // lists exactly what is known rather than leaving a reader to infer it.
+    let mut failed_to_record = false;
     for (path, _) in operations.iter().skip(progress.len()) {
         let row = ProgressRow {
             path: path.clone(),
@@ -1022,14 +1038,17 @@ fn direct(
             stopped = Some((
                 ApplyOutcomeClass::UncertainOutcome,
                 format!(
-                    "this apply could not record what it did not reach, so its own rows are \
-                     what is known and no more: {error}"
+                    "this apply could not record what it did not reach, so the journal says less \
+                     than this answer does about those paths: {error}"
                 ),
             ));
-            break;
+            failed_to_record = true;
         }
+        // The answer lists the path whether or not the journal took the row: leaving it out would
+        // make an apply that could not record itself look like one with fewer operations.
         progress.push(wire_progress(&row));
     }
+    let _ = failed_to_record;
     let after = match capture_destination(service, order, Some(before.change_set_id), "after") {
         Ok(after) => Some(after),
         Err(error) => {
@@ -1827,6 +1846,13 @@ fn carry_permissions(
         Err(_) => return Ok(None),
     };
     let mode = existing.unwrap_or(if executable { 0o755 } else { 0o644 });
+    // A directory can carry a **default** access-control list, which the platform puts on every
+    // file created inside it. The copy this host just made would then reach the destination
+    // carrying protection the file it replaces never had, and the mode bits alone would not say
+    // so. It is taken off the copy before the mode is set, or the path is left alone.
+    if !clear_inherited_access_control(staged) {
+        return Ok(None);
+    }
     // Through the handle this host created a moment ago, not through the name: a name reopened is
     // a name somebody could have put something else at.
     staged
@@ -1834,6 +1860,37 @@ fn carry_permissions(
         .set_permissions(cap_std::fs::Permissions::from_mode(mode))
         .map_err(ChangeSetError::storage)?;
     Ok(Some(mode))
+}
+
+/// Takes any inherited access-control list off the copy this host staged.
+///
+/// Returns false when the copy carries one this host could not take off, because publishing it
+/// would give the destination protection the file it replaces never had.
+#[cfg(target_os = "linux")]
+fn clear_inherited_access_control(staged: &kr_transfer::AuthorisedFile) -> bool {
+    match rustix::fs::fremovexattr(staged.handle(), "system.posix_acl_access") {
+        // There was one and it is off.
+        Ok(()) => true,
+        // There was none to take off, which is the ordinary case.
+        Err(rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => true,
+        Err(_) => false,
+    }
+}
+
+/// Returns true: an inherited list is not taken off the staged copy on this platform.
+///
+/// `exacl` reads and writes by path, and the staged copy's name is the one name here this host
+/// must not resolve a second time. A directory with an inheritable entry therefore publishes a
+/// copy carrying it, which is a stated limit rather than something this host establishes.
+#[cfg(target_os = "macos")]
+fn clear_inherited_access_control(_staged: &kr_transfer::AuthorisedFile) -> bool {
+    true
+}
+
+/// Returns true: this platform has no list for a new file to inherit.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn clear_inherited_access_control(_staged: &kr_transfer::AuthorisedFile) -> bool {
+    true
 }
 
 /// Returns true when the published file carries the permissions this host set on the copy it
@@ -2013,8 +2070,27 @@ fn overlay(
                     .find(|held| held.path == requested.path)
                     .cloned();
                 proposed.paths.retain(|held| held.path != requested.path);
-                let base_object_id = held.as_ref().and_then(|held| held.base_object_id.0.clone());
-                let base_mode = held.as_ref().and_then(|held| held.base_mode.0.clone());
+                // What the destination's own base holds for this path: from the captured path
+                // where the destination holds one, and from the deletion the destination already
+                // recorded where it does not. A removal must not replace a complete record of what
+                // was deleted with an empty one.
+                let recorded = proposed
+                    .deletions
+                    .iter()
+                    .find(|deleted| deleted.path == requested.path)
+                    .cloned();
+                let base_object_id = held
+                    .as_ref()
+                    .and_then(|held| held.base_object_id.0.clone())
+                    .or_else(|| {
+                        recorded
+                            .as_ref()
+                            .and_then(|held| held.base_object_id.clone())
+                    });
+                let base_mode = held
+                    .as_ref()
+                    .and_then(|held| held.base_mode.0.clone())
+                    .or_else(|| recorded.as_ref().and_then(|held| held.base_mode.clone()));
                 // What a revert of this proposal would put back, kept in this host's own store so
                 // it does not depend on the destination's repository still holding the object.
                 let content_digest = match (base_object_id.as_deref(), base_mode.as_deref()) {
@@ -2031,7 +2107,8 @@ fn overlay(
                     path: requested.path.clone(),
                     base_object_id,
                     base_mode,
-                    content_digest,
+                    content_digest: content_digest
+                        .or_else(|| recorded.as_ref().and_then(|held| held.content_digest)),
                 };
                 // One deletion per path. A path the destination's own base already recorded as
                 // deleted is not deleted twice by a change that also removes it.
@@ -2079,13 +2156,17 @@ fn overlay(
             || Nullable(deleted.as_ref().and_then(|d| d.base_mode.clone())),
             |held| held.base_mode.clone(),
         );
-        // Whether the proposal's content is the base revision's own content, asked of the base
-        // rather than of what the destination happens to hold now. A change that puts a path back
-        // to exactly what the commit has is not a dirty file: it is a tracked file again.
+        // Whether the proposal's content **and mode** are the base revision's own, asked of the
+        // base rather than of what the destination happens to hold now. A change that puts a path
+        // back to exactly what the commit has is not a dirty file: it is a tracked file again. A
+        // base this host could not read is no answer either way, so it fails rather than deciding.
+        let carried_bit = existing.as_ref().map_or(executable, |held| held.executable);
         let matches_base = match base_object_id.0.as_deref() {
-            Some(object_id) => read_object(service.project().profile(), repository, object_id)
-                .map(|base| digest_of(&base) == digest)
-                .unwrap_or(false),
+            Some(object_id) => {
+                let base = read_object(service.project().profile(), repository, object_id)?;
+                digest_of(&base) == digest
+                    && base_mode.0.as_deref() == Some(if carried_bit { "100755" } else { "100644" })
+            }
             None => false,
         };
         let replacement = CapturedPath {
@@ -2095,7 +2176,7 @@ fn overlay(
             // A direct apply preserves the destination's own permission, so a proposal of the
             // same change says the same thing: the destination's bit where it has one, and the
             // version's where the destination does not hold the path at all.
-            executable: existing.as_ref().map_or(executable, |held| held.executable),
+            executable: carried_bit,
             content: crate::capture::classify_content(&bytes),
             origin: ContentOrigin::WorkingTree,
             class: match existing.as_ref() {
@@ -2361,11 +2442,17 @@ pub fn read_apply(service: &ChangeSetService, action_id: ActionId) -> Result<Dif
             .filter(|entry| entry.state == PathProgressState::Conflicted)
             .map(|entry| PathConflict {
                 path: entry.path.clone(),
+                // The journal holds what this host **found**, not what the request that is gone
+                // expected, so a conflict read back from it says one side and not the other.
                 expected_worktree_digest: Nullable(None),
                 observed_worktree_digest: Nullable(entry.before_digest),
                 expected_index_object_id: Nullable(None),
                 observed_index_object_id: Nullable(None),
-                detail: entry.detail.clone(),
+                detail: format!(
+                    "{} (read back from this host's own record, which holds what it found rather \
+                     than what the request expected)",
+                    entry.detail
+                ),
             })
             .collect(),
         progress: progress.iter().map(wire_progress).collect(),

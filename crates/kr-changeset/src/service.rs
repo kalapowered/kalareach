@@ -784,16 +784,7 @@ impl ChangeSetService {
             limitations: crate::version::limitations(),
             captured_at_ms: now,
         };
-        let objects: Vec<_> = {
-            let mut digests: Vec<_> = manifest
-                .paths
-                .iter()
-                .map(|entry| entry.content_digest)
-                .collect();
-            digests.sort_unstable();
-            digests.dedup();
-            digests
-        };
+        let objects: Vec<_> = crate::capture::distinct_objects(manifest);
         self.locked()?.insert_version(
             &VersionRow {
                 change_set_id: from.change_set_id,

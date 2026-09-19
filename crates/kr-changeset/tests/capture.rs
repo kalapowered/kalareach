@@ -953,10 +953,11 @@ fn a_nested_repository_that_renamed_its_own_data_is_never_captured() {
         ],
     );
     write(&nested, "inner.txt", "inner content\n");
-    // Exactly what a repository made with a separate Git directory looks like from the tree.
+    // Exactly what a repository made with a separate Git directory looks like from the tree, in
+    // the spelling Git itself writes for a relative one.
     std::fs::rename(nested.join(".git"), nested.join("repo-data"))
         .expect("the repository keeps its data under another name");
-    std::fs::write(nested.join(".git"), b"gitdir: repo-data\n").expect("and points at it");
+    std::fs::write(nested.join(".git"), b"gitdir: ./repo-data\n").expect("and points at it");
 
     let workspace = fixture.workspace("renamed-tree");
     let record = fixture.capture(workspace, &include_everything());
@@ -987,6 +988,30 @@ fn a_nested_repository_that_renamed_its_own_data_is_never_captured() {
             .any(|entry| entry.path == "vendor/inner/repo-data"),
         "the exclusion names it: {:?}",
         record.exclusions
+    );
+
+    // And the same repository pointed at by its whole absolute path, which Git also accepts.
+    std::fs::write(
+        nested.join(".git"),
+        format!("gitdir: {}\n", nested.join("repo-data").display()).as_bytes(),
+    )
+    .expect("the absolute spelling of the same place");
+    let record = fixture.capture(workspace, &include_everything());
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    assert!(
+        manifest
+            .paths
+            .iter()
+            .all(|entry| !entry.path.contains("vendor/inner/repo-data")),
+        "the spelling does not decide it: {:?}",
+        manifest
+            .paths
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>()
     );
 }
 
