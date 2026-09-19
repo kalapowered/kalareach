@@ -354,7 +354,8 @@ pub fn judge(
         Outcome::NotAttempted { detail } => (
             CapabilityState::TemporarilyUnavailable,
             CapabilityEvidenceSource::DisclosedProbe,
-            Some(format!("the check could not be attempted: {detail}")),
+            // Not "could not be attempted": some of these started and did not get to the end.
+            Some(format!("this check established nothing: {detail}")),
         ),
         Outcome::WithheldForIsolation => (
             CapabilityState::NotTested,
@@ -640,7 +641,10 @@ fn read_authorised_file(plan: &Plan) -> Ran {
     // whatever is on the other end feels like. The look itself is inside the check's own bound,
     // because asking a filesystem that has stopped answering about a file blocks in the kernel
     // just as reading it does.
-    let Some(looked) = bounded_look(path, check.effects().bound) else {
+    // One deadline for the whole check, shared by the look and the read. Two of its own would add
+    // up to twice what the check declares.
+    let deadline = std::time::Instant::now() + check.effects().bound;
+    let Some(looked) = bounded_look(path, remaining(deadline)) else {
         return Ran {
             check,
             facility,
@@ -691,7 +695,7 @@ fn read_authorised_file(plan: &Plan) -> Ran {
             };
         }
     }
-    let outcome = match bounded_read(path, check.effects().bound) {
+    let outcome = match bounded_read(path, remaining(deadline)) {
         // Nothing to ask to stop: the read is in the kernel and the check stops waiting for it.
         None => Outcome::NotAttempted {
             detail: format!(
@@ -722,6 +726,12 @@ fn read_authorised_file(plan: &Plan) -> Ran {
         facility,
         outcome,
     }
+}
+
+/// How much of a deadline is left, and never less than nothing.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn remaining(deadline: std::time::Instant) -> Duration {
+    deadline.saturating_duration_since(std::time::Instant::now())
 }
 
 /// Reads the first block of a file, or gives up on the clock.

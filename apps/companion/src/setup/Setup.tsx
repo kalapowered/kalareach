@@ -424,6 +424,7 @@ export function Setup(): ReactNode {
  */
 function signatureLine(signature: SetupIdentity['signature']): string {
   if (!signature.read) return signature.refusal ?? 'not read'
+  if (!signature.valid) return 'a signature the operating system would not verify'
   if (signature.ad_hoc || !signature.authority) {
     return `an ad-hoc signature${signature.identifier ? ` on ${signature.identifier}` : ''}`
   }

@@ -103,6 +103,8 @@ export interface SigningIdentity {
   readonly identifier: string | null
   /** Whether the signature is ad-hoc: one this machine made, that nothing else can vouch for. */
   readonly ad_hoc: boolean
+  /** Whether the platform verified the signature against what it seals, rather than only read it. */
+  readonly valid: boolean
   /** What the platform said, where it would not answer. */
   readonly refusal: string | null
 }

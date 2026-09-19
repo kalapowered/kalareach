@@ -1123,6 +1123,7 @@ function setupIdentity(stable: boolean, connected: boolean): SetupIdentity {
           team: 'ABCDE12345',
           identifier: 'to.kala.reach.companion',
           ad_hoc: false,
+          valid: true,
           refusal: null
         }
       : {
@@ -1131,6 +1132,7 @@ function setupIdentity(stable: boolean, connected: boolean): SetupIdentity {
           team: null,
           identifier: 'kalareach_companion-11a57fcfccad3743',
           ad_hoc: true,
+          valid: true,
           refusal: null
         },
     stable,

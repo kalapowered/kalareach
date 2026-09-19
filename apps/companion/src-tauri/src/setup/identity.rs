@@ -60,6 +60,9 @@ pub struct Signature {
     pub identifier: Option<String>,
     /// Whether the signature is ad-hoc, which is one this machine made and nobody else can check.
     pub ad_hoc: bool,
+    /// Whether the platform verified the signature against what it seals, rather than only reading
+    /// it. A bundle whose contents were changed after it was signed fails this.
+    pub valid: bool,
     /// What the platform said, where it would not answer.
     pub refusal: Option<String>,
 }
@@ -74,6 +77,7 @@ impl Signature {
             team: None,
             identifier: None,
             ad_hoc: false,
+            valid: false,
             refusal: Some(refusal.into()),
         }
     }
@@ -81,7 +85,7 @@ impl Signature {
     /// Whether this signature is one the operating system recognises again after a rebuild.
     #[must_use]
     pub fn is_durable(&self) -> bool {
-        self.read && !self.ad_hoc && self.authority.is_some()
+        self.read && self.valid && !self.ad_hoc && self.authority.is_some()
     }
 }
 
@@ -170,6 +174,14 @@ pub fn unstable(executable: &str, bundled: bool, signature: &Signature) -> Optio
                 .map_or_else(String::new, |said| format!(": {said}"))
         ));
     }
+    if !signature.valid {
+        return Some(format!(
+            "The operating system did not verify {executable} against the signature it carries. A \
+             bundle whose contents changed after it was signed is one the platform treats as a \
+             different application, so a grant given now may not be there next time. Install a \
+             signed build before granting anything."
+        ));
+    }
     if signature.ad_hoc || signature.authority.is_none() {
         return Some(format!(
             "{executable} carries an ad-hoc signature, which is one this machine made for this \
@@ -244,8 +256,34 @@ pub fn read_signature(executable: &str) -> Signature {
         team: field(&said, "TeamIdentifier=").filter(|team| team != "not set"),
         identifier: field(&said, "Identifier="),
         ad_hoc: is_ad_hoc(&said),
+        // Reading a signature is not checking it. This is the second question, and the one that
+        // catches a bundle whose contents changed after it was signed.
+        valid: verifies(executable),
         refusal: None,
     }
+}
+
+/// Whether the platform verifies this executable against the signature it carries.
+///
+/// `--strict` refuses the leniencies the tool would otherwise allow, and `--deep` reaches the
+/// bundle's own contents rather than stopping at its outermost seal. A tool that does not answer
+/// inside its allowance is a signature this host has not verified.
+fn verifies(executable: &str) -> bool {
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let owned = executable.to_owned();
+    std::thread::spawn(move || {
+        let _ = sender.send(
+            std::process::Command::new(SIGNING_TOOL)
+                .args(["--verify", "--deep", "--strict", &owned])
+                .stdin(std::process::Stdio::null())
+                .output(),
+        );
+    });
+    receiver
+        .recv_timeout(SIGNING_BOUND)
+        .ok()
+        .and_then(Result::ok)
+        .is_some_and(|output| output.status.success())
 }
 
 /// How long the signing tool is given before the report says the signature was not read.
@@ -305,8 +343,26 @@ mod tests {
             team: Some("ABCDE12345".to_owned()),
             identifier: Some("to.kala.reach.companion".to_owned()),
             ad_hoc: false,
+            valid: true,
             refusal: None,
         }
+    }
+
+    #[test]
+    fn a_signature_the_platform_would_not_verify_is_not_stable() {
+        let unverified = Signature {
+            valid: false,
+            ..signed()
+        };
+        assert!(!unverified.is_durable());
+        let said = unstable(
+            "/Applications/KalaReach.app/Contents/MacOS/kalareach-companion",
+            true,
+            &unverified,
+        )
+        .expect("a signature the platform did not verify is not stable");
+        assert!(said.contains("did not verify"));
+        assert!(said.contains("changed after it was signed"));
     }
 
     #[test]
