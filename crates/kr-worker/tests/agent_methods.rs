@@ -1689,3 +1689,60 @@ fn kr_req_11_33_a_resolved_resource_leaves_the_rich_answer_nothing_to_admit() {
         "and the resolution the native answer made is the one that stands"
     );
 }
+
+/// KR-REQ-11.27 and KR-REQ-24.24: an admission that is abandoned before its bytes leaves the
+/// resource answerable, because the reservation and the dispatch marker are two moments.
+#[test]
+fn kr_req_11_27_an_abandoned_answer_leaves_the_resource_answerable() {
+    let upstream = std::sync::Arc::new(RecordingUpstream::default());
+    let broker = agent_broker_with(std::sync::Arc::clone(&upstream));
+    let opaque = broker
+        .forward_native(
+            GatewayConnectionId::new(1),
+            br#"{"id":11,"method":"session/request_permission"}"#,
+            TimestampMs::new(2),
+        )
+        .expect("forwarded")
+        .1
+        .expect("it expects a response");
+    let resource = broker
+        .interpret(
+            binding(),
+            opaque.resource_id,
+            projection(),
+            None,
+            TimestampMs::new(3),
+        )
+        .expect("interpreted");
+    let params = AgentApprovalRespondParams {
+        target: target(1),
+        resource_id: resource.resource_id,
+        option_id: "allow".to_owned(),
+    };
+
+    let admitted = broker
+        .admit_approval(&caller(), &params, TimestampMs::new(4))
+        .expect("the answer is admitted");
+    broker.abandon(&admitted);
+    assert!(!admitted.executable(), "the permit is gone");
+    assert!(
+        upstream.submitted().is_empty(),
+        "an abandoned admission sent nothing"
+    );
+    assert_eq!(
+        broker
+            .pending(resource.resource_id)
+            .expect("retained")
+            .state,
+        PendingState::Pending,
+        "and the resource is answerable again"
+    );
+
+    // Which the next answer proves: it admits, transmits and settles.
+    let answered = broker
+        .agent_approval_respond(&caller(), &params, TimestampMs::new(5))
+        .expect("the next answer is applied")
+        .0;
+    assert_eq!(answered.state, PendingState::Resolved);
+    assert_eq!(upstream.submitted().len(), 1);
+}

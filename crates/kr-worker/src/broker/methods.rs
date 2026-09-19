@@ -835,8 +835,12 @@ impl Broker {
             .ok_or_else(|| BrokerError::invalid("this admission holds no claim"))?;
         // The marker goes in immediately before the bytes. Everything that could refuse this
         // answer has already refused it, so what remains after this point is the transport's own
-        // failure, which is what uncertainty is for.
-        self.commit_dispatch(&claim, now)?;
+        // failure, which is what uncertainty is for. A marker this host could not write has sent
+        // nothing, so the reservation goes back and the resource stays answerable.
+        if let Err(error) = self.commit_dispatch(&claim, now) {
+            let _ = self.release_claim(&claim, now);
+            return Err(error);
+        }
         let outcome = match permit.dispatch.submit(&permit.request) {
             Ok(outcome) => outcome,
             Err(error) => {

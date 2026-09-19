@@ -125,6 +125,8 @@ pub struct Transition {
     dispatched: bool,
     /// The writer this transition admits to transmit, when it admits one.
     transmitter: Option<Transmitter>,
+    /// True when this transition gives the resource's transmission admission back.
+    releases_transmitter: bool,
 }
 
 impl Transition {
@@ -386,6 +388,7 @@ impl Arbitration {
             holds_claim: true,
             dispatched: false,
             transmitter: None,
+            releases_transmitter: false,
         })
     }
 
@@ -414,6 +417,7 @@ impl Arbitration {
             holds_claim: true,
             dispatched: false,
             transmitter: Some(Transmitter::Rich(claim.claim_id)),
+            releases_transmitter: false,
         })
     }
 
@@ -439,6 +443,7 @@ impl Arbitration {
             holds_claim: true,
             dispatched: true,
             transmitter: Some(Transmitter::Rich(claim.claim_id)),
+            releases_transmitter: false,
         })
     }
 
@@ -484,6 +489,7 @@ impl Arbitration {
             holds_claim: false,
             dispatched: true,
             transmitter: Some(Transmitter::Native),
+            releases_transmitter: false,
         })
     }
 
@@ -516,6 +522,7 @@ impl Arbitration {
             holds_claim: false,
             dispatched: true,
             transmitter: None,
+            releases_transmitter: false,
         })
     }
 
@@ -531,7 +538,11 @@ impl Arbitration {
         if pending.dispatched {
             return Err(BrokerError::Arbitration(ArbitrationError::AlreadyClaimed));
         }
-        self.plan_from_claim(claim, PendingState::Pending, false)
+        // The reservation goes back with the claim. A resource whose transmission admission was
+        // still held by a writer that sent nothing would be answerable by nobody.
+        let mut transition = self.plan_from_claim(claim, PendingState::Pending, false)?;
+        transition.releases_transmitter = true;
+        Ok(transition)
     }
 
     /// Plans the resolution of a claimed resource: the upstream confirmed the answer.
@@ -593,6 +604,7 @@ impl Arbitration {
             holds_claim: false,
             dispatched: pending.dispatched,
             transmitter: None,
+            releases_transmitter: false,
         })
     }
 
@@ -618,7 +630,9 @@ impl Arbitration {
             None
         };
         pending.dispatched = pending.dispatched || transition.dispatched;
-        if let Some(admitted) = transition.transmitter {
+        if transition.releases_transmitter {
+            pending.transmitter = None;
+        } else if let Some(admitted) = transition.transmitter {
             pending.transmitter = Some(admitted);
         }
         Ok(pending.resource.clone())
@@ -708,6 +722,7 @@ impl Arbitration {
                 holds_claim: false,
                 dispatched: pending.dispatched,
                 transmitter: None,
+                releases_transmitter: false,
             });
         }
         (result, transitions)
@@ -816,6 +831,7 @@ impl Arbitration {
             holds_claim: false,
             dispatched,
             transmitter: None,
+            releases_transmitter: false,
         })
     }
 
