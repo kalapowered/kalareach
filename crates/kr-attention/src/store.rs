@@ -39,11 +39,12 @@
 //!
 //! Every interval the engine measures is measured on the boot-scoped continuous clock, which means
 //! nothing after a restart. So the store records the wall-clock moments instead - when an item was
-//! first seen, when it was last announced, when a request became pending - and
-//! [`crate::host::Attention::open`] re-anchors each interval against the reading it opened at. A
-//! host that can prove its wall clock keeps an item's escalation where it was, including an
-//! interval that is already overdue; one that cannot starts the intervals again, which is the
-//! conservative answer rather than arithmetic on a clock nobody can vouch for.
+//! first seen, when it was last announced, when a request became pending - and, beside each one,
+//! whether the clock that stamped it could be proved. [`crate::host::Attention::open`] re-anchors
+//! each interval against the reading it opened at, and only where both ends were taken on a clock
+//! somebody could vouch for: this reading, and the moment itself. Every other interval starts
+//! again, which is the conservative answer rather than arithmetic across two clocks that were
+//! never on one scale.
 //!
 //! # What a stored value may not do
 //!
@@ -469,11 +470,12 @@ impl Store {
         })
     }
 
-    /// Returns whether this store has never had any state written to it.
+    /// Returns whether this store holds no state at all.
     ///
-    /// Every table one write replaces is asked, because any row in any of them means the state was
-    /// written under a secret, a key derivation and a schema this build has to be able to read
-    /// back exactly.
+    /// Every table one write replaces is asked, because a row in any of them was written under a
+    /// secret, a key derivation and a schema this build has to be able to read back exactly. It
+    /// answers about what is there now rather than about what was ever written: a store whose rows
+    /// have all been removed is empty, and nothing in it needs a secret to name.
     fn is_empty(&self) -> Result<bool> {
         for table in TABLES {
             let held: i64 = self.connection.query_row(

@@ -1239,10 +1239,12 @@ rounded up to the next time the host happened to look.
 
 Every interval the engine measures needs both of its ends on a clock somebody could vouch for: the
 reading it holds now, and the moment it is measuring from. An event says whether the producer could
-vouch for the clock that stamped it, and one that does not say is taken not to know, so the
-interval is measured inside the event's own moments or started again. Both answers make a reminder
-late; the arithmetic across two clocks that were never on one scale would make it immediate, and a
-reminder raised seconds after a request because a clock was corrected is the failure that matters.
+vouch for each moment it carries, separately, because a request can become pending long before the
+record of it is written and a clock can be corrected in between. A moment nobody vouched for is not
+measured from at all: the interval starts where the host read the record. Every answer but the
+vouched one is nought or less than the true wait, never more, because a reminder that comes late is
+still a reminder, and one raised seconds after a request because somebody corrected a clock is an
+interruption nobody earned.
 
 ### The rule set
 
@@ -1372,8 +1374,9 @@ session's life says where it is starting rather than leaving the first record to
 eviction.
 
 A rebuild announces nothing. An event from an hour ago is history rather than a notification to
-send now, so the replay restores the items with the ages they had and the first timer pass after it
-decides what still needs saying.
+send now, so the replay restores each item with the age it had, where the producer vouched for the
+moment that age is measured from, and starts the age here where nobody did. Either way the first
+timer pass after the rebuild decides what still needs saying.
 
 The inbox is a working set rather than a record: the receipts, the question ledger and the retained
 output are where the history lives. Past five hundred items the host lets go of its least urgent

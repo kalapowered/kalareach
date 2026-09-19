@@ -553,6 +553,7 @@ pub fn question_event(sequence: u64, event: &kr_protocol::question::QuestionEven
             session_id: event.question.session_id,
             verified: event.question.source.session_member,
             pending_since_ms: event.pending_since_ms,
+            pending_since_proven: false,
             summary: event.question.question.clone(),
         },
         kr_protocol::question::QuestionEventKind::Answered => EventKind::QuestionResolved {

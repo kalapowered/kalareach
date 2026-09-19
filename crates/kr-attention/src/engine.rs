@@ -90,12 +90,13 @@ pub struct Item {
     pub notification: NotificationState,
     /// When the last announcement was decided, when there has been one.
     pub last_notified_ms: Option<TimestampMs>,
-    /// Whether the clock was proved when this item's own moments were stamped.
+    /// Whether the producer could prove the clock that stamped [`Item::first_seen_ms`].
     ///
-    /// [`Item::first_seen_ms`] is what an interval measured against the present starts from, and a
-    /// host that could not prove its clock when it consumed the event cannot say what that moment
-    /// means on a clock it can prove later. So the two are kept together: an age is measured only
-    /// when both ends were taken on a clock somebody could vouch for, and starts again otherwise.
+    /// That moment is what an age measured against the present starts from, and it belongs to the
+    /// producer that recorded the condition rather than to the host that read the record. A moment
+    /// nobody vouched for cannot be subtracted from a clock this host can prove: the two are not
+    /// on one scale, and the difference would be whatever separates them. So the two are kept
+    /// together, and an age with an anchor nobody vouched for starts again.
     pub anchor_wall_proven: bool,
     /// Whether the clock that stamped [`Item::last_notified_ms`] could be proved at the time.
     ///
@@ -294,10 +295,11 @@ pub struct PendingInput {
     pub waited: Elapsed,
     /// Whether the reminder has already been raised for this request.
     pub reminded: bool,
-    /// Whether the clock was proved when [`PendingInput::pending_since_ms`] was taken.
+    /// Whether the producer could prove the clock that stamped
+    /// [`PendingInput::pending_since_ms`].
     ///
-    /// The five-minute reminder is measured from that moment, so a host that could not prove its
-    /// clock then cannot measure against it once it can. The wait starts again instead, which
+    /// The five-minute reminder is measured from that moment. A moment nobody vouched for cannot
+    /// be subtracted from a clock this host can prove, so the wait starts again instead, which
     /// raises the reminder late rather than at once.
     pub anchor_wall_proven: bool,
 }
@@ -573,9 +575,11 @@ impl Engine {
 
     /// Rebuilds state from one retained event without announcing anything.
     ///
-    /// This is the reconstruction path. An item's age is taken from the event's own recorded time,
-    /// so an approval that has been outstanding for an hour comes back an hour old, and nothing is
-    /// announced for something that happened before this host was running. The first
+    /// This is the reconstruction path. An item's age is taken from the event's own recorded time
+    /// when the producer vouched for the clock that stamped it, so an approval that has been
+    /// outstanding for an hour comes back an hour old; an event that vouched for nothing starts
+    /// its age here instead. Either way nothing is announced for something that happened before
+    /// this host was running. The first
     /// [`Engine::tick`] after a replay decides every announcement against the present.
     pub fn replay(&mut self, event: &SourceEvent, reading: HostReading) -> Vec<Outcome> {
         self.consume(event, reading, Mode::Replay)
@@ -826,6 +830,7 @@ impl Engine {
                 session_id,
                 verified,
                 pending_since_ms,
+                pending_since_proven,
                 summary,
             } => {
                 if !*verified {
@@ -834,7 +839,13 @@ impl Engine {
                     // not admit is a claim rather than a request.
                     return Vec::new();
                 }
-                let waited = Self::waited(*pending_since_ms, event.at_ms, event.at_proven, reading);
+                let waited = Self::waited(
+                    *pending_since_ms,
+                    *pending_since_proven,
+                    event.at_ms,
+                    event.at_proven,
+                    reading,
+                );
                 self.bound_pending_inputs(*question_id);
                 self.pending_inputs.insert(
                     *question_id,
@@ -844,7 +855,7 @@ impl Engine {
                         pending_since_ms: *pending_since_ms,
                         waited: Elapsed::already(waited, reading),
                         reminded: false,
-                        anchor_wall_proven: event.at_proven,
+                        anchor_wall_proven: *pending_since_proven,
                     },
                 );
                 self.raise(
@@ -1011,23 +1022,34 @@ impl Engine {
 
     /// Returns how long a request has been pending at this reading.
     ///
-    /// Measuring against the clock this host reads now counts the delay between the producer
-    /// recording the event and the engine consuming it, which is part of the wait. It is only
-    /// arithmetic anybody can trust when both ends were taken on a clock somebody could vouch for:
-    /// this reading, and the moment the event names. Where either cannot be vouched for, the wait
-    /// is measured inside the event's own moments, which are one producer's readings of one clock
-    /// whatever anyone could prove about it. That understates the wait rather than inventing one.
+    /// Both ends of an interval have to be on a clock somebody could vouch for, and each end is
+    /// asked about on its own. The moment it starts from is the one that has to be vouched for
+    /// first: without it there is nothing to measure against, whatever else can be proved, so the
+    /// interval starts here. With it, the reading this host holds is preferred, because the delay
+    /// between the producer recording the event and the engine consuming it is part of the wait;
+    /// failing that, the event's own recorded moment, when the producer vouched for that too.
+    /// Every fallback is nought or less than the true wait, never more: a reminder that comes late
+    /// is a reminder, and one that comes at once because a clock moved is an interruption nobody
+    /// earned.
     fn waited(
         since: TimestampMs,
+        since_proven: bool,
         at_ms: TimestampMs,
         at_proven: bool,
         reading: HostReading,
     ) -> u64 {
-        if reading.wall_proven && at_proven {
-            reading.wall_ms.get().saturating_sub(since.get())
-        } else {
-            at_ms.get().saturating_sub(since.get())
+        if !since_proven {
+            // Nobody can say what the moment the interval starts from means, so there is no
+            // interval to measure. It starts here instead.
+            return 0;
         }
+        if reading.wall_proven {
+            return reading.wall_ms.get().saturating_sub(since.get());
+        }
+        if at_proven {
+            return at_ms.get().saturating_sub(since.get());
+        }
+        0
     }
 
     fn raise(&mut self, raise: Raise, reading: HostReading, mode: Mode) -> Vec<Outcome> {
@@ -1097,7 +1119,13 @@ impl Engine {
             pending_handoff: None,
             uncertain: false,
             age: Elapsed::already(
-                Self::waited(raise.at_ms, raise.at_ms, raise.at_proven, reading),
+                Self::waited(
+                    raise.at_ms,
+                    raise.at_proven,
+                    raise.at_ms,
+                    raise.at_proven,
+                    reading,
+                ),
                 reading,
             ),
             since_notified: None,

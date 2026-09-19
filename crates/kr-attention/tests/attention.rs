@@ -114,6 +114,9 @@ fn pending_question(
             session_id: session(1),
             verified,
             pending_since_ms: TimestampMs::new(NOON + pending_since_ms),
+            // The producer vouched for the clock it stamped the moment on, which is what lets the
+            // wait be measured from there. The tests about a clock nobody vouched for say so.
+            pending_since_proven: true,
             summary: "which branch?".to_owned(),
         },
     )
@@ -3314,6 +3317,8 @@ fn a_request_stamped_on_an_unprovable_clock_does_not_come_back_five_minutes_old(
                         session_id: session(1),
                         verified: true,
                         pending_since_ms: TimestampMs::new(1_000),
+                        // Nobody vouched for the clock that stamped it, which is the whole case.
+                        pending_since_proven: false,
                         summary: "which branch?".to_owned(),
                     },
                 ),
@@ -3399,6 +3404,7 @@ fn a_moment_no_producer_vouched_for_is_not_measured_against_this_host_s_proved_c
                     session_id: session(1),
                     verified: true,
                     pending_since_ms: TimestampMs::new(NOON),
+                    pending_since_proven: false,
                     summary: "which branch?".to_owned(),
                 },
             ),
@@ -3425,6 +3431,7 @@ fn a_moment_no_producer_vouched_for_is_not_measured_against_this_host_s_proved_c
                     session_id: session(1),
                     verified: true,
                     pending_since_ms: TimestampMs::new(NOON),
+                    pending_since_proven: true,
                     summary: "which branch?".to_owned(),
                 },
             ),

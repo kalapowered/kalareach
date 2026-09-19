@@ -99,6 +99,14 @@ pub enum EventKind {
         verified: bool,
         /// When it became pending, which is where the idle interval counts from.
         pending_since_ms: TimestampMs,
+        /// Whether the clock that stamped [`EventKind::QuestionPending::pending_since_ms`] could
+        /// be proved at the time.
+        ///
+        /// It is asked about separately from [`SourceEvent::at_proven`] because it is a different
+        /// moment: a request can become pending long before the record of it is written, and a
+        /// clock can be corrected in between. One producer reading one clock twice does not put
+        /// two readings on one scale if somebody moved the clock between them.
+        pending_since_proven: bool,
         /// One line naming what is being asked.
         summary: String,
     },
