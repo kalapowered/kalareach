@@ -11,10 +11,10 @@ use kr_attention::rule::{ADAPTER_ESCALATION_MS, REMINDER_INTERVAL_MS, RULES, rul
 use kr_attention::{Attention, Content, HostReading};
 use kr_protocol::attention::{
     AttentionItem, AttentionKey, AttentionLevel, AttentionReadParams, AttentionRouting,
-    AttentionRule, AttentionSource, IDLE_REMINDER_MS, LogViewState, MAX_ATTENTION_SUMMARY_LEN,
-    MAX_RETAINED_ACTORS, MAX_RETAINED_ATTENTION_ITEMS, MAX_RETAINED_LOG_VIEWS,
-    MAX_RETAINED_PENDING_INPUTS, MAX_REVIEW_SUBJECTS, NotificationState, QuietHours, ReviewState,
-    ReviewSubject,
+    AttentionRule, AttentionSource, DEDUPLICATION_WINDOW_MS, IDLE_REMINDER_MS, LogViewState,
+    MAX_ATTENTION_SUMMARY_LEN, MAX_RETAINED_ACTORS, MAX_RETAINED_ATTENTION_ITEMS,
+    MAX_RETAINED_LOG_VIEWS, MAX_RETAINED_PENDING_INPUTS, MAX_REVIEW_SUBJECTS, NotificationState,
+    QuietHours, ReviewState, ReviewSubject,
 };
 use kr_protocol::ids::{
     ActorId, AgentTurnId, ApprovalRequestId, ChangeSetId, PluginId, QuestionId, SessionId,
@@ -166,6 +166,15 @@ fn deliver(attention: &mut Attention) {
     attention
         .settle_announcements(&taken)
         .expect("the store records the settlements");
+}
+
+/// The body of the notice this index raises, so a key and its event agree.
+fn notice_body(sequence: u64) -> String {
+    if sequence == 1 {
+        "the first notice".to_owned()
+    } else {
+        format!("notice {sequence}")
+    }
 }
 
 /// The key an unidentified notice of session one lands on.
@@ -2062,8 +2071,10 @@ fn a_fresh_notice_does_not_displace_an_urgent_approval_merely_by_being_newest() 
     // The notice's own decision is taken first: a decision nobody has recorded is work in flight,
     // and weighing the item against the rest is what happens once it is a record of a condition.
     deliver(&mut attention);
+    // Past the notice's own de-duplication window, so its item is a record of a condition rather
+    // than the only thing that remembers the window.
     let outcomes = attention
-        .tick(reading(bound * 61_000 + 1))
+        .tick(reading(bound * 61_000 + DEDUPLICATION_WINDOW_MS + 1))
         .expect("the store records the decision");
     assert!(
         outcomes
@@ -2963,4 +2974,152 @@ fn a_new_version_does_not_move_a_subject_under_a_page_that_is_continuing() {
         next[0].subject,
         ReviewSubject::ChangeSet { change_set_id, .. } if change_set_id == second
     ));
+}
+
+// ----- What retention may not take from a decision --------------------------------------------
+
+#[test]
+fn a_settled_decision_is_kept_until_its_window_has_run() {
+    // The item is the whole of what the engine remembers a de-duplication window by. Letting go of
+    // one inside its window would announce the same condition twice in under a minute.
+    let mut attention = engine();
+    let bound = MAX_RETAINED_ATTENTION_ITEMS;
+    let first = notice_key("the first notice");
+    for sequence in 1..=bound + 1 {
+        attention
+            .apply(
+                &notice(sequence, sequence, &notice_body(sequence), false),
+                reading(1_000),
+            )
+            .expect("the store records the decision");
+    }
+    // Every decision has been recorded by a consumer, so nothing is waiting on delivery.
+    deliver(&mut attention);
+    let inside = attention
+        .tick(reading(2_000))
+        .expect("the store records the decision");
+    assert!(
+        !inside
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Dropped { .. })),
+        "nothing is let go of inside its own window: {inside:?}"
+    );
+    assert!(whole_inbox(&attention).iter().any(|item| item.key == first));
+
+    // Past the window it is a record of a condition, and the bound may have it.
+    let outside = attention
+        .tick(reading(DEDUPLICATION_WINDOW_MS + 2_000))
+        .expect("the store records the decision");
+    assert!(
+        outside
+            .iter()
+            .any(|outcome| matches!(outcome, Outcome::Dropped { .. })),
+        "and past it the bound bites: {outside:?}"
+    );
+}
+
+// ----- A record arriving late -----------------------------------------------------------------
+
+#[test]
+fn a_turn_version_the_host_already_holds_reopens_no_review_and_announces_nothing() {
+    let mut attention = engine();
+    let who = actor("local:501");
+    attention
+        .apply(&turn_completed(1, 1_000, 2), reading(0))
+        .expect("the store records the decision");
+    let subject = ReviewSubject::CompletedTurn {
+        session_id: session(1),
+        turn_id: AgentTurnId::new("turn-1").expect("an identifier"),
+    };
+    attention
+        .acknowledge_review(&who, &subject, 2, reading(1_000))
+        .expect("the actor reads it");
+    assert!(
+        attention.inbox(&who, false, Content::Whole).is_empty(),
+        "the review is complete, so nothing is waiting for this actor"
+    );
+    let before = attention
+        .changed_since(&who, 500, 0, Content::Whole)
+        .changes
+        .len();
+
+    // The same turn at a version the host has already passed, arriving late under its own cursor.
+    let outcomes = attention
+        .apply(&turn_completed(2, 2_000, 1), reading(2_000))
+        .expect("the store records the decision");
+    assert!(
+        raised(&outcomes).is_empty() && notified(&outcomes).is_empty(),
+        "a record the host already holds is consumed and nothing else: {outcomes:?}"
+    );
+    assert!(
+        attention.inbox(&who, false, Content::Whole).is_empty(),
+        "and the completed review stays complete"
+    );
+    assert_eq!(
+        attention
+            .changed_since(&who, 500, 0, Content::Whole)
+            .changes
+            .len(),
+        before,
+        "a version nobody moved is not a change since a visit"
+    );
+    let state = attention
+        .reviews()
+        .state(&who, &subject)
+        .expect("the subject is still there");
+    assert_eq!(state.current_version, U64::new(2));
+    assert!(!state.outstanding);
+    // And it was consumed: the next event is not read as a range retention took.
+    assert_eq!(
+        attention.engine().consumed(AttentionSource::Semantic),
+        Some(2)
+    );
+}
+
+#[test]
+fn a_subject_recorded_after_a_reopen_takes_the_next_place_in_the_page() {
+    let directory = tempfile::tempdir().expect("a temporary directory");
+    let path = directory.path().join("attention.db");
+    let captured = |sequence: u64, byte: u8| {
+        event(
+            AttentionSource::Semantic,
+            sequence,
+            1_000 + sequence,
+            EventKind::ChangeSetCaptured {
+                session_id: session(1),
+                change_set_id: ChangeSetId::new(Uuid::from_bytes([byte; 16])),
+                version: 1,
+                summary: "rewrote the parser".to_owned(),
+            },
+        )
+    };
+    {
+        let mut attention = Attention::open(&path, reading(0)).expect("the feature store opens");
+        attention
+            .apply(&captured(1, 1), reading(0))
+            .expect("the store records the decision");
+    }
+    let mut reopened = Attention::open(&path, reading(1_000)).expect("the feature store reopens");
+    reopened
+        .apply(&captured(2, 2), reading(1_000))
+        .expect("the store records the decision");
+    let (page, more) = reopened
+        .review_states(&actor("local:501"), session(1), None, MAX_REVIEW_SUBJECTS)
+        .expect("a page from the oldest");
+    assert!(!more);
+    let order: Vec<_> = page
+        .iter()
+        .map(|state| match &state.subject {
+            ReviewSubject::ChangeSet { change_set_id, .. } => *change_set_id,
+            ReviewSubject::CompletedTurn { .. } => panic!("a change set was recorded"),
+        })
+        .collect();
+    assert_eq!(
+        order,
+        vec![
+            ChangeSetId::new(Uuid::from_bytes([1; 16])),
+            ChangeSetId::new(Uuid::from_bytes([2; 16]))
+        ],
+        "the one recorded after the reopen takes the place after it, not beside it"
+    );
 }

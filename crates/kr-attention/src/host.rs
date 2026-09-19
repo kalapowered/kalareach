@@ -570,6 +570,16 @@ fn consume(
         .engine
         .consumed(event.cursor.source)
         .is_none_or(|consumed| event.cursor.sequence > consumed);
+    // A turn the host already holds at this version or later is a record it has, not review work
+    // it has been given. The engine is told the record was consumed and nothing more, so a late
+    // event cannot reopen an inbox item whose review is complete.
+    let consumed_only;
+    let event = if reopens_nothing(state, event) {
+        consumed_only = SourceEvent::new(event.cursor, event.at_ms, EventKind::Observed);
+        &consumed_only
+    } else {
+        event
+    };
     let produced = if replay {
         state.engine.replay(event, reading)
     } else {
@@ -580,6 +590,30 @@ fn consume(
     if fresh {
         record_semantics(state, event);
     }
+}
+
+/// Whether this event names a completed turn at a version the host already holds.
+///
+/// The versions only go forward, so an event naming one the host has reached is a record arriving
+/// late rather than new review work. Raising its item again would reopen a review an actor has
+/// already completed, and announce it a second time once the rule's window had passed.
+fn reopens_nothing(state: &State, event: &SourceEvent) -> bool {
+    let EventKind::TurnCompleted {
+        session_id,
+        turn_id,
+        version,
+        ..
+    } = &event.kind
+    else {
+        return false;
+    };
+    state
+        .reviews
+        .version_of(&ReviewSubject::CompletedTurn {
+            session_id: *session_id,
+            turn_id: turn_id.clone(),
+        })
+        .is_some_and(|held| held >= *version)
 }
 
 /// Puts every gap the engine recorded where a visit can see it.
@@ -601,7 +635,7 @@ fn record_semantics(state: &mut State, event: &SourceEvent) {
             change_set,
             summary,
         } => {
-            state.reviews.record_version(
+            let turn_moved = state.reviews.record_version(
                 ReviewSubject::CompletedTurn {
                     session_id: *session_id,
                     turn_id: turn_id.clone(),
@@ -609,15 +643,18 @@ fn record_semantics(state: &mut State, event: &SourceEvent) {
                 *version,
                 event.at_ms,
             );
-            if let Some((change_set_id, change_set_version)) = change_set {
-                state.reviews.record_version(
+            // Each version is weighed on its own: a turn arriving late beside a change set the
+            // host has not seen records the change set and nothing else.
+            if let Some((change_set_id, change_set_version)) = change_set
+                && state.reviews.record_version(
                     ReviewSubject::ChangeSet {
                         session_id: *session_id,
                         change_set_id: *change_set_id,
                     },
                     *change_set_version,
                     event.at_ms,
-                );
+                )
+            {
                 state.visits.record(
                     SemanticChangeKind::ChangeSetCaptured,
                     *session_id,
@@ -625,12 +662,14 @@ fn record_semantics(state: &mut State, event: &SourceEvent) {
                     event.at_ms,
                 );
             }
-            state.visits.record(
-                SemanticChangeKind::TurnCompleted,
-                *session_id,
-                summary.clone(),
-                event.at_ms,
-            );
+            if turn_moved {
+                state.visits.record(
+                    SemanticChangeKind::TurnCompleted,
+                    *session_id,
+                    summary.clone(),
+                    event.at_ms,
+                );
+            }
         }
         EventKind::ChangeSetCaptured {
             session_id,
@@ -638,20 +677,21 @@ fn record_semantics(state: &mut State, event: &SourceEvent) {
             version,
             summary,
         } => {
-            state.reviews.record_version(
+            if state.reviews.record_version(
                 ReviewSubject::ChangeSet {
                     session_id: *session_id,
                     change_set_id: *change_set_id,
                 },
                 *version,
                 event.at_ms,
-            );
-            state.visits.record(
-                SemanticChangeKind::ChangeSetCaptured,
-                *session_id,
-                summary.clone(),
-                event.at_ms,
-            );
+            ) {
+                state.visits.record(
+                    SemanticChangeKind::ChangeSetCaptured,
+                    *session_id,
+                    summary.clone(),
+                    event.at_ms,
+                );
+            }
         }
         EventKind::CommandCompleted {
             session_id,

@@ -222,6 +222,13 @@ pub struct WorkerService {
     questions: Arc<crate::questions::Questions>,
     /// Section 25's attention engine, its feature store and the review state beside it.
     attention: Arc<crate::attention::Attention>,
+    /// What tells the host's own maintenance that the attention engine has something to do now.
+    ///
+    /// Maintenance works out how long to wait once and then waits, so a change that brings the
+    /// engine's next deadline forward - clearing a quiet-hours window that is holding an
+    /// announcement, most of all - would otherwise not be acted on until that wait ended. There is
+    /// one waiter, and a signal raised while it is between waits is kept for the next one.
+    attention_wake: tokio::sync::Notify,
     build_id: kr_protocol::ids::BuildId,
 }
 
@@ -320,6 +327,7 @@ impl WorkerService {
             identity,
             endpoint,
             attention,
+            attention_wake: tokio::sync::Notify::new(),
             environment_id: binding.environment_id,
             boot_identity: binding.boot_identity,
             boot_epoch,
@@ -457,10 +465,14 @@ impl WorkerService {
                     tokio::select! {
                         () = tokio::time::sleep(wait) => {}
                         _ = tick.tick() => {}
+                        () = self.attention_wake.notified() => {}
                     }
                 }
                 None => {
-                    tick.tick().await;
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        () = self.attention_wake.notified() => {}
+                    }
                 }
             }
         }
@@ -3227,7 +3239,8 @@ impl WorkerService {
             // about. A subject this session never held, a version nobody produced, a counter the
             // store could not write down as it was given, a window that is not minutes of a day
             // and one more actor than the store admits are refusals rather than outcomes nobody
-            // can establish, so they are answered here rather than inside the effect.
+            // can establish, so they are answered here, before the dispatch marker, rather than
+            // failing inside the effect and settling as an outcome nobody can establish.
             Method::AttentionAcknowledge => self.attention.check_actor(&caller.actor_id),
             Method::ReviewAcknowledge => {
                 let params: kr_protocol::attention::ReviewAcknowledgeParams =
@@ -3982,6 +3995,12 @@ impl WorkerService {
             Method::AttentionQuietHours => {
                 let params: kr_protocol::attention::AttentionQuietHoursParams = parse(params)?;
                 let result = self.attention.set_quiet_hours(&params, session.time())?;
+                // The window is recorded; what it lets through is a timer decision, and the
+                // engine's next deadline has just moved. Maintenance is waiting on the one it
+                // worked out before that, so it is woken to work it out again. The permit is
+                // stored when maintenance is between waits, so a change made in that moment wakes
+                // the next one rather than being missed.
+                self.attention_wake.notify_one();
                 Ok((encode(&result)?, AfterEffect::None))
             }
             Method::ReviewAcknowledge => {

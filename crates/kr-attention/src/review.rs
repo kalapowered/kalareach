@@ -185,6 +185,14 @@ impl Reviews {
             .expect("the subject was just read"))
     }
 
+    /// Returns the version the host holds of one subject, when it holds one.
+    #[must_use]
+    pub fn version_of(&self, subject: &ReviewSubject) -> Option<u64> {
+        self.subjects
+            .get(&subject_key(subject))
+            .map(|held| held.version)
+    }
+
     /// Returns one actor's state for one subject.
     #[must_use]
     pub fn state(&self, actor: &ActorId, subject: &ReviewSubject) -> Option<ReviewState> {

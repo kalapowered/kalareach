@@ -58,12 +58,17 @@ pub const MINUTES_IN_DAY: u64 = 1_440;
 /// Largest number of items one attention read returns.
 pub const MAX_ATTENTION_ITEMS: u64 = 200;
 
-/// Largest number of items the host keeps in one session's inbox.
+/// Where the host starts letting go of items in one session's inbox.
 ///
 /// The inbox is a working set rather than a record: the receipts, the question ledger and the
-/// retained output are where the history lives. Past this bound the host drops the least urgent
-/// and oldest item and counts it in [`AttentionReadResult::dropped`], because an inbox that grows
-/// without limit is one the host cannot write down or serve.
+/// retained output are where the history lives. Past this figure the host lets go of its least
+/// urgent and oldest item and counts it in [`AttentionReadResult::dropped`].
+///
+/// It is a figure rather than a ceiling, because what it may let go of is a *record* of a
+/// condition. A condition somebody is still waiting on, a decision no delivery consumer has
+/// recorded, a decision quiet hours are holding and a decision whose de-duplication window is
+/// still running are all kept, and an inbox made of those goes over this figure rather than
+/// answering that nothing is waiting.
 pub const MAX_RETAINED_ATTENTION_ITEMS: u64 = 500;
 
 /// Largest summary one item or change carries, in bytes.

@@ -557,7 +557,7 @@ impl Engine {
         // Last, because what the bound may let go of is decided by what has just been announced
         // and by what a consumer has settled since the last pass. An inbox that went over its
         // bound while everything in it was work in flight comes back inside it here.
-        outcomes.extend(self.enforce_bound());
+        outcomes.extend(self.enforce_bound(reading));
         outcomes
     }
 
@@ -1028,7 +1028,7 @@ impl Engine {
             rule: raise.id,
             level,
         });
-        outcomes.extend(self.enforce_bound());
+        outcomes.extend(self.enforce_bound(reading));
         if mode == Mode::Live && self.items.contains_key(&key) {
             outcomes.extend(self.announce(&key, reading, false));
         }
@@ -1045,9 +1045,9 @@ impl Engine {
     ///
     /// Four things are never let go of: a condition somebody or something is still waiting on, a
     /// decision no delivery consumer has settled, a decision quiet hours are holding, and a
-    /// condition nobody has decided about yet, which is what an item is between arriving and being
-    /// announced.
-    fn enforce_bound(&mut self) -> Vec<Outcome> {
+    /// decision whose de-duplication window is still running - which includes a condition nobody
+    /// has decided about at all, because that window has not started.
+    fn enforce_bound(&mut self, reading: HostReading) -> Vec<Outcome> {
         let bound = usize::try_from(MAX_RETAINED_ATTENTION_ITEMS).unwrap_or(usize::MAX);
         let mut outcomes = Vec::new();
         while self.items.len() > bound {
@@ -1055,16 +1055,21 @@ impl Engine {
                 .items
                 .values()
                 .filter(|item| {
-                    // Three of these are not a record of a condition but work in flight, and
+                    let policy = rule(item.rule);
+                    // Four of these are not a record of a condition but work in flight, and
                     // letting go of one loses something nothing will offer again: a decision
-                    // nobody has taken responsibility for, a decision quiet hours are holding,
-                    // and a condition nobody has decided about at all. The last is what a fresh
-                    // item is until it is announced, and what every replayed item is until the
-                    // first tick after the rebuild.
-                    rule(item.rule).droppable
+                    // nobody has taken responsibility for, a decision quiet hours are holding, a
+                    // condition nobody has decided about at all - which is what a fresh item is
+                    // until it is announced, and what every replayed item is until the first tick
+                    // after a rebuild - and a decision whose de-duplication window is still
+                    // running, because the item is the whole of what the engine remembers that
+                    // window by and the same condition would be announced twice inside it.
+                    policy.droppable
                         && item.pending_handoff.is_none()
                         && !item.deferred
-                        && item.since_notified.is_some()
+                        && item
+                            .since_notified
+                            .is_some_and(|since| since.ms(reading) >= policy.dedup_window_ms)
                 })
                 .min_by(|left, right| {
                     left.level

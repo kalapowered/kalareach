@@ -1273,10 +1273,10 @@ is the condition it was about ending, which is a cancellation rather than a loss
 waiting on the person any more.
 
 Setting or clearing the window records it and announces nothing by itself. What the change lets
-through is released by the next timer pass, which the host is told to run at once while anything is
-deferred. That is what keeps a release a decision about the present: announcing inside the setter
-would decide against whatever history the host had read at the moment somebody happened to change a
-setting.
+through is released by the next timer pass, and the change wakes maintenance rather than waiting
+for its next tick, so the release follows the setting rather than the minute. That is what keeps a
+release a decision about the present: announcing inside the setter would decide against whatever
+history the host had read at the moment somebody happened to change a setting.
 
 The window is minutes of the UTC day, so the host needs no time-zone database to decide whether it
 is inside one. A client converts its own local window before it sets one and may record the zone it
@@ -1288,6 +1288,11 @@ Setting the window is host management rather than session view authority, becaus
 suppresses the owner's delivery rather than one actor's.
 
 ### Review, and what it does not do
+
+A version only goes forward. A record of a turn or a change set at a version the host has already
+reached is a record arriving late rather than new review work: it moves the source's cursor, so
+what follows it is not read as a range retention took, and it raises nothing, reopens no completed
+review and is not a change since anybody's visit.
 
 A review acknowledgement records that one actor read one version of one subject: a completed turn,
 or a captured change set. It approves no command, applies no patch and changes no Git state.
@@ -1360,15 +1365,18 @@ decides what still needs saying.
 
 The inbox is a working set rather than a record: the receipts, the question ledger and the retained
 output are where the history lives. Past five hundred items the host lets go of its least urgent
-and oldest, weighing the item that has just arrived with the rest, so a fresh notice does not
-displace anything merely by being the newest thing there. The read says how many items the host has
-let go of.
+and oldest *record* of a condition, and the read says how many it has let go of. An item that has
+only just arrived is not one of those: nothing has been decided about it yet, so it is kept until
+its decision has gone out, been recorded by a consumer, and outlived the minute in which the same
+condition would be folded into it rather than announced again. Weighing what is left by level and
+age is what stops a fresh notice displacing an urgent approval.
 
 What the bound never lets go of is a condition somebody or something is still waiting on - an
 unanswered approval, an unanswered request, an adapter still down, a host still out of contact - or
 a decision about one that is still in flight: one no consumer has settled, one quiet hours are
-holding, and one nobody has made yet, which is what an item is between arriving and being
-announced. When the whole inbox is those, it goes over its bound rather than answering that nothing
+holding, one nobody has made yet, and one whose sixty-second window is still running, because the
+item is the whole of what the host remembers that window by and letting go of it would announce the
+same condition twice inside it. When the whole inbox is those, it goes over its bound rather than answering that nothing
 is waiting or losing an announcement nothing will offer again, and it comes back inside its bound
 on the next timer pass, against what that pass decided and what a consumer settled meanwhile. A
 host whose notifications nobody is taking therefore keeps them rather than quietly dropping them.

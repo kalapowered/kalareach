@@ -8,8 +8,8 @@
 //!
 //! # Why the whole state is written at once
 //!
-//! Every write here replaces the stored state in one transaction. What makes that affordable is
-//! that every part of the state carries a bound where it is built:
+//! Every write here replaces the stored state in one transaction. What keeps that affordable in
+//! the ordinary case is that most of the state carries a bound where it is built:
 //! [`kr_protocol::attention::MAX_RETAINED_ATTENTION_ITEMS`] items, each with a summary bounded by
 //! [`kr_protocol::attention::MAX_ATTENTION_SUMMARY_LEN`];
 //! [`crate::visit::MAX_RETAINED_CHANGES`] changes; [`crate::visit::MAX_OMITTED_RANGES`] omitted
