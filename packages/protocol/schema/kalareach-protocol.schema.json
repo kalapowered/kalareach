@@ -1533,6 +1533,394 @@
       "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
       "type": "string"
     },
+    "AttentionAcknowledgeParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `attention.acknowledge`.",
+      "properties": {
+        "keys": {
+          "description": "The items, by key.",
+          "items": {
+            "$ref": "#/$defs/AttentionKey"
+          },
+          "type": "array"
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session whose items are acknowledged."
+        }
+      },
+      "required": [
+        "session_id",
+        "keys"
+      ],
+      "type": "object"
+    },
+    "AttentionAcknowledgeResult": {
+      "additionalProperties": false,
+      "description": "The result of `attention.acknowledge`.",
+      "properties": {
+        "acknowledged": {
+          "description": "The keys that were acknowledged, in the order they were given.",
+          "items": {
+            "$ref": "#/$defs/AttentionKey"
+          },
+          "type": "array"
+        },
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The actor the acknowledgement belongs to."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "This actor's acknowledgement revision after the change."
+        }
+      },
+      "required": [
+        "actor_id",
+        "acknowledged",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "AttentionGap": {
+      "additionalProperties": false,
+      "description": "A range of retained source events the host can no longer read.",
+      "properties": {
+        "from_sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "The first sequence that is missing."
+        },
+        "source": {
+          "$ref": "#/$defs/AttentionSource",
+          "description": "Which source the range belongs to."
+        },
+        "to_sequence": {
+          "$ref": "#/$defs/U64",
+          "description": "The first sequence that is present again."
+        }
+      },
+      "required": [
+        "source",
+        "from_sequence",
+        "to_sequence"
+      ],
+      "type": "object"
+    },
+    "AttentionItem": {
+      "additionalProperties": false,
+      "description": "One item in the attention inbox.",
+      "properties": {
+        "acknowledged": {
+          "description": "Whether this actor has acknowledged it.",
+          "type": "boolean"
+        },
+        "first_seen_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the condition was first observed."
+        },
+        "key": {
+          "$ref": "#/$defs/AttentionKey",
+          "description": "The rule and subject this item stands for."
+        },
+        "last_seen_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it was last observed."
+        },
+        "level": {
+          "$ref": "#/$defs/AttentionLevel",
+          "description": "What it is asking for now, after any escalation."
+        },
+        "notification": {
+          "$ref": "#/$defs/NotificationState",
+          "description": "What became of the notification."
+        },
+        "occurrences": {
+          "$ref": "#/$defs/U64",
+          "description": "How many times the condition occurred, including the occurrences de-duplication suppressed."
+        },
+        "routing": {
+          "$ref": "#/$defs/AttentionRouting",
+          "description": "Where the notification went."
+        },
+        "rule": {
+          "$ref": "#/$defs/AttentionRule",
+          "description": "The rule that raised it."
+        },
+        "session_id": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/SessionId"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The session it belongs to, when it belongs to one."
+        },
+        "summary": {
+          "description": "One line naming the subject.",
+          "type": "string"
+        },
+        "trusted": {
+          "description": "Whether the host itself observed the condition.\n\nFalse for an application notice, which any process writing to the terminal can emit. A\nclient must not present an untrusted item as a host decision, and nothing untrusted is ever\na pending approval.",
+          "type": "boolean"
+        },
+        "uncertain": {
+          "description": "Whether a gap in the retained events covers this item's subject.\n\nA gap is not a resolution. An item whose resolving event may have been evicted stays in the\ninbox and says that the host cannot tell, which is section 24's rule that a history gap is\nnever an inferred approval or completion.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "key",
+        "rule",
+        "level",
+        "session_id",
+        "summary",
+        "trusted",
+        "routing",
+        "occurrences",
+        "first_seen_ms",
+        "last_seen_ms",
+        "notification",
+        "acknowledged",
+        "uncertain"
+      ],
+      "type": "object"
+    },
+    "AttentionKey": {
+      "description": "One attention rule and the subject it was raised about.",
+      "maxLength": 256,
+      "minLength": 1,
+      "type": "string"
+    },
+    "AttentionLevel": {
+      "description": "How much attention an item is asking for.",
+      "oneOf": [
+        {
+          "const": "informational",
+          "description": "Worth seeing when the person looks.",
+          "type": "string"
+        },
+        {
+          "const": "notable",
+          "description": "Worth telling the person about.",
+          "type": "string"
+        },
+        {
+          "const": "urgent",
+          "description": "Worth interrupting for, subject to quiet hours.",
+          "type": "string"
+        }
+      ]
+    },
+    "AttentionQuietHoursParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `attention.quiet_hours`.",
+      "properties": {
+        "quiet_hours": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QuietHours"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The window, or null to clear it."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session whose quiet hours are set."
+        }
+      },
+      "required": [
+        "session_id",
+        "quiet_hours"
+      ],
+      "type": "object"
+    },
+    "AttentionQuietHoursResult": {
+      "additionalProperties": false,
+      "description": "The result of `attention.quiet_hours`.",
+      "properties": {
+        "quiet_hours": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QuietHours"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The window now in force, or null when there is none."
+        },
+        "quiet_hours_provable": {
+          "description": "Whether this host can prove what its wall clock reads.",
+          "type": "boolean"
+        },
+        "quiet_now": {
+          "description": "Whether the host is inside it now.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "quiet_hours",
+        "quiet_now",
+        "quiet_hours_provable"
+      ],
+      "type": "object"
+    },
+    "AttentionReadParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `attention.read`.",
+      "properties": {
+        "include_acknowledged": {
+          "description": "Whether items this actor has already acknowledged are included.",
+          "type": "boolean"
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session whose inbox is read."
+        }
+      },
+      "required": [
+        "session_id",
+        "include_acknowledged"
+      ],
+      "type": "object"
+    },
+    "AttentionReadResult": {
+      "additionalProperties": false,
+      "description": "The result of `attention.read`.",
+      "properties": {
+        "gaps": {
+          "description": "The ranges of retained events the host can no longer read.",
+          "items": {
+            "$ref": "#/$defs/AttentionGap"
+          },
+          "type": "array"
+        },
+        "items": {
+          "description": "The items, oldest first.",
+          "items": {
+            "$ref": "#/$defs/AttentionItem"
+          },
+          "type": "array"
+        },
+        "quiet_hours": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/QuietHours"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The configured quiet hours, when there are any."
+        },
+        "quiet_hours_provable": {
+          "description": "Whether this host can prove what its wall clock reads.\n\nQuiet hours are a wall-clock window, so a host that cannot prove its clock cannot prove it\nis inside one. It delivers rather than suppresses, and says so here, because a suppression\ndecided on an unprovable clock withholds a notification nobody asked to withhold.",
+          "type": "boolean"
+        },
+        "quiet_now": {
+          "description": "Whether the host is inside its quiet hours now.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "items",
+        "gaps",
+        "quiet_hours",
+        "quiet_now",
+        "quiet_hours_provable"
+      ],
+      "type": "object"
+    },
+    "AttentionRouting": {
+      "description": "Where the host sent an item's notification.\n\nSection 8 gives a terminal side effect one destination, the attachment holding the input\nlease. With no lease holder there is nobody to send it to, so section 25 routes it through\nthe owner's configured notification policy and keeps it in Attention either way.",
+      "oneOf": [
+        {
+          "const": "lease_holder",
+          "description": "The attachment that held the input lease.",
+          "type": "string"
+        },
+        {
+          "const": "owner_policy",
+          "description": "The owner's configured notification policy.",
+          "type": "string"
+        }
+      ]
+    },
+    "AttentionRule": {
+      "description": "One rule of section 25's attention rule set.\n\nThe identifiers are stable: they are what an acknowledgement, a stored item and a client\npreference name, so they outlive any wording change in the text a rule produces.",
+      "oneOf": [
+        {
+          "const": "attention.pending_approval",
+          "description": "An upstream agent is waiting for an approval decision.",
+          "type": "string"
+        },
+        {
+          "const": "attention.pending_input",
+          "description": "A verified source is waiting for the person to answer a question.",
+          "type": "string"
+        },
+        {
+          "const": "attention.input_idle_reminder",
+          "description": "A verified pending input request has waited the idle interval.",
+          "type": "string"
+        },
+        {
+          "const": "attention.command_failed",
+          "description": "A command completed with a nonzero status.",
+          "type": "string"
+        },
+        {
+          "const": "attention.review_ready",
+          "description": "An agent turn completed and is waiting to be reviewed.",
+          "type": "string"
+        },
+        {
+          "const": "attention.adapter_failed",
+          "description": "An adapter failed and the capability it provided is unavailable.",
+          "type": "string"
+        },
+        {
+          "const": "attention.host_contact_lost",
+          "description": "Contact with the host was lost.",
+          "type": "string"
+        },
+        {
+          "const": "attention.application_notice",
+          "description": "An application asked for a notification. Untrusted, and never an approval.",
+          "type": "string"
+        }
+      ]
+    },
+    "AttentionSource": {
+      "description": "Which retained source one consumed cursor or one gap belongs to.",
+      "oneOf": [
+        {
+          "const": "receipts",
+          "description": "The worker's receipt journal.",
+          "type": "string"
+        },
+        {
+          "const": "questions",
+          "description": "The question ledger.",
+          "type": "string"
+        },
+        {
+          "const": "host_events",
+          "description": "Terminal side effects with no attachment to go to.",
+          "type": "string"
+        },
+        {
+          "const": "semantic",
+          "description": "The session's own semantic events.",
+          "type": "string"
+        }
+      ]
+    },
     "AuthorisationKey": {
       "contentEncoding": "base64url",
       "description": "A 32-byte Ed25519 authorisation public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
@@ -2674,6 +3062,45 @@
       "description": "The exact version of a change set that was tested or reviewed.",
       "pattern": "^(0|[1-9][0-9]*)$",
       "type": "string"
+    },
+    "ChangeSummary": {
+      "additionalProperties": false,
+      "description": "A model's summary of an interval, carried beside the authoritative events.\n\nSection 25 requires a summary to name its source interval and stay separate from the events. It\nis never merged into [`VisitChangedResult::changes`] and never stands in for one: a client that\nignores it loses nothing authoritative.",
+      "properties": {
+        "from_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The first cursor the summary was written from."
+        },
+        "from_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the interval started."
+        },
+        "model": {
+          "description": "The model that produced it, as the host recorded it.",
+          "type": "string"
+        },
+        "text": {
+          "description": "The summary text.",
+          "type": "string"
+        },
+        "to_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The first cursor after the interval the summary was written from."
+        },
+        "to_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When it ended."
+        }
+      },
+      "required": [
+        "text",
+        "from_cursor",
+        "to_cursor",
+        "from_ms",
+        "to_ms",
+        "model"
+      ],
+      "type": "object"
     },
     "CharsetDesignations": {
       "additionalProperties": false,
@@ -8384,6 +8811,30 @@
         }
       ]
     },
+    "LogViewState": {
+      "additionalProperties": false,
+      "description": "One log view's retained position and filter.\n\nSection 25 keeps a log view's source offsets and filtering state across a reconnect, a switch\nto another view and a retention eviction. The offset is the source's own cursor, so it survives\na client that discards everything it was holding.",
+      "properties": {
+        "filter": {
+          "description": "The filter the view had applied, in the client's own form.",
+          "type": "string"
+        },
+        "source_offset": {
+          "$ref": "#/$defs/U64",
+          "description": "The source offset the view was reading at."
+        },
+        "view_id": {
+          "description": "The view, as the client names it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "view_id",
+        "source_offset",
+        "filter"
+      ],
+      "type": "object"
+    },
     "LogoutPersistence": {
       "description": "Whether a per-user service survives the user logging out, on this platform.\n\nThe answer is a platform fact, not a preference, and it is reported rather than assumed. Setup\nenables persistence only through an explicit choice, and only where the service configuration\nqualifies for it.",
       "oneOf": [
@@ -9091,8 +9542,18 @@
           "type": "string"
         },
         {
+          "const": "attention.quiet_hours",
+          "description": "Set or clear the quiet-hours window. It defers audible delivery and drops nothing.",
+          "type": "string"
+        },
+        {
           "const": "visit.acknowledge",
           "description": "Record this actor's visit so changed-since-last-visit stays per actor.",
+          "type": "string"
+        },
+        {
+          "const": "visit.changed",
+          "description": "What changed since this actor's last visit, with omitted history stated as a gap.",
           "type": "string"
         },
         {
@@ -9770,6 +10231,31 @@
       "description": "A 32-byte X25519 notification-preview public key. On the wire it is a CBOR byte string; in JSON it is unpadded base64url.",
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
+    },
+    "NotificationState": {
+      "description": "What became of an item's notification.",
+      "oneOf": [
+        {
+          "const": "pending",
+          "description": "Not yet decided.",
+          "type": "string"
+        },
+        {
+          "const": "delivered",
+          "description": "Sent to the destination.",
+          "type": "string"
+        },
+        {
+          "const": "deferred",
+          "description": "Held by quiet hours, to be released when they end.",
+          "type": "string"
+        },
+        {
+          "const": "suppressed",
+          "description": "Inside the rule's de-duplication window.",
+          "type": "string"
+        }
+      ]
     },
     "ObservationProvenance": {
       "description": "Where an observation's evidence came from.\n\nOnly an authoritative answer can resolve an uncertain outcome. Everything else is evidence a\nperson may read and act on, and nothing more: section 9 says outright that an inferred screen\nobservation cannot change `unknown` to `applied`.",
@@ -14216,6 +14702,37 @@
       ],
       "type": "object"
     },
+    "QuietHours": {
+      "additionalProperties": false,
+      "description": "The window in which audible delivery is held back.\n\nBoth bounds are minutes of the UTC day, and a window whose end is at or before its start wraps\nmidnight. A window whose bounds are equal is a whole day of quiet hours, which is a thing a\nperson can choose; a client that means \"never\" clears the configuration instead.",
+      "properties": {
+        "end_minute": {
+          "$ref": "#/$defs/U64",
+          "description": "The first minute of the UTC day after the window."
+        },
+        "start_minute": {
+          "$ref": "#/$defs/U64",
+          "description": "The first minute of the UTC day the window covers."
+        },
+        "zone": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The time zone the client converted from, recorded for the client's own use.\n\nThe host stores it and gives it back. It never interprets it, which is why the window\nitself is in UTC: deciding a local window would need a zone database the host does not\ncarry, and guessing one would suppress a notification at the wrong hour."
+        }
+      },
+      "required": [
+        "start_minute",
+        "end_minute",
+        "zone"
+      ],
+      "type": "object"
+    },
     "ReaderContext": {
       "description": "Which reader a root editor event belongs to.\n\nThe three are what a pre-EOF decision and a fence acknowledgement have to distinguish. Only the\nprimary reader can carry the empty-prompt detach; a continuation line and the `read` builtin are\nordinary input even when the buffer looks empty.",
       "oneOf": [
@@ -15513,6 +16030,44 @@
         }
       ]
     },
+    "RetainedLogView": {
+      "additionalProperties": false,
+      "description": "One retained log view, with the gap retention left in it.",
+      "properties": {
+        "gap": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/HistoryGap"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The range retention evicted, when the retained offset is no longer readable."
+        },
+        "requested_offset": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The offset the view was left at, when retention has moved past it.\n\nPresent exactly when [`RetainedLogView::gap`] is: the view keeps saying where it was even\nthough it can no longer be served from there."
+        },
+        "view": {
+          "$ref": "#/$defs/LogViewState",
+          "description": "The view, at the offset it can be served from now."
+        }
+      },
+      "required": [
+        "view",
+        "requested_offset",
+        "gap"
+      ],
+      "type": "object"
+    },
     "RetentionPolicy": {
       "description": "What a workspace removal does with what it holds.",
       "oneOf": [
@@ -15619,6 +16174,203 @@
           "const": "outcome_unknown",
           "description": "Dispatch may have occurred. Never retry this action identifier; show the unknown result and\nrequire a new identifier for an explicit later user request.",
           "type": "string"
+        }
+      ]
+    },
+    "ReviewAcknowledgeParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `review.acknowledge`.",
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the subject belongs to."
+        },
+        "subject": {
+          "$ref": "#/$defs/ReviewSubject",
+          "description": "What is being acknowledged."
+        },
+        "version": {
+          "$ref": "#/$defs/U64",
+          "description": "The exact version that was read.\n\nA version the host does not hold is refused. Acknowledging a version nobody produced would\nclose review work that was never presented."
+        }
+      },
+      "required": [
+        "session_id",
+        "subject",
+        "version"
+      ],
+      "type": "object"
+    },
+    "ReviewAcknowledgeResult": {
+      "additionalProperties": false,
+      "description": "The result of `review.acknowledge`.\n\nIt reports review state and nothing else. Acknowledging approves no command, applies no patch\nand changes no Git state; section 14 makes promotion a separate authorised action, and this\ngroup has no method that performs one.",
+      "properties": {
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The actor the acknowledgement belongs to."
+        },
+        "review": {
+          "$ref": "#/$defs/ReviewState",
+          "description": "The state of the subject after the acknowledgement."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "This actor's acknowledgement revision after the change."
+        }
+      },
+      "required": [
+        "actor_id",
+        "review",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "ReviewReadParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `review.read`.",
+      "properties": {
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session the review state belongs to."
+        },
+        "subject": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ReviewSubject"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "One subject, or null for every subject this session knows about."
+        }
+      },
+      "required": [
+        "session_id",
+        "subject"
+      ],
+      "type": "object"
+    },
+    "ReviewReadResult": {
+      "additionalProperties": false,
+      "description": "The result of `review.read`.",
+      "properties": {
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The actor this state belongs to."
+        },
+        "reviews": {
+          "description": "The review state of each subject, oldest first.",
+          "items": {
+            "$ref": "#/$defs/ReviewState"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "actor_id",
+        "reviews"
+      ],
+      "type": "object"
+    },
+    "ReviewState": {
+      "additionalProperties": false,
+      "description": "The review state of one subject, for one actor.",
+      "properties": {
+        "acknowledged_at_ms": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMs"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "When this actor acknowledged it."
+        },
+        "acknowledged_version": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/U64"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The version this actor acknowledged, when it has acknowledged one."
+        },
+        "current_version": {
+          "$ref": "#/$defs/U64",
+          "description": "The current version of that subject."
+        },
+        "outstanding": {
+          "description": "Whether review work is outstanding for this actor.\n\nTrue when nothing has been acknowledged, and true again after a new version appears: a new\nchange is new review work, and an acknowledgement of an earlier version does not cover it.",
+          "type": "boolean"
+        },
+        "subject": {
+          "$ref": "#/$defs/ReviewSubject",
+          "description": "What is being reviewed, at the version the host currently holds."
+        }
+      },
+      "required": [
+        "subject",
+        "current_version",
+        "acknowledged_version",
+        "acknowledged_at_ms",
+        "outstanding"
+      ],
+      "type": "object"
+    },
+    "ReviewSubject": {
+      "description": "What a review acknowledgement is attached to.\n\nSection 14 binds an acknowledgement to a version. Both subjects carry one: a turn carries the\nturn identifier the agent gave it, and a repository revision carries the change set and the\nexact version of it that was read.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "description": "One completed agent turn.",
+          "properties": {
+            "kind": {
+              "const": "completed_turn",
+              "type": "string"
+            },
+            "session_id": {
+              "$ref": "#/$defs/SessionId",
+              "description": "The session the turn belongs to."
+            },
+            "turn_id": {
+              "$ref": "#/$defs/AgentTurnId",
+              "description": "The turn."
+            }
+          },
+          "required": [
+            "kind",
+            "session_id",
+            "turn_id"
+          ],
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "description": "One captured change set at one exact version.",
+          "properties": {
+            "change_set_id": {
+              "$ref": "#/$defs/ChangeSetId",
+              "description": "The change set."
+            },
+            "kind": {
+              "const": "change_set",
+              "type": "string"
+            },
+            "version": {
+              "$ref": "#/$defs/ChangeSetVersion",
+              "description": "The version that was read."
+            }
+          },
+          "required": [
+            "kind",
+            "change_set_id",
+            "version"
+          ],
+          "type": "object"
         }
       ]
     },
@@ -16507,6 +17259,70 @@
       "description": "Thirty-two secret bytes. The Rust representation clears them when it is dropped and redacts them in diagnostics; a consumer in another language must apply its own handling, because a JSON string carries no such guarantee.",
       "pattern": "^[A-Za-z0-9_-]{43}$",
       "type": "string"
+    },
+    "SemanticChange": {
+      "additionalProperties": false,
+      "description": "One semantic change in the changed-since-last-visit view.",
+      "properties": {
+        "at_ms": {
+          "$ref": "#/$defs/TimestampMs",
+          "description": "When the host recorded it."
+        },
+        "cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor this change sits at."
+        },
+        "kind": {
+          "$ref": "#/$defs/SemanticChangeKind",
+          "description": "What it was."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session it belongs to."
+        },
+        "summary": {
+          "description": "One line naming it.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "cursor",
+        "kind",
+        "session_id",
+        "summary",
+        "at_ms"
+      ],
+      "type": "object"
+    },
+    "SemanticChangeKind": {
+      "description": "What one semantic change was.",
+      "oneOf": [
+        {
+          "const": "turn_completed",
+          "description": "An agent turn finished.",
+          "type": "string"
+        },
+        {
+          "const": "command_completed",
+          "description": "A command finished.",
+          "type": "string"
+        },
+        {
+          "const": "question_answered",
+          "description": "A question was answered.",
+          "type": "string"
+        },
+        {
+          "const": "change_set_captured",
+          "description": "A change set was captured.",
+          "type": "string"
+        },
+        {
+          "const": "adapter_state",
+          "description": "An adapter failed or recovered.",
+          "type": "string"
+        }
+      ]
     },
     "SemanticContinuation": {
       "additionalProperties": false,
@@ -18632,6 +19448,149 @@
         }
       ]
     },
+    "VisitAcknowledgeParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `visit.acknowledge`.",
+      "properties": {
+        "acknowledged_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The semantic cursor this actor has seen up to."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session being visited."
+        },
+        "views": {
+          "description": "The log views this actor had open, with their offsets and filters.",
+          "items": {
+            "$ref": "#/$defs/LogViewState"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "session_id",
+        "acknowledged_cursor",
+        "views"
+      ],
+      "type": "object"
+    },
+    "VisitAcknowledgeResult": {
+      "additionalProperties": false,
+      "description": "The result of `visit.acknowledge`.",
+      "properties": {
+        "acknowledged_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor now recorded for it.\n\nIt never goes backwards. A client that acknowledges an older cursor than the one the host\nholds keeps the host's, because a visit records how far somebody has got."
+        },
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The actor the visit belongs to."
+        },
+        "revision": {
+          "$ref": "#/$defs/U64",
+          "description": "This actor's acknowledgement revision after the change."
+        },
+        "views": {
+          "description": "The views the host retained, after the per-session bound.",
+          "items": {
+            "$ref": "#/$defs/LogViewState"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "actor_id",
+        "acknowledged_cursor",
+        "views",
+        "revision"
+      ],
+      "type": "object"
+    },
+    "VisitChangedParams": {
+      "additionalProperties": false,
+      "description": "Parameters of `visit.changed`.",
+      "properties": {
+        "max_changes": {
+          "$ref": "#/$defs/U64",
+          "description": "The largest number of changes the caller will accept, bounded by [`MAX_VISIT_CHANGES`]."
+        },
+        "session_id": {
+          "$ref": "#/$defs/SessionId",
+          "description": "The session to compare."
+        }
+      },
+      "required": [
+        "session_id",
+        "max_changes"
+      ],
+      "type": "object"
+    },
+    "VisitChangedResult": {
+      "additionalProperties": false,
+      "description": "The result of `visit.changed`.",
+      "properties": {
+        "actor_id": {
+          "$ref": "#/$defs/ActorId",
+          "description": "The actor this view belongs to."
+        },
+        "changes": {
+          "description": "The semantic changes after the acknowledged cursor, oldest first.",
+          "items": {
+            "$ref": "#/$defs/SemanticChange"
+          },
+          "type": "array"
+        },
+        "from_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor this actor last acknowledged."
+        },
+        "more": {
+          "description": "Whether more changes remain past [`VisitChangedResult::to_cursor`].",
+          "type": "boolean"
+        },
+        "omitted": {
+          "description": "The ranges retention evicted before this view could show them.\n\nAn omitted range is stated. The view never presents a shorter list as if it were the whole\nof what happened.",
+          "items": {
+            "$ref": "#/$defs/AttentionGap"
+          },
+          "type": "array"
+        },
+        "summary": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ChangeSummary"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "The summary of this interval, when one was requested and produced."
+        },
+        "to_cursor": {
+          "$ref": "#/$defs/U64",
+          "description": "The cursor to acknowledge once this view has been read."
+        },
+        "views": {
+          "description": "The log views this actor retained, with any gap retention left in them.",
+          "items": {
+            "$ref": "#/$defs/RetainedLogView"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "actor_id",
+        "from_cursor",
+        "to_cursor",
+        "changes",
+        "omitted",
+        "more",
+        "summary",
+        "views"
+      ],
+      "type": "object"
+    },
     "WallClockTrust": {
       "description": "Whether this host can prove what its wall clock reads.",
       "oneOf": [
@@ -19529,6 +20488,30 @@
     "attachment_viewport_result": {
       "$ref": "#/$defs/AttachmentViewportResult"
     },
+    "attention_acknowledge_params": {
+      "$ref": "#/$defs/AttentionAcknowledgeParams"
+    },
+    "attention_acknowledge_result": {
+      "$ref": "#/$defs/AttentionAcknowledgeResult"
+    },
+    "attention_gap": {
+      "$ref": "#/$defs/AttentionGap"
+    },
+    "attention_item": {
+      "$ref": "#/$defs/AttentionItem"
+    },
+    "attention_quiet_hours_params": {
+      "$ref": "#/$defs/AttentionQuietHoursParams"
+    },
+    "attention_quiet_hours_result": {
+      "$ref": "#/$defs/AttentionQuietHoursResult"
+    },
+    "attention_read_params": {
+      "$ref": "#/$defs/AttentionReadParams"
+    },
+    "attention_read_result": {
+      "$ref": "#/$defs/AttentionReadResult"
+    },
     "authority_feed_status": {
       "$ref": "#/$defs/AuthorityFeedStatus"
     },
@@ -19555,6 +20538,9 @@
     },
     "change_operation": {
       "$ref": "#/$defs/ChangeOperation"
+    },
+    "change_summary": {
+      "$ref": "#/$defs/ChangeSummary"
     },
     "client_offer": {
       "$ref": "#/$defs/ClientOffer"
@@ -20021,6 +21007,9 @@
     "local_hello_ack": {
       "$ref": "#/$defs/LocalHelloAck"
     },
+    "log_view_state": {
+      "$ref": "#/$defs/LogViewState"
+    },
     "membership_lease": {
       "$ref": "#/$defs/MembershipLease"
     },
@@ -20213,6 +21202,9 @@
     "question_source": {
       "$ref": "#/$defs/QuestionSource"
     },
+    "quiet_hours": {
+      "$ref": "#/$defs/QuietHours"
+    },
     "receipt": {
       "$ref": "#/$defs/Receipt"
     },
@@ -20246,8 +21238,29 @@
     "resync_required": {
       "$ref": "#/$defs/ResyncRequired"
     },
+    "retained_log_view": {
+      "$ref": "#/$defs/RetainedLogView"
+    },
     "retrust_evidence": {
       "$ref": "#/$defs/RetrustEvidence"
+    },
+    "review_acknowledge_params": {
+      "$ref": "#/$defs/ReviewAcknowledgeParams"
+    },
+    "review_acknowledge_result": {
+      "$ref": "#/$defs/ReviewAcknowledgeResult"
+    },
+    "review_read_params": {
+      "$ref": "#/$defs/ReviewReadParams"
+    },
+    "review_read_result": {
+      "$ref": "#/$defs/ReviewReadResult"
+    },
+    "review_state": {
+      "$ref": "#/$defs/ReviewState"
+    },
+    "review_subject": {
+      "$ref": "#/$defs/ReviewSubject"
     },
     "revocation_acknowledgement": {
       "$ref": "#/$defs/RevocationAcknowledgement"
@@ -20305,6 +21318,9 @@
     },
     "sealed_envelope": {
       "$ref": "#/$defs/SealedEnvelope"
+    },
+    "semantic_change": {
+      "$ref": "#/$defs/SemanticChange"
     },
     "semantic_continuation": {
       "$ref": "#/$defs/SemanticContinuation"
@@ -20428,6 +21444,18 @@
     },
     "upload_status_result": {
       "$ref": "#/$defs/UploadStatusResult"
+    },
+    "visit_acknowledge_params": {
+      "$ref": "#/$defs/VisitAcknowledgeParams"
+    },
+    "visit_acknowledge_result": {
+      "$ref": "#/$defs/VisitAcknowledgeResult"
+    },
+    "visit_changed_params": {
+      "$ref": "#/$defs/VisitChangedParams"
+    },
+    "visit_changed_result": {
+      "$ref": "#/$defs/VisitChangedResult"
     },
     "worker_descriptor": {
       "$ref": "#/$defs/WorkerDescriptor"

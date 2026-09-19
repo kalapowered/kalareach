@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 use kr_protocol::actor::ActorIngress;
 use kr_protocol::authority::{
     AuthorityDecision, CapabilityRequirement, ConfirmationRequirement, DenialReason, EffectClass,
-    FreshnessRequirement, HistoryFilter, IdempotencyBehaviour, RequiredAuthority, RightCondition,
+    FreshnessRequirement, HistoryFilter, IdempotencyBehaviour, RequiredAuthority, RequiredRight,
+    RightCondition,
 };
 use kr_protocol::error::ErrorCode;
 use kr_protocol::method::{
@@ -251,9 +252,34 @@ fn the_required_methods_of_the_specification_table_are_all_listed() {
         );
     }
 
+    // Section 25 gives the review and attention group two operations that section 23's row does
+    // not name: a quiet-hours window has to be set before it can defer anything, and the
+    // changed-since-last-visit view has to be readable without moving the visit cursor that
+    // defines it. Both carry their own exhaustive entry under the group's own scoped-view right,
+    // and neither can mutate code: section 23's rule for this group is that no review method does,
+    // and the rights below are the whole of what they require.
+    let attention = [
+        ("attention.quiet_hours", EffectClass::Write),
+        ("visit.changed", EffectClass::Read),
+    ];
+    for (name, effect) in attention {
+        let entry = lookup(name).unwrap_or_else(|| panic!("{name} is missing from the registry"));
+        assert_eq!(entry.effect, effect, "{name} carries its own effect class");
+        assert_eq!(
+            entry.group,
+            MethodGroup::ReviewAndAttention,
+            "{name} is a review and attention method"
+        );
+        assert_eq!(
+            entry.required_rights,
+            &[RequiredRight::right(ActionRight::SessionView)],
+            "{name} asks for scoped view authority and nothing that mutates code"
+        );
+    }
+
     assert_eq!(
         REGISTRY.len(),
-        required.len() + added.len(),
+        required.len() + added.len() + attention.len(),
         "the registry holds the required methods and the named additions"
     );
 }

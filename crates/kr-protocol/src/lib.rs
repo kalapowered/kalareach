@@ -53,6 +53,7 @@
 //! | [`sharing`] | Roles, invitation previews, the notices a grant carries and the sharing method group |
 //! | [`skill`] | Contact-skill installation: agents, scopes and the exact change manifest |
 //! | [`attachment`] | Attachments, geometry ownership and the attachment method group |
+//! | [`attention`] | The attention inbox, review acknowledgements and the changed-since-last-visit view |
 //! | [`input`] | The single input lease and the input method group |
 //! | [`root`] | The trusted root integration: the editor fence, its events and the launch transaction |
 //! | [`recovery`] | Subscriptions, snapshots, history pages and resynchronisation |
@@ -99,6 +100,7 @@ pub mod action;
 pub mod actor;
 pub mod archive;
 pub mod attachment;
+pub mod attention;
 pub mod authority;
 pub mod desktop;
 pub mod digest;

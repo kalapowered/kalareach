@@ -1050,12 +1050,26 @@ methods! {
     confirmation: None, idempotency: ACTION,
     doc: "Acknowledge an attention item for this actor only.";
 
+    AttentionQuietHours = "attention.quiet_hours", ReviewAndAttention,
+    effect: Write, ingress: [LocalIpc, PairedDevice], rights: [req(SessionView)],
+    selectors: [Environment, Session],
+    history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
+    confirmation: None, idempotency: ACTION,
+    doc: "Set or clear the quiet-hours window. It defers audible delivery and drops nothing.";
+
     VisitAcknowledge = "visit.acknowledge", ReviewAndAttention,
     effect: Write, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],
     selectors: [Session],
     history: NotApplicable, capability: NO_CAPABILITY, freshness: ActionWindow,
     confirmation: None, idempotency: ACTION,
     doc: "Record this actor's visit so changed-since-last-visit stays per actor.";
+
+    VisitChanged = "visit.changed", ReviewAndAttention,
+    effect: Read, ingress: [LocalIpc, PairedDevice, Workflow], rights: [req(SessionView)],
+    selectors: [Session],
+    history: GrantLowerBound, capability: NO_CAPABILITY, freshness: CurrentAuthority,
+    confirmation: None, idempotency: READ,
+    doc: "What changed since this actor's last visit, with omitted history stated as a gap.";
 
     // ----- Pending action control -----------------------------------------------------------
     ActionCancel = "action.cancel", PendingActionControl,

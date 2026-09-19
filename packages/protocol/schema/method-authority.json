@@ -1,6 +1,6 @@
 {
   "description": "One exhaustive authority entry per method. Anything not listed is denied. Generated from crates/kr-protocol; do not edit by hand.",
-  "method_count": 137,
+  "method_count": 139,
   "methods": [
     {
       "capability": "none",
@@ -3170,6 +3170,37 @@
       "idempotency": "action_deduplicated",
       "ingress": [
         "local_ipc",
+        "paired_device"
+      ],
+      "method": "attention.quiet_hours",
+      "name": "attention.quiet_hours",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "session.view"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "environment",
+        "session"
+      ],
+      "summary": "Set or clear the quiet-hours window. It defers audible delivery and drops nothing.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "write",
+      "freshness": "action_window",
+      "group": "review_and_attention",
+      "history_filter": "not_applicable",
+      "idempotency": "action_deduplicated",
+      "ingress": [
+        "local_ipc",
         "paired_device",
         "workflow"
       ],
@@ -3189,6 +3220,37 @@
         "session"
       ],
       "summary": "Record this actor's visit so changed-since-last-visit stays per actor.",
+      "version": 1
+    },
+    {
+      "capability": "none",
+      "confirmation": "none",
+      "effect": "read",
+      "freshness": "current_authority",
+      "group": "review_and_attention",
+      "history_filter": "grant_lower_bound",
+      "idempotency": "idempotent_read",
+      "ingress": [
+        "local_ipc",
+        "paired_device",
+        "workflow"
+      ],
+      "method": "visit.changed",
+      "name": "visit.changed",
+      "required_rights": [
+        {
+          "authority": {
+            "right": {
+              "right": "session.view"
+            }
+          },
+          "when": "always"
+        }
+      ],
+      "resource_selectors": [
+        "session"
+      ],
+      "summary": "What changed since this actor's last visit, with omitted history stated as a gap.",
       "version": 1
     },
     {

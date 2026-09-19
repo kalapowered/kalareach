@@ -131,6 +131,10 @@ export type ViewportPosition =
  */
 export type AttachmentId = string
 /**
+ * One attention rule and the subject it was raised about.
+ */
+export type AttentionKey = string
+/**
  * One signed revocation request published by a remote owner.
  */
 export type RevocationRequestId = string
@@ -975,6 +979,36 @@ export type RetrustEvidence =
       kind: 'paired_peer'
     }
 /**
+ * What a review acknowledgement is attached to.
+ *
+ * Section 14 binds an acknowledgement to a version. Both subjects carry one: a turn carries the
+ * turn identifier the agent gave it, and a repository revision carries the change set and the
+ * exact version of it that was read.
+ */
+export type ReviewSubject =
+  | {
+      kind: 'completed_turn'
+      /**
+       * One KalaReach terminal session.
+       */
+      session_id: string
+      /**
+       * The turn.
+       */
+      turn_id: string
+    }
+  | {
+      /**
+       * One immutable captured change set.
+       */
+      change_set_id: string
+      kind: 'change_set'
+      /**
+       * The version that was read.
+       */
+      version: string
+    }
+/**
  * One published editor fence. An identity from an unacknowledged exchange names no fence.
  */
 export type FenceId = string
@@ -1089,6 +1123,14 @@ export interface KalaReachProtocol {
   attachment_summary?: AttachmentSummary
   attachment_viewport_params?: AttachmentViewportParams
   attachment_viewport_result?: AttachmentViewportResult
+  attention_acknowledge_params?: AttentionAcknowledgeParams
+  attention_acknowledge_result?: AttentionAcknowledgeResult
+  attention_gap?: AttentionGap
+  attention_item?: AttentionItem
+  attention_quiet_hours_params?: AttentionQuietHoursParams
+  attention_quiet_hours_result?: AttentionQuietHoursResult
+  attention_read_params?: AttentionReadParams
+  attention_read_result?: AttentionReadResult
   authority_feed_status?: AuthorityFeedStatus
   authority_revision_ack?: AuthorityRevisionAck
   authority_revision_notice?: AuthorityRevisionNotice
@@ -1098,6 +1140,7 @@ export interface KalaReachProtocol {
   capability_record?: CapabilityRecord
   change_manifest?: ChangeManifest1
   change_operation?: ChangeOperation
+  change_summary?: ChangeSummary
   client_offer?: ClientOffer
   closure_record?: ClosureRecord
   connect_reply?: ConnectReply
@@ -1256,6 +1299,7 @@ export interface KalaReachProtocol {
   live_screen_preview?: LiveScreenPreview
   local_hello?: LocalHello
   local_hello_ack?: LocalHelloAck
+  log_view_state?: LogViewState
   membership_lease?: MembershipLease
   method_entry?: MethodEntry
   mutation_request?: MutationRequest
@@ -1320,6 +1364,7 @@ export interface KalaReachProtocol {
   question_read_result?: QuestionReadResult
   question_resolve_result?: QuestionResolveResult
   question_source?: QuestionSource2
+  quiet_hours?: QuietHours
   receipt?: Receipt3
   receipt_response?: ReceiptResponse
   recovery_bundle?: RecoveryBundle
@@ -1331,7 +1376,14 @@ export interface KalaReachProtocol {
   request?: Request
   response?: Response
   resync_required?: ResyncRequired
+  retained_log_view?: RetainedLogView
   retrust_evidence?: RetrustEvidence
+  review_acknowledge_params?: ReviewAcknowledgeParams
+  review_acknowledge_result?: ReviewAcknowledgeResult
+  review_read_params?: ReviewReadParams
+  review_read_result?: ReviewReadResult
+  review_state?: ReviewState1
+  review_subject?: ReviewSubject
   revocation_acknowledgement?: RevocationAcknowledgement
   revocation_barrier?: RevocationBarrier
   revocation_request?: RevocationRequest
@@ -1351,6 +1403,7 @@ export interface KalaReachProtocol {
   root_eof_detach_params?: RootEofDetachParams
   root_eof_detach_result?: RootEofDetachResult
   sealed_envelope?: SealedEnvelope
+  semantic_change?: SemanticChange
   semantic_continuation?: SemanticContinuation
   service_request_signature?: ServiceRequestSignature
   session_attach_params?: SessionAttachParams
@@ -1392,6 +1445,10 @@ export interface KalaReachProtocol {
   upload_finish_result?: UploadFinishResult
   upload_status_params?: UploadStatusParams
   upload_status_result?: UploadStatusResult
+  visit_acknowledge_params?: VisitAcknowledgeParams
+  visit_acknowledge_result?: VisitAcknowledgeResult
+  visit_changed_params?: VisitChangedParams
+  visit_changed_result?: VisitChangedResult
   worker_descriptor?: WorkerDescriptor
   worker_launch_spec?: WorkerLaunchSpec
   worker_ready?: WorkerReady
@@ -2753,6 +2810,223 @@ export interface Dimensions2 {
   rows: string
 }
 /**
+ * Parameters of `attention.acknowledge`.
+ */
+export interface AttentionAcknowledgeParams {
+  /**
+   * The items, by key.
+   */
+  keys: AttentionKey[]
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `attention.acknowledge`.
+ */
+export interface AttentionAcknowledgeResult {
+  /**
+   * The keys that were acknowledged, in the order they were given.
+   */
+  acknowledged: AttentionKey[]
+  /**
+   * The actor the acknowledgement belongs to.
+   */
+  actor_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+}
+/**
+ * A range of retained source events the host can no longer read.
+ */
+export interface AttentionGap {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  from_sequence: string
+  /**
+   * Which source the range belongs to.
+   */
+  source: 'receipts' | 'questions' | 'host_events' | 'semantic'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  to_sequence: string
+}
+/**
+ * One item in the attention inbox.
+ */
+export interface AttentionItem {
+  /**
+   * Whether this actor has acknowledged it.
+   */
+  acknowledged: boolean
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  first_seen_ms: string
+  /**
+   * One attention rule and the subject it was raised about.
+   */
+  key: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  last_seen_ms: string
+  /**
+   * What it is asking for now, after any escalation.
+   */
+  level: 'informational' | 'notable' | 'urgent'
+  /**
+   * What became of the notification.
+   */
+  notification: 'pending' | 'delivered' | 'deferred' | 'suppressed'
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  occurrences: string
+  /**
+   * Where the notification went.
+   */
+  routing: 'lease_holder' | 'owner_policy'
+  /**
+   * The rule that raised it.
+   */
+  rule:
+    | 'attention.pending_approval'
+    | 'attention.pending_input'
+    | 'attention.input_idle_reminder'
+    | 'attention.command_failed'
+    | 'attention.review_ready'
+    | 'attention.adapter_failed'
+    | 'attention.host_contact_lost'
+    | 'attention.application_notice'
+  /**
+   * The session it belongs to, when it belongs to one.
+   */
+  session_id: SessionId | null
+  /**
+   * One line naming the subject.
+   */
+  summary: string
+  /**
+   * Whether the host itself observed the condition.
+   *
+   * False for an application notice, which any process writing to the terminal can emit. A
+   * client must not present an untrusted item as a host decision, and nothing untrusted is ever
+   * a pending approval.
+   */
+  trusted: boolean
+  /**
+   * Whether a gap in the retained events covers this item's subject.
+   *
+   * A gap is not a resolution. An item whose resolving event may have been evicted stays in the
+   * inbox and says that the host cannot tell, which is section 24's rule that a history gap is
+   * never an inferred approval or completion.
+   */
+  uncertain: boolean
+}
+/**
+ * Parameters of `attention.quiet_hours`.
+ */
+export interface AttentionQuietHoursParams {
+  /**
+   * The window, or null to clear it.
+   */
+  quiet_hours: QuietHours | null
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The window in which audible delivery is held back.
+ *
+ * Both bounds are minutes of the UTC day, and a window whose end is at or before its start wraps
+ * midnight. A window whose bounds are equal is a whole day of quiet hours, which is a thing a
+ * person can choose; a client that means "never" clears the configuration instead.
+ */
+export interface QuietHours {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  end_minute: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  start_minute: string
+  /**
+   * The time zone the client converted from, recorded for the client's own use.
+   *
+   * The host stores it and gives it back. It never interprets it, which is why the window
+   * itself is in UTC: deciding a local window would need a zone database the host does not
+   * carry, and guessing one would suppress a notification at the wrong hour.
+   */
+  zone: string | null
+}
+/**
+ * The result of `attention.quiet_hours`.
+ */
+export interface AttentionQuietHoursResult {
+  /**
+   * The window now in force, or null when there is none.
+   */
+  quiet_hours: QuietHours | null
+  /**
+   * Whether this host can prove what its wall clock reads.
+   */
+  quiet_hours_provable: boolean
+  /**
+   * Whether the host is inside it now.
+   */
+  quiet_now: boolean
+}
+/**
+ * Parameters of `attention.read`.
+ */
+export interface AttentionReadParams {
+  /**
+   * Whether items this actor has already acknowledged are included.
+   */
+  include_acknowledged: boolean
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `attention.read`.
+ */
+export interface AttentionReadResult {
+  /**
+   * The ranges of retained events the host can no longer read.
+   */
+  gaps: AttentionGap[]
+  /**
+   * The items, oldest first.
+   */
+  items: AttentionItem[]
+  /**
+   * The configured quiet hours, when there are any.
+   */
+  quiet_hours: QuietHours | null
+  /**
+   * Whether this host can prove what its wall clock reads.
+   *
+   * Quiet hours are a wall-clock window, so a host that cannot prove its clock cannot prove it
+   * is inside one. It delivers rather than suppresses, and says so here, because a suppression
+   * decided on an unprovable clock withholds a notification nobody asked to withhold.
+   */
+  quiet_hours_provable: boolean
+  /**
+   * Whether the host is inside its quiet hours now.
+   */
+  quiet_now: boolean
+}
+/**
  * What this host shows about the remote authority feed.
  */
 export interface AuthorityFeedStatus {
@@ -3172,6 +3446,39 @@ export interface ChangeManifest1 {
    * The skill version installed.
    */
   skill_version: string
+}
+/**
+ * A model's summary of an interval, carried beside the authoritative events.
+ *
+ * Section 25 requires a summary to name its source interval and stay separate from the events. It
+ * is never merged into [`VisitChangedResult::changes`] and never stands in for one: a client that
+ * ignores it loses nothing authoritative.
+ */
+export interface ChangeSummary {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  from_cursor: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  from_ms: string
+  /**
+   * The model that produced it, as the host recorded it.
+   */
+  model: string
+  /**
+   * The summary text.
+   */
+  text: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  to_cursor: string
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  to_ms: string
 }
 /**
  * The client's complete `hello` offer.
@@ -6967,6 +7274,27 @@ export interface InvitationPreview1 {
   single_use: boolean
 }
 /**
+ * One log view's retained position and filter.
+ *
+ * Section 25 keeps a log view's source offsets and filtering state across a reconnect, a switch
+ * to another view and a retention eviction. The offset is the source's own cursor, so it survives
+ * a client that discards everything it was holding.
+ */
+export interface LogViewState {
+  /**
+   * The filter the view had applied, in the client's own form.
+   */
+  filter: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  source_offset: string
+  /**
+   * The view, as the client names it.
+   */
+  view_id: string
+}
+/**
  * A signed statement that one account held one role in one organisation.
  */
 export interface MembershipLease {
@@ -7219,7 +7547,9 @@ export interface MethodEntry {
     | 'review.acknowledge'
     | 'attention.read'
     | 'attention.acknowledge'
+    | 'attention.quiet_hours'
     | 'visit.acknowledge'
+    | 'visit.changed'
     | 'action.cancel'
     | 'owner.confirmation.request'
     | 'owner.confirmation.complete'
@@ -11588,6 +11918,40 @@ export interface ResyncRequired {
   reason: 'send_queue_full' | 'history_evicted' | 'projection_reset'
 }
 /**
+ * One retained log view, with the gap retention left in it.
+ */
+export interface RetainedLogView {
+  /**
+   * The range retention evicted, when the retained offset is no longer readable.
+   */
+  gap: HistoryGap | null
+  /**
+   * The offset the view was left at, when retention has moved past it.
+   *
+   * Present exactly when [`RetainedLogView::gap`] is: the view keeps saying where it was even
+   * though it can no longer be served from there.
+   */
+  requested_offset: U64 | null
+  view: LogViewState1
+}
+/**
+ * The view, at the offset it can be served from now.
+ */
+export interface LogViewState1 {
+  /**
+   * The filter the view had applied, in the client's own form.
+   */
+  filter: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  source_offset: string
+  /**
+   * The view, as the client names it.
+   */
+  view_id: string
+}
+/**
  * The reading it produced.
  */
 export interface TimeAdapterReading {
@@ -11628,6 +11992,189 @@ export interface TimeAdapterReading {
    * A UTC timestamp in milliseconds, as a decimal string in JSON.
    */
   wall_clock_ms: string
+}
+/**
+ * Parameters of `review.acknowledge`.
+ */
+export interface ReviewAcknowledgeParams {
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * What is being acknowledged.
+   */
+  subject:
+    | {
+        kind: 'completed_turn'
+        /**
+         * One KalaReach terminal session.
+         */
+        session_id: string
+        /**
+         * The turn.
+         */
+        turn_id: string
+      }
+    | {
+        /**
+         * One immutable captured change set.
+         */
+        change_set_id: string
+        kind: 'change_set'
+        /**
+         * The version that was read.
+         */
+        version: string
+      }
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  version: string
+}
+/**
+ * The result of `review.acknowledge`.
+ *
+ * It reports review state and nothing else. Acknowledging approves no command, applies no patch
+ * and changes no Git state; section 14 makes promotion a separate authorised action, and this
+ * group has no method that performs one.
+ */
+export interface ReviewAcknowledgeResult {
+  /**
+   * The actor the acknowledgement belongs to.
+   */
+  actor_id: string
+  review: ReviewState
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+}
+/**
+ * The state of the subject after the acknowledgement.
+ */
+export interface ReviewState {
+  /**
+   * When this actor acknowledged it.
+   */
+  acknowledged_at_ms: TimestampMs | null
+  /**
+   * The version this actor acknowledged, when it has acknowledged one.
+   */
+  acknowledged_version: U64 | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  current_version: string
+  /**
+   * Whether review work is outstanding for this actor.
+   *
+   * True when nothing has been acknowledged, and true again after a new version appears: a new
+   * change is new review work, and an acknowledgement of an earlier version does not cover it.
+   */
+  outstanding: boolean
+  /**
+   * What is being reviewed, at the version the host currently holds.
+   */
+  subject:
+    | {
+        kind: 'completed_turn'
+        /**
+         * One KalaReach terminal session.
+         */
+        session_id: string
+        /**
+         * The turn.
+         */
+        turn_id: string
+      }
+    | {
+        /**
+         * One immutable captured change set.
+         */
+        change_set_id: string
+        kind: 'change_set'
+        /**
+         * The version that was read.
+         */
+        version: string
+      }
+}
+/**
+ * Parameters of `review.read`.
+ */
+export interface ReviewReadParams {
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * One subject, or null for every subject this session knows about.
+   */
+  subject: ReviewSubject | null
+}
+/**
+ * The result of `review.read`.
+ */
+export interface ReviewReadResult {
+  /**
+   * The actor this state belongs to.
+   */
+  actor_id: string
+  /**
+   * The review state of each subject, oldest first.
+   */
+  reviews: ReviewState1[]
+}
+/**
+ * The review state of one subject, for one actor.
+ */
+export interface ReviewState1 {
+  /**
+   * When this actor acknowledged it.
+   */
+  acknowledged_at_ms: TimestampMs | null
+  /**
+   * The version this actor acknowledged, when it has acknowledged one.
+   */
+  acknowledged_version: U64 | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  current_version: string
+  /**
+   * Whether review work is outstanding for this actor.
+   *
+   * True when nothing has been acknowledged, and true again after a new version appears: a new
+   * change is new review work, and an acknowledgement of an earlier version does not cover it.
+   */
+  outstanding: boolean
+  /**
+   * What is being reviewed, at the version the host currently holds.
+   */
+  subject:
+    | {
+        kind: 'completed_turn'
+        /**
+         * One KalaReach terminal session.
+         */
+        session_id: string
+        /**
+         * The turn.
+         */
+        turn_id: string
+      }
+    | {
+        /**
+         * One immutable captured change set.
+         */
+        change_set_id: string
+        kind: 'change_set'
+        /**
+         * The version that was read.
+         */
+        version: string
+      }
 }
 /**
  * The host's acknowledgement of one revocation request.
@@ -12333,6 +12880,36 @@ export interface RootEofDetachResult {
   state: 'outside' | 'unfenced' | 'fenced' | 'launch_reserved' | 'closing'
 }
 /**
+ * One semantic change in the changed-since-last-visit view.
+ */
+export interface SemanticChange {
+  /**
+   * A UTC timestamp in milliseconds, as a decimal string in JSON.
+   */
+  at_ms: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  cursor: string
+  /**
+   * What it was.
+   */
+  kind:
+    | 'turn_completed'
+    | 'command_completed'
+    | 'question_answered'
+    | 'change_set_captured'
+    | 'adapter_state'
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * One line naming it.
+   */
+  summary: string
+}
+/**
  * Where a reader continues a semantic snapshot that stopped short.
  *
  * It is present exactly when something was left out. A snapshot with no continuation is the whole
@@ -12496,7 +13073,9 @@ export interface ServiceRequestPayload {
     | 'review.acknowledge'
     | 'attention.read'
     | 'attention.acknowledge'
+    | 'attention.quiet_hours'
     | 'visit.acknowledge'
+    | 'visit.changed'
     | 'action.cancel'
     | 'owner.confirmation.request'
     | 'owner.confirmation.complete'
@@ -14119,6 +14698,97 @@ export interface ChunkLayout2 {
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
    */
   last_chunk_len: string
+}
+/**
+ * Parameters of `visit.acknowledge`.
+ */
+export interface VisitAcknowledgeParams {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  acknowledged_cursor: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+  /**
+   * The log views this actor had open, with their offsets and filters.
+   */
+  views: LogViewState[]
+}
+/**
+ * The result of `visit.acknowledge`.
+ */
+export interface VisitAcknowledgeResult {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  acknowledged_cursor: string
+  /**
+   * The actor the visit belongs to.
+   */
+  actor_id: string
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  revision: string
+  /**
+   * The views the host retained, after the per-session bound.
+   */
+  views: LogViewState[]
+}
+/**
+ * Parameters of `visit.changed`.
+ */
+export interface VisitChangedParams {
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  max_changes: string
+  /**
+   * One KalaReach terminal session.
+   */
+  session_id: string
+}
+/**
+ * The result of `visit.changed`.
+ */
+export interface VisitChangedResult {
+  /**
+   * The actor this view belongs to.
+   */
+  actor_id: string
+  /**
+   * The semantic changes after the acknowledged cursor, oldest first.
+   */
+  changes: SemanticChange[]
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  from_cursor: string
+  /**
+   * Whether more changes remain past [`VisitChangedResult::to_cursor`].
+   */
+  more: boolean
+  /**
+   * The ranges retention evicted before this view could show them.
+   *
+   * An omitted range is stated. The view never presents a shorter list as if it were the whole
+   * of what happened.
+   */
+  omitted: AttentionGap[]
+  /**
+   * The summary of this interval, when one was requested and produced.
+   */
+  summary: ChangeSummary | null
+  /**
+   * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
+   */
+  to_cursor: string
+  /**
+   * The log views this actor retained, with any gap retention left in them.
+   */
+  views: RetainedLogView[]
 }
 /**
  * What the controller publishes so a client can reach a worker without asking the controller.
