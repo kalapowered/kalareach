@@ -44,13 +44,29 @@ pub fn install_text(kind: ShellKind, command: &LaunchCommand) -> String {
         // Already the exact text to run, in that shell's own language. Quoting it again would
         // change what it means.
         LaunchCommand::QuotedCommand(text) => text.clone(),
-        LaunchCommand::Arguments(arguments) => arguments
-            .iter()
-            .map(|argument| quote(kind, argument))
-            .collect::<Vec<_>>()
-            .join(" "),
+        LaunchCommand::Arguments(arguments) => {
+            let mut words = arguments
+                .iter()
+                .map(|argument| quote(kind, argument))
+                .collect::<Vec<_>>();
+            // PowerShell reads a quoted word at command position as a string to evaluate, not as
+            // a program to run: `'C:\Program Files\git.exe'` prints the path. The call operator
+            // is what says to run it, and it is needed exactly when the first word had to be
+            // quoted. Nothing else on the line changes.
+            if kind == ShellKind::PowerShell
+                && words
+                    .first()
+                    .is_some_and(|program| program.starts_with('\''))
+            {
+                words[0] = format!("{CALL_OPERATOR} {}", words[0]);
+            }
+            words.join(" ")
+        }
     }
 }
+
+/// PowerShell's call operator, which runs a quoted word rather than printing it.
+pub const CALL_OPERATOR: &str = "&";
 
 /// Returns one argument as a single literal word in this shell.
 #[must_use]
@@ -152,6 +168,36 @@ mod tests {
         assert_eq!(quote(ShellKind::PowerShell, "it's"), "'it''s'");
         assert_eq!(quote(ShellKind::Fish, r"a\b"), r"'a\\b'");
         assert_eq!(quote(ShellKind::Bash, r"a\b"), r"'a\b'");
+    }
+
+    /// KR-REQ-23.54: a quoted executable path in PowerShell runs rather than printing itself.
+    #[test]
+    fn powershell_calls_a_quoted_program_rather_than_printing_it() {
+        let command = LaunchCommand::Arguments(vec![
+            r"C:\Program Files\Git\git.exe".to_owned(),
+            "status".to_owned(),
+        ]);
+        assert_eq!(
+            install_text(ShellKind::PowerShell, &command),
+            r"& 'C:\Program Files\Git\git.exe' status"
+        );
+        // A bare program needs none of it, and neither does any other shell.
+        let bare = LaunchCommand::Arguments(vec!["git".to_owned(), "status".to_owned()]);
+        assert_eq!(install_text(ShellKind::PowerShell, &bare), "git status");
+        for kind in [ShellKind::Zsh, ShellKind::Bash, ShellKind::Fish] {
+            assert!(
+                !install_text(kind, &command).starts_with(CALL_OPERATOR),
+                "{kind} runs a quoted program without a call operator"
+            );
+        }
+        // A command the caller already quoted for PowerShell is its own text, call operator and
+        // all: adding one would change what it means.
+        let quoted =
+            LaunchCommand::QuotedCommand("Get-ChildItem | Select-Object -First 5".to_owned());
+        assert_eq!(
+            install_text(ShellKind::PowerShell, &quoted),
+            "Get-ChildItem | Select-Object -First 5"
+        );
     }
 
     #[test]

@@ -361,6 +361,8 @@ mod tests {
             home: home.path().to_path_buf(),
             zdotdir: None,
             xdg_config_home: None,
+            user_profile: None,
+            onedrive: None,
         };
         let theirs = "export EDITOR=vim\n";
         let zshrc = home.path().join(".zshrc");

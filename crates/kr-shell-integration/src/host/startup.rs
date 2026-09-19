@@ -51,6 +51,10 @@ pub struct HomeLayout {
     pub zdotdir: Option<PathBuf>,
     /// The value of `XDG_CONFIG_HOME`, when the user has one.
     pub xdg_config_home: Option<PathBuf>,
+    /// The value of `USERPROFILE`, which is where Windows keeps a user's own directories.
+    pub user_profile: Option<PathBuf>,
+    /// The value of `OneDrive`, when a Windows installation has redirected the user's documents.
+    pub onedrive: Option<PathBuf>,
 }
 
 impl HomeLayout {
@@ -63,6 +67,8 @@ impl HomeLayout {
                 .unwrap_or_default(),
             zdotdir: std::env::var_os("ZDOTDIR").map(PathBuf::from),
             xdg_config_home: std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+            user_profile: std::env::var_os("USERPROFILE").map(PathBuf::from),
+            onedrive: std::env::var_os("OneDrive").map(PathBuf::from),
         }
     }
 
@@ -111,31 +117,87 @@ impl HomeLayout {
             }],
             ShellKind::PowerShell => vec![StartupTarget {
                 kind,
-                path: self
-                    .home
-                    .join(".config/powershell/Microsoft.PowerShell_profile.ps1"),
+                path: self.powershell_profile(),
                 reason: "the user's own profile, which this entry adds to rather than replaces",
             }],
         }
     }
 
+    /// Returns the profile PowerShell reads on this platform.
+    ///
+    /// PowerShell keeps its per-user profile where the platform puts a user's documents, and the
+    /// two platforms do not agree: Windows uses `Documents\PowerShell` under the user's profile
+    /// directory, following the `USERPROFILE` and `OneDrive` redirection a modern installation
+    /// does, and everything else uses `.config/powershell` under the home directory. Writing the
+    /// Unix path on Windows would add an entry to a file PowerShell never reads.
+    fn powershell_profile(&self) -> PathBuf {
+        const PROFILE: &str = "Microsoft.PowerShell_profile.ps1";
+
+        if cfg!(windows) {
+            // `Documents` is redirected when OneDrive's known-folder move is on, and the variable
+            // it sets is what says where. Without it the profile directory is under the user's own
+            // profile, which `USERPROFILE` names and `HOME` usually does not.
+            let documents = self
+                .onedrive
+                .clone()
+                .or_else(|| self.user_profile.clone())
+                .unwrap_or_else(|| self.home.clone())
+                .join("Documents");
+            return documents.join("PowerShell").join(PROFILE);
+        }
+        self.xdg_config_home
+            .clone()
+            .unwrap_or_else(|| self.home.join(".config"))
+            .join("powershell")
+            .join(PROFILE)
+    }
+
     /// Returns the first login file this user has, when it does not already source `.bashrc`.
     ///
-    /// Bash reads exactly one of these for a login shell, in this order. A file that already
+    /// Bash reads exactly one of these for a login shell, in this order, and a file that already
     /// sources `.bashrc` needs no entry of its own: the entry in `.bashrc` will run.
+    ///
+    /// What counts as sourcing it is a `source` or `.` of a path whose last component is
+    /// `.bashrc`, on a line that is not a comment. A file that merely mentions the name — in a
+    /// comment, in a message, in a variable that is never read — is not a file that runs it, and
+    /// treating it as one would leave a login shell with no entry at all.
     fn bash_login_file(&self) -> Option<PathBuf> {
         for name in [".bash_profile", ".bash_login", ".profile"] {
             let path = self.home.join(name);
             let Ok(contents) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if contents.contains(".bashrc") {
+            if contents.lines().any(sources_bashrc) {
                 return None;
             }
             return Some(path);
         }
         None
     }
+}
+
+/// Returns whether one line of a login file sources `.bashrc`.
+///
+/// The shape is a `source` or `.` command whose next word is a path ending in `.bashrc`, wherever
+/// on the line it appears: a login file writes it inside a test, after a `then`, behind a `&&`.
+/// A line that merely contains the name — in a comment, in a message, in a variable nothing reads
+/// — is not a line that runs it, and treating it as one would leave a login shell with no entry.
+fn sources_bashrc(line: &str) -> bool {
+    let line = line.trim();
+    if line.starts_with('#') {
+        return false;
+    }
+    let words: Vec<&str> = line.split_whitespace().collect();
+    words.windows(2).any(|pair| {
+        let verb = pair[0].trim_start_matches(|byte| matches!(byte, ';' | '&' | '|'));
+        if verb != "source" && verb != "." {
+            return false;
+        }
+        let argument = pair[1].trim_matches(|byte| matches!(byte, '"' | '\'' | ';'));
+        std::path::Path::new(argument)
+            .file_name()
+            .is_some_and(|name| name == ".bashrc")
+    })
 }
 
 /// What one guarded entry contains.
@@ -213,6 +275,7 @@ pub enum Change {
 /// Returns the underlying failure when the file cannot be read or written.
 pub fn install(path: &Path, body: &str) -> std::io::Result<Change> {
     let _writing = writing();
+    let _held = FileLock::take(path)?;
     let existing = read_or_empty(path)?;
     let (change, updated) = match strip(&existing) {
         Some((before, after)) => {
@@ -248,6 +311,7 @@ pub fn install(path: &Path, body: &str) -> std::io::Result<Change> {
 /// Returns the underlying failure when the file cannot be read or written.
 pub fn remove(path: &Path) -> std::io::Result<Change> {
     let _writing = writing();
+    let _held = FileLock::take(path)?;
     let existing = read_or_empty(path)?;
     let Some((before, after)) = strip(&existing) else {
         return Ok(Change::Absent);
@@ -270,11 +334,110 @@ pub fn remove(path: &Path) -> std::io::Result<Change> {
     Ok(Change::Removed)
 }
 
+/// How long a startup write waits for another one to finish before it gives up.
+const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// How old a lock file has to be before it is taken for one nobody is holding.
+///
+/// A startup write is a read, a rebuild and a rename of a small file. One that has held the lock
+/// for this long is not running; it is a process that died with the file still there, and leaving
+/// it would make every later write fail on a machine that had crashed once.
+const LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A lock beside one startup file, held for a whole read-rebuild-write.
+///
+/// This is what closes the window between the check before the rename and the rename itself, for
+/// the writer that window was about: another `kr` process installing or removing the same entry.
+/// The lock is a file created exclusively beside the startup file, so the two processes need no
+/// agreement beyond the directory they are both writing in.
+///
+/// It says nothing about an editor. A person who saves the file between the check and the rename
+/// still has that save replaced, and closing that would need the platform to offer a comparison
+/// and a rename in one step.
+struct FileLock {
+    path: PathBuf,
+}
+
+impl FileLock {
+    /// Takes the lock for one startup file, waiting for a holder that is still working.
+    ///
+    /// # Errors
+    ///
+    /// Returns the underlying failure, or a timeout when another writer held it throughout.
+    fn take(path: &Path) -> std::io::Result<Self> {
+        let target = resolved(path)?;
+        let directory = target.parent().unwrap_or_else(|| Path::new("."));
+        let name = target.file_name().map_or_else(
+            || String::from("startup"),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        let lock = directory.join(format!(".{name}.kalareach-lock"));
+        let deadline = std::time::Instant::now() + LOCK_PATIENCE;
+        loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock)
+            {
+                Ok(mut file) => {
+                    use std::io::Write as _;
+
+                    // What is in it is for a person reading a directory, not for this code: the
+                    // exclusive creation is the lock.
+                    let _ = writeln!(file, "kr {}", std::process::id());
+                    return Ok(Self { path: lock });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    if lock
+                        .metadata()
+                        .and_then(|data| data.modified())
+                        .is_ok_and(|written| {
+                            written.elapsed().is_ok_and(|age| age > LOCK_STALE_AFTER)
+                        })
+                    {
+                        // Nobody is holding it. Removing it races another writer doing the same,
+                        // and the loser simply takes the lock the winner released.
+                        let _ = std::fs::remove_file(&lock);
+                        continue;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            format!(
+                                "another kr process is writing {}; nothing was written",
+                                target.display()
+                            ),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(25));
+                }
+                // The directory is not there yet, which is the caller's to create. A lock it
+                // cannot take is not a reason to refuse the write: the file cannot exist either.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Self {
+                        path: PathBuf::new(),
+                    });
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if !self.path.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
 /// Serialises this process's own startup-file writes.
 ///
 /// Installing and removing both read a file, rebuild it and write it back. Two of them running at
-/// once against the same file could otherwise interleave and lose one of the two results. It says
-/// nothing about another process, which is what the check before the rename is for.
+/// once against the same file could otherwise interleave and lose one of the two results. Another
+/// process is excluded by [`FileLock`], and what neither covers is a person's own editor, which is
+/// what the check before the rename is for.
 fn writing() -> std::sync::MutexGuard<'static, ()> {
     static WRITING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -315,11 +478,12 @@ fn strip(contents: &str) -> Option<(String, String)> {
 /// checked again immediately before the rename, once the slow part is behind us: a replacement
 /// built on stale contents would silently drop whatever was saved in between.
 ///
-/// That last check is as good as this can be without the platform offering a comparison and a
-/// rename in one step. This process's own calls are serialised against each other; another process
-/// that saves between the check and the rename is not detected, and its save is what the rename
-/// replaces. The identity half of the check is a Unix one: elsewhere a file that was replaced
-/// rather than edited is caught only by its contents.
+/// What remains is one window and one writer. This process's own calls are serialised against each
+/// other and another `kr` process is excluded by the lock beside the file, so the writer the window
+/// is about is a person's own editor saving between the check and the rename; closing that would
+/// need the platform to offer a comparison and a rename in one step. The identity half of the
+/// check is a Unix one, and it is used only where the filesystem's numbers hold still: elsewhere a
+/// file that was replaced rather than edited is caught by its contents.
 fn replace(path: &Path, expected: &str, contents: &str) -> std::io::Result<()> {
     // The file the configuration actually lives in. A symlink is a deliberate arrangement of the
     // user's, and renaming over the link would replace it with a regular file and quietly cut the
@@ -335,7 +499,11 @@ fn replace(path: &Path, expected: &str, contents: &str) -> std::io::Result<()> {
     let permissions = std::fs::metadata(&target)
         .ok()
         .map(|data| data.permissions());
-    let identity = identity_of(&target);
+    // The identity this rename stands on, and whether it means anything here. A filesystem that
+    // hands out a different number for the same unchanged file is one where an identity check
+    // would refuse a write it should have made, so what such a filesystem gets is the contents
+    // check alone.
+    let identity = stable_identity(&target);
     let prepared = write_new(&temporary, contents).and_then(|()| {
         if let Some(permissions) = permissions {
             std::fs::set_permissions(&temporary, permissions)?;
@@ -343,7 +511,9 @@ fn replace(path: &Path, expected: &str, contents: &str) -> std::io::Result<()> {
         // The check the rename stands on, taken here rather than before the write: the write, the
         // permissions and the flush are where the time goes, and a check taken before them says
         // nothing about the file the rename is about to replace.
-        if read_or_empty(&target)? != expected || identity_of(&target) != identity {
+        if read_or_empty(&target)? != expected
+            || identity.is_some_and(|identity| stable_identity(&target) != Some(identity))
+        {
             return Err(std::io::Error::other(
                 "the startup file changed while this entry was being written, so nothing was \
                  written",
@@ -365,10 +535,23 @@ fn resolved(path: &Path) -> std::io::Result<std::path::PathBuf> {
     }
 }
 
-/// Returns what says this is still the same file, as far as the platform will say.
+/// Returns a file's identity, when this filesystem gives it one that holds still.
 ///
 /// A file that was replaced between the caller's read and this rename is a different file, whatever
 /// its contents happen to be, and the entry belongs in whichever one the startup path names now.
+/// That reasoning needs an identity that is stable for an unchanged file, which not every
+/// filesystem offers: some network and userspace filesystems synthesise inode numbers and hand out
+/// a different one for the same file. There, an identity check would refuse a write it should have
+/// made, so this reads the file twice and reports an identity only when the two readings agree.
+///
+/// Two readings that disagree because the file really was replaced in between are covered by the
+/// contents check, which runs whether or not there is an identity.
+fn stable_identity(path: &Path) -> Option<(u64, u64)> {
+    let first = identity_of(path)?;
+    (identity_of(path)? == first).then_some(first)
+}
+
+/// Returns what the platform says identifies this file.
 #[cfg(unix)]
 fn identity_of(path: &Path) -> Option<(u64, u64)> {
     use std::os::unix::fs::MetadataExt as _;
@@ -421,6 +604,8 @@ mod tests {
             home: root.to_path_buf(),
             zdotdir: None,
             xdg_config_home: None,
+            user_profile: None,
+            onedrive: None,
         }
     }
 
@@ -466,6 +651,145 @@ mod tests {
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].path, root.path().join(".bashrc"));
         assert_eq!(targets[1].path, root.path().join(".bash_profile"));
+    }
+
+    /// KR-REQ-07.30: only a login file that actually runs `.bashrc` counts as one that does.
+    #[test]
+    fn a_login_file_that_only_mentions_bashrc_still_gets_its_own_entry() {
+        let root = tempfile::tempdir().expect("a directory");
+        let home = layout(root.path());
+        for mentions in [
+            "# this used to source ~/.bashrc; it does not any more\n",
+            "echo 'see .bashrc for the aliases'\n",
+            "BASHRC=~/.bashrc\n",
+            "# . ~/.bashrc\n",
+        ] {
+            std::fs::write(root.path().join(".bash_profile"), mentions).expect("writes");
+            assert_eq!(
+                home.targets(ShellKind::Bash).len(),
+                2,
+                "a login file that names .bashrc without running it still needs an entry: \
+                 {mentions:?}"
+            );
+        }
+        for sources in [
+            ". ~/.bashrc\n",
+            "source ~/.bashrc\n",
+            "[ -f ~/.bashrc ] && source \"$HOME/.bashrc\"\n",
+            "export PATH=/opt:$PATH; . /home/someone/.bashrc\n",
+            "if [ -r ~/.bashrc ]; then . ~/.bashrc; fi\n",
+        ] {
+            std::fs::write(root.path().join(".bash_profile"), sources).expect("writes");
+            assert_eq!(
+                home.targets(ShellKind::Bash).len(),
+                1,
+                "a login file that runs .bashrc needs no entry of its own: {sources:?}"
+            );
+        }
+    }
+
+    /// KR-REQ-07.40: two writers of one startup file do not interleave, whichever process each
+    /// is in.
+    #[test]
+    fn a_second_writer_waits_for_the_first_and_neither_loses_its_entry() {
+        let root = tempfile::tempdir().expect("a directory");
+        let path = root.path().join(".zshrc");
+        std::fs::write(&path, "export EDITOR=vim\n").expect("writes");
+
+        // A lock is taken for the whole read-rebuild-write, so a writer that is not this process
+        // is kept out rather than racing the rename.
+        let held = FileLock::take(&path).expect("takes the lock");
+        let lock = root
+            .path()
+            .join(".{}.kalareach-lock".replace("{}", ".zshrc"));
+        assert!(lock.is_file(), "the lock is beside the file it is about");
+        drop(held);
+        assert!(!lock.exists(), "and it goes when the write is finished");
+
+        // A lock nobody is holding does not stop a write for ever.
+        std::fs::write(&lock, "kr 1\n").expect("writes a lock file");
+        let stale =
+            std::time::SystemTime::now() - LOCK_STALE_AFTER - std::time::Duration::from_secs(1);
+        std::fs::File::open(&lock)
+            .and_then(|file| file.set_times(std::fs::FileTimes::new().set_modified(stale)))
+            .expect("ages the lock file");
+        let reclaimed = FileLock::take(&path).expect("reclaims a lock nobody is holding");
+        drop(reclaimed);
+
+        let body = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), false);
+        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert!(
+            std::fs::read_to_string(&path)
+                .expect("reads")
+                .starts_with("export EDITOR=vim"),
+            "the user's own line is still first"
+        );
+        assert!(!lock.exists(), "and no lock is left behind");
+    }
+
+    /// KR-REQ-07.40: a filesystem whose identity numbers move does not refuse a legitimate write.
+    #[test]
+    fn an_unstable_identity_leaves_the_write_to_the_contents_check() {
+        let root = tempfile::tempdir().expect("a directory");
+        let path = root.path().join(".zshrc");
+        std::fs::write(&path, "export EDITOR=vim\n").expect("writes");
+        // On a filesystem that holds still, two readings agree and the identity is used.
+        assert_eq!(stable_identity(&path), identity_of(&path));
+        // A path that names nothing has no identity either way, and the write is decided by the
+        // contents alone, which is what a filesystem with moving numbers gets.
+        assert_eq!(stable_identity(&root.path().join("absent")), None);
+
+        let body = entry(ShellKind::Zsh, Path::new("/opt/kr/zsh-entry.zsh"), false);
+        assert_eq!(install(&path, &body).expect("installs"), Change::Added);
+        assert_eq!(remove(&path).expect("removes"), Change::Removed);
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("reads"),
+            "export EDITOR=vim\n"
+        );
+    }
+
+    /// KR-REQ-07.29: PowerShell's profile is the one this platform's PowerShell reads.
+    #[test]
+    fn the_powershell_profile_is_this_platforms_own() {
+        let root = tempfile::tempdir().expect("a directory");
+        let home = layout(root.path());
+        let path = &home.targets(ShellKind::PowerShell)[0].path;
+        assert_eq!(
+            path.file_name().expect("a file name"),
+            "Microsoft.PowerShell_profile.ps1"
+        );
+        if cfg!(windows) {
+            assert!(
+                path.to_string_lossy().contains("Documents"),
+                "Windows keeps the profile under the user's documents: {}",
+                path.display()
+            );
+            // A redirected documents directory is where the profile actually is.
+            let redirected = HomeLayout {
+                onedrive: Some(root.path().join("OneDrive")),
+                ..home.clone()
+            };
+            assert_eq!(
+                redirected.targets(ShellKind::PowerShell)[0].path,
+                root.path()
+                    .join("OneDrive/Documents/PowerShell/Microsoft.PowerShell_profile.ps1")
+            );
+        } else {
+            assert_eq!(
+                *path,
+                root.path()
+                    .join(".config/powershell/Microsoft.PowerShell_profile.ps1")
+            );
+            let configured = HomeLayout {
+                xdg_config_home: Some(root.path().join("xdg")),
+                ..home.clone()
+            };
+            assert_eq!(
+                configured.targets(ShellKind::PowerShell)[0].path,
+                root.path()
+                    .join("xdg/powershell/Microsoft.PowerShell_profile.ps1")
+            );
+        }
     }
 
     #[test]
