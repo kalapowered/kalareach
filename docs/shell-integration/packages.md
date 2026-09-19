@@ -271,7 +271,14 @@ script, every patch file, every added source, the startup entry, and the compile
 the build honours. The first sixteen hex characters name the directory the package is installed
 in, so the same inputs land in the same place and a second run reports that nothing changed.
 Change one byte of any of them, or build with a different compiler, and the identity changes with
+it. For a package whose own source is Rust the toolchain is pinned by name for the whole build, so
+the compiler the identity records is the one that ran, and the flags it honours are recorded beside
 it.
+
+The identity names the inputs a package was built from rather than the bytes it produced. fish's
+build records the directory it was built in, which is a fresh temporary one each time, so two runs
+from the same inputs give the same identity and the same install path rather than an identical
+file.
 
 Packages are installed outside the repository, under `~/Library/Caches/kalareach/shells/` on macOS
 and `${XDG_CACHE_HOME:-~/.cache}/kalareach/shells/` elsewhere. A process a service manager starts

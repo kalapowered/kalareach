@@ -549,19 +549,33 @@ four things:
 - The bridge's endpoint joins the reader's own `select` set, so a fence, a cancellation or a launch
   that arrives while the reader is blocked is answered then rather than at the person's next key.
 - The mailbox is read at every key-sequence boundary: after one complete sequence has been resolved
-  and before its binding runs, which is where the reader is between operations.
+  and before its binding runs, which is where the reader is between operations. Every wait the
+  reader can be in watches the endpoint alongside the terminal, including the wait for the rest of
+  a character and the timed wait for the rest of a sequence, and it watches for room to write while
+  an answer is still going out.
 - The end-of-file decision is a **named binding**, `kr-eof-decide`, in the reader's own command
   table. The guarded entry under `conf.d` puts it on the configured gesture once the person's own
-  configuration has run, keeps whatever was bound there, and runs that outside the detach
-  condition. A person who binds the gesture key afterwards takes it back, which is theirs to do.
+  configuration has run, in every bind mode the shipped bindings use, keeps whatever was bound
+  there in each of them, and runs that outside the detach condition. The decision carries the key
+  the reader decoded rather than the byte the terminal sent, so a gesture that arrived as a whole
+  escape sequence is still one key. A person who binds the gesture key afterwards takes it back,
+  which is theirs to do.
 - A cancellation ends a pending key wait through the reader's own interruption path, which returns
-  the part-read sequence, handles the interruption and leaves the edit buffer exactly as it was.
+  the part-read sequence, handles the interruption and leaves the edit buffer exactly as it was. It
+  settles at the boundary the reader comes out at rather than the one it was asked in, and reports
+  the bytes it dropped.
 
-Two things this reader does not have, and the package says so rather than claiming them: it
-accumulates no numeric argument, and it has no quoted insertion of its own. `get-key` waits for a
-literal key in the same way and the bridge reports that state, so a package that binds it is
-covered; nothing binds it by default. A vi operator here is a key sequence rather than a wait for a
-motion, which is why an unfinished operator reads as a pending multikey sequence.
+The states the detach condition excludes are read from where this reader actually keeps them. Its
+vi bindings hold a count and a pending operator in the shell's own variables and in the `operator`
+bind mode, and both are reported and both hold the partial-key queue. So do the first bytes of a
+character the decoder has not finished and characters the reader has taken from the terminal and
+not yet put in the buffer. One thing this reader does not have, and the package says so rather than
+claiming it: a quoted insertion of its own. `get-key` waits for a literal key in the same way and
+the bridge reports that state, so a package that binds it is covered; nothing binds it by default.
+
+The buffer's revision is the reader's own edit generation, so a binding that changes the line and
+puts it back has changed it twice; a directory change counts wherever `PWD` is set, for the same
+reason.
 
 The gesture follows the terminal's own end-of-file character, read from the modes the shell hands
 to the programs it runs. The reader holds the terminal in the shell's own modes while it reads, and
@@ -585,10 +599,10 @@ Section 7 says this package does not claim that the stock public API has an asyn
 method, and that is exactly what it cannot do:
 
 - **The reader is reached when it steps.** The module's queue is serviced on the reader's own
-  thread — at the read-line entry, inside every handler the module owns, and whenever the host
-  delivers the module's signal there. The host delivers that signal around the reader's own steps,
-  so a request that arrives at a reader parked in its key wait is answered at its next step rather
-  than immediately.
+  thread, where the editor reads its own key queue: at the read-line entry and in front of every
+  chord the editor has a binding for. A request that arrives at a reader parked in its key wait is
+  therefore answered at its next step rather than immediately, and until then the reader's last
+  idle report is what the worker has to go on.
 - **A launch is installed where it is decided and accepted at the next step.** The decision, the
   state check and the installation all happen on the reader's thread, inside the fence. The
   acceptance is submitted to the editor's own accept and its own return key is put in the editor's
@@ -601,6 +615,9 @@ method, and that is exactly what it cannot do:
 - **The queues are the editor's own.** The reader's key queue is read directly, under the version
   range this package was qualified against. Asking the console whether a key is available instead
   would take the lock the editor's own read is holding, and the reader would wait for itself.
+- **The buffer belongs to the read that is in progress.** Between one line being accepted and the
+  next read starting, the editor still holds the line that has gone; the module reports the buffer
+  it is about to have, which is empty, and counts no change the person did not make.
 
 Running the module on Windows, where the endpoint is a named pipe and the gesture is the configured
 chord rather than the line discipline's own character, is qualified separately.
