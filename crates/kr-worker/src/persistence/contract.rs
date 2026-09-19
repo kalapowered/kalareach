@@ -11,12 +11,12 @@
 //!   an fsync.** A terminal that flushed a page cache entry for every character would be a
 //!   terminal nobody could type in, and section 24 says so in as many words.
 //!
-//! What sits between the two is grouping. Writes that no acknowledgement and no dispatch is
-//! waiting on may share one flush, and [`CommitGroup`] is where they wait. The invariant that
-//! makes grouping safe is the one [`flush_policy`] states and the tests below check: a commit
-//! point is never grouped, and a commit point drains the group before it commits, so the durable
-//! order is the order this host produced. Grouping shares a flush; it never moves the dispatch
-//! boundary ahead of durability.
+//! What sits between the two is grouping. Section 24 permits writes to share a flush so long as
+//! that does not move the dispatch boundary ahead of durability, and the journal's own
+//! transactions are where that happens: a receipt transition writes the receipt row, its event
+//! and its outbox record in one transaction, so three rows share one flush and either all three
+//! are durable or none of them is. [`flush_policy`] is the rule that keeps it safe: a commit
+//! point is never grouped with anything a caller is not already waiting on.
 
 /// One point at which this host commits before it acts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -104,89 +104,6 @@ pub const fn flush_policy(write: WriteKind) -> FlushPolicy {
     }
 }
 
-/// How many grouped writes wait before the group is drained on its own account.
-///
-/// The bound exists so a session producing side effects and nothing else still reaches its store
-/// rather than holding an unbounded list. It is small, because what waits here is work nobody is
-/// blocked on and the cost of draining it is one transaction.
-pub const MAX_GROUPED_WRITES: usize = 64;
-
-/// Writes that may share one flush.
-///
-/// The group holds what no acknowledgement and no dispatch is waiting on. It is drained by the
-/// bound above, by the worker's own maintenance, and by every commit point before that point
-/// commits, which is what keeps the durable order the order this host produced.
-#[derive(Debug, Default)]
-pub struct CommitGroup<T> {
-    queued: Vec<T>,
-    flushes: u64,
-}
-
-impl<T> CommitGroup<T> {
-    /// Builds an empty group.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            queued: Vec::new(),
-            flushes: 0,
-        }
-    }
-
-    /// Adds a write to the group.
-    pub fn push(&mut self, write: T) {
-        self.queued.push(write);
-    }
-
-    /// Returns how many writes are waiting.
-    #[must_use]
-    pub fn len(&self) -> usize {
-        self.queued.len()
-    }
-
-    /// Returns true when nothing is waiting.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.queued.is_empty()
-    }
-
-    /// Returns true when the group has reached the bound it drains at on its own account.
-    #[must_use]
-    pub fn is_due(&self) -> bool {
-        self.queued.len() >= MAX_GROUPED_WRITES
-    }
-
-    /// Returns how many times the group has been drained.
-    ///
-    /// One drain is one shared flush, which is what makes the grouping visible to a test: a
-    /// hundred side effects that produced one flush shared it, and a hundred that produced a
-    /// hundred did not.
-    #[must_use]
-    pub const fn flushes(&self) -> u64 {
-        self.flushes
-    }
-
-    /// Takes everything waiting, and counts the flush.
-    ///
-    /// The caller writes what it is given in one transaction. An empty group counts no flush,
-    /// because nothing was written.
-    pub fn take(&mut self) -> Vec<T> {
-        if self.queued.is_empty() {
-            return Vec::new();
-        }
-        self.flushes += 1;
-        std::mem::take(&mut self.queued)
-    }
-
-    /// Puts writes back at the front after a drain that could not be committed.
-    ///
-    /// A group whose transaction failed has not been written, so what it held is still owed. The
-    /// flush that was counted stays counted: it happened, and it failed.
-    pub fn restore(&mut self, mut writes: Vec<T>) {
-        writes.append(&mut self.queued);
-        self.queued = writes;
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,38 +141,12 @@ mod tests {
     }
 
     #[test]
-    fn a_group_shares_one_flush_and_an_empty_one_counts_none() {
-        let mut group: CommitGroup<u8> = CommitGroup::new();
-        assert!(group.take().is_empty());
-        assert_eq!(group.flushes(), 0);
-        for value in 0..10 {
-            group.push(value);
+    fn every_commit_point_says_what_it_commits_before() {
+        for point in CommitPoint::ALL {
+            assert!(
+                !point.commits_before().is_empty(),
+                "{point:?} does not say what it is ahead of"
+            );
         }
-        assert_eq!(group.len(), 10);
-        assert_eq!(group.take().len(), 10);
-        assert_eq!(group.flushes(), 1);
-        assert!(group.is_empty());
-    }
-
-    #[test]
-    fn a_group_that_could_not_be_committed_still_owes_what_it_held() {
-        let mut group: CommitGroup<u8> = CommitGroup::new();
-        group.push(1);
-        group.push(2);
-        let taken = group.take();
-        group.push(3);
-        group.restore(taken);
-        assert_eq!(group.take(), vec![1, 2, 3]);
-    }
-
-    #[test]
-    fn the_group_drains_on_its_own_account_at_the_bound() {
-        let mut group: CommitGroup<u8> = CommitGroup::new();
-        for _ in 0..MAX_GROUPED_WRITES - 1 {
-            group.push(0);
-            assert!(!group.is_due());
-        }
-        group.push(0);
-        assert!(group.is_due());
     }
 }

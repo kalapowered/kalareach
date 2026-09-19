@@ -18,11 +18,6 @@ use std::time::Duration;
 pub enum Durability {
     /// Committed with full synchronisation before the caller is answered.
     CrashDurable,
-    /// Committed durably, and able to share a flush with the commit beside it.
-    ///
-    /// A grouped commit never moves the dispatch boundary ahead of durability: what shares a
-    /// flush is work that no acknowledgement and no dispatch is waiting on.
-    GroupedCommit,
     /// Written to disk without a flush of its own.
     BestEffortFile,
     /// Held in memory for the life of the process.
@@ -47,7 +42,9 @@ pub enum Retention {
 /// Section 24 keeps raw keystrokes, terminal bodies and provider keys out of a universal control
 /// log. The classes are what makes that checkable: a store declared [`ContentClass::Metadata`]
 /// that held a keystroke would be a store whose declaration is wrong, and the journal's own test
-/// greps for exactly that.
+/// greps for exactly that. A store that holds more than one class declares the widest it holds,
+/// because what acts on the declaration - privacy cleanup, an export, an archive - has to be
+/// right about the worst case rather than about the usual one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ContentClass {
     /// Operation metadata: identifiers, revisions, states, digests and counts.
@@ -79,6 +76,21 @@ pub enum Cleanup {
     ProcessExit,
 }
 
+/// What protects a store where it lies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Protection {
+    /// An owner-only directory under the environment's state root.
+    ///
+    /// Section 24 makes local state directories owner-only and the keys OS-protected. It does not
+    /// ask for local encryption at rest, and claiming it would be claiming something this build
+    /// does not do.
+    OwnerOnlyDirectory,
+    /// Held in this process's memory and never written.
+    ProcessMemory,
+    /// Encrypted before it leaves this host.
+    EncryptedBeforeUpload,
+}
+
 /// How a store is brought back into agreement after a restart.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Reconciliation {
@@ -105,6 +117,8 @@ pub struct StoreDescriptor {
     pub retention: Retention,
     /// What class of content it holds.
     pub content: ContentClass,
+    /// What protects it where it lies.
+    pub protection: Protection,
     /// Who removes what it no longer needs.
     pub cleanup: Cleanup,
     /// How it is brought back into agreement after a restart.
@@ -121,10 +135,14 @@ pub struct StoreDescriptor {
 pub static STORES: &[StoreDescriptor] = &[
     StoreDescriptor {
         name: "receipts",
-        holds: "one row per admitted action: its state, revision, digests and deadline",
+        holds: "one row per admitted action: its state, revision, digests, deadline and the intent envelope it was admitted with",
         durability: Durability::CrashDurable,
         retention: Retention::Period(RECEIPT_RETENTION),
-        content: ContentClass::Metadata,
+        // The intent envelope is what the caller asked for, exactly as it arrived, so a method
+        // that carries text a person wrote carries it here. It is never the terminal's own body
+        // and never a provider key, which is what section 24 forbids.
+        content: ContentClass::AuthoredContent,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::WorkerMaintenance,
         reconciliation: Reconciliation::UnfinishedDispatchesResolved,
         evictable_under_history_cap: false,
@@ -135,7 +153,10 @@ pub static STORES: &[StoreDescriptor] = &[
         holds: "the encoded result of an action that completed",
         durability: Durability::CrashDurable,
         retention: Retention::Period(RECEIPT_RETENTION),
-        content: ContentClass::Metadata,
+        // A result can restate what its request carried, so it is declared as widely as the
+        // request that produced it.
+        content: ContentClass::AuthoredContent,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::WorkerMaintenance,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
@@ -147,6 +168,7 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::CrashDurable,
         retention: Retention::Period(RECEIPT_RETENTION),
         content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::WorkerMaintenance,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
@@ -158,6 +180,7 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::CrashDurable,
         retention: Retention::UntilSubjectGone,
         content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::WorkerMaintenance,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
@@ -169,6 +192,7 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::CrashDurable,
         retention: Retention::UntilSubjectGone,
         content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::WorkerMaintenance,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
@@ -180,6 +204,7 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::CrashDurable,
         retention: Retention::Period(RECEIPT_RETENTION),
         content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::WorkerMaintenance,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
@@ -191,6 +216,7 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::CrashDurable,
         retention: Retention::UntilSubjectGone,
         content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::WorkerMaintenance,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
@@ -202,7 +228,8 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::CrashDurable,
         retention: Retention::UntilSubjectGone,
         content: ContentClass::Metadata,
-        cleanup: Cleanup::ProcessExit,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::ArchiveService,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
         served_by_archive: false,
@@ -213,7 +240,8 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::CrashDurable,
         retention: Retention::UntilSubjectGone,
         content: ContentClass::Metadata,
-        cleanup: Cleanup::ProcessExit,
+        protection: Protection::OwnerOnlyDirectory,
+        cleanup: Cleanup::ArchiveService,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
         served_by_archive: false,
@@ -224,6 +252,7 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::CrashDurable,
         retention: Retention::SessionLifetime,
         content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::ArchiveService,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
@@ -235,6 +264,7 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::CrashDurable,
         retention: Retention::SessionLifetime,
         content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::ArchiveService,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
@@ -246,6 +276,7 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::CrashDurable,
         retention: Retention::SessionLifetime,
         content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::ArchiveService,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
@@ -257,6 +288,7 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::CrashDurable,
         retention: Retention::UntilSubjectGone,
         content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::WorkerMaintenance,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
@@ -268,6 +300,7 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::CrashDurable,
         retention: Retention::UntilSubjectGone,
         content: ContentClass::Metadata,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::WorkerMaintenance,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
@@ -276,9 +309,10 @@ pub static STORES: &[StoreDescriptor] = &[
     StoreDescriptor {
         name: "host_events",
         holds: "an application notice that had no attachment to go to, and where in the stream it happened",
-        durability: Durability::GroupedCommit,
+        durability: Durability::CrashDurable,
         retention: Retention::SessionLifetime,
         content: ContentClass::ApplicationNotice,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::ArchiveService,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: true,
@@ -290,6 +324,7 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::BestEffortFile,
         retention: Retention::ByteCapped,
         content: ContentClass::TerminalContent,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::WorkerMaintenance,
         reconciliation: Reconciliation::RebuiltWithGaps,
         evictable_under_history_cap: true,
@@ -301,6 +336,7 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::ProcessMemory,
         retention: Retention::ByteCapped,
         content: ContentClass::TerminalContent,
+        protection: Protection::ProcessMemory,
         cleanup: Cleanup::ProcessExit,
         reconciliation: Reconciliation::NotRestored,
         evictable_under_history_cap: true,
@@ -312,6 +348,7 @@ pub static STORES: &[StoreDescriptor] = &[
         durability: Durability::CrashDurable,
         retention: Retention::UntilSubjectGone,
         content: ContentClass::AuthoredContent,
+        protection: Protection::OwnerOnlyDirectory,
         cleanup: Cleanup::TransferSweep,
         reconciliation: Reconciliation::ReadBack,
         evictable_under_history_cap: false,
@@ -379,35 +416,36 @@ mod tests {
     }
 
     #[test]
-    fn no_store_the_worker_journal_holds_declares_a_secret_or_authored_content() {
+    fn no_store_holds_key_material_and_only_the_output_layers_hold_the_terminals_body() {
+        let terminal: Vec<&str> = STORES
+            .iter()
+            .filter(|store| store.content == ContentClass::TerminalContent)
+            .map(|store| store.name)
+            .collect();
+        assert_eq!(
+            terminal,
+            vec!["output spool", "resident history"],
+            "the terminal's own body belongs to the retained output and nowhere else"
+        );
         for store in STORES {
-            if store.cleanup == Cleanup::TransferSweep {
-                // The transfer service holds files a person chose to send, under its own store.
-                continue;
-            }
-            if store.content == ContentClass::TerminalContent {
-                // The spool and the resident window are the retained output itself. What section
-                // 24 forbids is copying that into the control log, which is the assertion below.
-                continue;
-            }
             assert_ne!(
                 store.content,
                 ContentClass::Secret,
                 "{} must not hold key material",
                 store.name
             );
-            assert_ne!(
-                store.content,
-                ContentClass::AuthoredContent,
-                "{} must not hold authored content",
-                store.name
-            );
-            assert_ne!(
-                store.content,
-                ContentClass::TerminalContent,
-                "{} must not hold the terminal's own body",
-                store.name
-            );
+        }
+    }
+
+    #[test]
+    fn every_store_that_reaches_a_disk_says_what_protects_it() {
+        for store in STORES {
+            let expected = if store.durability == Durability::ProcessMemory {
+                Protection::ProcessMemory
+            } else {
+                Protection::OwnerOnlyDirectory
+            };
+            assert_eq!(store.protection, expected, "{}", store.name);
         }
     }
 
@@ -449,7 +487,7 @@ mod tests {
             store("host_events")
                 .expect("host events are declared")
                 .durability,
-            Durability::GroupedCommit
+            Durability::CrashDurable
         );
     }
 }

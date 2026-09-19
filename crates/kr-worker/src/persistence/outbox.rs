@@ -64,8 +64,10 @@ impl Subsystem {
 
 /// What a producer commits beside its state transition.
 ///
-/// Everything here is decided before the transaction opens, so committing it cannot fail for a
-/// reason the transition would not have failed for.
+/// It is written inside the transaction that made the transition true, so a crash between them is
+/// not a state this host can reach. The write can still fail on its own account - the store can be
+/// full, and the identifier has a uniqueness constraint - and when it does the transition goes
+/// back with it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OutboxEvent {
     /// The event's immutable identity. A redelivery carries the same one.
@@ -114,16 +116,36 @@ pub struct OutboxCursor {
 
 /// How many event identifiers a consumer remembers for de-duplication.
 ///
-/// At-least-once delivery means a consumer can be handed a record it has already applied. The
-/// cursor alone does not settle it, because the failure that causes a redelivery is exactly the
-/// one that lost the cursor write. Remembering the identifiers of the last page is what closes
-/// that window, and the page is what a redelivery is bounded by.
+/// At-least-once delivery means a consumer can be handed a record it has already applied. Two
+/// things close that window, and both are needed.
+///
+/// * **The cursor is durable.** A redelivery starts at the cursor the consumer last recorded, so
+///   the replayable range is bounded by what it has not yet recorded as taken.
+/// * **The remembered identifiers cover a whole page.** They are process memory, so a consumer
+///   that restarts remembers nothing and is handed its page again; what they close is the window
+///   *within* one process, between applying a record and recording the cursor past it. Because
+///   [`MAX_OUTBOX_PAGE`] is no larger than this figure, a replayed page can never displace an
+///   identifier the same page still needs.
+///
+/// Neither makes an effect outside this host idempotent. That is the destination's own property,
+/// and a consumer whose effect leaves the host has to establish it there.
 pub const REMEMBERED_EVENT_IDS: usize = 256;
 
-/// A consumer that applies each event once, however many times it is handed one.
+/// The most records one page of the outbox carries.
 ///
-/// This is the consumer's half of at-least-once delivery, and it is deliberately here rather than
+/// It is bounded by what a consumer can remember, so a page cannot outrun the de-duplication
+/// window that covers it.
+pub const MAX_OUTBOX_PAGE: u64 = REMEMBERED_EVENT_IDS as u64;
+
+/// A consumer's de-duplication of the page it is handed.
+///
+/// This is the consumer's side of at-least-once delivery, and it is deliberately here rather than
 /// in each consumer: a consumer that wrote its own would be a consumer that could get it wrong.
+///
+/// The order is the contract. [`Self::fresh`] says what has not been applied and remembers
+/// nothing; [`Self::note_applied`] is called *after* the effect, and is what makes the next
+/// answer different. A helper that remembered a record before its effect ran would suppress it
+/// after the effect failed, which is the one thing at-least-once delivery exists to prevent.
 #[derive(Clone, Debug, Default)]
 pub struct Fanout {
     seen: std::collections::VecDeque<Uuid>,
@@ -138,7 +160,7 @@ impl Fanout {
         Self::default()
     }
 
-    /// Rebuilds a fan-out from the identifiers a consumer last recorded.
+    /// Rebuilds a fan-out from the identifiers a consumer last held.
     #[must_use]
     pub fn resumed(seen: impl IntoIterator<Item = Uuid>) -> Self {
         let mut fanout = Self::default();
@@ -148,19 +170,29 @@ impl Fanout {
         fanout
     }
 
-    /// Returns the records this consumer has not already applied, and counts the rest.
-    pub fn accept<'a>(&mut self, page: &'a [OutboxRecord]) -> Vec<&'a OutboxRecord> {
+    /// Returns the records this consumer has not recorded as applied, and counts the rest.
+    ///
+    /// Nothing is remembered here. A record this returns is one the consumer still has to apply,
+    /// and it stays that way until [`Self::note_applied`] says otherwise.
+    pub fn fresh<'a>(&mut self, page: &'a [OutboxRecord]) -> Vec<&'a OutboxRecord> {
         let mut fresh = Vec::new();
         for record in page {
             if self.seen.contains(&record.event.event_id) {
                 self.suppressed += 1;
                 continue;
             }
-            self.remember(record.event.event_id);
-            self.applied += 1;
             fresh.push(record);
         }
         fresh
+    }
+
+    /// Records that one record's effect has been applied.
+    pub fn note_applied(&mut self, record: &OutboxRecord) {
+        if self.seen.contains(&record.event.event_id) {
+            return;
+        }
+        self.remember(record.event.event_id);
+        self.applied += 1;
     }
 
     /// Returns the identifiers this consumer remembers, oldest first.
@@ -220,52 +252,80 @@ mod tests {
             .collect()
     }
 
+    /// Applies a page the way a consumer does: take what is fresh, do the work, then say so.
+    fn apply(fanout: &mut Fanout, page: &[OutboxRecord]) -> Vec<u8> {
+        let fresh: Vec<OutboxRecord> = fanout.fresh(page).into_iter().cloned().collect();
+        let mut applied = Vec::new();
+        for record in &fresh {
+            applied.push(record.event.event_id.as_bytes()[0]);
+            fanout.note_applied(record);
+        }
+        applied
+    }
+
     #[test]
     fn a_redelivered_page_is_applied_once() {
         let mut fanout = Fanout::new();
         let first = page(&[1, 2, 3]);
-        assert_eq!(fanout.accept(&first).len(), 3);
-        // The consumer died before it recorded its cursor, so it is handed the same page again.
-        assert!(fanout.accept(&first).is_empty());
+        assert_eq!(apply(&mut fanout, &first), vec![1, 2, 3]);
+        // The cursor write is what failed, so the consumer is handed the same page again.
+        assert!(apply(&mut fanout, &first).is_empty());
         assert_eq!(fanout.applied(), 3);
         assert_eq!(fanout.suppressed(), 3);
     }
 
     #[test]
-    fn a_page_that_overlaps_the_previous_one_applies_only_what_is_new() {
+    fn a_record_whose_effect_failed_is_offered_again_rather_than_suppressed() {
         let mut fanout = Fanout::new();
-        fanout.accept(&page(&[1, 2, 3]));
-        let overlapping = page(&[2, 3, 4, 5]);
-        let fresh: Vec<u8> = fanout
-            .accept(&overlapping)
+        let first = page(&[1, 2, 3]);
+        // The consumer applies the first two and fails on the third.
+        let fresh: Vec<OutboxRecord> = fanout.fresh(&first).into_iter().cloned().collect();
+        for record in fresh.iter().take(2) {
+            fanout.note_applied(record);
+        }
+        let again: Vec<u8> = fanout
+            .fresh(&first)
             .into_iter()
             .map(|record| record.event.event_id.as_bytes()[0])
             .collect();
-        assert_eq!(fresh, vec![4, 5]);
+        assert_eq!(again, vec![3], "the failed effect is still owed");
     }
 
     #[test]
-    fn a_consumer_resumes_from_the_identifiers_it_recorded() {
+    fn a_page_that_overlaps_the_previous_one_applies_only_what_is_new() {
+        let mut fanout = Fanout::new();
+        apply(&mut fanout, &page(&[1, 2, 3]));
+        assert_eq!(apply(&mut fanout, &page(&[2, 3, 4, 5])), vec![4, 5]);
+    }
+
+    #[test]
+    fn a_consumer_resumes_from_the_identifiers_it_held() {
         let mut fanout = Fanout::new();
         let first = page(&[1, 2, 3]);
-        fanout.accept(&first);
-        let resumed = Fanout::resumed(fanout.remembered());
-        let mut resumed = resumed;
-        assert!(resumed.accept(&first).is_empty());
+        apply(&mut fanout, &first);
+        let mut resumed = Fanout::resumed(fanout.remembered());
+        assert!(apply(&mut resumed, &first).is_empty());
     }
 
     #[test]
-    fn what_a_consumer_remembers_is_bounded() {
+    fn a_whole_page_of_redeliveries_never_displaces_a_name_that_page_still_needs() {
+        // The window is what covers one page, so a page at the bound that is replayed entire
+        // suppresses every record in it rather than letting the newest evict the oldest.
+        let bytes: Vec<u8> = (0..REMEMBERED_EVENT_IDS as u16).map(|v| v as u8).collect();
+        let full: Vec<OutboxRecord> = bytes
+            .iter()
+            .enumerate()
+            .map(|(index, byte)| OutboxRecord {
+                cursor: index as u64 + 1,
+                event: event(*byte),
+            })
+            .collect();
+        assert_eq!(full.len() as u64, MAX_OUTBOX_PAGE);
         let mut fanout = Fanout::new();
-        for byte in 0..=255u8 {
-            fanout.accept(&page(&[byte]));
-        }
+        assert_eq!(apply(&mut fanout, &full).len(), full.len());
         assert_eq!(fanout.remembered().len(), REMEMBERED_EVENT_IDS);
-        for byte in 0..=255u8 {
-            fanout.accept(&page(&[byte]));
-        }
-        // Everything still fits inside what is remembered, so nothing was applied twice.
-        assert_eq!(fanout.applied(), 256);
+        assert!(apply(&mut fanout, &full).is_empty());
+        assert_eq!(fanout.applied() as usize, full.len());
     }
 
     #[test]

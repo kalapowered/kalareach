@@ -2584,13 +2584,18 @@ impl Session {
     /// `host_bytes` is what every session on this host retains. The host cap is a ceiling on the
     /// whole host rather than a sum of per-session allowances, so a session inside its own cap
     /// still gives bytes up when the host is over its.
+    /// `age_permitted` is the host time contract's answer to whether expiry-based collection may
+    /// run. A clock this host cannot prove stops the seven-day bound and leaves the caps, which
+    /// depend on no clock at all.
     pub fn apply_output_retention(
         &mut self,
         retention: crate::persistence::retention::OutputRetention,
         host_bytes: u64,
         now_ms: kr_protocol::scalars::TimestampMs,
+        age_permitted: bool,
     ) -> Vec<crate::persistence::retention::Eviction> {
-        self.history.apply_retention(retention, host_bytes, now_ms)
+        self.history
+            .apply_retention(retention, host_bytes, now_ms, age_permitted)
     }
 
     /// Tells one attachment to install a fresh snapshot.
@@ -2850,12 +2855,35 @@ impl Session {
         }
     }
 
+    /// Tries to leave a journal fault, and clears what this session says about it.
+    ///
+    /// There is one durability state, and this is what keeps it one: the journal's condition and
+    /// the reason this session reports are set and cleared together. A session that had recovered
+    /// its store and still reported `volatile` would be telling a caller its receipts were not
+    /// being kept when they were.
+    pub fn recover_journal(&mut self) -> Option<crate::persistence::fault::RecoveryGap> {
+        if self.health.condition().is_healthy() {
+            return None;
+        }
+        let now = kr_ipc::now_ms();
+        let recovered = self
+            .journal
+            .as_mut()
+            .and_then(|journal| journal.recover(now).ok().flatten());
+        if recovered.is_some() {
+            self.journal_failure = None;
+        }
+        recovered
+    }
+
     /// Applies section 20's output retention, on the host's own maintenance cadence.
     ///
     /// The host-wide figure is measured from the environment's whole spool directory rather than
     /// asked for, because that directory is what the 1 GiB bound is about and this host can read
-    /// it. A session whose spool is somewhere of its own answers for itself alone, which is the
-    /// conservative direction: it never evicts on another session's account.
+    /// it. It is a reading rather than an authority: a directory this host cannot read counts as
+    /// nothing, which under-reports and therefore evicts less rather than more, and a session
+    /// whose spool is configured somewhere else reads that other directory's contents instead.
+    /// The residual is recorded in this task's handoff.
     pub fn collect_output(&mut self) -> Vec<crate::persistence::retention::Eviction> {
         let host_bytes = self
             .config
@@ -2863,10 +2891,15 @@ impl Session {
             .as_deref()
             .and_then(std::path::Path::parent)
             .map_or_else(|| self.history.retained_bytes(), retained_bytes_under);
+        // Section 9 stops expiry-based collection while the wall clock cannot be proved, and
+        // removing output because it is seven days old is exactly that. The caps are applied
+        // either way: they are about bytes rather than about time.
+        let age_permitted = self.time.may_collect_expired();
         self.history.apply_retention(
             crate::persistence::retention::OutputRetention::DEFAULT,
             host_bytes,
             kr_ipc::now_ms(),
+            age_permitted,
         )
     }
 
@@ -3413,9 +3446,10 @@ pub const fn cursor(value: u64) -> StreamCursor {
 /// Returns how many bytes of retained output live under one directory.
 ///
 /// One level of session directories, each holding fixed-size segments, so the walk is bounded by
-/// the number of sessions rather than by how much output they have produced. A directory this
-/// host cannot read counts as nothing, which under-reports the host figure and therefore evicts
-/// less rather than more.
+/// the number of sessions and the segments each keeps rather than by how much output they have
+/// produced. A directory or a file this host cannot read counts as nothing, which under-reports
+/// the host figure and therefore evicts less rather than more. Output still in a session's
+/// resident window has not reached a spool and is not counted.
 fn retained_bytes_under(root: &std::path::Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;

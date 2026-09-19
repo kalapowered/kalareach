@@ -69,7 +69,7 @@ pub enum MigrationError {
     /// The database is older than the ladder starts from.
     #[error(
         "this store is at schema version {found}, which is older than the oldest version this \
-         build migrates ({oldest}); use {importer} rather than restoring it in part"
+         build migrates ({oldest}); it needs {importer} rather than being restored in part"
     )]
     Unsupported {
         /// The version the store records.
@@ -87,8 +87,13 @@ pub enum MigrationError {
     },
 }
 
-/// The explicit importer an unsupported store is named against.
-pub const IMPORTER: &str = "kr host import-journal";
+/// What an unsupported store is named against.
+///
+/// Section 24 asks for an explicit versioned importer or a supported older exporter, and neither
+/// exists in this build: what exists is the refusal that stops a store older than the ladder
+/// being restored in part. The refusal names the route rather than a command, because naming a
+/// command this build does not ship would send a person somewhere there is nothing to run.
+pub const IMPORTER: &str = "an explicit versioned import of a store this build cannot migrate";
 
 /// Returns the steps that bring a store at `found` to [`CURRENT`].
 ///

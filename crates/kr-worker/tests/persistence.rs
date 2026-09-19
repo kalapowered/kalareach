@@ -26,13 +26,12 @@ use kr_protocol::receipt::ReceiptState;
 use kr_protocol::recovery::HistoryGapCause;
 use kr_protocol::scalars::{Digest256, Nullable, TimestampMs, Uuid};
 use kr_protocol::session::{Dimensions, DisplayNumber, Durability, ShellMode};
+use kr_worker::history::SpoolLayout;
 use kr_worker::journal::{Journal, RETENTION_MS, Submission};
-use kr_worker::persistence::contract::{
-    CommitGroup, CommitPoint, FlushPolicy, WriteKind, flush_policy,
-};
+use kr_worker::persistence::contract::{CommitPoint, FlushPolicy, WriteKind, flush_policy};
 use kr_worker::persistence::fault::{FaultKind, WorkClass};
 use kr_worker::persistence::migration::{self, MigrationError};
-use kr_worker::persistence::outbox::Fanout;
+use kr_worker::persistence::outbox::{Fanout, MAX_OUTBOX_PAGE, REMEMBERED_EVENT_IDS};
 use kr_worker::persistence::retention::{OutputRetention, RetentionLimit};
 use kr_worker::persistence::stores;
 use kr_worker::pty::ShellCommand;
@@ -194,6 +193,17 @@ fn actor() -> ActorId {
     ActorId::new("test:persistence").expect("an actor")
 }
 
+/// A submission under a distinct identifier, for a test that needs more than a byte's worth.
+fn numbered_submission(index: u16) -> Submission {
+    let mut identifier = [0_u8; 16];
+    identifier[0] = (index >> 8) as u8;
+    identifier[1] = index as u8;
+    Submission {
+        action_id: kr_worker::journal::action_id_from(identifier),
+        ..submission(1, 1)
+    }
+}
+
 fn attach_params(session_id: SessionId) -> kr_protocol::attachment::SessionAttachParams {
     let mut requested = kr_protocol::scalars::CanonicalSet::new();
     requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
@@ -266,10 +276,12 @@ fn the_store_is_write_ahead_logged_with_full_synchronisation() {
 }
 
 #[test]
-fn the_intent_is_on_disk_before_the_caller_could_have_been_answered() {
-    // KR-REQ-24.02, first half: acceptance is committed before the acknowledgement. The proof is
-    // that a *different* connection to the same file sees the row while the accepting journal is
-    // still open, which is only true if the transaction committed rather than being buffered.
+fn the_intent_is_committed_before_the_caller_could_have_been_answered() {
+    // KR-REQ-24.02, first half: acceptance is *committed* before the acknowledgement returns. A
+    // second connection to the same file sees the row while the accepting journal is still open,
+    // which is true only of a committed transaction. What the store then does with a committed
+    // transaction is the store's contract, and the settings test above is what holds it to it:
+    // this test proves the commit point, not the fsync.
     let path = journal_path("accept-durable");
     let mut journal = Journal::open(&path).expect("opens");
     journal.accept(&submission(1, 1)).expect("accepts");
@@ -285,9 +297,9 @@ fn the_intent_is_on_disk_before_the_caller_could_have_been_answered() {
 }
 
 #[test]
-fn the_dispatch_marker_is_on_disk_before_the_effect_could_have_left() {
+fn the_dispatch_marker_is_committed_before_the_effect_could_have_left() {
     // KR-REQ-24.02, second half: the marker is committed before dispatch, which is what makes a
-    // lost outcome recoverable rather than repeatable.
+    // lost outcome recoverable rather than repeatable. Committed, on the same evidence as above.
     let path = journal_path("marker-durable");
     let mut journal = Journal::open(&path).expect("opens");
     journal.accept(&submission(2, 2)).expect("accepts");
@@ -310,10 +322,12 @@ fn the_dispatch_marker_is_on_disk_before_the_effect_could_have_left() {
 }
 
 #[tokio::test]
-async fn keystrokes_and_output_bytes_write_nothing_durable_at_all() {
+async fn output_bytes_write_no_row_to_the_journal_at_all() {
     // KR-REQ-24.03, first half. The live parser is in worker memory and the retained output is a
-    // bounded indexed spool, so a session that types and produces output leaves the durable store
-    // exactly as it found it. The count is the store's own, so nothing here depends on timing.
+    // bounded indexed spool, so a session producing output leaves the journal exactly as it found
+    // it. What is counted is rows written on this connection, which is what "waits for an fsync"
+    // reduces to here: a write that never happens never flushes. The spool's own files are a
+    // separate store, declared `BestEffortFile`, and they are what output does reach.
     let host = host().await;
     let before = host
         .runtime
@@ -341,8 +355,8 @@ async fn keystrokes_and_output_bytes_write_nothing_durable_at_all() {
 
 #[test]
 fn no_commit_point_shares_a_flush_and_the_writes_that_may_are_named() {
-    // KR-REQ-24.03, second half: grouped commits share a flush without moving the dispatch
-    // boundary ahead of durability, which means a commit point is never grouped.
+    // KR-REQ-24.03, second half, as a policy: grouped commits share a flush without moving the
+    // dispatch boundary ahead of durability, which means a commit point is never grouped.
     for point in CommitPoint::ALL {
         assert_eq!(
             flush_policy(WriteKind::Commit(*point)),
@@ -355,12 +369,67 @@ fn no_commit_point_shares_a_flush_and_the_writes_that_may_are_named() {
         flush_policy(WriteKind::PromptTelemetry),
         FlushPolicy::Grouped
     );
-    let mut group: CommitGroup<u8> = CommitGroup::new();
-    for value in 0..16 {
-        group.push(value);
-    }
-    assert_eq!(group.take().len(), 16);
-    assert_eq!(group.flushes(), 1, "sixteen writes shared one flush");
+}
+
+#[test]
+fn a_transition_its_event_and_its_outbox_row_share_one_flush_or_none() {
+    // KR-REQ-24.03's grouping, and KR-REQ-24.20's "same local transaction", proved together and
+    // by failure rather than by success: the outbox insert is the last write of the transaction,
+    // and a store that refuses it leaves the receipt where it was and the event unwritten. Three
+    // rows share one flush, and either all three are durable or none of them is.
+    let path = journal_path("one-transaction");
+    let mut journal = Journal::open(&path).expect("opens");
+    journal.accept(&submission(4, 4)).expect("accepts");
+    let before = journal
+        .read(actor(), kr_worker::journal::action_id_from([4; 16]))
+        .expect("reads")
+        .expect("a receipt");
+    let events_before = journal.events_after(0, 64).expect("reads").len();
+
+    rusqlite::Connection::open(&path)
+        .expect("the same database")
+        .execute_batch(
+            "CREATE TRIGGER refuse_outbox BEFORE INSERT ON outbox
+             BEGIN SELECT RAISE(ABORT, 'this store refused the outbox row'); END;",
+        )
+        .expect("the store will refuse the outbox row");
+    let refused = journal.mark_dispatching(
+        actor(),
+        kr_worker::journal::action_id_from([4; 16]),
+        TimestampMs::new(2_000),
+    );
+    assert!(refused.is_err(), "the transition could not be recorded");
+
+    let after = journal
+        .read(actor(), kr_worker::journal::action_id_from([4; 16]))
+        .expect("reads")
+        .expect("a receipt");
+    assert_eq!(after.state, before.state, "the receipt went back with it");
+    assert_eq!(after.revision, before.revision);
+    assert_eq!(
+        journal.events_after(0, 64).expect("reads").len(),
+        events_before,
+        "the event went back with it"
+    );
+
+    rusqlite::Connection::open(&path)
+        .expect("the same database")
+        .execute_batch("DROP TRIGGER refuse_outbox;")
+        .expect("the store will take it now");
+    journal
+        .mark_dispatching(
+            actor(),
+            kr_worker::journal::action_id_from([4; 16]),
+            TimestampMs::new(2_100),
+        )
+        .expect("marks");
+    assert_eq!(
+        journal.events_after(0, 64).expect("reads").len(),
+        events_before + 1
+    );
+    assert_eq!(journal.outbox_after(0, 64).expect("reads").len(), 2);
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -368,10 +437,10 @@ fn no_commit_point_shares_a_flush_and_the_writes_that_may_are_named() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn a_state_transition_and_its_event_are_one_transaction() {
-    // KR-REQ-24.20, first half. Each transition leaves exactly one outbox row, and the row is
-    // visible to a second connection the moment the transition is, which is what "same local
-    // transaction" means in practice.
+fn every_transition_leaves_one_outbox_row_in_this_journals_own_order() {
+    // KR-REQ-24.20, first half, for the happy path: each transition leaves exactly one outbox
+    // row, visible to a second connection the moment the transition is. That the two are one
+    // transaction rather than two in a row is what the rollback test below establishes.
     let path = journal_path("outbox-transaction");
     let mut journal = Journal::open(&path).expect("opens");
     journal.accept(&submission(3, 3)).expect("accepts");
@@ -417,9 +486,10 @@ fn a_state_transition_and_its_event_are_one_transaction() {
 
 #[test]
 fn a_consumer_that_dies_before_it_records_its_cursor_applies_each_event_once() {
-    // KR-REQ-24.20, second half: fan-out is at-least-once and idempotent. The journal hands the
-    // same page back, and the immutable event identifier is what makes applying it twice a
-    // decision rather than an accident.
+    // KR-REQ-24.20, second half: fan-out is at-least-once and idempotent. The durable half is the
+    // consumer's cursor, which bounds what a redelivery replays; the in-process half is the
+    // de-duplication window, which covers the interval between applying a record and recording
+    // the cursor past it.
     let path = journal_path("outbox-fanout");
     let mut journal = Journal::open(&path).expect("opens");
     for action in 1..=3 {
@@ -431,10 +501,16 @@ fn a_consumer_that_dies_before_it_records_its_cursor_applies_each_event_once() {
     let cursor = journal.outbox_cursor("attention").expect("a cursor");
     assert_eq!(cursor.cursor, 0);
     let page = journal.outbox_after(cursor.cursor, 64).expect("a page");
-    assert_eq!(consumer.accept(&page).len(), 3);
+    // The consumer applies each record and says so, which is the order that matters: a record
+    // remembered before its effect ran would be suppressed after that effect failed.
+    let fresh: Vec<_> = consumer.fresh(&page).into_iter().cloned().collect();
+    assert_eq!(fresh.len(), 3);
+    for record in &fresh {
+        consumer.note_applied(record);
+    }
     // It dies here, before `note_outbox_consumed`, so it is handed the same page again.
     let again = journal.outbox_after(0, 64).expect("a page");
-    assert!(consumer.accept(&again).is_empty());
+    assert!(consumer.fresh(&again).is_empty());
     assert_eq!(consumer.applied(), 3);
     assert_eq!(consumer.suppressed(), 3);
 
@@ -451,15 +527,66 @@ fn a_consumer_that_dies_before_it_records_its_cursor_applies_each_event_once() {
             .expect("a page")
             .is_empty()
     );
+
+    // A restarted consumer remembers nothing, and the cursor is what stops it replaying the
+    // journal: it is handed what it has not recorded as taken, and nothing before it.
+    let mut restarted = Fanout::new();
+    let resumed = journal.outbox_after(recorded.cursor, 64).expect("a page");
+    assert!(restarted.fresh(&resumed).is_empty());
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn a_page_of_the_outbox_never_outruns_the_window_that_covers_it() {
+    // The de-duplication window is what makes a replayed page idempotent, so a page larger than
+    // the window could displace an identifier the same page still needs. The journal bounds it.
+    let path = journal_path("outbox-page-bound");
+    let mut journal = Journal::open(&path).expect("opens");
+    for index in 0..u16::try_from(MAX_OUTBOX_PAGE + 4).expect("fits") {
+        journal
+            .accept(&numbered_submission(index))
+            .expect("accepts");
+    }
+    let page = journal.outbox_after(0, u64::MAX).expect("a page");
+    assert_eq!(page.len() as u64, MAX_OUTBOX_PAGE);
+    assert!(MAX_OUTBOX_PAGE as usize <= REMEMBERED_EVENT_IDS);
+    drop(journal);
+    std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
+}
+
+#[test]
+fn collecting_receipts_never_takes_an_event_a_consumer_still_owes() {
+    // KR-REQ-24.20 again, and the failure it guards against: a receipt written thirty days ago
+    // can have produced its outcome event this minute, and a consumer that has recorded no
+    // cursor past it has never been offered it.
+    let path = journal_path("outbox-collection");
+    let mut journal = Journal::open(&path).expect("opens");
+    journal.accept(&submission(1, 1)).expect("accepts");
+    journal
+        .note_outbox_consumed("attention", 0, 0)
+        .expect("a consumer registers");
+    // Long past the retention period, so the receipt itself is collectable.
+    let later = TimestampMs::new(kr_ipc::now_ms().get() + RETENTION_MS + 60_000);
+    journal.prune(later).expect("prunes");
+    let owed = journal.outbox_after(0, 64).expect("a page");
+    assert_eq!(owed.len(), 1, "the registered consumer is still owed it");
+
+    // Once it has taken it, collection may have it.
+    journal
+        .note_outbox_consumed("attention", owed[0].cursor, 1)
+        .expect("records the cursor");
+    journal.prune(later).expect("prunes");
+    assert!(journal.outbox_after(0, 64).expect("a page").is_empty());
     drop(journal);
     std::fs::remove_dir_all(path.parent().expect("a parent")).ok();
 }
 
 #[tokio::test]
-async fn no_keystroke_and_no_provider_key_reaches_the_control_log() {
-    // KR-REQ-24.21. The check is a grep of the journal's own bytes after a session has typed a
-    // recognisable secret and produced recognisable output: nothing the terminal carried is in
-    // the durable control record, whatever path it took to get there.
+async fn no_terminal_body_and_no_provider_key_reaches_the_control_log() {
+    // KR-REQ-24.21. The check is a search of the journal's own bytes after a session has produced
+    // output carrying a recognisable provider key, and after every commit point a session reaches
+    // has been driven: none of the terminal's body is in the durable control record.
     const SECRET: &str = "sk-provider-key-4d2f8a1b";
     const TYPED: &str = "export ANTHROPIC_API_KEY=sk-provider-key-4d2f8a1b";
     let host = host().await;
@@ -766,10 +893,10 @@ fn a_database_older_than_the_ladder_names_the_importer_rather_than_restoring_in_
 }
 
 #[test]
-fn there_is_one_current_schema_and_no_second_reader_of_an_older_one() {
-    // KR-REQ-24.30's "code reads one current schema after migration; do not maintain permanent
-    // dual readers". The ladder is contiguous and every step ends at the one version this build
-    // reads, so there is nowhere for a second reader to live.
+fn every_migration_path_ends_at_the_one_version_this_build_reads() {
+    // KR-REQ-24.30's "code reads one current schema after migration". The ladder is contiguous
+    // and every step ends at the one version `Journal::open` will then read, which is what leaves
+    // no older shape for a second reader to be written against.
     assert_eq!(kr_worker::journal::SCHEMA_VERSION, migration::CURRENT);
     let steps = migration::plan(migration::OLDEST_MIGRATABLE).expect("a plan");
     assert_eq!(steps.last().expect("a last step").to, migration::CURRENT);
@@ -780,14 +907,16 @@ fn there_is_one_current_schema_and_no_second_reader_of_an_older_one() {
     );
 }
 
-/// Writes the journal an earlier build of this schema wrote: version 1, with one receipt.
+/// Writes the journal the first build of this schema wrote: version 1, with one receipt.
+///
+/// The shape is `927ecc84`'s exactly - the receipt table and its one index, and nothing else -
+/// because a fixture that already had the later tables would not exercise what the ladder does.
 fn write_version_one_fixture(path: &std::path::Path) {
     let connection = rusqlite::Connection::open(path).expect("creates the fixture");
     connection
         .execute_batch(
-            "CREATE TABLE schema_version (version INTEGER NOT NULL);
-             INSERT INTO schema_version (version) VALUES (1);
-             CREATE TABLE receipts (
+            "CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL);
+             CREATE TABLE IF NOT EXISTS receipts (
                  actor_id             TEXT    NOT NULL,
                  action_id            BLOB    NOT NULL,
                  method               TEXT    NOT NULL,
@@ -803,24 +932,8 @@ fn write_version_one_fixture(path: &std::path::Path) {
                  updated_at_ms        INTEGER NOT NULL,
                  PRIMARY KEY (actor_id, action_id)
              );
-             CREATE TABLE results (
-                 actor_id  TEXT NOT NULL,
-                 action_id BLOB NOT NULL,
-                 result    BLOB NOT NULL,
-                 PRIMARY KEY (actor_id, action_id)
-             );
-             CREATE TABLE receipt_events (
-                 sequence       INTEGER PRIMARY KEY AUTOINCREMENT,
-                 actor_id       TEXT    NOT NULL,
-                 action_id      BLOB    NOT NULL,
-                 revision       INTEGER NOT NULL,
-                 state          TEXT    NOT NULL,
-                 recorded_at_ms INTEGER NOT NULL
-             );
-             CREATE TABLE closure (
-                 session_id BLOB PRIMARY KEY,
-                 record     BLOB NOT NULL
-             );",
+             CREATE INDEX IF NOT EXISTS receipts_created_at ON receipts (created_at_ms);
+             INSERT INTO schema_version (version) VALUES (1);",
         )
         .expect("the version 1 schema");
     connection
@@ -876,6 +989,7 @@ async fn a_live_session_applies_output_retention_and_leaves_a_gap_a_reader_is_to
             ),
             before,
             kr_ipc::now_ms(),
+            true,
         )
     };
     assert!(!evicted.is_empty(), "the session cap took something");
@@ -889,6 +1003,160 @@ async fn a_live_session_applies_output_retention_and_leaves_a_gap_a_reader_is_to
     let gap = page.gap.0.expect("the evicted range is reported");
     assert_eq!(gap.from_cursor.get(), 0);
     assert!(gap.to_cursor.get() > 0);
+}
+
+#[test]
+fn a_spool_that_retention_emptied_still_says_where_its_output_got_to() {
+    // KR-REQ-20.21. An eviction that took every segment leaves a directory with no segments in
+    // it, and a session reopened over that must not start its cursor again at nought: a client
+    // asking for what it missed would be served the new output as though it were the old, and
+    // the archive would have nothing to report a gap from.
+    let directory =
+        std::env::temp_dir().join(format!("kr-persist-boundary-{}", kr_ipc::new_uuid()));
+    // A cap of nothing, so the pass takes every segment and the directory is left empty.
+    let retention = OutputRetention::new(std::time::Duration::from_secs(1), 1024 * 1024, 0);
+    let before = {
+        let mut history =
+            kr_worker::history::OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 4096))
+                .expect("a spool");
+        for _ in 0..4 {
+            history.append(&[b'x'; 8]);
+        }
+        let taken = history.apply_retention(retention, 32, kr_ipc::now_ms(), true);
+        assert!(!taken.is_empty());
+        history.next_cursor()
+    };
+    assert_eq!(before, 32);
+    // The session restarts over the emptied directory.
+    let reopened =
+        kr_worker::history::OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 4096))
+            .expect("reopens the spool");
+    assert_eq!(
+        reopened.next_cursor(),
+        before,
+        "the cursor continues rather than starting again"
+    );
+    assert_eq!(reopened.oldest_retained_cursor(), before);
+    let page = reopened.page(0, 64).expect("a page");
+    let gap = page.gap.0.expect("everything before the boundary is a gap");
+    assert_eq!(gap.from_cursor.get(), 0);
+    assert_eq!(gap.to_cursor.get(), before);
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn a_clock_this_host_cannot_prove_stops_the_age_bound_and_not_the_caps() {
+    // KR-REQ-20.20 against section 9's collection rule: removing output because it is seven days
+    // old is expiry-based collection, and a host that cannot prove its wall clock does not do
+    // that. The caps are about bytes rather than about time, so they still apply.
+    let directory =
+        std::env::temp_dir().join(format!("kr-persist-unproved-{}", kr_ipc::new_uuid()));
+    let mut history =
+        kr_worker::history::OutputHistory::with_spool(4, &directory, SpoolLayout::new(8, 1 << 20))
+            .expect("a spool");
+    for _ in 0..4 {
+        history.append(&[b'x'; 8]);
+    }
+    let expired = TimestampMs::new(kr_ipc::now_ms().get() + 8 * 24 * 60 * 60 * 1000);
+    let age_only = OutputRetention::new(
+        std::time::Duration::from_secs(7 * 24 * 60 * 60),
+        1024 * 1024 * 1024,
+        1024 * 1024,
+    );
+    assert!(
+        history
+            .apply_retention(age_only, 32, expired, false)
+            .is_empty(),
+        "a clock this host cannot prove collects nothing by age"
+    );
+    let capped = OutputRetention::new(
+        std::time::Duration::from_secs(7 * 24 * 60 * 60),
+        1024 * 1024 * 1024,
+        8,
+    );
+    let taken = history.apply_retention(capped, 32, expired, false);
+    assert_eq!(taken.len(), 1, "the cap does not depend on a clock");
+    assert_eq!(taken[0].limit, RetentionLimit::SessionCap);
+    // And with the clock proved, the age bound applies as well.
+    let taken = history.apply_retention(age_only, 32, expired, true);
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].limit, RetentionLimit::Age);
+    std::fs::remove_dir_all(&directory).ok();
+}
+
+#[test]
+fn the_resident_window_is_collected_by_age_as_well_as_the_spool() {
+    // KR-REQ-20.20. The window is what a session serves when its spool has nothing left, so
+    // output past the retention period is not something a host may keep serving because it
+    // happens to be the newest it has.
+    let mut history = kr_worker::history::OutputHistory::in_memory(4096);
+    history.append(&[b'x'; 64]);
+    let expired = TimestampMs::new(kr_ipc::now_ms().get() + 8 * 24 * 60 * 60 * 1000);
+    let taken = history.apply_retention(OutputRetention::DEFAULT, 64, expired, true);
+    assert_eq!(taken.len(), 1, "the window's own output expired");
+    assert_eq!(taken[0].limit, RetentionLimit::Age);
+    assert_eq!(taken[0].bytes, 64);
+    assert_eq!(history.oldest_retained_cursor(), history.next_cursor());
+    let page = history.page(0, 64).expect("a page");
+    assert!(page.bytes.is_empty());
+    assert_eq!(
+        page.gap.0.expect("a gap").cause,
+        Some(HistoryGapCause::Retention)
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The wire shape of a history gap
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn a_gap_with_no_recorded_cause_is_byte_for_byte_what_an_earlier_build_wrote() {
+    // The cause is absent from the wire when the host has no reason recorded, so a gap this build
+    // reports to a client built before causes existed decodes there unchanged.
+    let gap = kr_protocol::recovery::HistoryGap {
+        from_cursor: kr_protocol::scalars::U64::new(0),
+        to_cursor: kr_protocol::scalars::U64::new(4096),
+        cause: None,
+    };
+    let encoded = kr_cbor::to_canonical_vec(&gap).expect("encodes");
+    let older: EarlierHistoryGap =
+        kr_cbor::from_canonical_slice(&encoded, &kr_cbor::Limits::default())
+            .expect("an earlier build decodes");
+    assert_eq!(older.from_cursor.get(), 0);
+    assert_eq!(older.to_cursor.get(), 4096);
+    // And a gap an earlier build wrote decodes here, with no cause.
+    let round: kr_protocol::recovery::HistoryGap = kr_cbor::from_canonical_slice(
+        &kr_cbor::to_canonical_vec(&older).expect("encodes"),
+        &kr_cbor::Limits::default(),
+    )
+    .expect("decodes");
+    assert_eq!(round.cause, None);
+}
+
+#[test]
+fn a_gap_that_carries_a_cause_is_refused_by_a_decoder_built_before_it() {
+    // The boundary, stated rather than hidden: `HistoryGap` denies unknown fields, so a client
+    // built before this field refuses a gap that carries one. This host only ever sends a cause
+    // it has recorded, so the case arises for a gap eviction produced and not for any other.
+    let gap = kr_protocol::recovery::HistoryGap {
+        from_cursor: kr_protocol::scalars::U64::new(0),
+        to_cursor: kr_protocol::scalars::U64::new(4096),
+        cause: Some(HistoryGapCause::HostCapacity),
+    };
+    let encoded = kr_cbor::to_canonical_vec(&gap).expect("encodes");
+    assert!(
+        kr_cbor::from_canonical_slice::<EarlierHistoryGap>(&encoded, &kr_cbor::Limits::default())
+            .is_err(),
+        "a decoder built before the field refuses it, which is what the handoff records"
+    );
+}
+
+/// `HistoryGap` as a build before the cause existed declares it.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EarlierHistoryGap {
+    from_cursor: kr_protocol::scalars::U64,
+    to_cursor: kr_protocol::scalars::U64,
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -435,6 +435,9 @@ impl WorkerService {
                 // time to say that it failed.
                 let state = {
                     let mut session = self.runtime.session();
+                    // A store that has started answering again is a store this host may call
+                    // durable, and the interval it could not is written down before it says so.
+                    session.recover_journal();
                     session.collect_expired();
                     // Output retention is separate from receipt retention and runs on the same
                     // tick: section 20 budgets the two stores apart, so history pressure never

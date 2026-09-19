@@ -30,6 +30,19 @@ use crate::error::{Result, WorkerError};
 /// The resident history cache of one session, in bytes.
 pub const DEFAULT_RESIDENT_BYTES: usize = 8 * 1024 * 1024;
 
+/// How coarse the resident window's own record of when its output arrived is.
+///
+/// One mark per minute bounds the record at a few entries for a window of any size, and bounds
+/// how much output past the retention period the window can still be serving to one minute of it.
+pub const RESIDENT_MARK_MS: u64 = 60 * 1000;
+
+/// How long one spool segment accepts output before the next one starts.
+///
+/// It bounds how far a segment's oldest byte can be behind its newest, which is what stops a
+/// session that produces a line an hour from holding a week of output in a segment retention
+/// would never collect.
+pub const SEGMENT_ROTATION_MS: u64 = 60 * 60 * 1000;
+
 /// How many evictions a session remembers the reason for.
 ///
 /// A reader is told which bound took the range it asked for, and the answer is only useful while
@@ -52,9 +65,15 @@ pub struct SpoolLayout {
 
 impl SpoolLayout {
     /// The layout a session uses unless it is configured otherwise.
+    ///
+    /// The capacity is section 20's per-session cap, so the bound holds between maintenance
+    /// passes as well as at them: a session that produced a gigabyte in a minute would otherwise
+    /// keep every byte of it until the next tick. The host-wide bound cannot be kept this way,
+    /// because one worker cannot see another's spool; it is applied on the maintenance tick and
+    /// what that leaves is recorded in this task's handoff.
     pub const DEFAULT: Self = Self {
         segment_bytes: 8 * 1024 * 1024,
-        capacity_bytes: 256 * 1024 * 1024,
+        capacity_bytes: crate::persistence::retention::SESSION_CAP_BYTES,
     };
 
     /// Builds a layout, keeping the segment size within the capacity.
@@ -75,6 +94,18 @@ pub struct OutputHistory {
     resident_start: u64,
     next_cursor: u64,
     spool: Option<Spool>,
+    /// When the output at each of a bounded set of cursors was produced, oldest first.
+    ///
+    /// The resident window is what a session serves when its spool has nothing left, so section
+    /// 20's seven days has to reach it as well. Bytes carry no timestamps, so the window carries
+    /// marks instead: one per [`RESIDENT_MARK_MS`], which is coarse enough to be a handful of
+    /// entries and fine enough that what is kept past the deadline is measured in minutes.
+    resident_marks: VecDeque<(u64, u64)>,
+    /// Whether this session was given a spool and then lost it.
+    ///
+    /// A write failure narrows the retained range to the resident window, and that is a different
+    /// answer from a bound being reached: it is reported as one rather than as retention.
+    spool_lost: bool,
     /// What retention took, newest last.
     ///
     /// A gap is reported by the cursors a page carries, and those say what is gone. This says
@@ -95,6 +126,8 @@ impl OutputHistory {
             resident_start: 0,
             next_cursor: 0,
             spool: None,
+            spool_lost: false,
+            resident_marks: VecDeque::new(),
             evictions: VecDeque::new(),
         }
     }
@@ -126,10 +159,19 @@ impl OutputHistory {
     }
 
     /// Returns the oldest cursor that can still be served.
+    ///
+    /// The two layers are both readable, so it is the older of them: a spool whose every segment
+    /// has been evicted still leaves the resident window, and a restarted session whose resident
+    /// window is empty still leaves whatever the spool holds. A session that has just restarted
+    /// over a spool with nothing left starts its cursor at the boundary the spool wrote down
+    /// rather than at nought, so the range that went is a gap rather than output that never
+    /// existed.
     #[must_use]
     pub fn oldest_retained_cursor(&self) -> u64 {
         match &self.spool {
-            Some(spool) => spool.oldest_cursor().unwrap_or(self.resident_start),
+            Some(spool) => spool.oldest_cursor().map_or(self.resident_start, |oldest| {
+                oldest.min(self.resident_start)
+            }),
             None => self.resident_start,
         }
     }
@@ -149,15 +191,45 @@ impl OutputHistory {
             // Losing the spool costs history, not correctness: the resident window still serves
             // recent output and everything older reads as an explicit gap.
             self.spool = None;
+            self.spool_lost = true;
         }
         self.resident.extend(bytes.iter().copied());
         self.next_cursor += bytes.len() as u64;
+        let now_ms = kr_ipc::now_ms().get();
+        if self
+            .resident_marks
+            .back()
+            .is_none_or(|(_, at)| now_ms.saturating_sub(*at) >= RESIDENT_MARK_MS)
+        {
+            self.resident_marks.push_back((start, now_ms));
+        }
         while self.resident.len() > self.resident_capacity {
             let excess = self.resident.len() - self.resident_capacity;
             self.resident.drain(..excess);
             self.resident_start += excess as u64;
         }
+        self.trim_marks();
         start
+    }
+
+    /// Drops the marks for output the resident window no longer holds.
+    fn trim_marks(&mut self) {
+        while self.resident_marks.len() > 1
+            && self
+                .resident_marks
+                .get(1)
+                .is_some_and(|(cursor, _)| *cursor <= self.resident_start)
+        {
+            self.resident_marks.pop_front();
+        }
+        if self
+            .resident_marks
+            .front()
+            .is_some_and(|(cursor, _)| *cursor < self.resident_start)
+        {
+            let (_, at) = self.resident_marks.pop_front().expect("a mark");
+            self.resident_marks.push_front((self.resident_start, at));
+        }
     }
 
     /// Returns how many bytes of output this session retains.
@@ -168,11 +240,15 @@ impl OutputHistory {
     }
 
     /// Returns when the oldest retained output was last written.
+    ///
+    /// The spool's oldest segment when it has one, and otherwise the resident window's own
+    /// oldest mark: a session serving from memory alone still has an age.
     #[must_use]
     pub fn oldest_written_at_ms(&self) -> Option<TimestampMs> {
         self.spool
             .as_ref()
             .and_then(Spool::oldest_written_at_ms)
+            .or_else(|| self.resident_marks.front().map(|(_, at)| *at))
             .map(TimestampMs::new)
     }
 
@@ -189,47 +265,43 @@ impl OutputHistory {
     /// when the host is over 1 GiB: the caps are simultaneous upper bounds, not reserved
     /// capacity. Each pass records the bound that forced it, and a reader asking for a cursor
     /// inside the range is told which one.
+    ///
+    /// `age_permitted` is the host time contract's answer. Removing output because it is old is
+    /// expiry-based collection, and section 9 stops that while the wall clock cannot be proved:
+    /// collecting against an unproved clock is how a rollback deletes something that had not
+    /// expired. The caps do not depend on a clock and are applied either way.
     pub fn apply_retention(
         &mut self,
         retention: OutputRetention,
         host_bytes: u64,
         now_ms: TimestampMs,
+        age_permitted: bool,
     ) -> Vec<Eviction> {
-        let Some(spool) = self.spool.as_mut() else {
-            // Without a spool the retained range is the resident window, which is bounded by its
-            // own capacity and reported as a gap. There is nothing here to collect.
-            return Vec::new();
-        };
         let mut taken = Vec::new();
-        let before = spool.oldest_cursor().unwrap_or(self.resident_start);
+        let expires_before = retention.expires_before(now_ms).get();
 
         // The age bound first, which is the order section 20 states the three in.
-        let expired = spool.drop_older_than(retention.expires_before(now_ms).get());
-        if expired > 0 {
-            let after = spool.oldest_cursor().unwrap_or(self.resident_start);
-            taken.push(Eviction {
-                limit: RetentionLimit::Age,
-                from_cursor: before,
-                to_cursor: after,
-                bytes: expired,
-                at_ms: now_ms,
-            });
+        if age_permitted && let Some(eviction) = self.evict_expired(expires_before, now_ms) {
+            taken.push(eviction);
         }
 
         // Then the two caps, which hold at once. Whichever asks for more bytes decides how many
-        // go; which one applies first decides what the reader is told.
-        let session_bytes = self
-            .next_cursor
-            .saturating_sub(spool.oldest_cursor().unwrap_or(self.resident_start));
+        // go; which one applies first decides what the reader is told. The host figure is what
+        // the age pass left, because bytes it has already taken are not there to count.
+        let removed: u64 = taken.iter().map(|eviction| eviction.bytes).sum();
+        let session_bytes = self.retained_bytes();
         let pressure = Pressure {
             session_bytes,
-            host_bytes: host_bytes.max(session_bytes),
-            oldest_at_ms: spool.oldest_written_at_ms().map(TimestampMs::new),
+            host_bytes: host_bytes.saturating_sub(removed).max(session_bytes),
+            oldest_at_ms: self.oldest_written_at_ms(),
         };
         let over = retention.bytes_over_cap(&pressure);
-        if over > 0 {
+        if over > 0
+            && let Some(spool) = self.spool.as_mut()
+        {
             let limit = retention
                 .first_applicable(&pressure, now_ms)
+                .filter(|limit| *limit != RetentionLimit::Age)
                 .unwrap_or(RetentionLimit::SessionCap);
             let start = spool.oldest_cursor().unwrap_or(self.resident_start);
             let dropped = spool.drop_at_least(over);
@@ -254,11 +326,56 @@ impl OutputHistory {
         taken
     }
 
+    /// Removes every byte produced before `expires_before`, from both layers.
+    ///
+    /// The resident window is part of it. A session whose spool has been emptied still serves
+    /// what it holds in memory, and output past the retention period is not something a host may
+    /// keep serving because it happens to be the newest it has.
+    fn evict_expired(&mut self, expires_before: u64, now_ms: TimestampMs) -> Option<Eviction> {
+        let before = self.oldest_retained_cursor();
+        let mut bytes = 0;
+        if let Some(spool) = self.spool.as_mut() {
+            bytes += spool.drop_older_than(expires_before);
+        }
+        // The window's own marks say where output produced before the deadline ends.
+        let expired_to = self
+            .resident_marks
+            .iter()
+            .take_while(|(_, at)| *at < expires_before)
+            .last()
+            .map(|_| {
+                self.resident_marks
+                    .iter()
+                    .find(|(_, at)| *at >= expires_before)
+                    .map_or(self.next_cursor, |(cursor, _)| *cursor)
+            });
+        if let Some(to) = expired_to
+            && to > self.resident_start
+        {
+            let excess = usize::try_from(to - self.resident_start).unwrap_or(usize::MAX);
+            let take = excess.min(self.resident.len());
+            self.resident.drain(..take);
+            self.resident_start += take as u64;
+            bytes += take as u64;
+            self.trim_marks();
+        }
+        if bytes == 0 {
+            return None;
+        }
+        Some(Eviction {
+            limit: RetentionLimit::Age,
+            from_cursor: before,
+            to_cursor: self.oldest_retained_cursor(),
+            bytes,
+            at_ms: now_ms,
+        })
+    }
+
     /// Returns why a cursor is no longer retained, when this host recorded a reason.
     fn cause_of(&self, cursor: u64) -> Option<HistoryGapCause> {
-        if self.spool.is_none() && !self.evictions.is_empty() {
-            // The spool is gone, so what is retained is the resident window alone. That is a
-            // different answer from a bound being reached and it is reported as one.
+        if self.spool_lost {
+            // The spool could not be written, so what is retained is the resident window alone.
+            // That is a different answer from a bound being reached and it is reported as one.
             return Some(HistoryGapCause::SpoolUnavailable);
         }
         self.evictions
@@ -329,6 +446,14 @@ impl OutputHistory {
     }
 }
 
+/// The file a spool records its boundary in, beside its segments.
+///
+/// A spool whose every segment has been evicted still has to say where its output got to.
+/// Without this, reopening an empty directory would start the cursor again at nought, a client
+/// asking for what it missed would be served the new output as though it were the old, and the
+/// archive would have nothing to report a gap from.
+const BOUNDARY_FILE: &str = "boundary";
+
 /// Fixed-size segment files holding output older than the resident window.
 #[derive(Debug)]
 struct Spool {
@@ -336,6 +461,11 @@ struct Spool {
     layout: SpoolLayout,
     segments: VecDeque<Segment>,
     total_bytes: u64,
+    /// The cursor after the last byte this spool has ever been given.
+    ///
+    /// It is written down whenever eviction empties the spool, and read back when it opens, so an
+    /// empty directory is a spool that has lost its history rather than one that has none.
+    boundary: u64,
     /// The segment being written, held open.
     ///
     /// Terminal output arrives in small batches — often one line at a time — and opening and
@@ -349,11 +479,19 @@ struct Segment {
     start: u64,
     len: u64,
     path: PathBuf,
+    /// When this segment was first written.
+    ///
+    /// It bounds how much older than its newest byte a segment's oldest byte can be, because a
+    /// segment is rotated once it reaches [`SEGMENT_ROTATION_MS`] whether or not it is full.
+    /// Without that, one slow session could hold a month of output in a segment whose newest byte
+    /// was written this minute and never be collected.
+    started_at_ms: u64,
     /// When this segment was last written, as the host reads it back after a restart.
     ///
     /// Section 20's seven-day bound is about when output was produced, and a spool that survives
     /// a restart has to answer that without a record of its own. The file's own modification time
-    /// is what the filesystem already keeps, so it is what this reads.
+    /// is what the filesystem already keeps, so it is what this reads. Eviction reads the newest
+    /// byte rather than the oldest, which is the direction that cannot delete output too early.
     written_at_ms: u64,
 }
 
@@ -394,16 +532,25 @@ impl Spool {
                 start,
                 len,
                 path,
+                // A restart cannot tell when a segment was started, and the modification time is
+                // the later of the two, so both read it: the segment is treated as if every byte
+                // in it were as new as its newest, which keeps rather than deletes.
+                started_at_ms: written_at_ms,
                 written_at_ms,
             });
         }
         segments.sort_by_key(|segment| segment.start);
         let total_bytes = segments.iter().map(|segment| segment.len).sum();
+        let recorded = read_boundary(&directory);
+        let from_segments = segments
+            .last()
+            .map_or(0, |segment| segment.start + segment.len);
         Ok(Self {
             directory,
             layout,
             segments: segments.into(),
             total_bytes,
+            boundary: recorded.max(from_segments),
             open_segment: None,
         })
     }
@@ -411,7 +558,7 @@ impl Spool {
     fn next_cursor(&self) -> u64 {
         self.segments
             .back()
-            .map_or(0, |segment| segment.start + segment.len)
+            .map_or(self.boundary, |segment| segment.start + segment.len)
     }
 
     fn oldest_cursor(&self) -> Option<u64> {
@@ -421,17 +568,19 @@ impl Spool {
     fn append(&mut self, start: u64, bytes: &[u8]) -> Result<()> {
         let mut written = 0_usize;
         while written < bytes.len() {
-            let needs_new_segment = self
-                .segments
-                .back()
-                .is_none_or(|segment| segment.len >= self.layout.segment_bytes);
+            let now_ms = kr_ipc::now_ms().get();
+            let needs_new_segment = self.segments.back().is_none_or(|segment| {
+                segment.len >= self.layout.segment_bytes
+                    || now_ms.saturating_sub(segment.started_at_ms) >= SEGMENT_ROTATION_MS
+            });
             if needs_new_segment {
                 let segment_start = start + written as u64;
                 self.segments.push_back(Segment {
                     start: segment_start,
                     len: 0,
                     path: self.directory.join(format!("{segment_start:020}.out")),
-                    written_at_ms: kr_ipc::now_ms().get(),
+                    started_at_ms: now_ms,
+                    written_at_ms: now_ms,
                 });
             }
             let segment_bytes = self.layout.segment_bytes;
@@ -457,6 +606,7 @@ impl Spool {
             append_open(handle, &bytes[written..written + segment_len])?;
             let segment = self.segments.back_mut().expect("a segment exists");
             segment.len += take as u64;
+            self.boundary = self.boundary.max(segment.start + segment.len);
             // The newest byte's time, not the oldest: a segment is past its retention only when
             // everything in it is, which is the direction that cannot delete output too early.
             segment.written_at_ms = kr_ipc::now_ms().get();
@@ -481,8 +631,8 @@ impl Spool {
             return 0;
         };
         self.total_bytes -= segment.len;
-        // A segment that is evicted while it is the one being written cannot happen - the newest
-        // segment is never the first - but its handle is dropped with it if it ever is.
+        // The newest segment can also be the oldest, and retention may take it: the handle it is
+        // being written through is dropped with it, so the next append opens a new one.
         if self
             .open_segment
             .as_ref()
@@ -491,6 +641,12 @@ impl Spool {
             self.open_segment = None;
         }
         let _ = std::fs::remove_file(&segment.path);
+        self.boundary = self.boundary.max(segment.start + segment.len);
+        if self.segments.is_empty() {
+            // The last segment has gone, so the directory alone no longer says where the output
+            // got to. Writing it down is what keeps a reopened spool's gap honest.
+            write_boundary(&self.directory, self.boundary);
+        }
         segment.len
     }
 
@@ -548,6 +704,23 @@ impl Spool {
         }
         Ok(out)
     }
+}
+
+/// Reads the boundary a spool recorded, or nought when it has none.
+fn read_boundary(directory: &Path) -> u64 {
+    std::fs::read_to_string(directory.join(BOUNDARY_FILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
+/// Writes the boundary down.
+///
+/// A failure costs the gap after a restart and nothing else, so it is not an error the session is
+/// told about: the retained output is already gone, and refusing to serve the session over it
+/// would be the worse answer.
+fn write_boundary(directory: &Path, boundary: u64) {
+    let _ = std::fs::write(directory.join(BOUNDARY_FILE), boundary.to_string());
 }
 
 fn open_segment(path: &Path) -> Result<std::fs::File> {
@@ -682,7 +855,7 @@ mod tests {
         history.append(&[b'c'; 8]);
         // Everything written so far is older than the retention period.
         let now = TimestampMs::new(kr_ipc::now_ms().get() + 8 * 24 * 60 * 60 * 1000);
-        let taken = history.apply_retention(OutputRetention::DEFAULT, 0, now);
+        let taken = history.apply_retention(OutputRetention::DEFAULT, 0, now, true);
         assert_eq!(taken.len(), 1);
         assert_eq!(taken[0].limit, RetentionLimit::Age);
         assert_eq!(taken[0].from_cursor, 0);
@@ -706,7 +879,7 @@ mod tests {
             OutputRetention::new(std::time::Duration::from_secs(7 * 24 * 60 * 60), 40, 1024);
         let now = kr_ipc::now_ms();
         // This session holds 32 bytes, well inside its own 1,024-byte cap, and the host holds 64.
-        let taken = history.apply_retention(retention, 64, now);
+        let taken = history.apply_retention(retention, 64, now, true);
         assert_eq!(taken.len(), 1);
         assert_eq!(taken[0].limit, RetentionLimit::HostCap);
         assert_eq!(taken[0].bytes, 24);
@@ -727,7 +900,7 @@ mod tests {
         }
         let retention =
             OutputRetention::new(std::time::Duration::from_secs(7 * 24 * 60 * 60), 1024, 16);
-        let taken = history.apply_retention(retention, 32, kr_ipc::now_ms());
+        let taken = history.apply_retention(retention, 32, kr_ipc::now_ms(), true);
         assert_eq!(taken.len(), 1);
         assert_eq!(taken[0].limit, RetentionLimit::SessionCap);
         let page = history.page(0, 64).expect("a page");
@@ -745,7 +918,7 @@ mod tests {
             OutputHistory::with_spool(4, directory.clone(), SpoolLayout::new(8, 1024 * 1024))
                 .expect("a spool");
         history.append(&[b'x'; 8]);
-        let taken = history.apply_retention(OutputRetention::DEFAULT, 8, kr_ipc::now_ms());
+        let taken = history.apply_retention(OutputRetention::DEFAULT, 8, kr_ipc::now_ms(), true);
         assert!(taken.is_empty());
         assert!(history.evictions().is_empty());
         assert!(!history.page(0, 64).expect("a page").gap.is_present());

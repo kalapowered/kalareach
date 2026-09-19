@@ -229,9 +229,11 @@ pub struct RecoveryGap {
 
 /// The shared condition of one session's journal.
 ///
-/// Held by the journal, read by anything that needs the posture. Reporting a fault never blocks:
-/// the thread that reports it is the thread holding the session, and a seam that waited for a
-/// reader would stop the session to tell somebody it had stopped.
+/// Held by the journal, read by anything that needs the posture. Reporting a fault does not wait
+/// for a consumer to be ready for it: the thread that reports it is the thread holding the
+/// session, and a seam that waited for a reader would stop the session to tell somebody it had
+/// stopped. What it can wait for is a reader that is holding the value while it looks at it,
+/// which is bounded by that reader's own borrow.
 #[derive(Debug)]
 pub struct JournalHealth {
     sender: watch::Sender<JournalCondition>,
@@ -290,7 +292,7 @@ impl JournalHealth {
     ///
     /// Called after a write commits, so the mark a later fault is measured from is the last
     /// sequence this host really wrote rather than the last one it attempted.
-    pub fn note_durable_through(&self, sequence: u64) {
+    pub(crate) fn note_durable_through(&self, sequence: u64) {
         self.durable_mark.fetch_max(sequence, Ordering::Relaxed);
     }
 
@@ -304,7 +306,7 @@ impl JournalHealth {
     ///
     /// This is the producer side of the seam, and it is one call so that every path through the
     /// journal reports a fault the same way. It returns true when the condition changed.
-    pub fn observe(&self, error: &rusqlite::Error, now_ms: u64) -> bool {
+    pub(crate) fn observe(&self, error: &rusqlite::Error, now_ms: u64) -> bool {
         self.note_fault(JournalFault {
             kind: FaultKind::classify(error),
             detail: error.to_string(),
@@ -318,7 +320,11 @@ impl JournalHealth {
     /// The first fault is what a recovery gap is measured from, so a second fault while one is
     /// already open does not replace it: what is being recorded is the interval durability was
     /// unavailable, and that interval began at the first failure.
-    pub fn note_fault(&self, fault: JournalFault) -> bool {
+    ///
+    /// It is crate-private on purpose. The condition is a fact about this host's durable store,
+    /// and a subsystem that reported its own failure into it would fence rich work for a reason
+    /// the store has nothing to do with.
+    pub(crate) fn note_fault(&self, fault: JournalFault) -> bool {
         let mut changed = false;
         self.sender.send_if_modified(|condition| {
             if condition.is_healthy() {
@@ -336,8 +342,10 @@ impl JournalHealth {
     ///
     /// The caller writes the gap down before it calls this. A recovery whose gap could not be
     /// committed is not a recovery, because the record would then read as continuous over an
-    /// interval this host knows it did not write.
-    pub fn note_recovered(&self) -> Option<JournalFault> {
+    /// interval this host knows it did not write. It is crate-private, and
+    /// [`crate::journal::Journal::recover`] is the only caller, so no consumer of the seam can
+    /// clear a condition without the gap that explains it.
+    pub(crate) fn note_recovered(&self) -> Option<JournalFault> {
         let mut previous = None;
         self.sender.send_if_modified(|condition| {
             match std::mem::replace(condition, JournalCondition::Healthy) {

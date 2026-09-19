@@ -249,6 +249,11 @@ impl Journal {
                 .map(|boot| boot.value.as_slice().to_vec()),
         };
         journal.migrate()?;
+        // The mark describes the store rather than this process, so it starts at what the store
+        // already holds. Starting at nought would make the first fault of a restarted host claim
+        // a gap back to the beginning of the session.
+        let high_water = journal.event_high_water()?;
+        journal.health.note_durable_through(high_water);
         Ok(journal)
     }
 
@@ -803,10 +808,11 @@ impl Journal {
                 ],
             )
             .map_err(|error| faulted(&self.health, error))?;
-        append_event(&self.health, &transaction, &receipt)?;
+        let sequence = append_event(&self.health, &transaction, &receipt)?;
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
+        self.health.note_durable_through(sequence);
         Ok(Admission {
             receipt,
             deduplicated: false,
@@ -931,10 +937,11 @@ impl Journal {
                 ],
             )
             .map_err(|error| faulted(&self.health, error))?;
-        append_event_at(&self.health, &transaction, &receipt, now_ms)?;
+        let sequence = append_event_at(&self.health, &transaction, &receipt, now_ms)?;
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
+        self.health.note_durable_through(sequence);
         Ok(receipt)
     }
 
@@ -1024,7 +1031,7 @@ fn append_event(
     health: &crate::persistence::fault::JournalHealth,
     transaction: &rusqlite::Transaction<'_>,
     receipt: &Receipt,
-) -> Result<()> {
+) -> Result<u64> {
     append_event_at(health, transaction, receipt, receipt.updated_at_ms)
 }
 
@@ -1040,7 +1047,7 @@ fn append_event_at(
     transaction: &rusqlite::Transaction<'_>,
     receipt: &Receipt,
     recorded_at_ms: TimestampMs,
-) -> Result<()> {
+) -> Result<u64> {
     transaction
         .execute(
             "INSERT INTO receipt_events (actor_id, action_id, revision, state, recorded_at_ms)
@@ -1054,8 +1061,9 @@ fn append_event_at(
             ],
         )
         .map_err(|error| faulted(health, error))?;
-    // The event's own sequence is what a recovery gap is measured from, so the mark moves here,
-    // inside the transaction that made it true, rather than when the caller gets its answer.
+    // The event's own sequence is what a recovery gap is measured from. It is *returned* rather
+    // than published: this transaction can still fail, and a mark taken from a write that rolled
+    // back would put the gap's start after the last sequence this host really wrote.
     let sequence = u64::try_from(transaction.last_insert_rowid()).unwrap_or(0);
     transaction
         .execute(
@@ -1076,8 +1084,7 @@ fn append_event_at(
             ],
         )
         .map_err(|error| faulted(health, error))?;
-    health.note_durable_through(sequence);
-    Ok(())
+    Ok(sequence)
 }
 
 impl Journal {
@@ -1181,7 +1188,7 @@ impl Journal {
             .transaction()
             .map_err(|error| faulted(&self.health, error))?;
         write_state(&self.health, &transaction, &receipt)?;
-        append_event(&self.health, &transaction, &receipt)?;
+        let sequence = append_event(&self.health, &transaction, &receipt)?;
         let named = match fenced_for {
             Some(revocation) => name_evidence(
                 &self.health,
@@ -1200,6 +1207,7 @@ impl Journal {
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
+        self.health.note_durable_through(sequence);
         Ok((receipt, named))
     }
 
@@ -2026,6 +2034,7 @@ impl Journal {
             )
             .map_err(|error| faulted(&self.health, error))?;
         let mut receipt = receipt;
+        let mut advanced = None;
         if let Some(state) = effect.reconciliation() {
             // The observation and the reconciliation are one commit. A crash between them would
             // leave a receipt claiming an outcome beside no record of what established it.
@@ -2035,11 +2044,14 @@ impl Journal {
             })?;
             receipt.updated_at_ms = observation.observed_at_ms;
             write_state(&self.health, &transaction, &receipt)?;
-            append_event(&self.health, &transaction, &receipt)?;
+            advanced = Some(append_event(&self.health, &transaction, &receipt)?);
         }
         transaction
             .commit()
             .map_err(|error| faulted(&self.health, error))?;
+        if let Some(sequence) = advanced {
+            self.health.note_durable_through(sequence);
+        }
         Ok(receipt)
     }
 
@@ -2230,13 +2242,21 @@ impl Journal {
             .connection
             .transaction()
             .map_err(|error| faulted(&self.health, error))?;
-        // The outbox rows of a receipt that is being forgotten go with it, and the consumer
-        // cursors stay: a cursor past a record that no longer exists still says correctly that
-        // the consumer has nothing to take, and resetting it would replay the whole journal.
+        // The outbox is collected by what it has left to deliver rather than by whose receipt it
+        // belongs to. A receipt written thirty days ago can have produced its outcome event this
+        // minute, and deleting that event with the receipt would take it from a consumer that had
+        // never been offered it. So a row goes when it is past the retention period *and* every
+        // registered consumer has recorded a cursor past it. A journal with no registered
+        // consumer owes nothing, and there the age alone decides.
         transaction
             .execute(
-                &format!("DELETE FROM outbox WHERE (actor_id, action_id) IN ({SELECT})"),
-                params![cutoff, boot, continuous_floor],
+                "DELETE FROM outbox
+                 WHERE recorded_at_ms < ?1
+                   AND cursor <= COALESCE(
+                       (SELECT MIN(cursor) FROM outbox_cursors),
+                       (SELECT COALESCE(MAX(cursor), 0) FROM outbox)
+                   )",
+                params![cutoff],
             )
             .map_err(|error| faulted(&self.health, error))?;
         for table in ["results", "receipt_events", "observations"] {
@@ -2331,6 +2351,32 @@ impl Journal {
         })
     }
 
+    /// Reports a stored value this build cannot read, and returns the refusal.
+    ///
+    /// A row the store returned that this build cannot decode is not a decoding preference: it is
+    /// a store whose content cannot be trusted, which is the condition the archive has to be told
+    /// about. It is classified as corruption rather than as an ordinary read failure.
+    fn corrupt(&self, detail: &'static str) -> WorkerError {
+        self.health
+            .note_fault(crate::persistence::fault::JournalFault {
+                kind: crate::persistence::fault::FaultKind::Corrupt,
+                detail: detail.to_owned(),
+                observed_at_ms: kr_ipc::now_ms(),
+                durable_through: self.health.durable_through(),
+            });
+        WorkerError::JournalUnavailable {
+            detail: detail.to_owned(),
+        }
+    }
+
+    /// Reads a stored sixteen-byte identifier.
+    fn uuid_from(&self, bytes: &[u8]) -> Result<Uuid> {
+        let raw: [u8; 16] = bytes
+            .try_into()
+            .map_err(|_| self.corrupt("a stored identifier is not sixteen bytes"))?;
+        Ok(Uuid::from_bytes(raw))
+    }
+
     /// Returns the schema version this store records.
     ///
     /// # Errors
@@ -2357,7 +2403,7 @@ impl Journal {
             .map_err(|error| faulted(&self.health, error))?;
         let mut names = Vec::new();
         for row in rows {
-            names.push(row.map_err(unavailable)?);
+            names.push(row.map_err(|error| faulted(&self.health, error))?);
         }
         Ok(names)
     }
@@ -2521,7 +2567,7 @@ impl Journal {
         let mut gaps = Vec::new();
         for row in rows {
             let (kind, detail, faulted_at, recovered_at, durable_through, resumed_at) =
-                row.map_err(unavailable)?;
+                row.map_err(|error| faulted(&self.health, error))?;
             gaps.push(crate::persistence::fault::RecoveryGap {
                 kind: crate::persistence::fault::FaultKind::from_stored(&kind).ok_or_else(
                     || unavailable_detail("a stored fault kind is not one this build writes"),
@@ -2542,6 +2588,10 @@ impl Journal {
     /// dies before it records its cursor is handed the same page again. The immutable event
     /// identifier is what lets it apply each record once.
     ///
+    /// The page is bounded by [`crate::persistence::outbox::MAX_OUTBOX_PAGE`], which is what a
+    /// consumer's de-duplication window covers: a page larger than that window could displace an
+    /// identifier the same page still needs.
+    ///
     /// # Errors
     ///
     /// Returns [`WorkerError::JournalUnavailable`] when the read fails.
@@ -2552,6 +2602,7 @@ impl Journal {
     ) -> Result<Vec<crate::persistence::outbox::OutboxRecord>> {
         use crate::persistence::outbox::{OutboxEvent, OutboxRecord, Subsystem};
 
+        let limit = limit.clamp(1, crate::persistence::outbox::MAX_OUTBOX_PAGE);
         let mut statement = self
             .connection
             .prepare(
@@ -2595,28 +2646,32 @@ impl Journal {
                 content,
                 detail,
                 recorded_at_ms,
-            ) = row.map_err(unavailable)?;
+            ) = row.map_err(|error| faulted(&self.health, error))?;
             records.push(OutboxRecord {
                 cursor: u64::try_from(cursor).unwrap_or(0),
                 event: OutboxEvent {
-                    event_id: uuid_from(&event_id)?,
-                    stream: parse_stream(&stream)?,
+                    event_id: self.uuid_from(&event_id)?,
+                    stream: parse_stream(&stream).ok_or_else(|| {
+                        self.corrupt("a stored stream is not one this build writes")
+                    })?,
                     source: Subsystem::from_stored(&source).ok_or_else(|| {
-                        unavailable_detail("a stored subsystem is not one this build writes")
+                        self.corrupt("a stored subsystem is not one this build writes")
                     })?,
                     actor_id: actor_id
                         .map(|actor| {
                             ActorId::new(actor)
-                                .map_err(|_| unavailable_detail("a stored actor is not valid"))
+                                .map_err(|_| self.corrupt("a stored actor is not valid"))
                         })
                         .transpose()?,
                     action_id: action_id
-                        .map(|bytes| uuid_from(&bytes).map(ActionId::new))
+                        .map(|bytes| self.uuid_from(&bytes).map(ActionId::new))
                         .transpose()?,
                     subject_revision: u64::try_from(subject_revision).unwrap_or(0),
                     causal_root: None,
                     causal_parent: None,
-                    content: parse_content_class(&content)?,
+                    content: parse_content_class(&content).ok_or_else(|| {
+                        self.corrupt("a stored content class is not one this build writes")
+                    })?,
                     detail,
                     recorded_at_ms: TimestampMs::new(u64::try_from(recorded_at_ms).unwrap_or(0)),
                 },
@@ -3035,32 +3090,23 @@ fn faulted(
 /// Used where the failure is a decoding failure rather than the store refusing to answer: what a
 /// stored row means is this build's business, and a value it cannot read is not the store saying
 /// it has stopped working.
-fn uuid_from(bytes: &[u8]) -> Result<Uuid> {
-    let raw: [u8; 16] = bytes
-        .try_into()
-        .map_err(|_| unavailable_detail("a stored identifier is not sixteen bytes"))?;
-    Ok(Uuid::from_bytes(raw))
-}
-
-fn parse_stream(value: &str) -> Result<kr_protocol::recovery::EventStream> {
+fn parse_stream(value: &str) -> Option<kr_protocol::recovery::EventStream> {
     kr_protocol::recovery::EventStream::ALL
         .iter()
         .copied()
         .find(|stream| stream.as_str() == value)
-        .ok_or_else(|| unavailable_detail("a stored stream is not one this build writes"))
 }
 
-fn parse_content_class(value: &str) -> Result<crate::persistence::stores::ContentClass> {
+fn parse_content_class(value: &str) -> Option<crate::persistence::stores::ContentClass> {
     use crate::persistence::stores::ContentClass;
 
     match value {
-        "metadata" => Ok(ContentClass::Metadata),
-        "terminal" => Ok(ContentClass::TerminalContent),
-        "authored" => Ok(ContentClass::AuthoredContent),
-        "secret" => Ok(ContentClass::Secret),
-        _ => Err(unavailable_detail(
-            "a stored content class is not one this build writes",
-        )),
+        "metadata" => Some(ContentClass::Metadata),
+        "terminal" => Some(ContentClass::TerminalContent),
+        "authored" => Some(ContentClass::AuthoredContent),
+        "notice" => Some(ContentClass::ApplicationNotice),
+        "secret" => Some(ContentClass::Secret),
+        _ => None,
     }
 }
 

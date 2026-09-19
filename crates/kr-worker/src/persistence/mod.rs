@@ -8,7 +8,7 @@
 //!
 //! | Module | What it holds |
 //! | --- | --- |
-//! | [`contract`] | The commit points, the flush policy and the group that shares a flush |
+//! | [`contract`] | The commit points and the flush policy that keeps grouping safe |
 //! | [`stores`] | Every store's durability, retention, content class, cleanup and reconciliation |
 //! | [`fault`] | The journal-fault and recovery seam: fault detected, rich work fenced, gap committed |
 //! | [`outbox`] | A state transition and its event in one transaction, with at-least-once idempotent fan-out |
@@ -25,7 +25,7 @@ pub mod retention;
 pub mod stores;
 
 pub use crate::persistence::capacity::{Exception, StoreCapacity};
-pub use crate::persistence::contract::{CommitGroup, CommitPoint, FlushPolicy, WriteKind};
+pub use crate::persistence::contract::{CommitPoint, FlushPolicy, WriteKind, flush_policy};
 pub use crate::persistence::fault::{
     DurabilityPosture, FaultKind, JournalCondition, JournalFault, JournalHealth, RecoveryGap,
     WorkClass,
