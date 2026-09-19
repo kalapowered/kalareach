@@ -875,6 +875,12 @@ impl Session {
         )
     }
 
+    /// The retained row one attachment's window starts at, or `None` for the live screen.
+    #[must_use]
+    pub fn history_window(&self, attachment_id: AttachmentId) -> Option<i64> {
+        self.attachments.history_top_row(attachment_id)
+    }
+
     /// What one attachment is looking through: its own size, and where its window sits.
     fn window_of(
         &self,

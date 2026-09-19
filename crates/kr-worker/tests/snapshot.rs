@@ -1894,6 +1894,14 @@ fn installed_rows(events: &[Event], buffer: ProjectedBuffer) -> Vec<(u64, String
     rows
 }
 
+/// A session that prints `lines` numbered lines, waits, and then takes the alternate screen.
+fn alternate_after(lines: u32) -> String {
+    format!(
+        "i=0; while [ $i -lt {lines} ]; do printf 'line %d\r\n' $i; i=$((i+1)); done; \
+         sleep 3; printf '\x1b[?1049h'; sleep 20"
+    )
+}
+
 /// A session that has printed `lines` numbered lines and is then idle.
 fn numbered(lines: u32) -> String {
     format!(
@@ -2570,26 +2578,82 @@ async fn a_buffer_switch_brings_every_window_back_to_the_live_screen() {
     };
     assert!(switched, "the application took the screen");
 
-    // The window came back with it, and nothing here asked for that: a report that names its own
-    // size and no position at all would clear the window itself, so the size this attachment
-    // already has is reported and the answer is read for where the window is.
-    let after = report_viewport(&host, &mut watcher, window, None).await;
+    // The window came back with it, and nothing here asked for that: a report naming no position
+    // would clear the window itself, so the session is asked where the window is instead.
     assert!(
-        after.position.0.is_none(),
-        "the window is the live screen: {:?}",
-        after.position.0
+        host.runtime
+            .session()
+            .history_window(watcher.attachment_id)
+            .is_none(),
+        "the window came back to the live screen with the screen that program took"
     );
-    let installed = collect_until_installed(&mut watcher.client, Duration::from_secs(10)).await;
-    let drawn = installed
-        .iter()
-        .rev()
-        .find_map(|event| match event {
-            Event::Snapshot(header) => Some(header.viewport),
-            _ => None,
-        })
-        .expect("a fresh screen follows");
-    assert_eq!(
-        drawn.top_row, drawn.screen_top_row,
-        "and the screen it draws is the live one"
+}
+
+/// And it comes back even for a client the session is publishing nothing to.
+///
+/// A subscriber that has fallen behind is told to resynchronise and is published nothing until it
+/// asks again. A window cleared only where a client is published to would survive the switch for
+/// exactly that client, and its next screen would put it back above rows that are no longer above
+/// anything.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_buffer_switch_reaches_a_window_whose_client_is_behind() {
+    let host = host_with(
+        &alternate_after(300),
+        Dimensions::new(CANONICAL.0, CANONICAL.1),
+        None,
+        1024 * 1024,
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let window = Dimensions::new(SMALLER.0, SMALLER.1);
+    let mut watcher = attach(&host, window, Some("xterm-256color")).await;
+    let _ = collect_until_installed(&mut watcher.client, Duration::from_secs(5)).await;
+    let answer = report_viewport(
+        &host,
+        &mut watcher,
+        window,
+        Some(kr_protocol::attachment::ViewportPosition::Above(
+            kr_protocol::scalars::U64::new(80),
+        )),
+    )
+    .await;
+    assert!(
+        matches!(
+            answer.position.0,
+            Some(kr_protocol::attachment::ViewportPosition::Row(_))
+        ),
+        "the window is above the live page: {:?}",
+        answer.position.0
+    );
+
+    // Behind, which is what stops it being published to at all.
+    {
+        let mut session = host.runtime.session();
+        session.require_resync(
+            watcher.attachment_id,
+            kr_protocol::recovery::ResyncReason::SendQueueFull,
+        );
+        assert!(session.is_resynchronising(watcher.attachment_id));
+    }
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+    while tokio::time::Instant::now() < deadline {
+        if host
+            .runtime
+            .session()
+            .history_window(watcher.attachment_id)
+            .is_none()
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(
+        host.runtime
+            .session()
+            .history_window(watcher.attachment_id)
+            .is_none(),
+        "the window came back even though nothing was published to this client"
     );
 }

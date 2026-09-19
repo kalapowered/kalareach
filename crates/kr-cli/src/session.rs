@@ -156,6 +156,27 @@ const PASTE_START: &[u8] = b"\x1b[200~";
 /// The bytes a terminal sends when a bracketed paste ends.
 const PASTE_END: &[u8] = b"\x1b[201~";
 
+/// What a read says about a bracketed paste, when it says anything.
+///
+/// The delimiter nearest the end of the read decides: a read ending in a start is a paste opening,
+/// one ending in an end is a paste closing, and a read with neither leaves the answer where it was.
+/// Nothing is held back, rewritten or reordered by this; it decides only whether a later read may
+/// be read as one of this terminal's own keys, and a paste whose delimiters a read boundary cut in
+/// half leaves it wrong until another delimiter arrives whole.
+fn paste_state(bytes: &[u8]) -> Option<bool> {
+    let last = |needle: &[u8]| {
+        bytes
+            .windows(needle.len())
+            .rposition(|window| window == needle)
+    };
+    match (last(PASTE_START), last(PASTE_END)) {
+        (None, None) => None,
+        (Some(_), None) => Some(true),
+        (None, Some(_)) => Some(false),
+        (Some(start), Some(end)) => Some(start > end),
+    }
+}
+
 /// Whether a read is nothing but reports about the pointer.
 ///
 /// The two encodings this host advertises: xterm's SGR reports, which are three numbers between
@@ -544,6 +565,10 @@ async fn drive(
     // the live screen. It is reported with every size report as well, so a window the person has
     // scrolled back to stays where they put it when they resize their terminal.
     let mut parked: Option<u64> = None;
+    // Where the scroll-back report in flight asked the window to go, when one is in flight. A size
+    // report sent meanwhile carries that rather than the position the window has left, because the
+    // session answers them in the order they arrive and the later one is the one it keeps.
+    let mut requested: Option<Option<u64>> = None;
     // Movement the person has asked for and the session has not answered yet, the step it was
     // measured with, and the size that report carried.
     let mut queued = 0_i64;
@@ -778,7 +803,7 @@ async fn drive(
                                                 u64::from(size.rows),
                                             ),
                                             position: Nullable(
-                                                parked.map(|row| {
+                                                requested.unwrap_or(parked).map(|row| {
                                                     ViewportPosition::Row(U64::new(row))
                                                 }),
                                             ),
@@ -876,12 +901,6 @@ async fn drive(
                                 {
                                     parked = landed(result.position.0);
                                 }
-                                // The screen this terminal has been given since is newer than any
-                                // answer about a request that was in flight while it arrived, and
-                                // where a window is is a property of the screen.
-                                if let Some(above) = display.window_above_the_live_page() {
-                                    parked = above;
-                                }
                                 // What the person asked for while this was in flight, resolved
                                 // against where the window actually ended up. A refusal leaves the
                                 // window where it was, and the movement is measured from there.
@@ -889,6 +908,7 @@ async fn drive(
                                     .then(|| scrolled(parked, queued, step))
                                     .flatten();
                                 queued = 0;
+                                requested = None;
                                 if let Some(position) = asked {
                                     let request_id =
                                         kr_protocol::ids::RequestId::new(next_request);
@@ -911,6 +931,7 @@ async fn drive(
                                         return AttachOutcome::Disconnected;
                                     }
                                     outstanding.insert(request_id, Outstanding::Scrollback);
+                                    requested = Some(landed(position));
                                 }
                             }
                             // The screen follows as ordinary output. A refusal means the session no
@@ -971,7 +992,9 @@ async fn drive(
                         attachment_id,
                         dimensions,
                         position: Nullable(
-                            parked.map(|row| ViewportPosition::Row(U64::new(row))),
+                            requested
+                                .unwrap_or(parked)
+                                .map(|row| ViewportPosition::Row(U64::new(row))),
                         ),
                     };
                     (
@@ -1010,8 +1033,8 @@ async fn drive(
                 // session byte for byte, whatever it happens to contain. The delimiters are read
                 // whole, like everything else here, so a paste is open from the read that begins
                 // with one to the read that ends with the other.
-                if pasting || bytes.starts_with(PASTE_START) {
-                    pasting = !bytes.ends_with(PASTE_END);
+                if let Some(open) = paste_state(&bytes) {
+                    pasting = open;
                 }
                 let mine = !pasting && display.holds_screen() && display.showing_history_buffer();
                 if mine
@@ -1063,6 +1086,7 @@ async fn drive(
                             return AttachOutcome::Disconnected;
                         }
                         outstanding.insert(request_id, Outstanding::Scrollback);
+                        requested = Some(landed(position));
                         }
                     }
                     // The key was this terminal's, so nothing of it reaches the session, whether
@@ -1397,6 +1421,26 @@ mod tests {
             scroll_step(40),
             39,
             "a terminal taller than the session moves by the session's rows"
+        );
+    }
+
+    /// A paste is open from the delimiter that opens it to the one that closes it.
+    #[test]
+    fn a_delimiter_anywhere_in_a_read_decides_the_paste() {
+        use super::paste_state;
+
+        assert_eq!(paste_state(b"ls -l"), None, "an ordinary read says nothing");
+        assert_eq!(paste_state(b"x\x1b[200~"), Some(true), "a paste opening");
+        assert_eq!(paste_state(b"\x1b[201~x"), Some(false), "and one closing");
+        assert_eq!(
+            paste_state(b"\x1b[200~text\x1b[201~"),
+            Some(false),
+            "a whole paste in one read is closed at the end of it"
+        );
+        assert_eq!(
+            paste_state(b"\x1b[201~\x1b[200~more"),
+            Some(true),
+            "and one paste ending while another begins is open"
         );
     }
 

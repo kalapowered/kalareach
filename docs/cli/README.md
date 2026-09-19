@@ -116,17 +116,18 @@ half and decide what a key means among bytes it did not recognise. What arrives 
 is forwarded like every other byte, so a key that reaches the command that way scrolls nothing and
 the person presses it again.
 
-Bracketed paste is read the same way and is the one piece of context the command keeps: from a read
-that begins with the start delimiter to the read that ends with the end delimiter, nothing is a key
-or a pointer report, so pasted text reaches the session byte for byte. A paste whose delimiters a
-read boundary cut in half, or one a terminal sends without them at all, is text the command cannot
-tell from typing.
+Bracketed paste is read the same way and is the one piece of context the command keeps: a read
+carrying a start delimiter opens a paste and one carrying an end delimiter closes it, and while a
+paste is open nothing is a key or a pointer report, so pasted text reaches the session byte for
+byte. A delimiter a read boundary cut in half, or a paste a terminal sends without delimiters at
+all, is text the command cannot tell from typing.
 
 The window this terminal is looking through is the session's answer to say. One scroll-back report
 is in flight at a time; what the person presses meanwhile waits for it and is measured from where
 the window actually landed. A report about this terminal's *size* goes out when the size changes,
 whatever else is in flight, because a window drawn for a size the terminal no longer has is wrong
-about every row.
+about every row; it carries the position the report in flight asked for, so the two cannot
+contradict each other about where the window is going.
 
 They are this terminal's keys only where this terminal has no history of its own. A terminal being
 handed the session's bytes has them, so its own scrollback holds what scrolled past and the command
