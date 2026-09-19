@@ -341,9 +341,16 @@ ldflags=${LDFLAGS:-}
 "
     if [ "$m_build_system" = "cmake" ]; then
         # A shell whose own source is Rust is the compiler that produced it as much as the C one,
-        # so a different toolchain is a different package here too.
+        # so a different toolchain is a different package here too. The toolchain is pinned by
+        # name as well as recorded, because the build runs in a temporary directory where this
+        # repository's own choice of toolchain does not reach.
+        local rust_toolchain
+        rust_toolchain="${RUSTUP_TOOLCHAIN:-$(rustup show active-toolchain 2>/dev/null | cut -d' ' -f1)}"
+        export RUSTUP_TOOLCHAIN="${rust_toolchain:-stable}"
         inputs="$inputs
 rustc=$(rustc --version 2>/dev/null)
+toolchain=$RUSTUP_TOOLCHAIN
+rustflags=${RUSTFLAGS:-}
 env=$m_environment
 "
     fi
