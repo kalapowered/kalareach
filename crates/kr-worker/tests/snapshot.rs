@@ -2497,14 +2497,35 @@ async fn a_window_too_large_for_this_queue_is_refused_rather_than_resynchronised
         .subscribe_within(watcher.attachment_id, live_minimum)
         .expect("a queue of exactly the live screen is enough for the live screen");
 
+    let above = Some(kr_protocol::attachment::ViewportPosition::Above(
+        kr_protocol::scalars::U64::new(100),
+    ));
+    // The answer the dispatch asks for before it marks the effect. It is the same answer, asked
+    // where a refusal is still a refusal: raised after the marker it would be an outcome nobody
+    // can read, and the requests behind it would wait on a receipt that never resolves.
+    let early = session
+        .viewportable(watcher.attachment_id, window, above)
+        .expect_err("a window this queue cannot carry is refused before anything is marked");
+    assert_eq!(
+        early.code(),
+        kr_protocol::error::ErrorCode::InvalidArgument,
+        "and it is the queue that refuses it: {early}"
+    );
+    assert!(early.to_string().contains("cannot carry this window"));
+    // The narrowed case takes the same path, and is refused there too.
+    session.narrow_content(watcher.attachment_id, kr_worker::render::Scope::LiveScreen);
+    let narrowed = session
+        .viewportable(watcher.attachment_id, window, above)
+        .expect_err("a caller shown the live screen cannot look above it either");
+    assert_eq!(
+        narrowed.code(),
+        kr_protocol::error::ErrorCode::UnsupportedCapability,
+        "and that refusal is about what it may be shown: {narrowed}"
+    );
+    session.narrow_content(watcher.attachment_id, kr_worker::render::Scope::WholeScreen);
+
     let refusal = session
-        .viewport(
-            watcher.attachment_id,
-            window,
-            Some(kr_protocol::attachment::ViewportPosition::Above(
-                kr_protocol::scalars::U64::new(100),
-            )),
-        )
+        .viewport(watcher.attachment_id, window, above)
         .expect_err("a window this queue cannot carry is refused");
     assert_eq!(
         refusal.code(),

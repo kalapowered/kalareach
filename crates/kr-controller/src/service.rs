@@ -3564,7 +3564,11 @@ mod a_create_that_launches_nothing {
         })
         .expect("encodes");
         let error = controller
-            .session_create(&actor_id, &probed, connection_id, accepted)
+            .session_create(
+                &actor_id,
+                &probed,
+                carried(&controller, connection_id, accepted),
+            )
             .await
             .expect_err("an invisible session has no terminal to have probed");
         assert_eq!(
@@ -3597,7 +3601,11 @@ mod a_create_that_launches_nothing {
         })
         .expect("encodes");
         let outcome = controller
-            .session_create(&actor_id, &preset, connection_id, accepted)
+            .session_create(
+                &actor_id,
+                &preset,
+                carried(&controller, connection_id, accepted),
+            )
             .await;
         assert!(
             outcome.is_err(),

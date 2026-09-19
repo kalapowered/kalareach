@@ -1089,54 +1089,13 @@ impl Session {
         let before = self.presentation_of_attachment(attachment_id);
         let before_dimensions = self.attachments.own_dimensions(attachment_id).flatten();
         let before_top_row = self.attachments.history_top_row(attachment_id);
-        // What this attachment's caller may be shown decides whether it may look above the live
-        // page at all. A caller narrowed to the live screen is served the screen that is showing
-        // and no retained content beyond it, and a window in the session's history is exactly that
-        // content: it is refused rather than quietly answered with the live screen, because a
-        // client told its window moved would draw as though it had.
-        if position.is_some()
-            && self.content_scope(attachment_id) == crate::render::Scope::LiveScreen
-        {
-            return Err(WorkerError::PresentationUnsupported {
-                detail: "this attachment is shown the live screen and no retained rows above it, \
-                         so its window cannot be placed in the session's history"
-                    .to_owned(),
-            });
-        }
+        // The same two answers the dispatch asked for before it marked the effect. Asked again
+        // because this is callable on its own, and because asking twice costs a measurement while
+        // not asking costs a refusal nobody can read.
+        self.window_refusal(attachment_id, dimensions, position)?;
         // Resolved against the session as it stands now: an offset above the live screen is a
         // place, and the row it names is what the attachment holds from here.
         let top_row = self.engine.resolve_position(position);
-        // The dimensions this report carries are checked before anything is built for them: a
-        // report that violates a constraint is refused for that, and naming a limit is the answer
-        // section 8 asks for rather than a figure about a queue.
-        let violations = dimensions.violations();
-        if let Some(violation) = violations.into_iter().next() {
-            return Err(WorkerError::Dimensions(violation));
-        }
-        // And the screen that window needs has to cross the queue this attachment already has. A
-        // window above the live page carries the rows it shows and the live screen behind them, so
-        // it can be a larger screen than the one this subscriber was admitted for; being told the
-        // window moved and then that the queue is full is two answers where there should be one.
-        // The size is part of the question: the same row in a taller window is a larger screen.
-        if top_row.is_some() && (top_row != before_top_row || before_dimensions != Some(dimensions))
-        {
-            let limit = self.hub.limit_of(attachment_id);
-            let minimum = self.engine.minimum_projection_install(
-                crate::projection::Window {
-                    dimensions,
-                    anchor: crate::projection::ViewportAnchor::of(top_row),
-                },
-                self.content_scope(attachment_id),
-            )?;
-            if limit > 0 && limit < minimum {
-                return Err(WorkerError::InvalidArgument(format!(
-                    "a send queue of {limit} bytes cannot carry this window: it is admitted \
-                     against {minimum} bytes, which is what the smallest screen of it costs with \
-                     the longest reason a reset can carry, and a client holding part of a screen \
-                     holds none of it"
-                )));
-            }
-        }
         let presentation = self
             .attachments
             .viewport(attachment_id, dimensions, top_row)?;
@@ -2286,8 +2245,82 @@ impl Session {
     /// Returns [`WorkerError::InvalidArgument`] when the dimensions are not ones this host serves
     /// or the attachment has no terminal presentation, and [`WorkerError::UnknownAttachment`] when
     /// the identifier names no attachment of this session.
-    pub fn viewportable(&self, attachment_id: AttachmentId, dimensions: Dimensions) -> Result<()> {
-        self.attachments.check_viewport(attachment_id, dimensions)
+    pub fn viewportable(
+        &self,
+        attachment_id: AttachmentId,
+        dimensions: Dimensions,
+        position: Option<kr_protocol::attachment::ViewportPosition>,
+    ) -> Result<()> {
+        self.attachments.check_viewport(attachment_id, dimensions)?;
+        self.window_refusal(attachment_id, dimensions, position)
+    }
+
+    /// Why this attachment may not put its window where the report asks, when it may not.
+    ///
+    /// Both answers are about the request rather than about anything the report would change, so
+    /// they belong where a refusal is still a refusal: before the marker that says the effect may
+    /// have happened. A refusal raised after it would be an outcome nobody can read, and the
+    /// requests behind it would wait on a receipt that never resolves.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WorkerError::PresentationUnsupported`] when a caller shown the live screen and no
+    /// retained content beyond it asks for a window above it, and [`WorkerError::InvalidArgument`]
+    /// when the smallest screen of that window will not cross the queue this attachment holds.
+    fn window_refusal(
+        &self,
+        attachment_id: AttachmentId,
+        dimensions: Dimensions,
+        position: Option<kr_protocol::attachment::ViewportPosition>,
+    ) -> Result<()> {
+        // What this attachment's caller may be shown decides whether it may look above the live
+        // page at all. A caller narrowed to the live screen is served the screen that is showing
+        // and no retained content beyond it, and a window in the session's history is exactly that
+        // content: it is refused rather than quietly answered with the live screen, because a
+        // client told its window moved would draw as though it had.
+        if position.is_some()
+            && self.content_scope(attachment_id) == crate::render::Scope::LiveScreen
+        {
+            return Err(WorkerError::PresentationUnsupported {
+                detail: "this attachment is shown the live screen and no retained rows above it, \
+                         so its window cannot be placed in the session's history"
+                    .to_owned(),
+            });
+        }
+        // The dimensions this report carries are checked before anything is built for them: a
+        // report that violates a constraint is refused for that, and naming a limit is the answer
+        // section 8 asks for rather than a figure about a queue.
+        if let Some(violation) = dimensions.violations().into_iter().next() {
+            return Err(WorkerError::Dimensions(violation));
+        }
+        // And the screen that window needs has to cross the queue this attachment already has. A
+        // window above the live page carries the rows it shows and the live screen behind them, so
+        // it can be a larger screen than the one this subscriber was admitted for; being told the
+        // window moved and then that the queue is full is two answers where there should be one.
+        // The size is part of the question: the same row in a taller window is a larger screen.
+        let top_row = self.engine.resolve_position(position);
+        let before_top_row = self.attachments.history_top_row(attachment_id);
+        let before_dimensions = self.attachments.own_dimensions(attachment_id).flatten();
+        if top_row.is_some() && (top_row != before_top_row || before_dimensions != Some(dimensions))
+        {
+            let limit = self.hub.limit_of(attachment_id);
+            let minimum = self.engine.minimum_projection_install(
+                crate::projection::Window {
+                    dimensions,
+                    anchor: crate::projection::ViewportAnchor::of(top_row),
+                },
+                self.content_scope(attachment_id),
+            )?;
+            if limit > 0 && limit < minimum {
+                return Err(WorkerError::InvalidArgument(format!(
+                    "a send queue of {limit} bytes cannot carry this window: it is admitted \
+                     against {minimum} bytes, which is what the smallest screen of it costs with \
+                     the longest reason a reset can carry, and a client holding part of a screen \
+                     holds none of it"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Decides whether one attachment can supply the input encoding this application reads.

@@ -913,6 +913,7 @@ async fn a_mutation_whose_admission_lapses_before_its_transaction_is_refused_ins
             dimensions: Nullable::null(),
             worker_profile: WorkerProfile::HeadlessUser,
             environment_snapshot: Vec::new(),
+            palette: Nullable::null(),
         })
         .expect("encodes"),
     };
@@ -1442,6 +1443,7 @@ async fn a_retry_reaches_its_retained_answer_after_its_window_stops_admitting_an
             dimensions: Nullable::null(),
             worker_profile: WorkerProfile::HeadlessUser,
             environment_snapshot: Vec::new(),
+            palette: Nullable::null(),
         })
         .expect("encodes"),
     };
@@ -1495,6 +1497,7 @@ async fn a_retained_action_is_disclosed_under_current_authority_and_not_under_wi
             dimensions: Nullable::null(),
             worker_profile: WorkerProfile::HeadlessUser,
             environment_snapshot: Vec::new(),
+            palette: Nullable::null(),
         })
         .expect("encodes"),
     };
@@ -1615,6 +1618,7 @@ async fn a_create_that_queues_past_its_lifetime_is_refused_without_starting_anyt
             dimensions: Nullable::null(),
             worker_profile: WorkerProfile::HeadlessUser,
             environment_snapshot: Vec::new(),
+            palette: Nullable::null(),
         })
         .expect("encodes"),
     };
@@ -1766,6 +1770,7 @@ async fn hosted_worker() -> Hosted {
                     dimensions: Nullable::null(),
                     worker_profile: WorkerProfile::HeadlessUser,
                     environment_snapshot: Vec::new(),
+                    palette: Nullable::null(),
                 })
                 .expect("encodes"),
             };

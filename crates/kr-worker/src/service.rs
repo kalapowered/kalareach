@@ -2708,9 +2708,10 @@ impl WorkerService {
             }
             Method::AttachmentViewport => {
                 let params: AttachmentViewportParams = parse(&mutation.params)?;
-                // The size this window reports, and whether this attachment is shown a terminal at
-                // all. A semantic attachment has no viewport to report.
-                session.viewportable(params.attachment_id, params.dimensions)
+                // The size this window reports, whether this attachment is shown a terminal at
+                // all, and whether it may put its window where the report asks. A semantic
+                // attachment has no viewport to report.
+                session.viewportable(params.attachment_id, params.dimensions, params.position.0)
             }
             Method::ActionCancel => {
                 let params: kr_protocol::receipt::ActionCancelParams = parse(&mutation.params)?;

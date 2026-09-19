@@ -1623,6 +1623,7 @@ fn perf_snapshot() -> Box<kr_protocol::projection::ProjectionSnapshot> {
         active_buffer: ProjectedBuffer::Primary,
         dimensions: kr_protocol::session::Dimensions::new(PERF_COLUMNS, PERF_ROWS),
         viewport: ProjectedViewport {
+            screen_top_row: U64::ZERO,
             top_row: U64::ZERO,
             rows: U64::new(PERF_ROWS),
             left_column: U64::ZERO,

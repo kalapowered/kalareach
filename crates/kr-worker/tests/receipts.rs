@@ -2683,6 +2683,7 @@ async fn a_refusal_the_host_could_decide_leaves_a_rejection_rather_than_an_uncer
         params: ParamsValue::from_typed(&kr_protocol::attachment::AttachmentViewportParams {
             attachment_id: attached.attachment.attachment_id,
             dimensions: Dimensions::new(0, 0),
+            position: Nullable::null(),
         })
         .expect("encodes"),
         ..close_mutation(
@@ -4305,4 +4306,90 @@ fn a_fence_that_failed_part_way_names_what_both_passes_did() {
         vec![crate::action(14)],
         "an action that ran after the previous fence is named however its stamp reads"
     );
+}
+
+/// A window the host can refuse is refused before the marker, not after it.
+///
+/// Both answers about where a window may go are about the request: a caller shown the live screen
+/// and no retained content beyond it may not look above it, and a window whose smallest screen will
+/// not cross the queue this attachment holds cannot be installed. Neither depends on anything the
+/// report would change, so both belong before the marker that says the effect may have happened.
+/// Raised after it, each would be an outcome nobody can read and the requests behind it would wait
+/// on a receipt that never resolves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_window_the_host_can_refuse_never_reaches_the_marker() {
+    let host = host().await;
+    let mut client = cli(&host).await;
+    let caller = actor(&format!("local:{}", kr_ipc::paths::current_uid()));
+
+    let mut requested = kr_protocol::scalars::CanonicalSet::new();
+    requested.insert(kr_protocol::attachment::AttachmentCapability::ObserveTerminal);
+    let attached: kr_protocol::attachment::SessionAttachResult = client
+        .mutate(
+            Method::SessionAttach,
+            ActionId::new(kr_ipc::new_uuid()),
+            target(&host),
+            &kr_protocol::attachment::SessionAttachParams {
+                session_id: host.session_id,
+                mode: kr_protocol::attachment::AttachMode::Terminal,
+                claim_geometry: false,
+                dimensions: Nullable::some(Dimensions::new(40, 10)),
+                terminal_profile_id: Nullable::some("xterm-256color".to_owned()),
+                requested,
+            },
+        )
+        .await
+        .expect("reaches the worker")
+        .expect("the attachment is accepted")
+        .to_typed()
+        .expect("decodes");
+    let attachment_id = attached.attachment.attachment_id;
+
+    // The narrowing a forwarded caller is given: the screen that is showing, and no retained
+    // content beyond it.
+    host.service
+        .runtime()
+        .session()
+        .narrow_content(attachment_id, kr_worker::render::Scope::LiveScreen);
+
+    let above = MutationRequest {
+        method: Method::AttachmentViewport.into(),
+        params: ParamsValue::from_typed(&kr_protocol::attachment::AttachmentViewportParams {
+            attachment_id,
+            dimensions: Dimensions::new(40, 10),
+            position: Nullable::some(kr_protocol::attachment::ViewportPosition::Above(
+                kr_protocol::scalars::U64::new(40),
+            )),
+        })
+        .expect("encodes"),
+        ..close_mutation(
+            &client,
+            &host,
+            DEFAULT_MUTATION_TTL.get(),
+            ParamsValue::empty(),
+        )
+    };
+    let named = above.action_id;
+    let Outcome::Error(error) = send_mutation(&mut client, above).await else {
+        panic!("an attachment shown the live screen cannot place its window above it");
+    };
+    assert_eq!(error.code, ErrorCode::UnsupportedCapability);
+    {
+        let mut session = host.service.runtime().session();
+        let journal = session.journal_mut().expect("a journal");
+        let receipt = journal
+            .read(caller.clone(), named)
+            .expect("reads")
+            .expect("the intent was committed before it was revalidated");
+        assert_eq!(
+            receipt.state,
+            ReceiptState::Rejected,
+            "the host could decide this, so it never wrote a dispatch marker"
+        );
+    }
+
+    // The other answer this path can give is about the queue a window has to cross, which needs
+    // a session with rows above its live page; `kr-worker/tests/snapshot.rs` asks that one of
+    // `Session::viewportable` directly, which is the same call this dispatch makes before its
+    // marker.
 }
