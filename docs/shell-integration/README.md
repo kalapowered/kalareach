@@ -213,7 +213,11 @@ Every package records, and the worker keeps with the session:
 
 ## The reader events
 
-Everything below comes from the reader itself, at the moment the reader does the thing.
+Everything below comes from the reader itself, at the moment the reader does the thing. This is the
+contract a bridge speaks and the host answers; which of these a given package sends is that
+package's own declaration. The Zsh and Bash packages send every event in this table but
+`command_resolve` and `command_block`, which the host answers and no packaged shell yet sends, so a
+command in one of those shells takes neither the integration's flags nor a command block.
 
 | Event | When | Fields |
 | --- | --- | --- |

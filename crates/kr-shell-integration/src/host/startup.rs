@@ -51,10 +51,12 @@ pub struct HomeLayout {
     pub zdotdir: Option<PathBuf>,
     /// The value of `XDG_CONFIG_HOME`, when the user has one.
     pub xdg_config_home: Option<PathBuf>,
-    /// The value of `USERPROFILE`, which is where Windows keeps a user's own directories.
-    pub user_profile: Option<PathBuf>,
-    /// The value of `OneDrive`, when a Windows installation has redirected the user's documents.
-    pub onedrive: Option<PathBuf>,
+    /// The PowerShell this host would launch, when one is installed.
+    ///
+    /// Asked where its own profile is, rather than having a path derived for it: PowerShell keeps
+    /// that file where the platform puts the user's documents, and on Windows a redirection can
+    /// move it anywhere.
+    pub powershell: Option<PathBuf>,
 }
 
 impl HomeLayout {
@@ -67,8 +69,7 @@ impl HomeLayout {
                 .unwrap_or_default(),
             zdotdir: std::env::var_os("ZDOTDIR").map(PathBuf::from),
             xdg_config_home: std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
-            user_profile: std::env::var_os("USERPROFILE").map(PathBuf::from),
-            onedrive: std::env::var_os("OneDrive").map(PathBuf::from),
+            powershell: powershell_on_path(),
         }
     }
 
@@ -115,11 +116,21 @@ impl HomeLayout {
                     .join("fish/conf.d/kalareach.fish"),
                 reason: "a guarded conf.d entry; it loads before config.fish and defers its own activation until after it",
             }],
-            ShellKind::PowerShell => vec![StartupTarget {
-                kind,
-                path: self.powershell_profile(),
-                reason: "the user's own profile, which this entry adds to rather than replaces",
-            }],
+            // PowerShell is the one shell whose profile path this host does not derive: where it
+            // keeps a per-user profile depends on where the platform puts that user's documents,
+            // and on Windows that is a known folder a redirection can move. So the shell is asked,
+            // and a shell that cannot be asked gets no target rather than an entry written where
+            // it will never be read.
+            ShellKind::PowerShell => self
+                .powershell_profile()
+                .map(|path| StartupTarget {
+                    kind,
+                    path,
+                    reason: "the profile this shell itself names, which this entry adds to rather \
+                             than replaces",
+                })
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -130,33 +141,28 @@ impl HomeLayout {
     /// directory, following the `USERPROFILE` and `OneDrive` redirection a modern installation
     /// does, and everything else uses `.config/powershell` under the home directory. Writing the
     /// Unix path on Windows would add an entry to a file PowerShell never reads.
-    fn powershell_profile(&self) -> PathBuf {
-        const PROFILE: &str = "Microsoft.PowerShell_profile.ps1";
-
-        if cfg!(windows) {
-            // `Documents` is redirected when OneDrive's known-folder move is on, and the directory
-            // that exists is what says whether it was: OneDrive can be installed without the move,
-            // and a profile written where PowerShell does not read it is an entry that never runs.
-            // Without either, the profile directory is under the user's own profile, which
-            // `USERPROFILE` names and `HOME` usually does not.
-            let redirected = self
-                .onedrive
-                .as_ref()
-                .map(|onedrive| onedrive.join("Documents"))
-                .filter(|documents| documents.is_dir());
-            let documents = redirected.unwrap_or_else(|| {
-                self.user_profile
-                    .clone()
-                    .unwrap_or_else(|| self.home.clone())
-                    .join("Documents")
-            });
-            return documents.join("PowerShell").join(PROFILE);
+    fn powershell_profile(&self) -> Option<PathBuf> {
+        let shell = self.powershell.as_ref()?;
+        // The shell's own answer, read from a shell started with no profile of its own so that
+        // nothing a user wrote decides where their profile is. `CurrentUserCurrentHost` is the one
+        // `kr shell install` adds to: the per-user file this host's PowerShell reads.
+        let printed = std::process::Command::new(shell)
+            .args([
+                "-NoProfile",
+                "-NonInteractive",
+                "-NoLogo",
+                "-Command",
+                "$PROFILE.CurrentUserCurrentHost",
+            ])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .ok()?;
+        if !printed.status.success() {
+            return None;
         }
-        self.xdg_config_home
-            .clone()
-            .unwrap_or_else(|| self.home.join(".config"))
-            .join("powershell")
-            .join(PROFILE)
+        let said = String::from_utf8_lossy(&printed.stdout);
+        let said = said.trim();
+        (!said.is_empty()).then(|| PathBuf::from(said))
     }
 
     /// Returns the first login file this user has, when it does not already source `.bashrc`.
@@ -183,6 +189,24 @@ impl HomeLayout {
     }
 }
 
+/// Returns the PowerShell this host would launch, when one is on the path.
+///
+/// The name differs by platform: `pwsh` is PowerShell 6 and later everywhere, and Windows also
+/// ships `powershell.exe`, the edition that came with it.
+fn powershell_on_path() -> Option<PathBuf> {
+    let names: &[&str] = if cfg!(windows) {
+        &["pwsh.exe", "powershell.exe"]
+    } else {
+        &["pwsh"]
+    };
+    let path = std::env::var_os("PATH")?;
+    names.iter().find_map(|name| {
+        std::env::split_paths(&path)
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
 /// Returns whether one line of a login file sources `.bashrc`.
 ///
 /// The shape is a `source` or `.` command whose next word is a path ending in `.bashrc`, wherever
@@ -191,69 +215,111 @@ impl HomeLayout {
 /// reads, is not a line that runs it, and treating it as one would leave a login shell with no
 /// entry.
 fn sources_bashrc(line: &str) -> bool {
-    let line = line.trim();
-    if line.starts_with('#') {
-        return false;
+    /// One word of a line, and what the scanner knows about it.
+    struct Word {
+        text: String,
+        /// Whether any of it was inside quotes, which makes it an argument rather than a verb.
+        quoted: bool,
+        /// Whether it stands where a command name stands.
+        command_position: bool,
     }
-    // The words of the line, with quoting tracked and a comment ending it. What is inside quotes
-    // is an argument or a message rather than a command, so `echo "please source ~/.bashrc"` is
-    // not a line that sources anything; a `#` that begins a word ends the command.
-    let mut words: Vec<(String, bool)> = Vec::new();
-    let mut word = String::new();
+
+    let line = line.trim();
+    let mut words: Vec<Word> = Vec::new();
+    let mut text = String::new();
     let mut quoted = false;
     let mut quote = '\0';
-    let mut started_quoted = false;
-    let mut began = true;
+    let mut escaped = false;
+    let mut any_quoted = false;
+    let mut started = false;
+    // A line begins at a command, and so does whatever follows a separator or one of the keywords
+    // that introduce one. Everything else is an argument.
+    let mut command_position = true;
+    let mut next_command_position = true;
+    let mut finish = |text: &mut String, any_quoted: &mut bool, started: &mut bool, at: bool| {
+        if !*started {
+            return;
+        }
+        words.push(Word {
+            text: std::mem::take(text),
+            quoted: *any_quoted,
+            command_position: at,
+        });
+        *any_quoted = false;
+        *started = false;
+    };
     for character in line.chars() {
+        if escaped {
+            text.push(character);
+            started = true;
+            escaped = false;
+            continue;
+        }
         if quoted {
-            if character == quote {
+            // A backslash inside double quotes escapes; inside single quotes nothing does.
+            if character == '\\' && quote == '"' {
+                escaped = true;
+            } else if character == quote {
                 quoted = false;
             } else {
-                word.push(character);
+                text.push(character);
             }
             continue;
         }
         match character {
+            '\\' => {
+                escaped = true;
+                started = true;
+            }
             '\'' | '"' => {
-                if word.is_empty() {
-                    started_quoted = true;
-                }
                 quoted = true;
                 quote = character;
+                any_quoted = true;
+                started = true;
             }
-            '#' if began => break,
+            // A comment begins at a `#` that begins a word, and ends the command.
+            '#' if !started => break,
+            ';' | '&' | '|' => {
+                finish(&mut text, &mut any_quoted, &mut started, command_position);
+                command_position = true;
+                next_command_position = true;
+            }
             character if character.is_whitespace() => {
-                if !word.is_empty() || started_quoted {
-                    words.push((std::mem::take(&mut word), started_quoted));
-                    started_quoted = false;
-                }
-                began = true;
+                finish(&mut text, &mut any_quoted, &mut started, command_position);
+                command_position = next_command_position;
             }
             character => {
-                word.push(character);
-                began = false;
+                text.push(character);
+                started = true;
+                next_command_position = false;
             }
         }
     }
-    if !word.is_empty() || started_quoted {
-        words.push((word, started_quoted));
+    finish(&mut text, &mut any_quoted, &mut started, command_position);
+    // A word that stands where a command stands and introduces one leaves the next word standing
+    // there too: `if [ -f ~/.bashrc ]; then . ~/.bashrc; fi` sources it.
+    let mut at_command = true;
+    let mut verbs: Vec<usize> = Vec::new();
+    for (index, word) in words.iter().enumerate() {
+        let introduces = matches!(
+            word.text.as_str(),
+            "if" | "then" | "else" | "elif" | "do" | "while" | "until" | "{" | "!"
+        );
+        if (at_command || word.command_position) && !word.quoted && !introduces {
+            verbs.push(index);
+        }
+        at_command = introduces;
     }
-    // A `source` or `.` whose next word is a path ending in `.bashrc`. The verb has to be a bare
-    // word: a quoted one is text, and so is a quoted path.
-    words.windows(2).any(|pair| {
-        let (verb, verb_quoted) = &pair[0];
-        if *verb_quoted {
+    verbs.iter().any(|index| {
+        let verb = &words[*index];
+        if verb.text != "source" && verb.text != "." {
             return false;
         }
-        let verb = verb.trim_start_matches([';', '&', '|']);
-        if verb != "source" && verb != "." {
-            return false;
-        }
-        let (argument, _) = &pair[1];
-        let argument = argument.trim_end_matches(';');
-        std::path::Path::new(argument)
-            .file_name()
-            .is_some_and(|name| name == ".bashrc")
+        words.get(index + 1).is_some_and(|argument| {
+            std::path::Path::new(&argument.text)
+                .file_name()
+                .is_some_and(|name| name == ".bashrc")
+        })
     })
 }
 
@@ -401,19 +467,18 @@ const LOCK_PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);
 /// The lock file sits beside the startup file, so the two processes need no agreement beyond the
 /// directory they are both writing in.
 ///
-/// On Unix the lock is the kernel's, taken on the open file with `flock`, so a holder that dies
-/// releases it and no staleness rule is needed. Elsewhere it is the exclusive creation of the file
-/// itself, and a lock file a crash left behind is reclaimed after [`LOCK_STALE_AFTER`].
+/// The lock is the operating system's on both platforms, so a holder that dies releases it and no
+/// staleness rule is needed: on Unix it is `flock` on the open file, and on Windows it is the file
+/// opened with no sharing at all, which refuses every other opener while the handle is held.
 ///
 /// It says nothing about an editor. A person who saves the file between the check and the rename
 /// still has that save replaced, and closing that would need the platform to offer a comparison
 /// and a rename in one step.
 #[derive(Debug)]
 struct FileLock {
-    /// The lock file, while this guard holds it.
+    /// The lock file this guard is about.
     path: PathBuf,
-    /// The open file the kernel's lock is on, released when this guard drops it.
-    #[cfg(unix)]
+    /// The open file the operating system's lock is on, released when this guard drops it.
     held: Option<std::fs::File>,
 }
 
@@ -476,33 +541,43 @@ impl FileLock {
 
     /// Takes the lock for one startup file, waiting for a holder that is still working.
     ///
+    /// The lock is the operating system's, not an age rule: the file is opened with no sharing at
+    /// all, so a second opener is refused while the first holds its handle and the handle closes
+    /// with the process that held it. A writer that died leaves a file nobody is holding, and the
+    /// next writer opens it.
+    ///
     /// # Errors
     ///
     /// Returns the underlying failure, or a timeout when another writer held it throughout.
     #[cfg(not(unix))]
     fn take(path: &Path) -> std::io::Result<Self> {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
         let lock = Self::beside(path)?;
         let deadline = std::time::Instant::now() + LOCK_PATIENCE;
         loop {
             match std::fs::OpenOptions::new()
                 .write(true)
-                .create_new(true)
+                .create(true)
+                .truncate(false)
+                // No sharing: while this handle is open, nothing else may open the file at all.
+                .share_mode(0)
                 .open(&lock)
             {
-                Ok(mut file) => {
-                    use std::io::Write as _;
-
-                    // What is in it is for a person reading a directory, not for this code: the
-                    // exclusive creation is the lock.
-                    let _ = writeln!(file, "kr {}", std::process::id());
-                    return Ok(Self { path: lock });
+                Ok(file) => {
+                    return Ok(Self {
+                        path: lock,
+                        held: Some(file),
+                    });
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                // Somebody is holding it. The platform reports a sharing violation as a denial.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::AlreadyExists
+                    ) => {}
                 Err(error) => return Err(error),
             }
-            // The deadline is checked on every path out of the attempt, including the one that
-            // reclaims a lock file nobody is holding: a removal that keeps failing must not loop
-            // for ever.
             if std::time::Instant::now() >= deadline {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
@@ -512,45 +587,20 @@ impl FileLock {
                     ),
                 ));
             }
-            if lock
-                .metadata()
-                .and_then(|data| data.modified())
-                .is_ok_and(|written| written.elapsed().is_ok_and(|age| age > LOCK_STALE_AFTER))
-            {
-                // Nobody is holding it. Removing it races another writer doing the same, and the
-                // loser simply takes the lock the winner released.
-                let _ = std::fs::remove_file(&lock);
-            }
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
     }
 }
 
-/// How old a lock file has to be before it is taken for one nobody is holding.
-///
-/// Only where the kernel will not hold the lock for us. A startup write is a read, a rebuild and a
-/// rename of a small file; one that has held the lock for this long is a process that died with
-/// the file still there, and leaving it would make every later write fail on a machine that had
-/// crashed once.
-#[cfg(not(unix))]
-const LOCK_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
-
 impl Drop for FileLock {
     fn drop(&mut self) {
-        #[cfg(unix)]
-        {
-            // The file stays. A waiter is holding the same inode open and waiting on the kernel's
-            // lock, and removing the name would let a third process create another file with it:
-            // two writers would then hold two different locks and write over each other. Closing
-            // the file is what releases the lock, and the empty file left beside the startup file
-            // costs nothing.
-            let _ = &self.path;
-            drop(self.held.take());
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = std::fs::remove_file(&self.path);
-        }
+        // The file stays. A waiter is holding the same name open and waiting on the operating
+        // system's own lock, and removing the name would let a third process create another file
+        // with it: two writers would then hold two different locks and write over each other.
+        // Closing the file is what releases the lock, and the empty file left beside the startup
+        // file costs nothing.
+        let _ = &self.path;
+        drop(self.held.take());
     }
 }
 
@@ -666,6 +716,10 @@ fn resolved(path: &Path) -> std::io::Result<std::path::PathBuf> {
 /// a different one for the same file. There, an identity check would refuse a write it should have
 /// made, so this reads the file twice and reports an identity only when the two readings agree.
 ///
+/// Two agreeing readings are a heuristic, not a proof: a filesystem whose numbers move can answer
+/// alike twice, and the refusal that follows is one the contents check would not have made. What
+/// they do establish is enough to keep the check off the filesystems that would fail it steadily.
+///
 /// Two readings that disagree because the file really was replaced in between are covered by the
 /// contents check, which runs whether or not there is an identity.
 fn stable_identity(path: &Path) -> Option<(u64, u64)> {
@@ -726,8 +780,7 @@ mod tests {
             home: root.to_path_buf(),
             zdotdir: None,
             xdg_config_home: None,
-            user_profile: None,
-            onedrive: None,
+            powershell: None,
         }
     }
 
@@ -789,6 +842,9 @@ mod tests {
             "PS1='> ' ## . ~/.bashrc\n",
             "echo \"please source ~/.bashrc\"\n",
             "echo 'run . ~/.bashrc yourself'\n",
+            "echo source ~/.bashrc\n",
+            "echo \"please \\\" source ~/.bashrc\"\n",
+            "printf '%s\\n' source ~/.bashrc\n",
         ] {
             std::fs::write(root.path().join(".bash_profile"), mentions).expect("writes");
             assert_eq!(
@@ -886,48 +942,45 @@ mod tests {
         );
     }
 
-    /// KR-REQ-07.29: PowerShell's profile is the one this platform's PowerShell reads.
+    /// KR-REQ-07.29: PowerShell's profile is the one that shell itself names.
     #[test]
-    fn the_powershell_profile_is_this_platforms_own() {
+    fn the_powershell_profile_is_the_one_that_shell_names() {
         let root = tempfile::tempdir().expect("a directory");
         let home = layout(root.path());
-        let path = &home.targets(ShellKind::PowerShell)[0].path;
-        assert_eq!(
-            path.file_name().expect("a file name"),
-            "Microsoft.PowerShell_profile.ps1"
+        assert!(
+            home.targets(ShellKind::PowerShell).is_empty(),
+            "a host with no PowerShell has no profile to add an entry to, and none is guessed"
         );
-        if cfg!(windows) {
-            assert!(
-                path.to_string_lossy().contains("Documents"),
-                "Windows keeps the profile under the user's documents: {}",
-                path.display()
-            );
-            // A redirected documents directory is where the profile actually is.
-            let redirected = HomeLayout {
-                onedrive: Some(root.path().join("OneDrive")),
-                ..home.clone()
-            };
-            assert_eq!(
-                redirected.targets(ShellKind::PowerShell)[0].path,
-                root.path()
-                    .join("OneDrive/Documents/PowerShell/Microsoft.PowerShell_profile.ps1")
-            );
-        } else {
-            assert_eq!(
-                *path,
-                root.path()
-                    .join(".config/powershell/Microsoft.PowerShell_profile.ps1")
-            );
-            let configured = HomeLayout {
-                xdg_config_home: Some(root.path().join("xdg")),
-                ..home.clone()
-            };
-            assert_eq!(
-                configured.targets(ShellKind::PowerShell)[0].path,
-                root.path()
-                    .join("xdg/powershell/Microsoft.PowerShell_profile.ps1")
-            );
-        }
+
+        // A shell that answers: the entry goes where it said, wherever that is.
+        let wanted = root.path().join("Documents/PowerShell/profile.ps1");
+        let asking = HomeLayout {
+            powershell: Some(fake_powershell(root.path(), &wanted.display().to_string())),
+            ..home.clone()
+        };
+        let targets = asking.targets(ShellKind::PowerShell);
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].path, wanted);
+
+        // A shell that answers nothing leaves this host with no profile rather than one it made up.
+        let silent = HomeLayout {
+            powershell: Some(fake_powershell(root.path(), "")),
+            ..home
+        };
+        assert!(silent.targets(ShellKind::PowerShell).is_empty());
+    }
+
+    /// Writes a program that prints one line, which is all this host asks PowerShell for.
+    #[cfg(unix)]
+    fn fake_powershell(root: &Path, says: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let path = root.join(format!("pwsh-{}", says.len()));
+        std::fs::write(&path, format!("#!/bin/sh\nprintf '%s\\n' '{says}'\n"))
+            .expect("writes a program");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("makes it runnable");
+        path
     }
 
     #[test]

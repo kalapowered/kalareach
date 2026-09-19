@@ -220,13 +220,32 @@ enum Printed {
 /// into a command line: the argument vector is a vector.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn run(program: &str, arguments: &[&str]) -> Printed {
-    let Ok(mut child) = std::process::Command::new(program)
+    // A reading whose capture never finished leaves two threads on a pipe some descendant is
+    // holding open. Every session on this host reads on its own cadence, so some are legitimately
+    // in flight at once; what must not happen is accumulation. This is the ceiling: above it the
+    // platform is not asked at all and the answer is `NotRun`, so a facility that has stopped
+    // answering costs a bounded number of threads rather than two more on every cadence.
+    static CAPTURING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    const OUTSTANDING_CAPTURES: usize = 8;
+
+    if CAPTURING.load(std::sync::atomic::Ordering::Acquire) >= OUTSTANDING_CAPTURES {
+        return Printed::NotRun;
+    }
+    let mut command = std::process::Command::new(program);
+    command
         .args(arguments)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    else {
+        .stderr(std::process::Stdio::piped());
+    // Its own process group, so a descendant that inherited a pipe is ended with the child rather
+    // than left holding the capture open.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+
+        command.process_group(0);
+    }
+    let Ok(mut child) = command.spawn() else {
         return Printed::NotRun;
     };
     // The reading has a deadline. A session facility that has stopped answering must not hold this
@@ -236,27 +255,30 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
     // by joins this wait would sit on: a command that prints more than one pipe holds blocks until
     // somebody reads it, and a descendant that inherited a pipe can hold it open after the child
     // this host started has gone. Neither may outlast the deadline.
-    let reading = |stream: Option<std::process::ChildStdout>| {
-        stream.map(|mut stream| {
-            let (said, heard) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                use std::io::Read as _;
-
-                let mut read = Vec::new();
-                let _ = stream.read_to_end(&mut read);
-                let _ = said.send(read);
-            });
-            heard
-        })
-    };
-    let out = reading(child.stdout.take());
-    let err = child.stderr.take().map(|mut stream| {
+    let out = child.stdout.take().map(|mut stream| {
         let (said, heard) = std::sync::mpsc::channel();
+        CAPTURING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         std::thread::spawn(move || {
             use std::io::Read as _;
 
             let mut read = Vec::new();
             let _ = stream.read_to_end(&mut read);
+            // Counted down before the answer is handed over, so a caller that has its answer sees
+            // no capture outstanding and the next reading is not refused by this one's tail.
+            CAPTURING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+            let _ = said.send(read);
+        });
+        heard
+    });
+    let err = child.stderr.take().map(|mut stream| {
+        let (said, heard) = std::sync::mpsc::channel();
+        CAPTURING.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+
+            let mut read = Vec::new();
+            let _ = stream.read_to_end(&mut read);
+            CAPTURING.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
             let _ = said.send(read);
         });
         heard
@@ -280,8 +302,16 @@ fn run(program: &str, arguments: &[&str]) -> Printed {
         std::thread::sleep(std::time::Duration::from_millis(10));
     };
     if !ended {
-        // Terminated and reaped: a child left running would outlive every probe after it, and one
-        // left unreaped would outlive the process.
+        // Terminated and reaped, the whole group where the platform has them: a child left running
+        // would outlive every probe after it, one left unreaped would outlive the process, and a
+        // descendant left holding a pipe would hold this reading's capture open.
+        #[cfg(unix)]
+        {
+            let group = rustix::process::Pid::from_raw(-(child.id() as i32));
+            if let Some(group) = group {
+                let _ = rustix::process::kill_process(group, rustix::process::Signal::KILL);
+            }
+        }
         let _ = child.kill();
         let _ = child.wait();
     }

@@ -154,6 +154,9 @@ async fn run(cli: Cli) -> Result<Completion> {
                 Presentation::Terminal | Presentation::Invisible => None,
             };
             let launch_profile = arguments.launch_profile()?;
+            // What the request asked for, kept for the report below: the profile itself travels
+            // into the create.
+            let fenced_launch = launch_profile.fenced_launch;
             let params = SessionCreateParams {
                 environment_id: environment.environment_id,
                 presentation,
@@ -227,11 +230,23 @@ async fn run(cli: Cli) -> Result<Completion> {
                 println!("{}", report::desktop_line(&created.session));
                 match created.session.shell_mode {
                     ShellMode::Managed => println!(
-                        "shell mode managed: Ctrl-D at an empty root prompt detaches this client, and a launch installs a command in {}'s own editor",
-                        created.session.shell_path
+                        "shell mode managed: Ctrl-D at an empty root prompt detaches this client, \
+                         and {}",
+                        if fenced_launch {
+                            format!(
+                                "a launch installs a command in {}'s own editor",
+                                created.session.shell_path
+                            )
+                        } else {
+                            "this session's launch profile admits no fenced launch, so a launch \
+                             installs no command"
+                                .to_owned()
+                        }
                     ),
                     ShellMode::NativeCompat => println!(
-                        "shell mode native_compat: Ctrl-D at the prompt follows {}'s own behaviour and can close the session, a launch installs no command, and kr detach always works",
+                        "shell mode native_compat: Ctrl-D at the prompt follows {}'s own behaviour \
+                         and can close the session, a launch installs no command, and kr detach \
+                         takes --attachment because this session records no originating attachment",
                         created.session.shell_path
                     ),
                 }

@@ -265,10 +265,12 @@ platform this runs on, and an editor that saves inside that interval has its sav
 these commands in one process are serialised against each other, and two `kr` processes are
 serialised by a lock beside the startup file, held for the whole read, rebuild and write.
 
-The identity half of the check is used only where the filesystem's own numbers hold still. A
-filesystem that gives a different number for the same unchanged file is read twice and, when the
-two readings disagree, decided by the contents alone: refusing a write there would refuse one that
-should have been made.
+The identity half of the check is used only where the filesystem's own numbers appear to hold
+still, and that is a heuristic rather than a property established: the file is read twice, and two
+readings that disagree fall back to the contents alone, because refusing a write on a filesystem
+that synthesises inode numbers would refuse one that should have been made. Two readings that agree
+do not prove the numbers are stable, so a filesystem that happens to answer alike twice can still
+produce a refusal the contents check would not have made.
 
 ## The command hooks
 

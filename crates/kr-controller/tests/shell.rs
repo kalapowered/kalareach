@@ -444,8 +444,7 @@ fn setup_adds_one_marked_entry_per_shell_and_removal_deletes_only_that() {
         home: home.path().to_path_buf(),
         zdotdir: Some(zdotdir.clone()),
         xdg_config_home: None,
-        user_profile: None,
-        onedrive: None,
+        powershell: None,
     };
 
     for package in set.packages() {

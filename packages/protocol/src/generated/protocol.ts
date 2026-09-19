@@ -13932,13 +13932,17 @@ export interface SessionReadResult {
    * The most recent command block the session's private hooks reported.
    *
    * Section 25's typed event: the command, its exit status, how long it ran and where. Null
-   * when no hook has reported one, which is every session without a managed root integration.
+   * where the host does not say, which is not the same as no command having run: no hook has
+   * reported one, which is every session without a managed root integration; the caller's grant
+   * does not reach it; or the worker is from a build that did not report blocks.
    */
   last_command_block: RootCommandBlockParams | null
   /**
    * How this session starts its root shell and what may be launched inside it.
    *
-   * Null for a session that has already closed, whose profile decides nothing any more.
+   * Null where the host does not say, which is not the same as a session without a profile: a
+   * session that has already closed, whose profile decides nothing any more, and a live session
+   * whose worker is from a build that did not report one.
    */
   launch_profile: LaunchProfile1 | null
   /**
