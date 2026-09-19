@@ -2404,17 +2404,7 @@ impl WorkerService {
         // freshness window and the subject preconditions decide whether a *new* action is
         // admitted, and applying them here would refuse a caller its own completed result because
         // its own effect moved the subject on.
-        // What section 7 and section 11 keep available when the store has failed, and what they
-        // do not. `session.close` is the authorised stop; `input.interrupt` is the interruption
-        // the live input lease keeps, which is the one way a person has of stopping a running
-        // command on a host whose journal has stopped answering. Everything else is rich work and
-        // is refused before dispatch. Neither exception authorises a hidden rich retry: what they
-        // lose is the receipt, which is what `durability=volatile` says for the close.
-        let work = match method {
-            Method::SessionClose => crate::persistence::fault::WorkClass::AuthorisedStop,
-            Method::InputInterrupt => crate::persistence::fault::WorkClass::NativeTerminal,
-            _ => crate::persistence::fault::WorkClass::RichMutation,
-        };
+        let work = work_class(method);
         let volatile_permitted = work.survives_a_journal_fault();
         match self.retained(&actor_id, mutation, digest) {
             Ok(Some(retained)) => return Ok(Answered::Retained(retained)),
@@ -2987,14 +2977,27 @@ impl WorkerService {
         let Some(journal) = session.journal_mut() else {
             return Ok(());
         };
-        let uncertain =
-            journal
-                .uncertain_for_subject(actor_id, subject)?
-                .map(|(action_id, revision)| crate::action::dedup::Uncertain {
-                    action_id,
-                    revision,
-                });
-        let outstanding = journal.outstanding(actor_id)?;
+        // These two reads are what stops a *new* rich action being admitted twice or past its
+        // limit. An authorised stop and a native interrupt are neither, and a store that cannot
+        // answer them is not a reason to take away the one way a person has of stopping a running
+        // command. The failure is published as the fault it is, and the checks it feeds are
+        // skipped rather than guessed at.
+        let volatile_permitted = work_class(method).survives_a_journal_fault();
+        let read = journal
+            .uncertain_for_subject(actor_id, subject)
+            .and_then(|uncertain| journal.outstanding(actor_id).map(|held| (uncertain, held)));
+        let (uncertain, outstanding) = match read {
+            Ok(pair) => pair,
+            Err(error) if volatile_permitted && is_storage_failure(&error) => {
+                session.note_journal_failure(error.to_string());
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
+        let uncertain = uncertain.map(|(action_id, revision)| crate::action::dedup::Uncertain {
+            action_id,
+            revision,
+        });
         drop(session);
         crate::action::dedup::check_supersession(uncertain, declared)?;
         if !crate::action::dedup::bounded_by_outstanding(method) {
@@ -4768,6 +4771,25 @@ async fn send_screen(
 /// worker's own clock is read **first** and the machine's clock second, so a pause between the two
 /// readings shortens the answer rather than lengthening it. The result is bounded by the protocol
 /// maximum, so a daemon cannot hand a worker a longer life than the protocol allows, and `None`
+/// Returns what a method is, for the purposes of a store that has failed.
+///
+/// What section 7 and section 11 keep available when the store has failed, and what they do not.
+/// `session.close` is the authorised stop; `input.interrupt` is the interruption the live input
+/// lease keeps, which is the one way a person has of stopping a running command on a host whose
+/// journal has stopped answering. Everything else is rich work and is refused before dispatch.
+/// Neither exception authorises a hidden rich retry: what they lose is the receipt, which is what
+/// `durability=volatile` says for the close.
+///
+/// One answer serves every gate on the way in, so a method the posture admits is not then refused
+/// by a read the same broken store could not answer.
+const fn work_class(method: Method) -> crate::persistence::fault::WorkClass {
+    match method {
+        Method::SessionClose => crate::persistence::fault::WorkClass::AuthorisedStop,
+        Method::InputInterrupt => crate::persistence::fault::WorkClass::NativeTerminal,
+        _ => crate::persistence::fault::WorkClass::RichMutation,
+    }
+}
+
 /// means the deadline has already passed.
 fn vouched_deadline(
     clock: &dyn ContinuousClock,
