@@ -752,8 +752,14 @@ mod handle {
     /// The child is created **suspended**. Section 7 requires an owned child to join the session's
     /// job object *before* execution, and a process that had already run could have started
     /// children of its own outside the job in the moment before it was assigned. So: create
-    /// suspended, assign, resume. A failure at either of the last two steps ends the process
-    /// rather than leaving one running that this host cannot account for.
+    /// suspended, assign, confirm, resume. A failure at any of the last three ends the process
+    /// rather than leaving one running that this host cannot account for, and a failure to end it
+    /// is reported rather than swallowed.
+    ///
+    /// What this does not close is a worker that dies between the create and the assign: the
+    /// suspended child is then nobody's. Only an assignment the operating system performs as part
+    /// of the create - `PROC_THREAD_ATTRIBUTE_JOB_LIST`, which this does not use - closes that
+    /// window.
     pub(super) fn spawn(
         console: &PseudoConsole,
         job: &super::super::job::SessionJob,
@@ -853,7 +859,10 @@ mod handle {
         // joined before execution, and a failure here is a failure to start: a process outside the
         // boundary is one this host could never honestly close.
         if let Err(failure) = job.hold(&process) {
-            terminate_unstarted(&process)?;
+            terminate_unstarted(
+                &process,
+                &format!("it could not be put into the job: {failure}"),
+            )?;
             return Err(failure);
         }
         // And the kernel is asked whether it really holds it, rather than the call being taken at
@@ -862,13 +871,16 @@ mod handle {
         match job.holds(&process) {
             Ok(true) => {}
             Ok(false) => {
-                terminate_unstarted(&process)?;
+                terminate_unstarted(&process, "the job object does not hold it")?;
                 return Err(std::io::Error::other(
                     "the session's job object does not hold the shell it was given",
                 ));
             }
             Err(failure) => {
-                terminate_unstarted(&process)?;
+                terminate_unstarted(
+                    &process,
+                    &format!("the job object would not say whether it holds it: {failure}"),
+                )?;
                 return Err(failure);
             }
         }
@@ -877,7 +889,7 @@ mod handle {
         let resumed = unsafe { ResumeThread(thread.as_raw_handle().cast()) };
         if resumed == u32::MAX {
             let failure = std::io::Error::last_os_error();
-            terminate_unstarted(&process)?;
+            terminate_unstarted(&process, &format!("its thread would not resume: {failure}"))?;
             return Err(failure);
         }
         drop(thread);
@@ -891,11 +903,14 @@ mod handle {
     ///
     /// A suspended process nothing can reach is worse than a launch failure: it holds the console
     /// and the job open and nothing will ever wait for it. So a refusal here is reported rather
-    /// than swallowed, and it replaces the failure that led to it, because it is the worse one.
-    fn terminate_unstarted(process: &OwnedHandle) -> std::io::Result<()> {
+    /// than swallowed, and it carries both causes: the one that stopped the launch and the one
+    /// that stopped the cleanup, because a reader needs the first to know what went wrong and the
+    /// second to know what is still running.
+    fn terminate_unstarted(process: &OwnedHandle, because: &str) -> std::io::Result<()> {
         end(process).map_err(|failure| {
             std::io::Error::other(format!(
-                "a shell that was created and never started could not be ended: {failure}"
+                "a shell was created and never started, because {because}, and then could not be \
+                 ended either: {failure}"
             ))
         })
     }

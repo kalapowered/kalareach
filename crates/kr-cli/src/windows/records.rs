@@ -178,47 +178,61 @@ impl RecordReader {
         Ok(events)
     }
 
-    /// Reads the console and returns the bytes to send, in the encoding this reader carries.
+    /// Reads the console and returns what to send, in the order it happened.
+    ///
+    /// A run of keys becomes one piece of input, in the encoding this reader carries. Anything
+    /// else keeps its own place between those runs, because a caller that could not tell whether
+    /// a click came before or after a keystroke could not dispatch either of them honestly.
     ///
     /// # Errors
     ///
     /// Returns an error when the console will not answer.
-    pub fn read_encoded(&mut self) -> Result<(Vec<u8>, Vec<ConsoleEvent>)> {
-        let events = self.read()?;
-        let keys: Vec<KeyRecord> = events
-            .iter()
-            .filter_map(|event| match event {
-                ConsoleEvent::Key(record) => Some(*record),
-                _ => None,
-            })
-            .collect();
+    pub fn read_encoded(&mut self) -> Result<Vec<EncodedEvent>> {
+        let mut out = Vec::new();
+        let mut keys: Vec<KeyRecord> = Vec::new();
+        for event in self.read()? {
+            match event {
+                ConsoleEvent::Key(record) => keys.push(record),
+                other => {
+                    self.flush_keys(&mut keys, &mut out);
+                    out.push(EncodedEvent::Console(other));
+                }
+            }
+        }
+        self.flush_keys(&mut keys, &mut out);
+        Ok(out)
+    }
+
+    /// Encodes the keys gathered so far and puts them in the stream.
+    fn flush_keys(&mut self, keys: &mut Vec<KeyRecord>, out: &mut Vec<EncodedEvent>) {
+        if keys.is_empty() {
+            return;
+        }
         let bytes = match self.fidelity {
-            Fidelity::Records => encode_all(&keys),
+            Fidelity::Records => encode_all(keys),
             // A session whose backend never asked for records is sent what a terminal doing the
             // translation would have sent. No scan code is claimed, because none is sent.
-            Fidelity::LegacyVt => self.legacy_input(&keys),
+            Fidelity::LegacyVt => self.legacy_input(keys),
         };
-        // Everything that was not a key, in the order it arrived, for its own dispatch.
-        let rest = events
-            .into_iter()
-            .filter(|event| !matches!(event, ConsoleEvent::Key(_)))
-            .collect();
-        Ok((bytes, rest))
+        keys.clear();
+        if !bytes.is_empty() {
+            out.push(EncodedEvent::Input(bytes));
+        }
     }
 
     /// Turns key records into what a legacy VT client would have sent.
     ///
-    /// Two kinds of key, and both go through the one encoder every client in this workspace uses,
-    /// so a Windows console and a Unix terminal spell a key the same way:
-    ///
-    /// * a key that produced a character is that character, repeated as many times as the record
-    ///   says it repeated;
-    /// * a key that produced none but is one the encoder names - an arrow, a function key, Home,
-    ///   Delete and the rest - is its sequence, with the modifiers the console reported.
+    /// Everything goes through [`kr_client::encoder::key`], the one encoder every client in this
+    /// workspace uses, so a Windows console and a Unix terminal spell a key the same way. Only
+    /// plain text - a character with no modifier the encoder would change it for - is written
+    /// straight out, because that is what the encoder produces for it anyway and because a
+    /// character outside the basic plane is two records that `char` cannot hold one of.
     ///
     /// A key coming up produces nothing: legacy input has no way to say so, and the encoder
-    /// refuses to invent one. A dead key and a modifier on its own produce nothing either, because
-    /// neither is a key an application receives.
+    /// refuses to invent one. A key the encoder cannot spell produces nothing rather than
+    /// something else.
+    ///
+    /// A repeat count is applied to whatever the key produced, character or sequence.
     ///
     /// A character outside the basic plane is two records, and one read of the console can end
     /// between them, so a trailing high surrogate is held here until the read that completes it.
@@ -229,18 +243,9 @@ impl RecordReader {
             if !key.key_down {
                 continue;
             }
-            if key.unicode == 0 {
-                // A special key interrupts the text around it, so what is pending is written
-                // before its sequence rather than after.
-                flush_text(&mut units, &mut out);
-                if let Some(bytes) = special_key(key) {
-                    out.extend_from_slice(&bytes);
-                }
-                continue;
-            }
-            // A repeat applies to the whole character, so a surrogate pair is put together first
-            // and repeated afterwards: high, high, low, low would be two replacements around one
-            // character.
+            // Half of a character outside the basic plane. Both halves are gathered and the pair
+            // is repeated as one character: high, high, low, low would be two replacements around
+            // one character.
             if key.is_high_surrogate() {
                 units.push(key.unicode);
                 continue;
@@ -262,8 +267,21 @@ impl RecordReader {
                 }
                 continue;
             }
-            for _ in 0..key.repeat.max(1) {
-                units.push(key.unicode);
+            // Plain text: no modifier the encoder would spell differently, and a character that
+            // is not a control code. Anything else is a key rather than text.
+            if let Some(character) = plain_text(key) {
+                for _ in 0..key.repeat.max(1) {
+                    units.push(character);
+                }
+                continue;
+            }
+            // A key interrupts the text around it, so what is pending is written before its
+            // sequence rather than after.
+            flush_text(&mut units, &mut out);
+            if let Some(bytes) = encoded_key(key) {
+                for _ in 0..key.repeat.max(1) {
+                    out.extend_from_slice(&bytes);
+                }
             }
         }
         // A high surrogate at the very end is the first half of a character whose second half is
@@ -277,6 +295,16 @@ impl RecordReader {
         flush_text(&mut units, &mut out);
         out
     }
+}
+
+/// One thing to dispatch, in the order the console reported it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EncodedEvent {
+    /// Input to write into the session, already in the encoding the session asked for.
+    Input(Vec<u8>),
+    /// A record that is its own operation: a resize, a mouse event, or one this command does not
+    /// act on.
+    Console(ConsoleEvent),
 }
 
 /// One record the console reported.
@@ -348,12 +376,34 @@ fn flush_text(units: &mut Vec<u16>, out: &mut Vec<u8>) {
     units.clear();
 }
 
-/// Returns the legacy sequence for a key that produced no character, or `None` for one that is not
-/// a key an application receives.
+/// Returns the character a record produced when nothing about it needs the encoder.
+///
+/// A printable character with no Control and no Alt held. Shift is not one of them: the layout has
+/// already applied it, and `A` is the character rather than a modified `a`. AltGr is not one
+/// either - it is how a layout produces a character, and reading its Ctrl and Alt bits as
+/// modifiers would turn the character into a different key.
+fn plain_text(record: &KeyRecord) -> Option<u16> {
+    if record.unicode == 0 || record.unicode < 0x20 || record.unicode == 0x7F {
+        return None;
+    }
+    if record.is_alt_graph() {
+        return Some(record.unicode);
+    }
+    let held = control_keys::LEFT_CTRL_PRESSED
+        | control_keys::RIGHT_CTRL_PRESSED
+        | control_keys::LEFT_ALT_PRESSED
+        | control_keys::RIGHT_ALT_PRESSED;
+    (record.control_keys & held == 0).then_some(record.unicode)
+}
+
+/// Returns the legacy sequence for one key, or `None` for a record that is not a key an
+/// application receives and for one this encoding cannot spell.
 ///
 /// The spelling is [`kr_client::encoder::key`], the one encoder every client in this workspace
-/// uses, so nothing here invents a second one.
-fn special_key(record: &KeyRecord) -> Option<Vec<u8>> {
+/// uses, so nothing here invents a second one. A key the encoder refuses - a release, a key it has
+/// no name for, a function key beyond the twelve the legacy encoding spells - produces nothing
+/// rather than something that would mean a different key.
+fn encoded_key(record: &KeyRecord) -> Option<Vec<u8>> {
     use kr_client::encoder::{Arrow, Key, KeyEvent, KeyboardEncoding, Modifiers, key};
 
     let named = match record.virtual_key {
@@ -371,20 +421,24 @@ fn special_key(record: &KeyRecord) -> Option<Vec<u8>> {
         0x28 => Key::Arrow(Arrow::Down),
         0x2D => Key::Insert,
         0x2E => Key::Delete,
-        // F1 to F24 are consecutive from 0x70.
-        code @ 0x70..=0x87 => Key::Function(u8::try_from(code - 0x6F).ok()?),
-        // A modifier on its own, a dead key, a lock key: nothing an application receives.
-        _ => return None,
+        // F1 to F12 are consecutive from 0x70. F13 upwards have no spelling in this encoding, and
+        // an invented one would be a key nobody pressed.
+        code @ 0x70..=0x7B => Key::Function(u8::try_from(code - 0x6F).ok()?),
+        // Not a named key. A character with a modifier the layout did not apply is still a key an
+        // application receives, and the encoder is what spells it.
+        _ => Key::Char(char::from_u32(u32::from(record.unicode)).filter(|_| record.unicode != 0)?),
     };
+    // AltGr is how a layout produces a character, so its Ctrl and Alt bits are not modifiers.
+    // That is true only of a record that produced one: a record with no character had no layout
+    // involved, and its modifiers are what they say.
+    let layout_produced = record.unicode != 0 && record.is_alt_graph();
     let modifiers = Modifiers {
         shift: record.control_keys & control_keys::SHIFT_PRESSED != 0,
-        // AltGr is not Ctrl and Alt held together: it is how a layout produces a character, and
-        // reporting it as two modifiers would turn a key into a different one.
-        control: !record.is_alt_graph()
+        control: !layout_produced
             && record.control_keys
                 & (control_keys::LEFT_CTRL_PRESSED | control_keys::RIGHT_CTRL_PRESSED)
                 != 0,
-        alt: !record.is_alt_graph()
+        alt: !layout_produced
             && record.control_keys
                 & (control_keys::LEFT_ALT_PRESSED | control_keys::RIGHT_ALT_PRESSED)
                 != 0,
@@ -392,7 +446,8 @@ fn special_key(record: &KeyRecord) -> Option<Vec<u8>> {
     };
     // The ordinary encoding, with the arrows in their cursor form. Whether the session's backend
     // put the terminal into application-cursor mode is the session's state rather than the
-    // console's, and a console reader has no way to know it.
+    // console's, and a console reader has no way to know it; a client that needs the other form
+    // is one the session tells, which is the transport this path does not yet have.
     key(
         KeyEvent::with(named, modifiers),
         KeyboardEncoding::Legacy {
@@ -491,6 +546,76 @@ mod tests {
             "\u{1F600}".as_bytes(),
             "the pair names the character it came from"
         );
+    }
+
+    #[test]
+    fn a_held_special_key_is_sent_as_many_times_as_it_repeated() {
+        let mut reader = encoder();
+        let up = KeyRecord {
+            virtual_key: 0x26,
+            scan_code: 0x48,
+            unicode: 0,
+            key_down: true,
+            control_keys: 0,
+            repeat: 3,
+        };
+        assert_eq!(reader.legacy_input(&[up]), b"\x1b[A\x1b[A\x1b[A");
+    }
+
+    #[test]
+    fn a_modifier_the_layout_did_not_apply_is_a_key_rather_than_its_character() {
+        let mut reader = encoder();
+        // Shift and Tab: the console reports the tab character, and a client that wrote it out
+        // would send a plain tab, which is a different key to every application that reads one.
+        let shift_tab = KeyRecord {
+            virtual_key: 0x09,
+            scan_code: 0x0F,
+            unicode: 0x09,
+            key_down: true,
+            control_keys: control_keys::SHIFT_PRESSED,
+            repeat: 1,
+        };
+        assert_eq!(reader.legacy_input(&[shift_tab]), b"\x1b[Z");
+
+        // Alt and `a`: the console reports `a`, and the sequence is the escape prefix and the
+        // character rather than the character alone.
+        let alt_a = KeyRecord {
+            virtual_key: 0x41,
+            scan_code: 0x1E,
+            unicode: u16::from(b'a'),
+            key_down: true,
+            control_keys: control_keys::LEFT_ALT_PRESSED,
+            repeat: 1,
+        };
+        assert_eq!(reader.legacy_input(&[alt_a]), b"\x1ba");
+
+        // AltGr and `2` on a layout that produces `@`: the character, and not a key with two
+        // modifiers on it.
+        let alt_graph = KeyRecord {
+            virtual_key: 0x32,
+            scan_code: 0x03,
+            unicode: u16::from(b'@'),
+            key_down: true,
+            control_keys: control_keys::RIGHT_ALT_PRESSED | control_keys::LEFT_CTRL_PRESSED,
+            repeat: 1,
+        };
+        assert_eq!(reader.legacy_input(&[alt_graph]), b"@");
+    }
+
+    #[test]
+    fn a_key_this_encoding_cannot_spell_produces_nothing_rather_than_another_key() {
+        let mut reader = encoder();
+        // F13 has no spelling in the legacy encoding. Sending F1 for it would be a key nobody
+        // pressed.
+        let f13 = KeyRecord {
+            virtual_key: 0x7C,
+            scan_code: 0x64,
+            unicode: 0,
+            key_down: true,
+            control_keys: 0,
+            repeat: 1,
+        };
+        assert!(reader.legacy_input(&[f13]).is_empty());
     }
 
     #[test]

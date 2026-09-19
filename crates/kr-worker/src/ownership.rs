@@ -170,9 +170,32 @@ impl OwnedProcesses {
         let OwnershipBoundary::JobObject { root } = self.boundary else {
             return true;
         };
-        crate::windows::job::holding(root)
-            .and_then(|job| job.process_ids().ok())
-            .is_some_and(|held| held.is_empty())
+        let Some(job) = crate::windows::job::holding(root) else {
+            self.note_unestablished(format!(
+                "the job object holding the session's root shell {root} could not be asked \
+                 whether anything was left in it"
+            ));
+            return false;
+        };
+        match job.process_ids() {
+            Ok(held) => {
+                if held.is_empty() {
+                    return true;
+                }
+                self.note_unestablished(format!(
+                    "the session's job object still held {} process(es) when the closure was \
+                     written",
+                    held.len()
+                ));
+                false
+            }
+            Err(error) => {
+                self.note_unestablished(format!(
+                    "the session's job object would not say what was left in it: {error}"
+                ));
+                false
+            }
+        }
     }
 
     /// Returns whether the boundary itself confirms it is holding nothing.
@@ -280,9 +303,12 @@ impl OwnedProcesses {
     }
 
     /// Records that a process was forced to stop rather than asked.
-    pub fn note_forced(&mut self, pid: u64) {
-        // Every process that had that identifier, because a record can hold more than one.
-        for (_, recorded) in self.seen.range_mut((pid, u64::MIN)..=(pid, u64::MAX)) {
+    ///
+    /// By identity, not by identifier. A record can hold two processes that had the same
+    /// identifier at different times, and marking both would put in the receipt that a process
+    /// which exited of its own accord was killed.
+    pub fn note_forced(&mut self, identity: &ProcessStartIdentity) {
+        if let Some(recorded) = self.seen.get_mut(&key(identity)) {
             recorded.forced = true;
         }
     }
@@ -294,19 +320,13 @@ impl OwnedProcesses {
     /// are exactly the ones no longer running by the time the record is written, and the record
     /// would then say every one of them stopped when it was asked.
     pub fn note_forced_now(&mut self) {
-        let running: Vec<u64> = self
-            .seen
-            .iter()
-            .filter(|(_, recorded)| {
-                matches!(
-                    kr_ipc::identity::process_state(&recorded.identity),
-                    kr_ipc::identity::ProcessState::Running
-                )
-            })
-            .map(|((pid, _), _)| *pid)
-            .collect();
-        for pid in running {
-            self.note_forced(pid);
+        for recorded in self.seen.values_mut() {
+            if matches!(
+                kr_ipc::identity::process_state(&recorded.identity),
+                kr_ipc::identity::ProcessState::Running
+            ) {
+                recorded.forced = true;
+            }
         }
     }
 
@@ -587,11 +607,37 @@ mod tests {
 
     #[test]
     fn a_complete_boundary_with_nothing_left_reports_complete() {
+        // A control group, because every platform reads its emptiness through the processes the
+        // record holds. A job object is asked directly, which needs a real one; that is
+        // `a_job_this_worker_cannot_ask_is_never_complete_coverage` below and the Windows suite.
         let owned = OwnedProcesses::establish(
-            OwnershipBoundary::JobObject { root: 4242 },
+            OwnershipBoundary::ControlGroup {
+                path: std::path::PathBuf::from("/sys/fs/cgroup/kalareach/session"),
+            },
             identity(u64::from(u32::MAX) + 1),
         );
         assert_eq!(owned.coverage(), OwnershipCoverage::Complete);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_job_this_worker_cannot_ask_is_never_complete_coverage() {
+        // Nothing registered this identifier's job, which is what a job that has gone looks like
+        // from here. Every recorded process has ended and the boundary is a complete one, and the
+        // answer is still incomplete, with the reason in the receipt: a boundary this host cannot
+        // read is one it cannot account for.
+        let owned = OwnedProcesses::establish(
+            OwnershipBoundary::JobObject { root: 0xFFFF_FFF0 },
+            identity(u64::from(u32::MAX) + 1),
+        );
+        assert_eq!(owned.coverage(), OwnershipCoverage::Incomplete);
+        assert!(
+            owned
+                .surviving_resources()
+                .iter()
+                .any(|resource| resource.kind == "unestablished"),
+            "and the receipt says which boundary could not be asked"
+        );
     }
 
     #[test]
@@ -640,18 +686,20 @@ mod tests {
                 group: 1,
                 terminal: None,
             },
-            first,
+            first.clone(),
         );
         owned.seen.insert(
             key(&second),
             Recorded {
-                identity: second,
+                identity: second.clone(),
                 forced: false,
             },
         );
         assert_eq!(owned.seen.len(), 2, "the record holds both");
-        // And marking that identifier as forced reaches both, because both were that identifier.
-        owned.note_forced(4242);
-        assert!(owned.seen.values().all(|recorded| recorded.forced));
+        // And force is attributed to the one it was used on. Marking both would put in the receipt
+        // that a process which exited of its own accord was killed.
+        owned.note_forced(&second);
+        assert!(!owned.seen[&key(&first)].forced, "the first exited");
+        assert!(owned.seen[&key(&second)].forced, "the second was forced");
     }
 }

@@ -700,7 +700,13 @@ mod tests {
     fn the_environment_is_replaced_rather_than_inherited() {
         // The worker's own process has this set and the launch environment does not carry it, so
         // a shell that sees it would be inheriting rather than being given its environment.
-        let inherited = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+        // Not one of the variables the test shell is deliberately given: those are what a program
+        // on this platform needs to start at all, and seeing one would prove nothing.
+        let inherited = if cfg!(windows) {
+            "COMPUTERNAME"
+        } else {
+            "HOME"
+        };
         assert!(
             std::env::var_os(inherited).is_some(),
             "the test process has {inherited}"
