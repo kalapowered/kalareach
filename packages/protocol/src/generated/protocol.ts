@@ -981,9 +981,10 @@ export type RetrustEvidence =
 /**
  * What a review acknowledgement is attached to.
  *
- * Section 14 binds an acknowledgement to a version. Both subjects carry one: a turn carries the
- * turn identifier the agent gave it, and a repository revision carries the change set and the
- * exact version of it that was read.
+ * A subject names what is being reviewed and nothing about which version of it. The version
+ * travels beside the subject, in [`ReviewState::current_version`] and
+ * [`ReviewAcknowledgeParams::version`], because a subject keeps one identity while its versions
+ * move: that is what lets a new change reopen review work an older version had closed.
  */
 export type ReviewSubject =
   | {
@@ -1004,9 +1005,9 @@ export type ReviewSubject =
       change_set_id: string
       kind: 'change_set'
       /**
-       * The version that was read.
+       * One KalaReach terminal session.
        */
-      version: string
+      session_id: string
     }
 /**
  * One published editor fence. An identity from an unacknowledged exchange names no fence.
@@ -12023,9 +12024,9 @@ export interface ReviewAcknowledgeParams {
         change_set_id: string
         kind: 'change_set'
         /**
-         * The version that was read.
+         * One KalaReach terminal session.
          */
-        version: string
+        session_id: string
       }
   /**
    * An unsigned 64-bit counter. On the wire it is a CBOR unsigned integer; in JSON it is a decimal string.
@@ -12095,9 +12096,9 @@ export interface ReviewState {
         change_set_id: string
         kind: 'change_set'
         /**
-         * The version that was read.
+         * One KalaReach terminal session.
          */
-        version: string
+        session_id: string
       }
 }
 /**
@@ -12171,9 +12172,9 @@ export interface ReviewState1 {
         change_set_id: string
         kind: 'change_set'
         /**
-         * The version that was read.
+         * One KalaReach terminal session.
          */
-        version: string
+        session_id: string
       }
 }
 /**

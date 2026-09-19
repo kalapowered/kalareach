@@ -16322,7 +16322,7 @@
       "type": "object"
     },
     "ReviewSubject": {
-      "description": "What a review acknowledgement is attached to.\n\nSection 14 binds an acknowledgement to a version. Both subjects carry one: a turn carries the\nturn identifier the agent gave it, and a repository revision carries the change set and the\nexact version of it that was read.",
+      "description": "What a review acknowledgement is attached to.\n\nA subject names what is being reviewed and nothing about which version of it. The version\ntravels beside the subject, in [`ReviewState::current_version`] and\n[`ReviewAcknowledgeParams::version`], because a subject keeps one identity while its versions\nmove: that is what lets a new change reopen review work an older version had closed.",
       "oneOf": [
         {
           "additionalProperties": false,
@@ -16350,7 +16350,7 @@
         },
         {
           "additionalProperties": false,
-          "description": "One captured change set at one exact version.",
+          "description": "One captured change set.",
           "properties": {
             "change_set_id": {
               "$ref": "#/$defs/ChangeSetId",
@@ -16360,15 +16360,15 @@
               "const": "change_set",
               "type": "string"
             },
-            "version": {
-              "$ref": "#/$defs/ChangeSetVersion",
-              "description": "The version that was read."
+            "session_id": {
+              "$ref": "#/$defs/SessionId",
+              "description": "The session the change set was captured in."
             }
           },
           "required": [
             "kind",
-            "change_set_id",
-            "version"
+            "session_id",
+            "change_set_id"
           ],
           "type": "object"
         }
