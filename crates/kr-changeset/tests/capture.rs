@@ -1218,6 +1218,60 @@ fn this_repository_s_own_data_is_excluded_by_what_it_is() {
     }
 }
 
+/// KR-REQ-14.33 and D-087a: **both** administrative directories a repository reports are excluded.
+///
+/// Git reports a common directory, which holds the configuration, the references and the objects,
+/// and this worktree's own, which holds its `HEAD` and its index. A linked worktree is where they
+/// differ, and this builds one with Git itself rather than by hand, because a layout Git would not
+/// accept proves nothing about what this host does with one it would.
+#[test]
+fn both_administrative_directories_a_repository_reports_are_excluded() {
+    let fixture = Fixture::create();
+    let main = ordinary_repository(fixture.work(), "main-tree");
+    let linked = fixture.work().join("linked-tree");
+    let added = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&main)
+        .args(["worktree", "add", "--detach"])
+        .arg(&linked)
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", fixture.work())
+        .output()
+        .expect("git runs");
+    if !added.status.success() {
+        eprintln!(
+            "this Git would not add a linked worktree, so the case is not exercised: {}",
+            String::from_utf8_lossy(&added.stderr)
+        );
+        return;
+    }
+    // Its own data is inside the main repository, which is outside this tree; what a capture of it
+    // must never hold is anything of either, whichever of the two a path would reach.
+    let workspace = fixture.workspace("linked-tree");
+    let outcome = fixture.capture_with(
+        workspace,
+        &include_everything(),
+        &kr_protocol::changeset::FileGrant::default(),
+        None,
+        None,
+    );
+    let Ok(record) = outcome else {
+        return;
+    };
+    let manifest = fixture
+        .service()
+        .manifest(record.change_set_id, record.version)
+        .expect("its manifest");
+    for entry in &manifest.paths {
+        assert!(
+            !entry.path.contains(".git"),
+            "nothing of either administrative directory is in the version: {}",
+            entry.path
+        );
+    }
+}
+
 /// KR-REQ-14.32: a quiescence declaration is recorded and never decides the consistency class,
 /// because nothing this host can reach holds a working tree still for the whole of a read.
 #[test]

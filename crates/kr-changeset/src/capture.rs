@@ -1204,26 +1204,29 @@ fn nested_repositories(
     // in the set too, so a directory that is that object reaches the same refusal whatever it is
     // called here.
     let mut refused: BTreeSet<(u64, u64)> = BTreeSet::new();
-    // Not a directory called `.git`: the directories **this repository resolves its own data to**,
-    // whatever they are called and however they are reached. A filesystem that ignores case, a
-    // `.git` file naming somewhere else, a link: none of them changes what those objects are.
+    // **Every administrative directory Git itself reports for this working tree** (D-087a), each
+    // entered by what it is rather than by what it is called. There can be two: the common one,
+    // which holds the configuration, the references and the objects, and this worktree's own,
+    // which holds its `HEAD` and its index. An ordinary repository keeps them in one place and a
+    // split one does not, and both hold administrative data.
     //
-    // There can be two. The common one holds the configuration, the references and the objects,
-    // and a worktree of its own holds that worktree's `HEAD` and index; an ordinary repository has
-    // them in one place and a split one does not. Both are this repository's own data.
-    let common = repository.identity().git_dir;
-    refused.insert((common.device, common.file_id));
-    let here = tree.identity();
-    if (common.device, common.file_id) == (here.device, here.file_id) {
-        // Its own data **is** this working tree. Everything in it is administrative and none of it
-        // is content, which is not a tree this host captures.
+    // A reported directory that **is** this working tree refuses the capture: a tree whose
+    // administrative data is its own root has no content for a version to hold. So does one this
+    // host cannot reach through its own handle for any reason but absence.
+    let here = (tree.identity().device, tree.identity().file_id);
+    let reported = repository.identity().git_dir;
+    if (reported.device, reported.file_id) == here {
         return Err(unplaceable("this working tree"));
     }
-    if let Some(own) = own_administrative_directory(repository) {
-        if own == (here.device, here.file_id) {
-            return Err(unplaceable("this working tree"));
+    refused.insert((reported.device, reported.file_id));
+    for path in [repository.git_dir_path(), repository.own_dir_path()] {
+        // A directory outside this working tree is one no path of this capture names.
+        if let Some(identity) = administrative_identity(repository, path)? {
+            if identity == here {
+                return Err(unplaceable("this working tree"));
+            }
+            refused.insert(identity);
         }
-        refused.insert(own);
     }
     for (directory, held) in &opened {
         let administrative = RelativeName::parse(grant::ADMINISTRATIVE_DIRECTORY)?;
@@ -1293,20 +1296,40 @@ fn nested_repositories(
     Ok(found)
 }
 
-/// Returns what this repository keeps **this working tree's** own data in, when it is reachable.
+/// Returns what one administrative directory Git reported **is**, when a capture could reach it.
 ///
-/// A split repository has two administrative directories: the common one, which the project
-/// service already establishes, and one of this worktree's own. This opens the second through the
-/// working tree's handle when it is inside the tree, which is the only case a capture could reach
-/// it at all, and answers what that directory **is**.
-fn own_administrative_directory(repository: &OpenedRepository) -> Option<(u64, u64)> {
-    let inside = repository
-        .git_dir_path()
-        .strip_prefix(repository.top_level())
-        .ok()?;
-    let name = RelativeName::parse(&inside.to_string_lossy()).ok()?;
-    let held = repository.work_tree().subdirectory(&name).ok()?;
-    Some(identity_of(&held))
+/// Reached through the working tree's own handle, one component at a time, so a link on the way
+/// ends it. A directory outside this working tree is one no path of this capture names, and
+/// answers nothing; so does one that is not there. Anything else this host could not resolve
+/// refuses the capture, because it cannot then say the tree is free of that repository's own data.
+fn administrative_identity(
+    repository: &OpenedRepository,
+    path: &std::path::Path,
+) -> Result<Option<(u64, u64)>> {
+    let Ok(inside) = path.strip_prefix(repository.top_level()) else {
+        return Ok(None);
+    };
+    if inside.as_os_str().is_empty() {
+        let here = repository.work_tree().identity();
+        return Ok(Some((here.device, here.file_id)));
+    }
+    let Some(text) = inside.to_str() else {
+        return Err(unplaceable("this repository's own data"));
+    };
+    let mut held = clone_of(repository.work_tree())?;
+    for component in text.split('/') {
+        let step = RelativeName::parse(component)?;
+        match held.probe(&step) {
+            Ok(kr_transfer::authority::ObjectKind::Directory) => {}
+            // Not there: nothing of it for a capture to hold.
+            Err(kr_transfer::Escape::NotFound { .. }) => return Ok(None),
+            _ => return Err(unplaceable("this repository's own data")),
+        }
+        held = held
+            .subdirectory(&step)
+            .map_err(|_| unplaceable("this repository's own data"))?;
+    }
+    Ok(Some(identity_of(&held)))
 }
 
 /// Returns the object one open directory is.

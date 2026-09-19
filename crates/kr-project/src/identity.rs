@@ -63,6 +63,7 @@ pub struct OpenedRepository {
     work_tree: AuthorisedDirectory,
     identity: RepositoryIdentity,
     git_dir_path: PathBuf,
+    own_dir_path: PathBuf,
     top_level: PathBuf,
     audit: ConfigurationAudit,
 }
@@ -89,16 +90,23 @@ impl OpenedRepository {
         // `--git-common-dir` rather than `--git-dir`: a linked worktree's own Git directory lives
         // inside the main one, and what identifies the repository is the object every worktree of
         // it shares.
-        let arguments: [&OsStr; 5] = [
+        // This worktree's own directory as well: a repository can keep that in one place and
+        // everything its worktrees share in another, and both are its administrative data, so a
+        // caller that has to exclude that data has to know both. `--absolute-git-dir` asks for it;
+        // the profile passes no argument that could redirect an invocation, and this is the query
+        // rather than the redirect.
+        let arguments: [&OsStr; 6] = [
             OsStr::new("rev-parse"),
             OsStr::new("--path-format=absolute"),
             OsStr::new("--git-common-dir"),
+            OsStr::new("--absolute-git-dir"),
             OsStr::new("--show-toplevel"),
             OsStr::new("--is-inside-work-tree"),
         ];
         let reported = profile.run_checked(&GitRequest::read(path, &arguments))?;
         let mut lines = reported.lines();
         let git_dir_path = PathBuf::from(lines.next().unwrap_or_default());
+        let own_dir_path = PathBuf::from(lines.next().unwrap_or_default());
         let top_level = PathBuf::from(lines.next().unwrap_or_default());
         let inside = lines.next().unwrap_or_default().trim();
         if inside != "true" {
@@ -137,6 +145,7 @@ impl OpenedRepository {
             work_tree,
             identity,
             git_dir_path,
+            own_dir_path,
             top_level,
             audit,
         })
@@ -219,6 +228,17 @@ impl OpenedRepository {
     #[must_use]
     pub fn git_dir_path(&self) -> &Path {
         &self.git_dir_path
+    }
+
+    /// Returns **this working tree's own** Git directory, which a split repository keeps apart
+    /// from the one every worktree of it shares.
+    ///
+    /// The same path as [`Self::git_dir_path`] in an ordinary repository, and a different one in a
+    /// linked worktree or a repository that was made with the two apart. A caller excluding a
+    /// repository's administrative data has to know both, because both hold it.
+    #[must_use]
+    pub fn own_dir_path(&self) -> &Path {
+        &self.own_dir_path
     }
 
     /// Returns what this repository's configuration named.
