@@ -411,11 +411,11 @@ happens to hold the input lease by the time the command runs.
 
 Run anywhere else it takes an identifier. The session answers a request that names nothing only
 when the calling process is the line it has a record of, which the kernel says twice: the process
-is in the session's own boundary or descends from its root shell, and it is in the job the
+is in the session's own boundary or descends from its root shell, and it leads the job the
 terminal has in the foreground, which is the job the root shell made for the line it accepted.
 `kr detach <session>` from an ordinary terminal, from a command the shell was told to run in the
-background, or from one left over from a line that has already finished, names the attachment it
-means. Where a platform does not name a foreground job, and where the shell runs without job control so
+background, from one left over from a line that has already finished, and from inside a subshell
+or a list that something else in the job leads, names the attachment it means. Where a platform does not name a foreground job, and where the shell runs without job control so
 that every line shares its own process group, there is no such job to be in and every `kr detach`
 names its attachment.
 

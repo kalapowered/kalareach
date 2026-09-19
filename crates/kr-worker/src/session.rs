@@ -1546,9 +1546,10 @@ impl Session {
     /// Returns whether one process is in the job this terminal has in the foreground.
     ///
     /// The foreground job is the one the root shell put the line it accepted into, and the one the
-    /// interrupt key would signal. A `kr detach` the person typed at the prompt is in it. One the
-    /// shell was told to run in the background, or one left over from a line that has already
-    /// finished, is not, and the attachment this session has a record of is not that caller's.
+    /// interrupt key would signal. A `kr detach` the person typed at the prompt leads it. One the
+    /// shell was told to run in the background, one left over from a line that has already
+    /// finished, and one started by something else inside the job do not, and the attachment this
+    /// session has a record of is not that caller's.
     ///
     /// Where the platform does not name a foreground job, and where the shell is running without
     /// job control so that every line shares the shell's own group, there is no such job to be in.
@@ -1576,6 +1577,15 @@ impl Session {
             .root_identity()
             .and_then(|identity| u32::try_from(identity.pid.get()).ok());
         if Some(group) == shell || Some(group) == root {
+            return false;
+        }
+        // And the caller leads that job rather than merely belonging to it. A shell makes the
+        // command it runs from a line the leader of the job it makes for that line, so a caller
+        // that leads the foreground job is the line the shell is running now. One that was
+        // started by something else in the job — a subshell, an earlier command in a list, a job
+        // the person has since brought back to the foreground with `fg` — belongs to a line that
+        // was accepted before this record was, and this record is not about it.
+        if group != pid {
             return false;
         }
         kr_ipc::identity::processes_in_group(group).is_ok_and(|members| members.contains(&pid))
