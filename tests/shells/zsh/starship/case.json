@@ -4,13 +4,37 @@
   "stack": "starship",
   "title": "starship, a prompt that runs a program at every prompt and installs its own hooks",
   "supported": true,
-  "requires": ["starship"],
-  "order": ["user-top", "stack", "user-bottom"],
+  "requires": [
+    "starship"
+  ],
+  "order": [
+    "user-top",
+    "stack",
+    "user-bottom"
+  ],
   "binding": "kr-user-widget",
-  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
-  "covers": ["KR-REQ-07.87"],
+  "checks": [
+    "identity",
+    "profile_order",
+    "plugin_active",
+    "plugin_buffer",
+    "user_bindings"
+  ],
+  "plugin": {
+    "probe": "echo kr-plugin=${STARSHIP_SESSION_KEY:+on}",
+    "marker": "kr-plugin=on"
+  },
+  "covers": [
+    "KR-REQ-07.87"
+  ],
   "home": [
-    { "file": "zshrc", "path": ".zshrc" },
-    { "file": "starship.toml", "path": ".config/starship.toml" }
+    {
+      "file": "zshrc",
+      "path": ".zshrc"
+    },
+    {
+      "file": "starship.toml",
+      "path": ".config/starship.toml"
+    }
   ]
 }

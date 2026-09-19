@@ -5,12 +5,30 @@
   "title": "an ordinary editor customisation: prediction, edit mode and key handlers of the person's own",
   "supported": true,
   "requires": [],
-  "order": ["all-hosts", "user-top", "user-bottom"],
+  "order": [
+    "all-hosts",
+    "user-top",
+    "user-bottom"
+  ],
   "binding": "kr-user-binding",
-  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer", "profile_once"],
-  "covers": ["KR-REQ-07.87"],
+  "checks": [
+    "identity",
+    "profile_order",
+    "profile_once",
+    "plugin_buffer",
+    "user_bindings"
+  ],
+  "covers": [
+    "KR-REQ-07.87"
+  ],
   "home": [
-    { "file": "profile.ps1", "path": ".config/powershell/profile.ps1" },
-    { "file": "host-profile.ps1", "path": ".config/powershell/Microsoft.PowerShell_profile.ps1" }
+    {
+      "file": "profile.ps1",
+      "path": ".config/powershell/profile.ps1"
+    },
+    {
+      "file": "host-profile.ps1",
+      "path": ".config/powershell/Microsoft.PowerShell_profile.ps1"
+    }
   ]
 }

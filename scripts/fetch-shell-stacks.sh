@@ -101,6 +101,7 @@ for stack in lock["stacks"]:
                 stack["version"],
                 stack["role"],
                 stack.get("program") or "-",
+                stack.get("entry") or "-",
                 chosen["url"] if chosen else "-",
                 chosen["sha256"] if chosen else "-",
                 str(chosen.get("strip_components", 0)) if chosen else "0",
@@ -117,9 +118,10 @@ record() {
     records+=("$(printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s' "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8")")
 }
 
-while IFS=$'\t' read -r id version role program url sha strip; do
+while IFS=$'\t' read -r id version role program entry url sha strip; do
     [ -n "$id" ] || continue
     [ "$program" = "-" ] && program=""
+    [ "$entry" = "-" ] && entry=""
     [ "$url" = "-" ] && url=""
     [ "$sha" = "-" ] && sha=""
     target="$cache/$id/$version"
@@ -135,7 +137,9 @@ while IFS=$'\t' read -r id version role program url sha strip; do
         continue
     fi
 
-    if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$sha" ] && [ -d "$target" ]; then
+    if [ -f "$stamp" ] && [ "$(cat "$stamp")" = "$sha" ] && [ -d "$target" ] \
+       && { [ -z "$entry" ] || [ -e "$target/$entry" ]; } \
+       && { [ -z "$program" ] || [ -x "$target/$program" ]; }; then
         echo "  $id $version: installed"
         record "$id" "$version" "installed" "$target" "$executable" "$url" "$sha" ""
         continue
@@ -147,7 +151,7 @@ while IFS=$'\t' read -r id version role program url sha strip; do
         continue
     fi
 
-    if [ "$offline" -eq 1 ] && [ ! -f "$archives/$sha.tar.gz" ]; then
+    if [ "$offline" -eq 1 ] && { [ ! -f "$archives/$sha.tar.gz" ] || [ "$(digest "$archives/$sha.tar.gz")" != "$sha" ]; }; then
         echo "  $id $version: not installed and no archive kept for it"
         record "$id" "$version" "unreachable" "" "" "$url" "$sha" "no archive for the pinned digest is kept here and this run does not fetch"
         continue
@@ -192,6 +196,12 @@ while IFS=$'\t' read -r id version role program url sha strip; do
     if [ -n "$executable" ] && [ ! -f "$work/tree/$program" ]; then
         echo "    the archive holds no $program"
         record "$id" "$version" "unreachable" "" "" "$url" "$sha" "the archive holds no $program"
+        rm -rf "${work:?}"
+        continue
+    fi
+    if [ -n "$entry" ] && [ ! -e "$work/tree/$entry" ]; then
+        echo "    the archive holds no $entry"
+        record "$id" "$version" "unreachable" "" "" "$url" "$sha" "the archive holds no $entry"
         rm -rf "${work:?}"
         continue
     fi

@@ -4,6 +4,7 @@
     { "stack": "zsh-autosuggestions", "reason": "the plugin is written against ZLE, which this shell's reader is not; its author publishes no Readline form" },
     { "stack": "zsh-syntax-highlighting", "reason": "the plugin wraps ZLE widgets, which this shell's reader does not have" },
     { "stack": "powerlevel10k", "reason": "the theme is a Zsh theme built on ZLE and gitstatus, and publishes no Readline form" },
-    { "stack": "oh-my-zsh", "reason": "the framework is Zsh's; its plugins and themes are Zsh scripts" }
+    { "stack": "oh-my-zsh", "reason": "the framework is Zsh's; its plugins and themes are Zsh scripts" },
+    { "stack": "atuin", "reason": "this shell has no pre-execution hook of its own, and the integration this release prints reports its backend as unknown unless bash-preexec or ble.sh is already loaded; neither is in this pinned set" }
   ]
 }

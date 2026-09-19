@@ -4,10 +4,33 @@
   "stack": "oh-my-zsh",
   "title": "oh-my-zsh with plugins, which rebinds keys and installs its own line-init hooks",
   "supported": true,
-  "requires": ["oh-my-zsh"],
-  "order": ["user-top", "stack", "user-bottom"],
+  "requires": [
+    "oh-my-zsh"
+  ],
+  "order": [
+    "user-top",
+    "stack",
+    "user-bottom"
+  ],
   "binding": "kr-user-widget",
-  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
-  "covers": ["KR-REQ-07.87"],
-  "home": [{ "file": "zshrc", "path": ".zshrc" }]
+  "checks": [
+    "identity",
+    "profile_order",
+    "plugin_active",
+    "plugin_buffer",
+    "user_bindings"
+  ],
+  "plugin": {
+    "probe": "echo kr-plugin=$(( $+functions[omz] ))",
+    "marker": "kr-plugin=1"
+  },
+  "covers": [
+    "KR-REQ-07.87"
+  ],
+  "home": [
+    {
+      "file": "zshrc",
+      "path": ".zshrc"
+    }
+  ]
 }

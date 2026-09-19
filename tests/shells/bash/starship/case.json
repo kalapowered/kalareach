@@ -4,13 +4,37 @@
   "stack": "starship",
   "title": "starship on the packaged Bash, with its prompt command and its own trap",
   "supported": true,
-  "requires": ["starship"],
-  "order": ["user-top", "stack", "user-bottom"],
+  "requires": [
+    "starship"
+  ],
+  "order": [
+    "user-top",
+    "stack",
+    "user-bottom"
+  ],
   "binding": "kr-user-binding",
-  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
-  "covers": ["KR-REQ-07.87"],
+  "checks": [
+    "identity",
+    "profile_order",
+    "plugin_active",
+    "plugin_buffer",
+    "user_bindings"
+  ],
+  "plugin": {
+    "probe": "echo kr-plugin=${STARSHIP_SESSION_KEY:+on}",
+    "marker": "kr-plugin=on"
+  },
+  "covers": [
+    "KR-REQ-07.87"
+  ],
   "home": [
-    { "file": "bashrc", "path": ".bashrc" },
-    { "file": "starship.toml", "path": ".config/starship.toml" }
+    {
+      "file": "bashrc",
+      "path": ".bashrc"
+    },
+    {
+      "file": "starship.toml",
+      "path": ".config/starship.toml"
+    }
   ]
 }

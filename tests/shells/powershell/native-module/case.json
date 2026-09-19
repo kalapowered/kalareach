@@ -5,18 +5,42 @@
   "title": "a binary module this runtime cannot load, diagnosed rather than loaded silently",
   "supported": true,
   "requires": [],
-  "order": ["all-hosts", "user-top", "kr-module-refused", "stack", "user-bottom"],
+  "order": [
+    "all-hosts",
+    "user-top",
+    "kr-module-refused",
+    "kr-module-absent",
+    "stack",
+    "user-bottom"
+  ],
   "binding": "kr-user-binding",
-  "checks": ["identity", "profile_order", "user_bindings", "native_module", "profile_once"],
+  "checks": [
+    "identity",
+    "profile_order",
+    "profile_once",
+    "native_module",
+    "user_bindings"
+  ],
   "native_module": {
     "name": "KrWrongAbi",
     "marker": "kr-module-refused",
-    "note": "A binary module built against another runtime ABI cannot be produced from a fixture, so what this case ships is an assembly file this runtime refuses to load. What it proves is the diagnosis: the profile records that the import failed, the module is absent from the loaded list, and the integration is still qualified afterwards."
+    "note": "What this case ships is a file named like a module whose contents this build's loader refuses, so what it proves is the diagnosis rather than an editor-ABI mismatch: the loader names the module it would not load, the shell's own list of loaded modules does not hold it, and the integration is still qualified afterwards. A module compiled against another ABI of this shell would prove the mismatch itself and needs a compiler and that shell's headers at qualification time, which this corpus does not have."
   },
-  "covers": ["KR-REQ-07.87"],
+  "covers": [
+    "KR-REQ-07.87"
+  ],
   "home": [
-    { "file": "profile.ps1", "path": ".config/powershell/profile.ps1" },
-    { "file": "host-profile.ps1", "path": ".config/powershell/Microsoft.PowerShell_profile.ps1" },
-    { "file": "KrWrongAbi.dll", "path": "modules/KrWrongAbi/KrWrongAbi.dll" }
+    {
+      "file": "profile.ps1",
+      "path": ".config/powershell/profile.ps1"
+    },
+    {
+      "file": "host-profile.ps1",
+      "path": ".config/powershell/Microsoft.PowerShell_profile.ps1"
+    },
+    {
+      "file": "KrWrongAbi.dll",
+      "path": "modules/KrWrongAbi/KrWrongAbi.dll"
+    }
   ]
 }

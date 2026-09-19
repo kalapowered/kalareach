@@ -39,13 +39,18 @@ const REQUIRE_STACKS: &str = "KR_REQUIRE_SHELL_STACKS";
 
 /// Every check a case may claim. A name outside this set is a corpus that says something this
 /// runner does not do, which is worse than a check that fails.
+/// They run in this order whatever order a case lists them in: a probe that runs a command ends
+/// the prompt the checks before it were asked at.
 const KNOWN_CHECKS: &[&str] = &[
     "identity",
     "profile_order",
-    "user_bindings",
-    "plugin_buffer",
-    "native_module",
     "profile_once",
+    "native_module",
+    "plugin_active",
+    "plugin_writes_buffer",
+    "plugin_buffer",
+    "user_bindings",
+    "instant_prompt",
 ];
 
 /// The customisations a case may name that are not pinned archives.
@@ -148,7 +153,7 @@ fn every_combination_of_a_shell_and_a_startup_customisation_is_accounted_for() {
                 entry.stack
             );
             assert!(
-                entry.reason.len() > 20,
+                entry.reason.split_whitespace().count() >= 8,
                 "{} records {} as unsupported without saying why",
                 shell.as_str(),
                 entry.stack
@@ -166,9 +171,12 @@ fn every_combination_of_a_shell_and_a_startup_customisation_is_accounted_for() {
                 );
                 continue;
             }
-            let driven = corpus
-                .iter()
-                .any(|case| case.shell == *shell && case.requires.contains(&pinned.id));
+            // A case recorded as unsupported is not coverage: it would let a stack be taken out
+            // of the qualification by marking it unsupported and still satisfy the rule that says
+            // the stack is covered.
+            let driven = corpus.iter().any(|case| {
+                case.shell == *shell && case.supported && case.requires.contains(&pinned.id)
+            });
             let excused = list
                 .unsupported
                 .iter()
@@ -201,14 +209,34 @@ fn every_combination_of_a_shell_and_a_startup_customisation_is_accounted_for() {
         assert!(
             corpus
                 .iter()
-                .any(|case| case.requires.iter().any(|id| id == named)),
+                .any(|case| case.supported && case.requires.iter().any(|id| id == named)),
             "no case drives {named}"
         );
     }
     assert!(
-        corpus.iter().any(|case| case.stack == "distribution"),
+        corpus
+            .iter()
+            .any(|case| case.supported && case.stack == "distribution"),
         "no case drives an ordinary distribution startup customisation"
     );
+    // A case that says a customisation is loaded has to ask the shell, or it proves only that a
+    // startup file ran.
+    for case in &corpus {
+        assert_eq!(
+            case.checks.contains(&"plugin_active".to_owned()),
+            case.plugin.is_some(),
+            "{} claims a customisation is active and asks the shell nothing, or the other way \
+             round",
+            case.id
+        );
+        if case.checks.contains(&"instant_prompt".to_owned()) {
+            assert!(
+                case.warm_order.is_some(),
+                "{} drives a second start and does not say what it should record",
+                case.id
+            );
+        }
+    }
 }
 
 #[test]
@@ -231,7 +259,13 @@ fn the_stacks_installed_here_are_the_ones_the_corpus_pins() {
     };
     assert_eq!(
         index.lock_sha256, digest,
-        "the installed stacks were fetched from another pinned set; run scripts/fetch-shell-stacks.sh"
+        "the installed stacks were fetched from another pinned set; run \
+         scripts/fetch-shell-stacks.sh"
+    );
+    assert_eq!(
+        index.platform,
+        host_platform(),
+        "the installed stacks were fetched for another platform"
     );
     for stack in &index.stacks {
         let pinned = lock
@@ -247,10 +281,32 @@ fn the_stacks_installed_here_are_the_ones_the_corpus_pins() {
         if stack.installed() {
             let digest = stack.sha256.as_deref().unwrap_or_default();
             assert!(
-                pinned.sources.iter().any(|source| source.sha256 == digest),
-                "{} was installed from an archive this set does not pin",
-                stack.id
+                pinned.sources.iter().any(|source| source.sha256 == digest
+                    && (source.platform == "any" || source.platform == index.platform)),
+                "{} was installed from an archive this set does not pin for {}",
+                stack.id,
+                index.platform
             );
+            let root = std::path::PathBuf::from(
+                stack
+                    .root
+                    .as_deref()
+                    .expect("an installed stack has a root"),
+            );
+            if let Some(entry) = pinned.entry.as_deref() {
+                assert!(
+                    root.join(entry).is_file(),
+                    "{} is recorded as installed and {entry} is not in its tree",
+                    stack.id
+                );
+            }
+            if let Some(program) = pinned.program.as_deref() {
+                assert!(
+                    root.join(program).is_file(),
+                    "{} is recorded as installed and holds no {program}",
+                    stack.id
+                );
+            }
         }
     }
 }
@@ -338,10 +394,38 @@ fn every_case_holds_against_the_package_it_names() {
 
     record_outcomes("qualification-cases.tsv", &outcomes);
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
-    assert!(
-        ran > 0,
-        "no case ran: no package is built here and no stack is fetched here"
-    );
+    // An ordinary workspace run has neither the packages nor the stacks: this suite says so and
+    // stops. A run that asked for them is the one that fails when nothing ran.
+    if std::env::var_os(shellpkg::REQUIRE).is_some() || std::env::var_os(REQUIRE_STACKS).is_some() {
+        assert!(
+            ran > 0,
+            "the packages or the stacks were required and no case ran"
+        );
+    } else if ran == 0 {
+        println!(
+            "skipped: no package is built here and no stack is fetched here; run \
+             scripts/build-shells.sh --all and scripts/fetch-shell-stacks.sh"
+        );
+    }
+}
+
+/// The platform triple the fetcher records, for the host this run is on.
+fn host_platform() -> String {
+    let architecture = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else if cfg!(target_arch = "x86_64") {
+        "x86_64"
+    } else {
+        "unknown"
+    };
+    let system = if cfg!(target_os = "macos") {
+        "apple-darwin"
+    } else if cfg!(target_os = "linux") {
+        "unknown-linux-gnu"
+    } else {
+        "unknown"
+    };
+    format!("{architecture}-{system}")
 }
 
 /// Reads the index the fetcher wrote, or records why there is none.
@@ -359,142 +443,333 @@ fn installed_stacks() -> Option<StackIndex> {
     }
 }
 
-/// Drives one case's shell through the checks it claims.
+/// Drives one case's shell through the checks it claims, in this suite's own order.
 fn run_case(case: &QualificationCase, package: &Package) {
     let index = StackIndex::read().expect("the index was read before this case was chosen");
     let setup = CaseSetup::prepare(case, package, &index);
     let mut session = Session::start_for(package, case, &setup);
-    let enter = session.first_prompt();
+    let mut enter = session.first_prompt();
     // Several of these prompts are drawn by a program that runs at every prompt, so the reader is
     // given until its drawing stops before anything is typed at it.
     settle(&mut session, Duration::from_millis(300), REPLY);
     session.ensure_reading();
 
-    for check in &case.checks {
-        match check.as_str() {
-            "identity" => {
-                assert_eq!(
-                    session.hello.shell.kind, case.shell,
-                    "{} declared another shell",
-                    case.id
-                );
-                assert_eq!(
-                    session.hello.abi,
-                    BridgeAbi::qualified(case.shell),
-                    "{} declared a mechanism this shell is not qualified for",
-                    case.id
-                );
-                let declared: Vec<String> = session
-                    .hello
-                    .shell
-                    .patches
-                    .iter()
-                    .map(|patch| patch.name.clone())
-                    .collect();
-                assert_eq!(
-                    declared,
-                    package.patch_names(),
-                    "{} declared patches the installed package does not record",
-                    case.id
-                );
-                assert_eq!(
-                    session.hello.shell.executable,
-                    package.executable.display().to_string(),
-                    "{} qualified a binary other than the one the record names",
-                    case.id
-                );
-            }
-            "profile_order" => {
-                let recorded = setup.recorded_order();
-                assert_eq!(
-                    recorded,
-                    case.order,
-                    "{} ran its startup in another order; the terminal showed:\n{}",
-                    case.id,
-                    session.terminal_output()
-                );
-            }
-            "profile_once" => {
-                let recorded = setup.recorded_order();
-                for marker in &case.order {
-                    assert_eq!(
-                        recorded.iter().filter(|line| *line == marker).count(),
-                        1,
-                        "{} ran the profile that records {marker} more than once",
-                        case.id
-                    );
-                }
-            }
-            "plugin_buffer" => {
-                // A plugin that rewrites the line on every keystroke is exactly what section 7
-                // says a prompt hook cannot tell from an empty prompt. The reader's own answer is
-                // what the fence carries, so it is asked with the line held and again once it is
-                // cleared, under the same plugin.
-                session.type_bytes(b"k");
-                settle(&mut session, Duration::from_millis(200), REPLY);
-                let held = session.fence_exchange(&enter, shellpkg::fence_id(1));
-                assert!(
-                    !held.editor.buffer_empty,
-                    "{}: a line the plugin had rewritten was reported as an empty prompt",
-                    case.id
-                );
-                session.clear_line();
-                settle(&mut session, Duration::from_millis(200), REPLY);
-                let cleared = session.fence_exchange(&enter, shellpkg::fence_id(2));
-                assert!(
-                    cleared.editor.buffer_empty,
-                    "{}: a cleared line was still reported as holding something",
-                    case.id
-                );
-            }
-            "user_bindings" => {
-                assert!(
-                    session.user_binding_ran(),
-                    "{}: the person's own binding {} did not survive the integration; the \
-                     terminal showed:\n{}",
-                    case.id,
-                    case.binding,
-                    session.terminal_output()
-                );
-                session.clear_line();
-            }
-            "native_module" => {
-                let module = case
-                    .native_module
-                    .as_ref()
-                    .expect("the corpus check refused a case without one");
-                let recorded = setup.recorded_order();
-                assert!(
-                    recorded.contains(&module.marker),
-                    "{}: {} was not diagnosed; the startup recorded {recorded:?}",
-                    case.id,
-                    module.name
-                );
-                assert!(
-                    !recorded.iter().any(|line| line == "kr-module-loaded"),
-                    "{}: {} was loaded",
-                    case.id,
-                    module.name
-                );
-                let diagnosis =
-                    std::fs::read_to_string(setup.home.join("module-error")).unwrap_or_default();
-                assert!(
-                    !diagnosis.trim().is_empty(),
-                    "{}: nothing said why {} was not loaded",
-                    case.id,
-                    module.name
-                );
-                // The integration is what it was before: the reader is there and answers.
-                let acknowledgement = session.fence_exchange(&enter, shellpkg::fence_id(3));
-                assert_eq!(acknowledgement.prompt_generation, enter.prompt_generation);
-            }
-            other => panic!("{}: {other} is not a check this suite runs", case.id),
+    let claimed = |name: &str| case.checks.iter().any(|check| check == name);
+
+    if claimed("identity") {
+        // What the package declares is checked against the record the build wrote beside the
+        // binary, rather than against itself: the handshake this harness answers takes the hello's
+        // own editor ABI as supported, so the record is what makes this an identity at all.
+        assert_eq!(
+            session.hello.shell.kind, case.shell,
+            "{} declared another shell",
+            case.id
+        );
+        assert_eq!(
+            session.hello.abi,
+            BridgeAbi::qualified(case.shell),
+            "{} declared a mechanism this shell is not qualified for",
+            case.id
+        );
+        let record = &package.record["shell"];
+        for (field, declared) in [
+            ("executable", package.executable.display().to_string()),
+            ("editor_abi", session.hello.shell.editor_abi.clone()),
+            (
+                "integration_version",
+                session.hello.shell.integration_version.clone(),
+            ),
+            (
+                "upstream_version",
+                session.hello.shell.upstream_version.clone(),
+            ),
+        ] {
+            let recorded = record[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("{} has no {field} in its identity record", case.id));
+            let declared = if field == "executable" {
+                package.executable.display().to_string()
+            } else {
+                declared
+            };
+            assert_eq!(
+                declared, recorded,
+                "{} declared a {field} the installed package does not record",
+                case.id
+            );
         }
+        let declared: Vec<String> = session
+            .hello
+            .shell
+            .patches
+            .iter()
+            .map(|patch| patch.name.clone())
+            .collect();
+        assert_eq!(
+            declared,
+            package.patch_names(),
+            "{} declared patches the installed package does not record",
+            case.id
+        );
+        let modules: Vec<String> = session
+            .hello
+            .shell
+            .modules
+            .iter()
+            .map(|module| module.name.clone())
+            .collect();
+        let recorded: Vec<String> = package.record["shell"]["modules"]
+            .as_array()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .filter_map(|module| module["name"].as_str().map(str::to_owned))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            modules, recorded,
+            "{} declared a module tree the installed package does not record",
+            case.id
+        );
+    }
+
+    if claimed("profile_order") {
+        let recorded = setup.recorded_order();
+        assert_eq!(
+            recorded,
+            case.order,
+            "{} ran its startup in another order; the terminal showed:\n{}",
+            case.id,
+            session.terminal_output()
+        );
+    }
+
+    if claimed("profile_once") {
+        let recorded = setup.recorded_order();
+        for marker in &case.order {
+            assert_eq!(
+                recorded.iter().filter(|line| *line == marker).count(),
+                1,
+                "{} ran the profile that records {marker} more than once",
+                case.id
+            );
+        }
+    }
+
+    if claimed("native_module") {
+        let module = case
+            .native_module
+            .as_ref()
+            .expect("the corpus check refused a case without one");
+        let recorded = setup.recorded_order();
+        assert!(
+            recorded.contains(&module.marker),
+            "{}: {} was not diagnosed; the startup recorded {recorded:?}",
+            case.id,
+            module.name
+        );
+        assert!(
+            !recorded.iter().any(|line| line == "kr-module-loaded"),
+            "{}: {} was loaded",
+            case.id,
+            module.name
+        );
+        assert!(
+            recorded.iter().any(|line| line == "kr-module-absent"),
+            "{}: {} is in the shell's own list of loaded modules",
+            case.id,
+            module.name
+        );
+        let diagnosis =
+            std::fs::read_to_string(setup.home.join("module-error")).unwrap_or_default();
+        assert!(
+            diagnosis.contains(&module.name),
+            "{}: what was said about {} does not name it: {diagnosis:?}",
+            case.id,
+            module.name
+        );
+        // The integration is what it was before: the reader is there and answers.
+        let acknowledgement = session.fence_exchange(&enter, shellpkg::fence_id(3));
+        assert_eq!(acknowledgement.prompt_generation, enter.prompt_generation);
+    }
+
+    if claimed("plugin_active") {
+        let probe = case
+            .plugin
+            .as_ref()
+            .expect("the corpus check refused a case without one");
+        assert!(
+            session.plugin_is_active(probe),
+            "{}: the customisation this case is about is not loaded; {} printed nothing like \
+             {}; the terminal showed:\n{}",
+            case.id,
+            probe.probe,
+            probe.marker,
+            session.terminal_output()
+        );
+        enter = session.next_prompt();
+        settle(&mut session, Duration::from_millis(300), REPLY);
+        session.ensure_reading();
+    }
+
+    if claimed("plugin_writes_buffer") {
+        enter = plugin_writes_the_buffer(case, &mut session, &enter);
+    }
+
+    if claimed("plugin_buffer") {
+        // A customisation that rewrites the line on every keystroke is exactly what section 7
+        // says a prompt hook cannot tell from an empty prompt. The reader's own answer is what
+        // the fence carries, so it is asked with the line held and again once it is cleared,
+        // under the same customisation.
+        session.type_bytes(b"k");
+        settle(&mut session, Duration::from_millis(200), REPLY);
+        let held = session.fence_exchange(&enter, shellpkg::fence_id(1));
+        assert!(
+            !held.editor.buffer_empty,
+            "{}: a line the customisation had drawn over was reported as an empty prompt",
+            case.id
+        );
+        session.clear_line();
+        settle(&mut session, Duration::from_millis(200), REPLY);
+        let cleared = session.fence_exchange(&enter, shellpkg::fence_id(2));
+        assert!(
+            cleared.editor.buffer_empty,
+            "{}: a cleared line was still reported as holding something",
+            case.id
+        );
+    }
+
+    if claimed("user_bindings") {
+        assert!(
+            session.user_binding_ran(),
+            "{}: the person's own binding {} did not survive the integration; the terminal \
+             showed:\n{}",
+            case.id,
+            case.binding,
+            session.terminal_output()
+        );
+        session.clear_line();
     }
 
     assert!(
         session.alive(),
         "{}: the shell did not survive its own qualification",
+        case.id
+    );
+
+    if claimed("instant_prompt") {
+        // The shell has to have gone before the second one starts: the cache the theme draws its
+        // early prompt from is written by the run that is ending.
+        drop(session);
+        a_second_start_draws_from_the_cache_the_first_wrote(case, package, &setup);
+    }
+}
+
+/// The customisation itself writes the line, and the reader reports what it wrote.
+///
+/// Typing a character proves only that typing fills a buffer. This drives the customisation's own
+/// operation: a line it remembered is offered as a suggestion for a prefix, the person accepts it
+/// with the key the customisation bound, and what ends up in the reader's buffer is text nobody
+/// typed.
+fn plugin_writes_the_buffer(
+    case: &QualificationCase,
+    session: &mut Session,
+    enter: &kr_protocol::root::RootEditorEnterParams,
+) -> kr_protocol::root::RootEditorEnterParams {
+    // The line the customisation remembers prints something its own text does not contain, so a
+    // run of it is the buffer having held the whole line rather than the editor having drawn one.
+    const REMEMBERED: &str = "echo kr-sugg''estion-ran";
+    const PREFIX: &str = "echo kr-sugg";
+    const PRINTED: &str = "kr-suggestion-ran";
+    const OFFERED: &str = "estion-ran";
+    const ACCEPT: &[u8] = &[0x05];
+
+    assert!(
+        session.run(REMEMBERED, PRINTED),
+        "{}: the line the customisation is to remember did not run",
+        case.id
+    );
+    let entered = session.next_prompt();
+    settle(session, Duration::from_millis(300), REPLY);
+    session.ensure_reading();
+
+    let before = session.written();
+    session.type_bytes(PREFIX.as_bytes());
+    settle(session, Duration::from_millis(250), REPLY);
+    assert!(
+        session.wait_for_output_after(before, OFFERED, Duration::from_secs(5)),
+        "{}: the customisation offered nothing for {PREFIX:?}; the terminal showed:\n{}",
+        case.id,
+        session.terminal_output()
+    );
+
+    session.type_bytes(ACCEPT);
+    settle(session, Duration::from_millis(250), REPLY);
+    let held = session.fence_exchange(&entered, shellpkg::fence_id(6));
+    assert!(
+        !held.editor.buffer_empty,
+        "{}: the reader reported an empty prompt while holding a line the customisation wrote",
+        case.id
+    );
+    assert!(
+        held.editor.buffer_revision.get() > 0,
+        "{}: the reader reported no edit at all",
+        case.id
+    );
+
+    let accepted = session.written();
+    session.type_bytes(b"\r");
+    assert!(
+        session.wait_for_output_after(accepted, PRINTED, REPLY),
+        "{}: what the customisation put in the buffer did not run; the terminal showed:\n{}",
+        case.id,
+        session.terminal_output()
+    );
+    let _ = enter;
+    let entered = session.next_prompt();
+    settle(session, Duration::from_millis(300), REPLY);
+    session.ensure_reading();
+    entered
+}
+
+/// A second start over the same home, which is the only one a cached early prompt exists for.
+///
+/// The theme draws a prompt from that cache before the startup file has finished, so what this
+/// asserts is the order the warm start records and the reader that ends up running afterwards:
+/// the early prompt is drawing, not a reader, and the managed one is what answers a fence.
+fn a_second_start_draws_from_the_cache_the_first_wrote(
+    case: &QualificationCase,
+    package: &Package,
+    setup: &CaseSetup,
+) {
+    let warm = case
+        .warm_order
+        .as_ref()
+        .expect("the corpus check refused a case without one");
+    setup.forget_order();
+    let mut session = Session::start_for(package, case, setup);
+    let enter = session.first_prompt();
+    settle(&mut session, Duration::from_millis(300), REPLY);
+    session.ensure_reading();
+    assert_eq!(
+        &setup.recorded_order(),
+        warm,
+        "{}: a second start over the same home did not draw from the cache the first wrote; the \
+         terminal showed:\n{}",
+        case.id,
+        session.terminal_output()
+    );
+    let acknowledgement = session.fence_exchange(&enter, shellpkg::fence_id(7));
+    assert_eq!(acknowledgement.prompt_generation, enter.prompt_generation);
+    assert!(
+        acknowledgement.editor.buffer_empty,
+        "{}: the reader that came out of the early prompt was holding something",
+        case.id
+    );
+    assert!(
+        session.alive(),
+        "{}: the shell did not survive its warm start",
         case.id
     );
 }

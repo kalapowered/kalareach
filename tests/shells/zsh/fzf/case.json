@@ -4,10 +4,34 @@
   "stack": "fzf",
   "title": "fzf's widgets, which take over keys and run a program inside the reader",
   "supported": true,
-  "requires": ["fzf", "fzf-shell"],
-  "order": ["user-top", "stack", "user-bottom"],
+  "requires": [
+    "fzf",
+    "fzf-shell"
+  ],
+  "order": [
+    "user-top",
+    "stack",
+    "user-bottom"
+  ],
   "binding": "kr-user-widget",
-  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
-  "covers": ["KR-REQ-07.87"],
-  "home": [{ "file": "zshrc", "path": ".zshrc" }]
+  "checks": [
+    "identity",
+    "profile_order",
+    "plugin_active",
+    "plugin_buffer",
+    "user_bindings"
+  ],
+  "plugin": {
+    "probe": "echo kr-plugin=$(( $+functions[fzf-file-widget] ))",
+    "marker": "kr-plugin=1"
+  },
+  "covers": [
+    "KR-REQ-07.87"
+  ],
+  "home": [
+    {
+      "file": "zshrc",
+      "path": ".zshrc"
+    }
+  ]
 }

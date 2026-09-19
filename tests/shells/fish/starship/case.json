@@ -4,15 +4,46 @@
   "stack": "starship",
   "title": "starship on the packaged fish, through conf.d and the prompt function it installs",
   "supported": true,
-  "requires": ["starship"],
-  "order": ["conf-d", "stack", "user-top", "user-bottom"],
+  "requires": [
+    "starship"
+  ],
+  "order": [
+    "conf-d",
+    "stack",
+    "user-top",
+    "user-bottom"
+  ],
   "binding": "kr-user-binding",
-  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
-  "covers": ["KR-REQ-07.87"],
+  "checks": [
+    "identity",
+    "profile_order",
+    "plugin_active",
+    "plugin_buffer",
+    "user_bindings"
+  ],
+  "plugin": {
+    "probe": "echo kr-plugin=(set -q STARSHIP_SESSION_KEY; and echo on; or echo off)",
+    "marker": "kr-plugin=on"
+  },
+  "covers": [
+    "KR-REQ-07.87"
+  ],
   "home": [
-    { "file": "order.fish", "path": ".config/fish/conf.d/00-kr-order.fish" },
-    { "file": "starship.fish", "path": ".config/fish/conf.d/10-starship.fish" },
-    { "file": "config.fish", "path": ".config/fish/config.fish" },
-    { "file": "starship.toml", "path": ".config/starship.toml" }
+    {
+      "file": "order.fish",
+      "path": ".config/fish/conf.d/00-kr-order.fish"
+    },
+    {
+      "file": "starship.fish",
+      "path": ".config/fish/conf.d/10-starship.fish"
+    },
+    {
+      "file": "config.fish",
+      "path": ".config/fish/config.fish"
+    },
+    {
+      "file": "starship.toml",
+      "path": ".config/starship.toml"
+    }
   ]
 }

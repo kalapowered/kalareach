@@ -4,13 +4,37 @@
   "stack": "atuin",
   "title": "atuin, which replaces the history search and adds a pre-execution hook",
   "supported": true,
-  "requires": ["atuin"],
-  "order": ["user-top", "stack", "user-bottom"],
+  "requires": [
+    "atuin"
+  ],
+  "order": [
+    "user-top",
+    "stack",
+    "user-bottom"
+  ],
   "binding": "kr-user-widget",
-  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
-  "covers": ["KR-REQ-07.87"],
+  "checks": [
+    "identity",
+    "profile_order",
+    "plugin_active",
+    "plugin_buffer",
+    "user_bindings"
+  ],
+  "plugin": {
+    "probe": "echo kr-plugin=${ATUIN_SESSION:+on}",
+    "marker": "kr-plugin=on"
+  },
+  "covers": [
+    "KR-REQ-07.87"
+  ],
   "home": [
-    { "file": "zshrc", "path": ".zshrc" },
-    { "file": "config.toml", "path": ".config/atuin/config.toml" }
+    {
+      "file": "zshrc",
+      "path": ".zshrc"
+    },
+    {
+      "file": "config.toml",
+      "path": ".config/atuin/config.toml"
+    }
   ]
 }

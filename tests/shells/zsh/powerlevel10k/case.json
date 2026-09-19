@@ -4,13 +4,44 @@
   "stack": "powerlevel10k",
   "title": "Powerlevel10k with its instant prompt, which draws a reader before the startup file finishes",
   "supported": true,
-  "requires": ["powerlevel10k"],
-  "order": ["user-top", "stack", "user-bottom"],
+  "requires": [
+    "powerlevel10k"
+  ],
+  "order": [
+    "user-top",
+    "stack",
+    "user-bottom"
+  ],
+  "warm_order": [
+    "instant-prompt",
+    "user-top",
+    "stack",
+    "user-bottom"
+  ],
   "binding": "kr-user-widget",
-  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
-  "covers": ["KR-REQ-07.87"],
+  "checks": [
+    "identity",
+    "profile_order",
+    "plugin_active",
+    "plugin_buffer",
+    "user_bindings",
+    "instant_prompt"
+  ],
+  "plugin": {
+    "probe": "echo kr-plugin=$(( $+functions[p10k] ))",
+    "marker": "kr-plugin=1"
+  },
+  "covers": [
+    "KR-REQ-07.87"
+  ],
   "home": [
-    { "file": "zshrc", "path": ".zshrc" },
-    { "file": "p10k.zsh", "path": ".p10k.zsh" }
+    {
+      "file": "zshrc",
+      "path": ".zshrc"
+    },
+    {
+      "file": "p10k.zsh",
+      "path": ".p10k.zsh"
+    }
   ]
 }

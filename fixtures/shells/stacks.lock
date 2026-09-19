@@ -132,7 +132,7 @@
       "version": "18.4.0",
       "role": "program",
       "program": "atuin",
-      "shells": ["zsh", "bash", "fish"],
+      "shells": ["zsh", "fish"],
       "sources": [
         {
           "platform": "aarch64-apple-darwin",

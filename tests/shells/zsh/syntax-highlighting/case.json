@@ -4,10 +4,33 @@
   "stack": "zsh-syntax-highlighting",
   "title": "zsh-syntax-highlighting, which wraps every reader widget and loads after the integration",
   "supported": true,
-  "requires": ["zsh-syntax-highlighting"],
-  "order": ["user-top", "user-bottom", "stack"],
+  "requires": [
+    "zsh-syntax-highlighting"
+  ],
+  "order": [
+    "user-top",
+    "user-bottom",
+    "stack"
+  ],
   "binding": "kr-user-widget",
-  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
-  "covers": ["KR-REQ-07.87"],
-  "home": [{ "file": "zshrc", "path": ".zshrc" }]
+  "checks": [
+    "identity",
+    "profile_order",
+    "plugin_active",
+    "plugin_buffer",
+    "user_bindings"
+  ],
+  "plugin": {
+    "probe": "echo kr-plugin=$ZSH_HIGHLIGHT_VERSION",
+    "marker": "kr-plugin=0.8.0"
+  },
+  "covers": [
+    "KR-REQ-07.87"
+  ],
+  "home": [
+    {
+      "file": "zshrc",
+      "path": ".zshrc"
+    }
+  ]
 }

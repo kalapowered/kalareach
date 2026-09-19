@@ -4,10 +4,34 @@
   "stack": "zsh-autosuggestions",
   "title": "zsh-autosuggestions, which rewrites the line the reader is holding on every keystroke",
   "supported": true,
-  "requires": ["zsh-autosuggestions"],
-  "order": ["user-top", "stack", "user-bottom"],
+  "requires": [
+    "zsh-autosuggestions"
+  ],
+  "order": [
+    "user-top",
+    "stack",
+    "user-bottom"
+  ],
   "binding": "kr-user-widget",
-  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
-  "covers": ["KR-REQ-07.87"],
-  "home": [{ "file": "zshrc", "path": ".zshrc" }]
+  "checks": [
+    "identity",
+    "profile_order",
+    "plugin_active",
+    "plugin_writes_buffer",
+    "plugin_buffer",
+    "user_bindings"
+  ],
+  "plugin": {
+    "probe": "echo kr-plugin=$(( $+functions[_zsh_autosuggest_start] ))",
+    "marker": "kr-plugin=1"
+  },
+  "covers": [
+    "KR-REQ-07.87"
+  ],
+  "home": [
+    {
+      "file": "zshrc",
+      "path": ".zshrc"
+    }
+  ]
 }

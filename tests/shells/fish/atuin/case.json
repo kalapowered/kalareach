@@ -4,15 +4,46 @@
   "stack": "atuin",
   "title": "atuin on the packaged fish, which replaces the history search and hooks every command",
   "supported": true,
-  "requires": ["atuin"],
-  "order": ["conf-d", "stack", "user-top", "user-bottom"],
+  "requires": [
+    "atuin"
+  ],
+  "order": [
+    "conf-d",
+    "stack",
+    "user-top",
+    "user-bottom"
+  ],
   "binding": "kr-user-binding",
-  "checks": ["identity", "profile_order", "user_bindings", "plugin_buffer"],
-  "covers": ["KR-REQ-07.87"],
+  "checks": [
+    "identity",
+    "profile_order",
+    "plugin_active",
+    "plugin_buffer",
+    "user_bindings"
+  ],
+  "plugin": {
+    "probe": "echo kr-plugin=(set -q ATUIN_SESSION; and echo on; or echo off)",
+    "marker": "kr-plugin=on"
+  },
+  "covers": [
+    "KR-REQ-07.87"
+  ],
   "home": [
-    { "file": "order.fish", "path": ".config/fish/conf.d/00-kr-order.fish" },
-    { "file": "atuin.fish", "path": ".config/fish/conf.d/10-atuin.fish" },
-    { "file": "config.fish", "path": ".config/fish/config.fish" },
-    { "file": "config.toml", "path": ".config/atuin/config.toml" }
+    {
+      "file": "order.fish",
+      "path": ".config/fish/conf.d/00-kr-order.fish"
+    },
+    {
+      "file": "atuin.fish",
+      "path": ".config/fish/conf.d/10-atuin.fish"
+    },
+    {
+      "file": "config.fish",
+      "path": ".config/fish/config.fish"
+    },
+    {
+      "file": "config.toml",
+      "path": ".config/atuin/config.toml"
+    }
   ]
 }

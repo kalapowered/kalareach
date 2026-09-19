@@ -18,7 +18,7 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
@@ -34,7 +34,7 @@ use kr_shell_integration::contract::transport::{
     BOOTSTRAP_SECRET_LEN, BridgeEndpoint, BridgeFrame, HandshakeOutcome, ObservedPeer,
     ProofVerdict, WorkerExpectation, bootstrap_transcript, decide_handshake,
 };
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use serde::Deserialize;
 
 use super::*;
@@ -192,10 +192,15 @@ pub struct QualificationCase {
     pub requires: Vec<String>,
     /// The markers the case's startup writes, in the order it writes them.
     pub order: Vec<String>,
+    /// The order a second start over the same home writes, where a case has one.
+    #[serde(default)]
+    pub warm_order: Option<Vec<String>>,
     /// What the person's own binding is called.
     pub binding: String,
     /// What this case claims to prove.
     pub checks: Vec<String>,
+    #[serde(default)]
+    pub plugin: Option<PluginProbe>,
     #[serde(default)]
     pub native_module: Option<NativeModuleCase>,
     pub covers: Vec<String>,
@@ -203,6 +208,20 @@ pub struct QualificationCase {
     /// Where the case was read from. Not part of the file.
     #[serde(skip)]
     pub directory: PathBuf,
+}
+
+/// How a case asks the shell whether its customisation is loaded and working.
+///
+/// Without this a case proves only that a startup file ran. With it, a customisation that failed
+/// to load — a path that moved, a release that changed its own entry point — fails the case that
+/// claims it rather than passing as a shell with nothing loaded.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PluginProbe {
+    /// The command the shell is given.
+    pub probe: String,
+    /// What it prints when the customisation is there.
+    pub marker: String,
 }
 
 /// A combination that does not exist, with the reason it does not.
@@ -361,17 +380,20 @@ impl CaseSetup {
         let mut entry_written = false;
         for file in &case.home {
             let source = case.directory.join("home").join(&file.file);
-            let body = std::fs::read_to_string(&source)
+            // Read as bytes: a case may ship a file that is not text, and a module the loader is
+            // meant to refuse is one of them.
+            let body = std::fs::read(&source)
                 .unwrap_or_else(|error| panic!("{}: {error}", source.display()));
             let destination = home_path(&home, &file.path);
             if let Some(parent) = destination.parent() {
                 std::fs::create_dir_all(parent).expect("a directory under the case home");
             }
-            let body = if body.contains(ENTRY_TOKEN) {
-                entry_written = true;
-                body.replace(ENTRY_TOKEN, &entry)
-            } else {
-                body
+            let body = match std::str::from_utf8(&body) {
+                Ok(text) if text.contains(ENTRY_TOKEN) => {
+                    entry_written = true;
+                    text.replace(ENTRY_TOKEN, &entry).into_bytes()
+                }
+                _ => body,
             };
             std::fs::write(&destination, body).expect("a startup file");
         }
@@ -412,6 +434,23 @@ impl CaseSetup {
                 .unwrap_or_else(|| panic!("{id} is {} and has no directory", stack.status));
             environment.push((stack_variable(id), root.clone()));
         }
+
+        // A process a harness starts is its own identity to the operating system, and one that
+        // reaches the removable volume this workspace lives on makes it ask the person at the
+        // machine for permission. Every path this shell is given is checked rather than assumed.
+        for (name, value) in &environment {
+            assert!(
+                outside_workspace(Path::new(value)),
+                "{} would give the shell {name}={value}, which is on the workspace volume",
+                case.id
+            );
+        }
+        assert!(
+            outside_workspace(&package.executable),
+            "{} would launch {}, which is on the workspace volume",
+            case.id,
+            package.executable.display()
+        );
 
         Self {
             home,
@@ -563,20 +602,33 @@ impl Session {
 
         let output = Arc::new(Mutex::new(Vec::new()));
         let stopped = Arc::new(AtomicBool::new(false));
+        // From here to the session being built, anything can fail: the shell may never connect,
+        // or its opening frame may not arrive. The guard ends and reaps the shell and stops the
+        // thread reading its terminal, because the session that would have done both does not
+        // exist yet and the cases after this one share the machine.
+        let mut guard = SpawnGuard {
+            child: Some(child),
+            stopped: Arc::clone(&stopped),
+        };
         let mut reader = pty.master.try_clone_reader().expect("a terminal reader");
         let collected = Arc::clone(&output);
         let finished = Arc::clone(&stopped);
-        let writer: Arc<Mutex<Box<dyn std::io::Write + Send>>> = Arc::new(Mutex::new(
+        let writer: Arc<Mutex<Box<dyn Write + Send>>> = Arc::new(Mutex::new(
             pty.master.take_writer().expect("a terminal writer"),
         ));
         let answering = Arc::clone(&writer);
         std::thread::spawn(move || {
             let mut buffer = [0u8; 4096];
+            // A terminal read ends wherever the kernel had bytes, which can be in the middle of a
+            // query an editor is waiting for an answer to. What has not been answered is carried
+            // to the next read rather than dropped.
+            let mut carried: Vec<u8> = Vec::new();
             while !finished.load(Ordering::Relaxed) {
                 match reader.read(&mut buffer) {
                     Ok(0) | Err(_) => break,
                     Ok(taken) => {
-                        answer_terminal_queries(&buffer[..taken], &answering);
+                        carried.extend_from_slice(&buffer[..taken]);
+                        answer_carried_queries(&mut carried, &answering);
                         collected
                             .lock()
                             .expect("the output lock")
@@ -604,6 +656,7 @@ impl Session {
             .tempdir()
             .expect("a session directory on the internal disk");
 
+        let child = guard.release();
         let mut session = Self {
             package_kind: package.kind,
             session_id,
@@ -709,11 +762,124 @@ impl Session {
     /// Presses the key the case's own binding is on and waits for what that binding writes.
     ///
     /// The text comes from the binding rather than from the two bytes that were typed, so seeing
-    /// it drawn is the binding having run rather than the terminal having echoed.
+    /// it drawn is the binding having run rather than the terminal having echoed. Only what
+    /// arrives after the key counts: a case that had already printed the same word would
+    /// otherwise pass without the binding running at all.
     #[must_use]
     pub fn user_binding_ran(&mut self) -> bool {
+        let start = self.written();
         self.type_bytes(USER_BINDING_KEY);
-        self.wait_for_output(USER_BINDING_TEXT, REPLY)
+        self.wait_for_output_after(start, USER_BINDING_TEXT, REPLY)
+    }
+
+    /// How much the terminal has shown so far, as an offset a later wait counts from.
+    #[must_use]
+    pub fn written(&self) -> usize {
+        self.output.lock().expect("the output lock").len()
+    }
+
+    /// Waits for `needle` in what the terminal showed after `start`.
+    pub fn wait_for_output_after(&mut self, start: usize, needle: &str, within: Duration) -> bool {
+        let deadline = Instant::now() + within;
+        loop {
+            {
+                let output = self.output.lock().expect("the output lock");
+                let from = start.min(output.len());
+                if find(&output[from..], needle.as_bytes()) {
+                    return true;
+                }
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            self.pump(Duration::from_millis(25));
+        }
+    }
+
+    /// Asks the shell whether the case's customisation is loaded and working.
+    #[must_use]
+    pub fn plugin_is_active(&mut self, probe: &PluginProbe) -> bool {
+        self.run(&probe.probe, &probe.marker)
+    }
+}
+
+/// Holds a shell that has started until the session that owns it exists.
+struct SpawnGuard {
+    child: Option<Box<dyn Child + Send + Sync>>,
+    stopped: Arc<AtomicBool>,
+}
+
+impl SpawnGuard {
+    /// Hands the shell to the session, after which the session ends it.
+    fn release(&mut self) -> Box<dyn Child + Send + Sync> {
+        self.child.take().expect("the shell is still held here")
+    }
+}
+
+impl Drop for SpawnGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = child.kill();
+        // The terminal keeps being read while the shell goes away: a process whose last bytes
+        // have nowhere to go cannot finish leaving.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) | Err(_) => break,
+                Ok(None) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        self.stopped.store(true, Ordering::Relaxed);
+    }
+}
+
+/// The queries a terminal is expected to answer, and what this one answers them with.
+const TERMINAL_QUERIES: &[(&[u8], &[u8])] = &[
+    (b"\x1b[6n", b"\x1b[1;1R"),
+    (b"\x1b[0c", b"\x1b[?6c"),
+    (b"\x1b[c", b"\x1b[?6c"),
+    (b"\x1b]11;?", b"\x1b]11;rgb:0000/0000/0000\x1b\\"),
+];
+
+/// Answers every complete query in `carried` and keeps only what could still become one.
+///
+/// A read ends wherever the kernel had bytes, so a query can arrive in two pieces. Each answer is
+/// sent once: everything up to the last query answered is dropped, and what is kept afterwards is
+/// shorter than the longest query, which is as much as an unfinished one can be.
+fn answer_carried_queries(carried: &mut Vec<u8>, writer: &Arc<Mutex<Box<dyn Write + Send>>>) {
+    let mut reply: Vec<u8> = Vec::new();
+    let mut answered = 0;
+    let mut index = 0;
+    while index < carried.len() {
+        let matched = TERMINAL_QUERIES.iter().find_map(|(query, answer)| {
+            carried[index..]
+                .starts_with(query)
+                .then_some((query.len(), *answer))
+        });
+        match matched {
+            Some((length, answer)) => {
+                reply.extend_from_slice(answer);
+                index += length;
+                answered = index;
+            }
+            None => index += 1,
+        }
+    }
+    let longest = TERMINAL_QUERIES
+        .iter()
+        .map(|(query, _)| query.len())
+        .max()
+        .unwrap_or(1);
+    let keep_from = answered.max(carried.len().saturating_sub(longest - 1));
+    carried.drain(..keep_from);
+    if reply.is_empty() {
+        return;
+    }
+    if let Ok(mut writer) = writer.lock() {
+        let _ = writer.write_all(&reply);
+        let _ = writer.flush();
     }
 }
 

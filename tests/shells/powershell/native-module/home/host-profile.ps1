@@ -17,6 +17,12 @@ try {
     Set-Content -LiteralPath (Join-Path $HOME 'module-error') -Value $_.Exception.Message
     Add-Content -LiteralPath $env:KR_TEST_ORDER -Value 'kr-module-refused'
 }
+# What the session ended up with, rather than what the import returned.
+if (Get-Module -Name KrWrongAbi) {
+    Add-Content -LiteralPath $env:KR_TEST_ORDER -Value 'kr-module-listed'
+} else {
+    Add-Content -LiteralPath $env:KR_TEST_ORDER -Value 'kr-module-absent'
+}
 Add-Content -LiteralPath $env:KR_TEST_ORDER -Value 'stack'
 
 Set-PSReadLineKeyHandler -Chord Alt+q -BriefDescription 'kr-user-binding' -LongDescription 'the person own binding' -ScriptBlock {

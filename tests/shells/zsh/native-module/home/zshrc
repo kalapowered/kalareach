@@ -15,6 +15,12 @@ if zmodload kr_wrong_abi 2>"$HOME/module-error"; then
 else
   print -r -- kr-module-refused >> "$KR_TEST_ORDER"
 fi
+# What the shell ended up with, rather than what the attempt returned.
+if zmodload -L 2>/dev/null | grep -q kr_wrong_abi; then
+  print -r -- kr-module-listed >> "$KR_TEST_ORDER"
+else
+  print -r -- kr-module-absent >> "$KR_TEST_ORDER"
+fi
 print -r -- stack >> "$KR_TEST_ORDER"
 
 kr-user-widget() { BUFFER='kr-user-binding-ran'; CURSOR=$#BUFFER }

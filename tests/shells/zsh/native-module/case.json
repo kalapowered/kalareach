@@ -5,17 +5,36 @@
   "title": "a user native module this build cannot load, diagnosed rather than loaded silently",
   "supported": true,
   "requires": [],
-  "order": ["user-top", "kr-module-refused", "stack", "user-bottom"],
+  "order": [
+    "user-top",
+    "kr-module-refused",
+    "kr-module-absent",
+    "stack",
+    "user-bottom"
+  ],
   "binding": "kr-user-widget",
-  "checks": ["identity", "profile_order", "user_bindings", "native_module"],
+  "checks": [
+    "identity",
+    "profile_order",
+    "native_module",
+    "user_bindings"
+  ],
   "native_module": {
     "name": "kr_wrong_abi",
     "marker": "kr-module-refused",
-    "note": "A module built against another Zsh ABI cannot be produced from a fixture, so what this case ships is a module file this build's loader refuses. What it proves is the diagnosis: the shell names the module it would not load, the module is absent from the loaded list, and the integration is still qualified afterwards."
+    "note": "What this case ships is a file named like a module whose contents this build's loader refuses, so what it proves is the diagnosis rather than an editor-ABI mismatch: the loader names the module it would not load, the shell's own list of loaded modules does not hold it, and the integration is still qualified afterwards. A module compiled against another ABI of this shell would prove the mismatch itself and needs a compiler and that shell's headers at qualification time, which this corpus does not have."
   },
-  "covers": ["KR-REQ-07.87"],
+  "covers": [
+    "KR-REQ-07.87"
+  ],
   "home": [
-    { "file": "zshrc", "path": ".zshrc" },
-    { "file": "kr_wrong_abi.so", "path": "modules/kr_wrong_abi.so" }
+    {
+      "file": "zshrc",
+      "path": ".zshrc"
+    },
+    {
+      "file": "kr_wrong_abi.so",
+      "path": "modules/kr_wrong_abi.so"
+    }
   ]
 }

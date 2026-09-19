@@ -5,6 +5,8 @@ PROMPT='KR> '
 setopt no_beep
 unsetopt zle_rprompt_indent 2>/dev/null
 HISTFILE=
+HISTSIZE=200
+SAVEHIST=0
 typeset -g KR_TEST_USER_CONFIGURATION=1
 
 # The suggestion this plugin draws is written into the reader's own line and taken out again on

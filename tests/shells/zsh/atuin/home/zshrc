@@ -6,7 +6,10 @@ unsetopt zle_rprompt_indent 2>/dev/null
 HISTFILE=
 typeset -g KR_TEST_USER_CONFIGURATION=1
 
+# The code this prints calls `atuin` by name for every history operation and for its search,
+# so the pinned build has to be the one the path finds.
 export ATUIN_CONFIG_DIR="$HOME/.config/atuin"
+path=("$KR_STACK_ATUIN" $path)
 eval "$("$KR_STACK_ATUIN/atuin" init zsh --disable-up-arrow)"
 print -r -- stack >> "$KR_TEST_ORDER"
 
