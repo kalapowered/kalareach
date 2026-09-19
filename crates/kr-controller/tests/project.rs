@@ -1158,14 +1158,24 @@ fn keys_are_this_test_s(
             path.display()
         );
     }
+    // The daemon names the directory as it resolved it, which is not always how this test spells
+    // it: a daemon given relative directories resolves them against the working directory the
+    // kernel reports, and on macOS that has already followed the link at `/var`. So the two names
+    // are compared as directories rather than as text.
     let said = std::fs::read_to_string(log).unwrap_or_default();
-    let expected = format!(
-        "kr-controller: keys in the 0700 fallback directory at {}",
-        environment.secrets_dir().display()
-    );
-    assert!(
-        said.contains(&expected),
-        "the daemon's log does not say where its keys went; it says: {said}"
+    let named = said
+        .lines()
+        .find_map(|line| {
+            line.strip_prefix("kr-controller: keys in the 0700 fallback directory at ")
+        })
+        .and_then(|rest| rest.split(" (").next())
+        .unwrap_or_else(|| {
+            panic!("the daemon's log does not say where its keys went; it says: {said}")
+        });
+    assert_eq!(
+        std::fs::canonicalize(named).expect("the directory the daemon named"),
+        std::fs::canonicalize(environment.secrets_dir()).expect("this test's secrets directory"),
+        "the daemon named a directory other than this test's own"
     );
 }
 
