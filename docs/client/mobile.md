@@ -19,12 +19,24 @@ The generated Tauri projects are committed at `apps/companion/src-tauri/gen/appl
 reference the hand-written native sources by relative path, which is why those sources live outside
 the generated directories: `tauri ios init` and `tauri android init` rewrite what is inside them.
 
-**The packaged applications do not build yet.** The shared native client reaches both mobile
-targets through the crate's `cdylib`, and two crates in that graph have no mobile support: `kr-ipc`
-has a platform module for Linux, macOS and Windows and none for Android, and `kr-term` pulls in a
-terminal library whose `termios` dependency has no iOS support. Until those are resolved, what is
-described below is exercised in the platform's own engine on both simulators and by the native
-targets' own tests, and `tauri ios build` and `tauri android build` do not complete.
+Both packaged applications build. `tauri ios build --debug --target aarch64-sim` produces
+`KalaReach.app`, which installs and runs on the iOS Simulator; `tauri android build --debug`
+produces an APK and an AAB.
+
+Two things a build needs to know:
+
+- **The Android toolchain is named, not inferred.** Android 15 and later run with 16 KB memory
+  pages and refuse a library linked for 4 KB ones, so `app/build.gradle.kts` names NDK 28, whose
+  linker aligns to 16 KB by default. Point `NDK_HOME` at the same one: the Rust half of the build
+  reads that variable and Gradle reads the setting.
+- **An iOS build writes into `src-tauri/gen/apple/build` and will not write over itself.** A second
+  run in the same tree stops at "Directory not empty"; remove that directory first.
+
+**The Android application does not start on a device yet**, and the reason is the one thing in the
+graph that does not cross-compile: libsodium. Its build produces an empty archive for
+`aarch64-linux-android`, so the shared library loads with `sodium_init` undefined and the activity
+fails at launch. The application's own code, the Kotlin half and the packaging are all in place;
+what is missing is a libsodium the Android linker can use.
 
 ## One bundle, two shells
 

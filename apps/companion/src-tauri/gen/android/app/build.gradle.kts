@@ -15,6 +15,10 @@ val tauriProperties = Properties().apply {
 
 android {
     compileSdk = 36
+    // Android 15 and later run with 16 KB memory pages, and a library linked for 4 KB pages is
+    // refused. This is the first toolchain whose linker aligns to 16 KB by default, so it is named
+    // rather than left to whichever one happens to be installed.
+    ndkVersion = "28.2.13676358"
     namespace = "to.kala.reach.companion"
     defaultConfig {
         manifestPlaceholders["usesCleartextTraffic"] = "false"
